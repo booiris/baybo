@@ -121,6 +121,12 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
       session_id: `sess-${Math.random().toString(36).substring(2, 12)}-${Math.random()
         .toString(36)
         .substring(2, 8)}`,
+      title: [
+        'Investigate gateway latency',
+        'Summarize the release changes',
+        'Fix flaky workspace tests',
+        'Plan the database migration',
+      ][i % 4],
       created_at: created.toISOString(),
       last_active: lastActive.toISOString(),
       latest_turn_status: makeTurnStatus(status),
@@ -190,29 +196,6 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
 }
 
 export const MOCK_CRONS = import.meta.env.DEV ? generateMockCrons(20) : [];
-
-export const MOCK_BACKGROUND_JOBS: components['schemas']['BackgroundJobsResponse'] = {
-  jobs: [
-    {
-      handle: 'bg-7f3a',
-      session_id: 'sess-mock-1',
-      kind: 'explorer',
-      summary: 'Map the auth subsystem',
-    },
-    {
-      handle: 'bg-2e10',
-      session_id: 'sess-mock-2',
-      kind: 'command',
-      summary: 'cargo test --workspace',
-    },
-    {
-      handle: 'bg-aa44',
-      session_id: 'sess-mock-2',
-      kind: 'planner',
-      summary: 'Draft the rollout plan',
-    },
-  ],
-};
 
 // Analytics mock lives inline in `pages/AnalyticsPage.tsx` so it can
 // produce the exact `AnalyticsResponse` shape from the OpenAPI schema

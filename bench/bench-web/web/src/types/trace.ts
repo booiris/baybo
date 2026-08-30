@@ -81,6 +81,7 @@ export type MessageSource =
   | 'system_prompt_update'
   | 'skill_listing'
   | 'skills_update'
+  | 'deferred_tool_listing'
   | 'subagent_seed'
   | 'agent';
 

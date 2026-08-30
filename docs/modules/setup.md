@@ -189,6 +189,10 @@ a `?token=` URL, which would leak it into the access log).
 - The LLM step is mandatory on a fresh install (`config.llm` is
   empty) and skippable on re-runs (operator is offered
   `Add another / Skip`).
+- Every entry created by the LLM step starts with `reasoning_effort =
+  "medium"`, without checking whether the selected provider or model supports
+  thinking. Providers with no effort wiring ignore the preference; if support
+  is added later, the entry already carries the setup default.
 - The Full-only channel step always offers `Add (another) / Skip`
   because the runner calls it with `allow_skip = true`.
 - Quick setup does not inspect or mutate channel or external-agent

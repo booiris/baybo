@@ -68,9 +68,8 @@ impl MemorySessionStore {
     }
 
     /// Synchronously seed a session row so consumers (`SessionStore::get`,
-    /// `SessionManager::history`, the `on_session_end` memory hook, …)
-    /// find it without going through an async executor — useful from
-    /// sync test setup (`AgentTestHarnessBuilder::build`).
+    /// `SessionManager::history`, …) find it without going through an async
+    /// executor — useful from sync test setup (`AgentTestHarnessBuilder::build`).
     pub fn seed_session(&self, session: &Session) {
         self.data.lock().insert(session.id.clone(), session.clone());
     }

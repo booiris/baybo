@@ -9,8 +9,8 @@
  * server sent, so every rule here is about that indexing and the two
  * recursions over it. The liveness rule deliberately diverges from
  * `isTurnLive` in `traceTreeModel`: `stuck` is live for a turn row but NOT for
- * a subagent, because a stuck child streams nothing and must not pin the page
- * to the fast poll tier forever.
+ * a subagent, because a stuck child cannot change without outside action and
+ * must not keep the parent page polling forever.
  */
 import { describe, expect, it } from 'vitest';
 import type {
@@ -302,8 +302,8 @@ describe('sessionIsLive', () => {
   });
 
   it('is FALSE for stuck — narrower than isTurnLive on purpose', () => {
-    // A stuck child streams nothing new; counting it live would hold the page
-    // on the fast poll tier forever. The turn-row rule says the opposite.
+    // A stuck child cannot change without outside action; counting it live
+    // would keep the parent page polling forever. The turn-row rule differs.
     const forest = buildForest([mkChild('c', { turns: [mkTurn('t1', 'stuck')] })]);
     expect(sessionIsLive(forest, 'c')).toBe(false);
     expect(isTurnLive('stuck')).toBe(true);

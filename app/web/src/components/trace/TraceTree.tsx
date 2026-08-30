@@ -73,21 +73,7 @@ import {
 const INDENT_TURN = 8;
 const INDENT_STEP = 26;
 const INDENT_SPAN = 46;
-/** How far a nested subagent's whole subtree shifts right of the span that
- *  spawned it, so the boundary reads as containment rather than as a sibling. */
-const INDENT_NEST = 14;
-
-/**
- * Hard stop on subagent nesting depth while rendering.
- *
- * The render walks child → turns → steps → spans → child, so a lineage that
- * points back at an ancestor would recurse until the stack blows and the whole
- * page white-screens. The backend's own walk is capped at 32 and de-duplicates
- * by session id, so this should be unreachable — which is exactly why it is
- * here: an unreachable guard that costs one integer compare beats a blank page
- * if the data ever disagrees with that assumption.
- */
-const MAX_RENDER_DEPTH = 32;
+const INDENT_CHILD_LINK = 60;
 
 export interface TraceTreeProps {
   overview: TraceOverview;
@@ -102,15 +88,11 @@ export interface TraceTreeProps {
   selectedSpanId: string | null;
   /** Selected transcript row, as its `TranscriptNode.id`. */
   selectedMessageId: string | null;
-  /** Selected subagent boundary row, as its child session id. */
-  selectedSessionId: string | null;
   onSelectTurn: (turnId: string) => void;
   onSelectStep: (turnId: string, stepId: string) => void;
   onSelectSpan: (turnId: string, spanId: string) => void;
   onSelectMessage: (turnId: string, nodeId: string) => void;
-  onSelectSession: (sessionId: string) => void;
-  /** Leave for the child's own trace page — the secondary action, now that the
-   *  child renders in place. */
+  /** Open a subagent on its own trace page. Child traces are never inlined. */
   onOpenSession: (sessionId: string) => void;
   interjectionCountByTurn: Map<string, number>;
   interjectionSpanIds: Set<string>;
@@ -119,9 +101,6 @@ export interface TraceTreeProps {
   messageLog: SessionMessageRow[];
   /** Subagent descendants, indexed by where they attach. */
   forest: TraceForest;
-  /** Lazily-fetched overview (transcript + turns) per expanded child session. */
-  childOverviews: Map<string, TraceOverview>;
-  loadingChildren: Set<string>;
   /** Legend group to highlight; non-matching rows dim. `null` = no highlight. */
   highlight: TraceGroup | null;
   // Controlled filter (owned by the page):
@@ -278,11 +257,11 @@ function TokenBadge({ input, output }: { input: number; output: number }) {
 
 // ── Span leaf row ────────────────────────────────────────────────────
 
-/** The `#3` / `#3.2` position marker. Rendered as its own dim column so it
+/** The `#3` / `3.2` / `3.2.1` position marker. Rendered as its own dim column so it
  *  reads as an index rather than as part of the title. */
 function OrderMark({ label }: { label: string }) {
   return (
-    <span className="shrink-0 w-8 text-right font-mono text-[0.65rem] font-bold text-ink-soft tabular-nums">
+    <span className="shrink-0 w-14 text-right font-mono text-[0.65rem] font-bold text-ink-soft tabular-nums">
       {label}
     </span>
   );
@@ -301,7 +280,7 @@ function SpanRow({
   onSelect,
 }: {
   span: Span;
-  /** Position in storage order: `<step>.<span>`, both 1-based. */
+  /** Hierarchical position: `<turn>.<step>.<span>`, all 1-based. */
   order: string;
   selected: boolean;
   interjected: boolean;
@@ -391,8 +370,8 @@ function StepRow({
   onSelect,
 }: {
   rs: ReplayStep;
-  /** 1-based position among the turn's steps, in storage order. */
-  order: number;
+  /** Hierarchical position: `<turn>.<step>`, both 1-based. */
+  order: string;
   selected: boolean;
   open: boolean;
   hasSpans: boolean;
@@ -413,7 +392,7 @@ function StepRow({
   return (
     <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint, dim)} style={{ paddingLeft: indent }}>
       {hasSpans ? <Chevron open={open} onClick={onToggle} /> : <span className="shrink-0 w-5" />}
-      <OrderMark label={`#${order}`} />
+      <OrderMark label={order} />
       <Glyph ch={visual.glyph} accent={visual.accent} />
       <div className="flex-1 min-w-0">
         <div className="font-bold uppercase tracking-wide text-[0.78rem] truncate">{visual.label}</div>
@@ -553,41 +532,29 @@ function TranscriptRow({
 
 // ── Child session row (subagent boundary) ────────────────────────────
 
-/** The seam where a subagent's own trace begins, nested under the
- *  `spawn_subagent` span that opened it. */
-function ChildSessionRow({
+/** A jump from a `spawn_subagent` span to the child's own trace page. */
+function ChildSessionLink({
   child,
-  selected,
-  open,
-  loading,
   failed,
   live,
   indent,
-  onToggle,
-  onSelect,
-  onOpenFullPage,
+  onOpen,
 }: {
   child: LineageSession;
-  selected: boolean;
-  open: boolean;
-  loading: boolean;
   failed: boolean;
   live: boolean;
   indent: number;
-  onToggle: () => void;
-  onSelect: () => void;
-  onOpenFullPage: () => void;
+  onOpen: () => void;
 }) {
   const backend = child.external_agent != null ? externalAgentLabel(child.external_agent) : 'baybo';
   const turns = child.turns.length;
 
   return (
     <div
-      {...rowInteractive(onSelect)}
-      className={rowShell(selected, stripeClass(CHILD_SESSION_VISUAL), '')}
+      {...rowInteractive(onOpen)}
+      className={rowShell(false, stripeClass(CHILD_SESSION_VISUAL), '')}
       style={{ paddingLeft: indent }}
     >
-      <Chevron open={open} onClick={onToggle} />
       <Glyph ch="⧉" accent={CHILD_SESSION_VISUAL.accent} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
@@ -602,20 +569,9 @@ function ChildSessionRow({
         </div>
       </div>
       <div className="shrink-0 flex items-center gap-2">
-        {loading && <RiLoader4Line className="text-ink-soft animate-spin text-xs" />}
         {failed && <RollupBadge count={null} />}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onOpenFullPage();
-          }}
-          title="Open this subagent as its own trace page"
-          aria-label="Open this subagent as its own trace page"
-          className="shrink-0 flex items-center justify-center h-5 w-5 text-ink-soft hover:text-ink cursor-pointer"
-        >
-          <RiExternalLinkLine />
-        </button>
+        <span className="text-[0.68rem] font-bold text-brand">Open trace</span>
+        <RiExternalLinkLine className="text-ink-soft" />
       </div>
     </div>
   );
@@ -637,12 +593,7 @@ function Toggle({ on, onClick, children, title }: { on: boolean; onClick: () => 
 
 // ── Tree ─────────────────────────────────────────────────────────────
 
-/**
- * Everything a subtree needs that doesn't vary per node. Threaded as one
- * object because the tree is now recursive — a subagent's session nests a
- * whole `Turn → Step → Span` tree of its own under the span that spawned it,
- * and prop-drilling twenty parameters through that recursion is unreadable.
- */
+/** Everything a root trace subtree needs that doesn't vary per node. */
 interface TreeCtx {
   turnTraces: Map<string, TurnTrace>;
   loadingTurns: Set<string>;
@@ -652,12 +603,10 @@ interface TreeCtx {
   selectedStepId: string | null;
   selectedSpanId: string | null;
   selectedMessageId: string | null;
-  selectedSessionId: string | null;
   onSelectTurn: (turnId: string) => void;
   onSelectStep: (turnId: string, stepId: string) => void;
   onSelectSpan: (turnId: string, spanId: string) => void;
   onSelectMessage: (turnId: string, nodeId: string) => void;
-  onSelectSession: (sessionId: string) => void;
   onOpenSession: (sessionId: string) => void;
   interjectionCountByTurn: Map<string, number>;
   interjectionSpanIds: Set<string>;
@@ -672,14 +621,7 @@ interface TreeCtx {
     stepVisible: (rs: ReplayStep) => boolean;
   };
   forest: TraceForest;
-  childOverviews: Map<string, TraceOverview>;
-  loadingChildren: Set<string>;
-  /**
-   * Whether a subagent survives the current filter — its own identity, its
-   * subtree's content, or its failure state. Memoized per render because the
-   * step and span gates both have to consult it to avoid filtering away a
-   * matching child's ancestors.
-   */
+  /** Whether a subagent jump survives the current filter. */
   childVisible: (child: LineageSession) => boolean;
 }
 
@@ -691,136 +633,44 @@ function childText(child: LineageSession): string {
   return `${child.subagent_type ?? ''} ${child.external_agent ?? ''} ${child.session_id} subagent`.toLowerCase();
 }
 
-/**
- * Whether a text filter should keep a subagent row — its own identity, or
- * anything in the subtree beneath it.
- *
- * Without the deep half, a filter hid the child row on an identity miss and
- * took its whole subtree with it, so a matching transcript row or step inside a
- * subagent became unreachable. Only *loaded* content can be searched (a
- * collapsed child has fetched nothing), which is the same
- * already-loaded-content limitation the turn-level filter has.
- */
 /** Whether any subagent hanging off this span survives the current filter. */
 function spanHostsVisibleChild(spanId: string, ctx: TreeCtx): boolean {
   const kids = ctx.forest.bySpan.get(spanId);
   return kids != null && kids.some((c) => ctx.childVisible(c));
 }
 
-function childSubtreeMatches(child: LineageSession, ctx: TreeCtx, seen: Set<string>): boolean {
-  if (seen.has(child.session_id)) return false;
-  seen.add(child.session_id);
-  if (childText(child).includes(ctx.q)) return true;
-
-  const overview = ctx.childOverviews.get(child.session_id);
-  const turns = overview && overview.turns.length > 0 ? overview.turns : child.turns;
-  if (turns.some((t) => `${t.turn_status_kind} ${t.turn_id}`.toLowerCase().includes(ctx.q))) return true;
-
-  if (overview) {
-    const nodes = buildTranscriptNodes(overview.session_messages);
-    if (nodes.some((n) => transcriptText(n).includes(ctx.q))) return true;
-  }
-  for (const t of turns) {
-    const trace = ctx.turnTraces.get(t.turn_id);
-    if (trace == null) continue;
-    const hit = trace.steps.some(
-      (rs) =>
-        stepText(rs).toLowerCase().includes(ctx.q) ||
-        rs.spans.some((sp) => spanText(sp).toLowerCase().includes(ctx.q)),
-    );
-    if (hit) return true;
-  }
-  return (ctx.forest.byParentSession.get(child.session_id) ?? []).some((g) =>
-    childSubtreeMatches(g, ctx, seen),
-  );
-}
-
-// ── Nested child sessions ────────────────────────────────────────────
+// ── Child-session jumps ──────────────────────────────────────────────
 
 /** The subagent sessions attached at one point in the tree (a span, or a turn
- *  when the spawning span wasn't recorded), each expanding into its own trace. */
-function ChildSessions({
+ *  when the spawning span wasn't recorded). Their traces stay on their own
+ *  pages; the parent renders only these links. */
+function ChildSessionLinks({
   children,
   offset,
-  depth,
   ctx,
 }: {
   children: LineageSession[] | undefined;
   offset: number;
-  depth: number;
   ctx: TreeCtx;
 }) {
   if (!children || children.length === 0) return null;
-  if (depth >= MAX_RENDER_DEPTH) {
-    return (
-      <div className="py-1.5 text-ink-soft text-[0.72rem] italic" style={{ paddingLeft: offset + INDENT_SPAN }}>
-        subagent nesting truncated at {MAX_RENDER_DEPTH} levels
-      </div>
-    );
-  }
   return (
     <>
-      {children.map((child) => (
-        <ChildSession key={child.session_id} child={child} offset={offset} depth={depth} ctx={ctx} />
-      ))}
-    </>
-  );
-}
-
-function ChildSession({
-  child,
-  offset,
-  depth,
-  ctx,
-}: {
-  child: LineageSession;
-  offset: number;
-  depth: number;
-  ctx: TreeCtx;
-}) {
-  const failed = sessionHasFailure(ctx.forest, child.session_id, ctx.turnTraces);
-  // A failing subagent must survive "failures only" — that filter exists to
-  // find exactly this, and a child hidden behind it takes its whole subtree
-  // with it.
-  if (ctx.filtering && !ctx.childVisible(child)) return null;
-
-  const open = resolveExpanded(child.session_id, ctx.userToggles, true);
-  const overview = ctx.childOverviews.get(child.session_id);
-  const indent = offset + INDENT_SPAN + INDENT_NEST;
-
-  return (
-    <div data-child-session-id={child.session_id}>
-      <ChildSessionRow
-        child={child}
-        selected={ctx.selectedSessionId === child.session_id}
-        open={open}
-        loading={ctx.loadingChildren.has(child.session_id)}
-        failed={failed}
-        live={sessionIsLive(ctx.forest, child.session_id)}
-        indent={indent}
-        onToggle={() => ctx.onToggle(child.session_id, open)}
-        onSelect={() => ctx.onSelectSession(child.session_id)}
-        onOpenFullPage={() => ctx.onOpenSession(child.session_id)}
-      />
-      {open &&
-        (overview ? (
-          <SessionTurns
-            turns={overview.turns.length > 0 ? overview.turns : child.turns}
-            messages={overview.session_messages}
-            externalAgent={overview.external_agent ?? child.external_agent}
-            offset={indent}
-            depth={depth + 1}
-            ctx={ctx}
-          />
-        ) : (
-          <div
-            className="flex items-center gap-2 py-1.5 text-ink-soft text-[0.75rem] italic"
-            style={{ paddingLeft: indent + INDENT_NEST }}
-          >
-            <RiLoader4Line className="animate-spin" /> Loading subagent trace…
+      {children.map((child) => {
+        if (ctx.filtering && !ctx.childVisible(child)) return null;
+        return (
+          <div key={child.session_id} data-child-session-id={child.session_id}>
+            <ChildSessionLink
+              child={child}
+              failed={sessionHasFailure(ctx.forest, child.session_id, ctx.turnTraces)}
+              live={sessionIsLive(ctx.forest, child.session_id)}
+              indent={offset + INDENT_CHILD_LINK}
+              onOpen={() => ctx.onOpenSession(child.session_id)}
+            />
           </div>
-        ))}
-    </div>
+        );
+      })}
+    </>
   );
 }
 
@@ -831,14 +681,12 @@ function SessionTurns({
   messages,
   externalAgent,
   offset,
-  depth,
   ctx,
 }: {
   turns: TraceTurnSummary[];
   messages: SessionMessageRow[];
   externalAgent: ExternalAgentKind | null | undefined;
   offset: number;
-  depth: number;
   ctx: TreeCtx;
 }) {
   const labels = useMemo(() => turnLabels(turns), [turns]);
@@ -852,12 +700,12 @@ function SessionTurns({
         <TurnSubtree
           key={turn.turn_id}
           turn={turn}
+          turnOrder={i + 1}
           label={labels[i].long}
           transcriptRows={transcripts.get(turn.turn_id) ?? []}
           messages={messages}
           externalAgent={externalAgent}
           offset={offset}
-          depth={depth}
           ctx={ctx}
         />
       ))}
@@ -869,21 +717,21 @@ function SessionTurns({
 
 function TurnSubtree({
   turn,
+  turnOrder,
   label,
   transcriptRows,
   messages,
   externalAgent,
   offset,
-  depth,
   ctx,
 }: {
   turn: TraceTurnSummary;
+  turnOrder: number;
   label: string;
   transcriptRows: SessionMessageRow[];
   messages: SessionMessageRow[];
   externalAgent: ExternalAgentKind | null | undefined;
   offset: number;
-  depth: number;
   ctx: TreeCtx;
 }) {
   const trace = ctx.turnTraces.get(turn.turn_id);
@@ -928,8 +776,7 @@ function TurnSubtree({
     ctx.selectedTurnId === turn.turn_id &&
     ctx.selectedStepId == null &&
     ctx.selectedSpanId == null &&
-    ctx.selectedMessageId == null &&
-    ctx.selectedSessionId == null;
+    ctx.selectedMessageId == null;
 
   return (
     <div data-turn-id={turn.turn_id}>
@@ -1001,7 +848,7 @@ function TurnSubtree({
               <div key={rs.step.id} data-step-id={rs.step.id}>
                 <StepRow
                   rs={rs}
-                  order={stepIndex + 1}
+                  order={`${turnOrder}.${stepIndex + 1}`}
                   selected={stepSelected}
                   open={stepOpen}
                   hasSpans={hasSpans}
@@ -1030,7 +877,7 @@ function TurnSubtree({
                       <div key={span.id}>
                         <SpanRow
                           span={span}
-                          order={`${stepIndex + 1}.${spanIndex + 1}`}
+                          order={`${turnOrder}.${stepIndex + 1}.${spanIndex + 1}`}
                           selected={ctx.selectedSpanId === span.id}
                           interjected={ctx.interjectionSpanIds.has(span.id)}
                           maxMs={maxSpanMs}
@@ -1052,12 +899,9 @@ function TurnSubtree({
                             {pv.slice(0, 160)}
                           </div>
                         )}
-                        {/* The subagent's own trace, in place — the span that
-                            spawned it is its parent row, not a link away. */}
-                        <ChildSessions
+                        <ChildSessionLinks
                           children={ctx.forest.bySpan.get(span.id)}
                           offset={offset}
-                          depth={depth}
                           ctx={ctx}
                         />
                       </div>
@@ -1069,7 +913,7 @@ function TurnSubtree({
 
           {/* Children whose spawning span was never recorded still belong to
               the turn, so they attach here rather than disappearing. */}
-          <ChildSessions children={turnChildren} offset={offset} depth={depth} ctx={ctx} />
+          <ChildSessionLinks children={turnChildren} offset={offset} ctx={ctx} />
         </>
       )}
     </div>
@@ -1144,12 +988,10 @@ export function TraceTree(props: TraceTreeProps) {
     selectedStepId,
     selectedSpanId,
     selectedMessageId,
-    selectedSessionId,
     onSelectTurn,
     onSelectStep,
     onSelectSpan,
     onSelectMessage,
-    onSelectSession,
     onOpenSession,
     interjectionCountByTurn,
     interjectionSpanIds,
@@ -1161,8 +1003,6 @@ export function TraceTree(props: TraceTreeProps) {
     onToggleFailures,
     filter,
     forest,
-    childOverviews,
-    loadingChildren,
   } = props;
 
   // Density controls — local UI state; they don't affect data loading.
@@ -1186,10 +1026,7 @@ export function TraceTree(props: TraceTreeProps) {
     childVisible: (child) => {
       const cached = childVisibleCache.get(child.session_id);
       if (cached !== undefined) return cached;
-      // Seed against re-entry: a cycle would otherwise recurse through
-      // `childSubtreeMatches` -> grandchildren -> back here.
-      childVisibleCache.set(child.session_id, false);
-      const textOk = q === '' || childSubtreeMatches(child, ctx, new Set());
+      const textOk = q === '' || childText(child).includes(q);
       const failOk = !failuresOnly || sessionHasFailure(ctx.forest, child.session_id, turnTraces);
       const visible = textOk && failOk;
       childVisibleCache.set(child.session_id, visible);
@@ -1203,12 +1040,10 @@ export function TraceTree(props: TraceTreeProps) {
     selectedStepId,
     selectedSpanId,
     selectedMessageId,
-    selectedSessionId,
     onSelectTurn,
     onSelectStep,
     onSelectSpan,
     onSelectMessage,
-    onSelectSession,
     onOpenSession,
     interjectionCountByTurn,
     interjectionSpanIds,
@@ -1220,8 +1055,6 @@ export function TraceTree(props: TraceTreeProps) {
     q,
     matchers,
     forest,
-    childOverviews,
-    loadingChildren,
   };
 
   const subagents = forest.byId.size;
@@ -1232,7 +1065,7 @@ export function TraceTree(props: TraceTreeProps) {
         <div className="flex items-center gap-2 flex-wrap">
           <SearchBox
             className="h-8"
-            placeholder="Filter, or jump: #3 · #3.2 · a step/span id"
+            placeholder="Filter, or jump: #3 · 3.2 · 3.2.1 · an id"
             value={filterRaw}
             onChange={(e) => onFilterRawChange(e.target.value)}
           />
@@ -1259,7 +1092,6 @@ export function TraceTree(props: TraceTreeProps) {
           messages={messageLog}
           externalAgent={overview.external_agent}
           offset={0}
-          depth={0}
           ctx={ctx}
         />
       </div>

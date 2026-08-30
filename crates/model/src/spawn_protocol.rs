@@ -11,6 +11,8 @@
 //! `spawn_subagent` tool hands to the `baybo_subagent::SubagentSpawner`
 //! capability (its actor-backed impl lives in `baybo-agent`).
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -194,7 +196,18 @@ pub enum SubagentExitStatus {
     Failed {
         reason: String,
     },
+    /// The backend's own idle window elapsed — it emitted nothing at all for
+    /// long enough that the backend abandoned it.
     Timeout,
+    /// A foreground spawn was still working when the fixed foreground wait
+    /// elapsed and `on_timeout: "kill"` cancelled it.
+    ///
+    /// Distinct from [`Self::Timeout`], which it used to share: that one says
+    /// the child produced nothing, this one says the child was not allowed to
+    /// keep the parent blocked. Reporting a kill as an idle timeout tells the
+    /// parent its subagent found nothing when it may have found everything,
+    /// and points it away from the transcript that holds the work.
+    ForegroundWaitElapsed,
 }
 
 /// Persistent record of a background job — a `background` (or
@@ -299,6 +312,17 @@ impl PendingBackgroundResult {
     }
 }
 
+/// Parent-facing text for [`SubagentExitStatus::Timeout`] — the backend's own
+/// idle window, which really does mean "nothing came out".
+const IDLE_TIMEOUT_NOTICE: &str =
+    "[subagent idle timeout — its backend produced no output within the idle window]";
+
+/// Parent-facing text for [`SubagentExitStatus::ForegroundWaitElapsed`]. It
+/// names the knob that caused the kill, because the parent chose it: re-running
+/// the same spawn unchanged reproduces the kill, and the child was cancelled
+/// mid-work rather than starved of output.
+const FOREGROUND_WAIT_ELAPSED_NOTICE: &str = r#"[subagent killed: it was still working when the foreground wait elapsed, and `on_timeout: "kill"` cancelled it before it wrote a final report. Re-run with `on_timeout: "background"` if it needs longer.]"#;
+
 impl SubagentResult {
     /// Convenience constructor for the early-return failure cases
     /// (channel closed, parent session missing, …) where no child
@@ -334,10 +358,29 @@ impl SubagentResult {
                 "[subagent cancelled by parent before producing a result]".to_string()
             }
             (SubagentExitStatus::Failed { reason }, _) => format!("[subagent failed: {reason}]"),
-            (SubagentExitStatus::Timeout, _) => {
-                "[subagent idle timeout — produced no output within the safety window]".to_string()
+            (SubagentExitStatus::Timeout, _) => IDLE_TIMEOUT_NOTICE.to_string(),
+            (SubagentExitStatus::ForegroundWaitElapsed, _) => {
+                FOREGROUND_WAIT_ELAPSED_NOTICE.to_string()
             }
         }
+    }
+
+    /// Where the child's work lives when [`Self::result_text`] carries none of
+    /// it. Every non-completed exit still leaves real transcript rows behind —
+    /// a killed subagent is usually one that did plenty — so a bare "it timed
+    /// out" hands the parent a dead end and invites it to re-run work that is
+    /// already sitting in the store. `None` for a completed run (whose report
+    /// is inline, and whose tail is [`Self::resume_tail`]) and for an early
+    /// failure that never minted a child session.
+    pub fn transcript_tail(&self, transcript_path: &Path) -> Option<String> {
+        (!matches!(self.status, SubagentExitStatus::Completed)
+            && !self.child_session_id.as_ref().is_empty())
+        .then(|| {
+            format!(
+                "\n[whatever it did before stopping is in its transcript at {} — `Read` that path rather than re-running it.]",
+                transcript_path.display()
+            )
+        })
     }
 
     /// The parseable `[subagent_session_id: …]` suffix appended to a
@@ -353,12 +396,16 @@ impl SubagentResult {
     }
 
     /// Flat text rendering for the parent's synthetic `tool_result`:
-    /// [`Self::result_text`] plus the [`Self::resume_tail`] suffix on
-    /// completion. Callers that want the body without the tail (e.g. the
-    /// background ack) use [`Self::result_text`] directly.
-    pub fn to_tool_result_text(&self) -> String {
+    /// [`Self::result_text`] plus exactly one tail — [`Self::resume_tail`] on
+    /// completion, [`Self::transcript_tail`] otherwise, so no outcome leaves
+    /// the parent without a way to reach the child's work. Callers that want
+    /// the body alone (e.g. the background ack) use [`Self::result_text`].
+    pub fn to_tool_result_text(&self, transcript_path: &Path) -> String {
         let mut text = self.result_text();
-        if let Some(tail) = self.resume_tail() {
+        if let Some(tail) = self
+            .resume_tail()
+            .or_else(|| self.transcript_tail(transcript_path))
+        {
             text.push_str(&tail);
         }
         text
@@ -380,6 +427,13 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
 mod tests {
     use super::*;
 
+    /// Stand-in for the child's virtual transcript address. Production
+    /// composes it with `WorkspacePaths::session_log_file`; the shape is
+    /// irrelevant here, only that a non-completed result reproduces it.
+    fn transcript() -> &'static Path {
+        Path::new("/ws/logs/sessions/child-x.jsonl")
+    }
+
     #[test]
     fn tool_result_text_completed_concatenates_text_blocks_and_tails_session_id() {
         let r = SubagentResult {
@@ -390,22 +444,34 @@ mod tests {
             ]),
             status: SubagentExitStatus::Completed,
         };
-        let text = r.to_tool_result_text();
+        let text = r.to_tool_result_text(transcript());
         assert!(text.starts_with("line one\nline two"), "got: {text}");
         assert!(
             text.contains("[subagent_session_id: child-1]"),
             "missing session-id tail: {text}",
+        );
+        // A completed result carries its report inline; the transcript
+        // pointer is for the outcomes that carry nothing.
+        assert!(
+            !text.contains("logs/sessions"),
+            "completed result should not also tail a transcript path: {text}",
         );
     }
 
     #[test]
     fn tool_result_text_failure_does_not_tail_session_id() {
         let r = SubagentResult::failed("boom");
-        let text = r.to_tool_result_text();
+        let text = r.to_tool_result_text(transcript());
         assert!(text.contains("boom"));
         assert!(
             !text.contains("subagent_session_id"),
             "failed result should not advertise a resume id: {text}",
+        );
+        // No child session was ever minted, so there is no transcript to
+        // point at either — naming one would send the parent to an empty read.
+        assert!(
+            !text.contains("logs/sessions"),
+            "early failure has no child transcript to cite: {text}",
         );
     }
 
@@ -444,19 +510,53 @@ mod tests {
     #[test]
     fn tool_result_text_failed_includes_reason() {
         let r = SubagentResult::failed("boom");
-        let s = r.to_tool_result_text();
+        let s = r.to_tool_result_text(transcript());
         assert!(s.contains("boom"));
         assert!(matches!(&r.status, SubagentExitStatus::Failed { reason } if reason == "boom"));
     }
 
     #[test]
-    fn tool_result_text_timeout_is_canned() {
+    fn tool_result_text_timeout_is_canned_and_cites_the_transcript() {
         let r = SubagentResult {
             child_session_id: SessionId::from("child-x"),
             final_content: None,
             status: SubagentExitStatus::Timeout,
         };
-        assert!(r.to_tool_result_text().contains("timeout"));
+        let text = r.to_tool_result_text(transcript());
+        assert!(text.contains("timeout"), "got: {text}");
+        assert!(
+            text.contains("/ws/logs/sessions/child-x.jsonl"),
+            "a terminal with no report must say where the work is: {text}",
+        );
+    }
+
+    /// A foreground spawn killed at the wait boundary is not an idle timeout.
+    ///
+    /// Both used to render `SubagentExitStatus::Timeout`, so a subagent that
+    /// had done a full report and was cancelled one second short of writing it
+    /// told the parent it "produced no output" — which reads as "found
+    /// nothing" and steers the parent into re-running the work instead of
+    /// reading it.
+    #[test]
+    fn foreground_wait_elapsed_reads_as_a_kill_not_an_idle_timeout() {
+        let r = SubagentResult {
+            child_session_id: SessionId::from("child-x"),
+            final_content: None,
+            status: SubagentExitStatus::ForegroundWaitElapsed,
+        };
+        let text = r.to_tool_result_text(transcript());
+        assert!(
+            !text.contains("idle"),
+            "a wait-boundary kill is not an idle timeout: {text}",
+        );
+        assert!(
+            text.contains("on_timeout") && text.contains("background"),
+            "must name the knob that caused the kill: {text}",
+        );
+        assert!(
+            text.contains("/ws/logs/sessions/child-x.jsonl"),
+            "must point at the work the kill interrupted: {text}",
+        );
     }
 
     /// The persisted tag key for a background job is `job`, not `turn`.

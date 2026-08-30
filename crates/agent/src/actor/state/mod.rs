@@ -109,6 +109,10 @@ pub struct VolatileResources {
     /// that stamps `notified_at` — closing out the boot re-drive that would
     /// otherwise replay it (`AgentMessage::CronResultReady`).
     pub cron_store: Arc<dyn CronStore>,
+    /// Workspace addresses. The background-notification prompt needs them to
+    /// name a finished child's virtual transcript path, so a truncated result
+    /// tells the parent where the rest actually is.
+    pub workspace: Arc<baybo_workspace::WorkspacePaths>,
 }
 
 /// Compile-time assertion: every field type of [`VolatileResources`]
@@ -128,6 +132,7 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     assert_volatile::<Option<AgentSupervisor>>();
     assert_volatile::<Arc<SessionManager>>();
     assert_volatile::<Arc<dyn CronStore>>();
+    assert_volatile::<Arc<baybo_workspace::WorkspacePaths>>();
 };
 
 /// Compile-time assertion: [`DurableActorState`] is fully

@@ -8,11 +8,9 @@
 //! **Automatic hooks** (the core's recall / write path):
 //! - **`recall`**: `POST /api/v1/search/find` with `{query, top_k}`.
 //! - **`on_turn_complete`**: `POST /api/v1/sessions/{ctx.session_id}/messages`
-//!   ×2 (user + assistant). The server accumulates session state for the
-//!   eventual commit.
-//! - **`on_session_end`**: `POST /api/v1/sessions/{ctx.session_id}/commit`,
-//!   skipped when `transcript.is_empty()`. Triggers the 6-category server-side
-//!   extraction (preferences / entities / events / cases / patterns / profile).
+//!   ×2 (user + assistant), then `POST /api/v1/sessions/{ctx.session_id}/commit`.
+//!   The commit triggers the 6-category server-side extraction (preferences /
+//!   entities / events / cases / patterns / profile).
 //!
 //! **Tools** (the model's explicit-signal path) — four `viking_`-prefixed tools
 //! ported from the official OpenViking `openclaw-plugin`:
@@ -38,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use baybo_model::{ChatMessage, ContentBlock, TrustLevel};
+use baybo_model::{ContentBlock, TrustLevel};
 use baybo_security::http::ProxySettings;
 use baybo_security::{SecretVault, USER_SECRET_PREFIX};
 use baybo_tools::{
@@ -73,7 +71,7 @@ pub struct OpenVikingTimeouts {
     /// down OpenViking server degrades the turn to "no recalled context"
     /// instead of stalling the user up to the full `http` budget.
     pub recall: Duration,
-    /// Background-write budget for `on_turn_complete` / `on_session_end`.
+    /// Background-write budget for `on_turn_complete` and explicit commits.
     /// Detached on the runtime root, so the user never waits;
     /// `/sessions/{sid}/commit` triggers the 6-category server-side extraction
     /// (LLM-backed), which can be slow under load — give it a generous ceiling.
@@ -640,10 +638,10 @@ impl OpenVikingMemory {
     }
 
     /// Commit a session's accumulated messages and return the [`CommitAck`]
-    /// (including any extraction `task_id`). The production write path
-    /// ([`Memory::on_session_end`]) commits fire-and-forget; callers that must
-    /// know when server-side extraction actually *finished* — benchmarks,
-    /// diagnostics — commit through this and then poll [`Self::wait_commit_task`].
+    /// (including any extraction `task_id`). The automatic turn-complete path
+    /// discards the task id; callers that must know when server-side extraction
+    /// actually *finished* — benchmarks, diagnostics — commit through this and
+    /// then poll [`Self::wait_commit_task`].
     pub async fn commit_session(
         &self,
         user_id: &str,
@@ -857,39 +855,27 @@ impl Memory for OpenVikingMemory {
         }
         let scope = VikingScope::new(ctx.user_id(), ctx.agent_id().as_str());
         let sid = ctx.session_id().as_str();
-        if !user_text.is_empty()
-            && let Err(e) = self
+        let mut wrote_message = false;
+        if !user_text.is_empty() {
+            match self
                 .add_message(scope.user, scope.agent, sid, "user", &user_text)
                 .await
-        {
-            debug!(error = %e, "openviking on_turn_complete user msg failed");
+            {
+                Ok(()) => wrote_message = true,
+                Err(e) => debug!(error = %e, "openviking on_turn_complete user msg failed"),
+            }
         }
-        if !assistant_text.is_empty()
-            && let Err(e) = self
+        if !assistant_text.is_empty() {
+            match self
                 .add_message(scope.user, scope.agent, sid, "assistant", &assistant_text)
                 .await
-        {
-            debug!(error = %e, "openviking on_turn_complete assistant msg failed");
+            {
+                Ok(()) => wrote_message = true,
+                Err(e) => debug!(error = %e, "openviking on_turn_complete assistant msg failed"),
+            }
         }
-        Ok(())
-    }
-
-    async fn on_session_end(&self, ctx: &MemoryContext, transcript: &[ChatMessage]) -> Result<()> {
-        if transcript.is_empty() {
-            return Ok(());
-        }
-        // Fire-and-forget: the extraction `task_id` the commit hands back is
-        // discarded here (the user never waits on extraction). Callers needing
-        // true completion go through `commit_session` + `wait_commit_task`.
-        if let Err(e) = self
-            .commit_session(
-                ctx.user_id(),
-                ctx.agent_id().as_str(),
-                ctx.session_id().as_str(),
-            )
-            .await
-        {
-            warn!(error = %e, "openviking session commit failed");
+        if wrote_message && let Err(e) = self.commit_session(scope.user, scope.agent, sid).await {
+            warn!(error = %e, "openviking on_turn_complete commit failed");
         }
         Ok(())
     }

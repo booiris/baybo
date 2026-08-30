@@ -4179,17 +4179,6 @@ async fn await_turn_complete(memory: &RecordingMemory, expected: usize) {
     }
 }
 
-/// Same idea for the `on_session_end` write — detached on the runtime root from
-/// the actor's `ActorStop` handler, so it can land after the actor's join.
-async fn await_session_end(memory: &RecordingMemory, expected: usize) {
-    for _ in 0..50 {
-        if memory.session_end_count() >= expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn memory_hooks_fire_on_user_chat_turn() {
     // The loop drives `recall` inline at turn start (with the user input) and
@@ -4387,46 +4376,6 @@ async fn memory_hooks_skip_subagent_notification_turn() {
     );
 
     harness.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn memory_on_session_end_fires_on_actor_stop_with_durable_transcript() {
-    // ActorStop is the session-end signal: a `Memory` impl gets one
-    // `on_session_end` call with the FULL durable transcript when the
-    // actor shuts down (idle reap, supervised shutdown, …). Detached on
-    // the runtime root so it lands after the actor's join handle resolves.
-    let memory = Arc::new(RecordingMemory::new());
-    let mut harness = AgentTestHarness::builder()
-        .with_memory(memory.clone() as Arc<dyn Memory>)
-        .build();
-    harness
-        .stub_llm
-        .push_stream(vec![StreamEvent::Text("ack".into())]);
-
-    harness.send_text("note me down").await.unwrap();
-    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
-
-    // ActorStop triggers the detached `on_session_end` write.
-    harness.shutdown().await;
-
-    await_session_end(&memory, 1).await;
-    assert_eq!(
-        memory.session_end_count(),
-        1,
-        "on_session_end fires exactly once on ActorStop",
-    );
-
-    // The transcript handed to the hook is the durable one (what
-    // `SessionManager::history` returns), which includes the user's turn.
-    let transcripts = memory.session_ends();
-    assert!(
-        transcripts[0].iter().any(|m| m.role == Role::User
-            && m.content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("note me down")))),
-        "on_session_end sees the user turn from the durable transcript: {:?}",
-        transcripts[0],
-    );
 }
 
 /// The `Task*` tools persist the checklist to the shared store AND the loop

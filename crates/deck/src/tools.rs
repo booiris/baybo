@@ -25,6 +25,30 @@ use crate::manager::{CardView, DeckManager};
 /// gates. Owner-channel-only: the deck is the owner's surface, so sessions
 /// on any other channel (telegram, tui, subagent, …) neither see these
 /// tools in their LLM list nor may execute them.
+/// The `ToolSearch` source label the deferred deck tools register under —
+/// also the group name in its directory and the `server` filter value.
+pub const DEFERRED_SOURCE: &str = "deck";
+
+/// Register the deck batch on `registry`, all DEFERRED: low-frequency,
+/// ~1.6 KB of schemas, reachable via `ToolSearch` + `ToolInvoke` with
+/// names unchanged.
+pub fn install_agent_tools(registry: &mut baybo_tools::ToolRegistry, manager: Arc<DeckManager>) {
+    for (tool, manifest) in agent_tools(manager) {
+        registry.register_dynamic_deferred(DEFERRED_SOURCE, tool, manifest);
+    }
+}
+
+/// This batch's row in the deferred-tools notice: `(source, description,
+/// trigger_scope)`. The scope mirrors the tools' own `SharedWorkspace`, so
+/// the door that keeps `DeckCard*` out of a session keeps its row out too.
+pub fn deferred_notice_spec() -> (String, Option<String>, ToolTriggerScope) {
+    (
+        DEFERRED_SOURCE.to_string(),
+        Some("Deck card management: create/get/update/list".to_string()),
+        ToolTriggerScope::SharedWorkspace,
+    )
+}
+
 pub fn agent_tools(manager: Arc<DeckManager>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let entries: Vec<(Arc<dyn Tool>, Vec<baybo_tools::ToolCapability>)> = vec![
         (

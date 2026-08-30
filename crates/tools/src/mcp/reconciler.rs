@@ -453,8 +453,13 @@ impl McpReconciler {
                 trust_level.clone(),
                 entry.capabilities.clone(),
             );
-            self.registry
-                .register_dynamic(&entry.name, Arc::new(tool), manifest);
+            if entry.defer {
+                self.registry
+                    .register_dynamic_deferred(&entry.name, Arc::new(tool), manifest);
+            } else {
+                self.registry
+                    .register_dynamic(&entry.name, Arc::new(tool), manifest);
+            }
         }
 
         self.state.lock().insert(
@@ -509,6 +514,9 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
     // Each registered tool captures the scope, so an edit has to go
     // through a reconnect to reach them.
     format!("{:?}", entry.trigger_scope).hash(&mut hasher);
+    // Same rule for lazy advertisement: the register call captured the bit,
+    // so flipping `defer` must force a reconnect to re-register under it.
+    entry.defer.hash(&mut hasher);
     let mut caps: Vec<String> = entry
         .capabilities
         .iter()
@@ -538,41 +546,28 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
 /// Becomes the McpTool's `default_resource_access` — the agent loop's
 /// pre-execute approval gate consults this list per call.
 ///
-/// For **user-configured** `.mcp.json` servers the answer is
-/// transport-derived: every stdio tool counts as an `ExecCommand{command}`,
-/// every HTTP tool as `Http{host}`. The agent loop's pre-execute approval
-/// gate prompts on these uniformly.
+/// **Interim: empty for every server, so no MCP tool call raises an approval
+/// prompt.** See `docs/todo/mcp-tool-approval.md` for what this replaced and
+/// why it is temporary.
 ///
-/// For **embedded** Baybo-owned servers (browser today, future code_exec /
-/// db_query) the embedded profile builder declares the capability
-/// ceiling explicitly via `EmbeddedMcpProfile::capabilities`. An *empty*
-/// `capabilities` is the embedded profile's way of saying "Baybo controls
-/// the spawn and trusts the vendor; do not gate per-call approval on the
-/// transport command" — the user already authorised the spawn by setting
-/// `enable=true` in baybo.json. The browser sidecar relies on this:
-/// chrome-devtools-mcp's tool surface is too broad and too high-frequency
-/// for a per-call "will run: node" prompt to make sense.
+/// The rule this drops was transport-derived and per-server: a stdio server
+/// meant `ExecCommand{command}` on all of its tools, an HTTP one
+/// `Http{host}`. It asked the wrong question — "may I run `node`?" rather
+/// than "may this operation touch this resource?" — so it prompted
+/// identically for a read-only `describe_regions` and a
+/// `modify_firewall_rules`, could only be answered at the coarse grain of
+/// the command string (one `ApproveAlways` on `node` covered every
+/// node-launched server in the session), and did not follow the operator's
+/// `permission` policy, which reaches only Bash and the OS sandbox.
 ///
-/// User servers can't reach this branch — `is_embedded=false` keeps the
-/// existing behaviour even if `.mcp.json` declares `capabilities: []`.
-fn resource_access_for(entry: &McpServerEntry, is_embedded: bool) -> Vec<ResourceAccess> {
-    if is_embedded && entry.capabilities.is_empty() {
-        return Vec::new();
-    }
-    match &entry.transport {
-        McpTransportConfig::Stdio { command, .. } => {
-            vec![ResourceAccess::ExecCommand {
-                command: command.clone(),
-            }]
-        }
-        McpTransportConfig::Http { url } => {
-            let host = url::Url::parse(url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .unwrap_or_default();
-            vec![ResourceAccess::Http { host }]
-        }
-    }
+/// What this does NOT relax: unattended executions. A cron lineage still
+/// needs an exact `McpToolGrant` (operation + transport identity) —
+/// `ToolExecutor::execute` derives that from `mcp_metadata`, independently
+/// of this list, and denies without one. Pinned by
+/// `inherited_context_denies_ungranted_zero_access_typed_mcp` in
+/// `crates/agent/src/runtime/tool_executor.rs`.
+fn resource_access_for(_entry: &McpServerEntry, _is_embedded: bool) -> Vec<ResourceAccess> {
+    Vec::new()
 }
 
 /// Whether a currently-connected server (`name`, present in
@@ -631,7 +626,9 @@ mod tests {
                 trust_level: crate::mcp::config::TrustLevelConfig::Trusted,
                 capabilities: Vec::new(),
                 oauth: None,
+                description: None,
                 trigger_scope: crate::ToolTriggerScope::Any,
+                defer: false,
             }],
         }
         .write(&root)
@@ -722,64 +719,55 @@ mod tests {
     /// pins the contract: an embedded server with empty capabilities
     /// gets an empty default access list, which short-circuits the
     /// agent loop's pre-execute approval gate.
+    /// Interim rule (`docs/todo/mcp-tool-approval.md`): NO MCP server's
+    /// tools carry approval-gated accesses — user or embedded, whatever the
+    /// transport, whatever the declared capabilities. The unattended path is
+    /// unaffected: it derives its requirement from `mcp_metadata`, not from
+    /// this list (see
+    /// `tool_executor::tests::inherited_context_denies_ungranted_zero_access_typed_mcp`).
     #[test]
-    fn embedded_with_empty_capabilities_skips_approval() {
-        use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
-
-        let entry = McpServerEntry {
-            name: "browser".into(),
-            transport: McpTransportConfig::Stdio {
-                command: "node".into(),
-                args: vec!["/path/to/bundle.mjs".into()],
-            },
-            trust_level: TrustLevelConfig::Trusted,
-            capabilities: vec![],
-            oauth: None,
-            trigger_scope: crate::ToolTriggerScope::Any,
-        };
-        let embedded = resource_access_for(&entry, true);
-        assert!(
-            embedded.is_empty(),
-            "embedded server with capabilities=[] must yield empty default \
-             accesses; got {embedded:?}",
-        );
-        // User servers with the same shape MUST still get the
-        // transport-derived ExecCommand prompt — `is_embedded=false` is
-        // the only difference.
-        let user = resource_access_for(&entry, false);
-        assert_eq!(
-            user.len(),
-            1,
-            "user .mcp.json server falls back to transport-derived ExecCommand",
-        );
-    }
-
-    /// Embedded servers that DO declare capabilities still get the
-    /// transport-derived approval — opting out via empty capabilities is
-    /// explicit. A future `code_exec` tool sidecar declaring
-    /// `[ExecCommand]` should still trigger the approval gate.
-    #[test]
-    fn embedded_with_capabilities_still_gets_approval() {
+    fn no_mcp_server_carries_approval_gated_accesses() {
         use crate::ToolCapability;
         use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
 
-        let entry = McpServerEntry {
-            name: "code_exec".into(),
-            transport: McpTransportConfig::Stdio {
-                command: "node".into(),
-                args: vec!["/path/to/exec_bundle.mjs".into()],
-            },
+        let entry = |transport, capabilities| McpServerEntry {
+            name: "srv".into(),
+            transport,
             trust_level: TrustLevelConfig::Trusted,
-            capabilities: vec![ToolCapability::ExecCommand],
+            capabilities,
             oauth: None,
+            description: None,
             trigger_scope: crate::ToolTriggerScope::Any,
+            defer: true,
         };
-        let access = resource_access_for(&entry, true);
-        assert_eq!(
-            access.len(),
-            1,
-            "embedded server with declared capabilities still gets approval gate",
-        );
+        let stdio = McpTransportConfig::Stdio {
+            command: "node".into(),
+            args: vec!["/path/to/bundle.mjs".into()],
+        };
+        let http = McpTransportConfig::Http {
+            url: "https://example.com/mcp".into(),
+        };
+
+        for (label, transport, capabilities) in [
+            ("stdio, no capabilities", stdio.clone(), vec![]),
+            (
+                "stdio, exec capability",
+                stdio,
+                vec![ToolCapability::ExecCommand],
+            ),
+            ("http, http capability", http, vec![ToolCapability::Http]),
+        ] {
+            for is_embedded in [true, false] {
+                let access = resource_access_for(
+                    &entry(transport.clone(), capabilities.clone()),
+                    is_embedded,
+                );
+                assert!(
+                    access.is_empty(),
+                    "{label} (embedded={is_embedded}) must raise no approval prompt; got {access:?}",
+                );
+            }
+        }
     }
 
     /// The tools registered for a server capture its scope at connect time,
@@ -799,7 +787,9 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: Vec::new(),
             oauth: None,
+            description: None,
             trigger_scope: crate::ToolTriggerScope::Any,
+            defer: true,
         };
         let narrowed = McpServerEntry {
             trigger_scope: crate::ToolTriggerScope::SharedWorkspace,
@@ -810,6 +800,37 @@ mod tests {
             identity_hash(&base, &env),
             identity_hash(&narrowed, &env),
             "a scope edit must reach the registered tools"
+        );
+    }
+
+    /// Same rule for `defer`: the register call routed on the bit, so a
+    /// flip must move the identity and force a reconnect.
+    #[test]
+    fn flipping_defer_changes_the_identity() {
+        use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
+
+        let deferred = McpServerEntry {
+            name: "srv".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "node".into(),
+                args: vec!["/path/to/bundle.mjs".into()],
+            },
+            trust_level: TrustLevelConfig::Trusted,
+            capabilities: Vec::new(),
+            oauth: None,
+            description: None,
+            trigger_scope: crate::ToolTriggerScope::Any,
+            defer: true,
+        };
+        let eager = McpServerEntry {
+            defer: false,
+            ..deferred.clone()
+        };
+        let env = HashMap::new();
+        assert_ne!(
+            identity_hash(&deferred, &env),
+            identity_hash(&eager, &env),
+            "a defer flip must reach the registered tools"
         );
     }
 }

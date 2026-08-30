@@ -97,6 +97,7 @@ pub(super) fn rehydrate_message(
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::SystemPromptUpdate => ChatMessage::system_prompt_update(content),
         MessageSource::SkillListing => ChatMessage::skill_listing(content),
+        MessageSource::DeferredToolListing => ChatMessage::deferred_tool_listing(content),
         MessageSource::SubagentSeed => ChatMessage::subagent_seed(content),
         MessageSource::SkillsUpdate => ChatMessage::skills_update(content),
         MessageSource::Agent => match role {
@@ -619,10 +620,9 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn list_by_channel(&self, channel: &baybo_model::ChannelType) -> Result<Vec<Session>> {
-        // The flat `channel` column (backfilled by `init_db`, written on
-        // every save) makes this an `idx_sessions_channel_active` range
-        // scan — non-matching rows never ship their `data` blob out of
-        // sqlite or pay the serde decode.
+        // The flat `channel` column written on every save makes this an
+        // `idx_sessions_channel_active` range scan — non-matching rows never
+        // ship their `data` blob out of sqlite or pay the serde decode.
         let channel = channel.as_str().to_string();
         let rows = self
             .pool
@@ -1982,14 +1982,6 @@ mod tests {
         .unwrap();
     }
 
-    /// Re-run the schema/migration boot path (what a new binary does against
-    /// an older DB).
-    async fn init_db(pool: &SqlitePool) {
-        pool.interact_write("test.init_db", super::super::init_db)
-            .await
-            .unwrap();
-    }
-
     fn text_value(s: &str) -> rusqlite::types::Value {
         rusqlite::types::Value::Text(s.to_string())
     }
@@ -2485,56 +2477,13 @@ mod tests {
             "the conversation stays in the user's list"
         );
     }
-
     #[tokio::test]
-    async fn legacy_sessions_table_without_pinned_is_migrated() {
-        // The "DB created before `pinned` existed" case the migration list
-        // (sqlite/mod.rs) handles. Simulate the pre-`pinned` schema by
-        // dropping the column the fresh `init_db` created, write a row the
-        // way an old build would (no `pinned`), then re-run `init_db` — the
-        // boot path a new binary takes. Without the ALTER migration the
-        // store's `SELECT … pinned` would fail with "no such column"; with
-        // it the column comes back and the old row defaults to unpinned.
+    async fn message_platform_msg_id_round_trips() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        exec(&pool, "ALTER TABLE sessions DROP COLUMN pinned", Vec::new()).await;
-        let data = serde_json::to_string(&make_root_session("legacy-1")).unwrap();
-        exec(
-            &pool,
-            "INSERT INTO sessions \
-             (id, root_session_id, trigger_kind, created_at, last_active, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            vec![
-                text_value("legacy-1"),
-                text_value("legacy-1"),
-                text_value("user"),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Text(data),
-            ],
-        )
-        .await;
-        // Re-running init_db applies the idempotent ALTER (re-adds pinned).
-        init_db(&pool).await;
-
         let store = SqliteSessionStore::new(pool);
-        let id = SessionId::from("legacy-1");
-        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
-        assert!(!loaded.pinned, "migrated legacy row defaults to unpinned");
-        // And the column is now writable like any other.
-        assert!(store.set_pinned(&id, true).await.unwrap());
-        assert!(store.get(&id).await.unwrap().unwrap().pinned);
-    }
-
-    #[tokio::test]
-    async fn message_platform_msg_id_round_trips_and_legacy_defaults_empty() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
-            .await
-            .unwrap();
-        let store = SqliteSessionStore::new(pool.clone());
         let session = make_root_session("platform-msg-id");
         store.save(&session).await.unwrap();
 
@@ -2551,41 +2500,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded[0].platform_msg_id(), "device-msg-1");
-
-        exec(&pool, "DROP VIEW session_messages_read", Vec::new()).await;
-        exec(
-            &pool,
-            "ALTER TABLE session_messages DROP COLUMN platform_msg_id",
-            Vec::new(),
-        )
-        .await;
-        exec(
-            &pool,
-            "INSERT INTO session_messages \
-             (session_id, ordinal, role, content, created_at, source) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            vec![
-                text_value("platform-msg-id"),
-                rusqlite::types::Value::Integer(1),
-                text_value("user"),
-                rusqlite::types::Value::Text(
-                    serde_json::to_string(&vec![baybo_model::ContentBlock::Text("legacy".into())])
-                        .unwrap(),
-                ),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                text_value("user"),
-            ],
-        )
-        .await;
-        init_db(&pool).await;
-
-        let store = SqliteSessionStore::new(pool);
-        let loaded = store
-            .load_active_session_messages(&session.id)
-            .await
-            .unwrap();
-        assert_eq!(loaded[0].platform_msg_id(), "");
-        assert_eq!(loaded[1].platform_msg_id(), "");
     }
 
     #[tokio::test]
@@ -2646,51 +2560,6 @@ mod tests {
         assert_eq!(rows.len(), 2, "one source row plus one compacted row");
         assert_eq!(rows[0].message.content, original.content);
     }
-
-    #[tokio::test]
-    async fn legacy_session_messages_table_gains_source_event_id() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
-            .await
-            .unwrap();
-        exec(
-            &pool,
-            "DROP INDEX idx_session_messages_source_event",
-            Vec::new(),
-        )
-        .await;
-        exec(&pool, "DROP VIEW session_messages_read", Vec::new()).await;
-        exec(
-            &pool,
-            "ALTER TABLE session_messages DROP COLUMN source_event_id",
-            Vec::new(),
-        )
-        .await;
-
-        init_db(&pool).await;
-        let store = SqliteSessionStore::new(pool);
-        let session = make_root_session("source-event-migrated");
-        store.save(&session).await.unwrap();
-        let message =
-            baybo_model::ChatMessage::cron_notification(vec![baybo_model::ContentBlock::Text(
-                "migrated".into(),
-            )]);
-        assert_eq!(
-            store
-                .append_session_message_idempotent(&session.id, "cron:legacy", &message)
-                .await
-                .unwrap(),
-            SessionMessageAppendOutcome::Inserted { ordinal: 0 }
-        );
-        assert_eq!(
-            store
-                .append_session_message_idempotent(&session.id, "cron:legacy", &message)
-                .await
-                .unwrap(),
-            SessionMessageAppendOutcome::Existing { ordinal: 0 }
-        );
-    }
-
     #[tokio::test]
     async fn save_does_not_clobber_pinned_set_by_set_pinned() {
         // Same race the `hidden` / `last_llm` guards defend against: a
@@ -2844,53 +2713,6 @@ mod tests {
             "list_all must project archived too"
         );
     }
-
-    #[tokio::test]
-    async fn legacy_sessions_table_without_archived_is_migrated() {
-        // The "DB created before `archived` existed" case the migration
-        // list (sqlite/mod.rs) handles — same shape as the `pinned`
-        // migration test above.
-        let tmpdir = tempfile::tempdir().unwrap();
-        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
-            .await
-            .unwrap();
-        exec(
-            &pool,
-            "ALTER TABLE sessions DROP COLUMN archived",
-            Vec::new(),
-        )
-        .await;
-        let data = serde_json::to_string(&make_root_session("legacy-arch")).unwrap();
-        exec(
-            &pool,
-            "INSERT INTO sessions \
-             (id, root_session_id, trigger_kind, created_at, last_active, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            vec![
-                text_value("legacy-arch"),
-                text_value("legacy-arch"),
-                text_value("user"),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Text(data),
-            ],
-        )
-        .await;
-        // Re-running init_db applies the idempotent ALTER (re-adds archived).
-        init_db(&pool).await;
-
-        let store = SqliteSessionStore::new(pool);
-        let id = SessionId::from("legacy-arch");
-        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
-        assert!(
-            !loaded.archived,
-            "migrated legacy row defaults to unarchived"
-        );
-        // And the column is now writable like any other.
-        assert!(store.set_archived(&id, true).await.unwrap());
-        assert!(store.get(&id).await.unwrap().unwrap().archived);
-    }
-
     #[tokio::test]
     async fn set_folder_round_trips_and_clears() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -2970,62 +2792,6 @@ mod tests {
             "folder_id must reflect the column in list projections (guards the index renumber)"
         );
     }
-
-    #[tokio::test]
-    async fn legacy_sessions_table_without_folder_id_is_migrated() {
-        // The "DB created before `folder_id` existed" case. Drop the column
-        // the fresh `init_db` created, write a row the old way, then re-run
-        // `init_db` (the boot path) — the idempotent ALTER re-adds it and
-        // the old row defaults to uncategorized.
-        let tmpdir = tempfile::tempdir().unwrap();
-        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
-            .await
-            .unwrap();
-        // SQLite refuses to drop an indexed column, so drop the index first
-        // — this also recreates the genuine pre-folder_id schema (no column,
-        // no index), the exact state `init_db`'s migration must recover from.
-        exec(
-            &pool,
-            "DROP INDEX IF EXISTS idx_sessions_folder",
-            Vec::new(),
-        )
-        .await;
-        exec(
-            &pool,
-            "ALTER TABLE sessions DROP COLUMN folder_id",
-            Vec::new(),
-        )
-        .await;
-        let data = serde_json::to_string(&make_root_session("legacy-fld")).unwrap();
-        exec(
-            &pool,
-            "INSERT INTO sessions \
-             (id, root_session_id, trigger_kind, created_at, last_active, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            vec![
-                text_value("legacy-fld"),
-                text_value("legacy-fld"),
-                text_value("user"),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Text(data),
-            ],
-        )
-        .await;
-        init_db(&pool).await;
-
-        let store = SqliteSessionStore::new(pool);
-        let id = SessionId::from("legacy-fld");
-        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
-        assert_eq!(
-            loaded.folder_id, None,
-            "migrated legacy row defaults to uncategorized"
-        );
-        let fid = baybo_model::FolderId::from("now-filed");
-        assert!(store.set_folder(&id, Some(&fid)).await.unwrap());
-        assert_eq!(store.get(&id).await.unwrap().unwrap().folder_id, Some(fid));
-    }
-
     #[tokio::test]
     async fn set_title_round_trips_and_clears() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -3147,45 +2913,6 @@ mod tests {
             listed[0].title.as_deref(),
             Some("Listed title"),
             "title must reflect the column in list projections (guards the index renumber)"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_sessions_table_without_title_is_migrated() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
-            .await
-            .unwrap();
-        exec(&pool, "ALTER TABLE sessions DROP COLUMN title", Vec::new()).await;
-        let data = serde_json::to_string(&make_root_session("legacy-title")).unwrap();
-        exec(
-            &pool,
-            "INSERT INTO sessions \
-             (id, root_session_id, trigger_kind, created_at, last_active, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            vec![
-                text_value("legacy-title"),
-                text_value("legacy-title"),
-                text_value("user"),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
-                rusqlite::types::Value::Text(data),
-            ],
-        )
-        .await;
-        init_db(&pool).await;
-
-        let store = SqliteSessionStore::new(pool);
-        let id = SessionId::from("legacy-title");
-        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
-        assert_eq!(
-            loaded.title, None,
-            "migrated legacy row defaults to no title"
-        );
-        assert!(store.set_title(&id, Some("Now titled")).await.unwrap());
-        assert_eq!(
-            store.get(&id).await.unwrap().unwrap().title.as_deref(),
-            Some("Now titled")
         );
     }
 

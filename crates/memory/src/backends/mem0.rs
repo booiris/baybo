@@ -7,8 +7,6 @@
 //! **Automatic hooks** (the core's recall / write path):
 //! - **`recall`**: `POST /v2/memories/search/` with `{filters, rerank, top_k}`.
 //! - **`on_turn_complete`**: `POST /v1/memories/` with `{messages, user_id, agent_id}`.
-//! - **`on_session_end`**: no-op (Mem0 has no session concept; extraction is
-//!   immediate on `add`).
 //!
 //! **Tools** (the model's explicit-signal path) — the eight-tool surface ported
 //! from the Mem0 `openclaw` plugin, each `mem0_`-prefixed to namespace this
@@ -793,14 +791,6 @@ impl Memory for Mem0Memory {
                 Ok(())
             }
         }
-    }
-
-    async fn on_session_end(
-        &self,
-        _ctx: &MemoryContext,
-        _transcript: &[baybo_model::ChatMessage],
-    ) -> Result<()> {
-        Ok(())
     }
 
     fn tools(&self) -> Vec<(Arc<dyn Tool>, ToolManifest)> {

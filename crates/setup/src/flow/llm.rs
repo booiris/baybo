@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use baybo_config::{BayboConfig, LlmEntry};
 use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
+use baybo_llm::effort::ReasoningEffort;
 use baybo_llm::providers::openai_subscription::{
     DeviceCode, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS, VaultTokenStore,
     device_code_login, pkce_login,
@@ -154,16 +155,6 @@ async fn add_entry<P: Prompter>(
         live[model_idx].id.clone()
     };
 
-    // Reasoning effort: only meaningful for openai-subscription.
-    let reasoning_effort = if provider == SUB_PROVIDER_NAME {
-        let levels = baybo_llm::providers::openai_subscription::allowed_efforts_for(&model);
-        let labels: Vec<&str> = levels.to_vec();
-        let idx = prompter.select("Reasoning effort:", &labels)?;
-        Some(levels[idx].to_string())
-    } else {
-        None
-    };
-
     let entry = LlmEntry {
         name: name.clone().into(),
         provider: provider.clone(),
@@ -184,7 +175,7 @@ async fn add_entry<P: Prompter>(
         lite_model: Some(model.clone()),
         api_key_env,
         base_url,
-        reasoning_effort,
+        reasoning_effort: Some(ReasoningEffort::Medium.to_string()),
     };
 
     config.llm.push(entry.clone());
@@ -312,7 +303,7 @@ mod tests {
     use baybo_security::test_support::MemorySecretStore;
     use baybo_security::{EncryptionKey, SecretVault};
 
-    use super::{LlmStepOutcome, configure_llm_step};
+    use super::{LlmStepOutcome, ReasoningEffort, configure_llm_step};
     use crate::flow::pick_add_or_skip;
     use crate::test_support::MockPrompter;
 
@@ -339,7 +330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_api_key_adds_keyless_entry_without_vault_write() {
+    async fn blank_api_key_adds_keyless_entry_with_medium_thinking_without_vault_write() {
         let registry = LlmProviderRegistry::with_default_providers();
         let providers = registry.provider_names();
         let llamafile = providers
@@ -367,6 +358,11 @@ mod tests {
         };
         assert_eq!(entry.name.as_str(), "local");
         assert_eq!(entry.provider, "llamafile");
+        assert_eq!(
+            entry.reasoning_effort.as_deref(),
+            Some(ReasoningEffort::Medium.as_str())
+        );
         assert!(store.is_empty());
+        assert!(prompter.selects.is_empty());
     }
 }

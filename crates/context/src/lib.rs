@@ -13,6 +13,7 @@ pub use calibration::TokenCalibration;
 pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
+pub use prompts::deferred_tools::DeferredServerNotice;
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 // ---------------------------------------------------------------------------
@@ -433,6 +434,11 @@ pub struct ContextManager {
     /// `None` means "unknown, go and look", on the same two occasions
     /// [`Self::system_prompt_version`] is cleared.
     skills_version: Option<String>,
+    /// The rendered deferred-MCP-servers notice, or `None` when this session
+    /// gets no row. Rendered once at construction from CONFIG-derived,
+    /// pre-filtered rows and reused verbatim by [`Self::ensure_seeded`] and
+    /// the post-compaction trailer — byte-stable for the session's life.
+    deferred_tool_notice: Option<String>,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -480,6 +486,15 @@ pub struct ContextManagerConfig {
     /// `memory.builtin.enabled`: whether this session's system prompt carries
     /// the `<memory>` index and the rules for maintaining it.
     pub builtin_memory: bool,
+    /// Deferred-MCP-server notice rows for this session. CONFIG-derived and
+    /// pre-filtered by the caller: every entry already passed the session's
+    /// trigger-scope door, and the Vec is empty when the session must not
+    /// see the notice (a subagent scoped by a `tool_allowlist`, or nothing
+    /// deferred). The manager stores neither the trigger nor the allowlist,
+    /// so both filters live at the construction site. Rendered ONCE here and
+    /// reused verbatim by the seed and the post-compaction trailer —
+    /// byte-stable for the session's whole life.
+    pub deferred_tool_servers: Vec<crate::prompts::deferred_tools::DeferredServerNotice>,
 }
 
 fn explicit_message_ordinals(
@@ -537,6 +552,11 @@ impl ContextManager {
             notification_cue: None,
             system_prompt_version: None,
             skills_version: None,
+            deferred_tool_notice: (!config.deferred_tool_servers.is_empty()).then(|| {
+                crate::prompts::deferred_tools::render_deferred_tool_reminder(
+                    &config.deferred_tool_servers,
+                )
+            }),
         }
     }
 
@@ -1215,6 +1235,14 @@ impl ContextManager {
             )]))
             .await?;
         }
+        // The deferred-MCP-servers notice, rendered once at construction.
+        // Absent rather than empty when there is nothing deferred.
+        if let Some(notice) = self.deferred_tool_notice.clone() {
+            self.append(&ChatMessage::deferred_tool_listing(vec![
+                ContentBlock::Text(notice),
+            ]))
+            .await?;
+        }
         // Stamp only after every row derived from these summaries is durable.
         // A retry must not mistake a failed skill-listing write for a listing
         // the model has already seen.
@@ -1818,6 +1846,7 @@ impl ContextManager {
             self.tokenizer.as_ref(),
             &self.called_skills,
             &self.invocable_skill_summaries(),
+            self.deferred_tool_notice.as_deref(),
         );
 
         let before_tokens = self.budget.current();
@@ -2722,6 +2751,10 @@ pub(crate) fn insert_skill_trailer(
     // keyed on `called_skills` unfiltered: a skill actually invoked in
     // this session must keep its definition re-broadcast.
     advertised: &[SkillSummary],
+    // The session's rendered deferred-tools notice, re-broadcast verbatim
+    // for the same reason the skill listing is: the summary discarded the
+    // seeded row by construction (the compressor filters it by provenance).
+    deferred_notice: Option<&str>,
 ) -> usize {
     let mut insert_at = 0;
     while insert_at < messages.len() && messages[insert_at].role == Role::System {
@@ -2733,6 +2766,14 @@ pub(crate) fn insert_skill_trailer(
         messages.insert(
             insert_at,
             ChatMessage::skill_listing(vec![ContentBlock::Text(reminder)]),
+        );
+        insert_at += 1;
+        inserted += 1;
+    }
+    if let Some(notice) = deferred_notice {
+        messages.insert(
+            insert_at,
+            ChatMessage::deferred_tool_listing(vec![ContentBlock::Text(notice.to_string())]),
         );
         insert_at += 1;
         inserted += 1;
@@ -2761,12 +2802,18 @@ pub(crate) fn estimate_skill_trailer_tokens(
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
     advertised: &[SkillSummary],
+    deferred_notice: Option<&str>,
 ) -> usize {
     let mut total = 0;
     if !advertised.is_empty() {
         let reminder = render_skill_reminder(advertised);
         total += tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
             reminder,
+        )]));
+    }
+    if let Some(notice) = deferred_notice {
+        total += tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
+            notice.to_string(),
         )]));
     }
     if let Some(detail) = build_skill_detail_payload(registry, agent, tokenizer, called_skills) {
@@ -2977,6 +3024,7 @@ mod tests {
             sessions,
             subagent_profile: None,
             builtin_memory: false,
+            deferred_tool_servers: Vec::new(),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -3007,6 +3055,7 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             builtin_memory: false,
+            deferred_tool_servers: Vec::new(),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -3687,6 +3736,7 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             builtin_memory: false,
+            deferred_tool_servers: Vec::new(),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -3763,6 +3813,7 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
             builtin_memory: false,
+            deferred_tool_servers: Vec::new(),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -3818,6 +3869,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            deferred_tool_servers: Vec::new(),
         })
     }
 
@@ -3990,6 +4042,7 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             builtin_memory: false,
+            deferred_tool_servers: Vec::new(),
         })
         .resolve_system_prompt()
         .await;
@@ -4052,6 +4105,67 @@ mod tests {
         ctx.reconcile_system_prompt().await.unwrap();
 
         assert_eq!(ctx.messages().len(), before, "{:?}", ctx.messages());
+    }
+
+    /// The deferred-tools notice seeds once, rides its own provenance, and
+    /// stays byte-identical across re-seeds; a session configured with no
+    /// deferred servers gets no row at all.
+    #[tokio::test]
+    async fn deferred_tools_notice_seeds_once_by_provenance() {
+        use crate::prompts::deferred_tools::DeferredServerNotice;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_BODY");
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: Some(AgentProfileId::builtin()),
+            builtin_memory: false,
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            max_active_tokens: 0,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            shape: crate::prompts::soul::PromptShape::Chat,
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            subagent_profile: None,
+            deferred_tool_servers: vec![DeferredServerNotice {
+                name: "tencent-lighthouse".into(),
+                description: Some("Lighthouse VM management".into()),
+            }],
+        });
+        ctx.ensure_seeded().await.unwrap();
+
+        let notice: Vec<&ChatMessage> = ctx
+            .messages()
+            .iter()
+            .filter(|m| m.source() == baybo_model::MessageSource::DeferredToolListing)
+            .collect();
+        assert_eq!(notice.len(), 1, "exactly one notice row");
+        let text = match notice[0].content.first() {
+            Some(ContentBlock::Text(t)) => t.as_str(),
+            other => panic!("notice must be text, got {other:?}"),
+        };
+        assert!(text.contains("tencent-lighthouse: Lighthouse VM management"));
+        assert!(text.contains("ToolSearch"));
+
+        // Re-seeding is a no-op: the leading System row short-circuits.
+        let before = ctx.messages().len();
+        ctx.ensure_seeded().await.unwrap();
+        assert_eq!(ctx.messages().len(), before);
+
+        // No deferred servers configured ⇒ no row.
+        let mut bare = bound_ctx(&workspace, AgentProfileId::builtin());
+        bare.ensure_seeded().await.unwrap();
+        assert!(
+            !bare
+                .messages()
+                .iter()
+                .any(|m| m.source() == baybo_model::MessageSource::DeferredToolListing),
+            "empty config must not seed an empty notice"
+        );
     }
 
     /// An edit that moves the mtime without changing what the prompt carries
@@ -4590,6 +4704,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            deferred_tool_servers: Vec::new(),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -4672,6 +4787,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: Arc::clone(&sessions),
             subagent_profile: None,
+            deferred_tool_servers: Vec::new(),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -5573,6 +5689,7 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             builtin_memory: false,
+            deferred_tool_servers: Vec::new(),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -6104,6 +6221,7 @@ mod tests {
             &SimpleTokenizer,
             &called,
             &advertised,
+            None,
         );
         let joined: String = scoped
             .iter()
@@ -6126,6 +6244,7 @@ mod tests {
             &SimpleTokenizer,
             &called,
             &advertised,
+            None,
         );
         let foreign_joined: String = foreign
             .iter()
@@ -6162,6 +6281,7 @@ mod tests {
             &SimpleTokenizer,
             &["hidden".to_string()],
             &advertised,
+            None,
         );
         let texts: Vec<&str> = messages
             .iter()
@@ -6178,7 +6298,24 @@ mod tests {
         assert!(texts[2].contains("H_BODY"), "called skill keeps its detail");
 
         let mut bare = vec![make_msg(Role::System, "sys")];
-        insert_skill_trailer(&mut bare, &registry, None, &SimpleTokenizer, &[], &[]);
+        insert_skill_trailer(&mut bare, &registry, None, &SimpleTokenizer, &[], &[], None);
+        // A session with a notice gets it re-broadcast right after the
+        // system block, under its own provenance.
+        let mut with_notice = vec![make_msg(Role::System, "sys")];
+        insert_skill_trailer(
+            &mut with_notice,
+            &registry,
+            None,
+            &SimpleTokenizer,
+            &[],
+            &[],
+            Some("<system-reminder>notice</system-reminder>"),
+        );
+        assert_eq!(
+            with_notice[1].source(),
+            baybo_model::MessageSource::DeferredToolListing,
+            "notice re-inserted after the system rows"
+        );
         assert_eq!(bare.len(), 1, "empty advertised set inserts no reminder");
     }
 

@@ -244,6 +244,16 @@ pub fn browser_mcp_profile(params: BrowserProfileParams<'_>) -> Option<EmbeddedM
         // pre-execute approval gate never fires for browser tool calls.
         capabilities: Vec::new(),
         extra_env,
+        // Deferred by default: the 24 browser schemas (~19 KB) ship only
+        // through ToolSearch; Chrome itself was already launched lazily on
+        // first tools/call, so this closes the gap where every request paid
+        // for a browser that never started.
+        defer: true,
+        description: Some(
+            "Drive the embedded Chrome browser: navigate, click, type, \
+             screenshot, read pages"
+                .into(),
+        ),
     })
 }
 

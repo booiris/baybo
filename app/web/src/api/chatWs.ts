@@ -338,6 +338,15 @@ export class ChatWs {
    *  NOT the subscription's job — the caller runs the REST sync loop
    *  (`GET …/sync?since_ordinal`) on each reconnect edge. */
   private subscriptions = new Set<string>();
+  /** Subscriptions already queued on the CURRENT registered socket. Kept
+   *  separate from `subscriptions`, which is the desired set replayed after
+   *  every reconnect. A send may target an outbox session before the page has
+   *  opened its view, so the send boundary must be able to queue Subscribe
+   *  ahead of Message on that same socket. */
+  private sentSubscriptions = new Set<string>();
+  /** True only after RegisterAck for the current socket. Subscribe frames are
+   *  held until then so nothing can overtake the handshake. */
+  private registered = false;
   private retryAttempt = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
@@ -358,9 +367,8 @@ export class ChatWs {
   /** Subscribe this connection to one more session. Sends the frame
    *  on the next available WS open; persisted across reconnects. */
   subscribe(sessionId: string): void {
-    if (this.subscriptions.has(sessionId)) return;
     this.subscriptions.add(sessionId);
-    this.sendFrame({ kind: 'subscribe', session_id: sessionId });
+    this.sendSubscribeIfReady(sessionId);
   }
 
   /** Sessions currently subscribed — the set the caller must sync on a
@@ -372,6 +380,7 @@ export class ChatWs {
   /** Drop one subscription. */
   unsubscribe(sessionId: string): void {
     if (!this.subscriptions.delete(sessionId)) return;
+    if (!this.sentSubscriptions.delete(sessionId)) return;
     this.sendFrame({ kind: 'unsubscribe', session_id: sessionId });
   }
 
@@ -390,9 +399,9 @@ export class ChatWs {
     channelType?: string;
     attachments?: WireAttachment[];
     clientMsgId?: string;
-  }): void {
+  }): boolean {
     const msgId = input.clientMsgId ?? uuid();
-    this.sendFrame({
+    return this.sendSubscribedFrame(input.sessionId, {
       kind: 'message',
       content: input.content,
       session_id: input.sessionId,
@@ -417,9 +426,9 @@ export class ChatWs {
     sessionId: string,
     messages: { content: string; clientMsgId: string; attachments?: WireAttachment[] }[],
     channelType = 'owner',
-  ): void {
-    if (messages.length === 0) return;
-    this.sendFrame({
+  ): boolean {
+    if (messages.length === 0) return false;
+    return this.sendSubscribedFrame(sessionId, {
       kind: 'messages',
       messages: messages.map((m) => ({
         content: m.content,
@@ -452,6 +461,8 @@ export class ChatWs {
 
   private detachAndCloseWs(): void {
     this.stopHeartbeat();
+    this.registered = false;
+    this.sentSubscriptions.clear();
     const old = this.ws;
     if (!old) return;
     // Strip handlers before close() so the deferred onclose for THIS
@@ -508,6 +519,8 @@ export class ChatWs {
 
   private connect(): void {
     if (this.closed) return;
+    this.registered = false;
+    this.sentSubscriptions.clear();
     this.notifyStatus({ state: 'connecting' });
     const url = buildWsUrl(this.opts.baseUrl, this.adminToken);
     let ws: WebSocket;
@@ -560,14 +573,18 @@ export class ChatWs {
           return;
         }
         this.retryAttempt = 0;
-        this.notifyStatus({ state: 'connected' });
         // Replay every subscription so the live stream resumes; each
         // Subscribe is answered with a `subscribe_state` snapshot. The
         // caller recovers missed transcript rows via the REST sync
         // loop on the connected edge — the server replays nothing.
+        this.registered = true;
         for (const sid of this.subscriptions) {
-          this.sendFrame({ kind: 'subscribe', session_id: sid });
+          this.sendSubscribeIfReady(sid);
         }
+        // `connected` means every desired subscription is already queued on
+        // this socket. A connected-edge outbox recovery can therefore append
+        // Message frames without racing the replay above.
+        this.notifyStatus({ state: 'connected' });
         this.startHeartbeat();
         return;
       }
@@ -592,6 +609,8 @@ export class ChatWs {
 
   private onClose(e: CloseEvent): void {
     this.stopHeartbeat();
+    this.registered = false;
+    this.sentSubscriptions.clear();
     this.ws = null;
     if (this.closed) return;
     const reason = `ws close (${e.code}${e.reason ? `: ${e.reason}` : ''})`;
@@ -613,11 +632,28 @@ export class ChatWs {
     }, delay);
   }
 
-  private sendFrame(frame: Frame): void {
+  private sendSubscribeIfReady(sessionId: string): void {
+    if (!this.registered || this.sentSubscriptions.has(sessionId)) return;
+    if (this.sendFrame({ kind: 'subscribe', session_id: sessionId })) {
+      this.sentSubscriptions.add(sessionId);
+    }
+  }
+
+  /** Queue a session-scoped outbound frame only after its Subscribe is on the
+   *  same socket. WebSocket preserves message order, so the gateway installs
+   *  the subscription before it evaluates the following Message. */
+  private sendSubscribedFrame(sessionId: string, frame: Frame): boolean {
+    this.subscribe(sessionId);
+    if (!this.registered || !this.sentSubscriptions.has(sessionId)) return false;
+    return this.sendFrame(frame);
+  }
+
+  private sendFrame(frame: Frame): boolean {
     const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     const bytes = encode(frame);
     ws.send(bytes);
+    return true;
   }
 
   private notifyStatus(status: ConnectionStatus): void {

@@ -696,6 +696,28 @@ impl ApprovalHandle {
         accesses: Vec<ResourceAccess>,
         params_preview: String,
     ) -> ApprovalOutcome {
+        self.request_uncached_with_description(
+            tool,
+            session_id,
+            user,
+            accesses,
+            params_preview,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::request_uncached`], with user-facing context displayed
+    /// prominently by approval clients that support descriptions.
+    pub(crate) async fn request_uncached_with_description(
+        &self,
+        tool: &str,
+        session_id: &SessionId,
+        user: &User,
+        accesses: Vec<ResourceAccess>,
+        params_preview: String,
+        description: Option<String>,
+    ) -> ApprovalOutcome {
         let req = ApprovalRequest {
             call_id: Uuid::new_v4().to_string(),
             tool_call_id: self.tool_call_id.clone(),
@@ -704,7 +726,7 @@ impl ApprovalHandle {
             tool: tool.to_string(),
             accesses,
             params_preview,
-            description: None,
+            description,
         };
         let outcome = self.gate.request(req).await;
         *self.last_decision.lock() = Some(outcome.decision);
@@ -1089,7 +1111,9 @@ pub fn resource_path(p: impl Into<PathBuf>) -> PathBuf {
     p.into()
 }
 
-pub use registry::{McpToolGrantResolveError, McpToolGrantResolver, ToolRegistry};
+pub use registry::{
+    DeferredLookup, DeferredToolIndex, McpToolGrantResolveError, McpToolGrantResolver, ToolRegistry,
+};
 
 #[cfg(test)]
 mod multi_modal_text_tests {

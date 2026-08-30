@@ -88,17 +88,20 @@ Runtime strategy:
 
 ## Trace viewer polling
 
-The per-session trace page (`app/web/src/pages/TraceSessionPage.tsx`) refreshes on a **two-tier, visibility-gated cadence** that stops entirely once nothing is live. There is **one** interval, not two: a tick bumps `refreshKey`, which refetches the overview and cascades into the step trees of every live turn. Its period is `POLL_ACTIVE_MS` (2s) when work is actually in flight — the selected turn is non-terminal, its tree holds a pending span, or **any nested subagent has a running turn** — and `POLL_TERMINAL_MS` (10s) when the only live thing is some other turn in the session. Both are skipped while the tab is hidden (`document.visibilityState !== 'visible'`), and when nothing is live no interval runs at all.
+The per-session trace page (`app/web/src/pages/TraceSessionPage.tsx`) refreshes on a **two-tier, visibility-gated cadence** that stops entirely once nothing is live. There is **one** interval, not two: a tick bumps `refreshKey`, which refetches the overview and cascades into the step trees of every live turn. Its period is `POLL_ACTIVE_MS` (2s) when the selected turn is non-terminal or its tree holds a pending span, and `POLL_TERMINAL_MS` (10s) when the only live thing is another turn in the session or a subagent represented by a jump row. Both are skipped while the tab is hidden (`document.visibilityState !== 'visible'`), and when nothing is live no interval runs at all.
 
-The live-subagent clause matters for external agents: the parent's `spawn_subagent` span sits pending for the whole child run, and once the parent turn goes terminal nothing else would hold the page on the fast tier — so a streaming child would fall to 10s, or stop refreshing entirely. `liveSessions` (`components/trace/traceForest.ts`) counts only `pending`/`in_progress`, deliberately **not** `stuck`: a stuck subagent is not producing anything new and must not pin the fast tier forever.
+The live-subagent clause keeps the page on the **slow** tier after the parent turn settles, so a subagent jump row can eventually move from running to completed. It does not select the fast tier: child trace data is never rendered or fetched on the parent page. `liveSessions` (`components/trace/traceForest.ts`) counts only `pending`/`in_progress`, deliberately **not** `stuck`: a stuck subagent is not producing anything new and must not keep polling forever.
 
 ### Row order, and jumping to an id
 
-Step and span rows carry their position in **storage order** — `#3` on a step,
-`#3.2` on its second span — read off the arrays the API returns, which the
-backend orders by `started_at` (`ORDER BY started_at` on both the step and the
-span query). It is the index in the returned array, not a running count of
-rendered rows, so an active filter never renumbers what survives it.
+Every row carries its full position in **storage order**: `#3` is the third
+turn, `3.2` its second step, and `3.2.4` that step's fourth span. The positions
+come from the arrays the API returns, which the backend orders by `started_at`
+(`ORDER BY started_at` on both the step and the span query). They are indexes
+in the returned arrays, not running counts of rendered rows, so an active
+filter never renumbers what survives it. Maintenance turns such as compaction
+participate in the same turn sequence; otherwise their child paths would carry
+a prefix that disagreed with the parent row.
 
 The tree's filter box doubles as a **jump box**, two ways:
 
@@ -107,11 +110,11 @@ The tree's filter box doubles as a **jump box**, two ways:
   and clears the filter. The filter is the entry point on purpose: it already
   eager-loads every turn's tree, which is what lets an id resolve anywhere in
   the session rather than only in the turn that happens to be open.
-- **By marker** — `#3` or `#3.2`, the position the tree prints on its own rows,
-  resolved within the turn on screen (which is what those numbers are scoped
-  to). The `#` is required so a bare `3` stays a text search: someone typing a
-  number is looking for content, not navigating. `#0` is refused rather than
-  silently resolving to the last row via a negative index.
+- **By marker** — `#3`, `3.2`, or `3.2.4`, the full path the tree prints on the
+  turn, step, or span row. A leading `#` is also accepted on child paths for
+  paste compatibility. A bare integer remains a text search; only a turn is
+  written with `#`. Zero is refused at every level rather than silently
+  resolving to the last row via a negative index.
 
 `resolveJumpTarget` / `resolveOrdinalTarget`
 (`components/trace/traceTreeModel.ts`) do the lookups; anything neither matches
@@ -204,16 +207,14 @@ dash and its real number sits under the column that measures it.
 
 `GET /v1/traces/{session_id}/lineage` returns every subagent session descended from this one, flattened, each row carrying its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), its backend (`external_agent`, absent for in-process children), and its turn summaries. It refreshes on the same tick as the overview, so a subagent spawned mid-turn appears without a manual reload.
 
-The client indexes it with `buildForest` and nests each child **in place** under the span that spawned it: expanding a child fetches its own overview (transcript + turns) and, for a baybo-backed child, its per-turn step trees — an external child has no step tree to fetch, so those round trips are skipped entirely. Navigating to the child's own page is still there as a secondary action. A collapsed subagent row carries a roll-up failure badge computed across the whole subtree from turn statuses, which the lineage response supplies up front — that is what lets "something failed in there" show before anything is expanded.
+The client indexes it with `buildForest` and places one **jump row** under the `spawn_subagent` span that started the child. Clicking it navigates to `/traces/{child_session_id}`. The parent never fetches the child's overview or per-turn trees and never renders child transcript, steps, or spans inline. The jump row still carries running and roll-up failure state from the turn summaries already present in the lineage response, so "something failed in there" remains visible without loading the child trace.
 
-Both walks are bounded and de-duplicated: `QueryApi::load_lineage_overview` keeps a visited set (a depth cap alone would still walk a cycle repeatedly) and caps at `MAX_LINEAGE_DEPTH` / `MAX_LINEAGE_SESSIONS`, warning when it truncates; the render path carries its own `MAX_RENDER_DEPTH` backstop so malformed lineage degrades to a truncation notice instead of a blown stack.
+The lineage walk is bounded and de-duplicated: `QueryApi::load_lineage_overview` keeps a visited set (a depth cap alone would still walk a cycle repeatedly) and caps at `MAX_LINEAGE_DEPTH` / `MAX_LINEAGE_SESSIONS`, warning when it truncates. The parent render is non-recursive: only attach points belonging to spans in the current session can appear.
 
 `/lineage` is the expensive call in the family — the server spends roughly four store round trips per descendant — so it is throttled to the **slow** tier even while the overview polls fast. The set of subagents changes when one is spawned, not when a token arrives.
 
-**Known gap:** the trace-overview strip (`TraceOverviewBar`) and the turn column (`TurnAnchors`) still summarise only the *viewed* session's turns. A subagent's steps, spans, failures, and tool calls are drawn in the tree but do not appear in the strip's counts or its clickable minimap, so on a trace with subagents the strip under-reports. This predates inline nesting (subagents were not drawn at all before) and is not a regression, but it is now visibly inconsistent with the tree below it.
-
 The overview poll is **incremental**. `GET /v1/traces/{session_id}?since_ordinal=N` returns only `session_messages` rows with `ordinal > N` (each still carrying its `superseded_by` marker), always the full (tiny) `turns` array, and a top-level `supersede_watermark` — the session's highest `superseded_by`, which advances only when a compaction re-marks rows. Each poll passes `since_ordinal` = the highest ordinal already held, then **appends** the strictly-newer delta rows (no dedup) and replaces `turns`; a freshly-opened session or cold start omits the param and takes the full page. When the response's `supersede_watermark` differs from the cached one, a compaction re-marked rows the client may hold, so the cached prefix is stale — it is dropped and reloaded in full once (no param). The append allocates new `session_messages` **and** overview object references so every messageLog-derived memo (persisted-span-input hydration, the interjection-span index) recomputes.
 
-Deep links carry the selection in the query string: `?turn`, `?step`, `?span`, `?msg` (a transcript row, as `ordinal:blockIndex`), `?child` (a subagent boundary), and `?tab`. The `turn` param is validated against the turns the page knows about — the session's own **and** every nested subagent's, since turn ids are globally unique — and falls back to the oldest turn of the session being viewed when it names nothing. Selecting any one kind clears the others, so the URL never disagrees with the highlighted row.
+Deep links carry the selection in the query string: `?turn`, `?step`, `?span`, `?msg` (a transcript row, as `ordinal:blockIndex`), and `?tab`. The `turn` param is validated against the viewed session's turns and falls back to its oldest turn when it names nothing. A subagent jump changes the route to the child's own trace page instead of creating a selection inside the parent. Selecting any one kind clears the others, so the URL never disagrees with the highlighted row.
 
 This watermark protocol is deliberately **not** the chat sync protocol ([`docs/sync-protocol.md`](sync-protocol.md)): the trace viewer is a read-only admin poller over the *full* transcript (superseded rows included) with no outbox, no WS subscription, and no per-device cursor durability — sync-v2's rebase/gap machinery would be overkill, and the one staleness event that matters here (compaction re-marking held rows) is exactly what the watermark encodes. A new *chat-facing* surface should reach for sync-v2, not copy this.

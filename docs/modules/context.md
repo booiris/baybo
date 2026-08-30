@@ -80,8 +80,9 @@ ContextManager (struct)
 the LLM transcript. The pure builders are unit-testable on their own; both
 `ContextManager` (`resolve_system_prompt` via `ensure_seeded`,
 `cap_tool_output`, `reseed_system_row`, `reconcile_system_prompt`) and the agent-loop seam
-(`append_cron_fire`, `append_background_completion_reply_once`,
-`append_background_notification_prompt_once`) call into them. The
+(`append_cron_fire`, `append_background_notification_prompt_once`) call
+into them; the background acknowledgement is a control event, so it goes
+through `persist_control_event` rather than a transcript append. The
 injection *detection* for tool output stays in `baybo-security`, and the
 `<tool_output>` envelope itself is `baybo_model::wrap_tool_output` — it sits
 beside the `TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX` delimiters it keys off, and out of

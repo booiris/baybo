@@ -400,10 +400,8 @@ impl SessionManager {
     /// later marked `superseded_by` (i.e. rewritten by compaction), in
     /// original ordinal order. Use this when a caller needs the raw
     /// user/assistant turns instead of the compressed active view that
-    /// [`Self::history`] returns: today the only consumer is
-    /// `Memory::on_session_end`, whose contract is the full transcript
-    /// before any compression folded earlier turns into a summary. Errors
-    /// with `SessionError::NotFound` if the session row is missing.
+    /// [`Self::history`] returns. Errors with `SessionError::NotFound` if the
+    /// session row is missing.
     pub async fn full_transcript(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
         Ok(self
             .transcript_from(session_id, 0)
@@ -1648,12 +1646,8 @@ mod tests {
 
     #[tokio::test]
     async fn full_transcript_surfaces_superseded_rows_that_history_hides() {
-        // The whole reason `full_transcript` exists separately from
-        // `history`: `Memory::on_session_end` needs the raw user/assistant
-        // turns even after compaction has folded them into a summary.
-        // `history` filters by `superseded_by IS NULL` and would hide
-        // the original three turns; `full_transcript` returns every row
-        // ever appended.
+        // `history` filters by `superseded_by IS NULL` and hides original
+        // turns after compaction; `full_transcript` returns every appended row.
         use baybo_model::{ChatMessage, ContentBlock};
 
         let store = Arc::new(MemorySessionStore::new());

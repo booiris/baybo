@@ -1,7 +1,7 @@
 /**
  * Indexes the subagent sessions descended from the session being viewed, so
- * the tree can nest each child's trace under the `spawn_subagent` span that
- * started it instead of making the reader navigate away and lose the parent.
+ * the tree can place a jump to each child's own trace under the
+ * `spawn_subagent` span that started it.
  *
  * Pure — the shape of the forest and its cross-boundary failure roll-up are
  * decided here, not while rendering.
@@ -49,16 +49,15 @@ export function buildForest(sessions: LineageSession[]): TraceForest {
 
 /**
  * Whether a child session's subtree holds a failure — its own turns, plus
- * every session descended from it. This is what lets a collapsed
- * `spawn_subagent` row say "something failed in there" without the reader
- * opening it.
+ * every session descended from it. This is what lets the `spawn_subagent`
+ * jump say "something failed in there" before the reader opens the child.
  *
  * Turn *status* is the signal, not a loaded step tree: the lineage response
  * carries statuses for every descendant up front, while step trees are
- * fetched lazily, so a status-based roll-up is the only one that can cross
- * the boundary before anything is expanded. Where a turn's tree happens to be
- * loaded, a failing span counts too — a turn can report `completed` while a
- * span inside it failed and was recovered.
+ * not fetched on the parent page, so a status-based roll-up is the only one
+ * that can cross the boundary. Where a turn's tree happens to be loaded, a
+ * failing span counts too — a turn can report `completed` while a span inside
+ * it failed and was recovered.
  */
 export function sessionHasFailure(
   forest: TraceForest,
@@ -85,7 +84,7 @@ function turnsHaveFailure(turns: TraceTurnSummary[], turnTraces: Map<string, Tur
 }
 
 /** Whether any turn in a child's subtree is still running — drives the live
- *  spinner on a collapsed subagent row, and the page's fast poll tier. */
+ *  spinner on its jump row. */
 export function sessionIsLive(
   forest: TraceForest,
   sessionId: string,
@@ -101,9 +100,9 @@ export function sessionIsLive(
   return false;
 }
 
-/** Every descendant session that has at least one running turn. The page polls
- *  while this is non-empty, so a live subagent refreshes without the reader
- *  having to hit Refresh. */
+/** Every descendant session that has at least one running turn. The parent
+ *  page stays on its slow poll tier while this is non-empty so jump status can
+ *  settle without a manual refresh. */
 export function liveSessions(forest: TraceForest): string[] {
   return [...forest.byId.values()]
     .filter((child) => child.turns.some((t) => turnRunning(t.turn_status_kind)))
@@ -111,8 +110,8 @@ export function liveSessions(forest: TraceForest): string[] {
 }
 
 /** A turn that is still doing work. Narrower than `isTurnLive`, which also
- *  counts `stuck` — a stuck subagent is not streaming anything new, so it must
- *  not hold the page on the fast poll tier forever. */
+ *  counts `stuck` — a stuck subagent cannot change without outside action, so
+ *  it must not keep the parent page polling forever. */
 function turnRunning(status: TurnStatusKind): boolean {
   return status === 'pending' || status === 'in_progress';
 }

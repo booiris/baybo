@@ -129,6 +129,12 @@ pub struct ManagerGraph {
     pub cron_scheduler: Arc<CronScheduler>,
     pub security_gateway: Arc<SecurityGateway>,
     pub skill_registry: Arc<SkillRegistry>,
+    /// EMBEDDED deferred-MCP-server specs `(name, description,
+    /// trigger_scope)` for the per-session notice row — the half that is
+    /// fixed for the process lifetime. `wire_router` merges in a fresh
+    /// `.mcp.json` snapshot at each actor spawn and filters per session
+    /// by trigger scope.
+    pub deferred_mcp_servers: Arc<Vec<(String, Option<String>, baybo_tools::ToolTriggerScope)>>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
     /// Deferred supervisor handle for the background-turn manager (built
@@ -525,11 +531,14 @@ pub async fn build_managers(
     let subagent_spawner_slot: baybo_subagent::tool::SubagentSpawnerSlot =
         Arc::new(std::sync::OnceLock::new());
     let mcp_tool_grants = tool_registry.mcp_tool_grant_resolver();
-    for (tool, manifest) in
-        baybo_cron::tools::agent_tools(Arc::clone(&cron_scheduler), mcp_tool_grants)
-    {
-        tool_registry.register(tool, manifest);
-    }
+    // Cron* mutators register deferred, `report_nothing` eager — the
+    // split, the source label, and the rationale live with the batch in
+    // `baybo-cron`, not here.
+    baybo_cron::tools::install_agent_tools(
+        &mut tool_registry,
+        Arc::clone(&cron_scheduler),
+        mcp_tool_grants,
+    );
 
     // The dream pass is a cron job like any other, so it is seeded through
     // the same scheduler the model's own jobs go through. It belongs to the
@@ -617,9 +626,9 @@ pub async fn build_managers(
         deck_root: workspace_paths.deck_dir(),
         scratch_root: workspace_paths.state_dir().join("deck-scratch"),
     });
-    for (tool, manifest) in baybo_deck::tools::agent_tools(Arc::clone(&deck_manager)) {
-        tool_registry.register(tool, manifest);
-    }
+    // All four DeckCard* tools register deferred — policy owned by the
+    // batch in `baybo-deck`.
+    baybo_deck::tools::install_agent_tools(&mut tool_registry, Arc::clone(&deck_manager));
 
     // One hook, shared by everything that writes the board: the manager and
     // the dispatcher both announce, and a board watched through two hooks
@@ -695,6 +704,40 @@ pub async fn build_managers(
             tool_registry.register(tool, manifest);
         }
     }
+
+    // Discovery pair for lazily-advertised tools (`ToolSearch` +
+    // `ToolInvoke`). Unconditional: the deferred cron/deck builtins above
+    // mean every deployment has deferred tools now, so the old boot-stable
+    // "any MCP configured" gate would only ever be true anyway.
+    for (tool, manifest) in
+        baybo_tools::builtin::tool_search::tools(tool_registry.deferred_tool_index())
+    {
+        tool_registry.register(tool, manifest);
+    }
+
+    // Embedded deferred-server notice specs. Embedded profiles are fixed
+    // for the process lifetime, so this half is boot-derived; the
+    // user-configured half is re-read from `.mcp.json` at each actor spawn
+    // (`wire_router`), so a server added mid-run reaches the notice of every
+    // session spawned after it. Sessions already seeded keep their bytes —
+    // the notice is per-session immutable by design — and discover new
+    // servers through ToolSearch, whose index is a live registry view.
+    let deferred_mcp_servers: Arc<Vec<(String, Option<String>, baybo_tools::ToolTriggerScope)>> =
+        Arc::new(
+            embedded_mcp_servers
+                .iter()
+                .map(|e| &e.entry)
+                .filter(|entry| entry.defer)
+                .map(|entry| {
+                    (
+                        entry.name.clone(),
+                        entry.description.clone(),
+                        entry.trigger_scope,
+                    )
+                })
+                .chain(builtin_deferred_notice_specs())
+                .collect(),
+        );
 
     // Freeze the registry now that mutation is done; downstream
     // consumers (`tool_executor`, `McpReconciler`, the actor spawner)
@@ -851,6 +894,7 @@ pub async fn build_managers(
         security_gateway,
         bg_supervisor_slot,
         skill_registry,
+        deferred_mcp_servers,
         tool_registry,
         tool_executor,
         subagent_registry,
@@ -944,6 +988,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);
         let skill_registry = Arc::clone(&graph.skill_registry);
+        let deferred_mcp_servers = Arc::clone(&graph.deferred_mcp_servers);
         let tool_executor = Arc::clone(&graph.tool_executor);
         let trace_store = graph.stores.trace.clone();
         let task_store = graph.stores.task.clone();
@@ -1031,6 +1076,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         // with another's skills.
                         agent: Some(agent_id),
                         builtin_memory,
+                        deferred_tool_servers: deferred_notice_rows_for_session(
+                            &deferred_mcp_servers,
+                            workspace_paths_arc.root(),
+                            &session.trigger,
+                        ),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
@@ -1066,6 +1116,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         supervisor: Some(supervisor_for_spawn.clone()),
                         session_manager: Arc::clone(&sessions),
                         cron_store: Arc::clone(&cron_store_for_spawn),
+                        workspace: Arc::clone(&workspace_paths_arc),
                     },
                 );
                 let (sender, mailbox) =
@@ -1224,4 +1275,125 @@ pub fn force_exit_watchdog(
 
 pub(crate) fn manager_shutdown_deadline(budget: std::time::Duration) -> tokio::time::Instant {
     tokio::time::Instant::now() + budget.saturating_sub(SHUTDOWN_WATCHDOG_MARGIN)
+}
+
+/// The deferred-servers notice rows for one session, filtered by the one
+/// session-scoped door — the server's trigger scope vs the session's
+/// trigger (the same door as prompt assembly). The filter lives here
+/// because `ContextManager` deliberately does not store the trigger (only
+/// the lossy `PromptShape`). Allowlisted subagents get the notice too:
+/// the allowlist is a prompt budget, not a boundary — a child that acts
+/// on the notice and calls `ToolSearch` executes fine.
+///
+/// The user-configured half is a fresh `.mcp.json` snapshot per spawn,
+/// merged with the process-fixed embedded half — so a server added mid-run
+/// reaches sessions spawned after it. The rendered row is then immutable
+/// for the session's life; live sessions see new servers through
+/// ToolSearch instead.
+fn deferred_notice_rows_for_session(
+    embedded: &[(String, Option<String>, baybo_tools::ToolTriggerScope)],
+    workspace_root: &std::path::Path,
+    trigger: &baybo_model::TriggerSource,
+) -> Vec<baybo_context::DeferredServerNotice> {
+    embedded
+        .iter()
+        .cloned()
+        .chain(deferred_notice_specs_from_disk(workspace_root))
+        .filter(|(_, _, scope)| scope.allows_trigger(trigger))
+        .map(|(name, description, _)| baybo_context::DeferredServerNotice { name, description })
+        .collect()
+}
+
+/// Notice rows for the always-deferred builtin batches. Pure aggregation:
+/// each row — source label, description, scope — is owned by its batch's
+/// crate, so this list cannot drift from what those crates register.
+fn builtin_deferred_notice_specs()
+-> impl Iterator<Item = (String, Option<String>, baybo_tools::ToolTriggerScope)> {
+    [
+        baybo_cron::tools::deferred_notice_spec(),
+        baybo_deck::tools::deferred_notice_spec(),
+    ]
+    .into_iter()
+}
+
+/// The user-configured half of the deferred-servers notice, read fresh from
+/// `.mcp.json`. Missing file ⇒ empty; a read or parse error degrades to
+/// empty with a warning (the reconciler logs the same failure on its own
+/// tick). Sync IO on purpose: the file is a few KB, read once per actor
+/// spawn.
+fn deferred_notice_specs_from_disk(
+    workspace_root: &std::path::Path,
+) -> Vec<(String, Option<String>, baybo_tools::ToolTriggerScope)> {
+    let path = baybo_tools::mcp::McpFile::path_for(workspace_root);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "failed to read .mcp.json for the deferred-tools notice");
+            return Vec::new();
+        }
+    };
+    match baybo_tools::mcp::McpFile::parse(&contents) {
+        Ok(file) => file
+            .servers
+            .into_iter()
+            .filter(|entry| entry.defer)
+            .map(|entry| (entry.name, entry.description, entry.trigger_scope))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse .mcp.json for the deferred-tools notice");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_notice_tests {
+    use super::deferred_notice_rows_for_session;
+    use baybo_model::TriggerSource;
+    use baybo_tools::ToolTriggerScope;
+
+    fn embedded() -> Vec<(String, Option<String>, ToolTriggerScope)> {
+        vec![
+            (
+                "browser".into(),
+                Some("Drive the embedded Chrome".into()),
+                ToolTriggerScope::SharedWorkspace,
+            ),
+            ("cron-only".into(), None, ToolTriggerScope::CronConversation),
+        ]
+    }
+
+    #[test]
+    fn builtin_batches_ride_the_notice_with_their_tools_scopes() {
+        let rows: Vec<_> = super::builtin_deferred_notice_specs().collect();
+        let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["cron", "deck"]);
+        // Deck mirrors its tools' SharedWorkspace scope, so the same door
+        // that keeps DeckCard* out of a session keeps its row out too.
+        let deck = &rows[1];
+        assert_eq!(deck.2, ToolTriggerScope::SharedWorkspace);
+        let filtered = deferred_notice_rows_for_session(
+            &rows,
+            std::path::Path::new("/nonexistent"),
+            &TriggerSource::User,
+        );
+        assert_eq!(filtered.len(), 2, "a user chat is admitted by both scopes");
+    }
+
+    #[test]
+    fn trigger_scope_filters_per_session() {
+        // A user chat is admitted by SharedWorkspace but not CronConversation.
+        let rows = deferred_notice_rows_for_session(
+            &embedded(),
+            std::path::Path::new("/nonexistent"),
+            &TriggerSource::User,
+        );
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["browser"]);
+        assert_eq!(
+            rows[0].description.as_deref(),
+            Some("Drive the embedded Chrome")
+        );
+    }
 }

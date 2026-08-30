@@ -407,64 +407,6 @@ mod tests {
         assert_eq!(records[0].cost_usd, usd(0.05));
         assert_eq!(records[0].reasoning_effort.as_deref(), Some("high"));
     }
-
-    #[tokio::test]
-    async fn legacy_rows_survive_reasoning_effort_migration() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("legacy.db");
-        let record = test_record("u1", usd(0.05));
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"CREATE TABLE cost_records (
-                    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id                     TEXT    NOT NULL,
-                    session_id                  TEXT    NOT NULL,
-                    turn_id                     TEXT    NOT NULL,
-                    span_id                     TEXT    NOT NULL,
-                    reason                      TEXT,
-                    model                       TEXT    NOT NULL,
-                    input_tokens                INTEGER NOT NULL,
-                    output_tokens               INTEGER NOT NULL,
-                    cached_input_tokens         INTEGER NOT NULL DEFAULT 0,
-                    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-                    cost_usd                    INTEGER NOT NULL,
-                    timestamp                   INTEGER NOT NULL
-                );"#,
-            )
-            .unwrap();
-            conn.execute(
-                r#"INSERT INTO cost_records
-                 (user_id, session_id, turn_id, span_id, reason, model, input_tokens,
-                  output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                  cost_usd, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
-                rusqlite::params![
-                    record.user_id,
-                    record.session_id.as_str(),
-                    record.turn_id.to_string(),
-                    record.span_id.to_string(),
-                    record.reason.to_token().into_owned(),
-                    record.model,
-                    record.input_tokens as i64,
-                    record.output_tokens as i64,
-                    record.cached_input_tokens as i64,
-                    record.cache_creation_input_tokens as i64,
-                    record.cost_usd.into_micros(),
-                    time::to_us(record.timestamp),
-                ],
-            )
-            .unwrap();
-        }
-
-        let pool = SqlitePool::open(path).await.unwrap();
-        let store = SqliteCostStore::new(pool);
-        let records = store.query_user("u1", wide_range()).await.unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].cost_usd, usd(0.05));
-        assert_eq!(records[0].reasoning_effort, None);
-    }
-
     #[tokio::test]
     async fn query_global_summary() {
         let tmpdir = tempfile::tempdir().unwrap();

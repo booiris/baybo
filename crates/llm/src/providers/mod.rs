@@ -95,39 +95,21 @@ pub struct FactoryDefaults {
     pub supports_vision: bool,
 }
 
+const DEFAULT_CONTEXT_WINDOW: usize = 256_000;
+
 pub fn factory_defaults_for(provider: &str) -> FactoryDefaults {
-    match provider {
-        "openai" => FactoryDefaults {
-            context_window: 128_000,
-            supports_vision: true,
-        },
-        "anthropic" => FactoryDefaults {
-            context_window: 200_000,
-            supports_vision: true,
-        },
-        "gemini" => FactoryDefaults {
-            context_window: 1_000_000,
-            supports_vision: true,
-        },
-        "minimax" => FactoryDefaults {
-            context_window: 200_000,
-            supports_vision: false,
-        },
-        // DeepSeek V3/R1 family: 128k context, text-only.
-        "deepseek" => FactoryDefaults {
-            context_window: 128_000,
-            supports_vision: false,
-        },
+    let supports_vision = match provider {
+        "openai" | "anthropic" | "gemini" => true,
+        "minimax" | "deepseek" => false,
         // Codex Responses models advertise image input in the live
         // catalog, and the subscription converter emits `input_image`.
-        openai_subscription::PROVIDER_NAME => FactoryDefaults {
-            context_window: 272_000,
-            supports_vision: true,
-        },
-        _ => FactoryDefaults {
-            context_window: 128_000,
-            supports_vision: false,
-        },
+        openai_subscription::PROVIDER_NAME => true,
+        _ => false,
+    };
+
+    FactoryDefaults {
+        context_window: DEFAULT_CONTEXT_WINDOW,
+        supports_vision,
     }
 }
 
@@ -140,6 +122,25 @@ mod tests {
         assert!(factory_defaults_for("openai").supports_vision);
         assert!(factory_defaults_for(openai_subscription::PROVIDER_NAME).supports_vision);
         assert!(!factory_defaults_for("unknown-provider").supports_vision);
+    }
+
+    #[test]
+    fn every_provider_uses_the_shared_context_window_default() {
+        for provider in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "minimax",
+            "deepseek",
+            openai_subscription::PROVIDER_NAME,
+            "unknown-provider",
+        ] {
+            assert_eq!(
+                factory_defaults_for(provider).context_window,
+                DEFAULT_CONTEXT_WINDOW,
+                "provider {provider}"
+            );
+        }
     }
 }
 

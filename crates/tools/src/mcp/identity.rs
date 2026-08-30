@@ -139,7 +139,9 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![ToolCapability::Http, ToolCapability::ExecCommand],
             oauth: None,
+            description: None,
             trigger_scope: ToolTriggerScope::Any,
+            defer: true,
         }
     }
 

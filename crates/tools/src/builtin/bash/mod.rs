@@ -39,8 +39,11 @@
 //! `permission` controls approvals and isolation: `auto` risk-judges
 //! destructive commands and sandbox-failure escapes, `manual` declares every
 //! Bash command to the executor's approval gate and asks before sandbox escape,
-//! and `free` runs directly with no Bash approval. Environment variables and
-//! `cd` changes do NOT persist across invocations.
+//! and `free` runs directly with no Bash approval. A per-call
+//! `sandbox_permissions=require_escalated` override is reserved for an explicit
+//! user request and raises a fresh approval for the exact command before
+//! selecting the unsandboxed route. Environment variables and `cd` changes do
+//! NOT persist across invocations.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -60,7 +63,7 @@ use baybo_model::new_background_handle;
 
 use crate::{
     ApprovalDecision, BackgroundJobSink, DetachedCommand, ExecSandbox, NoticeLevel, ResourceAccess,
-    RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
+    RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput, refusal_reason,
 };
 
 mod judge;
@@ -96,7 +99,7 @@ fn command_head(command: &str) -> String {
         .collect()
 }
 
-/// Shared Bash tool description. Four sections vary by permission —
+/// Shared Bash tool description. Four sections vary by permission/profile —
 /// `{{isolation}}` (the FS/network surface), `{{approval}}` (the gate),
 /// `{{work_dir_scope}}` (writability + the `work/tmp` SCRATCH advertisement,
 /// which must not reach the bench profile: there is no janitor in a bench
@@ -108,72 +111,69 @@ fn command_head(command: &str) -> String {
 /// re-skins exactly what changed and nothing is said twice. Work-dir/platform
 /// live here, not the system prompt, so they sit next to the tool that
 /// consumes them.
-const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. The result you get back is capped at {{max_output_kib}} KiB, with a notice naming the file the full text spilled to.
+const DESCRIPTION_TEMPLATE: &str = r#"Run a command in a fresh `sh -c` process on {{platform}}. Environment and cwd changes do not persist. Output over {{max_output_kib}} KiB spills to a named file.
 
-Reserve Bash for system commands, git, build/test, and anything that genuinely needs a shell. A plain `cat`/`head` of one absolute path is answered by `Read` (you get Read's line numbers); every other leading `cat`/`head`/`tail`/`less`/`sed`/`awk` against a file is rejected — use `Read`/`Write`/`Edit`/`Glob`/`Grep`, or keep the command after a pipe so it reads stdin. Downloading a file to disk IS Bash's job (`curl`/`wget`) — WebFetch only returns rendered text and never writes to disk.
+Use Bash for system commands, git, builds/tests, and downloads. Use `Read`/`Edit` for direct file access.
 
 {{isolation}}
 
 {{approval}}
 
-DEFAULT CWD: If `cwd` is omitted, the command runs in this session's own working directory — the issue checkout when the session was given one, otherwise {{work_dir}} — and `PWD` is exported to match.
+DEFAULT CWD: The session checkout when present, otherwise {{work_dir}}.
 
-PATHS: Every directory or file argument, and `cwd` itself, MUST be absolute; relative values are rejected. Quote paths containing spaces.
+PATHS: Paths, including `cwd`, must be absolute. Quote paths containing spaces.
 
 {{work_dir_scope}}
 
-BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks against unknown directories without first checking their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a shallow `find -maxdepth 2`). Large trees can hang the process.
-
-{{python_runtime}}
-
-ENVIRONMENT:
-- Platform: {{platform}}"#;
+{{python_runtime}}"#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell has read+write access to the workspace and `$HOME`, with the FHS roots (`/usr`, `/bin`, `/etc`, …) readable; nothing outside that union exists. The usual credential directories under `$HOME` (ssh, aws, gnupg, gh, gcloud, docker, kube, and Baybo's own state dir) are masked and read as empty, and `/dev` is minimal. Network is enabled."#;
+const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The workspace and `$HOME` are read+write, system roots are read-only, and credential directories plus Baybo state are masked and read as empty. Other host paths are hidden. Network is enabled."#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write), `skills/` (read+execute, never write), and blob payload paths returned by `GetBlob` (read-only). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
+const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Within the workspace, Bash may name only {{work_dir}} (read+write), its own `skills/` (read+execute), and `GetBlob` payloads (read-only). Use file tools for other workspace paths.
 
-SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Anything meant to be kept belongs in your checkout when you have one, and elsewhere under {{work_dir}} otherwise."#;
+SCRATCH: Use {{work_tmp_dir}} for disposable files; it is swept after {{work_tmp_ttl_days}} days. Keep durable files in the session checkout or {{work_dir}}."#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
+const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`/`python3`/`pip` use `uv run python`/`uv pip` in this shell. Use PEP 723 for one-file third-party dependencies; nested shells and absolute interpreter paths bypass the shim."#;
 
 /// `{{isolation}}` for `permission = free`: only the OS sandbox is
 /// dropped (the work-dir jail and uv shim still apply — described by their own
 /// sections).
 #[cfg(not(feature = "bench-bash"))]
-const FREE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run directly via `sh -c` on the host: no bwrap, no credential-vault masking, no resource caps, and the host filesystem is reachable. Network is enabled."#;
+const FREE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF; commands can reach host files and credentials. Network is enabled."#;
 
 /// `{{approval}}` for `permission = manual`: human approval for every
 /// Bash command.
 #[cfg(not(feature = "bench-bash"))]
-const MANUAL_APPROVAL: &str = r#"APPROVAL: Every Bash command needs human approval before it runs, and approved commands run sandboxed where a runner exists. A sandboxed run that fails is asked about again before any unsandboxed retry. Commands Bash rejects outright are refused without ever reaching the prompt."#;
+const MANUAL_APPROVAL: &str = r#"APPROVAL: Every command requires approval. A failed sandboxed command needs separate approval before an unsandboxed retry."#;
 
 /// `{{approval}}` for `permission = auto`.
 #[cfg(not(feature = "bench-bash"))]
-const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run sandboxed without prompting. A destructive one (file deletion, a history-rewriting `git` op) is risk-judged first, and you are asked only when the judge flags it. Sandbox failures and escapes are handled for you; a run that ended up unsandboxed says so in a `sandbox_escalation` field."#;
+const AUTO_APPROVAL: &str = r#"APPROVAL: Commands are sandboxed by default. Destructive commands are risk-judged, and sandbox escapes may require approval. Unsandboxed retries report `sandbox_escalation`."#;
 
 /// `{{approval}}` for `permission = free`.
 #[cfg(not(feature = "bench-bash"))]
-const FREE_APPROVAL: &str = r#"APPROVAL: Bash is free: commands run directly without Bash pre-execution approval, destructive-command judging, or sandbox-failure escalation."#;
+const FREE_APPROVAL: &str =
+    r#"APPROVAL: Default calls run directly without Bash approval or sandbox-failure escalation."#;
 
 // ── Prompt sections for the `bench-bash` profile: raw container exec ──────────
 // No OS sandbox, no work-dir jail, no uv shim, inherited cwd, no gate. Compiled
 // only with the feature; the normal-build sections above are absent then.
 
 #[cfg(feature = "bench-bash")]
-const BENCH_ISOLATION: &str = r#"EXECUTION: The shell runs directly on the host filesystem with full read+write access — no OS sandbox and no masked paths (this environment is already disposable/isolated). Network is enabled."#;
+const BENCH_ISOLATION: &str = r#"EXECUTION: Commands run directly in this disposable environment without an OS sandbox or masked paths. Network is enabled."#;
 
 #[cfg(feature = "bench-bash")]
-const BENCH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is your working directory — create and modify files there, including with the `Write`/`Edit` tools (give them absolute paths under it). There is no work-dir jail; just keep output under {{work_dir}}."#;
+const BENCH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is the working directory. There is no work-dir jail; keep output there."#;
 
 #[cfg(feature = "bench-bash")]
-const BENCH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the host's own interpreters — run them directly. There is no uv shim, so call them as-is (no `uv run` or PEP 723 `--script` needed)."#;
+const BENCH_PYTHON: &str =
+    r#"PYTHON: `python`/`python3`/`pip` are the host's own interpreters; there is no uv shim."#;
 
 #[cfg(feature = "bench-bash")]
-const BENCH_APPROVAL: &str = r#"APPROVAL: Commands run directly with no approval gate."#;
+const BENCH_APPROVAL: &str = r#"APPROVAL: There is no approval gate."#;
 
 /// Compile-time switch for the bench profile (the `bench-bash` feature). When
 /// true, the Bash tool ignores the configured permission for execution shape and always
@@ -193,6 +193,24 @@ pub enum BashPermissionMode {
     Auto = 0,
     Manual = 1,
     Free = 2,
+}
+
+/// Per-call override of the configured Bash sandbox route. When the configured
+/// mode would otherwise use the OS sandbox, `RequireEscalated` raises a fresh,
+/// uncached approval prompt before selecting the unsandboxed route. It is a
+/// no-op when [`BashPermissionMode::Free`] already selects that route.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SandboxPermissions {
+    #[default]
+    UseDefault,
+    RequireEscalated,
+}
+
+impl SandboxPermissions {
+    fn requires_approval(self, permission: BashPermissionMode) -> bool {
+        self == Self::RequireEscalated && !permission_skips_os_sandbox(permission)
+    }
 }
 
 impl BashPermissionMode {
@@ -650,6 +668,15 @@ impl BashTool {
 #[derive(Debug, Deserialize)]
 struct Params {
     command: String,
+    /// `use_default` keeps the configured permission route.
+    /// `require_escalated` asks once, uncached, before changing a sandboxed
+    /// route to unsandboxed. It is a no-op when the configured mode is `free`.
+    #[serde(default)]
+    sandbox_permissions: SandboxPermissions,
+    /// User-facing reason or question shown only by the explicit unsandboxed
+    /// approval prompt. Empty input falls back to Bash's generic question.
+    #[serde(default)]
+    justification: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -663,6 +690,14 @@ struct Params {
     /// [`ToolContext::background_eligible`](crate::ToolContext::background_eligible).
     #[serde(default)]
     on_timeout: Option<String>,
+}
+
+fn sandbox_permissions_from_params(params: &Value) -> SandboxPermissions {
+    params
+        .get("sandbox_permissions")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -696,10 +731,17 @@ impl Tool for BashTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        let sandbox_permissions_description = if BENCH {
+            "This benchmark profile already runs without an OS sandbox or approval gate, so both values have the same effect."
+        } else {
+            "Keep 'use_default' unless the user explicitly asks to run this command without the OS sandbox. Only then use 'require_escalated'; Baybo shows the exact command for approval before changing a sandboxed route to unsandboxed. If permission is 'free', the command is already unsandboxed and no approval is shown."
+        };
         json!({
             "type": "object",
             "properties": {
                 "command":    { "type": "string", "description": "The shell command to run" },
+                "sandbox_permissions": { "type": "string", "enum": ["use_default", "require_escalated"], "default": "use_default", "description": sandbox_permissions_description },
+                "justification": { "type": "string", "description": "A concise user-facing question or reason explaining why this command needs unsandboxed execution. Shown only when sandbox_permissions is 'require_escalated' and the configured route is sandboxed. An empty string uses a generic prompt; omit it for 'use_default' or permission 'free'." },
                 "timeout_ms": { "type": "integer", "minimum": 0, "description": "Per-command timeout in ms. Use `0` to fall back to the tool context timeout." },
                 "cwd":        { "type": "string", "description": "Working directory for the command. An empty string uses the session work directory." },
                 "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
@@ -748,9 +790,15 @@ impl Tool for BashTool {
         // Manual permission declares every executable Bash command to the
         // executor's human approval gate. Auto owns the destructive-command
         // gate inside `execute` via the LLM judge, and free disables Baybo's
-        // pre-execution approval entirely. FileToolRedirect commands are
-        // rejected before any spawn, so asking would be noise.
-        if BENCH || self.permission() != BashPermissionMode::Manual {
+        // default pre-execution approval entirely. `require_escalated` owns an
+        // uncached prompt inside `execute`: a cached approval for the same
+        // sandboxed command must never authorize its unsandboxed form.
+        // FileToolRedirect commands are rejected before any spawn, so asking
+        // would be noise.
+        if BENCH
+            || sandbox_permissions_from_params(params) == SandboxPermissions::RequireEscalated
+            || self.permission() != BashPermissionMode::Manual
+        {
             return Vec::new();
         }
         params
@@ -770,6 +818,10 @@ impl Tool for BashTool {
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         p.timeout_ms = p.timeout_ms.filter(|timeout| *timeout > 0);
         p.cwd = p.cwd.filter(|cwd| !cwd.as_os_str().is_empty());
+        p.justification = p
+            .justification
+            .map(|justification| justification.trim().to_string())
+            .filter(|justification| !justification.is_empty());
 
         if let Some(dir) = &p.cwd {
             require_absolute(dir, "Bash", "cwd")?;
@@ -871,7 +923,7 @@ impl Tool for BashTool {
         }
 
         let permission = self.permission();
-        let execution_route = bash_execution_route(&command, permission);
+        let execution_route = bash_execution_route(&command, permission, p.sandbox_permissions);
         // Both rejections surface a precise instruction naming the correct
         // absolute path: sandboxing either shape would fail opaquely on the
         // masked state dir / unmounted binary, and the agent has no way to
@@ -880,6 +932,10 @@ impl Tool for BashTool {
             return Err(ToolError::InvalidParams(
                 template.replace(BAYBO_BIN_PLACEHOLDER, &baybo_bin_display()),
             ));
+        }
+        if p.sandbox_permissions.requires_approval(permission) {
+            self.request_explicit_unsandboxed_approval(&command, p.justification.as_deref(), ctx)
+                .await?;
         }
         let sandbox_bypassed = execution_route.is_sandboxed() && ctx.sandbox.is_none();
         let effective_sandboxed = execution_route.is_sandboxed() && !sandbox_bypassed;
@@ -1807,8 +1863,23 @@ impl BashExecutionRoute {
     }
 }
 
-fn bash_execution_route(command: &str, permission: BashPermissionMode) -> BashExecutionRoute {
-    bash_execution_route_for_kind(classify_baybo_cli_command(command), permission)
+fn bash_execution_route(
+    command: &str,
+    permission: BashPermissionMode,
+    sandbox_permissions: SandboxPermissions,
+) -> BashExecutionRoute {
+    let default_route =
+        bash_execution_route_for_kind(classify_baybo_cli_command(command), permission);
+    if !sandbox_permissions.requires_approval(permission) {
+        return default_route;
+    }
+    match default_route {
+        BashExecutionRoute::RejectNonCanonicalBayboCliPath
+        | BashExecutionRoute::RejectChainedBayboCli => default_route,
+        BashExecutionRoute::RunBayboCliUnsandboxed
+        | BashExecutionRoute::RunUnsandboxed
+        | BashExecutionRoute::RunSandboxed { .. } => BashExecutionRoute::RunUnsandboxed,
+    }
 }
 
 #[cfg(test)]
@@ -1980,6 +2051,52 @@ fn argv0_matches_gateway_binary(argv0: &str, bin: &Path) -> bool {
 }
 
 impl BashTool {
+    async fn request_explicit_unsandboxed_approval(
+        &self,
+        command: &str,
+        justification: Option<&str>,
+        ctx: &ToolContext,
+    ) -> crate::Result<()> {
+        let Some(approval) = ctx.approval.as_ref() else {
+            return Err(ToolError::Execution(
+                "sandbox_permissions=require_escalated needs user approval, but no approval channel is available"
+                    .to_string(),
+            ));
+        };
+        let hint = justification.unwrap_or("Run this Bash command without the OS sandbox?");
+        let warning = "This command will run without the OS sandbox and may access host files and credentials normally hidden by it.";
+        let description = format!("{hint}\n\n{warning}");
+        // Some clients foreground `description`, while the TUI currently
+        // renders only `params_preview`, so both need the safety context.
+        let preview = format!(
+            "{description}\n\n\
+             Command:\n{command}\n\n\
+             Baybo's workspace path rules still apply."
+        );
+        let outcome = approval
+            .request_uncached_with_description(
+                "Bash",
+                &ctx.session_id,
+                &ctx.user,
+                vec![ResourceAccess::ExecCommand {
+                    command: command.to_string(),
+                }],
+                preview,
+                Some(description),
+            )
+            .await;
+        match outcome.decision {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
+            ApprovalDecision::Deny => Err(ToolError::Denied {
+                tool: "Bash".to_string(),
+                reason: format!(
+                    "unsandboxed execution was not approved: {}",
+                    refusal_reason(outcome.resolution)
+                ),
+            }),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_sandbox_start_failure(
         &self,
@@ -3308,6 +3425,29 @@ mod tests {
         assert!(
             d.contains("SCRATCH:") && d.contains("/some/ws/work/tmp"),
             "sandboxed profile advertises the swept work/tmp scratch dir"
+        );
+    }
+
+    #[test]
+    fn schema_exposes_explicit_unsandboxed_escalation() {
+        let schema = BashTool::for_test().parameters_schema();
+        let field = &schema["properties"]["sandbox_permissions"];
+        assert_eq!(field["enum"], json!(["use_default", "require_escalated"]));
+        assert_eq!(field["default"], "use_default");
+        let description = field["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("user explicitly asks")
+                && description.contains("exact command for approval"),
+            "schema must teach the model when and how to escalate: {description}"
+        );
+        let justification = &schema["properties"]["justification"];
+        assert_eq!(justification["type"], "string");
+        assert!(
+            justification["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("user-facing"),
+            "justification must be described as approval UI text"
         );
     }
 
@@ -4736,7 +4876,14 @@ mod tests {
         });
         let tool = BashTool::for_test();
         let out = tool
-            .execute(json!({ "command": "echo hello" }), &ctx_with(Some(sandbox)))
+            .execute(
+                json!({
+                    "command": "echo hello",
+                    "sandbox_permissions": "use_default",
+                    "justification": "This is ignored on the default route.",
+                }),
+                &ctx_with(Some(sandbox)),
+            )
             .await
             .unwrap();
         let ToolOutput::Json(v) = out else { panic!() };
@@ -4759,6 +4906,177 @@ mod tests {
             calls[0].args[1].ends_with("echo hello"),
             "command body should land at the tail of the sh -c arg, got: {}",
             calls[0].args[1],
+        );
+    }
+
+    #[cfg(not(feature = "bench-bash"))]
+    #[tokio::test]
+    async fn require_escalated_approves_exact_command_and_skips_sandbox() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"sandboxed\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let command = "printf 'unsandboxed-route\\n'";
+        let justification = "Allow this command to use the host toolchain?";
+        let mut ctx = ctx_with(Some(sandbox));
+        let cache = Arc::new(Mutex::new(vec![ApprovedResource::ExecCommand {
+            command: command.to_string(),
+        }]));
+        ctx.approval = Some(ApprovalHandle::new(gate.clone(), cache, None));
+
+        let out = BashTool::for_test()
+            .execute(
+                json!({
+                    "command": command,
+                    "sandbox_permissions": "require_escalated",
+                    "justification": justification,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("approved escalation runs");
+
+        let ToolOutput::Json(result) = out else {
+            panic!("expected JSON result")
+        };
+        assert_eq!(result["stdout"], "unsandboxed-route\n");
+        assert!(
+            fake.calls().is_empty(),
+            "explicit escalation must not invoke the sandbox backend"
+        );
+        let requests = gate.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a cached sandboxed approval must not suppress the escalation prompt"
+        );
+        assert_eq!(
+            requests[0].accesses,
+            vec![ResourceAccess::ExecCommand {
+                command: command.to_string(),
+            }]
+        );
+        let description = requests[0]
+            .description
+            .as_deref()
+            .expect("escalation approval must have a prominent hint");
+        assert!(
+            description.contains(justification) && description.contains("without the OS sandbox"),
+            "approval description must explain the privilege boundary: {description}"
+        );
+        assert!(
+            requests[0].params_preview.contains(justification)
+                && requests[0].params_preview.contains(command)
+                && requests[0]
+                    .params_preview
+                    .contains("without the OS sandbox"),
+            "approval must name the command and privilege boundary: {}",
+            requests[0].params_preview
+        );
+    }
+
+    #[cfg(not(feature = "bench-bash"))]
+    #[tokio::test]
+    async fn require_escalated_does_not_prompt_when_permission_is_free() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"sandboxed\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let out = BashTool::for_test()
+            .with_permission(BashPermissionMode::Free)
+            .execute(
+                json!({
+                    "command": "printf 'already-unsandboxed\\n'",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "This must not trigger a redundant prompt.",
+                }),
+                &ctx_with(Some(sandbox)),
+            )
+            .await
+            .expect("free permission already grants the unsandboxed route");
+
+        let ToolOutput::Json(result) = out else {
+            panic!("expected JSON result")
+        };
+        assert_eq!(result["stdout"], "already-unsandboxed\n");
+        assert!(
+            fake.calls().is_empty(),
+            "free permission must not invoke the sandbox backend"
+        );
+    }
+
+    #[cfg(not(feature = "bench-bash"))]
+    #[tokio::test]
+    async fn require_escalated_denial_runs_nothing() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"sandboxed\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+
+        let err = BashTool::for_test()
+            .execute(
+                json!({
+                    "command": "printf should-not-run",
+                    "sandbox_permissions": "require_escalated",
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("denied escalation must fail closed");
+
+        assert!(matches!(err, ToolError::Denied { .. }));
+        assert!(
+            fake.calls().is_empty(),
+            "denial must not run in the sandbox"
+        );
+        let requests = gate.requests();
+        assert_eq!(requests.len(), 1, "denial still records one prompt");
+        assert!(
+            requests[0]
+                .params_preview
+                .starts_with("Run this Bash command without the OS sandbox?"),
+            "missing justification must use the generic prompt"
+        );
+    }
+
+    #[cfg(not(feature = "bench-bash"))]
+    #[tokio::test]
+    async fn require_escalated_without_approval_channel_fails_closed() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"sandboxed\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let err = BashTool::for_test()
+            .execute(
+                json!({
+                    "command": "printf should-not-run",
+                    "sandbox_permissions": "require_escalated",
+                }),
+                &ctx_with(Some(sandbox)),
+            )
+            .await
+            .expect_err("unattended escalation must fail closed");
+
+        let ToolError::Execution(message) = err else {
+            panic!("expected execution error, got {err:?}")
+        };
+        assert!(message.contains("no approval channel is available"));
+        assert!(
+            fake.calls().is_empty(),
+            "missing approval must not fall back to the sandbox"
         );
     }
 
@@ -5693,10 +6011,18 @@ mod tests {
     fn accessed_resources_only_manual_permission_prompts() {
         let destructive = json!({ "command": "rm -rf /tmp/work/build" });
         let benign = json!({ "command": "git status" });
+        let escalated = json!({
+            "command": "git status",
+            "sandbox_permissions": "require_escalated",
+        });
 
         let manual = BashTool::for_test().with_permission(BashPermissionMode::Manual);
         assert_eq!(manual.accessed_resources(&destructive).len(), 1);
         assert_eq!(manual.accessed_resources(&benign).len(), 1);
+        assert!(
+            manual.accessed_resources(&escalated).is_empty(),
+            "the tool's uncached escalation prompt must be the only prompt"
+        );
 
         let auto = BashTool::for_test().with_permission(auto_permission());
         assert!(auto.accessed_resources(&destructive).is_empty());

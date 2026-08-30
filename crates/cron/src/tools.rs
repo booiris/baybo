@@ -57,6 +57,44 @@ fn granted_mcp_tool_names(job: &CronJob) -> Vec<&str> {
 /// Build every cron tool with its manifest, ready to be registered with a
 /// `ToolRegistry`. Always `Trusted` with no capabilities — they operate on
 /// agent-internal scheduler state, not on the host filesystem or network.
+/// The `ToolSearch` source label the deferred cron mutators register under —
+/// also the group name in its directory and the `server` filter value.
+pub const DEFERRED_SOURCE: &str = "cron";
+
+/// `report_nothing`'s tool name. Named here (not at the registration site)
+/// so the eager-vs-deferred split below and the `Tool` impl cannot drift.
+pub const REPORT_NOTHING_TOOL_NAME: &str = "report_nothing";
+
+/// Register the cron batch on `registry`: the `Cron*` mutators are DEFERRED
+/// (low-frequency, ~7 KB of schemas — discovered via `ToolSearch`, called
+/// via `ToolInvoke`, names unchanged), while [`REPORT_NOTHING_TOOL_NAME`]
+/// stays advertised — it is the verb every quiet recurring fire needs
+/// already in hand, not one worth a search round-trip per silent fire.
+pub fn install_agent_tools(
+    registry: &mut baybo_tools::ToolRegistry,
+    scheduler: Arc<CronScheduler>,
+    mcp_grants: Arc<dyn McpToolGrantResolver>,
+) {
+    for (tool, manifest) in agent_tools(scheduler, mcp_grants) {
+        if tool.name() == REPORT_NOTHING_TOOL_NAME {
+            registry.register(tool, manifest);
+        } else {
+            registry.register_dynamic_deferred(DEFERRED_SOURCE, tool, manifest);
+        }
+    }
+}
+
+/// This batch's row in the deferred-tools notice: `(source, description,
+/// trigger_scope)`. The scope mirrors the mutators' own (`Any`), so the
+/// same door that offers the tools offers their row.
+pub fn deferred_notice_spec() -> (String, Option<String>, baybo_tools::ToolTriggerScope) {
+    (
+        DEFERRED_SOURCE.to_string(),
+        Some("Scheduled jobs: create/update/pause/resume/delete/list".to_string()),
+        baybo_tools::ToolTriggerScope::Any,
+    )
+}
+
 pub fn agent_tools(
     scheduler: Arc<CronScheduler>,
     mcp_grants: Arc<dyn McpToolGrantResolver>,
@@ -107,7 +145,7 @@ struct CronReportNothingTool;
 #[async_trait]
 impl Tool for CronReportNothingTool {
     fn name(&self) -> &str {
-        "report_nothing"
+        REPORT_NOTHING_TOOL_NAME
     }
 
     fn description(&self) -> String {

@@ -399,12 +399,13 @@ export function TracesPage() {
 
       <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
         <div className="flex-1 overflow-auto overscroll-none">
-          <table className="w-full border-separate border-spacing-0 table-fixed">
+          <table className="w-full min-w-[1540px] border-separate border-spacing-0 table-fixed">
             <thead>
               <tr>
                 <th className={`${thCell} w-[160px]`}>Created</th>
                 <th className={`${thCell} w-[160px]`}>Last Active</th>
-                <th className={`${thCell}`}>Session ID</th>
+                <th className={`${thCell} w-[280px]`}>Title</th>
+                <th className={`${thCell} w-[300px]`}>Session ID</th>
                 <th className={`${thCell} w-[140px]`}>Status</th>
                 <th className={`${thCell} w-[110px]`}>Spans</th>
                 <th className={`${thCell} w-[130px] whitespace-nowrap`}>Tok In</th>
@@ -415,7 +416,7 @@ export function TracesPage() {
             <tbody>
               {items.length === 0 && !loading && (
                 <tr>
-                  <td colSpan={7} className="px-6 py-10 text-center text-ink-soft text-[0.9rem]">
+                  <td colSpan={9} className="px-6 py-10 text-center text-ink-soft text-[0.9rem]">
                     No sessions found.
                   </td>
                 </tr>
@@ -442,6 +443,14 @@ export function TracesPage() {
                         {active.date}
                         <br />
                         {active.time}
+                      </div>
+                    </td>
+                    <td className={cell}>
+                      <div
+                        className="truncate font-bold text-[0.9rem]"
+                        title={row.title ?? undefined}
+                      >
+                        {row.title ?? '—'}
                       </div>
                     </td>
                     <td className={cell}>

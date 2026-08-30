@@ -3664,6 +3664,8 @@ export interface components {
             output_tokens: number;
             session_id: string;
             span_count: number;
+            /** @description Stored conversation title, falling back to a truncated first message. */
+            title?: string | null;
             turn_count: number;
         };
         /**

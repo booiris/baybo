@@ -21,14 +21,17 @@ use std::sync::Arc;
 
 use baybo_cost::{CostError, CostStore, CostSummary, TimeRange};
 use baybo_model::{
-    CallReason, ExternalAgentKind, Lineage, LineageKind, MicroUsd, Session, SessionId, SpanId,
-    StepId, SubagentBackendTag, ToolSetHash, TriggerKind, TurnId,
+    CallReason, ContentBlock, ExternalAgentKind, Lineage, LineageKind, MAX_SESSION_TITLE_LEN,
+    MicroUsd, Session, SessionId, SpanId, StepId, SubagentBackendTag, ToolSetHash, TriggerKind,
+    TurnId,
 };
 use baybo_session::{SessionError, SessionStore, StoredMessage};
 use baybo_trace::{
     LlmCallInputs, LlmToolSet, Span, SpanEvent, SpanKind, Step, TraceError, TraceStore,
 };
-use baybo_turn::{Turn, TurnError, TurnInputKind, TurnLifecycle, TurnStatus, TurnStatusKind};
+use baybo_turn::{
+    Turn, TurnError, TurnInput, TurnInputKind, TurnLifecycle, TurnStatus, TurnStatusKind,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -200,6 +203,53 @@ fn derive_session_kind(session: &Session) -> SessionKind {
     }
 }
 
+fn session_summary_title(session: &Session, turns: &[Turn]) -> Option<String> {
+    session.title.clone().or_else(|| {
+        turns
+            .iter()
+            .filter_map(|turn| {
+                turn_input_text(&turn.input).map(|text| ((turn.created_at, turn.id), text))
+            })
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, text)| text)
+    })
+}
+
+fn turn_input_text(input: &TurnInput) -> Option<String> {
+    let blocks = match input {
+        TurnInput::UserChat { content }
+        | TurnInput::CronNotification { content }
+        | TurnInput::SubagentNotification { content } => Some(content.as_slice()),
+        TurnInput::Spawned { initial_prompt } => Some(initial_prompt.as_slice()),
+        TurnInput::IssueRun { brief, .. } => Some(brief.as_slice()),
+        TurnInput::Cron { action_payload } => {
+            return action_payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .and_then(truncate_title_text);
+        }
+        TurnInput::Compact => None,
+    }?;
+
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_title_text(&text)
+}
+
+fn truncate_title_text(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(MAX_SESSION_TITLE_LEN).collect())
+}
+
 /// Filter for [`QueryApi::list_session_summaries`]. All fields are
 /// AND-combined; `None` means no constraint. `status_kind` matches
 /// against the *latest* turn's `TurnStatusKind` (not any historical turn).
@@ -231,6 +281,9 @@ pub struct SessionSummaryPage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: SessionId,
+    /// Stored conversation title, or the first text-bearing turn input
+    /// collapsed to one line and truncated to [`MAX_SESSION_TITLE_LEN`].
+    pub title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     /// `None` when the session has no turns (filtered out by default).
@@ -1001,6 +1054,7 @@ impl QueryApi {
 
                     Ok::<SessionSummary, QueryError>(SessionSummary {
                         session_id: session.id.clone(),
+                        title: session_summary_title(&session, &turns),
                         created_at: session.created_at,
                         last_active: session.last_active,
                         latest_turn_status: latest.map(|j| j.status.clone()),
@@ -1736,6 +1790,44 @@ mod tests {
         TurnInput::UserChat {
             content: vec![ContentBlock::Text("hi".into())],
         }
+    }
+
+    #[test]
+    fn session_summary_title_prefers_stored_title() {
+        let mut session = make_session("title-stored");
+        session.title = Some("Saved title".into());
+        let turn = Turn::new(session.id.clone(), TriggerKind::User, user_input(), None);
+
+        assert_eq!(
+            session_summary_title(&session, &[turn]).as_deref(),
+            Some("Saved title")
+        );
+    }
+
+    #[test]
+    fn session_summary_title_truncates_earliest_text_input() {
+        let session = make_session("title-fallback");
+        let base = Utc::now();
+        let opening = format!("  第一条\n消息   {}", "界".repeat(MAX_SESSION_TITLE_LEN));
+        let collapsed = opening.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected: String = collapsed.chars().take(MAX_SESSION_TITLE_LEN).collect();
+
+        let mut first = Turn::new(
+            session.id.clone(),
+            TriggerKind::User,
+            TurnInput::UserChat {
+                content: vec![ContentBlock::Text(opening)],
+            },
+            None,
+        );
+        first.created_at = base;
+        let mut later = Turn::new(session.id.clone(), TriggerKind::User, user_input(), None);
+        later.created_at = base + chrono::Duration::seconds(1);
+
+        let title = session_summary_title(&session, &[later, first]).expect("fallback title");
+        assert_eq!(title, expected);
+        assert_eq!(title.chars().count(), MAX_SESSION_TITLE_LEN);
+        assert!(!title.contains('\n'));
     }
 
     /// Minimal in-memory `SessionStore` for query-API tests. The
@@ -3820,6 +3912,7 @@ mod tests {
         assert_eq!(listing.items.len(), 1);
         let item = &listing.items[0];
         assert_eq!(item.session_id, mid_session.id);
+        assert_eq!(item.title.as_deref(), Some("hi"));
         assert_eq!(item.turn_count, 1);
         assert_eq!(item.span_count, 2);
         assert!(matches!(item.latest_turn_status, Some(TurnStatus::Pending)));

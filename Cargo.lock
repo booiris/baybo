@@ -398,6 +398,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "jsonschema",
  "libc",
  "parking_lot",
  "regex",

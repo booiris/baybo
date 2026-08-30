@@ -138,12 +138,6 @@ todo_tool!(
 );
 
 // -- Tool search -------------------------------------------------------------
-todo_tool!(
-    ToolSearchTool,
-    name = "ToolSearch",
-    desc = "Search for and load deferred tools.",
-    reason = "deferred-tool registry is not yet modeled"
-);
 
 // -- Agent teams -------------------------------------------------------------
 todo_tool!(

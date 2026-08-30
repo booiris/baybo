@@ -270,7 +270,7 @@ Anything that opens a second sqlite file in the workspace must do the same.
 
 Each domain has an independent Store implementation (`SqliteSessionStore`, `SqliteCostStore`, etc.). All share one `SqlitePool` while preserving domain isolation. No giant struct implementing every interface.
 
-`cost_records.reasoning_effort` is nullable: in-process calls copy `ChatRequest::reasoning_effort`, while requests without the setting, external-agent accounting, and legacy rows remain `NULL`. Analytics groups the column directly in SQL; no inference from current session or LLM config is valid because either may have changed since the call.
+`cost_records.reasoning_effort` is nullable: in-process calls copy `ChatRequest::reasoning_effort`, while requests without the setting and external-agent accounting remain `NULL`. Analytics groups the column directly in SQL; no inference from current session or LLM config is valid because either may have changed since the call.
 
 ### Store solves initialization, not abstraction
 
@@ -285,7 +285,7 @@ Table schemas are created centrally in `SqlitePool::init_db()`, but each Store s
 Fields difficult to fully structure (`SessionState.extra`, `Turn.input` / `Turn.final_result`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
 
 `cron_jobs.data` also carries the authored, sorted exact MCP tool grants. The
-field is serde-defaulted, so legacy rows grant nothing. `cron_executions.data`
+field is serde-defaulted, so an absent list grants nothing. `cron_executions.data`
 contains a fire-time copy: pending-execution recovery must authorize against
 that immutable snapshot, never the job's current list. For scheduled fires,
 `CronStore::record_execution_if_job_unchanged` checks the source job's
@@ -325,36 +325,25 @@ previous body immediately. The payload row is representation data, not
 user-facing history: deleting it at reference count zero does not delete a
 session, message, turn, step, or span.
 
-### Renaming a persisted name
+### Schema baseline and migrations
 
-`init_db` runs on every open and is the only migration runner: additive
-`AddColumn` entries plus a handful of one-time, self-disarming data passes. A
-rename that touches persisted state has three traps, all of which fail silently
-rather than loudly.
+The current `CREATE TABLE` batch is the schema baseline; it already contains
+every live column. `init_db` still runs on every open and remains the migration
+runner, but `ADD_COLUMNS` is intentionally empty at this baseline.
 
-**Order.** A one-time rename must run *before* the DDL batch. `CREATE TABLE IF
-NOT EXISTS <new>` against a pre-rename database mints an empty table, after
-which `ALTER TABLE <old> RENAME TO <new>` can only fail — and the app boots
-clean reporting zero rows.
+A future additive column must be declared in two places: its table's `CREATE`
+statement for fresh databases and `ADD_COLUMNS` for databases created from this
+baseline. `AddColumn::apply` probes `pragma_table_xinfo` before issuing `ALTER
+TABLE`, so repeated opens are idempotent and generated VIRTUAL columns are
+visible to the guard (`pragma_table_info` would omit them). Views, indexes, and
+triggers are installed after the migration loop so they may safely reference a
+newly added column. The migration-mechanism tests cover add-once behavior and
+surface a missing target table as a programming error.
 
-**`pragma_table_xinfo`, never `pragma_table_info`.** `table_info` omits VIRTUAL
-generated columns entirely, so a guard written against it reports `steps` as
-having only `(id, data)`. Every generated-column migration keyed on it takes the
-wrong branch, and only against a real database — a fresh one has nothing to
-migrate, so the whole test suite stays green.
-
-**Serde field names inside a `data` blob are schema.** Renaming one orphans
-every existing row. Where the field is required (`Lineage.parent_turn_id` inside
-`sessions.data`) the *whole* row stops deserializing, and
-`decode_session_list_rows` drops undecodable rows with only a `warn!` — a live
-conversation silently leaves the user's list. Where it is `Option`, it quietly
-reads `None` and the next write persists that loss. The same applies to enum tag
-keys: `BackgroundJobKind` is `#[serde(tag = "job")]` and pinned by a test,
-because it rides inside `Session`.
-
-Indexes survive `ALTER TABLE … RENAME` under their **old** names, so a migration
-that renames a table must drop them explicitly or the DDL builds a second copy
-of each.
+If a future change cannot be expressed as an additive column, add an explicit,
+transactional, self-disarming pass to `init_db` and test it against the exact
+pre-change schema. Serde field names and enum tags inside `data` blobs are schema
+too; changing one requires migrating the blob in the same transaction.
 
 ### Transaction boundaries
 
@@ -365,16 +354,14 @@ model entirely: there is no `SessionStore::delete` method and no production
 idle cleanup only reaps the in-memory actor.
 
 Operator comments may carry `issue_events.client_msg_id`, a canonical UUID and
-NULL on every legacy/non-client event. A partial unique index on
+NULL on every non-client event. A partial unique index on
 `(issue_id, client_msg_id) WHERE client_msg_id IS NOT NULL` is the durable idempotency
 claim. `append_event_idempotent` inserts and, on a conflicting claim, reads the
 original row in the same transaction; callers receive `Inserted` versus
 `Existing`. Client-keyed inserts also write
 `comment_consequences_applied = 0`; the project manager marks it 1 after the
-comment's uncancel / mention / wake consequences finish. Existing databases add
-the column with default 1, so migration never replays historical comments whose
-old code already completed (or intentionally best-effort attempted) those
-effects.
+comment's uncancel / mention / wake consequences finish. Non-client events are
+complete at insertion and store 1.
 
 ### Deletable tables hard-delete except `cron_jobs`, `deck_cards`, `projects`, `issues` and a project's agents
 
@@ -411,7 +398,7 @@ CREATE TRIGGER IF NOT EXISTS agent_profiles_team_is_insert_only
     BEGIN SELECT RAISE(ABORT, '…'); END;
 ```
 
-This policy trigger earns its place by guarding the one column a *human* typed into prose that is already stored: `@dev-1` in a comment resolves through this row and nothing else. (The other schema triggers are mechanical `content_payloads.ref_count` maintenance.) It fires on the value, not on the column being mentioned, so a write-back of the same membership passes and `remove_from_team`'s `deleted_at` stamp never touches it. It lives with the post-migration indexes rather than the `CREATE TABLE` batch, for the same reason they do — on a pre-team DB the columns do not exist until the `ALTER` loop runs.
+This policy trigger earns its place by guarding the one column a *human* typed into prose that is already stored: `@dev-1` in a comment resolves through this row and nothing else. (The other schema triggers are mechanical `content_payloads.ref_count` maintenance.) It fires on the value, not on the column being mentioned, so a write-back of the same membership passes and `remove_from_team`'s `deleted_at` stamp never touches it. It is installed after the migration loop so a future additive migration may introduce a column used by an index or trigger before that schema object is created.
 
 It is also half of an invariant that SQL alone cannot hold. The display name the handle was derived from is frozen in the same way and for the same reason, but it is a line in the agent's own `IDENTITY.md` — there is no name column here to constrain, deliberately (see [`agent-profiles.md`](agent-profiles.md)). That half is enforced inside the one writer of that file in each crate that has one; this is the half a trigger can keep.
 

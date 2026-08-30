@@ -17,6 +17,12 @@ struct DynamicState {
     tools: HashMap<String, Arc<dyn Tool>>,
     manifests: HashMap<String, ToolManifest>,
     by_source: HashMap<String, Vec<String>>,
+    /// Names whose schemas are withheld from the LLM tool block
+    /// (`tool_definitions_for_session`), discovered via `ToolSearch` and
+    /// called via `ToolInvoke`. Registration state, not governance: a
+    /// deferred tool resolves, grants and executes exactly like an eager
+    /// one — the executor's doors never consult this set.
+    deferred: std::collections::HashSet<String>,
 }
 
 /// Narrow, cloneable view used by authoring surfaces that turn current MCP
@@ -156,11 +162,63 @@ impl ToolRegistry {
         })
     }
 
+    /// Whether `name` is registered with its schema withheld from the LLM
+    /// tool block. The agent loop's `ToolInvoke` unwrap consults this so an
+    /// un-namespaced deferred registration (the cron/deck builtins) is a
+    /// valid envelope target while eager builtins are not.
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.dynamic.read().deferred.contains(name)
+    }
+
+    /// Canonical registered name for a `ToolInvoke` target: the exact
+    /// deferred name, or — because `ToolSearch` groups by SOURCE and the
+    /// model naturally spells that as `source/Name` — the alias
+    /// `cron/CronCreate` → `CronCreate` when the bare name is deferred and
+    /// registered under that source. Data-driven off `by_source`: any
+    /// un-namespaced deferred batch gets the tolerance, nothing is
+    /// hardcoded, and a bare name deferred under a DIFFERENT source does
+    /// not alias. `None` when nothing deferred matches.
+    pub fn resolve_deferred_target(&self, name: &str) -> Option<String> {
+        canonical_deferred_name(&self.dynamic.read(), name)
+    }
+
+    /// A live, narrow view over the deferred half of the dynamic registry
+    /// for `ToolSearch`. Shares only the dynamic-state lock — the same
+    /// no-`Arc`-cycle shape as [`Self::mcp_tool_grant_resolver`] — and
+    /// follows reconciler connects/disconnects live.
+    pub fn deferred_tool_index(&self) -> DeferredToolIndex {
+        DeferredToolIndex {
+            dynamic: Arc::clone(&self.dynamic),
+        }
+    }
+
     /// Register a tool sourced from an external provider (an MCP server,
     /// for example). `source` is the logical owner the reconciler uses
     /// for [`Self::unregister_for_source`]; tools should be named with a
     /// `<source>/<tool>` convention to avoid colliding with builtins.
     pub fn register_dynamic(&self, source: &str, tool: Arc<dyn Tool>, manifest: ToolManifest) {
+        self.register_dynamic_inner(source, tool, manifest, false);
+    }
+
+    /// [`Self::register_dynamic`], but with the tool's schema withheld from
+    /// the LLM tool block. The tool still resolves, grants and executes by
+    /// name; sessions reach it through `ToolSearch` + `ToolInvoke`.
+    pub fn register_dynamic_deferred(
+        &self,
+        source: &str,
+        tool: Arc<dyn Tool>,
+        manifest: ToolManifest,
+    ) {
+        self.register_dynamic_inner(source, tool, manifest, true);
+    }
+
+    fn register_dynamic_inner(
+        &self,
+        source: &str,
+        tool: Arc<dyn Tool>,
+        manifest: ToolManifest,
+        deferred: bool,
+    ) {
         let name = tool.name().to_string();
         debug_assert_eq!(
             name, manifest.name,
@@ -178,6 +236,12 @@ impl ToolRegistry {
         let mut state = self.dynamic.write();
         state.tools.insert(name.clone(), tool);
         state.manifests.insert(name.clone(), manifest);
+        if deferred {
+            state.deferred.insert(name.clone());
+        } else {
+            // A re-registration under the same name flips the bit both ways.
+            state.deferred.remove(&name);
+        }
         state
             .by_source
             .entry(source.to_string())
@@ -203,6 +267,7 @@ impl ToolRegistry {
         for name in state.by_source.remove(source).unwrap_or_default() {
             state.tools.remove(&name);
             state.manifests.remove(&name);
+            state.deferred.remove(&name);
         }
         let mut names = Vec::with_capacity(tools.len());
         for (tool, manifest) in tools {
@@ -238,6 +303,7 @@ impl ToolRegistry {
         for name in &names {
             state.tools.remove(name);
             state.manifests.remove(name);
+            state.deferred.remove(name);
         }
         names
     }
@@ -335,7 +401,17 @@ impl ToolRegistry {
                 .manifests
                 .get(name)
                 .is_none_or(|m| m.allows_channel(channel));
-            if channel_ok && tool.trigger_scope().allows_trigger(trigger) && allowed(name) {
+            // A deferred tool is advertised only when a subagent profile's
+            // allowlist names it explicitly: the author asked for that
+            // schema, and child prompts are small. Everyone else reaches it
+            // through `ToolSearch` + `ToolInvoke`.
+            let withheld = dynamic.deferred.contains(name)
+                && !allowlist.is_some_and(|list| list.contains(name));
+            if channel_ok
+                && tool.trigger_scope().allows_trigger(trigger)
+                && allowed(name)
+                && !withheld
+            {
                 let def = tool_definition_offered(tool.as_ref(), trigger);
                 defs.insert(def.name.clone(), def);
             } else {
@@ -415,6 +491,132 @@ impl ToolRegistry {
         }
         self.builtin_manifests.get(name).cloned()
     }
+}
+
+/// Narrow, cloneable view over the deferred half of the dynamic registry,
+/// held by the `ToolSearch` builtin. What it reveals to a session is
+/// filtered on the same two doors as prompt assembly (`allows_channel` +
+/// `trigger_scope`), and schemas go through [`tool_definition_offered`] so a
+/// trigger-withheld parameter stays withheld in search results too.
+#[derive(Clone)]
+pub struct DeferredToolIndex {
+    dynamic: Arc<RwLock<DynamicState>>,
+}
+
+/// Where a name landed when [`DeferredToolIndex::lookup`] resolved it, so
+/// `ToolSearch` can answer misses precisely instead of a blanket
+/// "not found".
+pub enum DeferredLookup {
+    /// Deferred and visible to this session: full definition attached.
+    Visible(ToolDefinition),
+    /// Deferred, but this session's channel or trigger scope excludes it.
+    OutOfScope,
+    /// Registered eagerly — it is already in the session's tool block.
+    Eager,
+    /// No dynamic tool has this name (never configured, or its server is
+    /// currently disconnected).
+    Unknown,
+}
+
+impl DeferredToolIndex {
+    /// Every deferred tool this session may see, name-sorted for stable
+    /// output.
+    pub fn visible(
+        &self,
+        channel: &baybo_model::ChannelType,
+        trigger: &baybo_model::TriggerSource,
+    ) -> Vec<ToolDefinition> {
+        self.visible_with_source(channel, trigger)
+            .into_iter()
+            .map(|(_, def)| def)
+            .collect()
+    }
+
+    /// [`Self::visible`] with each tool's registration SOURCE attached — the
+    /// grouping key `ToolSearch`'s directory and `server` filter use. For an
+    /// MCP tool the source equals the `server/` name prefix; for a deferred
+    /// builtin batch (cron, deck) it is the batch label, which is what makes
+    /// un-namespaced names groupable at all. Sorted by (source, name).
+    pub fn visible_with_source(
+        &self,
+        channel: &baybo_model::ChannelType,
+        trigger: &baybo_model::TriggerSource,
+    ) -> Vec<(String, ToolDefinition)> {
+        let dynamic = self.dynamic.read();
+        let mut out: Vec<(String, ToolDefinition)> = Vec::new();
+        for (source, names) in &dynamic.by_source {
+            for name in names {
+                if !dynamic.deferred.contains(name) {
+                    continue;
+                }
+                let Some(tool) = dynamic.tools.get(name) else {
+                    continue;
+                };
+                let channel_ok = dynamic
+                    .manifests
+                    .get(name)
+                    .is_none_or(|m| m.allows_channel(channel));
+                if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
+                    out.push((
+                        source.clone(),
+                        tool_definition_offered(tool.as_ref(), trigger),
+                    ));
+                }
+            }
+        }
+        out.sort_by(|a, b| (&a.0, &a.1.name).cmp(&(&b.0, &b.1.name)));
+        out
+    }
+
+    /// Resolve one exact name against a single registry snapshot. The
+    /// channel/trigger doors are evaluated before the eager/deferred split:
+    /// an eager tool this session cannot see answers `OutOfScope`, not
+    /// "call it directly" — the direct call would only hit the executor's
+    /// refusal. A `source/Name` spelling of an un-namespaced deferred
+    /// registration resolves through the same alias `ToolInvoke` accepts.
+    pub fn lookup(
+        &self,
+        name: &str,
+        channel: &baybo_model::ChannelType,
+        trigger: &baybo_model::TriggerSource,
+    ) -> DeferredLookup {
+        let dynamic = self.dynamic.read();
+        let canonical = if dynamic.tools.contains_key(name) {
+            None
+        } else {
+            canonical_deferred_name(&dynamic, name)
+        };
+        let name = canonical.as_deref().unwrap_or(name);
+        let Some(tool) = dynamic.tools.get(name) else {
+            return DeferredLookup::Unknown;
+        };
+        let channel_ok = dynamic
+            .manifests
+            .get(name)
+            .is_none_or(|m| m.allows_channel(channel));
+        if !(channel_ok && tool.trigger_scope().allows_trigger(trigger)) {
+            return DeferredLookup::OutOfScope;
+        }
+        if !dynamic.deferred.contains(name) {
+            return DeferredLookup::Eager;
+        }
+        DeferredLookup::Visible(tool_definition_offered(tool.as_ref(), trigger))
+    }
+}
+
+/// See [`ToolRegistry::resolve_deferred_target`]. Split out so the
+/// registry method and [`DeferredToolIndex::lookup`] share one rule.
+fn canonical_deferred_name(state: &DynamicState, requested: &str) -> Option<String> {
+    if state.deferred.contains(requested) {
+        return Some(requested.to_string());
+    }
+    let (source, bare) = requested.split_once('/')?;
+    (state.deferred.contains(bare)
+        && state
+            .by_source
+            .get(source)
+            .is_some_and(|names| names.iter().any(|n| n == bare)))
+    .then(|| bare.to_string())
 }
 
 /// A tool's whole declared surface, for inventory views (`baybo status`, the
@@ -787,6 +989,106 @@ mod tests {
             !restricted.contains(&"OffTrigger".to_string()),
             "naming a tool cannot hand a run one its trigger refuses"
         );
+    }
+
+    /// A deferred dynamic tool is registered — it resolves, grants and
+    /// executes — but its schema stays out of the session tool block until
+    /// a subagent allowlist names it explicitly.
+    #[test]
+    fn deferred_dynamic_tools_are_withheld_from_the_session_block() {
+        use baybo_model::TriggerSource;
+
+        use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
+
+        struct Named(&'static str);
+
+        #[async_trait::async_trait]
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn trigger_scope(&self) -> ToolTriggerScope {
+                ToolTriggerScope::Any
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> crate::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let registry = default_registry();
+        let manifest = |name: &str| crate::ToolManifest {
+            name: name.into(),
+            description: "x".into(),
+            trust_level: baybo_model::TrustLevel::Trusted,
+            parameters_schema: serde_json::json!({"type": "object"}),
+            capabilities: vec![],
+            channels: Vec::new(),
+        };
+        registry.register_dynamic_deferred(
+            "srv",
+            Arc::new(Named("srv/deferred_op")),
+            manifest("srv/deferred_op"),
+        );
+        registry.register_dynamic(
+            "srv",
+            Arc::new(Named("srv/eager_op")),
+            manifest("srv/eager_op"),
+        );
+
+        let names = |allow: Option<&[String]>| {
+            registry
+                .tool_definitions_for_session(
+                    &baybo_model::ChannelType::owner(),
+                    &TriggerSource::User,
+                    allow,
+                )
+                .into_iter()
+                .map(|d| d.name)
+                .collect::<Vec<_>>()
+        };
+
+        let advertised = names(None);
+        assert!(advertised.contains(&"srv/eager_op".to_string()));
+        assert!(
+            !advertised.contains(&"srv/deferred_op".to_string()),
+            "a deferred tool's schema must stay out of the block"
+        );
+        // ...while staying fully registered for execution and grants.
+        assert!(registry.get("srv/deferred_op").is_some());
+        assert!(registry.get_manifest("srv/deferred_op").is_some());
+
+        // An allowlist naming the deferred tool pins it eager: the profile
+        // author asked for that schema by name.
+        let allow = ["srv/deferred_op".to_string()];
+        let pinned = names(Some(&allow));
+        assert!(pinned.contains(&"srv/deferred_op".to_string()));
+        assert!(!pinned.contains(&"srv/eager_op".to_string()));
+
+        // Disconnect cleans the deferred set with the registration.
+        registry.unregister_for_source("srv");
+        assert!(registry.get("srv/deferred_op").is_none());
+        let after = names(None);
+        assert!(!after.contains(&"srv/deferred_op".to_string()));
+
+        // A re-registration under the same name without deferral flips the
+        // bit back: the eager registration must advertise.
+        registry.register_dynamic_deferred(
+            "srv",
+            Arc::new(Named("srv/flip")),
+            manifest("srv/flip"),
+        );
+        registry.register_dynamic("srv", Arc::new(Named("srv/flip")), manifest("srv/flip"));
+        assert!(names(None).contains(&"srv/flip".to_string()));
     }
 
     /// The tools whose target is state the workspace shares, or a chat there

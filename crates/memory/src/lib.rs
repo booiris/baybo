@@ -9,10 +9,9 @@
 //!
 //! Core ships the trait, its value types, and a [`NoopMemory`] default that
 //! does nothing; there is no real implementation here. The agent loop drives it
-//! through three hooks — a synchronous [`Memory::recall`] at turn start and on
-//! each interjection, and the fire-and-forget [`Memory::on_turn_complete`] /
-//! [`Memory::on_session_end`] events — plus the tools the impl contributes via
-//! [`Memory::tools`].
+//! through two hooks — a synchronous [`Memory::recall`] at turn start and on
+//! each interjection, and the fire-and-forget [`Memory::on_turn_complete`]
+//! event — plus the tools the impl contributes via [`Memory::tools`].
 //!
 //! Recall results are injected into the prompt as a framed, persisted
 //! [`baybo_model::MessageSource::RecalledMemory`] row, never a `Role::System`
@@ -31,7 +30,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_llm::Attribution;
-use baybo_model::{AgentProfileId, ChatMessage, ContentBlock, SessionId, TurnId};
+use baybo_model::{AgentProfileId, ContentBlock, SessionId, TurnId};
 use baybo_tools::{Tool, ToolManifest};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
@@ -198,10 +197,6 @@ pub trait Memory: Send + Sync {
         final_output: &[ContentBlock],
     ) -> Result<()>;
 
-    /// Background event: whole-session consolidation at idle-timeout, with the
-    /// FULL durable transcript (the in-memory view may have been compressed).
-    async fn on_session_end(&self, ctx: &MemoryContext, transcript: &[ChatMessage]) -> Result<()>;
-
     /// Tools this implementation contributes to the agent registry — the
     /// model's "explicit signal" path, coexisting with the automatic
     /// recall/write path. Built pre-wired to the impl's own state and clients,
@@ -235,18 +230,10 @@ impl Memory for NoopMemory {
     ) -> Result<()> {
         Ok(())
     }
-
-    async fn on_session_end(
-        &self,
-        _ctx: &MemoryContext,
-        _transcript: &[ChatMessage],
-    ) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Recall-only wrapper: forwards `recall` + `tools` to the inner backend but
-/// no-ops the write hooks (`on_turn_complete` / `on_session_end`). Wired into
+/// no-ops the `on_turn_complete` write hook. Wired into
 /// `baybo`'s runtime only under the `bench-readonly-memory` feature, so the
 /// memory benchmark can drive the real agent end-to-end (recall + tools live)
 /// without QA turns writing into — and polluting — the recall scope. NOT a
@@ -277,14 +264,6 @@ impl Memory for ReadOnlyMemory {
         _ctx: &MemoryContext,
         _user_input: &[ContentBlock],
         _final_output: &[ContentBlock],
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn on_session_end(
-        &self,
-        _ctx: &MemoryContext,
-        _transcript: &[ChatMessage],
     ) -> Result<()> {
         Ok(())
     }

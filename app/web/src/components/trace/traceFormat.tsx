@@ -152,9 +152,8 @@ const SUBAGENT_VISUAL: KindVisual = {
   label: 'Subagent',
 };
 
-/** Visual for a child-session node — the subagent's own trace, nested under the
- *  `spawn_subagent` span that started it. Shares the Subagent identity so the
- *  boundary reads as one continuous thing with the call that opened it. */
+/** Visual for the jump to a child session's own trace. It shares the Subagent
+ *  identity with the `spawn_subagent` span that opened it. */
 export const CHILD_SESSION_VISUAL: KindVisual = SUBAGENT_VISUAL;
 
 /**
