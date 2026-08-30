@@ -316,11 +316,11 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> String {
-        r#"Fetch a web page and read it as markdown. `url` is upgraded to HTTPS; `prompt` says what you want from the page, and a side LLM answers it when the page is large.
+        r#"Fetch a web page and read it as markdown. `prompt` says what you want from the page, and a side LLM answers it when the page is large.
 
-The reply opens with `[WebFetch] summarized=<bool> raw_content_file=<absolute path>`. `summarized=true` means you are reading that side LLM's answer rather than the page; either way the full rendered page is archived at `raw_content_file` (under `<workspace>/state/blobs/`, and it outlives the turn), so `Read` it when the answer is not enough. Prefer re-fetching over an old archive when freshness matters.
+The reply header's `summarized=true` means you are reading that side LLM's answer rather than the page; either way the full rendered page is archived at `raw_content_file` (it outlives the turn), so `Read` it when the answer is not enough.
 
-REFUSED, so do not retry the same way: a URL resolving to loopback, a private or link-local range, or a cloud metadata address — including a public hostname that resolves to one — and any non-text content type. To download a `.zip`, an image or an archive, use Bash with `curl`/`wget`; WebFetch never writes to disk. For GitHub, `gh` via Bash (`gh pr view`, `gh issue view`, `gh api`) beats scraping the HTML."#
+REFUSED, so do not retry the same way: a URL resolving to loopback, a private or link-local range, or a cloud metadata address — including a public hostname that resolves to one — and any non-text content type. To download a `.zip`, an image or an archive, use Bash with `curl`/`wget`. For GitHub, `gh` via Bash (`gh pr view`, `gh issue view`, `gh api`) beats scraping the HTML."#
         .to_string()
     }
 
@@ -328,8 +328,8 @@ REFUSED, so do not retry the same way: a URL resolving to loopback, a private or
         json!({
             "type": "object",
             "properties": {
-                "url":    { "type": "string", "format": "uri", "description": "The http(s) URL to fetch" },
-                "prompt": { "type": "string", "description": "Optional extraction prompt: when set, the rendered page is forwarded to a side LLM that returns a focused answer instead of the raw body" }
+                "url":    { "type": "string", "format": "uri", "pattern": "^https?://" },
+                "prompt": { "type": "string" }
             },
             "required": ["url"]
         })

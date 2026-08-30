@@ -7,12 +7,21 @@
 //! can still see and stop what a reply in the same conversation started.
 
 use async_trait::async_trait;
+use baybo_workspace::WorkspacePaths;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext, ToolError, ToolOutput};
 
-pub struct JobListTool;
+pub struct JobListTool {
+    workspace_paths: WorkspacePaths,
+}
+
+impl JobListTool {
+    pub fn new(workspace_paths: WorkspacePaths) -> Self {
+        Self { workspace_paths }
+    }
+}
 
 #[async_trait]
 impl Tool for JobListTool {
@@ -25,12 +34,15 @@ impl Tool for JobListTool {
     }
 
     fn description(&self) -> String {
-        "List the background jobs (detached subagents and Bash commands) still \
-         running for this conversation. Each entry has a handle, a kind, and a \
-         summary. A detached command's output streams to \
-         logs/background/<handle>.out (and .err) — Read it for live progress. \
-         Returns an empty list when nothing is in flight."
-            .to_string()
+        // Absolute on purpose: `Read` rejects relative paths, and the
+        // directory sits outside the work dir `Bash` is confined to, so a
+        // relative spelling names nothing the model can reach.
+        format!(
+            "List the background jobs (detached subagents and Bash commands) still \
+             running for this conversation. A detached command's output streams to \
+             {}/<handle>.out (and .err) — Read it for live progress.",
+            crate::builtin::bash::background_output_dir(&self.workspace_paths).display()
+        )
     }
 
     fn parameters_schema(&self) -> Value {
@@ -68,10 +80,9 @@ impl Tool for JobStopTool {
     }
 
     fn description(&self) -> String {
-        "Kill one in-flight background job by its handle (from JobList, or the \
-         notice you got when it was backgrounded). The job is terminated and \
-         will NOT send a completion notification. Returns whether a matching \
-         running job was found."
+        "Kill one in-flight background job by its handle (from JobList, or its \
+         backgrounding notice). The job is terminated and will NOT send a \
+         completion notification."
             .to_string()
     }
 
@@ -79,7 +90,7 @@ impl Tool for JobStopTool {
         json!({
             "type": "object",
             "properties": {
-                "handle": { "type": "string", "description": "The job handle to stop (e.g. bg-…)." }
+                "handle": { "type": "string" }
             },
             "required": ["handle"]
         })
@@ -141,9 +152,13 @@ mod tests {
         }
     }
 
+    fn job_list() -> JobListTool {
+        JobListTool::new(WorkspacePaths::new("/tmp"))
+    }
+
     #[tokio::test]
     async fn job_list_is_empty_without_a_control() {
-        let out = JobListTool.execute(json!({}), &ctx(None)).await.unwrap();
+        let out = job_list().execute(json!({}), &ctx(None)).await.unwrap();
         let ToolOutput::Json(v) = out else {
             panic!("expected json");
         };
@@ -152,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_list_reports_in_flight_jobs() {
-        let out = JobListTool
+        let out = job_list()
             .execute(json!({}), &ctx(Some(Arc::new(FakeControl))))
             .await
             .unwrap();
@@ -189,5 +204,29 @@ mod tests {
             panic!("expected text");
         };
         assert!(t.contains("No in-flight"), "{t}");
+    }
+
+    #[test]
+    fn the_descriptions_are_compact() {
+        let listed = job_list().description();
+        assert!(
+            listed.len() <= 245,
+            "JobList description is too long: {listed}"
+        );
+        let stopped = JobStopTool.description();
+        assert!(
+            stopped.len() <= 180,
+            "JobStop description is too long: {stopped}"
+        );
+    }
+
+    #[test]
+    fn job_list_names_the_absolute_background_output_dir() {
+        let described = job_list().description();
+        let dir = crate::builtin::bash::background_output_dir(&WorkspacePaths::new("/tmp"));
+        assert!(
+            described.contains(&format!("{}/<handle>.out", dir.display())),
+            "Read rejects a relative path: {described}"
+        );
     }
 }

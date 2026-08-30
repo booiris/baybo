@@ -11,6 +11,7 @@
 //! stops the two from drifting on a check one of them quietly skips.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use baybo_model::BlobRef;
@@ -24,6 +25,12 @@ use crate::{ResourceAccess, ToolError};
 
 pub(super) const MAX_LOCAL_BLOB_BYTES: u64 = MAX_BLOB_BYTES as u64;
 pub(super) const MAX_LOCAL_BLOB_MIB: u64 = MAX_LOCAL_BLOB_BYTES / 1024 / 1024;
+
+/// The size sentence both tools' descriptions carry, rendered here so the
+/// cap is read from `MAX_LOCAL_BLOB_MIB` at one site rather than templated
+/// into each tool separately.
+pub(super) static BLOB_SIZE_CLAUSE: LazyLock<String> =
+    LazyLock::new(|| format!("Any MIME type, up to {MAX_LOCAL_BLOB_MIB} MiB."));
 
 /// Streams up to 100 MiB into `BlobStore`. On a slow disk the copy alone
 /// can take tens of seconds, so the trait-default 30 s is tight; 60 s
@@ -95,6 +102,9 @@ impl LocalBlobFile {
             .map_err(|e| ToolError::Execution(format!("blob upload: {e}")))
     }
 }
+
+pub(super) const BLOB_MIME_PARAM_DESC: &str =
+    "MIME type; defaults from the file extension, as does an empty string.";
 
 /// The MIME both tools stage under: an explicit override when the caller
 /// supplied one, otherwise the extension guess.

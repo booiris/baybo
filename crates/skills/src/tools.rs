@@ -82,15 +82,7 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> String {
-        "Load a registered skill so its instructions enter the conversation. \
-         Available skills are listed in a system reminder near the top of \
-         this conversation — invoke this tool with `skill: \"<name>\"` to \
-         pull one in. Pass `args` to \
-         forward free-form arguments. Pass `file_path` to fetch a sub-file \
-         (relative path inside the skill's directory) referenced from the \
-         main SKILL.md. Skills the operator marked untrusted or marked \
-         `disable-model-invocation: true` are not callable here."
-            .to_string()
+        "Load a registered skill so its instructions enter the conversation.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -99,15 +91,15 @@ impl Tool for SkillTool {
             "properties": {
                 SKILL_INPUT_NAME_FIELD: {
                     "type": "string",
-                    "description": "Name of the skill to load — must match an entry from the skill listing."
+                    "description": "Must match a name from the skill listing."
                 },
                 "args": {
                     "type": "string",
-                    "description": "Optional free-form arguments passed alongside the skill body. Returned as a top-level JSON field for skill authors who key off it."
+                    "description": "Optional free-form arguments passed alongside the skill body."
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Optional sub-file path relative to the skill's directory (e.g. \"references/dataset-formats.md\"). When set, the tool returns that file's contents instead of SKILL.md plus the linked-file inventory."
+                    "description": "Sub-file path relative to the skill's directory (e.g. \"references/dataset-formats.md\"); returns that file instead of SKILL.md."
                 }
             },
             "required": [SKILL_INPUT_NAME_FIELD]
@@ -534,13 +526,8 @@ impl Tool for SkillInstallTool {
 
     fn description(&self) -> String {
         "Install a skill from an on-disk directory into this session's own \
-         skills folder. Every agent has one of its own, so the skill lands in \
-         exactly the set this session can see: it shows up in the next turn's \
-         listing and in no other agent's. The source directory must contain a \
-         valid SKILL.md; the skill is run through the risk assessor \
-         (Dangerous verdicts abort the install) and the registry is \
-         hot-reloaded. Refuses to overwrite an existing installation; the old \
-         copy must be removed first."
+         skills folder. Refuses to overwrite; SkillUninstall the old copy \
+         first."
             .to_string()
     }
 
@@ -724,12 +711,8 @@ impl Tool for SkillUninstallTool {
 
     fn description(&self) -> String {
         "Remove an installed skill from this session's own skills folder. \
-         Only skills this session can see are addressable by name, and of \
-         those only the ones living under its own folder are removable — a \
-         skill reached from anywhere else (one compiled into the binary, \
-         another agent's folder, a registry-only or third-party-mounted \
-         skill) is refused rather than deleted. The registry is hot-reloaded so the skill disappears \
-         from the next turn's listing."
+         Only skills under that folder are removable; a built-in is refused, \
+         not deleted."
             .to_string()
     }
 
@@ -739,7 +722,7 @@ impl Tool for SkillUninstallTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Name of the registered skill to remove."
+                    "description": "Skill name from the listing."
                 }
             },
             "required": ["name"]
@@ -1242,6 +1225,21 @@ mod tests {
         assert_eq!(v["args"], "rollback to v3");
     }
 
+    /// Nothing else asserts on this text, and it rides every request that
+    /// offers the tool — the ceiling is what catches silent regrowth.
+    #[test]
+    fn the_skill_description_is_compact() {
+        let tool = SkillTool {
+            registry: Arc::new(SkillRegistry::new()),
+            risk_check: Arc::new(AlwaysPass),
+        };
+        let described = tool.description();
+        assert!(
+            described.len() <= 80,
+            "description is too long: {described}"
+        );
+    }
+
     #[test]
     fn manifest_is_trusted_with_no_capabilities() {
         let registry = Arc::new(SkillRegistry::new());
@@ -1331,6 +1329,17 @@ mod tests {
             registry,
             risk_check: risk,
         }
+    }
+
+    /// Unpinned elsewhere, and offered on every SharedWorkspace turn.
+    #[test]
+    fn the_install_description_is_compact() {
+        let tool = install_tool(Arc::new(SkillRegistry::new()), Arc::new(AlwaysPass));
+        let described = tool.description();
+        assert!(
+            described.len() <= 160,
+            "description is too long: {described}"
+        );
     }
 
     #[tokio::test]
@@ -1661,6 +1670,16 @@ mod tests {
 
     fn uninstall_tool(registry: Arc<SkillRegistry>) -> SkillUninstallTool {
         SkillUninstallTool { registry }
+    }
+
+    /// Unpinned elsewhere, and offered on every SharedWorkspace turn.
+    #[test]
+    fn the_uninstall_description_is_compact() {
+        let described = uninstall_tool(Arc::new(SkillRegistry::new())).description();
+        assert!(
+            described.len() <= 170,
+            "description is too long: {described}"
+        );
     }
 
     #[tokio::test]

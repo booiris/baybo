@@ -110,14 +110,9 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> String {
-        "Perform targeted string replacement inside a file. \
-         Replace `old_string` with `new_string`; when `replace_all` is \
-         false (default), `old_string` must appear exactly once — otherwise \
-         the tool fails without touching the file. Provide enough surrounding \
-         context in `old_string` to ensure a unique match.\n\n\
-         READ FIRST: you must Read the file before editing it. If it changed \
-         on disk since your last Read, Read it again — the edit is rejected \
-         until your view is current."
+        "Replace `old_string` with `new_string` in a file. `old_string` must \
+         match exactly once unless `replace_all` is true — include \
+         surrounding context to make it unique."
             .to_string()
     }
 
@@ -164,7 +159,7 @@ impl Tool for EditTool {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        require_absolute(&p.file_path, "Edit", "file_path")?;
+        require_absolute(&p.file_path, EDIT_TOOL_NAME, "file_path")?;
 
         if p.old_string == p.new_string {
             return Err(ToolError::InvalidParams(

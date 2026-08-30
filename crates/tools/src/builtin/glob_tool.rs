@@ -23,16 +23,14 @@ const NO_MATCHES_MESSAGE: &str = "No files found";
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Find files by glob pattern (e.g. `**/*.rs`), backed by ripgrep. \
-         Results are absolute paths sorted by \
-         modification time, newest first, and capped at {MAX_RESULTS} \
-         entries.\n\n\
-         PATTERN SEMANTICS: a pattern with no `/` matches a file's name \
-         at ANY depth — `*.rs` finds every Rust file under `path`, and \
-         `*` finds every file. `*` never crosses `/`, so add separators \
-         to anchor depth: `src/*.rs` matches `.rs` directly under \
-         `src/`, `**/*.rs` matches at any depth. To narrow a broad \
-         search, tighten `path` rather than widening the pattern."
+        "Find files by glob pattern (e.g. `**/*.rs`). Absolute paths, \
+         newest first, capped at {MAX_RESULTS}. Ignore files are NOT \
+         applied: build trees like `target/` match and, being newest, \
+         fill the cap first.\n\n\
+         PATTERN SEMANTICS: a pattern with no `/` matches a filename at \
+         ANY depth (`*.rs` = every Rust file under `path`). `*` never \
+         crosses `/`: `src/*.rs` matches only directly under `src/`, \
+         `**/*.rs` at any depth."
     )
 });
 
@@ -76,8 +74,8 @@ impl Tool for GlobTool {
         json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Glob pattern, relative to `path`; absolute is rejected" },
-                "path":    { "type": "string", "description": "Absolute directory to search in (required)" }
+                "pattern": { "type": "string", "description": "Glob pattern, relative to `path`" },
+                "path":    { "type": "string", "description": "Absolute directory to search in" }
             },
             "required": ["pattern", "path"]
         })

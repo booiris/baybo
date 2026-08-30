@@ -72,13 +72,23 @@ fn status_or_deleted_schema(description: &str) -> Value {
     let mut allowed = vec![UNCHANGED_ACTION];
     allowed.extend(status_values());
     allowed.push(DELETED_ACTION);
-    json!({ "type": "string", "enum": allowed, "description": description })
+    json!({
+        "type": "string",
+        "enum": allowed,
+        "default": UNCHANGED_ACTION,
+        "description": description,
+    })
 }
 
 fn status_filter_schema(description: &str) -> Value {
     let mut allowed = vec![ALL_STATUSES_FILTER];
     allowed.extend(status_values());
-    json!({ "type": "string", "enum": allowed, "description": description })
+    json!({
+        "type": "string",
+        "enum": allowed,
+        "default": ALL_STATUSES_FILTER,
+        "description": description,
+    })
 }
 
 fn parse_task_id(s: &str, field: &str) -> Result<TaskId, ToolError> {
@@ -176,7 +186,7 @@ impl Tool for TaskCreateTool {
     }
 
     fn description(&self) -> String {
-        r#"Add one or more tasks to this session's planning checklist. Use it to lay out a multi-step plan before you start, so both you and the user can track progress. Each task has a brief imperative `subject` (e.g. "Add the TaskStore table"), a `description` of what needs to be done, an optional `status` (defaults to `pending`), and optional prerequisites. Use `depends_on` for real task ids returned by an earlier call. Within this call, give prerequisite tasks a short `key` and reference those names through `depends_on_keys`; do not invent numeric or placeholder task ids. Returns the created task ids and their batch-key mapping. Convention: keep at most ONE task `in_progress` at a time — mark a task `in_progress` when you start it and `completed` the moment it's done. If a task turns out bigger or more complex than expected while you're working on it, decompose it: call `TaskCreate` again to add the finer sub-tasks and wire prerequisites rather than pushing through one giant step. To edit or delete one task use `TaskUpdate`."#
+        r#"Add one or more tasks to this session's planning checklist. Use it to lay out a multi-step plan before you start, so both you and the user can track progress. If a task turns out bigger or more complex than expected, call `TaskCreate` again to add the finer sub-tasks and wire prerequisites."#
             .to_string()
     }
 
@@ -190,14 +200,14 @@ impl Tool for TaskCreateTool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "key": { "type": "string", "description": "Optional name used only by this call so later entries can depend on this task through `depends_on_keys`. An empty string means unset." },
-                            "subject": { "type": "string", "description": "Brief imperative title of the task." },
-                            "description": { "type": "string", "description": "What needs to be done — the task body." },
-                            "status": status_schema("Initial status; defaults to `pending`."),
+                            "key": { "type": "string", "description": "Name that later entries in this same call can reference through `depends_on_keys`. An empty string means unset." },
+                            "subject": { "type": "string", "minLength": 1, "description": "Brief imperative title, e.g. \"Add the TaskStore table\"." },
+                            "description": { "type": "string", "minLength": 1, "description": "What needs to be done — the task body." },
+                            "status": status_schema("Leave `pending` unless you are starting this task now — at most one `in_progress` at a time."),
                             "depends_on": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Real task ids returned by earlier TaskCreate or TaskList calls that must complete first (advisory). Do not put batch keys or list positions here."
+                                "description": "Real task ids from an earlier TaskCreate or TaskList result, which must complete first (advisory). Never a batch key, a list position, or an invented number — for tasks created in this same call use `depends_on_keys`."
                             },
                             "depends_on_keys": {
                                 "type": "array",
@@ -370,16 +380,14 @@ impl Tool for TaskListTool {
     }
 
     fn description(&self) -> String {
-        "List this session's planning-checklist tasks with their status — the \
-         at-a-glance progress view. Optionally filter by `status`."
-            .to_string()
+        "List this session's planning-checklist tasks with their status.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "status": status_filter_schema("Only return tasks with this status. Use `all` when the strict schema requires a value but no filter is wanted.")
+                "status": status_filter_schema("Only return tasks with this status; `all` is the no-filter value.")
             }
         })
     }
@@ -447,7 +455,7 @@ impl Tool for TaskGetTool {
         json!({
             "type": "object",
             "properties": {
-                "id": { "type": "string", "description": "Task id to retrieve." }
+                "id": { "type": "string" }
             },
             "required": ["id"]
         })
@@ -509,7 +517,7 @@ impl Tool for TaskUpdateTool {
     }
 
     fn description(&self) -> String {
-        r#"Update or delete one task in the session checklist by `id`. Set `status` to move it through `pending` -> `in_progress` -> `completed`, or to `deleted` to remove the task entirely. You can also edit its `subject` / `description` / `depends_on`. Only the fields you pass change. Mark a task `in_progress` when you start it (one at a time) and `completed` the moment it's done so the checklist reflects reality. When you split a task into finer sub-tasks, narrow this task's scope (edit its `subject`/`description`), or set `status` to `deleted` if the sub-tasks fully replace it."#
+        r#"Update or delete one task in the session checklist by `id`. Only the fields you pass change. Mark a task `in_progress` when you start it (one at a time) and `completed` the moment it's done. After splitting a task, narrow its `subject`/`description` to what is left, or set `status` to `deleted` if the sub-tasks fully replace it."#
             .to_string()
     }
 
@@ -517,8 +525,8 @@ impl Tool for TaskUpdateTool {
         json!({
             "type": "object",
             "properties": {
-                "id": { "type": "string", "description": "Task id to update." },
-                "status": status_or_deleted_schema("New status, `deleted` to remove the task, or `unchanged` when the strict schema requires a value but status is not changing."),
+                "id": { "type": "string" },
+                "status": status_or_deleted_schema("New status; `deleted` removes the task, `unchanged` is the inert filler."),
                 "subject": { "type": "string", "description": "New brief title. An empty string means unchanged." },
                 "description": { "type": "string", "description": "New task body. An empty string means unchanged." },
                 "depends_on": {

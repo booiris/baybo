@@ -324,7 +324,7 @@ impl Tool for WebSearchTool {
                 "query": {
                     "type": "string",
                     "minLength": MIN_QUERY_CHARS,
-                    "description": "The search query. Include the year for anything time-sensitive."
+                    "description": "Include the year for anything time-sensitive."
                 },
                 "allowed_domains": {
                     "type": "array",
@@ -336,12 +336,12 @@ impl Tool for WebSearchTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "maxItems": MAX_DOMAIN_FILTER_ENTRIES,
-                    "description": "Never return results from these domains. Mutually exclusive with allowed_domains."
+                    "description": "Never return results from these domains. Same bare-hostname form."
                 },
                 "freshness": {
                     "type": "string",
                     "enum": [ANY_FRESHNESS, "day", "week", "month", "year"],
-                    "description": "Prefer results from this window. Use `any` when the strict schema requires a value but no freshness filter is wanted."
+                    "description": "Prefer results from this window; `any` applies no filter."
                 }
             },
             "required": ["query"],

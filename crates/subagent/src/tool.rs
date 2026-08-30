@@ -59,21 +59,9 @@ pub const DEFAULT_MAX_SUBAGENTS_PER_ROOT: u32 = 8;
 /// forever. Pegged well above any realistic depth.
 const MAX_LINEAGE_WALK_HOPS: u32 = 128;
 
-const STATIC_DESCRIPTION: &str = r#"Spawn a child subagent — a fresh, independent agent session — to investigate
-or perform a focused sub-task. Use when the work is decomposable: the
-parent agent stays focused on the conversation while the subagent
-runs to completion and returns a single final message.
+const STATIC_DESCRIPTION: &str = r#"Spawn a child subagent — a fresh, independent agent session — for a focused, decomposable sub-task. The call blocks until its final message, which is all you get back; intermediate tool output is not surfaced.
 
-The call blocks until the subagent's final message, which is all you
-get back; intermediate tool output is not surfaced.
-
-Pick the most specific `subagent_type` from the catalogue below, and
-fall back to `general-purpose` only when none fits; an unknown one is a
-hard error, not a soft fallback. Each spawn is a fresh LLM cost stream,
-so use them sparingly — but when sub-tasks are independent, emit their
-`spawn_subagent` blocks IN ONE message so they run concurrently rather
-than serialising. A subagent may spawn its own, under a hard depth cap;
-one or two specialists per parent is the shape that pays.
+Pick the most specific `subagent_type` from the catalogue below, falling back to `general-purpose` only when none fits. Each spawn is a fresh LLM cost stream, so use them sparingly — but when sub-tasks are independent, emit their `spawn_subagent` blocks IN ONE message so they run concurrently rather than serialising. A subagent may spawn its own, under a hard depth cap; one or two specialists per parent is the shape that pays.
 
 Its final message reports what it INTENDED to do, not necessarily what
 landed — verify a claimed change with `Read` or `git diff` before
@@ -466,17 +454,23 @@ fn catalogue_blurb(description: &str) -> std::borrow::Cow<'_, str> {
 /// only actionable once the model has decided to spawn one — as prose in the
 /// always-on description it was ~170 tokens charged on every call of every
 /// session, including the overwhelming majority that never dispatch anything.
-const PROMPT_FIELD_DESCRIPTION: &str = r#"Self-contained brief the subagent sees as its first user message. It has NOT seen this conversation, so brief it like a teammate who just sat down: goal in a sentence or two, then the facts. Include exact paths and line numbers (`crate/foo.rs:123`) rather than making it re-find what you already located, and the span or turn ids if it has to hop across traces. If the task is a fix, say what to change — pushing the synthesis back onto it ("based on your findings, decide what to do") gives away the point of dispatching one. Ask for short output if you want it."#;
+const PROMPT_FIELD_DESCRIPTION: &str = r#"Self-contained brief the subagent sees as its first user message. It has NOT seen this conversation, so brief it like a teammate who just sat down: goal in a sentence or two, then the facts. Include exact paths and line numbers (`crate/foo.rs:123`) rather than making it re-find what you already located. If the task is a fix, say what to change — pushing the synthesis back onto it ("based on your findings, decide what to do") gives away the point of dispatching one. Ask for short output if you want it."#;
 
-fn parameters_schema() -> Value {
+/// `registered` is the live profile list, so the model gets the legal names as
+/// an `enum` rather than a prose pointer at the catalogue in the description.
+/// An empty registry would serialize as `"enum": []`, which admits no value at
+/// all, so the bare string stands in until a profile registers.
+fn parameters_schema(registered: &[String]) -> Value {
+    let subagent_type = if registered.is_empty() {
+        json!({ "type": "string" })
+    } else {
+        json!({ "type": "string", "enum": registered })
+    };
     json!({
         "type": "object",
         "required": ["subagent_type", "description", "prompt"],
         "properties": {
-            "subagent_type": {
-                "type": "string",
-                "description": "Name of a registered SubagentProfile (see live list in the description). Unknown values return an error."
-            },
+            "subagent_type": subagent_type,
             "description": {
                 "type": "string",
                 "description": "Short (3-5 word) task summary. Trace/UI display only — does NOT seed the subagent's context."
@@ -488,7 +482,7 @@ fn parameters_schema() -> Value {
             "model_tier": {
                 "type": "string",
                 "enum": [DEFAULT_MODEL_TIER, "lite", "balanced", "deep"],
-                "description": "Coarse model selection. Use `default` to fall back to the profile's default_tier, then the pool default. Only applies to backend='baybo'."
+                "description": "Coarse model selection; `default` uses the profile's own default tier. Only applies to backend='baybo'."
             },
             "backend": {
                 "type": "string",
@@ -497,7 +491,7 @@ fn parameters_schema() -> Value {
             },
             "background": {
                 "type": "boolean",
-                "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Works for any backend; especially useful for long external (claude/codex) runs."
+                "description": "Return a handle immediately instead of blocking on the child. Any backend; best for long external (claude/codex) runs."
             },
             "on_timeout": {
                 "type": "string",
@@ -506,7 +500,7 @@ fn parameters_schema() -> Value {
             },
             "group": {
                 "type": "string",
-                "description": "Barrier cohort name. Spawn several subagents with the SAME group in one turn to run them in parallel and get a SINGLE merged notification only once they ALL finish — instead of a separate notification per subagent. Grouped subagents always run in the background (they never block this turn). Use when you fan out a batch of related tasks and want to react to the whole set at once."
+                "description": "Barrier cohort name. Subagents sharing a group, spawned in one turn, run in parallel and deliver ONE merged notification once they ALL finish, instead of one each. A group always runs in the background."
             },
             "resume_session_id": {
                 "type": "string",
@@ -548,7 +542,13 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        parameters_schema()
+        let registered: Vec<String> = self
+            .registry
+            .all_summaries_sorted()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        parameters_schema(&registered)
     }
 
     fn max_timeout(&self) -> Duration {
@@ -1272,6 +1272,39 @@ mod tests {
             catalogue_blurb(&sentence),
             format!("Finds {}things.", "many ".repeat(40))
         );
+    }
+
+    /// The catalogue in the description names the profiles; the schema has to
+    /// constrain them too, or a wrong name is only caught at execution.
+    #[test]
+    fn subagent_type_enumerates_the_registered_profiles() {
+        let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
+            spawner: unwired_spawner(),
+            registry: registry_with_builtins(),
+            sessions: empty_session_manager(),
+            dispatch_limiter: unbounded_limiter(),
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        });
+        let schema = tool.parameters_schema();
+        let names = schema["properties"]["subagent_type"]["enum"]
+            .as_array()
+            .expect("subagent_type carries an enum");
+        assert_eq!(
+            names.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            ["explorer", "general-purpose", "planner", "reviewer"],
+            "enum mirrors the sorted catalogue"
+        );
+    }
+
+    /// Serializing an empty registry as `"enum": []` would admit no value at
+    /// all, making the tool uncallable rather than merely unconstrained.
+    #[test]
+    fn subagent_type_stays_a_bare_string_with_no_profiles_registered() {
+        let schema = parameters_schema(&[]);
+        let field = &schema["properties"]["subagent_type"];
+        assert_eq!(field["type"], "string");
+        assert!(field.get("enum").is_none(), "no empty enum: {field}");
     }
 
     #[test]

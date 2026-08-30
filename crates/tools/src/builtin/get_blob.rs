@@ -54,7 +54,7 @@ const TOOL_NAME: &str = "GetBlob";
 /// `channels: [owner]` while this tool is unrestricted, so on a Telegram
 /// session "the inverse of PutBlob" would point at a tool the model cannot
 /// see.
-const DESCRIPTION: &str = r#"Resolve a blob to its file on disk and return the absolute path.
+const DESCRIPTION: &str = r#"Resolve a blob to its file on disk: absolute path, mime type, size.
 
 Reach for it whenever something needs a FILE — an external CLI, a skill's script, a Bash pipeline. The path cannot be derived from a blob_id by hand; this is the only way to get one. Ids ride in the `blob` field of an Image / Audio / File block, or in a tool result.
 

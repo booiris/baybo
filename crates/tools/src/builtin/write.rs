@@ -60,12 +60,8 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> String {
-        "Create or overwrite a file with the provided content. \
-         Prefer `Edit` for modifying \
-         existing files — only use `Write` for new files or complete \
-         rewrites. Overwriting a file that already exists requires you to \
-         have Read it first (and it must be unchanged since); creating a new \
-         file does not. Parent directories must already exist."
+        "Create or overwrite a file. Prefer `Edit` for existing files; only \
+         use `Write` for new files or full rewrites. Parent dirs must exist."
             .to_string()
     }
 
@@ -303,6 +299,15 @@ mod tests {
         assert!(
             matches!(err, ToolError::Execution(ref m) if m.contains("changed on disk")),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_description_is_compact() {
+        let described = tool().description();
+        assert!(
+            described.len() <= 155,
+            "description is too long: {described}"
         );
     }
 

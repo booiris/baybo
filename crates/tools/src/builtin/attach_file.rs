@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::blob_upload::{
-    BLOB_TOOL_TIMEOUT, LocalBlobFile, MAX_LOCAL_BLOB_BYTES, MAX_LOCAL_BLOB_MIB,
+    BLOB_MIME_PARAM_DESC, BLOB_SIZE_CLAUSE, BLOB_TOOL_TIMEOUT, LocalBlobFile, MAX_LOCAL_BLOB_BYTES,
     path_progress_label, path_read_access, resolve_mime_type,
 };
 use crate::{
@@ -23,12 +23,12 @@ use crate::{
 const TOOL_NAME: &str = "AttachFile";
 const MAX_BYTES: u64 = MAX_LOCAL_BLOB_BYTES;
 
-const DESCRIPTION_TEMPLATE: &str = r#"Give the user a local file — it arrives as an attachment in the chat. Any MIME type, up to {{max_mib}} MiB. Use it instead of pasting binary or large text into a message, and don't paste the contents after attaching.
+const DESCRIPTION_TEMPLATE: &str = r#"Give the user a local file — it arrives as an attachment in the chat. {{size_clause}} Use it instead of pasting binary or large text into a message, and don't paste the contents after attaching.
 
 DELIVERY: the file attaches to your FINAL reply, not to this call; several calls in one turn share that reply."#;
 
 static DESCRIPTION: LazyLock<String> =
-    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_LOCAL_BLOB_MIB.to_string()));
+    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{size_clause}}", BLOB_SIZE_CLAUSE.as_str()));
 
 pub struct AttachFileTool {
     blob_store: Arc<dyn BlobStore>,
@@ -73,11 +73,11 @@ impl Tool for AttachFileTool {
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Optional override for the filename shown to the recipient. Defaults to the path's basename; an empty string also uses that default."
+                    "description": "Name shown to the recipient; defaults to the path's basename, as does an empty string."
                 },
                 "mime_type": {
                     "type": "string",
-                    "description": "Optional MIME type override. Defaults to an extension-based guess; an empty string also uses that default."
+                    "description": BLOB_MIME_PARAM_DESC
                 }
             },
             "required": ["path"]

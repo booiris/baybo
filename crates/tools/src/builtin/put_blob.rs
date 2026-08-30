@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::blob_upload::{
-    BLOB_TOOL_TIMEOUT, LocalBlobFile, MAX_LOCAL_BLOB_BYTES, MAX_LOCAL_BLOB_MIB,
-    path_progress_label, path_read_access, resolve_mime_type,
+    BLOB_MIME_PARAM_DESC, BLOB_SIZE_CLAUSE, BLOB_TOOL_TIMEOUT, LocalBlobFile, MAX_LOCAL_BLOB_BYTES,
+    MAX_LOCAL_BLOB_MIB, path_progress_label, path_read_access, resolve_mime_type,
 };
 use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
@@ -21,12 +21,12 @@ use crate::{
 
 const TOOL_NAME: &str = "PutBlob";
 const MAX_BYTES: u64 = MAX_LOCAL_BLOB_BYTES;
-const DESCRIPTION_TEMPLATE: &str = r#"Store a local file in BlobStore and return its capability id for another tool or response protocol to reference. This does NOT send or attach the file to the user; use AttachFile when the file itself should appear in the final reply. Any MIME type, up to {{max_mib}} MiB.
+const DESCRIPTION_TEMPLATE: &str = r#"Store a local file in BlobStore and return its capability id for another tool or response protocol to reference. This does NOT send or attach the file to the user; use AttachFile when the file itself should appear in the final reply. {{size_clause}}
 
-`path` must be absolute. `mime_type` defaults from the extension. `max_bytes` can impose a smaller use-case-specific cap. The returned `blob_id` is a bearer read capability; expose it only through the protocol that requested it. Sensitive paths are blocked."#;
+The returned `blob_id` is a bearer read capability; expose it only through the protocol that requested it."#;
 
 static DESCRIPTION: LazyLock<String> =
-    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_LOCAL_BLOB_MIB.to_string()));
+    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{size_clause}}", BLOB_SIZE_CLAUSE.as_str()));
 
 struct PutBlobTool {
     blob_store: Arc<dyn BlobStore>,
@@ -63,17 +63,17 @@ impl Tool for PutBlobTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the local file to store."
+                    "description": "Absolute path. Sensitive paths (SSH keys, .env, …) are blocked."
                 },
                 "mime_type": {
                     "type": "string",
-                    "description": "Optional MIME type. Defaults from the file extension; an empty string also uses that default."
+                    "description": BLOB_MIME_PARAM_DESC
                 },
                 "max_bytes": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": MAX_BYTES,
-                    "description": "Optional smaller upload cap for the calling protocol. Use `0` when the strict schema requires a value but the default cap is wanted."
+                    "description": format!("Smaller upload cap for the calling protocol; `0` uses the default {MAX_LOCAL_BLOB_MIB} MiB cap.")
                 }
             },
             "required": ["path"]

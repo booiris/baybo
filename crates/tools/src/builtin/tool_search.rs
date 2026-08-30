@@ -69,9 +69,7 @@ impl Tool for ToolSearchTool {
         // Static on purpose: a description that enumerated live servers
         // would change the advertised tool block whenever one connects,
         // which is exactly the cache churn deferral exists to remove.
-        "Find deferred MCP tools (not in your tool list); call them via \
-         ToolInvoke. Empty query lists all servers and tool names."
-            .to_string()
+        "Find deferred MCP tools (not in your tool list); call them via ToolInvoke.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -80,12 +78,13 @@ impl Tool for ToolSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords (fuzzy) or comma-separated tool names (exact); empty lists everything."
+                    "description": "Search terms; empty lists everything."
                 },
                 "kind": {
                     "type": "string",
                     "enum": ["fuzzy", "exact"],
-                    "description": "fuzzy (default) ranks by relevance; exact returns schemas for the names in query."
+                    "default": "fuzzy",
+                    "description": "fuzzy ranks by relevance; exact returns schemas for the comma-separated names in query."
                 },
                 "server": {
                     "type": "string",
@@ -95,10 +94,10 @@ impl Tool for ToolSearchTool {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_MAX_RESULTS,
-                    "description": "Full schemas per call (default 8); the rest return names only."
+                    "default": DEFAULT_MAX_RESULTS,
+                    "description": "Full schemas per call; the rest are names only."
                 }
-            },
-            "additionalProperties": false
+            }
         })
     }
 
@@ -606,6 +605,42 @@ mod tests {
             "guidance names the shape: {msg}"
         );
         assert!(msg.contains(TOOL_SEARCH_NAME));
+    }
+
+    #[test]
+    fn the_description_is_compact() {
+        let described = ToolSearchTool {
+            index: ToolRegistry::new().deferred_tool_index(),
+        }
+        .description();
+        assert!(
+            described.len() <= 85,
+            "description is too long: {described}"
+        );
+    }
+
+    #[test]
+    fn the_schema_carries_the_empty_and_exact_query_shapes() {
+        let schema = ToolSearchTool {
+            index: ToolRegistry::new().deferred_tool_index(),
+        }
+        .parameters_schema();
+        let props = &schema["properties"];
+        assert!(
+            props["query"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("empty lists everything"),
+            "{props}"
+        );
+        assert!(
+            props["kind"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("comma-separated"),
+            "{props}"
+        );
+        assert_eq!(props["max_results"]["default"], DEFAULT_MAX_RESULTS);
     }
 
     #[test]

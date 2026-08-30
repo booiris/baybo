@@ -45,9 +45,6 @@ impl Tool for SecretAddTool {
     fn description(&self) -> String {
         "Store a user secret (e.g. an API token) under an environment-variable name so shell \
          commands can use it via the Bash tool's `secret_env` without you ever seeing the value. \
-         Pass the secret as `value`; if it arrived in chat as a redacted placeholder, pass that \
-         placeholder verbatim — it resolves to the real value at the execution boundary and is \
-         never written to the transcript. Set `overwrite: true` to replace an existing name. \
          Values are write-only: no tool ever returns them."
             .to_string()
     }
@@ -56,8 +53,8 @@ impl Tool for SecretAddTool {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "Env-var-style name, e.g. OPENAI_API_KEY (must match [A-Za-z_][A-Za-z0-9_]*)" },
-                "value": { "type": "string", "description": "The secret value, or a redacted placeholder that resolves to it" },
+                "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "Env-var-style name, e.g. OPENAI_API_KEY" },
+                "value": { "type": "string", "description": "The secret value. If it arrived in chat as a redacted placeholder, pass that placeholder verbatim — it is revealed at the execution boundary and never enters the transcript." },
                 "overwrite": { "type": "boolean", "default": false, "description": "Replace the value if the name already exists" }
             },
             "required": ["name", "value"],
@@ -95,13 +92,12 @@ impl Tool for SecretListTool {
     }
 
     fn description(&self) -> String {
-        "List the names of stored user secrets (names only — values are never returned). Use \
-         these names with SecretCheck or the Bash tool's `secret_env`."
+        "List the names of stored user secrets. Use these names with the Bash tool's `secret_env`."
             .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        json!({ "type": "object", "properties": {} })
     }
 
     async fn execute(&self, _params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -129,16 +125,14 @@ impl Tool for SecretCheckTool {
     }
 
     fn description(&self) -> String {
-        "Check whether named user secrets exist before relying on them (e.g. in the Bash tool's \
-         `secret_env`). Returns a name→boolean map; never returns values."
-            .to_string()
+        "Check whether named user secrets exist before relying on them.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "names": { "type": "array", "items": { "type": "string" }, "description": "Secret names to check" }
+                "names": { "type": "array", "items": { "type": "string" } }
             },
             "required": ["names"],
             "additionalProperties": false

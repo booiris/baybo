@@ -19,7 +19,7 @@ use crate::{
 pub const READ_TOOL_NAME: &str = "Read";
 
 const DEFAULT_LIMIT: usize = 800;
-const MAX_LIMIT: usize = 50_00;
+const MAX_LIMIT: usize = 5_000;
 const MAX_LINE_BYTES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
@@ -117,19 +117,7 @@ pub fn paginate_numbered(content: &str, offset: Option<usize>, limit: Option<usi
 }
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "Read the contents of a file from the local filesystem. \
-         Supports optional `offset` (1-based starting line) and `limit` \
-         (max lines, default {DEFAULT_LIMIT}, capped at {MAX_LIMIT}). Long \
-         individual lines are truncated to {MAX_LINE_BYTES} bytes (at a \
-         UTF-8 char boundary). Files larger than {MAX_FILE_MIB} MiB are \
-         only scanned for the first {MAX_FILE_MIB} MiB of content. Output \
-         is formatted with line numbers for easy reference."
-    )
-});
-
-static LIMIT_DESC: LazyLock<String> = LazyLock::new(|| {
-    format!("Maximum number of lines to read (default {DEFAULT_LIMIT}, max {MAX_LIMIT})")
+    format!("Read a file. Output is line-numbered; lines are truncated at {MAX_LINE_BYTES} bytes.")
 });
 
 pub struct ReadTool;
@@ -158,8 +146,8 @@ impl Tool for ReadTool {
             "type": "object",
             "properties": {
                 "file_path": { "type": "string", "description": "Absolute path; relative is rejected" },
-                "offset": { "type": "integer", "minimum": 0, "description": "Line number to start reading from (1-based). Use `0` when the strict schema requires a value but reading should start at line 1." },
-                "limit": { "type": "integer", "minimum": 0, "description": format!("{}. Use `0` when the strict schema requires a value but the default is wanted.", &*LIMIT_DESC) }
+                "offset": { "type": "integer", "description": "First line to read (1-based). Use `0` for line 1." },
+                "limit": { "type": "integer", "default": DEFAULT_LIMIT, "maximum": MAX_LIMIT, "description": "Max lines. Use `0` for the default." }
             },
             "required": ["file_path"]
         })
@@ -456,6 +444,15 @@ mod tests {
                 }))
                 .as_deref(),
             Some("/data/baybo/crates/tools/src/builtin/read.rs"),
+        );
+    }
+
+    #[test]
+    fn the_description_is_compact() {
+        let described = ReadTool.description();
+        assert!(
+            described.len() <= 85,
+            "description is too long: {described}"
         );
     }
 

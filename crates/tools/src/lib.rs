@@ -158,9 +158,13 @@ pub trait Tool: Send + Sync {
     /// be in front of the model at all. Naming it and then explaining when it
     /// does nothing costs tokens on every request and still gets tried.
     ///
-    /// Vary only on the trigger. It is fixed for a session's whole life, so
-    /// the offered schema is too, which is what the prompt-cache prefix
-    /// needs.
+    /// Vary on the trigger by default: it is fixed for a session's whole
+    /// life, so the offered schema is too, which is what the prompt-cache
+    /// prefix needs. Live, hot-swappable state is admissible only where
+    /// [`Self::description`] already re-renders with it — Bash's permission
+    /// mode is the one such case — because the two are rebuilt together, so
+    /// anything that reskins the description has already invalidated the
+    /// prefix and the schema costs nothing further.
     fn parameters_schema_for(&self, _trigger: &TriggerSource) -> Value {
         self.parameters_schema()
     }

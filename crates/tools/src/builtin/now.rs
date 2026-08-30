@@ -32,7 +32,7 @@ impl Tool for NowTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        json!({ "type": "object", "properties": {} })
     }
 
     async fn execute(&self, _params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {

@@ -30,17 +30,9 @@ const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Search file contents with a regular expression by spawning the \
-         `rg` (ripgrep) binary. `output_mode` may be `content` (matching lines), \
-         `files_with_matches` (default, paths only), or `count` (match \
-         counts per file). Supports file-type filtering via the `glob` \
-         parameter. Sensitive paths (SSH/AWS/GPG configs, .env, \
-         /etc/shadow, …) are filtered out of the output so their contents \
-         never enter the result.\n\n\
-         BEFORE SEARCHING: For an unfamiliar directory, first probe its \
-         scale with `Glob` (e.g. count entries) and narrow the search root \
-         or `glob` filter accordingly. Files larger than {MAX_FILE_MIB} MiB \
-         are skipped, and per-mode results are capped at {MAX_HITS}."
+        "Search file contents with a regular expression. Sensitive paths \
+         (.env, SSH/AWS keys, …) are filtered out of the results. Skips \
+         files excluded by .gitignore and files over {MAX_FILE_MIB} MiB."
     )
 });
 
@@ -95,8 +87,8 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern":          { "type": "string", "description": "Rust-flavor regex" },
-                "path":             { "type": "string", "description": "Absolute directory to search (required)" },
-                "glob":             { "type": "string", "description": "Filename glob to filter files (e.g. `*.rs`). An empty string means no filename filter." },
+                "path":             { "type": "string", "description": "Absolute file or directory" },
+                "glob":             { "type": "string", "description": "Filename glob (e.g. `*.rs`). Empty = no filter." },
                 "case_insensitive": { "type": "boolean", "default": false },
                 "output_mode":      {
                     "type": "string",

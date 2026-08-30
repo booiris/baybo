@@ -83,6 +83,12 @@ use parse::{
 const MAX_OUTPUT_BYTES: usize = 2 * baybo_model::MAX_TOOL_OUTPUT_BYTES;
 /// Cap for the one-line command digest logged on sandbox-bypass events.
 const COMMAND_HEAD_MAX_CHARS: usize = 160;
+/// [`Tool::max_timeout`] for Bash, and the `maximum` advertised for
+/// `timeout_ms`: builds, test suites and migration scripts are all fair game
+/// here, so the trait default 30 s would clip anything non-trivial. Beyond
+/// this the executor's own deadline starts racing the background handoff, so
+/// a larger budget buys the model nothing.
+const MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// One-line, log-safe digest of a shell command for a structured log
 /// field: the first line with control chars flattened via `escape_debug`
@@ -155,8 +161,7 @@ const AUTO_APPROVAL: &str = r#"APPROVAL: Commands are sandboxed by default. Dest
 
 /// `{{approval}}` for `permission = free`.
 #[cfg(not(feature = "bench-bash"))]
-const FREE_APPROVAL: &str =
-    r#"APPROVAL: Default calls run directly without Bash approval or sandbox-failure escalation."#;
+const FREE_APPROVAL: &str = r#"APPROVAL: Commands run directly; no approval prompt."#;
 
 // ── Prompt sections for the `bench-bash` profile: raw container exec ──────────
 // No OS sandbox, no work-dir jail, no uv shim, inherited cwd, no gate. Compiled
@@ -715,17 +720,31 @@ impl Tool for BashTool {
         out
     }
 
-    /// Withholds `on_timeout` where detaching is refused. Without a
-    /// background host a slow command is killed whatever this says, so
-    /// offering the knob is offering a choice the runtime does not have —
+    /// Withholds `on_timeout` where detaching is refused, and the escalation
+    /// pair where the route already skips the OS sandbox. Without a
+    /// background host a slow command is killed whatever `on_timeout` says,
     /// and the timeout the model picks is then the only thing standing
-    /// between a long build and losing its work.
+    /// between a long build and losing its work; under `free`/bench
+    /// [`SandboxPermissions::requires_approval`] is structurally false, so
+    /// `sandbox_permissions` cannot change a route that is already
+    /// unsandboxed and `justification` is only ever rendered by the prompt
+    /// that knob raises. Offering either is offering a choice the runtime
+    /// has already made.
+    ///
+    /// This is the one schema that varies on the live permission and not
+    /// just the trigger. It costs no extra prompt-cache invalidation:
+    /// `description()` is permission-skinned too and is rebuilt beside the
+    /// schema on every definition build.
     fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
         let mut schema = self.parameters_schema();
-        if !trigger.can_host_background_jobs()
-            && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
-        {
-            props.remove("on_timeout");
+        if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            if !trigger.can_host_background_jobs() {
+                props.remove("on_timeout");
+            }
+            if permission_skips_os_sandbox(self.permission()) {
+                props.remove("sandbox_permissions");
+                props.remove("justification");
+            }
         }
         schema
     }
@@ -734,18 +753,18 @@ impl Tool for BashTool {
         let sandbox_permissions_description = if BENCH {
             "This benchmark profile already runs without an OS sandbox or approval gate, so both values have the same effect."
         } else {
-            "Keep 'use_default' unless the user explicitly asks to run this command without the OS sandbox. Only then use 'require_escalated'; Baybo shows the exact command for approval before changing a sandboxed route to unsandboxed. If permission is 'free', the command is already unsandboxed and no approval is shown."
+            "Use 'require_escalated' only when the user explicitly asks to run this command without the OS sandbox; Baybo then shows the exact command for approval before switching a sandboxed route to unsandboxed."
         };
         json!({
             "type": "object",
             "properties": {
-                "command":    { "type": "string", "description": "The shell command to run" },
+                "command":    { "type": "string" },
                 "sandbox_permissions": { "type": "string", "enum": ["use_default", "require_escalated"], "default": "use_default", "description": sandbox_permissions_description },
                 "justification": { "type": "string", "description": "A concise user-facing question or reason explaining why this command needs unsandboxed execution. Shown only when sandbox_permissions is 'require_escalated' and the configured route is sandboxed. An empty string uses a generic prompt; omit it for 'use_default' or permission 'free'." },
-                "timeout_ms": { "type": "integer", "minimum": 0, "description": "Per-command timeout in ms. Use `0` to fall back to the tool context timeout." },
-                "cwd":        { "type": "string", "description": "Working directory for the command. An empty string uses the session work directory." },
+                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": MAX_TIMEOUT_MS, "description": "Use `0` for the tool-context default." },
+                "cwd":        { "type": "string", "description": "An empty string uses the default cwd." },
                 "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
-                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' terminates it and returns a timeout error." }
+                "on_timeout": { "type": "string", "enum": ["background", "kill"], "default": "background", "description": "'background' detaches the command and delivers its result in a later turn; 'kill' terminates it and returns a timeout error." }
             },
             "required": ["command"]
         })
@@ -778,12 +797,7 @@ impl Tool for BashTool {
     }
 
     fn max_timeout(&self) -> Duration {
-        // Builds, test suites and migration scripts are all fair game
-        // through Bash, so the trait default 30 s would clip anything
-        // non-trivial. Cap the *outer* deadline at 10 min; per-call
-        // `timeout_ms` (and the in-tool sandbox spawn) still tighten
-        // further.
-        Duration::from_secs(600)
+        Duration::from_millis(MAX_TIMEOUT_MS)
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {

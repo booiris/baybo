@@ -121,7 +121,7 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
-            BashTool::new(workspace_paths, Arc::clone(&process_manager))
+            BashTool::new(workspace_paths.clone(), Arc::clone(&process_manager))
                 .with_permission_handle(permission),
             vec![ToolCapability::ExecCommand],
         ),
@@ -144,7 +144,7 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
         trusted(secret::SecretAddTool, vec![]),
         trusted(secret::SecretListTool, vec![]),
         trusted(secret::SecretCheckTool, vec![]),
-        trusted(JobListTool, vec![]),
+        trusted(JobListTool::new(workspace_paths), vec![]),
         trusted(JobStopTool, vec![]),
     ];
     if builtin_memory {

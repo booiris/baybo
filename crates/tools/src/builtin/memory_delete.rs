@@ -37,11 +37,9 @@ use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 /// every audit commit have to agree.
 const MEMORY_DELETE_TOOL_NAME: &str = "MemoryDelete";
 
-const DESCRIPTION: &str = r#"Delete one file from your memory directory, when what it records has turned out to be wrong, obsolete, or superseded by another memory.
+const DESCRIPTION: &str = r#"Delete one file from your own memory directory.
 
-Only paths inside a memory tree are accepted — anything else is refused outright, so this can never be used as a general-purpose delete. Remove the file's line from MEMORY.md in the same breath, or the index will point at nothing.
-
-The deletion is committed to the memory directory's git history, so it can be recovered later if it turns out to have been a mistake."#;
+Only paths inside a memory tree are accepted; anything else is refused."#;
 
 pub struct MemoryDeleteTool {
     roots: ManagedRoots,
@@ -123,7 +121,7 @@ impl Tool for MemoryDeleteTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path of the memory file to delete"
+                    "description": "Absolute path"
                 }
             },
             "required": ["file_path"],
@@ -209,6 +207,20 @@ mod tests {
         assert!(!line_names_file("- [Data](data.md) — hook", "a.md"));
         assert!(!line_names_file("- [Other](a.markdown) — hook", "a.md"));
         assert!(!line_names_file("- [Nested](sub/xa.md) — hook", "a.md"));
+    }
+
+    /// The scope word is load-bearing and unpinned anywhere else: a
+    /// cross-agent path is refused with "…is not one", which is wrong for a
+    /// path that *is* inside a memory directory, so the description is the
+    /// only correct statement of that boundary.
+    #[test]
+    fn the_description_is_compact_and_keeps_the_scope() {
+        let described = MemoryDeleteTool::new(WorkspacePaths::new("/tmp")).description();
+        assert!(
+            described.len() <= 138,
+            "description is too long: {described}"
+        );
+        assert!(described.contains("your own"), "got: {described}");
     }
 
     fn ctx() -> ToolContext {
