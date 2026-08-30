@@ -140,9 +140,10 @@ sandbox. This second approval is intentionally separate from the first approval:
 an unsandboxed retry has a wider privilege boundary than the original sandboxed
 run.
 
-File-content viewer redirects that Bash rejects up front, such as `cat foo` or
-`sed -i ...`, are refused before approval. Asking the user would not make those
-commands valid.
+File-reading and file-editing shell commands follow the same route as every
+other Bash command. In `manual`, commands such as `cat foo` and `sed -i ...`
+therefore require approval and then execute in the sandbox; Baybo does not
+force the model to replace them with `Read` or `Edit`.
 
 ### `free`
 

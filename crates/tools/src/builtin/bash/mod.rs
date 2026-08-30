@@ -793,8 +793,6 @@ impl Tool for BashTool {
         // default pre-execution approval entirely. `require_escalated` owns an
         // uncached prompt inside `execute`: a cached approval for the same
         // sandboxed command must never authorize its unsandboxed form.
-        // FileToolRedirect commands are rejected before any spawn, so asking
-        // would be noise.
         if BENCH
             || sandbox_permissions_from_params(params) == SandboxPermissions::RequireEscalated
             || self.permission() != BashPermissionMode::Manual
@@ -804,7 +802,6 @@ impl Tool for BashTool {
         params
             .get("command")
             .and_then(|v| v.as_str())
-            .filter(|s| !is_file_tool_redirect(s))
             .map(|s| {
                 vec![ResourceAccess::ExecCommand {
                     command: s.to_string(),
@@ -870,50 +867,6 @@ impl Tool for BashTool {
             .or(inherited_cwd.as_deref())
             .or(ctx.checkout_root.as_deref())
             .or(Some(ctx.workspace_root.as_path()));
-
-        if is_file_tool_redirect(&command) {
-            // Do the read rather than send the model back for another turn.
-            // Through `ReadTool` itself, so the path policy is the one a
-            // direct `Read` gets — a shell read that authorized nothing
-            // would be worse than the refusal it replaces.
-            //
-            // It anchors the read tracker for this process only: the durable
-            // anchor is rebuilt from the transcript by tool NAME plus a
-            // `file_path` argument (`READ_TRACKER_ANCHORING_TOOLS`), and this
-            // call carries neither. So an `Edit` after a rehydrate asks for a
-            // real `Read` first — the conservative direction, and why the
-            // notice below promises nothing about it.
-            if let Some((file_path, limit)) = as_plain_file_read(&command) {
-                let mut params = json!({ crate::TOOL_FILE_PATH_ARG: file_path });
-                if let Some(limit) = limit {
-                    params[READ_LIMIT_ARG] = json!(limit);
-                }
-                let read = crate::builtin::read::ReadTool.execute(params, ctx).await?;
-                let stdout = match read {
-                    ToolOutput::Text(text) => text,
-                    other => format!("{other:?}"),
-                };
-                return Ok(ToolOutput::Json(json!({
-                    "exit_code": 0,
-                    "stdout": stdout,
-                    "stderr": "",
-                    REDIRECTED_TO_FIELD: REDIRECTED_TO_READ,
-                })));
-            }
-            let argv0 = first_token(&command).unwrap_or("?");
-            return Err(ToolError::InvalidParams(format!(
-                "Refusing to run `{argv0}` against a file via Bash. Use the right tool \
-                 for the turn:\n\
-                 - Reading content: `Read` (with `offset`/`limit` for head- and \
-                   tail-style slices).\n\
-                 - In-place file edits: `Edit` (exact-string replacement, fail-fast \
-                   on ambiguous matches; far safer than `sed -i`).\n\
-                 - Stream filtering inside a pipeline: keep `{argv0}` AFTER a pipe so \
-                   it consumes stdin instead of opening a file (e.g. \
-                   `git log | sed 's/.../.../'` is fine — only `{argv0} <file>` is \
-                   blocked).",
-            )));
-        }
 
         // Record when the destructive-command detector's shell parser can't
         // parse this command — it then falls back to the fail-closed keyword
@@ -1604,69 +1557,6 @@ fn interpret_exit(command: &str, exit_code: i32) -> Option<&'static str> {
         "diff" | "cmp" => Some("differences found"),
         _ => None,
     }
-}
-
-const FILE_TOOL_REDIRECT_COMMANDS: &[&str] = &[
-    "cat", "head", "tail", "less", "more", "tac", "sed", "awk", "gawk", "mawk",
-];
-
-/// Shell punctuation that makes a command more than "open this one file":
-/// a pipeline, a redirect, a chain, a substitution. Any of them and the
-/// redirect below declines to translate rather than guess.
-const SHELL_PUNCTUATION: &[char] = &['|', '<', '>', '&', ';', '(', ')', '`', '$', '\n'];
-
-/// Default lines `head` prints when no `-n` is given.
-const HEAD_DEFAULT_LINES: usize = 10;
-
-/// `Read`'s line-count parameter, the one `head -n` maps onto.
-const READ_LIMIT_ARG: &str = "limit";
-
-/// Result field naming the tool that actually served a translated read, and
-/// what that changes about the output.
-const REDIRECTED_TO_FIELD: &str = "redirected_to";
-const REDIRECTED_TO_READ: &str = "Read — a plain `cat`/`head` against one file is served by the Read tool, \
-so the line numbers you see are Read's. Call `Read` directly next time.";
-
-/// A `cat`/`head` that is only asking to read one file — no pipeline, no
-/// redirect, no chaining, no flags beyond `head -n`. `Some((path, limit))`
-/// is what [`ReadTool`](crate::builtin::read::ReadTool) would be called with;
-/// `None` means refuse as before, which is what every exotic form still gets.
-fn as_plain_file_read(command: &str) -> Option<(PathBuf, Option<usize>)> {
-    if command.contains(SHELL_PUNCTUATION) {
-        return None;
-    }
-    // A relative path keeps the refusal on purpose: `Read` would reject it
-    // anyway, and its own message names the tools, which is what a model
-    // that reached for `cat` needs to hear.
-    let tokens = shell_words::split(command).ok()?;
-    let (argv0, args) = tokens.split_first()?;
-    let argv0 = Path::new(argv0).file_name()?.to_str()?;
-    let absolute = |file: &String| {
-        let p = PathBuf::from(file);
-        p.is_absolute().then_some(p)
-    };
-    match argv0 {
-        "cat" => match args {
-            [file] if !file.starts_with('-') => Some((absolute(file)?, None)),
-            _ => None,
-        },
-        "head" => match args {
-            [file] if !file.starts_with('-') => Some((absolute(file)?, Some(HEAD_DEFAULT_LINES))),
-            [n, file] if !file.starts_with('-') => {
-                let n = n.strip_prefix("-n").or_else(|| n.strip_prefix('-'))?;
-                Some((absolute(file)?, Some(n.parse().ok()?)))
-            }
-            [flag, n, file] if flag == "-n" && !file.starts_with('-') => {
-                Some((absolute(file)?, Some(n.parse().ok()?)))
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn is_file_tool_redirect(command: &str) -> bool {
-    first_token(command).is_some_and(|t| FILE_TOOL_REDIRECT_COMMANDS.contains(&t))
 }
 
 /// Prefix `command` with `export BAYBO_HELP_AGENT=1; export
@@ -5856,141 +5746,27 @@ mod tests {
         );
     }
 
-    /// The round trip a run used to pay for 72 times: `cat` came back as a
-    /// refusal and the model had to spend another turn on `Read`.
     #[tokio::test]
-    async fn a_plain_cat_comes_back_with_the_file_instead_of_a_refusal() {
-        // Under `/tmp/work`, because the work-dir jail runs BEFORE the
-        // redirect and still governs which files a shell may name at all.
-        tokio::fs::create_dir_all("/tmp/work")
-            .await
-            .expect("work dir");
-        let dir = tempfile::tempdir_in("/tmp/work").expect("tempdir under the work dir");
-        let file = dir.path().join("note.txt");
-        tokio::fs::write(&file, "alpha\nbeta\ngamma\n")
-            .await
-            .expect("write");
-
-        let out = BashTool::for_test()
-            .execute(
-                json!({ "command": format!("cat {}", file.display()) }),
-                &ctx_with(None),
-            )
-            .await
-            .expect("a plain cat is served, not refused");
-        let ToolOutput::Json(v) = out else {
-            panic!("bash keeps its result shape")
-        };
-        assert_eq!(v["exit_code"], 0);
-        let stdout = v["stdout"].as_str().expect("stdout");
-        assert!(stdout.contains("alpha"), "{stdout:?}");
-        assert!(stdout.contains("3\tgamma"), "Read's numbering: {stdout:?}");
-        assert!(
-            v[REDIRECTED_TO_FIELD]
-                .as_str()
-                .is_some_and(|s| s.starts_with("Read")),
-            "the model must be told which tool answered: {v}"
-        );
-
-        // Everything the translation cannot honour still refuses.
-        let refused = BashTool::for_test()
-            .execute(
-                json!({ "command": format!("cat {} | head -1", file.display()) }),
-                &ctx_with(None),
-            )
-            .await;
-        assert!(refused.is_err(), "a pipeline is not a one-file read");
-
-        // And the jail still decides what a shell may name: a workspace path
-        // outside `work/` is refused before the redirect is even consulted.
-        let jailed = BashTool::for_test()
-            .execute(
-                json!({ "command": "cat /tmp/state/storage.db" }),
-                &ctx_with(None),
-            )
-            .await;
-        assert!(jailed.is_err(), "the redirect must not widen shell reach");
-    }
-
-    #[test]
-    fn a_plain_one_file_cat_or_head_maps_onto_read() {
-        assert_eq!(
-            as_plain_file_read("cat /w/a.txt"),
-            Some((PathBuf::from("/w/a.txt"), None))
-        );
-        assert_eq!(
-            as_plain_file_read("/usr/bin/cat '/w/a b.txt'"),
-            Some((PathBuf::from("/w/a b.txt"), None))
-        );
-        assert_eq!(
-            as_plain_file_read("head /w/f.log"),
-            Some((PathBuf::from("/w/f.log"), Some(HEAD_DEFAULT_LINES)))
-        );
-        for form in [
-            "head -n 20 /w/f.log",
-            "head -n20 /w/f.log",
-            "head -20 /w/f.log",
+    async fn file_commands_run_as_ordinary_bash_commands() {
+        for command in [
+            "cat note.txt",
+            "head -n 5 note.txt",
+            "tail note.txt",
+            "sed -i 's/a/b/' note.txt",
+            "awk '{print}' note.txt",
         ] {
-            assert_eq!(
-                as_plain_file_read(form),
-                Some((PathBuf::from("/w/f.log"), Some(20))),
-                "{form}"
-            );
-        }
-
-        // Anything that is more than opening one file keeps the refusal: the
-        // translation has no way to honour the rest of it.
-        for form in [
-            "cat foo.txt",         // relative — Read would reject it anyway
-            "cat /w/a /w/b",       // two files — Read takes one
-            "cat",                 // stdin
-            "cat /w/a | grep x",   // pipeline
-            "cat /w/a > /w/b",     // redirect
-            "cat /w/a && rm /w/b", // chain
-            "cat $(ls)",           // substitution
-            "cat -n /w/a",         // a flag Read has no answer for
-            "tail -f /w/a",        // Read has no negative offset
-            "sed -i 's/a/b/' f",   // a write wearing a read's clothes
-            "head -q -n 2 /w/a",   // more than the one flag
-        ] {
-            assert_eq!(as_plain_file_read(form), None, "{form}");
-        }
-    }
-
-    #[test]
-    fn is_file_tool_redirect_catches_leading_argv0_only() {
-        // FileToolRedirect is a tool-layer policy: only the literal
-        // leading argv0 counts. Wrapped or env-prefixed variants
-        // (`xargs cat`, `LANG=C cat`, `timeout 5 head`) deliberately
-        // route through the sandbox path so the LLM still has the
-        // escape hatch when it really needs `cat` in a pipeline.
-        for cmd in [
-            "cat foo.txt",
-            "head -n 10 a.log",
-            "/usr/bin/less x",
-            "sed -i 's/a/b/' f",
-            "awk '{print $1}' f",
-            "gawk -F, '{print}' f",
-            "mawk '/x/' f",
-        ] {
+            let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                timed_out: false,
+            });
+            let out = BashTool::for_test()
+                .execute(json!({ "command": command }), &ctx_with(Some(sandbox)))
+                .await;
             assert!(
-                is_file_tool_redirect(cmd),
-                "leading argv0 must trigger redirect for {cmd:?}"
-            );
-        }
-
-        for cmd in [
-            "echo hi",
-            "grep foo bar.txt",
-            "xargs cat foo",
-            "LANG=C cat foo",
-            "timeout 5 head log",
-            "git log | sed 's/foo/bar/'",
-            "",
-        ] {
-            assert!(
-                !is_file_tool_redirect(cmd),
-                "non-leading or unrelated argv0 must NOT trigger for {cmd:?}"
+                out.is_ok(),
+                "file command should reach Bash: {command}: {out:?}"
             );
         }
     }
@@ -6008,14 +5784,6 @@ mod tests {
 
     #[test]
     fn manual_accessed_resources_prompts_for_every_executable_command() {
-        // FileToolRedirect rejection bypasses approval — the sandbox
-        // never gets reached.
-        let resources = BashTool::for_test().accessed_resources(&json!({ "command": "cat foo" }));
-        assert!(
-            resources.is_empty(),
-            "content-read is rejected before sandbox; no approval needed"
-        );
-
         // Manual permission: every executable Bash command declares
         // ExecCommand for the executor's human approval gate.
         for cmd in [
@@ -6026,6 +5794,8 @@ mod tests {
             "ls /etc",
             "pwd",
             "stat /tmp/x",
+            "cat foo",
+            "sed -i 's/a/b/' foo",
         ] {
             let resources = BashTool::for_test().accessed_resources(&json!({ "command": cmd }));
             assert_eq!(
@@ -6122,32 +5892,6 @@ mod tests {
                 BashTool::for_test().call_label(&json!({ "command": cmd })),
                 None,
                 "benign command {cmd:?} must not surface a warning label"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_file_tool_redirect_commands_with_read_tool_hint() {
-        for cmd in [
-            "cat foo",
-            "head -n 5 a",
-            "tail b",
-            "less c",
-            "more d",
-            "tac e",
-            "sed -i 's/a/b/' f",
-            "awk '{print}' f",
-        ] {
-            let err = BashTool::for_test()
-                .execute(json!({ "command": cmd }), &ctx_with(None))
-                .await
-                .unwrap_err();
-            let ToolError::InvalidParams(msg) = err else {
-                panic!("expected InvalidParams for {cmd:?}, got: {err:?}");
-            };
-            assert!(
-                msg.contains("Read") && msg.contains("Edit"),
-                "rejection for {cmd:?} should mention both Read and Edit: {msg}"
             );
         }
     }
