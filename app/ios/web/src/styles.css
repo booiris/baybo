@@ -448,6 +448,15 @@ html.retargeting #root { visibility: hidden; }
    .md's role as a step-row flex item. The caret selector above rides
    `.md:last-child` — the tail — so settled chunks never grow a caret. */
 .md-stream { min-width: 0; flex: 1; }
+/* Offscreen rows skip layout/paint and release their raster memory — the
+   bulk of the ~1000x source-to-resident amplification that killed heavy
+   threads. `auto` intrinsic-size locks to the real height once a row has
+   been measured, so scrollHeight only estimates on the first pass; the
+   follow pin's drift re-pin and the prepend/replace anchors absorb that. */
+.msg-group, .work-ladder {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 160px;
+}
 .md-stream > .md + .md { margin-top: var(--md-block-gap); }
 /* The raw source, shown when the markdown pipeline threw (see `MarkdownFallback`
    in Markdown.tsx). Newlines are all the structure that is left, so keep them. */
