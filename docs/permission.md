@@ -38,6 +38,36 @@ Python shim. The `bench-bash` Cargo feature is separate and stronger: it runs
 raw in a disposable benchmark container, with no OS sandbox, no uv shim, no
 work-directory jail, and inherited cwd.
 
+### Per-call `sandbox_permissions`
+
+The Bash tool has a separate per-call `sandbox_permissions` parameter:
+
+| Value | Meaning |
+| --- | --- |
+| `use_default` | Default. Follow the configured `permission` route described below. |
+| `require_escalated` | Use only when the user explicitly asks for this command to run without the OS sandbox. When the configured route is sandboxed, show the exact command in a fresh approval prompt, then run unsandboxed only if approved. Under `permission=free`, the route is already unsandboxed and no prompt is shown. |
+
+Calls using `require_escalated` may also provide `justification`, a concise
+user-facing question or reason shown at the top of the approval prompt. Empty
+or omitted input uses a generic question. The exact command and the fixed
+warning about normally hidden host files and credentials are always rendered
+separately, so model-authored justification cannot hide what is being approved.
+
+Under `permission=auto` or `manual`, `require_escalated` is an explicit privilege
+transition even when an identical sandboxed command was approved earlier. Its
+approval is therefore uncached: a session-level `ApproveAlways` entry for
+`ExecCommand { command }` cannot silently promote that command to the host
+route, and choosing “always” on this prompt does not grant later unsandboxed
+calls. A denied, timed-out, abandoned, or unattended request starts no process.
+Under `permission=free`, no privilege transition occurs, so
+`require_escalated` and `justification` are ignored and no approval is raised.
+The tool-layer work-directory jail, uv shim, timeout/background handling,
+secret injection, and command-shape checks still apply; only the OS sandbox
+route changes.
+
+The bench-only `bench-bash` profile is already unsandboxed and intentionally
+has no approval gate, so the parameter is a no-op there.
+
 ### `auto`
 
 `auto` is the default policy for normal interactive use.
@@ -186,7 +216,8 @@ The executor approval gate and Bash's internal judge intentionally do not both
 own the same prompt.
 
 In `manual`, Bash declares an `ExecCommand` resource for every executable Bash
-command, so the executor approval gate prompts before execution.
+command using `sandbox_permissions=use_default`, so the executor approval gate
+prompts before execution.
 
 In `auto`, Bash declares no execution resource at all — neither for destructive
 nor benign commands. For a destructive command Bash owns the pre-execution judge
@@ -195,6 +226,14 @@ This avoids double prompts for the same command.
 
 In `free`, Bash declares no execution resource because the mode is explicitly
 ungated.
+
+For `sandbox_permissions=require_escalated`, Bash declares no pre-execution
+resource in any global permission mode. Under `auto` or `manual`, it owns one
+uncached mid-execution prompt instead, whose `ExecCommand` access and preview
+both name the exact command. This avoids a double prompt in `manual` and
+prevents the ordinary resource cache from collapsing the sandboxed and
+unsandboxed privilege levels. Under `free`, it raises no prompt because the
+command already runs outside the OS sandbox.
 
 ## Background Runs
 
