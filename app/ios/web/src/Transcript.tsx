@@ -23,6 +23,7 @@ import {
   postSyncRequest,
   resendOutline,
   retrySend,
+  revealAfterRetarget,
   subscribeTranscript,
   type OutlinePost,
   type UserSentPayload,
@@ -1584,6 +1585,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
 /// isn't.
 export const FIRST_PAINT_ROWS = 40;
 
+
 /// Split a sanitized mirror into what the first commit renders (`tail`) and the
 /// older rows deferred past it (`head`, oldest-first). Below the threshold the
 /// head is empty and nothing about the open changes.
@@ -1860,7 +1862,7 @@ export function Transcript({
   // (`splitForFirstPaint`), with the backward-paging state that describes what
   // is actually RENDERED while the older half is withheld: the floor is the
   // tail's own oldest ordinal, and there is always more older (the head itself).
-  // `drainDeferredHead` hands the mirror's own values back when it folds it in.
+  // `popDeferredHeadPage` hands the mirror's own values back on the final pop.
   //
   // Built in one `useState` initializer, not inline: a `useRef(expr)` argument
   // is evaluated on EVERY render, and this walks and slices the whole thread.
@@ -1879,6 +1881,8 @@ export function Transcript({
   // Emptied without being rendered if a REPLACE lands first: those rows describe
   // a thread the server has just rebased away.
   const deferredHead = useRef<Row[]>(restoredSplit.head);
+  // Row count at last render — the mount beacon reads it (triage instrument).
+  const renderRowCount = useRef(0);
   const [messages, setMessages] = useState<Row[]>(restoredSplit.tail);
   // The rendered thread, readable from `runSync` — which must NOT re-create on
   // every row change: its identity gates the mount and safety-tick sync effects,
@@ -2143,20 +2147,19 @@ export function Transcript({
   useEffect(() => {
     persistLatest.current = () => {
       if (messages.length === 0 && cursorRef.current.cursor === null) return;
-      // The first commit deliberately renders only the mirror's newest rows
-      // (`splitForFirstPaint`); writing in that window persists the TRUNCATED
-      // thread and loses the rest for good — the file is the only copy of a row
-      // the sync cursor has long since passed. The debounce usually hides this
-      // (the drain lands a frame later and supersedes the pending write), but
-      // `flushPersist` is synchronous and both `pagehide` and native's detach
-      // fire it — so a back-out inside that frame is a real path, not a
-      // theoretical one.
-      if (deferredHead.current.length > 0) return;
+      // The reservoir half of the mirror is WITHHELD from the DOM (see
+      // popDeferredHeadPage), never gone — a persist must write the whole
+      // thread, head included, or a back-out would truncate the only copy of
+      // rows the sync cursor has long since passed. While rows are withheld
+      // the paging floor persisted is the mirror's own, not the rendered
+      // half's.
+      const withheld = deferredHead.current;
       persistState({
-        messages,
+        messages: withheld.length > 0 ? [...withheld, ...messages] : messages,
         lastOrdinal: cursorRef.current.cursor,
-        oldestOrdinal: oldestOrdinal.current,
-        hasMoreOlder,
+        oldestOrdinal:
+          withheld.length > 0 ? (restored?.oldestOrdinal ?? null) : oldestOrdinal.current,
+        hasMoreOlder: withheld.length > 0 ? (restored?.hasMoreOlder ?? false) : hasMoreOlder,
         imageDims: Object.fromEntries(imageDims),
         compactionPoints,
       });
@@ -2166,9 +2169,14 @@ export function Transcript({
 
   // Open the thread at its newest edge — a restored thread would otherwise
   // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.
+  // Lifting the retarget veil here (post-commit, pre-paint) means the frame
+  // that reveals the page is the frame this conversation's content — pinned
+  // to its newest edge — paints.
   useLayoutEffect(() => {
     const el = scrollEl();
     if (el) el.scrollTop = el.scrollHeight;
+    revealAfterRetarget();
+    log("info", `boot: mounted rows=${renderRowCount.current}`);
   }, []);
 
   // While pinned to the newest edge, keep it in view as content lands (rows,
@@ -2592,6 +2600,7 @@ export function Transcript({
       // The bundle reads and rewrites the tail block — queued live steps must
       // have landed first or the rebuild silently drops them.
       flushRowOps();
+      log("info", `boot: subscribe_state steps=${wireSteps.length} approvals=${pendingApprovals.length}`);
       const startedMs = turn.started_at ? Date.parse(turn.started_at) : null;
       if (startedMs !== null && endedTurnStarts.current.includes(startedMs)) return;
       if (!turn.active) {
@@ -2721,40 +2730,41 @@ export function Transcript({
   }, [flushRowOps]);
 
   // Fold the mirror's withheld older rows into the thread (see
-  // `splitForFirstPaint`), restoring the paging state they were held back from.
-  // Idempotent and one-shot: the reservoir is cleared before the prepend, so a
-  // drain racing the frame effect below can't double-render it.
+  // `splitForFirstPaint`), a PAGE at a time — the reservoir is the backward
+  // paging source while it lasts, never a bulk drain. Draining it whole
+  // mounted the entire mirror as DOM one frame after first paint, and a heavy
+  // session's restore then climbed past the WebContent per-process jetsam
+  // limit on device (~300MB desktop-WebKit for a 560KB mirror; ~2.3GB at
+  // device scale): every entry died as a white flash, repeated entries as a
+  // blank page. Withheld rows are DOM the reader never paid for until they
+  // actually scroll up to them.
   //
-  // Goes through `prependOlder` rather than a bare `setMessages` so the head
-  // arrives under exactly the rules a scroll-up page does — viewport anchored by
+  // Goes through `prependOlder` rather than a bare `setMessages` so a page
+  // arrives under exactly the rules a network page does — viewport anchored by
   // `prependAnchor`, `sentIds`/`renderedOrdinals` re-seeded, seam folded (a
   // no-op on an already-sanitized split, see `splitForFirstPaint`).
-  const drainDeferredHead = useCallback(() => {
+  const popDeferredHeadPage = useCallback(() => {
     const head = deferredHead.current;
     if (head.length === 0) return;
-    deferredHead.current = [];
-    prependOlder(head, restored?.oldestOrdinal ?? null, restored?.hasMoreOlder ?? false);
-    // `prependOlder` leaves the floor PUT on a null — its "an empty page changes
-    // nothing" rule. Here null is the mirror's real answer ("no durable floor to
-    // page from"), and the tail's own oldest — seeded only to describe the half
-    // that was rendered — must not outlive the half it described.
-    oldestOrdinal.current = restored?.oldestOrdinal ?? null;
+    const at = Math.max(0, head.length - HISTORY_PAGE_LIMIT);
+    const page = head.slice(at);
+    deferredHead.current = head.slice(0, at);
+    log("info", `boot: reservoir pop page=${page.length} left=${at}`);
+    if (at === 0) {
+      // Final pop — hand the mirror's own paging state back. `prependOlder`
+      // leaves the floor PUT on a null — its "an empty page changes nothing"
+      // rule. Here null is the mirror's real answer ("no durable floor to
+      // page from"), and the tail's own oldest — seeded only to describe the
+      // rendered half — must not outlive the half it described.
+      prependOlder(page, restored?.oldestOrdinal ?? null, restored?.hasMoreOlder ?? false);
+      oldestOrdinal.current = restored?.oldestOrdinal ?? null;
+    } else {
+      // Rows remain withheld above — more-older stays true and the floor
+      // stays describing the rendered half; the network is never asked while
+      // the reservoir can answer (see loadOlder).
+      prependOlder(page, null, true);
+    }
   }, [prependOlder, restored]);
-
-  // One frame after the first paint. `useEffect` alone runs before the browser
-  // has painted the commit, which would put the whole thread back in the first
-  // frame and undo the split; the nested rAF lands after it.
-  useEffect(() => {
-    if (deferredHead.current.length === 0) return;
-    let inner = 0;
-    const outer = requestAnimationFrame(() => {
-      inner = requestAnimationFrame(drainDeferredHead);
-    });
-    return () => {
-      cancelAnimationFrame(outer);
-      cancelAnimationFrame(inner);
-    };
-  }, [drainDeferredHead]);
 
   // Recover from a gateway `Frame::Reset` (catch-up gap over the replay cap, or
   // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap
@@ -2770,7 +2780,7 @@ export function Transcript({
     // webview is hidden), which would otherwise re-fetch what is on disk and
     // fail outright offline.
     if (deferredHead.current.length > 0) {
-      drainDeferredHead();
+      popDeferredHeadPage();
       return;
     }
     const before = oldestOrdinal.current;
@@ -2791,7 +2801,7 @@ export function Transcript({
       log("warn", `history page failed: ${String(e)}`);
       appendNotice(t("chat.recoverFailed", { error: String(e) }));
     }
-  }, [hasMoreOlder, requestHistory, appendNotice, drainDeferredHead, t]);
+  }, [hasMoreOlder, requestHistory, appendNotice, popDeferredHeadPage, t]);
 
   // The one forward-recovery pull (docs/sync-protocol.md "The one client
   // algorithm"): session open, reconnect, gap nudge and the safety tick all
@@ -2855,6 +2865,7 @@ export function Transcript({
       // Queued work-frame ops target the pre-page tail; land them before the
       // page merges or REPLACEs so they aren't applied to rebuilt rows.
       flushRowOps();
+      log("info", `boot: sync_page rows=${frame.rows.length} rebased=${String(frame.rebased)} since=${String(frame.since_ordinal)}`);
       setSyncInFlight(false);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
@@ -3822,6 +3833,7 @@ export function Transcript({
       }),
     [messages],
   );
+  renderRowCount.current = renderRows.length;
   const defaultExpandedWorkIds = useMemo(
     () => (expandUnansweredTail ? unansweredTailWorkIds(renderRows) : undefined),
     [expandUnansweredTail, renderRows],

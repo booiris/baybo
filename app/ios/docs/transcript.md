@@ -65,6 +65,25 @@ never re-boots the runtime.
   frames after `init`, and replays the inset/jump/reveal the `ready` handler would have
   (no page reload fires).
 
+The keyed swap commits ASYNCHRONOUSLY inside a webview that stays visible
+(hiding it native-side pauses WebKit rAF — see the retarget comment), so two
+web-side mechanisms keep the transition clean. A cross-session `init`
+synchronously veils `#root` (`concealForRetarget` in `bridge.ts`) so the
+outgoing conversation vanishes on the next frame instead of lingering under
+the incoming commit; the incoming tree lifts the veil from its mount layout
+effect — the reveal and its first paint are one frame — with a timeout
+failsafe so a throwing mount can't leave the page blank. And the mount is
+BOUNDED: only the mirror's newest `FIRST_PAINT_ROWS` mount at open, and the
+older half is a paging RESERVOIR (`popDeferredHeadPage`), fed to `loadOlder`
+one page at a time before the network is ever asked. It must never be
+drained wholesale: rendered markdown costs WebKit roughly three orders of
+magnitude more resident memory than its source bytes (a 560KB mirror
+measured ~320MB on desktop WebKit, past the ~2.2GB per-process jetsam limit
+at device scale), so mounting a whole heavy mirror killed WebContent on
+every entry — a white flash per entry, a terminally blank page once the
+crash-reload budget gave up. While rows are withheld, `persistLatest` writes
+head + rendered rows together, so a back-out never truncates the mirror.
+
 ### Cross-session isolation
 
 Isolation is enforced on the WEB side because the webview is shared:

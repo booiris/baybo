@@ -285,6 +285,11 @@ describe("scroll-up paging holds the viewport", () => {
 
   it("keeps the rows under the reader in place when an older page prepends", async () => {
     await open(60, 999);
+    // First scroll-up consumes the withheld mirror head (the reservoir pages
+    // in before the network is asked); the wire flow under test starts once
+    // the reservoir is dry.
+    await scrollTo(0);
+    await settle();
     await scrollTo(0);
     expect(posts().some((p) => p.type === "fetchHistory")).toBe(true);
 
@@ -404,6 +409,11 @@ describe("a REPLACE under a reader parked in history", () => {
   /// reported bug fired from.
   async function readingHistory(cursor?: number | null): Promise<void> {
     await open(60, 999, cursor);
+    // First scroll-up consumes the withheld mirror head (the reservoir pages
+    // in before the network is asked); the wire flow under test starts once
+    // the reservoir is dry.
+    await scrollTo(0);
+    await settle();
     await scrollTo(0);
     await pushFrame({
       kind: "history_page",
@@ -716,6 +726,11 @@ describe("jump to a search hit's ordinal", () => {
   // forever. Only the budget stops it.
   it("is bounded when empty pages keep claiming there is more", async () => {
     await open(60, 999);
+    // First scroll-up consumes the withheld mirror head (the reservoir pages
+    // in before the network is asked); the wire flow under test starts once
+    // the reservoir is dry.
+    await scrollTo(0);
+    await settle();
     await jumpTo(1);
 
     for (let i = 0; i < 30; i++) {

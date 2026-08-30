@@ -135,6 +135,7 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
             urlSchemeTask.didFailWithError(URLError(.badURL))
             return
         }
+        WebTrail.note("scheme \(url.path)")
         if dynamicRoute == .deckBlob, url.path.hasPrefix(Self.deckBlobPathPrefix) {
             startDeckBlob(url: url, task: urlSchemeTask)
             return

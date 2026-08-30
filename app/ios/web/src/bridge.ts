@@ -165,6 +165,30 @@ export function postToNative(message: Record<string, unknown>): void {
   post(message);
 }
 
+/// Cross-session retarget veil. `concealForRetarget` hides `#root` with a
+/// SYNCHRONOUS DOM write from inside the init evaluation, so the outgoing
+/// conversation vanishes on the very next frame instead of lingering under
+/// the incoming one's async keyed commit. The incoming tree reveals from its
+/// mount layout effect — post-commit, pre-paint, so the reveal and the new
+/// content's first paint are the same frame. The timeout is a failsafe only
+/// (a mount that throws must not leave the page permanently blank); the
+/// class lives on <html> so a React remount can't clobber it.
+const RETARGET_VEIL_CLASS = "retargeting";
+const RETARGET_VEIL_FAILSAFE_MS = 400;
+let veilFailsafe: ReturnType<typeof setTimeout> | undefined;
+
+function concealForRetarget(): void {
+  document.documentElement.classList.add(RETARGET_VEIL_CLASS);
+  clearTimeout(veilFailsafe);
+  veilFailsafe = setTimeout(revealAfterRetarget, RETARGET_VEIL_FAILSAFE_MS);
+}
+
+export function revealAfterRetarget(): void {
+  clearTimeout(veilFailsafe);
+  veilFailsafe = undefined;
+  document.documentElement.classList.remove(RETARGET_VEIL_CLASS);
+}
+
 export function bindNativeTarget(targetId: string): () => void {
   // Bound by the keyed tree layout effect, not init: during retargeting the
   // outgoing tree keeps its old id so native can reject late messages.
@@ -712,7 +736,18 @@ window.baybo = {
     // buffers and drains at the new tree's subscription. Same-session re-inits
     // (an LRU-evicted store re-created) must KEEP it: the key doesn't change,
     // nothing remounts, and nobody would ever subscribe again.
-    if (initPayload !== null && initPayload.sessionId !== payload.sessionId) events = null;
+    if (initPayload !== null && initPayload.sessionId !== payload.sessionId) {
+      events = null;
+      // The keyed swap to the new conversation commits ASYNCHRONOUSLY, and
+      // this webview stays visible through the transition (hiding it native-
+      // side pauses WebKit rAF — see TranscriptBridge.retarget) — so the
+      // OUTGOING session's pixels sit on screen until the new tree paints:
+      // the stale leftover on a long→short switch. This write is synchronous
+      // inside the init evaluation, so the very next frame is blank paper;
+      // the new tree's mount reveals in the same frame its content paints
+      // (`revealAfterRetarget` from Transcript's mount layout effect).
+      concealForRetarget();
+    }
     blobPending.clear();
     posterPending.clear();
     clearTimeout(persistTimer);
@@ -740,6 +775,15 @@ window.baybo = {
     onInitCb?.(payload);
   },
   pushFrame(frameJson) {
+    // Telemetry beacon (white-flash triage): a giant inbound frame is a
+    // memory event worth a line in the native console before it is parsed.
+    if (frameJson.length > 262144) {
+      post({
+        type: "log",
+        level: "warn",
+        message: `boot: giant frame bytes=${frameJson.length} head=${frameJson.slice(0, 80)}`,
+      });
+    }
     dispatch({ kind: "frame", frameJson });
   },
   setConnEpoch(epoch) {
@@ -756,6 +800,13 @@ window.baybo = {
     dispatch({ kind: "sendConfirmed", msgId, ordinal: ordinal ?? null });
   },
   blobResult(payload) {
+    if (payload.dataBase64 !== null && payload.dataBase64.length > 1048576) {
+      post({
+        type: "log",
+        level: "warn",
+        message: `boot: giant blob base64=${payload.dataBase64.length}`,
+      });
+    }
     settleBlob(payload);
   },
   fileState(payload) {
@@ -811,3 +862,8 @@ window.baybo = {
     flushPersist();
   },
 };
+
+// Boot beacon: surfaces in the native console the moment this module finishes
+// evaluating — a page that dies BEFORE this line never got through the module
+// graph (a bundle/eval problem); one that dies after `ready` died in app code.
+post({ type: "log", level: "info", message: "boot: bridge evaluated" });

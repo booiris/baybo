@@ -434,6 +434,11 @@ button {
    the reading edge — such math belongs in a `$$` display block, which has its
    own scroller. `clip` keeps vertical overflow visible and creates no scroll
    container, so short inline math (the norm) is untouched. */
+/* Cross-session retarget veil (see bridge.ts concealForRetarget): the old
+   conversation is hidden the instant the init for a different session lands,
+   and the incoming tree reveals itself in the frame its content paints. */
+html.retargeting #root { visibility: hidden; }
+
 .md { overflow-x: clip; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }

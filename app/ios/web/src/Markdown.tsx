@@ -51,6 +51,15 @@ const REMARK_PLUGINS = [
 // position in the array carries no constraint. Deliberately NOT extended to the
 // answer: `prose` steps are the answer's own bytes (see `segmentWorkSteps`).
 const REMARK_PLUGINS_BREAKS = [...REMARK_PLUGINS, remarkBreaks];
+// The STREAMING pipelines: no `remark-math` (and no rehype-katex, no
+// `normalizeMath` rewrite — see MarkdownPipeline). Math delimiters on a
+// still-growing text pair up wrong — a lone `$` grabs prose (or a later
+// currency `$`) and KaTeX "eats" the characters between into garbled math,
+// and a chunk that froze with a wrong pairing kept it until the settle
+// render. Live text shows `$...$` as typed; the settle render typesets it
+// once, correctly, against the final text.
+const REMARK_PLUGINS_LIVE = [remarkGfm, remarkCjkFriendly, remarkCjkFriendlyGfmStrikethrough];
+const REMARK_PLUGINS_LIVE_BREAKS = [...REMARK_PLUGINS_LIVE, remarkBreaks];
 // `rehype-katex` renders the math nodes to KaTeX markup in the hast. It leaves
 // `trust` off (so `\href`/`\includegraphics` stay disabled) and, on a malformed
 // expression, renders the offending source in place rather than throwing — a
@@ -231,7 +240,28 @@ class MarkdownFallback extends Component<
 /// boundary catches what its children throw, and a call left in `MarkdownBody`'s
 /// own render would sit in the boundary's PARENT — outside it — while walking
 /// the same slice-damaged text KaTeX chokes on.
-function MarkdownPipeline({ text, breaks }: { text: string; breaks: boolean }) {
+function MarkdownPipeline({
+  text,
+  breaks,
+  streaming,
+}: {
+  text: string;
+  breaks: boolean;
+  streaming: boolean;
+}) {
+  if (streaming) {
+    // No math while the text is still growing (see REMARK_PLUGINS_LIVE), and
+    // no `normalizeMath` either — its `\(..\)`→`$` rewrite would put back the
+    // very delimiters the live pipeline refuses to parse.
+    return (
+      <ReactMarkdown
+        remarkPlugins={breaks ? REMARK_PLUGINS_LIVE_BREAKS : REMARK_PLUGINS_LIVE}
+        components={COMPONENTS}
+      >
+        {text}
+      </ReactMarkdown>
+    );
+  }
   return (
     <ReactMarkdown
       remarkPlugins={breaks ? REMARK_PLUGINS_BREAKS : REMARK_PLUGINS}
@@ -280,8 +310,17 @@ export function StreamingMarkdownBody({
   }
   return (
     <div className="md-stream">
+      {/* Chunks render through the LIVE pipeline too (`streaming`): a chunk
+          that froze a wrong `$` pairing or a half-highlighted fence would keep
+          it until settle — while the text streams, NOTHING typesets math or
+          colors code; the settle render does both once, against final text. */}
       {ends.map((end, i) => (
-        <MarkdownBody key={i} text={text.slice(i === 0 ? 0 : ends[i - 1], end)} breaks={breaks} />
+        <MarkdownBody
+          key={i}
+          text={text.slice(i === 0 ? 0 : ends[i - 1], end)}
+          breaks={breaks}
+          streaming
+        />
       ))}
       <MarkdownBody
         text={text.slice(ends.length > 0 ? ends[ends.length - 1] : 0)}
@@ -308,7 +347,7 @@ export const MarkdownBody = memo(function MarkdownBody({
     <div className="md">
       <MarkdownFallback text={text}>
         <MarkdownStreamingContext.Provider value={streaming}>
-          <MarkdownPipeline text={text} breaks={breaks} />
+          <MarkdownPipeline text={text} breaks={breaks} streaming={streaming} />
         </MarkdownStreamingContext.Provider>
       </MarkdownFallback>
     </div>

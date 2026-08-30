@@ -386,6 +386,15 @@ describe("MarkdownBody code highlighting under streaming", () => {
     expect(container.querySelector("pre")?.textContent).toContain("compute(width, height)");
   });
 
+  it("defers math while streaming, typesets on the settle render", () => {
+    const src = "energy is $E = mc^2$ today";
+    const { container, rerender } = render(<MarkdownBody text={src} streaming />);
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toContain("$E = mc^2$");
+    rerender(<MarkdownBody text={src} />);
+    expect(container.querySelector(".katex")).not.toBeNull();
+  });
+
   it("still detects and highlights an unlabeled fence", () => {
     const { container } = render(
       <MarkdownBody text={"```\nfunction greet(name) { return name; }\n```"} />,
@@ -410,13 +419,17 @@ describe("StreamingMarkdownBody", () => {
     expect(bodies[1].textContent).toContain("tail still going");
   });
 
-  it("highlights code in the settled chunk but defers it in the tail", () => {
-    const tailCode = "```swift\nlet tail = true\n```\nmore";
+  it("colors and typesets nothing anywhere while streaming — settle does it once", () => {
+    const tailCode = "```swift\nlet tail = true\n```\nand math $x^2$ here";
     const { container } = render(<StreamingMarkdownBody text={`${settled}${tailCode}`} />);
     const bodies = container.querySelectorAll(".md-stream > .md");
-    expect(bodies[0].querySelector(".hljs-keyword")?.textContent).toBe("let");
-    expect(bodies[1].querySelector(".hljs-keyword")).toBeNull();
+    expect(bodies.length).toBe(2);
+    // A chunk that froze a wrong $ pairing or a half-colored fence would keep
+    // it until settle, so the live pipeline runs NO hljs and NO KaTeX at all.
+    expect(container.querySelector(".hljs-keyword")).toBeNull();
+    expect(container.querySelector(".katex")).toBeNull();
     expect(bodies[1].textContent).toContain("let tail = true");
+    expect(bodies[1].textContent).toContain("$x^2$");
   });
 
   it("keeps chunk cuts while the text extends, drops them on a rewrite", () => {

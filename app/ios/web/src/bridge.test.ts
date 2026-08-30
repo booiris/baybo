@@ -105,7 +105,9 @@ describe("outbound posts", () => {
     bridge.postReady();
     bridge.postSyncRequest(null, 50);
     bridge.postRunState(true);
-    expect(posted).toEqual([
+    // The module-eval boot beacon rides ahead of everything — drop log posts,
+    // this test pins the parseable control shapes.
+    expect(posted.filter((p) => (p as { type?: string }).type !== "log")).toEqual([
       { type: "ready" },
       { type: "sync", sinceOrdinal: null, limit: 50 },
       { type: "runState", running: true },
