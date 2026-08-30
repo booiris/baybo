@@ -160,7 +160,12 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     /// rebuilds the same footprint — with no cap, a page that dies on every
     /// load flickers forever while hammering the gateway with mount-edge
     /// syncs. Past the cap the transcript stays blank until the user backs
-    /// out or resyncs; a successful first paint (`shown`) re-arms the budget.
+    /// out or resyncs. The budget re-arms on TIME ONLY (a death landing more
+    /// than the window after the previous one resets the count) — never on a
+    /// paint. It originally re-armed on `shown`, and the white-flash flicker
+    /// loop sailed straight through the cap: each reload PAINTED (re-arming
+    /// the budget) and then re-exploded to the per-process jetsam limit within
+    /// ~1s, six kills in five seconds with the guard never firing.
     private static let maxConsecutiveDeaths = 3
     private static let deathWindowSeconds: TimeInterval = 30
     private var consecutiveDeaths = 0
@@ -583,9 +588,9 @@ extension TranscriptBridge: WKScriptMessageHandler {
             htmlPreviewMaximized = false
         case "shown":
             // The transcript painted its first frame — fade the webview in.
-            // A real paint also proves the reloaded process is standing, so
-            // the crash-reload budget re-arms.
-            consecutiveDeaths = 0
+            // Deliberately NOT a crash-reload budget re-arm: a page can paint
+            // and still re-explode moments later (the white-flash loop), so
+            // surviving is proven by time between deaths, not by a paint.
             contentVisible = true
         case "sync":
             // The one forward-recovery pull: the webview posts its cursor

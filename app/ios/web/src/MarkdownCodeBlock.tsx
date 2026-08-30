@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { LanguageFn } from "highlight.js";
 import hljs from "highlight.js/lib/core";
@@ -60,20 +60,44 @@ for (const [name, language] of LANGUAGES) {
 const AUTO_LANGUAGES = LANGUAGES.map(([name]) => name);
 const PLAIN_LANGUAGES = new Set(["text", "plain", "plaintext", "txt", "console", "output"]);
 
+/// True while the surrounding `MarkdownBody`'s text is still streaming in.
+/// A growing block's `shown` changes every tick, so the highlight memo below
+/// can never hold — and re-highlighting per tick is what ballooned WebContent
+/// to the 2.2GB per-process jetsam limit (killed → reloaded → re-exploded →
+/// the white-flash loop). While streaming, the block renders
+/// plain — React then patches one text node per tick instead of swapping the
+/// whole highlighted subtree — and the settle re-render colors it once.
+export const MarkdownStreamingContext = createContext(false);
+
+/// Hard ceiling on what gets highlighted at all. `highlightAuto` allocates
+/// ~100MB of transient garbage per call at 64KB input (measured against this
+/// hljs build); a restored transcript re-renders every block in one pass, so
+/// one giant block re-kills the fresh WebContent process on every crash
+/// reload. Past the cap the block is plain text — readable, just uncolored.
+const HIGHLIGHT_MAX_CHARS = 32 * 1024;
+
+/// Unlabeled fences detect their language on a prefix, then highlight the full
+/// text with the single winning grammar — auto-detect over all 22 grammars
+/// holds every candidate's full result simultaneously and is ~20× slower.
+const DETECT_SLICE_CHARS = 4 * 1024;
+
 function highlightCode(
   code: string,
   requestedLanguage?: string | null,
 ): { html: string; language: string | null } | null {
   const requested = requestedLanguage?.trim().toLowerCase() ?? "";
   if (PLAIN_LANGUAGES.has(requested)) return null;
+  if (code.length > HIGHLIGHT_MAX_CHARS) return null;
   try {
     if (requested !== "") {
       if (hljs.getLanguage(requested) === undefined) return null;
       const result = hljs.highlight(code, { language: requested, ignoreIllegals: true });
       return { html: result.value, language: result.language ?? null };
     }
-    const result = hljs.highlightAuto(code, AUTO_LANGUAGES);
-    return result.language === undefined ? null : { html: result.value, language: result.language };
+    const detected = hljs.highlightAuto(code.slice(0, DETECT_SLICE_CHARS), AUTO_LANGUAGES).language;
+    if (detected === undefined) return null;
+    const result = hljs.highlight(code, { language: detected, ignoreIllegals: true });
+    return { html: result.value, language: result.language ?? detected };
   } catch {
     return null;
   }
@@ -94,8 +118,12 @@ function CopyGlyph({ copied }: { copied: boolean }) {
 
 export function MarkdownCodeBlock({ code, language }: { code: string; language?: string | null }) {
   const { t } = useTranslation();
+  const streamingText = useContext(MarkdownStreamingContext);
   const shown = code.endsWith("\n") ? code.slice(0, -1) : code;
-  const highlighted = useMemo(() => highlightCode(shown, language), [shown, language]);
+  const highlighted = useMemo(
+    () => (streamingText ? null : highlightCode(shown, language)),
+    [shown, language, streamingText],
+  );
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const resetTimer = useRef<number | null>(null);
   const copied = copiedCode === shown;

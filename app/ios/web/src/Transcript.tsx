@@ -34,7 +34,7 @@ import {
   type ImageDimsStore,
 } from "./attachments";
 import { useLongPress } from "./gestures";
-import { MarkdownBody } from "./Markdown";
+import { MarkdownBody, StreamingMarkdownBody } from "./Markdown";
 import { advanceFromLive, advanceFromSync, type CursorState } from "./transcript/cursor";
 import { compactionStatusText, WorkBlockView } from "./WorkBlock";
 import {
@@ -2256,17 +2256,68 @@ export function Transcript({
     el.scrollTop += node.getBoundingClientRect().top - anchor.top;
   }, [messages]);
 
-  const foldMidTurnNotice = useCallback((level: string, text: string) => {
-    setMessages((rows) => foldMidTurnNoticeIn(rows, level, text));
+  // ---- work-frame commit coalescing ----------------------------------------
+  // reasoning / tool / status / notice frames arrive one wire frame per task
+  // (each its own evaluateJavaScript), so their setMessages calls can never
+  // batch on their own: a chatty Working phase committed — and recomputed
+  // every O(thread) render derivation — at wire rate, not display rate. Row
+  // transforms from those handlers queue here and land as ONE reduced
+  // setMessages per animation frame, in arrival order. Anything that must
+  // observe the applied rows in its own task (a terminal message, a sync
+  // page, a send append — each reads or extends the tail the queued ops
+  // target) drains the queue first via flushRowOps; React batches the drain
+  // with the caller's own update, so the barrier costs no extra commit.
+  const rowOps = useRef<Array<(rows: Row[]) => Row[]>>([]);
+  const rowOpsRaf = useRef<number | undefined>(undefined);
+  const flushRowOps = useCallback(() => {
+    if (rowOpsRaf.current !== undefined) {
+      cancelAnimationFrame(rowOpsRaf.current);
+      rowOpsRaf.current = undefined;
+    }
+    const ops = rowOps.current;
+    if (ops.length === 0) return;
+    rowOps.current = [];
+    setMessages((rows) => ops.reduce((acc, op) => op(acc), rows));
   }, []);
+  const enqueueRowOp = useCallback(
+    (op: (rows: Row[]) => Row[]) => {
+      rowOps.current.push(op);
+      if (rowOpsRaf.current === undefined) {
+        rowOpsRaf.current = requestAnimationFrame(() => {
+          rowOpsRaf.current = undefined;
+          flushRowOps();
+        });
+      }
+    },
+    [flushRowOps],
+  );
+  useEffect(
+    () => () => {
+      if (rowOpsRaf.current !== undefined) cancelAnimationFrame(rowOpsRaf.current);
+    },
+    [],
+  );
 
-  const severTerminalNotice = useCallback((text: string, durableId: string | null) => {
-    setMessages((rows) => severTerminalNoticeIn(rows, text, durableId));
-  }, []);
+  const foldMidTurnNotice = useCallback(
+    (level: string, text: string) => {
+      enqueueRowOp((rows) => foldMidTurnNoticeIn(rows, level, text));
+    },
+    [enqueueRowOp],
+  );
 
-  const appendNotice = useCallback((text: string) => {
-    setMessages((m) => [...m, { id: uid(), role: "notice", content: text }]);
-  }, []);
+  const severTerminalNotice = useCallback(
+    (text: string, durableId: string | null) => {
+      enqueueRowOp((rows) => severTerminalNoticeIn(rows, text, durableId));
+    },
+    [enqueueRowOp],
+  );
+
+  const appendNotice = useCallback(
+    (text: string) => {
+      enqueueRowOp((m) => [...m, { id: uid(), role: "notice", content: text }]);
+    },
+    [enqueueRowOp],
+  );
 
   // A user opened a collapsed work block: stop following the newest edge so the
   // block grows DOWNWARD from its summary. Left following, the pin (ResizeObserver
@@ -2368,9 +2419,12 @@ export function Transcript({
 
   // ---- work block (the turn's thinking / tool process) ---------------------
 
-  const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
-    setMessages((rows) => openWorkIn(rows, mutate));
-  }, []);
+  const withOpenWork = useCallback(
+    (mutate: (row: WorkRow) => WorkRow) => {
+      enqueueRowOp((rows) => openWorkIn(rows, mutate));
+    },
+    [enqueueRowOp],
+  );
 
   const pushWorkStep = useCallback(
     (step: WorkStep) => {
@@ -2386,14 +2440,17 @@ export function Transcript({
   // `approval_resolved` is broadcast connection-wide (it carries no session), so
   // a session with no block open would otherwise sprout an empty "Working" card
   // every time some other conversation answered a prompt.
-  const rewriteToolSteps = useCallback((mutate: (step: WorkStep) => WorkStep) => {
-    setMessages((rows) => {
-      const last = rows[rows.length - 1];
-      if (!last || last.role !== "work") return rows;
-      const steps = last.steps.map((s) => (s.kind === "tool" ? mutate(s) : s));
-      return [...rows.slice(0, -1), { ...last, steps }];
-    });
-  }, []);
+  const rewriteToolSteps = useCallback(
+    (mutate: (step: WorkStep) => WorkStep) => {
+      enqueueRowOp((rows) => {
+        const last = rows[rows.length - 1];
+        if (!last || last.role !== "work") return rows;
+        const steps = last.steps.map((s) => (s.kind === "tool" ? mutate(s) : s));
+        return [...rows.slice(0, -1), { ...last, steps }];
+      });
+    },
+    [enqueueRowOp],
+  );
 
   // A prompt opened on `toolCallId`: badge that step as waiting. Keyed by the
   // TOOL call's id (`tool_call_id`), which is what the step carries — the
@@ -2434,14 +2491,18 @@ export function Transcript({
     const text = streamText.current;
     if (!text) return;
     const at = streamStartedAt.current;
-    clearStreaming();
     pushWorkStep({ kind: "prose", text, at });
-  }, [clearStreaming, pushWorkStep]);
+    // Drain the queued step in THIS task, so the prose step and the emptied
+    // reply commit together — left to the rAF, the paragraph blanks for a
+    // frame mid-read (the exact bug `setStreamingText` exists to prevent).
+    flushRowOps();
+    clearStreaming();
+  }, [clearStreaming, pushWorkStep, flushRowOps]);
 
   // Close the tail work block: freeze the elapsed label, or drop the block
   // entirely when the turn produced no steps (a plain direct answer).
   const closeWork = useCallback(() => {
-    setMessages((rows) => {
+    enqueueRowOp((rows) => {
       const last = rows[rows.length - 1];
       if (!last || last.role !== "work" || !last.active) return rows;
       if (last.steps.length === 0) return rows.slice(0, -1);
@@ -2450,7 +2511,7 @@ export function Transcript({
       const elapsedMs = last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined);
       return [...rows.slice(0, -1), { ...last, active: false, elapsedMs }];
     });
-  }, []);
+  }, [enqueueRowOp]);
 
   // Remember a turn we've seen END (turn_state{active:false} or its final
   // Message), so a later `subscribe_state` bundle for the SAME turn — matched by
@@ -2479,6 +2540,9 @@ export function Transcript({
       wireSteps: WireWorkStepFrame[],
       pendingApprovals: WireApprovalCard[],
     ) => {
+      // The bundle reads and rewrites the tail block — queued live steps must
+      // have landed first or the rebuild silently drops them.
+      flushRowOps();
       const startedMs = turn.started_at ? Date.parse(turn.started_at) : null;
       if (startedMs !== null && endedTurnStarts.current.includes(startedMs)) return;
       if (!turn.active) {
@@ -2553,7 +2617,7 @@ export function Transcript({
           : [...freezeActiveWork(rows), rebuilt];
       });
     },
-    [closeWork, setStreamingText],
+    [closeWork, setStreamingText, flushRowOps],
   );
 
   // Fire a backward-history (scroll-up) request through native. The API result
@@ -2578,6 +2642,7 @@ export function Transcript({
   // can't overlap — the id-set filter is just a safety net. Re-seeds `sentIds`
   // so a later live echo of an own message doesn't double-render.
   const prependOlder = useCallback((older: Row[], newOldest: number | null, more: boolean) => {
+    flushRowOps();
     const anchorEl = scrollEl();
     if (older.length > 0 && anchorEl) {
       prependAnchor.current = {
@@ -2604,7 +2669,7 @@ export function Transcript({
     if (newOldest !== null) oldestOrdinal.current = newOldest;
     setHasMoreOlder(more);
     hasMoreOlderRef.current = more;
-  }, []);
+  }, [flushRowOps]);
 
   // Fold the mirror's withheld older rows into the thread (see
   // `splitForFirstPaint`), restoring the paging state they were held back from.
@@ -2738,6 +2803,9 @@ export function Transcript({
   // row by `platform_msg_id`. Rows arrive ascending; each carries a stable id.
   const applySyncPage = useCallback(
     (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
+      // Queued work-frame ops target the pre-page tail; land them before the
+      // page merges or REPLACEs so they aren't applied to rebuilt rows.
+      flushRowOps();
       setSyncInFlight(false);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
@@ -2905,7 +2973,7 @@ export function Transcript({
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
       markReadIfAdvanced();
     },
-    [advanceCursorFromSync, clearStreaming, markReadIfAdvanced, setSyncInFlight, runSync],
+    [advanceCursorFromSync, clearStreaming, markReadIfAdvanced, setSyncInFlight, runSync, flushRowOps],
   );
 
   const handleFrame = (frameJson: string) => {
@@ -2981,6 +3049,10 @@ export function Transcript({
           if (cursorRef.current.rebaseDirty) runSync();
         }
         if (ordinal !== null) renderedOrdinals.current.add(ordinal);
+        // Land queued steps (and the assistant branch's closeWork) first, so
+        // the settled row appends BELOW the finished block, in one commit with
+        // the cleared streaming reply.
+        flushRowOps();
         setMessages((m) => [
           ...m,
           {
@@ -3140,7 +3212,7 @@ export function Transcript({
           // event). Instead end the optimistic window, freeze any open work
           // block, and pull the durable indicator in via one sync.
           setAwaitingReply(false);
-          setMessages((rows) => freezeActiveWork(rows));
+          enqueueRowOp((rows) => freezeActiveWork(rows));
           runSync();
         } else if (frame.mid_turn ?? true) {
           // A tool-authored aside — the server's fold-eligibility declaration.
@@ -3221,6 +3293,10 @@ export function Transcript({
   // the state updater must repeat the identity check against the actual rows it
   // receives.
   const handleUserSent = (payload: UserSentPayload) => {
+    // Queued work steps must land in the tail block BEFORE the bubble appends
+    // below it — applied after, `openWorkIn` would see the bubble as the tail
+    // and mint a second block.
+    flushRowOps();
     unconfirmedSends.current.add(payload.msgId);
     if (holdsUserSend(messagesRef.current, payload.msgId)) return;
     sentIds.current.add(payload.msgId);
@@ -3675,16 +3751,26 @@ export function Transcript({
   // Collapse adjacent "Stopped" indicators to one: the live indicator (a
   // client `uid`) and its durable notice row (`n<seq>`, re-delivered by a later
   // sync) are the same event and would otherwise stack two identical marks.
-  const renderRows = messages.filter((m, i) => {
-    if (m.role !== "notice" || !m.stopped) return true;
-    const prev = messages[i - 1];
-    return !(prev && prev.role === "notice" && prev.stopped);
-  });
-  const defaultExpandedWorkIds = expandUnansweredTail
-    ? unansweredTailWorkIds(renderRows)
-    : undefined;
+  // Memoized on `messages` so the per-rAF streaming re-renders — which change
+  // only the `streaming` string — skip these O(thread) scans.
+  const renderRows = useMemo(
+    () =>
+      messages.filter((m, i) => {
+        if (m.role !== "notice" || !m.stopped) return true;
+        const prev = messages[i - 1];
+        return !(prev && prev.role === "notice" && prev.stopped);
+      }),
+    [messages],
+  );
+  const defaultExpandedWorkIds = useMemo(
+    () => (expandUnansweredTail ? unansweredTailWorkIds(renderRows) : undefined),
+    [expandUnansweredTail, renderRows],
+  );
   // Row ids that get a pre-compaction divider rendered before them.
-  const dividerBeforeId = compactionDividerIds(renderRows, compactionPoints);
+  const dividerBeforeId = useMemo(
+    () => compactionDividerIds(renderRows, compactionPoints),
+    [renderRows, compactionPoints],
+  );
 
   return (
     <ImageDimsContext.Provider value={imageDimsStore}>
@@ -3726,7 +3812,7 @@ export function Transcript({
         })}
         {streaming && (
           <div className="msg assistant streaming">
-            <MarkdownBody text={streaming} />
+            <StreamingMarkdownBody text={streaming} />
           </div>
         )}
         {(awaitingReply || turnActive) && !streaming && !workLive && (

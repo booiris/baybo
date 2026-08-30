@@ -9,8 +9,9 @@ import rehypeKatex from "rehype-katex";
 import { openUrl } from "./bridge";
 import { HtmlPreview, InvalidHtmlPreview } from "./HtmlPreview";
 import { htmlPreviewBlobId } from "./htmlPreviewProtocol";
-import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
+import { MarkdownCodeBlock, MarkdownStreamingContext } from "./MarkdownCodeBlock";
 import { normalizeMath } from "./mathDelimiters";
+import { advanceChunkEnds } from "./streamSplit";
 
 // GFM (tables, strikethrough, autolinks) + math. `remark-math` tokenizes the
 // `$...$` / `$$...$$` spans into math nodes; the `\(...\)` / `\[...\]` form is
@@ -249,17 +250,66 @@ function MarkdownPipeline({ text, breaks }: { text: string; breaks: boolean }) {
 /// markdown source until the chunk loaded, then reflowed to formatted prose —
 /// a visible flash. Bundling it into the entry means the first paint is already
 /// rendered.
-export const MarkdownBody = memo(function MarkdownBody({
+/// A STILL-GROWING body, split at safe block boundaries into settled chunks —
+/// each its own memoized `MarkdownBody`, parsed once and never again — plus a
+/// live tail that re-parses per update. One body over the whole text re-parses
+/// everything on every tick: quadratic over a stream, and the dominant
+/// main-thread cost of a long turn (see `streamSplit.ts`). Chunk cuts are
+/// immutable while the text only extends them; a rewrite that doesn't (a
+/// recovery snapshot replacing the tail) drops every cut and re-chunks — the
+/// startsWith is a microseconds memcmp against the parses it guards.
+export function StreamingMarkdownBody({
   text,
   breaks = false,
 }: {
   text: string;
   breaks?: boolean;
 }) {
+  const cache = useRef<{ prefix: string; ends: readonly number[] }>({ prefix: "", ends: [] });
+  const c = cache.current;
+  if (!text.startsWith(c.prefix)) {
+    c.prefix = "";
+    c.ends = [];
+  }
+  // Ref mutation during render, deliberately: this is a monotonic derivation
+  // cache (advancing twice is idempotent), the same shape as a memo.
+  const ends = advanceChunkEnds(text, c.ends);
+  if (ends !== c.ends) {
+    c.ends = ends;
+    c.prefix = text.slice(0, ends[ends.length - 1]);
+  }
+  return (
+    <div className="md-stream">
+      {ends.map((end, i) => (
+        <MarkdownBody key={i} text={text.slice(i === 0 ? 0 : ends[i - 1], end)} breaks={breaks} />
+      ))}
+      <MarkdownBody
+        text={text.slice(ends.length > 0 ? ends[ends.length - 1] : 0)}
+        breaks={breaks}
+        streaming
+      />
+    </div>
+  );
+}
+
+/// `streaming` marks a body whose text is still growing (the live answer
+/// bubble): code blocks inside it defer highlighting until the settle render —
+/// see `MarkdownStreamingContext`.
+export const MarkdownBody = memo(function MarkdownBody({
+  text,
+  breaks = false,
+  streaming = false,
+}: {
+  text: string;
+  breaks?: boolean;
+  streaming?: boolean;
+}) {
   return (
     <div className="md">
       <MarkdownFallback text={text}>
-        <MarkdownPipeline text={text} breaks={breaks} />
+        <MarkdownStreamingContext.Provider value={streaming}>
+          <MarkdownPipeline text={text} breaks={breaks} />
+        </MarkdownStreamingContext.Provider>
       </MarkdownFallback>
     </div>
   );

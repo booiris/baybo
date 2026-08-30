@@ -43,7 +43,7 @@ import {
 } from 'react-icons/ri';
 
 import { atBottom, useHoldBottomEdge } from '../components/scrollPin';
-import { MarkdownCodeBlock } from '../components/MarkdownCodeBlock';
+import { MarkdownCodeBlock, MarkdownStreamingContext } from '../components/MarkdownCodeBlock';
 import { useAdminClient, useAuth } from '../api/auth';
 import {
   ChatWs,
@@ -6196,17 +6196,23 @@ function MarkdownPipeline({ text, breaks }: { text: string; breaks: boolean }) {
 
 /** Assistant prose. Memoized because a streaming turn re-renders its parent per
  *  frame, and without it every finalized message in the thread would re-parse
- *  its markdown — and re-run the math normalizer — on each tick. */
+ *  its markdown — and re-run the math normalizer — on each tick. `streaming`
+ *  marks a body whose text is still growing: code blocks inside it defer
+ *  highlighting until the settle render (see `MarkdownStreamingContext`). */
 export const MarkdownBody = memo(function MarkdownBody({
   text,
   breaks = false,
+  streaming = false,
 }: {
   text: string;
   breaks?: boolean;
+  streaming?: boolean;
 }) {
   return (
     <MarkdownFallback text={text}>
-      <MarkdownPipeline text={text} breaks={breaks} />
+      <MarkdownStreamingContext.Provider value={streaming}>
+        <MarkdownPipeline text={text} breaks={breaks} />
+      </MarkdownStreamingContext.Provider>
     </MarkdownFallback>
   );
 });
@@ -6492,7 +6498,7 @@ function MessageBubble({
               </div>
             ) : null}
             {showMarkdown ? (
-              <MarkdownBody text={body} breaks={isUser} />
+              <MarkdownBody text={body} breaks={isUser} streaming={row.streaming === true} />
             ) : (
               <>
                 {body}
@@ -6591,7 +6597,10 @@ function ReasoningStepView({ text }: { text: string }) {
     <div className="flex items-start gap-2 font-mono text-xs text-ink-soft">
       <span className="select-none">✻</span>
       <div className="chat-prose work-reasoning min-w-0 flex-1">
-        <MarkdownBody text={shown} breaks />
+        {/* `shown` lagging `text` means the trace is still growing — the
+            sampler has more queued — so code inside defers highlighting; the
+            trailing sample closes the gap and the settle render colors it. */}
+        <MarkdownBody text={shown} breaks streaming={shown !== text} />
       </div>
     </div>
   );

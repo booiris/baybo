@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { MarkdownBody } from "./Markdown";
+import { MarkdownBody, StreamingMarkdownBody } from "./Markdown";
 import type { WorkRow, WorkStep } from "./types";
 
 /// Humanized duration: seconds under a minute, "Xm Ys" under an hour,
@@ -102,10 +102,20 @@ function useSampledText(text: string): string {
 /// — as raw text a `**要点：**` reached the reader as literal asterisks.
 function ReasoningStepView({ text }: { text: string }) {
   const shown = useSampledText(text);
+  // `shown` lagging `text` means the trace is still growing — the sampler has
+  // more queued. A growing trace renders chunked (settled blocks parse once,
+  // code defers highlighting — see StreamingMarkdownBody); the trailing
+  // sample closes the gap and the settled render parses the whole trace once,
+  // colored and seamless.
+  const growing = shown !== text;
   return (
     <div className="step reasoning">
       <span className="step-glyph">✻</span>
-      <MarkdownBody text={shown} breaks />
+      {growing ? (
+        <StreamingMarkdownBody text={shown} breaks />
+      ) : (
+        <MarkdownBody text={shown} breaks />
+      )}
     </div>
   );
 }

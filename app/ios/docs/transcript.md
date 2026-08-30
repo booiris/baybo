@@ -163,10 +163,15 @@ load-bearing:
   first.
 - **A crash-loop budget.** The kill is memory pressure and the reload rebuilds
   the same footprint, so an uncapped handler would flicker forever while
-  hammering the gateway with mount-edge syncs. Three reloads per 30s window;
-  a real first paint (`shown`) re-arms it. Past the cap the transcript stays
-  blank until the user backs out or resyncs. (`DeckBridge.contentProcessDied`
-  is the deck webview's twin, budget included, re-armed on its `ready`.)
+  hammering the gateway with mount-edge syncs. Three reloads per 30s window,
+  re-armed by TIME ONLY — a death landing more than the window after the
+  previous one resets the count. It must never re-arm on a paint: the
+  white-flash loop that motivated this painted on every reload (re-arming the
+  then-`shown`-based budget) and re-exploded to the 2.2GB per-process jetsam
+  limit within ~1s, six kills in five seconds with the cap never firing. Past
+  the cap the transcript stays blank until the user backs out or resyncs.
+  (`DeckBridge.contentProcessDied` is the deck webview's twin, budget
+  included, same time-only re-arm.)
 
 The LEG is untouched — no unsubscribe, no redial. An in-flight turn keeps running
 and its frames keep arriving through the reload (they buffer in the bridge's
