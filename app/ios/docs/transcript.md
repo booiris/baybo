@@ -65,6 +65,25 @@ never re-boots the runtime.
   frames after `init`, and replays the inset/jump/reveal the `ready` handler would have
   (no page reload fires).
 
+The keyed swap commits ASYNCHRONOUSLY inside a webview that stays visible
+(hiding it native-side pauses WebKit rAF — see the retarget comment), so two
+web-side mechanisms keep the transition clean. A cross-session `init`
+synchronously veils `#root` (`concealForRetarget` in `bridge.ts`) so the
+outgoing conversation vanishes on the next frame instead of lingering under
+the incoming commit; the incoming tree lifts the veil from its mount layout
+effect — the reveal and its first paint are one frame — with a timeout
+failsafe so a throwing mount can't leave the page blank. And the mount is
+BOUNDED: only the mirror's newest `FIRST_PAINT_ROWS` mount at open, and the
+older half is a paging RESERVOIR (`popDeferredHeadPage`), fed to `loadOlder`
+one page at a time before the network is ever asked. It must never be
+drained wholesale: rendered markdown costs WebKit roughly three orders of
+magnitude more resident memory than its source bytes (a 560KB mirror
+measured ~320MB on desktop WebKit, past the ~2.2GB per-process jetsam limit
+at device scale), so mounting a whole heavy mirror killed WebContent on
+every entry — a white flash per entry, a terminally blank page once the
+crash-reload budget gave up. While rows are withheld, `persistLatest` writes
+head + rendered rows together, so a back-out never truncates the mirror.
+
 ### Cross-session isolation
 
 Isolation is enforced on the WEB side because the webview is shared:
@@ -163,10 +182,15 @@ load-bearing:
   first.
 - **A crash-loop budget.** The kill is memory pressure and the reload rebuilds
   the same footprint, so an uncapped handler would flicker forever while
-  hammering the gateway with mount-edge syncs. Three reloads per 30s window;
-  a real first paint (`shown`) re-arms it. Past the cap the transcript stays
-  blank until the user backs out or resyncs. (`DeckBridge.contentProcessDied`
-  is the deck webview's twin, budget included, re-armed on its `ready`.)
+  hammering the gateway with mount-edge syncs. Three reloads per 30s window,
+  re-armed by TIME ONLY — a death landing more than the window after the
+  previous one resets the count. It must never re-arm on a paint: the
+  white-flash loop that motivated this painted on every reload (re-arming the
+  then-`shown`-based budget) and re-exploded to the 2.2GB per-process jetsam
+  limit within ~1s, six kills in five seconds with the cap never firing. Past
+  the cap the transcript stays blank until the user backs out or resyncs.
+  (`DeckBridge.contentProcessDied` is the deck webview's twin, budget
+  included, same time-only re-arm.)
 
 The LEG is untouched — no unsubscribe, no redial. An in-flight turn keeps running
 and its frames keep arriving through the reload (they buffer in the bridge's

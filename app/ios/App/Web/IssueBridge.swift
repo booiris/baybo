@@ -38,7 +38,9 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
 
         switch type {
         case "issueReady", "ready":
-            consecutiveDeaths = 0
+            // No crash-budget re-arm here: surviving is proven by time between
+            // deaths (see the window reset in `contentProcessDied`), not by a
+            // load that may still re-explode.
             ready = true
             let hadPending = !pending.isEmpty
             for js in pending { webView?.evaluateJavaScript(js) }

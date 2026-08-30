@@ -33,6 +33,27 @@ import Testing
         #expect(missing.sorted() == [])
     }
 
+    @Test func deckQuickSetupUsesAnOrdinaryLanguagePrompt() throws {
+        let catalog = try Self.catalog()
+        let en = Self.value(for: "deck.quickSetupPrompt", language: "en", in: catalog)
+        let zh = Self.value(for: "deck.quickSetupPrompt", language: "zh-Hans", in: catalog)
+        let enEmpty = Self.value(for: "deck.empty", language: "en", in: catalog)
+        let zhEmpty = Self.value(for: "deck.empty", language: "zh-Hans", in: catalog)
+
+        #expect(en?.hasPrefix("/") == false)
+        #expect(zh?.hasPrefix("/") == false)
+        #expect(en?.contains("line chart") == true)
+        #expect(zh?.contains("折线图") == true)
+        #expect(en?.contains("concise") == true)
+        #expect(zh?.contains("保持简洁") == true)
+        #expect(en?.contains("detailed usage data") == true)
+        #expect(zh?.contains("详细的使用数据") == true)
+        #expect(en?.contains("maximized view") == true)
+        #expect(zh?.contains("最大化视图") == true)
+        #expect(enEmpty?.contains("/deck") == false)
+        #expect(zhEmpty?.contains("/deck") == false)
+    }
+
     // MARK: - Sources
 
     private static func repoRoot() -> URL {
@@ -50,6 +71,15 @@ import Testing
 
     private static func catalogKeys() throws -> Set<String> {
         Set(try catalog().keys)
+    }
+
+    private static func value(
+        for key: String, language: String, in catalog: [String: [String: Any]]
+    ) -> String? {
+        let localizations = catalog[key]?["localizations"] as? [String: Any]
+        let localization = localizations?[language] as? [String: Any]
+        let stringUnit = localization?["stringUnit"] as? [String: Any]
+        return stringUnit?["value"] as? String
     }
 
     private static func referencedKeys() throws -> [(file: String, key: String)] {

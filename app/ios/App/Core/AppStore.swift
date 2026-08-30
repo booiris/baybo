@@ -569,10 +569,10 @@ final class AppStore: ObservableObject {
     /// before it touches the network, so a kill in that window can leave a
     /// message for a session the gateway never heard of and the list never
     /// showed — unreachable from the UI and drained by nothing. Re-drive every
-    /// session that still has one: the store ensures its remote row, lists it,
-    /// and dials, and the dial's reconciliation gate looks each entry up before
-    /// resending. Idempotent and cheap on the common path; only the active
-    /// server namespace is inspected.
+    /// session that still has one: the store ensures its remote row and looks
+    /// each entry up before deciding whether a missing local row should be
+    /// listed for redelivery. Idempotent and cheap on the common path; only the
+    /// active server namespace is inspected.
     private func resumeStrandedSends() {
         for sessionId in OutboxStore.pendingSessionIds(in: SessionIndex.supportDirectory()) {
             chatStore(for: sessionId).resumePersistedSends()

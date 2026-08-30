@@ -13,10 +13,6 @@ export type DeckStatePayload = {
 export type DeckInitPayload = DeckStatePayload & {
   lang: string;
   editMode?: boolean;
-  /// A `/deck` creation started from the empty-board CTA is still running
-  /// (no card yet): the CTA shows an in-flight state and a re-tap returns
-  /// to that chat rather than starting a new one.
-  setupInflight?: boolean;
 };
 
 export type CardDataPayload = { cardId: string; seq: number; payload: string };
@@ -46,7 +42,6 @@ export type DeckShellGlobal = {
   pickResult(payload: PickResultPayload): void;
   setEditMode(active: boolean): void;
   setLanguage(lang: string): void;
-  setSetupInflight(active: boolean): void;
   /// Native → web: the header's ✕ was tapped; collapse the maximized card.
   restoreMaximized(): void;
 };
@@ -152,11 +147,4 @@ export function postMaximize(active: boolean): void {
 /// Fire a native impact haptic (the long-press reorder pickup).
 export function postHaptic(): void {
   postSafe({ type: "haptic" });
-}
-
-/// Empty-board "Quick setup": ask native to open a fresh chat on the Chats
-/// tab and auto-send an ordinary-language `prompt` so the user lands in the
-/// conversation already working.
-export function postQuickSetup(prompt: string): void {
-  post({ type: "quickSetup", prompt });
 }

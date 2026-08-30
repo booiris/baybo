@@ -1,10 +1,9 @@
 import PhotosUI
 import SwiftUI
 
-/// The Deck tab (docs/modules/deck.md): the full-bleed deck-shell webview
-/// under the shared wordmark header, with an edit-mode Done pill and the
-/// native delete confirm (destructive actions confirm natively; the shell
-/// only reports intent).
+/// The Deck tab (docs/modules/deck.md): a native empty state over the warm,
+/// full-bleed card-grid webview, under the shared wordmark header, with an
+/// edit-mode Done pill and native destructive confirmation.
 struct DeckScreen: View {
     @EnvironmentObject private var store: AppStore
     @ObservedObject private var lang = Lang.shared
@@ -32,6 +31,9 @@ private struct DeckContent: View {
             // header's paper veil instead of hitting a hard edge.
             DeckWebView(host: host)
                 .ignoresSafeArea()
+            if deck.isEmpty {
+                emptyState
+            }
             // The header (wordmark + ☰ menu) STAYS on a maximized card — the
             // maximized card fills the area below it and its content scrolls
             // under the header's paper veil, same as the grid. Only the edit
@@ -87,6 +89,34 @@ private struct DeckContent: View {
         .sheet(item: $deck.shareItem) { item in
             ShareSheet(url: item.url)
         }
+    }
+
+    private var emptyState: some View {
+        VStack {
+            Spacer()
+            CreationPrompt(
+                symbol: AppStore.HomeTab.deck.icon,
+                title: lang.t("home.tab.deck"),
+                message: lang.t("deck.empty"),
+                actionTitle: emptyActionTitle,
+                actionIdentifier: "deck-empty-new-card",
+                actionInFlight: deck.setupSessionId != nil
+            ) {
+                Haptics.tap()
+                appStore.startCardDraft(prompt: lang.t("deck.quickSetupPrompt"))
+            }
+            Spacer()
+        }
+        .padding(.bottom, 80)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.paper)
+    }
+
+    private var emptyActionTitle: String {
+        if deck.setupSessionId != nil {
+            return lang.t("deck.createCardInflight")
+        }
+        return lang.t("deck.quickSetup")
     }
 
     /// The photo picker's selection, taken through a binding SETTER rather than
@@ -156,7 +186,7 @@ private struct DeckContent: View {
             .padding(.trailing, 20)
             .accessibilityLabel(Text(verbatim: lang.t("deck.editDone")))
             .transition(.opacity)
-        } else {
+        } else if !deck.isEmpty {
             Button {
                 deck.setEditMode(!deck.editMode)
             } label: {

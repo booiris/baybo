@@ -74,6 +74,69 @@ struct ChatStoreStrandedSendTests {
         #expect(client.transmissions.isEmpty, "a durable send must never be re-run")
     }
 
+    /// A previous lookup can be interrupted after it parks the entry as
+    /// `unknown`. If the durable session was hidden elsewhere, its row is absent
+    /// from the authoritative list. Recovery must prove durability before it
+    /// calls `recordUserSend`, otherwise the hidden conversation flashes on
+    /// every cold launch and foreground entry.
+    @Test func aDurableUnknownSendDoesNotRecreateAMissingListRow() async {
+        outbox.markUnknown(platformMsgId: Self.msgId)
+        client.answerLookup(platformMsgId: Self.msgId, found: true, ordinal: 3)
+
+        store.resumePersistedSends()
+
+        #expect(await waitUntil { outbox.entries().isEmpty })
+        #expect(!index.contains(sessionId: Self.sessionId))
+        #expect(client.connectedSessions.isEmpty, "nothing remains to redeliver")
+        #expect(client.transmissions.isEmpty)
+
+        store.connectIfNeeded()
+        #expect(await waitUntil { store.connState == .connected })
+        #expect(!index.contains(sessionId: Self.sessionId), "an explicit open still cannot relist it")
+    }
+
+    /// An ambiguous lookup stays invisible and remains recoverable. A later
+    /// foreground/cold-start pass retries the same key; once durability is
+    /// known, the outbox drains without synthesising a local session row.
+    @Test func anUnknownLookupFailureRetriesWithoutCreatingAGhostRow() async {
+        outbox.markUnknown(platformMsgId: Self.msgId)
+        client.failLookup(with: BayboError.Other(message: "gateway unreachable"))
+
+        store.resumePersistedSends()
+
+        #expect(await waitUntil { client.lookupCalls.count == 1 })
+        #expect(outbox.entries().first?.state == .unknown)
+        #expect(!index.contains(sessionId: Self.sessionId))
+        #expect(store.connState == .draft, "the in-session recovery loop must keep retrying")
+
+        client.clearLookupFailure()
+        client.answerLookup(platformMsgId: Self.msgId, found: true, ordinal: 3)
+        let nextLaunch = ChatStore(
+            sessionId: Self.sessionId, client: client, index: index, outbox: outbox,
+            supportDirectory: temp.url)
+        nextLaunch.resumePersistedSends()
+
+        #expect(await waitUntil { client.lookupCalls.count == 2 })
+        #expect(await waitUntil { outbox.entries().isEmpty })
+        #expect(!index.contains(sessionId: Self.sessionId))
+    }
+
+    /// Launch completion and `didBecomeActive` can arrive together. The first
+    /// caller claims recovery synchronously, so the second cannot duplicate the
+    /// create/lookup sequence or race a local row insertion.
+    @Test func overlappingRecoveryTriggersShareOneAttempt() async {
+        outbox.markUnknown(platformMsgId: Self.msgId)
+        client.answerLookup(platformMsgId: Self.msgId, found: true, ordinal: 3)
+
+        store.resumePersistedSends()
+        store.resumePersistedSends()
+
+        #expect(await waitUntil { outbox.entries().isEmpty })
+        #expect(client.createdSessionIds == [Self.sessionId])
+        #expect(client.lookupCalls.map(\.platformMsgId) == [Self.msgId])
+        #expect(!index.contains(sessionId: Self.sessionId))
+    }
+
     /// Provably absent → redelivered under the ORIGINAL key, so a delivery that
     /// races this one still lands as a single row.
     @Test func aStrandedSendThatNeverLandedIsRedelivered() async {

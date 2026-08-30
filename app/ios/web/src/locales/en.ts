@@ -37,6 +37,8 @@ export const en = {
       approvalApproved: "approved",
       approvalApprovedAlways: "always approved",
       approvalDenied: "denied",
+      toolDetails: "Details",
+      toolResult: "Result",
       workedFor: "Worked {{dur}}",
       cancelled: "Cancelled",
       cancelledFor: "Cancelled · Worked {{dur}}",
@@ -93,11 +95,6 @@ export const en = {
       },
     },
     deck: {
-      empty: "No cards yet — create one in a chat.",
-      quickSetup: "Create a card",
-      createCardInflight: "Creating · view",
-      quickSetupPrompt:
-        "Create a card that monitors Baybo's token usage. Keep the standard card view concise, showing only key metrics and a line chart of usage trends. Reserve the most complete and detailed usage data and analysis for the maximized view",
       quarantined: "This card was stopped after repeated failures.",
       disabled: "Paused",
       reenable: "Re-enable",

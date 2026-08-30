@@ -28,7 +28,7 @@ vi.mock("./mathDelimiters", async (importOriginal) => {
   };
 });
 
-import { MarkdownBody } from "./Markdown";
+import { MarkdownBody, StreamingMarkdownBody } from "./Markdown";
 import { copyText } from "./bridge";
 import i18n from "./i18n";
 
@@ -358,5 +358,88 @@ describe("MarkdownBody failure fallback", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+// The white-flash loop: highlighting a still-growing block per
+// streaming tick ballooned WebContent to the 2.2GB per-process jetsam limit.
+// These pin the three defenses added against it (defer-while-streaming, the
+// input-size cap, unlabeled detection) at the MarkdownBody surface — the same
+// seam the streaming answer bubble uses.
+describe("MarkdownBody code highlighting under streaming", () => {
+  const fenced = (body: string) => `\`\`\`swift\n${body}\n\`\`\``;
+
+  it("defers highlighting while streaming, colors on the settle render", () => {
+    const source = "let answer: Int = 42";
+    const { container, rerender } = render(<MarkdownBody text={fenced(source)} streaming />);
+    expect(container.querySelector(".hljs-keyword")).toBeNull();
+    expect(container.querySelector("pre")?.textContent).toBe(source);
+    rerender(<MarkdownBody text={fenced(source)} />);
+    expect(container.querySelector(".hljs-keyword")?.textContent).toBe("let");
+  });
+
+  it("renders a block past the size cap as plain text", () => {
+    const line = "let value = compute(width, height)\n";
+    const giant = line.repeat(Math.ceil((33 * 1024) / line.length));
+    const { container } = render(<MarkdownBody text={fenced(giant)} />);
+    expect(container.querySelector(".hljs-keyword")).toBeNull();
+    expect(container.querySelector("pre")?.textContent).toContain("compute(width, height)");
+  });
+
+  it("defers math while streaming, typesets on the settle render", () => {
+    const src = "energy is $E = mc^2$ today";
+    const { container, rerender } = render(<MarkdownBody text={src} streaming />);
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toContain("$E = mc^2$");
+    rerender(<MarkdownBody text={src} />);
+    expect(container.querySelector(".katex")).not.toBeNull();
+  });
+
+  it("still detects and highlights an unlabeled fence", () => {
+    const { container } = render(
+      <MarkdownBody text={"```\nfunction greet(name) { return name; }\n```"} />,
+    );
+    expect(container.querySelector(".hljs-title.function_")?.textContent).toBe("greet");
+    expect(container.querySelector("code")?.className).toContain("language-");
+  });
+});
+
+// The quadratic-stream fix: a growing body renders as settled chunks (each
+// parsed once) plus a live tail. See streamSplit.ts for the boundary rules —
+// these pin the component seam: chunk/tail split, per-side highlighting, and
+// recovery from a rewrite that invalidates the cuts.
+describe("StreamingMarkdownBody", () => {
+  const settled = `${"```swift\nlet answer: Int = 42\n```\n\n"}${"filler paragraph. ".repeat(80)}\n\n`;
+
+  it("splits into a settled chunk and a live tail once enough text lands", () => {
+    const { container } = render(<StreamingMarkdownBody text={`${settled}tail still going`} />);
+    const bodies = container.querySelectorAll(".md-stream > .md");
+    expect(bodies.length).toBe(2);
+    expect(bodies[0].textContent).toContain("let answer");
+    expect(bodies[1].textContent).toContain("tail still going");
+  });
+
+  it("colors and typesets nothing anywhere while streaming — settle does it once", () => {
+    const tailCode = "```swift\nlet tail = true\n```\nand math $x^2$ here";
+    const { container } = render(<StreamingMarkdownBody text={`${settled}${tailCode}`} />);
+    const bodies = container.querySelectorAll(".md-stream > .md");
+    expect(bodies.length).toBe(2);
+    // A chunk that froze a wrong $ pairing or a half-colored fence would keep
+    // it until settle, so the live pipeline runs NO hljs and NO KaTeX at all.
+    expect(container.querySelector(".hljs-keyword")).toBeNull();
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(bodies[1].textContent).toContain("let tail = true");
+    expect(bodies[1].textContent).toContain("$x^2$");
+  });
+
+  it("keeps chunk cuts while the text extends, drops them on a rewrite", () => {
+    const { container, rerender } = render(<StreamingMarkdownBody text={`${settled}tail`} />);
+    expect(container.querySelectorAll(".md-stream > .md").length).toBe(2);
+    rerender(<StreamingMarkdownBody text={`${settled}tail grew longer`} />);
+    expect(container.querySelectorAll(".md-stream > .md").length).toBe(2);
+    rerender(<StreamingMarkdownBody text={"a rewrite that shares no prefix"} />);
+    const bodies = container.querySelectorAll(".md-stream > .md");
+    expect(bodies.length).toBe(1);
+    expect(bodies[0].textContent).toContain("a rewrite");
   });
 });

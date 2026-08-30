@@ -1,6 +1,6 @@
 # Deck (iOS shell)
 
-*`docs/modules/deck.md` is the source of truth for the Deck design; this document covers only the iOS half — `app/ios/App/Core/DeckStore.swift`, `app/ios/App/Web/DeckBridge.swift`, and the `app/ios/web/src/deck/` shell.*
+*`docs/modules/deck.md` is the source of truth for the Deck design; this document covers only the iOS half — `app/ios/App/Screens/DeckScreen.swift`, `app/ios/App/Core/DeckStore.swift`, `app/ios/App/Web/DeckBridge.swift`, and the `app/ios/web/src/deck/` shell.*
 
 ## The second webview
 
@@ -33,6 +33,14 @@ identity.
 
 Destructive card actions confirm **NATIVELY** — the shell only reports intent.
 
+The empty board is native too. `DeckStore.isEmpty` follows the durable mirror
+and each refetch; while it is true, `DeckScreen` covers the still-warm webview
+with the shared `CreationPrompt`. That gives Deck the same SF Symbol, vertical
+placement, typography, and CTA as Projects, Chats, and an empty project stage.
+The CTA calls `AppStore.startCardDraft` directly. Its tracked setup session is
+published by `DeckStore`, so the native button can show the in-flight state and
+a second tap returns to the same chat.
+
 The recycle bin is also native. Restore is the visible row action; permanent
 delete is available from either a long-press menu or a trailing destructive
 swipe with full-swipe disabled, followed by an explicit Cancel / Delete
@@ -46,19 +54,19 @@ if the active-leg request fails.
 native→web:
 
 ```
-init/deckState/cardData/bundle/callResult/pickResult/setEditMode/setSetupInflight/
-setLanguage/restoreMaximized
+init/deckState/cardData/bundle/callResult/pickResult/setEditMode/setLanguage/
+restoreMaximized
 ```
 
 web→native:
 
 ```
-ready/refetch/requestBundle/call/pick/share/layout/cardAction/editMode/
-quickSetup/maximize/haptic/log
+ready/refetch/requestBundle/call/pick/share/layout/cardAction/editMode/maximize/
+haptic/log
 ```
 
-- `quickSetup` is the empty-board CTA: native opens a fresh chat and auto-sends
-  an ordinary-language card request, via `AppStore.startCardDraft`.
+- The empty-board CTA does not cross this bridge: it already lives in
+  `DeckScreen` and calls `AppStore.startCardDraft` natively.
 - `maximize` reports a card entered/left its full-screen layout so `DeckScreen`
   fades the wordmark header out — the tab bar stays — while `DeckStore.maximized`
   is set.

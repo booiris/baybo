@@ -23,6 +23,7 @@ import {
   postSyncRequest,
   resendOutline,
   retrySend,
+  revealAfterRetarget,
   subscribeTranscript,
   type OutlinePost,
   type UserSentPayload,
@@ -34,7 +35,7 @@ import {
   type ImageDimsStore,
 } from "./attachments";
 import { useLongPress } from "./gestures";
-import { MarkdownBody } from "./Markdown";
+import { MarkdownBody, StreamingMarkdownBody } from "./Markdown";
 import { advanceFromLive, advanceFromSync, type CursorState } from "./transcript/cursor";
 import { compactionStatusText, WorkBlockView } from "./WorkBlock";
 import {
@@ -212,6 +213,14 @@ const SCROLL_TOP_THRESHOLD_PX = 64;
 /// pinned to the bottom; above it (reading history) they leave the viewport
 /// alone. Roughly one short bubble, so only genuinely-at-the-edge follows.
 const FOLLOW_BOTTOM_THRESHOLD_PX = 96;
+
+/// How long after a lifted finger an off-edge scroll reading still counts as
+/// the READER moving (momentum coast) rather than the EDGE moving (late
+/// reflow under a pin, which onScroll answers by re-pinning). A flick can
+/// coast for a couple of seconds after touchend; only touches on the
+/// transcript document itself stamp the clock, so a cold open — whose taps
+/// all land on native chrome — is never inside the grace.
+const TOUCH_COAST_GRACE_MS = 3000;
 
 /// Cap on the jump-to-latest smooth glide. Browsers finish a smooth scroll well
 /// inside this, so hitting the cap means the glide was cancelled (a finger
@@ -1576,6 +1585,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
 /// isn't.
 export const FIRST_PAINT_ROWS = 40;
 
+
 /// Split a sanitized mirror into what the first commit renders (`tail`) and the
 /// older rows deferred past it (`head`, oldest-first). Below the threshold the
 /// head is empty and nothing about the open changes.
@@ -1852,7 +1862,7 @@ export function Transcript({
   // (`splitForFirstPaint`), with the backward-paging state that describes what
   // is actually RENDERED while the older half is withheld: the floor is the
   // tail's own oldest ordinal, and there is always more older (the head itself).
-  // `drainDeferredHead` hands the mirror's own values back when it folds it in.
+  // `popDeferredHeadPage` hands the mirror's own values back on the final pop.
   //
   // Built in one `useState` initializer, not inline: a `useRef(expr)` argument
   // is evaluated on EVERY render, and this walks and slices the whole thread.
@@ -2034,6 +2044,11 @@ export function Transcript({
   // loop) fight the drag on the main-frame scroller — a write landing mid-drag
   // slams scrollTop back to the bottom every frame. Suspend them while touching.
   const userTouchingRef = useRef(false);
+  // When the last finger lifted — the coast-grace clock (TOUCH_COAST_GRACE_MS).
+  // -Infinity, NOT 0: performance.now() is near zero on a fresh page, and a 0
+  // start would read the whole first grace-window of a cold open as "a finger
+  // just lifted" — exactly the window the drift re-pin exists to protect.
+  const lastTouchEndAt = useRef(Number.NEGATIVE_INFINITY);
   // Document scrollTop captured at touchstart, so touchend can tell a deliberate
   // upward DRAG (must stay put) from a pure HOLD at the bottom during streaming
   // (content grew below with pins suspended → catch up on lift). Without this,
@@ -2055,6 +2070,26 @@ export function Transcript({
   const glidingRef = useRef(false);
   const glideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(glideTimer.current), []);
+
+  // Arm the glide window around a programmatic move to the newest edge: the
+  // move's scroll event (and any events from layout still settling after it)
+  // reads a transient off-edge gap, and outside a glide onScroll would take
+  // that reading at face value and disarm following. Settles the moment a
+  // scroll lands in the follow band, or re-evaluates honestly at the cap.
+  const armPinGlide = useCallback(() => {
+    glidingRef.current = true;
+    followRef.current = true;
+    clearTimeout(glideTimer.current);
+    glideTimer.current = setTimeout(() => {
+      glidingRef.current = false;
+      const el = scrollEl();
+      if (!el) return;
+      const follow =
+        el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
+      followRef.current = follow;
+      setShowJump(!follow);
+    }, GLIDE_SETTLE_CAP_MS);
+  }, []);
   // Which row the jump ring is blooming around, and the replay nonce that lets
   // it bloom again on a repeat jump to the same row (see MessageRow's `flash`).
   const [flash, setFlash] = useState({ id: "", nonce: 0 });
@@ -2110,20 +2145,19 @@ export function Transcript({
   useEffect(() => {
     persistLatest.current = () => {
       if (messages.length === 0 && cursorRef.current.cursor === null) return;
-      // The first commit deliberately renders only the mirror's newest rows
-      // (`splitForFirstPaint`); writing in that window persists the TRUNCATED
-      // thread and loses the rest for good — the file is the only copy of a row
-      // the sync cursor has long since passed. The debounce usually hides this
-      // (the drain lands a frame later and supersedes the pending write), but
-      // `flushPersist` is synchronous and both `pagehide` and native's detach
-      // fire it — so a back-out inside that frame is a real path, not a
-      // theoretical one.
-      if (deferredHead.current.length > 0) return;
+      // The reservoir half of the mirror is WITHHELD from the DOM (see
+      // popDeferredHeadPage), never gone — a persist must write the whole
+      // thread, head included, or a back-out would truncate the only copy of
+      // rows the sync cursor has long since passed. While rows are withheld
+      // the paging floor persisted is the mirror's own, not the rendered
+      // half's.
+      const withheld = deferredHead.current;
       persistState({
-        messages,
+        messages: withheld.length > 0 ? [...withheld, ...messages] : messages,
         lastOrdinal: cursorRef.current.cursor,
-        oldestOrdinal: oldestOrdinal.current,
-        hasMoreOlder,
+        oldestOrdinal:
+          withheld.length > 0 ? (restored?.oldestOrdinal ?? null) : oldestOrdinal.current,
+        hasMoreOlder: withheld.length > 0 ? (restored?.hasMoreOlder ?? false) : hasMoreOlder,
         imageDims: Object.fromEntries(imageDims),
         compactionPoints,
       });
@@ -2133,9 +2167,13 @@ export function Transcript({
 
   // Open the thread at its newest edge — a restored thread would otherwise
   // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.
+  // Lifting the retarget veil here (post-commit, pre-paint) means the frame
+  // that reveals the page is the frame this conversation's content — pinned
+  // to its newest edge — paints.
   useLayoutEffect(() => {
     const el = scrollEl();
     if (el) el.scrollTop = el.scrollHeight;
+    revealAfterRetarget();
   }, []);
 
   // While pinned to the newest edge, keep it in view as content lands (rows,
@@ -2203,6 +2241,7 @@ export function Transcript({
     };
     const up = () => {
       userTouchingRef.current = false;
+      lastTouchEndAt.current = performance.now();
       const el = scrollEl();
       if (!el) return;
       // Catch up to the newest edge on lift ONLY for a hold at the bottom where
@@ -2232,9 +2271,24 @@ export function Transcript({
     const anchor = prependAnchor.current;
     const el = scrollEl();
     if (!anchor || !el) return;
-    el.scrollTop = anchor.prevScrollTop + (el.scrollHeight - anchor.prevScrollHeight);
+    // A prepend under a FOLLOWING reader — the cold-open deferred-head drain,
+    // which runs while the viewport sits pinned to the newest edge — re-pins
+    // instead of restoring the arithmetic anchor. The arithmetic assumes every
+    // height change sits above the viewport, but the prepended markdown keeps
+    // reflowing after this write (font swap, KaTeX, max-content code blocks),
+    // and on real WebKit the drift left the reader ~hundreds of px off the
+    // bottom — the "cold open no longer lands at the bottom" regression.
+    // While following, the newest edge IS the reader's place; onScroll's
+    // drift re-pin holds it there through the post-write reflow. (A scroll-up
+    // page can't take this branch: paging requires scrolling up past the
+    // follow threshold first.)
+    if (followRef.current && !userTouchingRef.current) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      el.scrollTop = anchor.prevScrollTop + (el.scrollHeight - anchor.prevScrollHeight);
+    }
     prependAnchor.current = null;
-  }, [messages]);
+  }, [messages, armPinGlide]);
 
   // After a REPLACE, put the row the reader was on back under the same pixel.
   // Declared AFTER the prepend anchor so a history page and a REPLACE landing in
@@ -2256,17 +2310,68 @@ export function Transcript({
     el.scrollTop += node.getBoundingClientRect().top - anchor.top;
   }, [messages]);
 
-  const foldMidTurnNotice = useCallback((level: string, text: string) => {
-    setMessages((rows) => foldMidTurnNoticeIn(rows, level, text));
+  // ---- work-frame commit coalescing ----------------------------------------
+  // reasoning / tool / status / notice frames arrive one wire frame per task
+  // (each its own evaluateJavaScript), so their setMessages calls can never
+  // batch on their own: a chatty Working phase committed — and recomputed
+  // every O(thread) render derivation — at wire rate, not display rate. Row
+  // transforms from those handlers queue here and land as ONE reduced
+  // setMessages per animation frame, in arrival order. Anything that must
+  // observe the applied rows in its own task (a terminal message, a sync
+  // page, a send append — each reads or extends the tail the queued ops
+  // target) drains the queue first via flushRowOps; React batches the drain
+  // with the caller's own update, so the barrier costs no extra commit.
+  const rowOps = useRef<Array<(rows: Row[]) => Row[]>>([]);
+  const rowOpsRaf = useRef<number | undefined>(undefined);
+  const flushRowOps = useCallback(() => {
+    if (rowOpsRaf.current !== undefined) {
+      cancelAnimationFrame(rowOpsRaf.current);
+      rowOpsRaf.current = undefined;
+    }
+    const ops = rowOps.current;
+    if (ops.length === 0) return;
+    rowOps.current = [];
+    setMessages((rows) => ops.reduce((acc, op) => op(acc), rows));
   }, []);
+  const enqueueRowOp = useCallback(
+    (op: (rows: Row[]) => Row[]) => {
+      rowOps.current.push(op);
+      if (rowOpsRaf.current === undefined) {
+        rowOpsRaf.current = requestAnimationFrame(() => {
+          rowOpsRaf.current = undefined;
+          flushRowOps();
+        });
+      }
+    },
+    [flushRowOps],
+  );
+  useEffect(
+    () => () => {
+      if (rowOpsRaf.current !== undefined) cancelAnimationFrame(rowOpsRaf.current);
+    },
+    [],
+  );
 
-  const severTerminalNotice = useCallback((text: string, durableId: string | null) => {
-    setMessages((rows) => severTerminalNoticeIn(rows, text, durableId));
-  }, []);
+  const foldMidTurnNotice = useCallback(
+    (level: string, text: string) => {
+      enqueueRowOp((rows) => foldMidTurnNoticeIn(rows, level, text));
+    },
+    [enqueueRowOp],
+  );
 
-  const appendNotice = useCallback((text: string) => {
-    setMessages((m) => [...m, { id: uid(), role: "notice", content: text }]);
-  }, []);
+  const severTerminalNotice = useCallback(
+    (text: string, durableId: string | null) => {
+      enqueueRowOp((rows) => severTerminalNoticeIn(rows, text, durableId));
+    },
+    [enqueueRowOp],
+  );
+
+  const appendNotice = useCallback(
+    (text: string) => {
+      enqueueRowOp((m) => [...m, { id: uid(), role: "notice", content: text }]);
+    },
+    [enqueueRowOp],
+  );
 
   // A user opened a collapsed work block: stop following the newest edge so the
   // block grows DOWNWARD from its summary. Left following, the pin (ResizeObserver
@@ -2368,9 +2473,12 @@ export function Transcript({
 
   // ---- work block (the turn's thinking / tool process) ---------------------
 
-  const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
-    setMessages((rows) => openWorkIn(rows, mutate));
-  }, []);
+  const withOpenWork = useCallback(
+    (mutate: (row: WorkRow) => WorkRow) => {
+      enqueueRowOp((rows) => openWorkIn(rows, mutate));
+    },
+    [enqueueRowOp],
+  );
 
   const pushWorkStep = useCallback(
     (step: WorkStep) => {
@@ -2386,14 +2494,17 @@ export function Transcript({
   // `approval_resolved` is broadcast connection-wide (it carries no session), so
   // a session with no block open would otherwise sprout an empty "Working" card
   // every time some other conversation answered a prompt.
-  const rewriteToolSteps = useCallback((mutate: (step: WorkStep) => WorkStep) => {
-    setMessages((rows) => {
-      const last = rows[rows.length - 1];
-      if (!last || last.role !== "work") return rows;
-      const steps = last.steps.map((s) => (s.kind === "tool" ? mutate(s) : s));
-      return [...rows.slice(0, -1), { ...last, steps }];
-    });
-  }, []);
+  const rewriteToolSteps = useCallback(
+    (mutate: (step: WorkStep) => WorkStep) => {
+      enqueueRowOp((rows) => {
+        const last = rows[rows.length - 1];
+        if (!last || last.role !== "work") return rows;
+        const steps = last.steps.map((s) => (s.kind === "tool" ? mutate(s) : s));
+        return [...rows.slice(0, -1), { ...last, steps }];
+      });
+    },
+    [enqueueRowOp],
+  );
 
   // A prompt opened on `toolCallId`: badge that step as waiting. Keyed by the
   // TOOL call's id (`tool_call_id`), which is what the step carries — the
@@ -2434,14 +2545,18 @@ export function Transcript({
     const text = streamText.current;
     if (!text) return;
     const at = streamStartedAt.current;
-    clearStreaming();
     pushWorkStep({ kind: "prose", text, at });
-  }, [clearStreaming, pushWorkStep]);
+    // Drain the queued step in THIS task, so the prose step and the emptied
+    // reply commit together — left to the rAF, the paragraph blanks for a
+    // frame mid-read (the exact bug `setStreamingText` exists to prevent).
+    flushRowOps();
+    clearStreaming();
+  }, [clearStreaming, pushWorkStep, flushRowOps]);
 
   // Close the tail work block: freeze the elapsed label, or drop the block
   // entirely when the turn produced no steps (a plain direct answer).
   const closeWork = useCallback(() => {
-    setMessages((rows) => {
+    enqueueRowOp((rows) => {
       const last = rows[rows.length - 1];
       if (!last || last.role !== "work" || !last.active) return rows;
       if (last.steps.length === 0) return rows.slice(0, -1);
@@ -2450,7 +2565,7 @@ export function Transcript({
       const elapsedMs = last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined);
       return [...rows.slice(0, -1), { ...last, active: false, elapsedMs }];
     });
-  }, []);
+  }, [enqueueRowOp]);
 
   // Remember a turn we've seen END (turn_state{active:false} or its final
   // Message), so a later `subscribe_state` bundle for the SAME turn — matched by
@@ -2479,6 +2594,9 @@ export function Transcript({
       wireSteps: WireWorkStepFrame[],
       pendingApprovals: WireApprovalCard[],
     ) => {
+      // The bundle reads and rewrites the tail block — queued live steps must
+      // have landed first or the rebuild silently drops them.
+      flushRowOps();
       const startedMs = turn.started_at ? Date.parse(turn.started_at) : null;
       if (startedMs !== null && endedTurnStarts.current.includes(startedMs)) return;
       if (!turn.active) {
@@ -2553,7 +2671,7 @@ export function Transcript({
           : [...freezeActiveWork(rows), rebuilt];
       });
     },
-    [closeWork, setStreamingText],
+    [closeWork, setStreamingText, flushRowOps],
   );
 
   // Fire a backward-history (scroll-up) request through native. The API result
@@ -2578,6 +2696,7 @@ export function Transcript({
   // can't overlap — the id-set filter is just a safety net. Re-seeds `sentIds`
   // so a later live echo of an own message doesn't double-render.
   const prependOlder = useCallback((older: Row[], newOldest: number | null, more: boolean) => {
+    flushRowOps();
     const anchorEl = scrollEl();
     if (older.length > 0 && anchorEl) {
       prependAnchor.current = {
@@ -2604,43 +2723,43 @@ export function Transcript({
     if (newOldest !== null) oldestOrdinal.current = newOldest;
     setHasMoreOlder(more);
     hasMoreOlderRef.current = more;
-  }, []);
+  }, [flushRowOps]);
 
   // Fold the mirror's withheld older rows into the thread (see
-  // `splitForFirstPaint`), restoring the paging state they were held back from.
-  // Idempotent and one-shot: the reservoir is cleared before the prepend, so a
-  // drain racing the frame effect below can't double-render it.
+  // `splitForFirstPaint`), a PAGE at a time — the reservoir is the backward
+  // paging source while it lasts, never a bulk drain. Draining it whole
+  // mounted the entire mirror as DOM one frame after first paint, and a heavy
+  // session's restore then climbed past the WebContent per-process jetsam
+  // limit on device (~300MB desktop-WebKit for a 560KB mirror; ~2.3GB at
+  // device scale): every entry died as a white flash, repeated entries as a
+  // blank page. Withheld rows are DOM the reader never paid for until they
+  // actually scroll up to them.
   //
-  // Goes through `prependOlder` rather than a bare `setMessages` so the head
-  // arrives under exactly the rules a scroll-up page does — viewport anchored by
+  // Goes through `prependOlder` rather than a bare `setMessages` so a page
+  // arrives under exactly the rules a network page does — viewport anchored by
   // `prependAnchor`, `sentIds`/`renderedOrdinals` re-seeded, seam folded (a
   // no-op on an already-sanitized split, see `splitForFirstPaint`).
-  const drainDeferredHead = useCallback(() => {
+  const popDeferredHeadPage = useCallback(() => {
     const head = deferredHead.current;
     if (head.length === 0) return;
-    deferredHead.current = [];
-    prependOlder(head, restored?.oldestOrdinal ?? null, restored?.hasMoreOlder ?? false);
-    // `prependOlder` leaves the floor PUT on a null — its "an empty page changes
-    // nothing" rule. Here null is the mirror's real answer ("no durable floor to
-    // page from"), and the tail's own oldest — seeded only to describe the half
-    // that was rendered — must not outlive the half it described.
-    oldestOrdinal.current = restored?.oldestOrdinal ?? null;
+    const at = Math.max(0, head.length - HISTORY_PAGE_LIMIT);
+    const page = head.slice(at);
+    deferredHead.current = head.slice(0, at);
+    if (at === 0) {
+      // Final pop — hand the mirror's own paging state back. `prependOlder`
+      // leaves the floor PUT on a null — its "an empty page changes nothing"
+      // rule. Here null is the mirror's real answer ("no durable floor to
+      // page from"), and the tail's own oldest — seeded only to describe the
+      // rendered half — must not outlive the half it described.
+      prependOlder(page, restored?.oldestOrdinal ?? null, restored?.hasMoreOlder ?? false);
+      oldestOrdinal.current = restored?.oldestOrdinal ?? null;
+    } else {
+      // Rows remain withheld above — more-older stays true and the floor
+      // stays describing the rendered half; the network is never asked while
+      // the reservoir can answer (see loadOlder).
+      prependOlder(page, null, true);
+    }
   }, [prependOlder, restored]);
-
-  // One frame after the first paint. `useEffect` alone runs before the browser
-  // has painted the commit, which would put the whole thread back in the first
-  // frame and undo the split; the nested rAF lands after it.
-  useEffect(() => {
-    if (deferredHead.current.length === 0) return;
-    let inner = 0;
-    const outer = requestAnimationFrame(() => {
-      inner = requestAnimationFrame(drainDeferredHead);
-    });
-    return () => {
-      cancelAnimationFrame(outer);
-      cancelAnimationFrame(inner);
-    };
-  }, [drainDeferredHead]);
 
   // Recover from a gateway `Frame::Reset` (catch-up gap over the replay cap, or
   // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap
@@ -2656,7 +2775,7 @@ export function Transcript({
     // webview is hidden), which would otherwise re-fetch what is on disk and
     // fail outright offline.
     if (deferredHead.current.length > 0) {
-      drainDeferredHead();
+      popDeferredHeadPage();
       return;
     }
     const before = oldestOrdinal.current;
@@ -2677,7 +2796,7 @@ export function Transcript({
       log("warn", `history page failed: ${String(e)}`);
       appendNotice(t("chat.recoverFailed", { error: String(e) }));
     }
-  }, [hasMoreOlder, requestHistory, appendNotice, drainDeferredHead, t]);
+  }, [hasMoreOlder, requestHistory, appendNotice, popDeferredHeadPage, t]);
 
   // The one forward-recovery pull (docs/sync-protocol.md "The one client
   // algorithm"): session open, reconnect, gap nudge and the safety tick all
@@ -2738,6 +2857,9 @@ export function Transcript({
   // row by `platform_msg_id`. Rows arrive ascending; each carries a stable id.
   const applySyncPage = useCallback(
     (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
+      // Queued work-frame ops target the pre-page tail; land them before the
+      // page merges or REPLACEs so they aren't applied to rebuilt rows.
+      flushRowOps();
       setSyncInFlight(false);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
@@ -2905,7 +3027,7 @@ export function Transcript({
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
       markReadIfAdvanced();
     },
-    [advanceCursorFromSync, clearStreaming, markReadIfAdvanced, setSyncInFlight, runSync],
+    [advanceCursorFromSync, clearStreaming, markReadIfAdvanced, setSyncInFlight, runSync, flushRowOps],
   );
 
   const handleFrame = (frameJson: string) => {
@@ -2981,6 +3103,10 @@ export function Transcript({
           if (cursorRef.current.rebaseDirty) runSync();
         }
         if (ordinal !== null) renderedOrdinals.current.add(ordinal);
+        // Land queued steps (and the assistant branch's closeWork) first, so
+        // the settled row appends BELOW the finished block, in one commit with
+        // the cleared streaming reply.
+        flushRowOps();
         setMessages((m) => [
           ...m,
           {
@@ -3140,7 +3266,7 @@ export function Transcript({
           // event). Instead end the optimistic window, freeze any open work
           // block, and pull the durable indicator in via one sync.
           setAwaitingReply(false);
-          setMessages((rows) => freezeActiveWork(rows));
+          enqueueRowOp((rows) => freezeActiveWork(rows));
           runSync();
         } else if (frame.mid_turn ?? true) {
           // A tool-authored aside — the server's fold-eligibility declaration.
@@ -3221,6 +3347,10 @@ export function Transcript({
   // the state updater must repeat the identity check against the actual rows it
   // receives.
   const handleUserSent = (payload: UserSentPayload) => {
+    // Queued work steps must land in the tail block BEFORE the bubble appends
+    // below it — applied after, `openWorkIn` would see the bubble as the tail
+    // and mint a second block.
+    flushRowOps();
     unconfirmedSends.current.add(payload.msgId);
     if (holdsUserSend(messagesRef.current, payload.msgId)) return;
     sentIds.current.add(payload.msgId);
@@ -3371,9 +3501,31 @@ export function Transcript({
           glidingRef.current = false;
           clearTimeout(glideTimer.current);
         }
+      } else if (follow) {
+        followRef.current = true;
+        setShowJump(false);
+      } else if (
+        userTouchingRef.current ||
+        !followRef.current ||
+        performance.now() - lastTouchEndAt.current < TOUCH_COAST_GRACE_MS
+      ) {
+        // Off the edge under a finger (a drag leaving the bottom), already not
+        // following (momentum from that drag, an outline jump parked in
+        // history — those disarm explicitly), or within the coast grace of a
+        // lifted finger — a flick so fast its first scroll event lands after
+        // touchend must still read as the reader leaving, not as drift. The
+        // reader left; respect it.
+        followRef.current = false;
+        setShowJump(true);
       } else {
-        followRef.current = follow;
-        setShowJump(!follow);
+        // Off-edge reading under a FOLLOWING reader with no finger down: the
+        // EDGE moved, not the reader — late reflow under a pin (the drained
+        // head's fonts/KaTeX/max-content code settling, a big keyboard inset
+        // landing in one frame). Taken at face value this disarmed following
+        // on cold open and left the thread parked short of the bottom, with
+        // every later growth compounding the gap. Re-pin instead: content can
+        // never scroll the reader away — only fingers and explicit jumps do.
+        el.scrollTop = el.scrollHeight;
       }
       if (el.scrollTop <= SCROLL_TOP_THRESHOLD_PX) loadOlder();
     };
@@ -3450,19 +3602,8 @@ export function Transcript({
   function jumpToLatest() {
     const el = scrollEl();
     if (!el) return;
-    glidingRef.current = true;
-    followRef.current = true;
+    armPinGlide();
     setShowJump(false);
-    clearTimeout(glideTimer.current);
-    glideTimer.current = setTimeout(() => {
-      glidingRef.current = false;
-      const logEl = scrollEl();
-      if (!logEl) return;
-      const follow =
-        logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
-      followRef.current = follow;
-      setShowJump(!follow);
-    }, GLIDE_SETTLE_CAP_MS);
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }
 
@@ -3675,16 +3816,26 @@ export function Transcript({
   // Collapse adjacent "Stopped" indicators to one: the live indicator (a
   // client `uid`) and its durable notice row (`n<seq>`, re-delivered by a later
   // sync) are the same event and would otherwise stack two identical marks.
-  const renderRows = messages.filter((m, i) => {
-    if (m.role !== "notice" || !m.stopped) return true;
-    const prev = messages[i - 1];
-    return !(prev && prev.role === "notice" && prev.stopped);
-  });
-  const defaultExpandedWorkIds = expandUnansweredTail
-    ? unansweredTailWorkIds(renderRows)
-    : undefined;
+  // Memoized on `messages` so the per-rAF streaming re-renders — which change
+  // only the `streaming` string — skip these O(thread) scans.
+  const renderRows = useMemo(
+    () =>
+      messages.filter((m, i) => {
+        if (m.role !== "notice" || !m.stopped) return true;
+        const prev = messages[i - 1];
+        return !(prev && prev.role === "notice" && prev.stopped);
+      }),
+    [messages],
+  );
+  const defaultExpandedWorkIds = useMemo(
+    () => (expandUnansweredTail ? unansweredTailWorkIds(renderRows) : undefined),
+    [expandUnansweredTail, renderRows],
+  );
   // Row ids that get a pre-compaction divider rendered before them.
-  const dividerBeforeId = compactionDividerIds(renderRows, compactionPoints);
+  const dividerBeforeId = useMemo(
+    () => compactionDividerIds(renderRows, compactionPoints),
+    [renderRows, compactionPoints],
+  );
 
   return (
     <ImageDimsContext.Provider value={imageDimsStore}>
@@ -3726,7 +3877,7 @@ export function Transcript({
         })}
         {streaming && (
           <div className="msg assistant streaming">
-            <MarkdownBody text={streaming} />
+            <StreamingMarkdownBody text={streaming} />
           </div>
         )}
         {(awaitingReply || turnActive) && !streaming && !workLive && (

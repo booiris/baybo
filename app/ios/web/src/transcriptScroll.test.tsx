@@ -224,9 +224,15 @@ async function pushFrame(frame: Record<string, unknown>): Promise<void> {
   await settle();
 }
 
+/// Model a USER scroll: real readers move the viewport with a finger, and
+/// onScroll now tells fingers from drift (an off-edge reading with no recent
+/// touch re-pins — see the drift branch). A bare scrollTop write with no touch
+/// would read as drift and get pinned right back.
 async function scrollTo(top: number): Promise<void> {
   await act(async () => {
+    window.dispatchEvent(new Event("touchstart"));
     document.documentElement.scrollTop = top;
+    window.dispatchEvent(new Event("touchend"));
   });
   await settle();
 }
@@ -256,8 +262,34 @@ describe("scroll-up paging holds the viewport", () => {
     expect(scrollTop).toBe(maxScroll());
   });
 
+  // The real-WebKit cold-open race: the drained head's markdown keeps
+  // reflowing after the drain's pin wrote, so the pin's own scroll event reads
+  // an off-edge gap. Un-glided, onScroll took that reading at face value —
+  // follow disarmed, jump button up, and every later growth left the reader
+  // further off the bottom (the "cold open no longer lands at the bottom"
+  // regression). The drain pin now arms the glide window, so the transient
+  // reading is held and the ResizeObserver pin chases the edge as it settles.
+  it("holds the newest edge when layout drifts out from under the drain's pin", async () => {
+    await open(60, 999);
+    expect(scrollTop).toBe(maxScroll());
+    await act(async () => {
+      // Bypass the setter: this models the EDGE moving, not the reader.
+      scrollTop = maxScroll() - 300;
+      window.dispatchEvent(new Event("scroll"));
+      roCallbacks.forEach((cb) => cb());
+    });
+    await settle();
+    expect(scrollTop).toBe(maxScroll());
+    expect(posts().some((p) => p.type === "jumpVisible" && p.visible === true)).toBe(false);
+  });
+
   it("keeps the rows under the reader in place when an older page prepends", async () => {
     await open(60, 999);
+    // First scroll-up consumes the withheld mirror head (the reservoir pages
+    // in before the network is asked); the wire flow under test starts once
+    // the reservoir is dry.
+    await scrollTo(0);
+    await settle();
     await scrollTo(0);
     expect(posts().some((p) => p.type === "fetchHistory")).toBe(true);
 
@@ -377,6 +409,11 @@ describe("a REPLACE under a reader parked in history", () => {
   /// reported bug fired from.
   async function readingHistory(cursor?: number | null): Promise<void> {
     await open(60, 999, cursor);
+    // First scroll-up consumes the withheld mirror head (the reservoir pages
+    // in before the network is asked); the wire flow under test starts once
+    // the reservoir is dry.
+    await scrollTo(0);
+    await settle();
     await scrollTo(0);
     await pushFrame({
       kind: "history_page",
@@ -689,6 +726,11 @@ describe("jump to a search hit's ordinal", () => {
   // forever. Only the budget stops it.
   it("is bounded when empty pages keep claiming there is more", async () => {
     await open(60, 999);
+    // First scroll-up consumes the withheld mirror head (the reservoir pages
+    // in before the network is asked); the wire flow under test starts once
+    // the reservoir is dry.
+    await scrollTo(0);
+    await settle();
     await jumpTo(1);
 
     for (let i = 0; i < 30; i++) {

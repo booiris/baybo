@@ -413,7 +413,7 @@ button {
 }
 /* Streaming caret: a pulsing block riding the last rendered markdown element
    (skipped on boxes where an inline caret would look detached). */
-.msg.assistant.streaming .md > :last-child:not(pre):not(.md-table-wrap)::after {
+.msg.assistant.streaming .md:last-child > :last-child:not(pre):not(.md-table-wrap)::after {
   content: "";
   display: inline-block;
   width: 0.45em;
@@ -434,9 +434,30 @@ button {
    the reading edge — such math belongs in a `$$` display block, which has its
    own scroller. `clip` keeps vertical overflow visible and creates no scroll
    container, so short inline math (the norm) is untouched. */
+/* Cross-session retarget veil (see bridge.ts concealForRetarget): the old
+   conversation is hidden the instant the init for a different session lands,
+   and the incoming tree reveals itself in the frame its content paints. */
+html.retargeting #root { visibility: hidden; }
+
 .md { overflow-x: clip; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
+/* A streaming body split into settled chunks + a live tail
+   (StreamingMarkdownBody). Each chunk is its own .md with trimmed edge
+   margins, so the seams put the block gap back; the wrapper takes over the
+   .md's role as a step-row flex item. The caret selector above rides
+   `.md:last-child` — the tail — so settled chunks never grow a caret. */
+.md-stream { min-width: 0; flex: 1; }
+/* Offscreen rows skip layout/paint and release their raster memory — the
+   bulk of the ~1000x source-to-resident amplification that killed heavy
+   threads. `auto` intrinsic-size locks to the real height once a row has
+   been measured, so scrollHeight only estimates on the first pass; the
+   follow pin's drift re-pin and the prepend/replace anchors absorb that. */
+.msg-group, .work-ladder {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 160px;
+}
+.md-stream > .md + .md { margin-top: var(--md-block-gap); }
 /* The raw source, shown when the markdown pipeline threw (see `MarkdownFallback`
    in Markdown.tsx). Newlines are all the structure that is left, so keep them. */
 .md-failed { white-space: pre-wrap; word-break: break-word; }

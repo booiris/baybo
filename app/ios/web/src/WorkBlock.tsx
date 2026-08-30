@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { MarkdownBody } from "./Markdown";
+import { MarkdownBody, StreamingMarkdownBody } from "./Markdown";
 import type { WorkRow, WorkStep } from "./types";
 
 /// Humanized duration: seconds under a minute, "Xm Ys" under an hour,
@@ -100,12 +100,22 @@ function useSampledText(text: string): string {
 
 /// Reasoning is the model's own markdown, rendered as prose beside the ✻ marker
 /// — as raw text a `**要点：**` reached the reader as literal asterisks.
-function ReasoningStepView({ text }: { text: string }) {
+function ReasoningStepView({ text, live = false }: { text: string; live?: boolean }) {
   const shown = useSampledText(text);
+  // `live` — the run is still being produced into — NOT `shown !== text`: the
+  // sampler catches up at every pause in the stream, and a catch-up equality
+  // flipped the whole trace to the settled pipeline (KaTeX + highlight + a
+  // full subtree remount) for a frame and back on the next delta — a white
+  // flash and a math flicker on every hiccup of a long think. The run
+  // closing is the one settle that sticks.
   return (
     <div className="step reasoning">
       <span className="step-glyph">✻</span>
-      <MarkdownBody text={shown} breaks />
+      {live ? (
+        <StreamingMarkdownBody text={shown} breaks />
+      ) : (
+        <MarkdownBody text={shown} breaks />
+      )}
     </div>
   );
 }
@@ -113,11 +123,11 @@ function ReasoningStepView({ text }: { text: string }) {
 /// One MACHINERY step — the reasoning / tool / status / notice traffic the
 /// "Worked Xs" summary folds away. `prose` never reaches here: `segmentWorkSteps`
 /// routes the model's own words to their own run, outside the collapse.
-function WorkStepView({ step }: { step: WorkStep }) {
+function WorkStepView({ step, live = false }: { step: WorkStep; live?: boolean }) {
   const { t } = useTranslation();
   switch (step.kind) {
     case "reasoning":
-      return <ReasoningStepView text={step.text} />;
+      return <ReasoningStepView text={step.text} live={live} />;
     case "prose":
       return null;
     case "status":
@@ -289,7 +299,7 @@ function WorkRunView({
         {seg.steps.length > 0 && (
           <div className="work-steps">
             {seg.steps.map((s, j) => (
-              <WorkStepView key={j} step={s} />
+              <WorkStepView key={j} step={s} live />
             ))}
           </div>
         )}

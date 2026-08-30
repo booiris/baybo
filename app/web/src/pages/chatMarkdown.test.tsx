@@ -369,3 +369,37 @@ describe('MarkdownBody failure fallback', () => {
     }
   });
 });
+
+// Mirror of the iOS transcript's defenses (app/ios/web): highlighting a
+// still-growing block per streaming tick is what ballooned the iOS WebContent
+// process to its 2.2GB jetsam limit; a desktop tab survives the
+// same construction but stalls for seconds. These pin defer-while-streaming,
+// the input-size cap, and unlabeled detection at the MarkdownBody surface.
+describe('MarkdownBody code highlighting under streaming', () => {
+  const fenced = (body: string) => `\`\`\`typescript\n${body}\n\`\`\``;
+
+  it('defers highlighting while streaming, colors on the settle render', () => {
+    const source = 'const answer: number = 42;';
+    const { container, rerender } = render(<MarkdownBody text={fenced(source)} streaming />);
+    expect(container.querySelector('.hljs-keyword')).toBeNull();
+    expect(container.querySelector('pre')?.textContent).toBe(source);
+    rerender(<MarkdownBody text={fenced(source)} />);
+    expect(container.querySelector('.hljs-keyword')?.textContent).toBe('const');
+  });
+
+  it('renders a block past the size cap as plain text', () => {
+    const line = 'const value = compute(width, height);\n';
+    const giant = line.repeat(Math.ceil((33 * 1024) / line.length));
+    const { container } = render(<MarkdownBody text={fenced(giant)} />);
+    expect(container.querySelector('.hljs-keyword')).toBeNull();
+    expect(container.querySelector('pre')?.textContent).toContain('compute(width, height)');
+  });
+
+  it('still detects and highlights an unlabeled fence', () => {
+    const { container } = render(
+      <MarkdownBody text={'```\nfunction greet(name) { return name; }\n```'} />,
+    );
+    expect(container.querySelector('.hljs-title.function_')?.textContent).toBe('greet');
+    expect(container.querySelector('code')?.className).toContain('language-');
+  });
+});

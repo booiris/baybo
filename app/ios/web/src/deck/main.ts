@@ -12,7 +12,6 @@ window.deckShell = {
   init(payload) {
     shell.setLanguage(payload.lang);
     if (payload.editMode !== undefined) shell.setEditMode(payload.editMode);
-    shell.setSetupInflight(payload.setupInflight ?? false);
     shell.applyDeckState(payload.cards, payload.snapshots);
   },
   deckState(payload) {
@@ -35,9 +34,6 @@ window.deckShell = {
   },
   setLanguage(lang) {
     shell.setLanguage(lang);
-  },
-  setSetupInflight(active) {
-    shell.setSetupInflight(active);
   },
   restoreMaximized() {
     shell.restoreMaximizedCard();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { RiCheckLine, RiFileCopyLine } from 'react-icons/ri';
 import type { LanguageFn } from 'highlight.js';
 import hljs from 'highlight.js/lib/core';
@@ -59,6 +59,30 @@ for (const [name, language] of LANGUAGES) {
 const AUTO_LANGUAGES = LANGUAGES.map(([name]) => name);
 const PLAIN_LANGUAGES = new Set(['text', 'plain', 'plaintext', 'txt', 'console', 'output']);
 
+/** True while the surrounding `MarkdownBody`'s text is still streaming in.
+ *  A growing block's `shown` changes every pacer tick, so the highlight memo
+ *  can never hold — and an unclosed fence swallows the whole remaining stream,
+ *  so "the growing block" is routinely the entire tail of the answer. On iOS
+ *  the identical construction re-highlighted per tick until WebContent hit the
+ *  2.2GB per-process jetsam limit (the white-flash loop); a desktop
+ *  tab survives but stalls for seconds and churns GBs of GC garbage. While
+ *  streaming, the block renders plain — React then patches one text node per
+ *  tick instead of swapping the whole highlighted subtree — and the settle
+ *  render colors it once. */
+export const MarkdownStreamingContext = createContext(false);
+
+/** Hard ceiling on what gets highlighted at all. `highlightAuto` allocates
+ *  ~100MB of transient garbage per call at 64KB input (measured against this
+ *  hljs build), and `highlightCode` also runs per keystroke for every block in
+ *  the projects card editor (`markdownCodePlugin`). Past the cap the block is
+ *  plain text — readable, just uncolored. */
+const HIGHLIGHT_MAX_CHARS = 32 * 1024;
+
+/** Unlabeled fences detect their language on a prefix, then highlight the full
+ *  text with the single winning grammar — auto-detect over all 22 grammars
+ *  holds every candidate's full result simultaneously and is ~20× slower. */
+const DETECT_SLICE_CHARS = 4 * 1024;
+
 export type HighlightedCode = {
   html: string;
   language: string | null;
@@ -67,14 +91,17 @@ export type HighlightedCode = {
 export function highlightCode(code: string, requestedLanguage?: string | null): HighlightedCode | null {
   const requested = requestedLanguage?.trim().toLowerCase() ?? '';
   if (PLAIN_LANGUAGES.has(requested)) return null;
+  if (code.length > HIGHLIGHT_MAX_CHARS) return null;
   try {
     if (requested !== '') {
       if (hljs.getLanguage(requested) === undefined) return null;
       const result = hljs.highlight(code, { language: requested, ignoreIllegals: true });
       return { html: result.value, language: result.language ?? null };
     }
-    const result = hljs.highlightAuto(code, AUTO_LANGUAGES);
-    return result.language === undefined ? null : { html: result.value, language: result.language };
+    const detected = hljs.highlightAuto(code.slice(0, DETECT_SLICE_CHARS), AUTO_LANGUAGES).language;
+    if (detected === undefined) return null;
+    const result = hljs.highlight(code, { language: detected, ignoreIllegals: true });
+    return { html: result.value, language: result.language ?? detected };
   } catch {
     return null;
   }
@@ -99,8 +126,12 @@ export async function copyText(text: string): Promise<boolean> {
 }
 
 export function MarkdownCodeBlock({ code, language }: { code: string; language?: string | null }) {
+  const streamingText = useContext(MarkdownStreamingContext);
   const shown = code.endsWith('\n') ? code.slice(0, -1) : code;
-  const highlighted = useMemo(() => highlightCode(shown, language), [shown, language]);
+  const highlighted = useMemo(
+    () => (streamingText ? null : highlightCode(shown, language)),
+    [shown, language, streamingText],
+  );
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const resetTimer = useRef<number | null>(null);
   const copied = copiedCode === shown;
