@@ -105,30 +105,18 @@ struct ProjectsScreen: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 14) {
+        VStack {
             Spacer()
-            Image(systemName: AppStore.HomeTab.projects.icon)
-                .font(.system(size: 46, weight: .light))
-                .foregroundStyle(Theme.inkSoft)
-            Text(verbatim: lang.t("home.tab.projects"))
-                .font(Theme.mono(17))
-                .foregroundStyle(Theme.ink)
-            // Says the one thing about this feature a phone user would
-            // otherwise learn the hard way: nothing here is pushed.
-            Text(verbatim: lang.t("projects.empty"))
-                .font(Theme.sys(14))
-                .foregroundStyle(Theme.inkSoft)
-                .multilineTextAlignment(.center)
-                .lineSpacing(3)
-                .padding(.horizontal, 40)
-            Button(lang.t("projects.new")) {
+            CreationPrompt(
+                symbol: AppStore.HomeTab.projects.icon,
+                title: lang.t("home.tab.projects"),
+                message: lang.t("projects.empty"),
+                actionTitle: lang.t("projects.new"),
+                actionIdentifier: "project-new"
+            ) {
                 Haptics.tap()
                 appStore.openNewProject()
             }
-            .buttonStyle(InkPillButtonStyle())
-            .frame(maxWidth: 260)
-            .padding(.top, 6)
-            .accessibilityIdentifier("project-new")
             Spacer()
         }
         .padding(.bottom, 80)

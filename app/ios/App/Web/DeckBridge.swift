@@ -22,8 +22,7 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
         // Only the shell (main frame) may drive the native bridge. Cards are
         // sandboxed subframes, and WKWebView injects the message handler into
         // EVERY frame — so without this guard a card's own JS could call the
-        // native surface directly (`quickSetup` seeds and auto-sends an agent
-        // prompt with no user tap; `cardAction`/`layout`/`delete` mutate the
+        // native surface directly (`cardAction`/`layout`/`delete` mutate the
         // deck), bypassing the port-mediated shell. Cards reach the shell over
         // their per-card MessagePort, never this handler.
         guard message.frameInfo.isMainFrame,
@@ -91,12 +90,6 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
         case "haptic":
             // The long-press reorder pickup.
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        case "quickSetup":
-            // Empty-board CTA: open a fresh chat and auto-send an
-            // ordinary-language card request.
-            if let prompt = body["prompt"] as? String {
-                AppStore.shared?.startCardDraft(prompt: prompt)
-            }
         case "log":
             let level = body["level"] as? String ?? "info"
             let text = body["message"] as? String ?? ""
@@ -216,10 +209,6 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
 
     func setEditMode(_ active: Bool) {
         eval("setEditMode", active ? "true" : "false")
-    }
-
-    func setSetupInflight(_ active: Bool) {
-        eval("setSetupInflight", active ? "true" : "false")
     }
 
     /// Ask the shell to collapse the maximized card (the native header's ✕).

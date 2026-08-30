@@ -327,14 +327,31 @@ struct DeckStoreTests {
             ]
         )
         let store = makeStore(fake)
+        #expect(store.isEmpty)
         await store.refreshNow()
+        #expect(!store.isEmpty)
         #expect(store.state.cards.map(\.cardId) == ["a", "b"] || store.state.cards.count == 2)
         #expect(store.state.snapshots.first?.seq == 3)
 
         // The mirror round-trips: a fresh store paints from disk.
         let rehydrated = DeckStore(clientProvider: { fake })
+        #expect(!rehydrated.isEmpty)
         #expect(rehydrated.state.cards.count == 2)
         #expect(rehydrated.state.snapshots.first?.payload == "{\"n\":3}")
+        DeckStore.removeMirror()
+    }
+
+    @Test func emptyStateTracksRefreshes() async {
+        let fake = FakeBayboClient()
+        fake.deckView = DeckView(cards: [card("a", position: 0)], snapshots: [])
+        let store = makeStore(fake)
+
+        await store.refreshNow()
+        #expect(!store.isEmpty)
+
+        fake.deckView = DeckView(cards: [], snapshots: [])
+        await store.refreshNow()
+        #expect(store.isEmpty)
         DeckStore.removeMirror()
     }
 

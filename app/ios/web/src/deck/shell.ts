@@ -26,7 +26,7 @@ import {
 } from "./state";
 
 // Locale DATA only — the i18next runtime lives in the React transcript entry
-// and must not be dragged into this vanilla chunk for four strings.
+// and must not be dragged into this vanilla chunk for its small string table.
 // `Partial` because `t()` looks keys up dynamically — a miss is real.
 const STRINGS: Record<"en" | "zh", Partial<Record<string, string>>> = {
   en: en.translation.deck,
@@ -53,16 +53,13 @@ type Tile = {
 };
 
 export class DeckShell {
-  private root: HTMLElement;
   private grid: HTMLElement;
-  private emptyEl: HTMLElement;
   private state: DeckState = EMPTY_STATE;
   private tiles = new Map<string, Tile>();
   // Correlates a native call/pick result back to the card generation that
   // asked (the port pin lives in PendingRegistry).
   private pending = new PendingRegistry();
   private editMode = false;
-  private setupInflight = false;
   private lang: "en" | "zh" = "en";
   // Maximize state (the full-screen card). `maximizedCardId` is the card
   // currently expanded; `maxPlaceholder` holds its grid slot so the tile
@@ -86,13 +83,9 @@ export class DeckShell {
   private dragRaf = 0;
 
   constructor(root: HTMLElement) {
-    this.root = root;
     this.grid = document.createElement("div");
     this.grid.className = "deck-grid";
-    this.emptyEl = document.createElement("div");
-    this.emptyEl.className = "deck-empty";
-    this.root.append(this.grid, this.emptyEl);
-    this.renderEmpty();
+    root.append(this.grid);
   }
 
   private t(key: string): string {
@@ -101,16 +94,7 @@ export class DeckShell {
 
   setLanguage(lang: string): void {
     this.lang = lang.startsWith("zh") ? "zh" : "en";
-    this.renderEmpty();
     for (const tile of this.tiles.values()) this.renderOverlay(tile);
-  }
-
-  /// A `/deck` creation from the empty-board CTA is running (no card yet):
-  /// the CTA shows a spinner and a re-tap returns to that chat (native
-  /// routes it; the shell just reflects the state).
-  setSetupInflight(active: boolean): void {
-    this.setupInflight = active;
-    this.renderEmpty();
   }
 
   setEditMode(active: boolean): void {
@@ -132,7 +116,6 @@ export class DeckShell {
     this.state = replaceState(cards, snapshots);
     this.reconcileTiles();
     for (const card of this.state.cards) this.pushSnapshot(card.cardId);
-    this.renderEmpty();
   }
 
   applyCardData(cardId: string, seq: number, payload: string): void {
@@ -231,33 +214,6 @@ export class DeckShell {
     const cell = this.state.snaps[cardId];
     if (!tile || !tile.port || cell === undefined) return;
     tile.port.postMessage({ type: "data", payload: parsePayload(cell) });
-  }
-
-  private renderEmpty(): void {
-    const empty = this.state.cards.length === 0;
-    this.emptyEl.style.display = empty ? "" : "none";
-    if (!empty) return;
-    // Rebuilt each call (also on setLanguage), so the copy + CTA follow
-    // the active locale.
-    this.emptyEl.replaceChildren();
-    const msg = document.createElement("div");
-    msg.textContent = this.t("empty");
-    const cta = document.createElement("button");
-    cta.className = "deck-empty-cta";
-    // Same CTA either way — native decides new-vs-return from its own
-    // setup-session state; the shell only shows which mode it's in.
-    if (this.setupInflight) {
-      cta.classList.add("inflight");
-      const spin = document.createElement("span");
-      spin.className = "deck-cta-spin";
-      cta.append(spin, document.createTextNode(this.t("createCardInflight")));
-    } else {
-      cta.textContent = this.t("quickSetup");
-    }
-    cta.addEventListener("click", () =>
-      bridge.postQuickSetup(this.t("quickSetupPrompt")),
-    );
-    this.emptyEl.append(msg, cta);
   }
 
   private reconcileTiles(): void {

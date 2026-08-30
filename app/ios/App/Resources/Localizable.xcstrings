@@ -857,13 +857,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Nothing in %@."
+            "value": "No cards here yet."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ 里什么都没有。"
+            "value": "这里还没有卡片。"
           }
         }
       }
@@ -2534,6 +2534,23 @@
         }
       }
     },
+    "deck.createCardInflight": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Creating · view"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "创建中 · 查看"
+          }
+        }
+      }
+    },
     "deck.deleteBody": {
       "extractionState": "stale",
       "localizations": {
@@ -2636,6 +2653,23 @@
         }
       }
     },
+    "deck.empty": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No cards yet — create one in a chat."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "还没有卡片 — 在聊天里创建一张。"
+          }
+        }
+      }
+    },
     "deck.menuRecycle": {
       "extractionState": "stale",
       "localizations": {
@@ -2700,6 +2734,40 @@
           "stringUnit": {
             "state": "translated",
             "value": "永久删除这张卡片？"
+          }
+        }
+      }
+    },
+    "deck.quickSetup": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Create a card"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "创建卡片"
+          }
+        }
+      }
+    },
+    "deck.quickSetupPrompt": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Create a card that monitors Baybo's token usage. Keep the standard card view concise, showing only key metrics and a line chart of usage trends. Reserve the most complete and detailed usage data and analysis for the maximized view"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "帮我创建一张监控 Baybo token 使用量的卡片。普通卡片视图保持简洁，只展示关键指标，并用折线图清晰呈现使用趋势；在最大化视图中再提供尽可能完整、详细的使用数据与分析"
           }
         }
       }
@@ -3866,13 +3934,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "No ceiling — this board spends what its work costs."
+            "value": "Blank means no limit."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "留空表示不设上限，板子花多少算多少。"
+            "value": "留空表示不限额。"
           }
         }
       }
@@ -3900,13 +3968,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ceilings · optional"
+            "value": "Optional limits"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "每日上限 · 可选"
+            "value": "可选上限"
           }
         }
       }
@@ -3968,13 +4036,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "A lead is hired with the board. Teammates are hired by the lead, or from Team on the desk."
+            "value": "Includes a lead agent."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "建板时会自动雇一个 lead。其它队员由 lead 雇，或在桌面端的 Team 里加。"
+            "value": "自动加入一名 lead agent。"
           }
         }
       }
@@ -4036,13 +4104,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The board keeps this many runs going, taking the most urgent staffed card out of Todo whenever one finishes. 0 = cards stay in Todo until you move them."
+            "value": "Keeps this many cards running automatically. 0 = manual."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "板子会自己保持这么多个 run 在跑，每完成一个就从 Todo 里取最紧急且有人认领的卡。填 0 表示只有你手动挪卡才会开跑。"
+            "value": "自动维持这么多张卡运行；0 表示手动启动。"
           }
         }
       }
@@ -4087,13 +4155,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The ceiling that still bites on a subscription plan."
+            "value": "Also applies to subscription models."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "订阅制计费下，只有这个上限是真的会拦住板子的。"
+            "value": "订阅制模型也会受此上限约束。"
           }
         }
       }
@@ -4121,13 +4189,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "A working directory is created under work/<name> and git-initialised. Point a board at an existing repo from the desk."
+            "value": "Creates and Git-initializes work/<name>."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "服务端会在 work/<名称> 下建目录并 git init。要接已有仓库请在桌面端操作。"
+            "value": "自动创建 work/<名称> 并初始化为 Git 仓库。"
           }
         }
       }
@@ -4359,13 +4427,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "No boards yet. A project is a repo, a team of agents and one board. Baybo only knows about boards while it is open — nothing about them is pushed."
+            "value": "A repo, a board, and an agent team."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "还没有看板。一个项目 = 一个仓库 + 一队 agent + 一块看板。板子不会推送通知，只有 app 打开时才看得到变化。"
+            "value": "一个仓库、一块看板和一队 agent。"
           }
         }
       }

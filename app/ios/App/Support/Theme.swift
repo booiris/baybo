@@ -64,6 +64,60 @@ struct InkPillButtonStyle: ButtonStyle {
     }
 }
 
+struct CreationPrompt: View {
+    let symbol: String
+    let title: String
+    let message: String
+    let actionTitle: String
+    let actionIdentifier: String
+    var showsAction = true
+    var actionDisabled = false
+    var actionInFlight = false
+    let action: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: symbol)
+                .font(.system(size: 46, weight: .light))
+                .foregroundStyle(Theme.inkSoft)
+                .accessibilityHidden(true)
+
+            Text(verbatim: title)
+                .font(Theme.mono(17))
+                .foregroundStyle(Theme.ink)
+
+            Text(verbatim: message)
+                .font(Theme.sys(14))
+                .foregroundStyle(Theme.inkSoft)
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+                .padding(.horizontal, 40)
+
+            if showsAction {
+                Button(action: action) {
+                    HStack(spacing: 8) {
+                        if actionInFlight {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .tint(Theme.paper)
+                                .scaleEffect(0.75)
+                                .frame(width: 13, height: 13)
+                        }
+                        Text(verbatim: actionTitle)
+                    }
+                }
+                .buttonStyle(InkPillButtonStyle())
+                .frame(maxWidth: 260)
+                .padding(.top, 6)
+                .disabled(actionDisabled)
+                .opacity(actionDisabled ? 0.35 : 1)
+                .accessibilityIdentifier(actionIdentifier)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
 /// Secondary CTA — the web `.cta-secondary`: ink outline pill with NO case
 /// transform and NO tracking (the web class resets both on purpose — quiet
 /// next to the primary).

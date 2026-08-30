@@ -290,22 +290,21 @@ struct ChatListScreen: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 24) {
+        VStack {
             Spacer()
-            Text(verbatim: lang.t("list.empty"))
-                .font(Theme.sys(14))
-                .foregroundStyle(Theme.inkSoft)
-            Button {
-                compose()
-            } label: {
-                Text(verbatim: lang.t("list.newChat"))
-            }
-            .buttonStyle(InkPillButtonStyle())
-            .frame(maxWidth: 260)
-            .disabled(appStore.busy)
+            CreationPrompt(
+                symbol: AppStore.HomeTab.chats.icon,
+                title: lang.t("home.tab.chats"),
+                message: lang.t("list.empty"),
+                actionTitle: lang.t("list.newChat"),
+                actionIdentifier: "chat-new",
+                actionDisabled: appStore.busy,
+                action: compose
+            )
             Spacer()
         }
         .frame(maxWidth: .infinity)
+        .padding(.bottom, 80)
     }
 
     /// The archive undo toast: an ink capsule above the tab bar — 「已归档」+

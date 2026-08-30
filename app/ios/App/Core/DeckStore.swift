@@ -51,7 +51,6 @@ final class DeckStore: ObservableObject {
         let snapshots: [Snapshot]
         let lang: String
         let editMode: Bool
-        let setupInflight: Bool
     }
 
     /// One soft-deleted card in the recycle bin. Not persisted — the bin is
@@ -165,6 +164,9 @@ final class DeckStore: ObservableObject {
     /// A delete waiting on the native confirm (destructive actions confirm
     /// natively; the shell only reports intent).
     @Published var pendingDelete: String?
+    /// Kept separate from `state` so high-rate snapshot pushes do not redraw
+    /// the native Deck shell.
+    @Published private(set) var isEmpty = true
     /// The recycle bin, most recently deleted first (server order).
     @Published private(set) var recycle: [RecycledCard] = []
 
@@ -203,7 +205,7 @@ final class DeckStore: ObservableObject {
     /// `AppStore.startCardDraft`, cleared when a card actually lands). While
     /// set, the empty-board CTA shows an in-flight state and a re-tap returns
     /// to this chat instead of starting a new one.
-    private(set) var setupSessionId: String?
+    @Published private(set) var setupSessionId: String?
     weak var bridge: DeckBridge?
 
     /// Lazily resolved so constructing the store (an `AppStore` stored
@@ -238,6 +240,7 @@ final class DeckStore: ObservableObject {
             let cached = try? JSONDecoder().decode(StatePayload.self, from: data)
         {
             state = cached
+            isEmpty = cached.cards.isEmpty
         }
     }
 
@@ -255,8 +258,7 @@ final class DeckStore: ObservableObject {
                 cards: state.cards,
                 snapshots: state.snapshots,
                 lang: Lang.shared.code,
-                editMode: editMode,
-                setupInflight: setupSessionId != nil
+                editMode: editMode
             ))
         requestRefresh()
     }
@@ -285,7 +287,6 @@ final class DeckStore: ObservableObject {
     func setSetupSession(_ id: String?) {
         guard setupSessionId != id else { return }
         setupSessionId = id
-        bridge?.setSetupInflight(id != nil)
     }
 
     // MARK: refresh + live pushes
@@ -304,6 +305,7 @@ final class DeckStore: ObservableObject {
             let cards = view.cards.map(Self.card(from:))
             let snapshots = view.snapshots.map(Self.snapshot(from:))
             state = StatePayload(cards: cards, snapshots: snapshots)
+            isEmpty = cards.isEmpty
             persist()
             pruneBundleCache(keeping: Set(cards.map { $0.cardId }))
             bridge?.deliverState(state)

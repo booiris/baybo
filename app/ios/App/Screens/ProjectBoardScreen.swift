@@ -168,6 +168,7 @@ struct ProjectBoardScreen: View {
             }
             if visibleIssues.isEmpty {
                 emptyStage
+                    .listRowInsets(EdgeInsets())
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
             }
@@ -291,11 +292,19 @@ struct ProjectBoardScreen: View {
     }
 
     private var emptyStage: some View {
-        Text(verbatim: lang.t("board.emptyStage", MoveConsequence.label(stage)))
-            .font(Theme.sys(13))
-            .foregroundStyle(Theme.inkSoft)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 46)
+        CreationPrompt(
+            symbol: "rectangle.stack",
+            title: MoveConsequence.label(stage),
+            message: lang.t("board.emptyStage"),
+            actionTitle: lang.t("newIssue.title"),
+            actionIdentifier: "board-empty-new-issue",
+            showsAction: !isArchived,
+            actionDisabled: projects.isOffline
+        ) {
+            Haptics.tap()
+            appStore.openNewIssue(project: projectId, status: stage)
+        }
+        .padding(.vertical, 38)
     }
 
     private var boardSkeleton: some View {
