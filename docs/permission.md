@@ -24,6 +24,12 @@ Accepted values are:
 `permission` only controls the Bash tool. Other tools keep their own
 validation and approval rules.
 
+MCP tools are outside it in both directions: they never consult `permission`,
+and as of the lazy-loading change they raise no approval prompt at all — see
+[`todo/mcp-tool-approval.md`](todo/mcp-tool-approval.md) for why, and for what
+still gates them (trust, channel, trigger scope, and the exact grant an
+unattended cron lineage needs).
+
 ## Execution Model
 
 The first route for `auto` and `manual` is the OS sandbox when an inner sandbox
