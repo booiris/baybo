@@ -838,12 +838,18 @@ impl Tool for BashTool {
             .unwrap_or(ctx.timeout);
 
         let command = p.command;
+        let baybo_cli_kind = classify_baybo_cli_command(&command);
         if !BENCH {
+            let leading_baybo_bin =
+                matches!(baybo_cli_kind, BayboCliCommandKind::CanonicalSelfInvocation)
+                    .then(|| BAYBO_BIN.as_deref())
+                    .flatten();
             require_command_paths_within_work_dir(
                 &command,
                 &self.workspace_root,
                 &self.work_dir,
                 &crate::shell_reachable_workspace_roots(&ctx.workspace_paths, &ctx.agent_id),
+                leading_baybo_bin,
             )?;
         }
         // The bench profile has no work-dir jail, so a command with no explicit
@@ -923,7 +929,11 @@ impl Tool for BashTool {
         }
 
         let permission = self.permission();
-        let execution_route = bash_execution_route(&command, permission, p.sandbox_permissions);
+        let execution_route = bash_execution_route_for_kind_and_permissions(
+            baybo_cli_kind,
+            permission,
+            p.sandbox_permissions,
+        );
         // Both rejections surface a precise instruction naming the correct
         // absolute path: sandboxing either shape would fail opaquely on the
         // masked state dir / unmounted binary, and the agent has no way to
@@ -1491,19 +1501,34 @@ fn require_within_work_dir(
 /// skill's script there is exactly how a skill is meant to run. Writes
 /// still fail at the RO bind, so there's nothing to guard against by
 /// rejecting the path token.
+///
+/// `leading_baybo_bin` exempts only a canonical gateway binary used as the
+/// leading argv0. The self-CLI route runs that command unsandboxed, but every
+/// later path token remains inside this guard.
 fn require_command_paths_within_work_dir(
     command: &str,
     workspace_root: &Path,
     work_dir: &Path,
     exempt_roots: &[PathBuf],
+    leading_baybo_bin: Option<&Path>,
 ) -> crate::Result<()> {
-    for sub in split_into_subcommands(command) {
+    for (sub_index, sub) in split_into_subcommands(command).into_iter().enumerate() {
+        let mut leader_argv0_pending = sub_index == 0;
         for tok in sub {
             let Ok(words) = shell_words::split(tok) else {
                 continue;
             };
             for word in words {
                 let p = Path::new(&word);
+                let is_leading_argv0 = leader_argv0_pending && !is_env_assignment(&word);
+                if is_leading_argv0 {
+                    leader_argv0_pending = false;
+                }
+                if is_leading_argv0
+                    && leading_baybo_bin.is_some_and(|bin| argv0_matches_gateway_binary(&word, bin))
+                {
+                    continue;
+                }
                 if p.is_absolute() && exempt_roots.iter().any(|root| p.starts_with(root)) {
                     continue;
                 }
@@ -1863,13 +1888,12 @@ impl BashExecutionRoute {
     }
 }
 
-fn bash_execution_route(
-    command: &str,
+fn bash_execution_route_for_kind_and_permissions(
+    kind: BayboCliCommandKind,
     permission: BashPermissionMode,
     sandbox_permissions: SandboxPermissions,
 ) -> BashExecutionRoute {
-    let default_route =
-        bash_execution_route_for_kind(classify_baybo_cli_command(command), permission);
+    let default_route = bash_execution_route_for_kind(kind, permission);
     if !sandbox_permissions.requires_approval(permission) {
         return default_route;
     }
@@ -5525,16 +5549,22 @@ mod tests {
                 "ls /tmp/work && cat /etc/hosts",
                 ws,
                 work,
-                &exempt
+                &exempt,
+                None,
             )
             .is_ok()
         );
 
         // Quoted path inside the workspace but outside work — caught
         // after `shell_words::split` unquotes the token.
-        let err =
-            require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work, &exempt)
-                .unwrap_err();
+        let err = require_command_paths_within_work_dir(
+            r#"ls "/tmp/profile/foo""#,
+            ws,
+            work,
+            &exempt,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/profile/foo")));
 
         // Path hidden behind a pipeline still gets walked.
@@ -5543,6 +5573,7 @@ mod tests {
             ws,
             work,
             &exempt,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/logs/out")));
@@ -5556,10 +5587,39 @@ mod tests {
                 &format!("python {} auth-status", script.display()),
                 ws,
                 work,
-                &exempt
+                &exempt,
+                None,
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn work_dir_guard_exempts_only_a_leading_canonical_baybo_argv0() {
+        let ws = Path::new("/tmp");
+        let work = Path::new("/tmp/work");
+        let bin = Path::new("/tmp/bin/baybo");
+
+        for command in [
+            r#"'/tmp/bin/baybo' --help 2>&1 | head -80"#,
+            r#"BAYBO_LOG=trace '/tmp/bin/baybo' --help | head -80"#,
+        ] {
+            assert!(
+                require_command_paths_within_work_dir(command, ws, work, &[], Some(bin)).is_ok(),
+                "leading self-CLI argv0 should be exempt: {command}"
+            );
+        }
+
+        for command in [
+            r#"echo ok | '/tmp/bin/baybo' --help"#,
+            r#"'/tmp/bin/baybo' --config /tmp/config/baybo.json"#,
+            r#"'/tmp/bin/not-baybo' --help"#,
+        ] {
+            assert!(
+                require_command_paths_within_work_dir(command, ws, work, &[], Some(bin)).is_err(),
+                "non-argv0 workspace paths must remain guarded: {command}"
+            );
+        }
     }
 
     #[tokio::test]
