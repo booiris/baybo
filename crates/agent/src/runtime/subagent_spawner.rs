@@ -909,13 +909,15 @@ async fn run_foreground_job(
             }
             OnTimeout::Kill => {
                 // Force-cancel the underlying work, let it observe the cancel
-                // and drain, then surface a timeout on the foreground oneshot.
+                // and drain, then surface the wait-elapsed terminal on the
+                // foreground oneshot. NOT `Timeout`: the child was working, it
+                // just ran past the wait the parent was willing to hold for.
                 child_token.cancel();
                 let _ = fut.await;
                 let _ = result_tx.send(SubagentResult {
                     child_session_id,
                     final_content: None,
-                    status: SubagentExitStatus::Timeout,
+                    status: SubagentExitStatus::ForegroundWaitElapsed,
                 });
                 release_reserved_slot(limiter.as_ref(), &fan_out_root);
             }
@@ -1160,7 +1162,7 @@ async fn run_external_agent_turn(
         SubagentExitStatus::Failed { reason } => {
             let _ = turn_ctx.lifecycle.fail(&turn.id, reason.clone()).await;
         }
-        SubagentExitStatus::Timeout => {
+        SubagentExitStatus::Timeout | SubagentExitStatus::ForegroundWaitElapsed => {
             let _ = turn_ctx
                 .lifecycle
                 .cancel(&turn.id, CancelReason::SubagentTimeout, vec![])
@@ -1836,7 +1838,10 @@ mod foreground_turn_tests {
     }
 
     // User parent + `Kill` + a run that overruns → the run's token is cancelled
-    // and a `Timeout` surfaces on the foreground oneshot.
+    // and `ForegroundWaitElapsed` surfaces on the foreground oneshot. NOT
+    // `Timeout`: that one means the backend emitted nothing, and rendering a
+    // wait-boundary kill as one told the parent its subagent had found nothing
+    // when it may have been one write away from a full report.
     #[tokio::test(start_paused = true)]
     async fn kills_on_overrun_when_policy_is_kill() {
         let (tx, rx) = oneshot::channel();
@@ -1853,7 +1858,10 @@ mod foreground_turn_tests {
         };
         spawn_turn(turn(true, OnTimeout::Kill, token.clone(), tx), fut);
         let result = rx.await.expect("timeout result");
-        assert!(matches!(result.status, SubagentExitStatus::Timeout));
+        assert!(matches!(
+            result.status,
+            SubagentExitStatus::ForegroundWaitElapsed
+        ));
         assert!(token.is_cancelled(), "the kill cancelled the run's token");
     }
 

@@ -1116,6 +1116,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         supervisor: Some(supervisor_for_spawn.clone()),
                         session_manager: Arc::clone(&sessions),
                         cron_store: Arc::clone(&cron_store_for_spawn),
+                        workspace: Arc::clone(&workspace_paths_arc),
                     },
                 );
                 let (sender, mailbox) =

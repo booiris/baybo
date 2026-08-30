@@ -163,6 +163,34 @@ The inference turn retains the historical persisted/API kind
 `SubagentNotification` for compatibility, although its payload may describe
 either subagents or commands.
 
+#### Result bodies, and where the rest lives
+
+Each `<result>` element's `<output>` is capped at `MAX_RESULT_BYTES` —
+defined as `MAX_TOOL_OUTPUT_BYTES`, deliberately the same budget the *same*
+report would have kept had the job finished inside its foreground wait and
+returned as a tool result. The two paths must agree: a foreground subagent
+that crosses `SUBAGENT_FOREGROUND_WAIT` converts to background and delivers
+here instead, and when this cap was smaller that conversion silently cost a
+report ~30x more of itself than finishing a second earlier would have. One
+turn's combined bodies are additionally bounded by `MAX_BATCH_BYTES`, split
+evenly, so draining a full 64-result buffer cannot land a multi-megabyte
+prompt; at real batch sizes each result still gets the whole per-result
+budget.
+
+A body that *is* cut names the absolute path holding the full text, and both
+kinds carry that path as an element beside the body:
+
+- subagent → `<transcript_file>` (`<root>/logs/sessions/<child-id>.jsonl`,
+  served out of the store by `SessionTranscriptReader` — nothing is written
+  there, and `Read` resolves it before touching the filesystem)
+- command → `<output_file>`
+
+The path is the load-bearing part. `<child_session>` alone affords only a
+resume, which spends an LLM round-trip re-dictating text that is already
+sitting in `session_messages` — and a resume can itself be killed at the
+foreground wait, which is how a truncated batch once reached the user with the
+missing table still missing.
+
 ### 4. Streaming analysis and delivery outcomes
 
 The acknowledgement itself runs no inference. The following parent-agent turn
@@ -252,6 +280,11 @@ transcript or command output remains intact.
 ## Invariants
 
 - Session rows and transcripts are never deleted by this pipeline.
+- A result body the prompt truncates always names a readable absolute path to
+  the whole of it. Nothing this pipeline drops is unreachable.
+- The background body budget never falls below what the same result would have
+  kept on the foreground tool-result path; crossing the foreground wait changes
+  *when* a report arrives, not how much of it survives.
 - At most one `active_delivery` exists, but it may coexist with buffered/grouped
   results for later batches.
 - Raw results own analysed-report delivery before the hidden prompt append; the

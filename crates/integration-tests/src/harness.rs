@@ -489,7 +489,7 @@ impl AgentTestHarnessBuilder {
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             agent: None,
             tokenizer,
-            workspace,
+            workspace: Arc::clone(&workspace),
             keep_recent,
             compression_threshold,
             // The harness drives compaction through the window share and a
@@ -568,6 +568,7 @@ impl AgentTestHarnessBuilder {
                 supervisor: None,
                 session_manager: Arc::clone(&session_manager),
                 cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
+                workspace: Arc::clone(&workspace),
             },
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));

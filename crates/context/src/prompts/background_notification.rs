@@ -5,7 +5,10 @@
 //! the result as a hidden agent-context row and records it on the session's
 //! notification ledger, which drives delivery retries.
 
+use std::path::{Path, PathBuf};
+
 use baybo_model::{BackgroundJobKind, ContentBlock, PendingBackgroundResult, SubagentExitStatus};
+use baybo_workspace::WorkspacePaths;
 
 /// Assistant-reply lead sent before the parent starts analysing a finished
 /// background batch. Carries no result content (see [`build_completion_reply`]);
@@ -17,6 +20,20 @@ const BACKGROUND_COMPLETION_REPLY_LEAD: &str =
 /// content (never the system prompt) so the prompt-cache prefix is identical
 /// to a normal main-path turn.
 const BACKGROUND_NOTIFICATION_FRAMING: &str = "[background task(s) finished since your last turn. A brief completion acknowledgement has already been sent to the user. Analyze the results now and report the useful outcome as the next fresh, proactive message; do not repeat the acknowledgement.]";
+
+/// Per-result body budget, matching what the SAME report would have kept had
+/// the job finished inside its foreground wait and come back as a tool result.
+/// Before this the two paths disagreed by ~30x, so a subagent that crossed the
+/// wait and converted to background had its report gutted while an identical
+/// one finishing a second earlier arrived whole.
+const MAX_RESULT_BYTES: usize = baybo_model::MAX_TOOL_OUTPUT_BYTES;
+
+/// Ceiling on one notification turn's combined result bodies. The buffer holds
+/// up to 64 terminal results and drains them into a single prompt, so a
+/// per-result budget alone would let a wide fan-out land a multi-megabyte
+/// turn. Split evenly; at the batch sizes that actually occur (a handful)
+/// every result still gets the full per-result budget.
+const MAX_BATCH_BYTES: usize = 4 * MAX_RESULT_BYTES;
 
 /// Per-result element of the nested `<background_results>` block. Metadata
 /// rides as attributes; `task` / `output` (and the kind-specific `detail`)
@@ -78,27 +95,43 @@ pub fn build_retry_cue() -> Vec<ContentBlock> {
 /// notification ledger, so a retry re-runs against exactly this prompt. The
 /// framing rides in this per-turn content (never the system prompt) so the
 /// prompt-cache prefix stays identical to a normal main-path turn.
-pub fn build_notification_content(pending: &[PendingBackgroundResult]) -> Vec<ContentBlock> {
+pub fn build_notification_content(
+    pending: &[PendingBackgroundResult],
+    workspace: &WorkspacePaths,
+) -> Vec<ContentBlock> {
+    let budget = result_budget(pending.len());
     let mut xml = String::from(BACKGROUND_NOTIFICATION_FRAMING);
     xml.push_str("\n\n<background_results>\n");
     for p in pending {
-        let (type_attr, detail) = match &p.kind {
+        let (type_attr, full_text, detail) = match &p.kind {
             BackgroundJobKind::Subagent {
                 child_session_id,
                 subagent_type,
-            } => (
-                subagent_type.clone(),
-                format!(
-                    "    <child_session>{}</child_session>\n",
-                    xml_escape(child_session_id.as_ref())
-                ),
-            ),
+            } => {
+                // The child's transcript is served virtually out of the store
+                // (see `SessionTranscriptReader`), so this address is `Read`-able
+                // even though nothing is written there. Naming it is what makes
+                // the truncation notice below actionable: the id alone only
+                // suggests a resume, which re-runs an LLM to re-emit text that
+                // is already sitting in the database.
+                let transcript = workspace.session_log_file(child_session_id.as_ref());
+                (
+                    subagent_type.clone(),
+                    transcript.clone(),
+                    format!(
+                        "    <child_session>{}</child_session>\n    <transcript_file>{}</transcript_file>\n",
+                        xml_escape(child_session_id.as_ref()),
+                        xml_escape(&transcript.display().to_string()),
+                    ),
+                )
+            }
             BackgroundJobKind::Command {
                 exit_code,
                 output_path,
                 ..
             } => (
                 "command".to_string(),
+                PathBuf::from(output_path),
                 format!(
                     "    <exit_code>{}</exit_code>\n    <output_file>{}</output_file>\n",
                     exit_code,
@@ -114,7 +147,7 @@ pub fn build_notification_content(pending: &[PendingBackgroundResult]) -> Vec<Co
                 .replace("{{task}}", &xml_escape(&p.label))
                 .replace(
                     "{{output}}",
-                    &xml_escape(&truncate_for_notice(&p.summary_text)),
+                    &xml_escape(&truncate_for_notice(&p.summary_text, budget, &full_text)),
                 )
                 .replace("{{detail}}", &detail),
         );
@@ -123,25 +156,43 @@ pub fn build_notification_content(pending: &[PendingBackgroundResult]) -> Vec<Co
     vec![ContentBlock::Text(xml)]
 }
 
+/// Bytes each result in a batch of `count` may spend on its body.
+fn result_budget(count: usize) -> usize {
+    MAX_RESULT_BYTES.min(MAX_BATCH_BYTES / count.max(1))
+}
+
 fn pending_status_label(status: &SubagentExitStatus) -> &'static str {
     match status {
         SubagentExitStatus::Completed => "completed",
         SubagentExitStatus::Cancelled => "cancelled",
         SubagentExitStatus::Failed { .. } => "failed",
         SubagentExitStatus::Timeout => "timeout",
+        SubagentExitStatus::ForegroundWaitElapsed => "killed",
     }
 }
 
-/// Cap a result's free text so one chatty turn can't blow the notification
-/// turn's budget; the full text stays in the child session transcript (for a
-/// subagent) or the turn's output file (for a command).
-fn truncate_for_notice(text: &str) -> String {
-    const MAX: usize = 1024;
-    if text.chars().count() <= MAX {
+/// Cap a result's free text at `budget` bytes so one chatty batch can't blow
+/// the notification turn, and point the model at `full_text` — a `Read`-able
+/// absolute path — for the rest.
+///
+/// The path is the whole point. The notice used to say "full text in the
+/// turn's transcript / output file", which named no path and, for a subagent,
+/// named a file that does not exist; the only affordance beside it was a bare
+/// child-session id, so a parent that noticed the cut re-spawned the child to
+/// re-dictate text that was already in the store, and paid an LLM round-trip
+/// to fail at it.
+fn truncate_for_notice(text: &str, budget: usize, full_text: &Path) -> String {
+    if text.len() <= budget {
         return text.to_string();
     }
-    let truncated: String = text.chars().take(MAX).collect();
-    format!("{truncated}… [truncated; full text in the turn's transcript / output file]")
+    let cut = text.floor_char_boundary(budget);
+    format!(
+        "{}… [truncated: {} of {} bytes shown. The FULL text is at {} — `Read` that absolute path (with `offset`/`limit` to page) instead of re-running or resuming the job.]",
+        &text[..cut],
+        cut,
+        text.len(),
+        full_text.display(),
+    )
 }
 
 fn xml_escape(s: &str) -> String {
@@ -165,19 +216,78 @@ mod tests {
             "failed"
         );
         assert_eq!(pending_status_label(&S::Timeout), "timeout");
+        assert_eq!(pending_status_label(&S::ForegroundWaitElapsed), "killed");
+    }
+
+    fn workspace() -> WorkspacePaths {
+        WorkspacePaths::new(PathBuf::from("/ws"))
     }
 
     #[test]
-    fn truncate_for_notice_appends_marker_when_over_cap() {
-        let long = "a".repeat(2000);
-        let out = truncate_for_notice(&long);
-        assert!(
-            out.len() > 1024,
-            "marker must be appended on overflow: {out:?}"
-        );
+    fn truncate_for_notice_appends_marker_and_the_recovery_path_when_over_cap() {
+        let long = "a".repeat(MAX_RESULT_BYTES * 2);
+        let path = Path::new("/ws/logs/sessions/child-1.jsonl");
+        let out = truncate_for_notice(&long, MAX_RESULT_BYTES, path);
         assert!(out.contains("truncated"));
-        let short = "hello";
-        assert_eq!(truncate_for_notice(short), "hello");
+        // A cut that does not say where the rest is leaves the parent to
+        // re-run work that is already in the store.
+        assert!(
+            out.contains("/ws/logs/sessions/child-1.jsonl"),
+            "truncation marker must name the readable path: {out}"
+        );
+        assert_eq!(
+            truncate_for_notice("hello", MAX_RESULT_BYTES, path),
+            "hello"
+        );
+    }
+
+    /// A subagent report that a FOREGROUND return would have delivered whole
+    /// must survive the background notification whole too.
+    ///
+    /// This is the regression the incident turned on: a report crossed the
+    /// 120s foreground wait, converted to background, and lost 85% of itself
+    /// to a 1024-char cap — the same bytes a tool result would have kept under
+    /// `MAX_TOOL_OUTPUT_BYTES`.
+    #[test]
+    fn a_report_that_fits_a_tool_result_is_not_cut_by_the_notification() {
+        let report = "彤程新材".repeat(1024); // ~12 KiB, the incident's size
+        assert!(report.len() <= baybo_model::MAX_TOOL_OUTPUT_BYTES);
+        let pending = vec![PendingBackgroundResult::subagent(
+            "h1",
+            "explorer",
+            "peer financials",
+            baybo_model::SessionId::from("child-1"),
+            report.clone(),
+            SubagentExitStatus::Completed,
+        )];
+        let blocks = build_notification_content(&pending, &workspace());
+        let ContentBlock::Text(xml) = &blocks[0] else {
+            panic!("expected text block");
+        };
+        assert!(xml.contains(&report), "report was cut: {} bytes", xml.len());
+        assert!(!xml.contains("truncated"));
+    }
+
+    /// The per-result budget shrinks so a wide fan-out cannot land a
+    /// multi-megabyte turn, but a handful of results each keep the full one.
+    #[test]
+    fn batch_budget_splits_across_results_but_spares_small_batches() {
+        assert_eq!(result_budget(1), MAX_RESULT_BYTES);
+        assert_eq!(result_budget(4), MAX_RESULT_BYTES);
+        assert_eq!(result_budget(64), MAX_BATCH_BYTES / 64);
+        assert!(result_budget(64) * 64 <= MAX_BATCH_BYTES);
+        // `count` is the batch length, which the caller can hand in as 0.
+        assert_eq!(result_budget(0), MAX_RESULT_BYTES);
+    }
+
+    /// A multi-byte character straddling the budget must not panic or emit
+    /// a broken code point — the incident's report was Chinese throughout.
+    #[test]
+    fn truncation_cuts_on_a_char_boundary() {
+        let text = "彤".repeat(64); // 3 bytes each
+        let out = truncate_for_notice(&text, 100, Path::new("/ws/x.jsonl"));
+        assert!(out.starts_with(&"彤".repeat(33)));
+        assert!(!out.starts_with(&"彤".repeat(34)));
     }
 
     #[test]
@@ -190,7 +300,7 @@ mod tests {
             "result & more",
             SubagentExitStatus::Completed,
         )];
-        let blocks = build_notification_content(&pending);
+        let blocks = build_notification_content(&pending, &workspace());
         let ContentBlock::Text(xml) = &blocks[0] else {
             panic!("expected text block");
         };
@@ -202,6 +312,13 @@ mod tests {
         assert!(xml.contains("do &lt;stuff&gt;"));
         assert!(xml.contains("result &amp; more"));
         assert!(xml.contains("<child_session>child-1</child_session>"));
+        // The subagent arm must name a readable address, not just an id —
+        // mirroring `<output_file>` on the command arm below. An id alone
+        // only affords a resume, which re-runs an LLM to re-emit stored text.
+        assert!(
+            xml.contains("<transcript_file>/ws/logs/sessions/child-1.jsonl</transcript_file>"),
+            "missing transcript pointer: {xml}"
+        );
     }
 
     #[test]
@@ -214,7 +331,7 @@ mod tests {
             "Compiling…\nFinished",
             SubagentExitStatus::Completed,
         )];
-        let blocks = build_notification_content(&pending);
+        let blocks = build_notification_content(&pending, &workspace());
         let ContentBlock::Text(xml) = &blocks[0] else {
             panic!("expected text block");
         };

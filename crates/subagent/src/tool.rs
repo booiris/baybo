@@ -640,7 +640,10 @@ impl Tool for SpawnSubagentTool {
         let text = if background {
             result.result_text()
         } else {
-            result.to_tool_result_text()
+            result.to_tool_result_text(
+                &ctx.workspace_paths
+                    .session_log_file(result.child_session_id.as_ref()),
+            )
         };
         Ok(ToolOutput::Text(text))
     }

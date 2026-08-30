@@ -322,8 +322,10 @@ impl AgentActor {
             .iter()
             .map(|result| result.handle_id.clone())
             .collect();
-        let content =
-            baybo_context::prompts::background_notification::build_notification_content(&pending);
+        let content = baybo_context::prompts::background_notification::build_notification_content(
+            &pending,
+            &self.volatile.workspace,
+        );
         let source_event_id = background_prompt_source_event_id(&handle_ids);
 
         // The prompt row and its batch idempotency key land atomically. Raw
