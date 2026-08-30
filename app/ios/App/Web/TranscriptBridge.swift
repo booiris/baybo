@@ -188,7 +188,6 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
         }
         lastDeathAt = now
         consecutiveDeaths += 1
-        WebTrail.note("DIED visible count=\(consecutiveDeaths)")
         guard consecutiveDeaths <= Self.maxConsecutiveDeaths else {
             NSLog("baybo: transcript web content process died again; giving up on reloads")
             return
@@ -455,7 +454,6 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
 
     private func deliverInit() {
         guard let store else { return }
-        WebTrail.note("init session=\(store.sessionId)")
         shownSessionId = store.sessionId
         let restored: String?
         if store.mirrored {
@@ -565,11 +563,6 @@ extension TranscriptBridge: WKScriptMessageHandler {
     }
 
     private func handle(type: String, body: [String: Any]) {
-        if type == "log" {
-            WebTrail.note("web \(body["level"] as? String ?? "?"): \(body["message"] as? String ?? "")")
-        } else if type != "persist" && type != "scroll" {
-            WebTrail.note("msg \(type)")
-        }
         switch type {
         case "ready":
             NSLog("baybo: transcript bridge ready (session=%@)", store?.sessionId ?? "?")

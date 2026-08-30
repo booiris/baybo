@@ -1881,8 +1881,6 @@ export function Transcript({
   // Emptied without being rendered if a REPLACE lands first: those rows describe
   // a thread the server has just rebased away.
   const deferredHead = useRef<Row[]>(restoredSplit.head);
-  // Row count at last render — the mount beacon reads it (triage instrument).
-  const renderRowCount = useRef(0);
   const [messages, setMessages] = useState<Row[]>(restoredSplit.tail);
   // The rendered thread, readable from `runSync` — which must NOT re-create on
   // every row change: its identity gates the mount and safety-tick sync effects,
@@ -2176,7 +2174,6 @@ export function Transcript({
     const el = scrollEl();
     if (el) el.scrollTop = el.scrollHeight;
     revealAfterRetarget();
-    log("info", `boot: mounted rows=${renderRowCount.current}`);
   }, []);
 
   // While pinned to the newest edge, keep it in view as content lands (rows,
@@ -2600,7 +2597,6 @@ export function Transcript({
       // The bundle reads and rewrites the tail block — queued live steps must
       // have landed first or the rebuild silently drops them.
       flushRowOps();
-      log("info", `boot: subscribe_state steps=${wireSteps.length} approvals=${pendingApprovals.length}`);
       const startedMs = turn.started_at ? Date.parse(turn.started_at) : null;
       if (startedMs !== null && endedTurnStarts.current.includes(startedMs)) return;
       if (!turn.active) {
@@ -2749,7 +2745,6 @@ export function Transcript({
     const at = Math.max(0, head.length - HISTORY_PAGE_LIMIT);
     const page = head.slice(at);
     deferredHead.current = head.slice(0, at);
-    log("info", `boot: reservoir pop page=${page.length} left=${at}`);
     if (at === 0) {
       // Final pop — hand the mirror's own paging state back. `prependOlder`
       // leaves the floor PUT on a null — its "an empty page changes nothing"
@@ -2865,7 +2860,6 @@ export function Transcript({
       // Queued work-frame ops target the pre-page tail; land them before the
       // page merges or REPLACEs so they aren't applied to rebuilt rows.
       flushRowOps();
-      log("info", `boot: sync_page rows=${frame.rows.length} rebased=${String(frame.rebased)} since=${String(frame.since_ordinal)}`);
       setSyncInFlight(false);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
@@ -3833,7 +3827,6 @@ export function Transcript({
       }),
     [messages],
   );
-  renderRowCount.current = renderRows.length;
   const defaultExpandedWorkIds = useMemo(
     () => (expandUnansweredTail ? unansweredTailWorkIds(renderRows) : undefined),
     [expandUnansweredTail, renderRows],

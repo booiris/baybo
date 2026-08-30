@@ -775,15 +775,6 @@ window.baybo = {
     onInitCb?.(payload);
   },
   pushFrame(frameJson) {
-    // Telemetry beacon (white-flash triage): a giant inbound frame is a
-    // memory event worth a line in the native console before it is parsed.
-    if (frameJson.length > 262144) {
-      post({
-        type: "log",
-        level: "warn",
-        message: `boot: giant frame bytes=${frameJson.length} head=${frameJson.slice(0, 80)}`,
-      });
-    }
     dispatch({ kind: "frame", frameJson });
   },
   setConnEpoch(epoch) {
@@ -800,13 +791,6 @@ window.baybo = {
     dispatch({ kind: "sendConfirmed", msgId, ordinal: ordinal ?? null });
   },
   blobResult(payload) {
-    if (payload.dataBase64 !== null && payload.dataBase64.length > 1048576) {
-      post({
-        type: "log",
-        level: "warn",
-        message: `boot: giant blob base64=${payload.dataBase64.length}`,
-      });
-    }
     settleBlob(payload);
   },
   fileState(payload) {
@@ -862,8 +846,3 @@ window.baybo = {
     flushPersist();
   },
 };
-
-// Boot beacon: surfaces in the native console the moment this module finishes
-// evaluating — a page that dies BEFORE this line never got through the module
-// graph (a bundle/eval problem); one that dies after `ready` died in app code.
-post({ type: "log", level: "info", message: "boot: bridge evaluated" });

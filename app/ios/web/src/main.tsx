@@ -15,7 +15,7 @@ import "@fontsource-variable/inter";
 import "katex/dist/katex.min.css";
 import i18n from "./i18n";
 import "./styles.css";
-import { hasNativeBridge, onInit, onLanguage, postContentReady, postReady, postToNative } from "./bridge";
+import { hasNativeBridge, onInit, onLanguage, postContentReady, postReady } from "./bridge";
 import { Transcript } from "./Transcript";
 
 onLanguage((lang) => void i18n.changeLanguage(lang));
@@ -39,7 +39,6 @@ onInit((payload) => {
   requestAnimationFrame(() => postContentReady());
 });
 
-postToNative({ type: "log", level: "info", message: "boot: main evaluated" });
 postReady();
 
 // Dev browser (pnpm dev, no WKWebView): native never replies to ready, so
