@@ -25,8 +25,9 @@ UI、Telegram、微信或已配对的 iOS 应用与它对话——所有入口�
 
 - **多渠道** —— Web 面板、终端 UI、一次性 CLI、Telegram 与微信机器人,以及端到端
   加密的 iOS 客户端。新渠道通过 TypeScript sidecar SDK 接入。
-- **19 家 LLM 提供商** —— Anthropic、OpenAI(API 及 ChatGPT 订阅 OAuth)、Gemini、
-  DeepSeek、xAI、Mistral、Groq、Ollama、llamafile 等;按会话切换模型、配置热重载。
+- **19 家 LLM 提供商** —— Anthropic、OpenAI(API key,或用 ChatGPT/Codex 订阅走
+  OAuth —— 直连 Codex Responses API,无需 API key)、Gemini、DeepSeek、xAI、
+  Mistral、Groq、Ollama、llamafile 等;按会话切换模型、配置热重载。
 - **工具与 MCP** —— 内置 `Read`/`Write`/`Edit`/`Bash`/`Grep`/`WebFetch`/`WebSearch`
   等工具,还可通过 `baybo mcp add` 接入任意 MCP 服务器。
 - **可扩展的 agent** —— 带信任分级和 LLM 风险评估的声明式技能、类型化子代理配置、

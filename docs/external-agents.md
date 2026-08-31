@@ -11,6 +11,12 @@ in-process baybo `AgentActor`. Two are registered today:
 - **`codex`** drives `codex` (OpenAI Codex CLI) — billed against the
   operator's ChatGPT subscription.
 
+> Not to be confused with the **`openai-subscription` LLM provider**
+> ([`modules/llm-openai-subscription.md`](modules/llm-openai-subscription.md)),
+> which bills against the same ChatGPT plan but is not an external agent: it
+> needs no `codex` binary, speaks the Codex Responses API in-process, and is
+> configured as an `llm[]` entry rather than under `external_agents.codex`.
+
 Both let an baybo subagent's task be handled by the external
 agent's own autonomous loop without spending baybo's own per-token API
 credit.
