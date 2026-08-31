@@ -1,6 +1,9 @@
 # Kanban projects — a board that runs itself
 
-Design spec, 2026-08-05 (rev 1). This is the productivity-shaped successor to
+Design spec, 2026-08-05. **Living document, last reconciled with the code
+2026-08-24.** It owns the product-level rationale and the phasing; where it and
+[`../modules/project.md`](../modules/project.md) disagree about *behaviour*,
+that one describes the code. This is the productivity-shaped successor to
 the Slack-room multi-project design (`docs/todo/multi-project.md` on the
 unmerged `multi_project` branch). The verdict on that branch: the substrate
 (projects, self-staffing agents, wake ledger, budget, workdir writes) is
@@ -716,8 +719,8 @@ announces which of these will happen before sending.
    waits for Phase 4's gate. `parent_issue_id`/`stage` wait for Phase 4's
    barriers, and `branch` for Phase 2's worktrees. `blocked_reason` and
    `cancelled_at` are here now because a user can set them today.
-2. **Execution.** `issue_runs` + trigger predicate + ledger, per-issue
-   sessions, worktree/branch creation, timeline events + WS deltas,
+2. **Execution.** ✅ **Shipped.** `issue_runs` + trigger predicate + ledger,
+   per-issue sessions, worktree/branch creation, timeline events + WS deltas,
    execution log + transcript links, comment delivery (wake/interject).
 3. **Review plane.** ✅ **Shipped.** `issues.branch` (written only once
    the work has a commit, so "has a branch" and "produced something" are
@@ -798,7 +801,7 @@ announces which of these will happen before sending.
      resolves the **card** before touching the queue: the queue is keyed by
      call id alone, so that check is the only thing stopping one board from
      answering another's prompt.
-5. **Polish.** Three of four shipped; cron→issue is designed and not built.
+5. **Polish.** ✅ **Shipped**, all four.
 
    - **Board filters.** ✅ Free text over title and `#number`, an assignee
      picker with a separate "Unassigned", a blocked-only toggle, and the
@@ -867,11 +870,11 @@ announces which of these will happen before sending.
      rather than because a page loaded — which was the whole defect.
 
      **Push is deliberately not part of this**, and not because of one
-     predicate. The iOS Projects tab is a placeholder, a push payload can
-     only address a session, and the tap handler touches that session into
-     the phone's chat list — which is exactly what the project-session
-     exclusion exists to prevent. `APPROVAL_TIMEOUT` is also a gateway-wide
-     300s, so pushing an approval deadline to a locked phone is theatre.
+     predicate. A push payload can only address a session, and the tap
+     handler touches that session into the phone's chat list — which is
+     exactly what the project-session exclusion exists to prevent.
+     `APPROVAL_TIMEOUT` is also a gateway-wide 300s, so pushing an
+     approval deadline to a locked phone is theatre.
      Board push is its own phase. State plainly in any PR: a web rail badge
      reaches an operator with a tab open, not one away from their machine.
 
@@ -969,10 +972,11 @@ remain, all recorded with their reasons rather than left to be re-derived:
   ("one-shot sessions have no follow-up traffic"), which is precisely the
   assumption injection would break. Worth it only for "stop, you are going
   the wrong way".
-- **Push about a board.** Not one predicate away: the iOS Projects tab is a
-  placeholder, a push payload can only address a session, and the tap
-  handler touches that session into the phone's chat list — which is what
-  the issue-session exclusion exists to prevent. `APPROVAL_TIMEOUT` is
+- **Push about a board.** Not one predicate away. The iOS board tab has since
+  shipped (`app/ios/App/Screens/Project*`), so the surface is no longer the
+  blocker — the addressing is: a push payload can only address a session, and
+  the tap handler touches that session into the phone's chat list, which is
+  what the issue-session exclusion exists to prevent. `APPROVAL_TIMEOUT` is
   also a gateway-wide 300s, so pushing an approval deadline to a locked
   phone is theatre. Its own phase. The rail badge reaches an operator with
   a tab open, not one away from their machine; say so rather than letting
