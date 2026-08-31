@@ -1151,7 +1151,6 @@ fn cron_trigger(event: &CronTriggerEvent, builtin: Option<BuiltinFireContext>) -
         job_id: event.job_id.clone(),
         title: event.title.clone(),
         prompt: event.prompt.clone(),
-        mcp_tool_grants: event.mcp_tool_grants.clone(),
         delivery: if event.one_shot {
             CronDelivery::OriginSession
         } else {
@@ -1375,7 +1374,6 @@ mod tests {
                 one_shot,
                 project_id: None,
                 origin_session_id: Some(SessionId::from("sess-user")),
-                mcp_tool_grants: Vec::new(),
                 previous_fire_at: None,
             }
         }
@@ -2048,27 +2046,20 @@ mod tests {
         // The skip is keyed on the built-in job id alone; a user's own job
         // must fire whether or not anyone has spoken lately.
         let mut h = RouterHarness::new();
-        let grant = baybo_model::McpToolGrant::new(
-            "server/tool",
-            baybo_model::McpTransportIdentity::from_sha256([0x42; 32]),
-        );
-        let mut event = RouterHarness::event(false);
-        event.mcp_tool_grants = vec![grant.clone()];
+        let event = RouterHarness::event(false);
         h.router
             .handle_cron_trigger(event)
             .await
             .expect("route the fire");
 
         let (_, mut mailbox) = h.fire();
-        let Ok(AgentMessage::CronTrigger {
-            builtin: None,
-            mcp_tool_grants,
-            ..
-        }) = mailbox.try_recv()
-        else {
-            panic!("ordinary fire trigger")
-        };
-        assert_eq!(mcp_tool_grants, vec![grant]);
+        assert!(
+            matches!(
+                mailbox.try_recv(),
+                Ok(AgentMessage::CronTrigger { builtin: None, .. })
+            ),
+            "ordinary fire trigger"
+        );
     }
 
     #[tokio::test]
@@ -2298,7 +2289,6 @@ mod tests {
             updated_at: Utc::now(),
             project_id: None,
             origin_session_id: None,
-            mcp_tool_grants: Vec::new(),
             deleted_at: None,
             pinned: false,
             builtin: false,

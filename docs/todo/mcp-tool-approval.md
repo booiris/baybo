@@ -57,13 +57,10 @@ still keys off the live registry, per call, in `ToolExecutor::execute`:
 - **Trust** — `manifest.validate_auto_execution()`.
 - **Channel** — `manifest.allows_channel()`.
 - **Trigger scope** — `Tool::trigger_scope().allows_trigger()`.
-- **Unattended authority** — a cron/subagent lineage carrying
-  `InheritedToolContext` needs an exact `McpToolGrant` (namespaced operation +
-  transport identity) or the call is denied. This is derived from
-  `mcp_metadata`, **independently of the access list**, so an empty list does
-  not weaken it. Pinned by
-  `inherited_context_denies_ungranted_zero_access_typed_mcp`
-  (`crates/agent/src/runtime/tool_executor.rs`); keep that test passing.
+- **Unattended lineages** — an execution carrying `InheritedToolContext`
+  denies any uncovered approval-gated access without prompting. Vacuous for
+  MCP tools while their access list is empty: unattended MCP calls run
+  exactly as attended ones do.
 - **Secret placeholders** — arguments are revealed only inside the executor,
   after every gate.
 
@@ -82,9 +79,8 @@ rule could not express:
   is the cheapest honest signal available, with a server-level default for
   servers that annotate nothing.
 - **Grants at the operation grain.** `ApprovedResource` has no MCP variant; the
-  natural one is `(namespaced operation, transport identity)` — the same pair
-  cron grants already use (`baybo_model::McpToolGrant`), which would let the
-  interactive and unattended paths finally share a vocabulary.
+  natural one is a `(namespaced operation, transport identity)` pair, which
+  would let the interactive and unattended paths share a vocabulary.
 - **Durability beyond one session.** `approved_resources` is per-session state;
   "always allow this server's read-only operations" belongs in config or a
   durable per-server record, not a field every new session starts empty.

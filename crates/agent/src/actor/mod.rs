@@ -94,8 +94,6 @@ pub enum AgentMessage {
         job_id: String,
         title: String,
         prompt: String,
-        /// Exact MCP tool grants snapshotted onto this execution.
-        mcp_tool_grants: Vec<baybo_model::McpToolGrant>,
         delivery: CronDelivery,
         /// Present only for a runtime-owned job's fire — see
         /// [`BuiltinFireContext`]. `None` for every job a user created.
@@ -508,20 +506,12 @@ impl AgentActor {
                 job_id,
                 title,
                 prompt,
-                mcp_tool_grants,
                 delivery,
                 builtin,
             } => {
                 debug!(session_id = %session_id, job_id = %job_id, ?delivery, "received cron trigger");
                 if let Err(e) = self
-                    .dispatch_cron_prompt(
-                        &prompt,
-                        &job_id,
-                        &title,
-                        mcp_tool_grants,
-                        delivery,
-                        builtin,
-                    )
+                    .dispatch_cron_prompt(&prompt, &job_id, &title, delivery, builtin)
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -737,7 +727,6 @@ impl AgentActor {
         prompt: &str,
         job_id: &str,
         title: &str,
-        mcp_tool_grants: Vec<baybo_model::McpToolGrant>,
         delivery: CronDelivery,
         builtin: Option<BuiltinFireContext>,
     ) -> anyhow::Result<()> {
@@ -765,7 +754,7 @@ impl AgentActor {
                 None,
                 None,
                 silence.clone(),
-                Some(baybo_model::InheritedToolContext::new(mcp_tool_grants)),
+                Some(baybo_model::InheritedToolContext),
             )
             .await?;
         let silenced = silence.as_ref().is_some_and(|s| s.requested());
@@ -1781,7 +1770,6 @@ mod tests {
             job_id: "j".into(),
             title: "t".into(),
             prompt: "p".into(),
-            mcp_tool_grants: Vec::new(),
             delivery: CronDelivery::Channel,
         })
         .await

@@ -177,13 +177,6 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
 
-    /// Typed MCP provenance for unattended cron authorization. Native tools
-    /// return `None`; MCP wrappers return the exact operation and transport
-    /// identity plus only the transport resources its cron grant may bypass.
-    fn mcp_metadata(&self) -> Option<mcp::McpToolMetadata> {
-        None
-    }
-
     /// Output provenance for prompt-injection severity; defaults to opaque.
     fn output_source(&self) -> OutputSource {
         OutputSource::default()
@@ -1115,9 +1108,7 @@ pub fn resource_path(p: impl Into<PathBuf>) -> PathBuf {
     p.into()
 }
 
-pub use registry::{
-    DeferredLookup, DeferredToolIndex, McpToolGrantResolveError, McpToolGrantResolver, ToolRegistry,
-};
+pub use registry::{DeferredLookup, DeferredToolIndex, ToolRegistry};
 
 #[cfg(test)]
 mod multi_modal_text_tests {

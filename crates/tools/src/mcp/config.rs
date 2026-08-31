@@ -86,8 +86,7 @@ pub struct McpServerEntry {
     /// Operator one-liner shown to the model in the deferred-servers notice
     /// row. Model-facing prose only: NOT part of the reconciler identity
     /// hash (editing it must not tear down a live connection — it changes
-    /// what NEW sessions are told, nothing about the server itself) and not
-    /// part of the SHA-256 transport identity.
+    /// what NEW sessions are told, nothing about the server itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Which sessions this server's tools are offered to. Defaults to
@@ -102,9 +101,7 @@ pub struct McpServerEntry {
     /// `ToolInvoke`. Defaults to `true` (MCP schemas are the bulk of the
     /// prompt's tool bytes); set `"defer": false` to advertise eagerly.
     ///
-    /// Not part of the SHA-256 transport identity (deferral does not change
-    /// what the server *is*, so persisted cron grants survive a flip), but
-    /// folded into the reconciler's identity hash so an edit forces a
+    /// Folded into the reconciler's identity hash so an edit forces a
     /// reconnect and re-registration under the new bit.
     ///
     /// Version-skew hazard: a pre-`defer` binary's `baybo mcp add`/`remove`
@@ -127,17 +124,6 @@ fn is_true(value: &bool) -> bool {
 }
 
 impl McpServerEntry {
-    pub fn transport_identity<I, S>(
-        &self,
-        env_names: I,
-    ) -> McpResult<baybo_model::McpTransportIdentity>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        crate::mcp::identity::transport_identity(self, env_names)
-    }
-
     pub fn validate(&self) -> McpResult<()> {
         if self.name.is_empty() {
             return Err(McpError::InvalidConfig(

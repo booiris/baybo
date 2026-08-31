@@ -787,34 +787,13 @@ impl ToolExecutor {
                         )
                     });
 
-                let mcp_metadata = pinned_tool.as_ref().and_then(|tool| tool.mcp_metadata());
-                let exact_mcp_grant = inherited_context.as_ref().is_some_and(|context| {
-                    mcp_metadata.as_ref().is_some_and(|metadata| {
-                        metadata.tool_name == tool_name_owned
-                            && context.grants_mcp_tool(
-                                &tool_name_owned,
-                                &metadata.transport_identity,
-                            )
-                    })
-                });
-                let inherited_context_requires_mcp_grant = inherited_context.is_some()
-                    && mcp_metadata.is_some()
-                    && !exact_mcp_grant;
                 let uncovered: Vec<ResourceAccess> = {
                     let approved = approved_resources.lock();
                     accesses
                         .iter()
                         .filter(|acc| {
-                            if matches!(acc, ResourceAccess::ReadFile { .. }) {
-                                return false;
-                            }
-                            if approved.iter().any(|ar| ar.covers(acc)) {
-                                return false;
-                            }
-                            !(exact_mcp_grant
-                                && mcp_metadata.as_ref().is_some_and(|metadata| {
-                                    metadata.transport_accesses.contains(acc)
-                                }))
+                            !matches!(acc, ResourceAccess::ReadFile { .. })
+                                && !approved.iter().any(|ar| ar.covers(acc))
                         })
                         .cloned()
                         .collect()
@@ -824,7 +803,7 @@ impl ToolExecutor {
                     hook();
                 }
 
-                if inherited_context_requires_mcp_grant || !uncovered.is_empty() {
+                if !uncovered.is_empty() {
                     if inherited_context.is_some() {
                         *approval_sink.lock() = Some(ApprovalDecision::Deny);
                         for access in &uncovered {
@@ -840,27 +819,13 @@ impl ToolExecutor {
                                 .await;
                             event_seq += 1;
                         }
-                        let reason = match (&mcp_metadata, exact_mcp_grant) {
-                            (Some(_), false) => String::from(
-                                "this execution inherited unattended authority and this exact MCP \
-                                 tool and transport configuration is not granted; grant the current \
-                                 namespaced operation and transport identity in the originating \
-                                 execution's permission settings",
-                            ),
-                            (Some(_), true) => String::from(
-                                "the inherited exact MCP tool grant covers only that operation's \
-                                 transport access; the call requested additional approval-gated \
-                                 resources, which this unattended execution cannot approve",
-                            ),
-                            (None, _) => String::from(
-                                "this execution inherited unattended authority and cannot request new \
-                                 approval for a non-MCP tool; run this operation from a user reply \
-                                 or expose it through an exact MCP tool grant",
-                            ),
-                        };
                         return Err(anyhow::Error::new(ToolError::Denied {
                             tool: tool_name_owned.clone(),
-                            reason,
+                            reason: String::from(
+                                "this execution runs unattended and cannot raise an approval \
+                                 prompt for the resources this call requires; run this operation \
+                                 from an interactive user session",
+                            ),
                         }));
                     }
                     let gate = self.gate_map.get(&user.channel, session_id);
@@ -1461,7 +1426,7 @@ mod tests {
         ExecutedTool, InvokeValidatorCache, ToolExecutor, admits_repo, admits_worktree,
         permissive_scope,
     };
-    use baybo_model::{InheritedToolContext, McpToolGrant, McpTransportIdentity};
+    use baybo_model::InheritedToolContext;
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2305,20 +2270,20 @@ mod tests {
     }
 
     const SELECTED_MCP_TOOL: &str = "lighthouse/run_audit";
-    const SIBLING_MCP_TOOL: &str = "lighthouse/get_report";
 
-    struct TypedMcpTool {
+    /// The shape an MCP wrapper presents to the executor: a dynamic tool
+    /// whose accesses are declared up front (usually none — see
+    /// `resource_access_for` in `baybo-tools`), optionally asking for more
+    /// mid-call.
+    struct McpShapedTool {
         namespaced_name: &'static str,
-        upstream_name: &'static str,
-        transport_identity: McpTransportIdentity,
-        declares_transport_access: bool,
-        extra_access: bool,
+        declares_access: bool,
         mid_execution_access: bool,
         ran: Arc<AtomicBool>,
     }
 
-    impl TypedMcpTool {
-        fn transport_access() -> ResourceAccess {
+    impl McpShapedTool {
+        fn declared_access() -> ResourceAccess {
             ResourceAccess::Http {
                 host: "mcp.example".to_string(),
             }
@@ -2326,13 +2291,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl baybo_tools::Tool for TypedMcpTool {
+    impl baybo_tools::Tool for McpShapedTool {
         fn name(&self) -> &str {
             self.namespaced_name
         }
 
         fn description(&self) -> String {
-            "typed MCP authorization test".to_string()
+            "unattended authorization test".to_string()
         }
 
         fn parameters_schema(&self) -> Value {
@@ -2340,31 +2305,11 @@ mod tests {
         }
 
         fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
-            let mut accesses = if self.declares_transport_access {
-                vec![Self::transport_access()]
+            if self.declares_access {
+                vec![Self::declared_access()]
             } else {
                 Vec::new()
-            };
-            if self.extra_access {
-                accesses.push(ResourceAccess::WriteFile {
-                    path: PathBuf::from("/tmp/not-transport"),
-                });
             }
-            accesses
-        }
-
-        fn mcp_metadata(&self) -> Option<baybo_tools::mcp::McpToolMetadata> {
-            Some(baybo_tools::mcp::McpToolMetadata {
-                tool_name: self.namespaced_name.to_string(),
-                server_name: "lighthouse".to_string(),
-                upstream_name: self.upstream_name.to_string(),
-                transport_identity: self.transport_identity.clone(),
-                transport_accesses: if self.declares_transport_access {
-                    vec![Self::transport_access()]
-                } else {
-                    Vec::new()
-                },
-            })
         }
 
         async fn execute(
@@ -2528,92 +2473,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_mcp_tool_grant_bypasses_only_its_transport_access() {
-        let identity = McpTransportIdentity::from_sha256([10; 32]);
-        let ran = Arc::new(AtomicBool::new(false));
-        let (gate_calls, gate) = counting_gate();
-        let approved = Arc::new(Mutex::new(Vec::new()));
-        let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
-                namespaced_name: SELECTED_MCP_TOOL,
-                upstream_name: "run_audit",
-                transport_identity: identity.clone(),
-                declares_transport_access: true,
-                extra_access: false,
-                mid_execution_access: false,
-                ran: Arc::clone(&ran),
-            }),
-            gate,
-            Arc::clone(&approved),
-            Some(InheritedToolContext::new(vec![McpToolGrant::new(
-                SELECTED_MCP_TOOL,
-                identity,
-            )])),
-        )
-        .await;
-
-        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
-        assert_eq!(executed.approval, None);
-        assert!(ran.load(Ordering::SeqCst));
-        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
-        assert!(approved.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn inherited_context_denies_ungranted_zero_access_typed_mcp() {
+    async fn inherited_context_runs_zero_access_mcp_tool_without_any_gate() {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
         let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
+            Arc::new(McpShapedTool {
                 namespaced_name: SELECTED_MCP_TOOL,
-                upstream_name: "run_audit",
-                transport_identity: McpTransportIdentity::from_sha256([19; 32]),
-                declares_transport_access: false,
-                extra_access: false,
+                declares_access: false,
                 mid_execution_access: false,
                 ran: Arc::clone(&ran),
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext::default()),
-        )
-        .await;
-
-        let error = executed
-            .output
-            .expect_err("zero-access typed MCP still requires an exact grant");
-        assert!(
-            error
-                .to_string()
-                .contains("exact MCP tool and transport configuration"),
-            "{error}"
-        );
-        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
-        assert!(!ran.load(Ordering::SeqCst));
-        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn inherited_context_allows_granted_zero_access_typed_mcp() {
-        let identity = McpTransportIdentity::from_sha256([20; 32]);
-        let ran = Arc::new(AtomicBool::new(false));
-        let (gate_calls, gate) = counting_gate();
-        let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
-                namespaced_name: SELECTED_MCP_TOOL,
-                upstream_name: "run_audit",
-                transport_identity: identity.clone(),
-                declares_transport_access: false,
-                extra_access: false,
-                mid_execution_access: false,
-                ran: Arc::clone(&ran),
-            }),
-            gate,
-            Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext::new(vec![McpToolGrant::new(
-                SELECTED_MCP_TOOL,
-                identity,
-            )])),
+            Some(InheritedToolContext),
         )
         .await;
 
@@ -2625,25 +2497,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dynamic_replacement_after_authorization_executes_the_pinned_tool() {
-        let granted_identity = McpTransportIdentity::from_sha256([17; 32]);
-        let replacement_identity = McpTransportIdentity::from_sha256([18; 32]);
         let original_ran = Arc::new(AtomicBool::new(false));
         let replacement_ran = Arc::new(AtomicBool::new(false));
-        let original: Arc<dyn baybo_tools::Tool> = Arc::new(TypedMcpTool {
+        let original: Arc<dyn baybo_tools::Tool> = Arc::new(McpShapedTool {
             namespaced_name: SELECTED_MCP_TOOL,
-            upstream_name: "run_audit",
-            transport_identity: granted_identity.clone(),
-            declares_transport_access: true,
-            extra_access: false,
+            declares_access: true,
             mid_execution_access: false,
             ran: Arc::clone(&original_ran),
         });
-        let replacement: Arc<dyn baybo_tools::Tool> = Arc::new(TypedMcpTool {
+        let replacement: Arc<dyn baybo_tools::Tool> = Arc::new(McpShapedTool {
             namespaced_name: SELECTED_MCP_TOOL,
-            upstream_name: "run_audit",
-            transport_identity: replacement_identity.clone(),
-            declares_transport_access: true,
-            extra_access: true,
+            declares_access: true,
             mid_execution_access: false,
             ran: Arc::clone(&replacement_ran),
         });
@@ -2677,182 +2541,57 @@ mod tests {
             SELECTED_MCP_TOOL.to_string(),
             gate,
             Arc::clone(&approved),
-            Some(InheritedToolContext::new(vec![McpToolGrant::new(
-                SELECTED_MCP_TOOL,
-                granted_identity,
-            )])),
+            None,
             Some(hook),
         )
         .await;
         replacement_task.await.expect("replacement task");
 
-        assert_eq!(
-            registry
-                .mcp_metadata(SELECTED_MCP_TOOL)
-                .expect("replacement remains registered")
-                .transport_identity,
-            replacement_identity,
-            "the registry replacement must complete before the pinned call resumes"
-        );
         assert!(executed.output.is_ok(), "{:?}", executed.output.err());
-        assert_eq!(executed.approval, None);
+        assert_eq!(executed.approval, Some(ApprovalDecision::Approve));
         assert!(
             original_ran.load(Ordering::SeqCst),
-            "the generation whose identity and accesses were authorized must execute"
+            "the generation whose accesses were authorized must execute"
         );
         assert!(
             !replacement_ran.load(Ordering::SeqCst),
-            "a same-name replacement must not execute under the prior generation's grant"
+            "a same-name replacement must not execute under the prior generation's approval"
         );
-        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
         assert!(approved.lock().is_empty());
     }
 
     #[tokio::test]
-    async fn inherited_context_denies_another_tool_on_the_same_mcp_transport() {
-        let identity = McpTransportIdentity::from_sha256([11; 32]);
-        let ran = Arc::new(AtomicBool::new(false));
-        let (gate_calls, gate) = counting_gate();
-        let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
-                namespaced_name: SIBLING_MCP_TOOL,
-                upstream_name: "get_report",
-                transport_identity: identity.clone(),
-                declares_transport_access: true,
-                extra_access: false,
-                mid_execution_access: false,
-                ran: Arc::clone(&ran),
-            }),
-            gate,
-            Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext::new(vec![McpToolGrant::new(
-                SELECTED_MCP_TOOL,
-                identity,
-            )])),
-        )
-        .await;
-
-        let error = executed
-            .output
-            .expect_err("a sibling operation must not inherit the grant");
-        assert!(
-            error
-                .to_string()
-                .contains("exact MCP tool and transport configuration"),
-            "{error}"
-        );
-        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
-        assert!(!ran.load(Ordering::SeqCst));
-        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn inherited_context_denies_the_granted_tool_after_its_transport_identity_changes() {
-        let granted_identity = McpTransportIdentity::from_sha256([12; 32]);
-        let current_identity = McpTransportIdentity::from_sha256([13; 32]);
-        let ran = Arc::new(AtomicBool::new(false));
-        let (gate_calls, gate) = counting_gate();
-        let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
-                namespaced_name: SELECTED_MCP_TOOL,
-                upstream_name: "run_audit",
-                transport_identity: current_identity,
-                declares_transport_access: true,
-                extra_access: false,
-                mid_execution_access: false,
-                ran: Arc::clone(&ran),
-            }),
-            gate,
-            Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext::new(vec![McpToolGrant::new(
-                SELECTED_MCP_TOOL,
-                granted_identity,
-            )])),
-        )
-        .await;
-
-        let error = executed
-            .output
-            .expect_err("a changed transport identity must invalidate the grant");
-        assert!(
-            error
-                .to_string()
-                .contains("exact MCP tool and transport configuration"),
-            "{error}"
-        );
-        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
-        assert!(!ran.load(Ordering::SeqCst));
-        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn exact_mcp_tool_grant_does_not_cover_non_transport_access() {
-        let identity = McpTransportIdentity::from_sha256([14; 32]);
-        let ran = Arc::new(AtomicBool::new(false));
-        let (gate_calls, gate) = counting_gate();
-        let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
-                namespaced_name: SELECTED_MCP_TOOL,
-                upstream_name: "run_audit",
-                transport_identity: identity.clone(),
-                declares_transport_access: true,
-                extra_access: true,
-                mid_execution_access: false,
-                ran: Arc::clone(&ran),
-            }),
-            gate,
-            Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext::new(vec![McpToolGrant::new(
-                SELECTED_MCP_TOOL,
-                identity,
-            )])),
-        )
-        .await;
-
-        let error = executed.output.expect_err("extra access must fail");
-        assert!(error.to_string().contains("covers only"), "{error}");
-        assert!(!ran.load(Ordering::SeqCst));
-        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn inherited_context_denies_unapproved_non_mcp_access_without_prompting() {
+    async fn inherited_context_denies_uncovered_access_without_prompting() {
         let (gate_calls, gate) = counting_gate();
         let executed = execute_authorization_tool(
             Arc::new(GatedTool),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext::default()),
+            Some(InheritedToolContext),
         )
         .await;
 
-        let error = executed.output.expect_err("non-MCP access must fail");
-        assert!(error.to_string().contains("non-MCP tool"), "{error}");
+        let error = executed.output.expect_err("uncovered access must fail");
+        assert!(error.to_string().contains("runs unattended"), "{error}");
         assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn inherited_context_auto_denies_access_discovered_during_mcp_execution() {
-        let identity = McpTransportIdentity::from_sha256([15; 32]);
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
         let approved = Arc::new(Mutex::new(Vec::new()));
         let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
+            Arc::new(McpShapedTool {
                 namespaced_name: SELECTED_MCP_TOOL,
-                upstream_name: "run_audit",
-                transport_identity: identity.clone(),
-                declares_transport_access: true,
-                extra_access: false,
+                declares_access: false,
                 mid_execution_access: true,
                 ran: Arc::clone(&ran),
             }),
             gate,
             Arc::clone(&approved),
-            Some(InheritedToolContext::new(vec![McpToolGrant::new(
-                SELECTED_MCP_TOOL,
-                identity,
-            )])),
+            Some(InheritedToolContext),
         )
         .await;
 
@@ -2871,12 +2610,9 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
         let executed = execute_authorization_tool(
-            Arc::new(TypedMcpTool {
+            Arc::new(McpShapedTool {
                 namespaced_name: SELECTED_MCP_TOOL,
-                upstream_name: "run_audit",
-                transport_identity: McpTransportIdentity::from_sha256([16; 32]),
-                declares_transport_access: true,
-                extra_access: false,
+                declares_access: true,
                 mid_execution_access: false,
                 ran: Arc::clone(&ran),
             }),

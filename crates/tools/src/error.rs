@@ -34,8 +34,9 @@ pub enum ToolError {
     )]
     SubagentFanoutExceeded { current_count: u32, cap: u32 },
 
-    /// The user denied the approval request for this call.
-    #[error("tool '{tool}' denied by user: {reason}")]
+    /// The approval request for this call was refused — by a human answer,
+    /// a gate timeout, or a no-prompt-surface policy; `reason` says which.
+    #[error("tool '{tool}' permission denied: {reason}")]
     Denied { tool: String, reason: String },
 
     #[error("mcp error: {0}")]

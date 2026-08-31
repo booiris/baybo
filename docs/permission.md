@@ -27,8 +27,7 @@ validation and approval rules.
 MCP tools are outside it in both directions: they never consult `permission`,
 and as of the lazy-loading change they raise no approval prompt at all — see
 [`todo/mcp-tool-approval.md`](todo/mcp-tool-approval.md) for why, and for what
-still gates them (trust, channel, trigger scope, and the exact grant an
-unattended cron lineage needs).
+still gates them (trust, channel, and trigger scope).
 
 ## Execution Model
 

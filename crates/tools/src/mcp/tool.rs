@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use baybo_model::McpTransportIdentity;
 use baybo_store::BlobStore;
 use rmcp::RoleClient;
 use rmcp::model::{CallToolRequestParams, Tool as RmcpTool};
@@ -12,16 +11,6 @@ use serde_json::Value;
 use crate::approval::ResourceAccess;
 use crate::mcp::content_adapter::adapt_call_result;
 use crate::{Tool, ToolContext, ToolError, ToolOutput, ToolTriggerScope};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpToolMetadata {
-    /// Full namespaced registry name used by the LLM and authorization grant.
-    pub tool_name: String,
-    pub server_name: String,
-    pub upstream_name: String,
-    pub transport_identity: McpTransportIdentity,
-    pub transport_accesses: Vec<ResourceAccess>,
-}
 
 /// Wrapper that exposes one rmcp-discovered tool to Baybo's agent loop.
 ///
@@ -43,7 +32,6 @@ pub struct McpTool {
     description: String,
     parameters_schema: Value,
     default_resource_access: Vec<ResourceAccess>,
-    transport_identity: McpTransportIdentity,
     trigger_scope: ToolTriggerScope,
     peer: Peer<RoleClient>,
     blob_store: Option<Arc<dyn BlobStore>>,
@@ -54,7 +42,6 @@ impl McpTool {
         server_name: String,
         descriptor: RmcpTool,
         default_resource_access: Vec<ResourceAccess>,
-        transport_identity: McpTransportIdentity,
         trigger_scope: ToolTriggerScope,
         peer: Peer<RoleClient>,
         blob_store: Option<Arc<dyn BlobStore>>,
@@ -73,19 +60,10 @@ impl McpTool {
             description,
             parameters_schema,
             default_resource_access,
-            transport_identity,
             trigger_scope,
             peer,
             blob_store,
         }
-    }
-
-    pub fn server(&self) -> &str {
-        &self.server_name
-    }
-
-    pub fn upstream_name(&self) -> &str {
-        &self.tool_name
     }
 }
 
@@ -105,16 +83,6 @@ impl Tool for McpTool {
 
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         self.default_resource_access.clone()
-    }
-
-    fn mcp_metadata(&self) -> Option<McpToolMetadata> {
-        Some(McpToolMetadata {
-            tool_name: self.namespaced_name.clone(),
-            server_name: self.server_name.clone(),
-            upstream_name: self.tool_name.clone(),
-            transport_identity: self.transport_identity.clone(),
-            transport_accesses: self.default_resource_access.clone(),
-        })
     }
 
     fn trigger_scope(&self) -> ToolTriggerScope {

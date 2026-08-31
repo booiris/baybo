@@ -35,7 +35,7 @@ registered at runtime — not just `baybo-tools::builtin`.
 | `SecretAdd`, `SecretList`, `SecretCheck`                                                                                                                                                                                                                              | implemented | value-blind user-secret management (`builtin/secret.rs`); no delete tool — deletion is CLI-only. See [Secret access](#secret-access) |
 | `JobList`, `JobStop`                                                                                                                                                                                                                                                  | implemented | view and kill the conversation's in-flight background jobs (detached subagents and `Bash` commands) via `BackgroundJobControl`; they ignore `background_eligible` (observing is not creating) and report nothing in flight where no manager is wired |
 | `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
-| `CronCreate`, `CronUpdate`, `CronDelete`, `CronPause`, `CronResume`, `CronList`                                                                                                                                                                                                     | implemented | live in `baybo-cron::tools` (not `baybo-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `crates/baybo/src/runtime.rs` after the scheduler is constructed. Create/update accept `permissions.mcp_tools` and use a narrow live-registry resolver to persist exact transport-bound grants; update omission preserves them and an empty list revokes them. `CronUpdate` edits a job in place and is the tool to reach for whenever a job changes — it keeps the job's id, and with it its past runs and the conversations they opened, which delete + create throws away. `CronPause`/`CronResume` take a job out of the firing schedule and back in (resume recomputes the next fire from now); `CronDelete` moves it to the recycle bin, where only the human surfaces (web page, admin API) can see or restore it — `CronList` returns live jobs only. See [`cron.md`](cron.md) |
+| `CronCreate`, `CronUpdate`, `CronDelete`, `CronPause`, `CronResume`, `CronList`                                                                                                                                                                                                     | implemented | live in `baybo-cron::tools` (not `baybo-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `crates/baybo/src/runtime.rs` after the scheduler is constructed. `CronUpdate` edits a job in place and is the tool to reach for whenever a job changes — it keeps the job's id, and with it its past runs and the conversations they opened, which delete + create throws away. `CronPause`/`CronResume` take a job out of the firing schedule and back in (resume recomputes the next fire from now); `CronDelete` moves it to the recycle bin, where only the human surfaces (web page, admin API) can see or restore it — `CronList` returns live jobs only. See [`cron.md`](cron.md) |
 | `Skill`                                                                                                                                                                                                                                                               | implemented | lives in `baybo-skills::tools` (parallel to `baybo-cron::tools`) because it holds `Arc<SkillRegistry>` + `Arc<dyn SkillRiskCheck>`; registered from `crates/baybo/src/runtime.rs` after the assessor is constructed. Mode 1 (no `file_path`) returns the SKILL.md body plus a categorized inventory of helper files (`references/`, `templates/`, `scripts/`, `other`). Mode 2 (`file_path` set) returns a sub-file's contents with path-traversal protections. Risk assessor and `required_env` approval gate fire on every call. |
 | `SkillInstall`                                                                                                                                                                                                                                                        | implemented | lives in `baybo-skills::tools` alongside `Skill`. Installs into the **caller's own resolved persona skill directory**, picked from `ctx.agent_id`; the built-in and unbound sessions use `personas/baybo/skills/`, while new project agents resolve below `personas/project/`. Validates a source directory (must contain a parseable SKILL.md, must be outside that same directory, must not collide with an existing install there), runs the risk assessor (`Dangerous` aborts with `ToolError::Denied`), copies the tree via a staging-and-rename for atomicity, registers the destination, then triggers `SkillRegistry::reload()` so the new skill is available next turn. Declares `WriteFile` capability. |
 | `SkillUninstall`                                                                                                                                                                                                                                                      | implemented | symmetric counterpart to `SkillInstall`. Resolves the name through `get_scoped`, so one the session cannot see is a plain `NotFound` rather than a refusal that confirms it exists; then refuses if it has no on-disk source or its canonicalized `source_path` doesn't sit under the caller's **own** directory (so compiled-in builtins, another agent's folder, and registry-only or third-party-mounted skills aren't deletable). Removes the directory recursively, then triggers `SkillRegistry::reload()`. Same `WriteFile` capability. |
@@ -242,35 +242,19 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   vault persistence. Failed authorization → no `.mcp.json` mutation.
 - **Trust + capabilities** — the entry's `trust_level` becomes the
   `ToolManifest`'s ceiling; defaults are `[Http]` for HTTP and
-  `[Http, ExecCommand]` for stdio. The existing
+  `[Http, ExecCommand]` for stdio.  The existing
   `ToolExecutor::validate_trust` rule still fires (e.g. an `installed`
-  server may not declare `WriteFile` or `ExecCommand`). Each `McpTool`
-  reports a single `ResourceAccess::Http { host }` (HTTP) or
-  `ResourceAccess::ExecCommand { command }` (stdio) so the approval
-  gate can prompt per host or per command.
+  server may not declare `WriteFile` or `ExecCommand`). MCP tools carry no
+  approval-gated resource accesses (`resource_access_for` returns an empty
+  list for every server — the interim rule in
+  [`todo/mcp-tool-approval.md`](../todo/mcp-tool-approval.md)), so MCP calls
+  never prompt.
 
-- **Grant metadata and transport identity** — each `McpTool` exposes typed
-  `McpToolMetadata` through the `Tool`/`ToolRegistry` seam: the exact namespaced
-  tool name, configured server and upstream names, transport identity, and the
-  transport accesses the approval gate sees. Consumers never recover this by
-  splitting `<server>/<tool>`. The identity is a separate versioned SHA-256 over
-  canonical non-secret config (transport; ordered stdio args or normalized URL;
-  trust; sorted capabilities; trigger scope; public OAuth config; env names).
-  Secret/env values are excluded. It is deliberately distinct from the
-  reconciler's process-lifecycle hash, which may include secret values.
-- **Cron grants** — a cron fire's unattended authority lineage may bypass an MCP
-  transport prompt only when its snapshotted exact tool name and transport
-  identity match this live metadata. The fire packages the grants into a generic
-  `InheritedToolContext`; `ToolContext::inherited_context` lets
-  `spawn_subagent` carry it unchanged through all in-process descendants.
-  `Some(default())` retains the fail-closed policy, while a later independently
-  resumed child receives `None`. The bypass does not cover sibling operations or
-  additional resources and is never installed as a session approval.
-  `ToolRegistry` also
-  exposes a narrow `McpToolGrantResolver` backed only by its shared dynamic
-  state. `CronCreate` / `CronUpdate` hold that resolver, so agent-supplied
-  operation names are resolved from one live snapshot without retaining the
-  whole registry or creating an `Arc` cycle. See [`cron.md`](cron.md).
+- **Unattended lineages** — a cron/subagent lineage carries the field-less
+  `InheritedToolContext` marker; any approval-gated resource access is denied
+  there without a prompt (nobody can answer one). Since MCP tools declare no
+  such accesses, they run in cron/subagent sessions exactly as in chat. See
+  [`cron.md`](cron.md).
 
 ### Embedded MCP servers
 
@@ -403,7 +387,7 @@ Tools decide what `ResourceAccess` to declare from their parameters; the matchin
 2. **Literal IP that the SSRF floor would reject** (RFC1918, loopback, link-local, CGNAT, IPv6 ULA, link-local v6, unspecified, IPv4-mapped-v6) → `[]` → no approval. `validate_url_with` fails the call at parse time so the prompt would just stack a click in front of an error. WHATWG-canonicalised forms (`http://2130706433/`, `http://0x7f000001/`, `http://0177.0.0.1/`, `http://127.1/`) reach this branch via `url::Url::host_str` returning the dotted form.
 3. **Literal *public* IP** (`http://1.2.3.4/`, `http://[2001:db8::1]/`) → `ResourceAccess::Http { host }` → approval prompt. RFC range checks can't tell a routable IP that belongs to internal infrastructure from a real public service, so this is the only shape where human-in-the-loop adds something `is_blocked_ip` can't.
 
-This is a deliberate departure from "concrete HTTP hosts are gated by approval" — `WebFetch` is the only HTTP-emitting builtin where the per-call resolver guarantee makes the prompt redundant. MCP HTTP transports still declare `ResourceAccess::Http { host }` and go through approval normally, because their target hosts are operator-configured at install time and the LLM doesn't pick them.
+This is a deliberate departure from "concrete HTTP hosts are gated by approval" — `WebFetch` is the only HTTP-emitting builtin where the per-call resolver guarantee makes the prompt redundant. MCP tools sidestep the question entirely — they declare no approval-gated accesses at all (see the MCP client section above).
 
 Cross-host redirects are still rejected inside the redirect policy (with a "re-issue WebFetch on the new URL" error) so a host change is always visible in the call trace, not silently followed inside `reqwest`. Per-hop SSRF re-validation runs on every redirect target regardless.
 

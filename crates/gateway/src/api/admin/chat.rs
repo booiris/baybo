@@ -50,7 +50,8 @@ use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent}
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
     ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, Role, Session, SessionId,
-    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
+    TOOL_DENIED_INFIX, TOOL_DENIED_PREFIX, TOOL_RESULT_ERROR_PREFIX, ThinkingContent,
+    TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -3967,13 +3968,16 @@ fn summarize_tool_result(content: &str) -> String {
 /// Best-effort `ok` / `error` / `denied` status for a persisted tool
 /// result. The structured outcome isn't stored, so this keys off the
 /// agent's own result-formatting prefixes (`runtime::agent_loop` writes
-/// `Error: …` for failures and a fixed `The user explicitly denied
-/// permission …` message for denied calls) — enough for reload to
-/// color-code failures the way the live view did.
+/// `Error: …` for failures and the [`TOOL_DENIED_PREFIX`] frame for denied
+/// calls; rows persisted before that frame carry `The user explicitly
+/// denied permission …`) — enough for reload to color-code failures the
+/// way the live view did.
 fn tool_result_status(content: &str) -> String {
     let inner = strip_tool_output_envelope(content);
     let inner = inner.trim_start();
-    if inner.starts_with("The user explicitly denied permission") {
+    if (inner.starts_with(TOOL_DENIED_PREFIX) && inner.contains(TOOL_DENIED_INFIX))
+        || inner.starts_with("The user explicitly denied permission")
+    {
         "denied".to_owned()
     } else if inner.starts_with(TOOL_RESULT_ERROR_PREFIX) {
         "error".to_owned()
@@ -5252,6 +5256,17 @@ mod tests {
         assert_eq!(
             tool_result_status("The user explicitly denied permission for tool 'x'."),
             "denied"
+        );
+        assert_eq!(
+            tool_result_status(
+                "Permission for tool 'x' was denied: a human saw this prompt and said no."
+            ),
+            "denied"
+        );
+        assert_eq!(
+            tool_result_status("Permission for tool 'x' granted"),
+            "ok",
+            "only the full denied frame may read as a denial"
         );
         assert_eq!(tool_result_status("all good"), "ok");
     }

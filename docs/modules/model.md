@@ -16,8 +16,7 @@ Contents:
 - **Governance types**: `TrustLevel`, `ArtifactSource`
 - **Security types**: `PlaceholderId`, `SecretKind`
 - **Cost & money types**: `CostRecord`, `CostSummary`, `CallReason`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
-- **MCP authorization types**: `McpTransportIdentity` (validated versioned SHA-256 string) and `McpToolGrant` (exact namespaced tool + transport identity); cron jobs and executions persist these without depending on the tools runtime
-- **Inherited tool context**: `InheritedToolContext`, generic transient authority that follows an in-process execution lineage without becoming persistent session state
+- **Inherited tool context**: `InheritedToolContext`, a field-less marker that an in-process execution lineage is unattended (no operator to answer approval prompts); it follows spawned children without becoming persistent session state
 - **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
 - **Approval types**: `ApprovalDecision`, `ApprovedResource`, `HostPattern`, `ResourceAccess`
 - **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentParentContext`, `SubagentResult`, `SubagentExitStatus`, `PendingBackgroundResult`, `BackgroundJobKind`, `OnTimeout`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers (`SUBAGENT_CHANNEL_TAG`, `BACKGROUND_SUBAGENT_HANDLE_PREFIX`, `BACKGROUND_DISPATCH_ACK_PREFIX`, `new_background_handle`)

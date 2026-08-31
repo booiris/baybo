@@ -46,10 +46,10 @@ When a Baybo child is spawned from an execution carrying an
 unchanged and the actor-backed spawner installs it on the child's `Spawned`
 turn. Descendants repeat the same propagation, without knowing whether cron or
 another dispatcher created the context. This is execution context, not session
-identity: it is not stored on the child row, an independently resumed child does
-not recover it, and `Some(default())` deliberately keeps the child fail-closed.
-External backends do not consume it because they do not run through Baybo's MCP
-registry or `ToolExecutor`.
+identity: it is not stored on the child row, and an independently resumed child
+does not recover it. Its presence keeps the child unattended — approval-gated
+accesses are denied rather than prompted. External backends do not consume it
+because they do not run through Baybo's `ToolExecutor`.
 
 The tool is registered by the runtime wiring code (`crates/baybo/src/runtime.rs`), **not** by `baybo_tools::builtin::default_tools`, because it needs the runtime-owned spawner slot and the live `SubagentRegistry` for its per-turn description. Its manifest carries `TrustLevel::Trusted` and an empty capability set.
 

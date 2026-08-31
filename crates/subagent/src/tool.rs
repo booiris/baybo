@@ -906,12 +906,8 @@ mod tests {
             final_content: Some(vec![baybo_model::ContentBlock::Text("done".into())]),
             status: SubagentExitStatus::Completed,
         });
-        let grant = baybo_model::McpToolGrant::new(
-            "browser/navigate_page",
-            baybo_model::McpTransportIdentity::from_sha256([37; 32]),
-        );
         let context = ToolContext {
-            inherited_context: Some(baybo_model::InheritedToolContext::new(vec![grant.clone()])),
+            inherited_context: Some(baybo_model::InheritedToolContext),
             ..ctx()
         };
 
@@ -929,12 +925,9 @@ mod tests {
             .expect("spawn succeeds");
 
         let (_, parent) = captured.lock().take().expect("spawner saw a request");
-        assert_eq!(
-            parent
-                .inherited_context
-                .as_ref()
-                .map(baybo_model::InheritedToolContext::mcp_tool_grants),
-            Some(std::slice::from_ref(&grant))
+        assert!(
+            parent.inherited_context.is_some(),
+            "the unattended marker must reach the child spawner"
         );
     }
 

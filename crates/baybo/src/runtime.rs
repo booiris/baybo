@@ -530,15 +530,10 @@ pub async fn build_managers(
     // `wire_router`, once the supervisor + actor spawner exist.
     let subagent_spawner_slot: baybo_subagent::tool::SubagentSpawnerSlot =
         Arc::new(std::sync::OnceLock::new());
-    let mcp_tool_grants = tool_registry.mcp_tool_grant_resolver();
     // Cron* mutators register deferred, `report_nothing` eager — the
     // split, the source label, and the rationale live with the batch in
     // `baybo-cron`, not here.
-    baybo_cron::tools::install_agent_tools(
-        &mut tool_registry,
-        Arc::clone(&cron_scheduler),
-        mcp_tool_grants,
-    );
+    baybo_cron::tools::install_agent_tools(&mut tool_registry, Arc::clone(&cron_scheduler));
 
     // The dream pass is a cron job like any other, so it is seeded through
     // the same scheduler the model's own jobs go through. It belongs to the

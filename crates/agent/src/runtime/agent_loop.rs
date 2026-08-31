@@ -9,7 +9,7 @@ use baybo_llm::{
 use baybo_memory::{Memory, MemoryContext, MemoryScope};
 use baybo_model::{
     ChatMessage, ContentBlock, InheritedToolContext, LlmEntryName, MessageSource,
-    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TurnId,
+    TOOL_DENIED_INFIX, TOOL_DENIED_PREFIX, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TurnId,
 };
 use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
@@ -1702,11 +1702,11 @@ impl AgentLoop {
                 }
                 Ok(ToolOutput::Error(msg)) => format!("{TOOL_RESULT_ERROR_PREFIX} {msg}"),
                 Err(e) => {
-                    if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()
-                        && matches!(denied, baybo_tools::ToolError::Denied { .. })
+                    if let Some(baybo_tools::ToolError::Denied { reason, .. }) =
+                        e.downcast_ref::<baybo_tools::ToolError>()
                     {
                         format!(
-                            "The user explicitly denied permission for tool '{}'. \
+                            "{TOOL_DENIED_PREFIX}{}{TOOL_DENIED_INFIX}{reason}. \
                              Do NOT retry this tool call. Either use an alternative \
                              approach or inform the user that the operation was skipped.",
                             dispatch.name

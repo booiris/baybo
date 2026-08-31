@@ -310,6 +310,16 @@ pub const TOOL_OUTPUT_CLOSE_PREFIX: &str = "</tool_output";
 /// Shared so a fourth producer cannot invent a spelling the reader misses.
 pub const TOOL_RESULT_ERROR_PREFIX: &str = "Error:";
 
+/// Frame of a denied tool result: `{PREFIX}<tool name>{INFIX}<reason>. …`.
+/// Like [`TOOL_RESULT_ERROR_PREFIX`], the literal is the durable signal the
+/// transcript reader keys off on reload — the writer (`baybo-agent`'s loop)
+/// and the sniffer must share one spelling. Rows persisted before this frame
+/// carry `The user explicitly denied permission …`; that historical literal
+/// lives only in the reader.
+pub const TOOL_DENIED_PREFIX: &str = "Permission for tool '";
+/// See [`TOOL_DENIED_PREFIX`].
+pub const TOOL_DENIED_INFIX: &str = "' was denied: ";
+
 /// A single thinking/reasoning content item from the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

@@ -103,56 +103,19 @@ previous-fire cursor rides `CronExecution::previous_fire_at` rather than the
 job row: the row is advanced before the trigger is dispatched, so it already
 holds *this* fire's stamp by the time anything downstream reads it.
 
-## Exact MCP authority for unattended fires
+## Fires run unattended
 
-A cron job may carry `mcp_tool_grants`, a sorted/deduplicated list of exact
-`{ tool_name, transport_identity }` pairs. Legacy rows deserialize to an empty
-list. Each `CronExecution` snapshots the list when the fire is recorded, so
-recovery uses the policy that existed at fire time rather than a later job edit.
-The source job's schedule/lifecycle columns, monotonic `updated_at` version, and
-exact grant list are checked in the same write transaction that inserts the
-execution (the direct grant comparison also closes equal-clock-timestamp cases):
-if revocation commits before the execution row exists, the stale snapshot is
-refused and a later tick retries from the current job; once the
-execution exists, its fire-time policy is immutable. The transport identity is a versioned SHA-256 digest of canonical non-secret MCP
-configuration: transport type; stdio command and ordered arguments or normalized
-HTTP URL; trust; sorted capabilities; trigger scope; public OAuth settings; and
-environment variable names. Credential values are excluded, so rotation does not
-revoke authority. A renamed tool or changed command, arguments, URL, trust,
-capabilities, scope, OAuth settings, or env-name set fails closed.
-
-The snapshot reaches `ToolExecutor` through the initial `CronTrigger` turn and
-is inherited by the initial turn of every in-process Baybo subagent spawned
-inside that authority lineage. The handoff is explicit through `ToolContext` and
-`SubagentParentContext`, never reconstructed from the persistent Cron trigger.
-It is never copied into `SessionState::approved_resources`, and a user reply in
-a recurring fire's conversation or an independently resumed child gets ordinary
-interactive approval behavior. Every typed MCP call on an inherited unattended
-turn requires an exact grant, including an embedded transport that declares zero
-resource accesses. An exact match bypasses only that MCP tool's declared
-transport access. A different
-operation on the same server, a different Node MCP server, and every non-MCP
-resource remain uncovered. Because the initial fire is unattended, any uncovered
-access is denied immediately with a settings-oriented diagnostic instead of
-opening the five-minute approval prompt.
-
-`CronCreate` and `CronUpdate` expose `permissions.mcp_tools` to the agent. The
-agent names the exact current MCP operations its future task needs; a narrow
-resolver backed by the registry's shared dynamic snapshot converts those names
-to transport-bound grants before the scheduler writes anything. The model never
-supplies a transport identity. Create omission means no grants; update omission
-preserves the list and `[]` revokes it. An unknown, disconnected, or
-out-of-scope operation rejects the entire call rather than silently dropping or
-rebinding authority. `CronList` and both mutation results return the granted
-operation names so a later edit can preserve or replace them deliberately.
-
-The authenticated admin HTTP API does not expose or mutate this authority:
-admin-created jobs start without grants, admin PATCH preserves any grants the
-job already has, and HTTP responses omit them. MCP permissions are managed only
-through conversational `CronCreate` and `CronUpdate` calls.
-
-iOS support is tracked separately on board issue #6; the transient phone approval
-card does not gain `ApproveAlways`.
+A fire's turn — and every in-process descendant it spawns — runs unattended,
+carried by the field-less `InheritedToolContext` marker (see
+[`agent.md`](agent.md)'s approval-gate wiring for the mechanism). Any tool call
+with an approval-gated access not already covered by session approvals is
+denied immediately instead of parking on a prompt nobody can answer. MCP tools
+declare no approval-gated accesses (the interim rule in
+[`todo/mcp-tool-approval.md`](../todo/mcp-tool-approval.md)), so they are
+usable in fires exactly as in chat. Nothing about a fire ever seeds
+`SessionState::approved_resources`; a user reply in a recurring fire's
+conversation or an independently resumed child gets ordinary interactive
+approval behavior.
 
 ## Design Decisions
 
@@ -304,7 +267,7 @@ A fire is delivered to the model as a *user* turn, so a bare prompt is ambiguous
 
 ### LLM-invocable cron tools live in baybo-cron
 
-`tools::agent_tools` returns `CronCreateTool`, `CronUpdateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`; create/update also hold the narrow `McpToolGrantResolver`), plus `CronReportNothingTool` (holds no scheduler — its only effect is to flip the fire's `NotifySilence` handle, and it is visible only inside a recurring fire; see [A recurring fire can stay silent](#a-recurring-fire-can-stay-silent)). They live in `baybo-cron::tools` — the same pattern as `baybo-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `baybo-store` ports crate: the old `baybo-storage → baybo-cron` edge is gone, so `baybo-cron` taking a dependency on `baybo-tools` (for the `Tool` trait) no longer closes the cycle `baybo-cron → baybo-tools → baybo-storage → baybo-cron`. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+`tools::agent_tools` returns `CronCreateTool`, `CronUpdateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`), plus `CronReportNothingTool` (holds no scheduler — its only effect is to flip the fire's `NotifySilence` handle, and it is visible only inside a recurring fire; see [A recurring fire can stay silent](#a-recurring-fire-can-stay-silent)). They live in `baybo-cron::tools` — the same pattern as `baybo-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `baybo-store` ports crate: the old `baybo-storage → baybo-cron` edge is gone, so `baybo-cron` taking a dependency on `baybo-tools` (for the `Tool` trait) no longer closes the cycle `baybo-cron → baybo-tools → baybo-storage → baybo-cron`. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
 
 The three single-job tools (`CronDelete` / `CronPause` / `CronResume`) share one `{ id }` parameter shape — one `JobIdParams`, one schema builder, one progress label — so the only thing that distinguishes them to the model is the description, and each description carries the distinction it has to get right: delete stops the job and leaves the list *but is recoverable from the recycle bin*, pause keeps the job listed and stops it *until resumed*, resume computes the next fire *from now* and cannot revive a one-shot whose moment has passed. Both of the descriptions a model reads when it is about to *replace* a job — delete's, and resume's refusal of a fired one-shot — point it at `CronUpdate` instead, because that is the moment it would otherwise reach for delete + create.
 
@@ -317,7 +280,7 @@ layer materializes both `schedule` and `at`, the unused side is `""`. Creation
 still requires exactly one non-empty side; update treats two empty sides as no
 schedule change.
 
-The bin itself is **not** part of the model's surface. `CronList` returns live jobs only, including each job's granted `mcp_tools`: a paused job appears with `status: disabled`, a deleted one does not appear at all, so the model can neither see nor act on a job the user has removed. Restore is a human affordance — the web cron page's Recycle Bin view and `POST /v1/cron/{id}/restore`.
+The bin itself is **not** part of the model's surface. `CronList` returns live jobs only: a paused job appears with `status: disabled`, a deleted one does not appear at all, so the model can neither see nor act on a job the user has removed. Restore is a human affordance — the web cron page's Recycle Bin view and `POST /v1/cron/{id}/restore`.
 
 ### Storage decoupling
 

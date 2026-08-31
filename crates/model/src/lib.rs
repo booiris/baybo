@@ -11,7 +11,6 @@ mod ids;
 mod inherited_tool_context;
 mod llm_entry_name;
 mod llm_pin;
-mod mcp;
 mod message;
 mod model_tier;
 mod money;
@@ -50,15 +49,11 @@ pub use ids::{
 pub use inherited_tool_context::InheritedToolContext;
 pub use llm_entry_name::LlmEntryName;
 pub use llm_pin::LlmPin;
-pub use mcp::{
-    InvalidMcpTransportIdentity, MCP_TRANSPORT_IDENTITY_V1_PREFIX, McpToolGrant,
-    McpTransportIdentity, normalize_mcp_tool_grants,
-};
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MediaBlock, MediaKind, MessageMetadata, MessageSource,
-    Role, SHA256_PREFIX, TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX,
-    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, ToolResultMeta, blob_content_digest,
-    prose_with_media,
+    Role, SHA256_PREFIX, TOOL_DENIED_INFIX, TOOL_DENIED_PREFIX, TOOL_OUTPUT_CLOSE_PREFIX,
+    TOOL_OUTPUT_OPEN_PREFIX, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, ToolResultMeta,
+    blob_content_digest, prose_with_media,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};

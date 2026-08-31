@@ -16,7 +16,7 @@ use crate::mcp::McpError;
 use crate::mcp::config::{McpFile, McpServerEntry, McpTransportConfig};
 use crate::mcp::embedded::EmbeddedMcpServer;
 use crate::mcp::runtime::McpRuntime;
-use crate::mcp::transport::{McpServerSession, connect_with_extra_env, load_env_names};
+use crate::mcp::transport::{McpServerSession, connect_with_extra_env};
 use crate::{Tool, ToolRegistry};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -427,13 +427,6 @@ impl McpReconciler {
                 })??
         };
         let resources = resource_access_for(entry, is_embedded);
-        let mut env_names = if matches!(entry.transport, McpTransportConfig::Stdio { .. }) {
-            load_env_names(&self.vault, &entry.name).await?
-        } else {
-            Vec::new()
-        };
-        env_names.extend(extra_env.keys().cloned());
-        let transport_identity = entry.transport_identity(env_names)?;
         let trust_level: baybo_model::TrustLevel = entry.trust_level.into();
 
         for descriptor in session.tools().to_vec() {
@@ -441,7 +434,6 @@ impl McpReconciler {
                 entry.name.clone(),
                 descriptor.clone(),
                 resources.clone(),
-                transport_identity.clone(),
                 entry.trigger_scope,
                 session.peer(),
                 self.blob_store.clone(),
@@ -560,12 +552,9 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
 /// node-launched server in the session), and did not follow the operator's
 /// `permission` policy, which reaches only Bash and the OS sandbox.
 ///
-/// What this does NOT relax: unattended executions. A cron lineage still
-/// needs an exact `McpToolGrant` (operation + transport identity) —
-/// `ToolExecutor::execute` derives that from `mcp_metadata`, independently
-/// of this list, and denies without one. Pinned by
-/// `inherited_context_denies_ungranted_zero_access_typed_mcp` in
-/// `crates/agent/src/runtime/tool_executor.rs`.
+/// Unattended lineages (`InheritedToolContext`) still deny any approval-gated
+/// resource access — they cannot prompt — but since this list is empty, MCP
+/// calls raise none and execute in cron/subagent sessions like any other.
 fn resource_access_for(_entry: &McpServerEntry, _is_embedded: bool) -> Vec<ResourceAccess> {
     Vec::new()
 }
@@ -721,10 +710,8 @@ mod tests {
     /// agent loop's pre-execute approval gate.
     /// Interim rule (`docs/todo/mcp-tool-approval.md`): NO MCP server's
     /// tools carry approval-gated accesses — user or embedded, whatever the
-    /// transport, whatever the declared capabilities. The unattended path is
-    /// unaffected: it derives its requirement from `mcp_metadata`, not from
-    /// this list (see
-    /// `tool_executor::tests::inherited_context_denies_ungranted_zero_access_typed_mcp`).
+    /// transport, whatever the declared capabilities — so MCP calls never
+    /// prompt and never trip the unattended resource-access deny.
     #[test]
     fn no_mcp_server_carries_approval_gated_accesses() {
         use crate::ToolCapability;

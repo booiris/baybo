@@ -20,90 +20,9 @@ struct DynamicState {
     /// Names whose schemas are withheld from the LLM tool block
     /// (`tool_definitions_for_session`), discovered via `ToolSearch` and
     /// called via `ToolInvoke`. Registration state, not governance: a
-    /// deferred tool resolves, grants and executes exactly like an eager
-    /// one — the executor's doors never consult this set.
+    /// deferred tool resolves and executes exactly like an eager one —
+    /// the executor's doors never consult this set.
     deferred: std::collections::HashSet<String>,
-}
-
-/// Narrow, cloneable view used by authoring surfaces that turn current MCP
-/// operation names into exact, persisted grants. It shares only the dynamic
-/// registry state; holding it from a builtin tool does not create an `Arc`
-/// cycle back to the whole [`ToolRegistry`].
-#[derive(Clone)]
-struct RegistryMcpToolGrantResolver {
-    dynamic: Arc<RwLock<DynamicState>>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum McpToolGrantResolveError {
-    #[error("MCP tool {tool_name:?} is not currently connected")]
-    NotConnected { tool_name: String },
-    #[error("tool {tool_name:?} is not a typed MCP operation")]
-    NotMcp { tool_name: String },
-    #[error("MCP tool {tool_name:?} is not available to this scheduled job")]
-    OutOfScope { tool_name: String },
-    #[error("MCP tool {tool_name:?} cannot be granted: {reason}")]
-    NotAutoExecutable { tool_name: String, reason: String },
-}
-
-/// Resolves model-visible MCP operation names to exact transport-bound grants.
-/// Implementations must resolve one stable registry snapshot so a reconnect
-/// cannot pair an old operation with a new transport identity.
-pub trait McpToolGrantResolver: Send + Sync {
-    fn resolve_for_session(
-        &self,
-        tool_names: &[String],
-        channel: &baybo_model::ChannelType,
-        trigger: &baybo_model::TriggerSource,
-    ) -> Result<Vec<baybo_model::McpToolGrant>, McpToolGrantResolveError>;
-}
-
-impl McpToolGrantResolver for RegistryMcpToolGrantResolver {
-    fn resolve_for_session(
-        &self,
-        tool_names: &[String],
-        channel: &baybo_model::ChannelType,
-        trigger: &baybo_model::TriggerSource,
-    ) -> Result<Vec<baybo_model::McpToolGrant>, McpToolGrantResolveError> {
-        let dynamic = self.dynamic.read();
-        let mut grants = Vec::with_capacity(tool_names.len());
-        for requested in tool_names {
-            let tool_name = requested.trim();
-            let tool = dynamic.tools.get(tool_name).ok_or_else(|| {
-                McpToolGrantResolveError::NotConnected {
-                    tool_name: tool_name.to_string(),
-                }
-            })?;
-            let metadata = tool
-                .mcp_metadata()
-                .ok_or_else(|| McpToolGrantResolveError::NotMcp {
-                    tool_name: tool_name.to_string(),
-                })?;
-            let manifest = dynamic.manifests.get(tool_name).ok_or_else(|| {
-                McpToolGrantResolveError::NotConnected {
-                    tool_name: tool_name.to_string(),
-                }
-            })?;
-            manifest.validate_auto_execution().map_err(|error| {
-                McpToolGrantResolveError::NotAutoExecutable {
-                    tool_name: tool_name.to_string(),
-                    reason: error.to_string(),
-                }
-            })?;
-            let channel_allowed = manifest.allows_channel(channel);
-            if !channel_allowed || !tool.trigger_scope().allows_trigger(trigger) {
-                return Err(McpToolGrantResolveError::OutOfScope {
-                    tool_name: tool_name.to_string(),
-                });
-            }
-            grants.push(baybo_model::McpToolGrant::new(
-                metadata.tool_name,
-                metadata.transport_identity,
-            ));
-        }
-        baybo_model::normalize_mcp_tool_grants(&mut grants);
-        Ok(grants)
-    }
 }
 
 impl Default for ToolRegistry {
@@ -153,15 +72,6 @@ impl ToolRegistry {
         self.builtin.insert(name, tool);
     }
 
-    /// A live MCP grant resolver for tools registered during startup. The
-    /// resolver follows later reconciler connects, disconnects and identity
-    /// changes through the shared dynamic-state lock.
-    pub fn mcp_tool_grant_resolver(&self) -> Arc<dyn McpToolGrantResolver> {
-        Arc::new(RegistryMcpToolGrantResolver {
-            dynamic: Arc::clone(&self.dynamic),
-        })
-    }
-
     /// Whether `name` is registered with its schema withheld from the LLM
     /// tool block. The agent loop's `ToolInvoke` unwrap consults this so an
     /// un-namespaced deferred registration (the cron/deck builtins) is a
@@ -183,9 +93,9 @@ impl ToolRegistry {
     }
 
     /// A live, narrow view over the deferred half of the dynamic registry
-    /// for `ToolSearch`. Shares only the dynamic-state lock — the same
-    /// no-`Arc`-cycle shape as [`Self::mcp_tool_grant_resolver`] — and
-    /// follows reconciler connects/disconnects live.
+    /// for `ToolSearch`. Shares only the dynamic-state lock (no `Arc` cycle
+    /// back to the whole registry) and follows reconciler
+    /// connects/disconnects live.
     pub fn deferred_tool_index(&self) -> DeferredToolIndex {
         DeferredToolIndex {
             dynamic: Arc::clone(&self.dynamic),
@@ -201,8 +111,8 @@ impl ToolRegistry {
     }
 
     /// [`Self::register_dynamic`], but with the tool's schema withheld from
-    /// the LLM tool block. The tool still resolves, grants and executes by
-    /// name; sessions reach it through `ToolSearch` + `ToolInvoke`.
+    /// the LLM tool block. The tool still resolves and executes by name;
+    /// sessions reach it through `ToolSearch` + `ToolInvoke`.
     pub fn register_dynamic_deferred(
         &self,
         source: &str,
@@ -462,12 +372,6 @@ impl ToolRegistry {
         self.get(name)
             .map(|tool| tool.concurrency())
             .unwrap_or(ToolConcurrency::Exclusive)
-    }
-
-    /// Typed MCP operation and transport provenance for authorization. The
-    /// registry asks the tool directly; callers never parse its display name.
-    pub fn mcp_metadata(&self, name: &str) -> Option<crate::mcp::McpToolMetadata> {
-        self.get(name).and_then(|tool| tool.mcp_metadata())
     }
 
     /// Execute a tool by name with the given parameters and context.
@@ -991,9 +895,9 @@ mod tests {
         );
     }
 
-    /// A deferred dynamic tool is registered — it resolves, grants and
-    /// executes — but its schema stays out of the session tool block until
-    /// a subagent allowlist names it explicitly.
+    /// A deferred dynamic tool is registered — it resolves and executes —
+    /// but its schema stays out of the session tool block until a subagent
+    /// allowlist names it explicitly.
     #[test]
     fn deferred_dynamic_tools_are_withheld_from_the_session_block() {
         use baybo_model::TriggerSource;
@@ -1063,7 +967,7 @@ mod tests {
             !advertised.contains(&"srv/deferred_op".to_string()),
             "a deferred tool's schema must stay out of the block"
         );
-        // ...while staying fully registered for execution and grants.
+        // ...while staying fully registered for execution.
         assert!(registry.get("srv/deferred_op").is_some());
         assert!(registry.get_manifest("srv/deferred_op").is_some());
 
@@ -1142,15 +1046,6 @@ mod tests {
             fn trigger_scope(&self) -> ToolTriggerScope {
                 ToolTriggerScope::SharedWorkspace
             }
-            fn mcp_metadata(&self) -> Option<crate::mcp::McpToolMetadata> {
-                Some(crate::mcp::McpToolMetadata {
-                    tool_name: self.name().to_string(),
-                    server_name: "browser".to_string(),
-                    upstream_name: "navigate_page".to_string(),
-                    transport_identity: baybo_model::McpTransportIdentity::from_sha256([7; 32]),
-                    transport_accesses: Vec::new(),
-                })
-            }
             async fn execute(
                 &self,
                 _p: serde_json::Value,
@@ -1209,69 +1104,6 @@ mod tests {
             }),
             "a card's run has its own checkout; the shared browser is not its to hold"
         );
-
-        let resolver = registry.mcp_tool_grant_resolver();
-        let cron = TriggerSource::Cron {
-            cron_job_id: "future".into(),
-            origin_session_id: None,
-            conversation: true,
-            job_title: None,
-            project_id: None,
-        };
-        let grants = resolver
-            .resolve_for_session(
-                &["browser/navigate_page".to_string()],
-                &baybo_model::ChannelType::owner(),
-                &cron,
-            )
-            .expect("live typed MCP resolves");
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].tool_name, "browser/navigate_page");
-
-        let issue = TriggerSource::Issue {
-            project_id: baybo_model::ProjectId::generate(),
-            issue_id: baybo_model::IssueId::generate(),
-            number: 2,
-        };
-        assert!(matches!(
-            resolver.resolve_for_session(
-                &["browser/navigate_page".to_string()],
-                &baybo_model::ChannelType::owner(),
-                &issue,
-            ),
-            Err(super::McpToolGrantResolveError::OutOfScope { .. })
-        ));
-
-        registry.unregister_for_source("browser");
-        assert!(matches!(
-            resolver.resolve_for_session(
-                &["browser/navigate_page".to_string()],
-                &baybo_model::ChannelType::owner(),
-                &cron,
-            ),
-            Err(super::McpToolGrantResolveError::NotConnected { .. })
-        ));
-
-        registry.register_dynamic(
-            "browser",
-            Arc::new(WatchedOnly),
-            crate::ToolManifest {
-                name: "browser/navigate_page".into(),
-                description: "x".into(),
-                trust_level: baybo_model::TrustLevel::Untrusted,
-                parameters_schema: serde_json::json!({"type": "object"}),
-                capabilities: vec![],
-                channels: Vec::new(),
-            },
-        );
-        assert!(matches!(
-            resolver.resolve_for_session(
-                &["browser/navigate_page".to_string()],
-                &baybo_model::ChannelType::owner(),
-                &cron,
-            ),
-            Err(super::McpToolGrantResolveError::NotAutoExecutable { .. })
-        ));
     }
 
     fn recording(name: &str) -> (Arc<dyn crate::Tool>, crate::ToolManifest) {

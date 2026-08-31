@@ -172,10 +172,10 @@ pub struct SubagentParentContext {
     /// the turn half. `false` makes a foreground spawn block until terminal
     /// and downgrades an explicit `background: true` to a blocking run.
     pub background_eligible: bool,
-    /// Transient tool authority inherited from the dispatching execution.
-    /// `Some(default())` is distinct from `None` and keeps delegated work in
-    /// the same fail-closed regime. The actor-backed Baybo spawner forwards it
-    /// unchanged; external backends have no access to Baybo's tool registry.
+    /// Unattended-lineage marker inherited from the dispatching execution.
+    /// Its presence keeps delegated work in the same no-approval-prompts
+    /// regime as the dispatcher. The actor-backed Baybo spawner forwards it
+    /// unchanged; external backends do not run through Baybo's `ToolExecutor`.
     pub inherited_context: Option<InheritedToolContext>,
 }
 

@@ -210,7 +210,6 @@ async fn update_cron(
         prompt,
         schedule: schedule.map(Into::into),
         timezone,
-        mcp_tool_grants: None,
     };
     let job = state
         .cron_scheduler

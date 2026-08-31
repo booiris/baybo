@@ -1,7 +1,7 @@
 //! Discovery pair for lazily-advertised (deferred) MCP tools.
 //!
 //! A deferred server's tools register and execute exactly like eager ones —
-//! same trust, channel, trigger-scope, grant and approval doors — but their
+//! same trust, channel, trigger-scope and approval doors — but their
 //! schemas are withheld from the LLM tool block (see
 //! [`crate::registry::ToolRegistry::register_dynamic_deferred`]). The model
 //! reaches them through this pair:

@@ -250,7 +250,6 @@ impl CronStore for InMemoryCronStore {
             stored.id == expected_job.id
                 && unmoved(stored, expected_job)
                 && stored.updated_at == expected_job.updated_at
-                && stored.mcp_tool_grants == expected_job.mcp_tool_grants
         });
         if !unchanged {
             return Ok(false);
