@@ -1,6 +1,36 @@
 import SwiftUI
 import UIKit
 
+#if DEBUG
+
+    enum AppStoreScreenshotData {
+        static let launchArgument = "-baybo-appstore-data"
+        static let boardLaunchArgument = "-baybo-appstore-board"
+        static let boardProjectName = "rglide"
+        static let avatarDirectoryName = "appstore-avatars"
+
+        static var requested: Bool {
+            ProcessInfo.processInfo.arguments.contains(launchArgument)
+        }
+
+        static var launchesBoard: Bool {
+            requested && ProcessInfo.processInfo.arguments.contains(boardLaunchArgument)
+        }
+
+        static func avatar(for blobId: String) -> Image? {
+            guard requested, blobId.hasPrefix("sha256:") else { return nil }
+            let digest = blobId.dropFirst("sha256:".count).split(separator: ".").first
+            guard let digest else { return nil }
+            let url = ServerCache.rootDirectory()
+                .appendingPathComponent(avatarDirectoryName, isDirectory: true)
+                .appendingPathComponent(String(digest))
+            guard let image = UIImage(contentsOfFile: url.path) else { return nil }
+            return Image(uiImage: image)
+        }
+    }
+
+#endif
+
 @MainActor
 /// App-wide avatar cache keyed by blob id: repeated drawings share one fetch,
 /// while replacing an avatar naturally changes the key.
@@ -40,6 +70,10 @@ final class AgentAvatars: ObservableObject {
             return
         }
         #if DEBUG
+            if let screenshotAvatar = AppStoreScreenshotData.avatar(for: blobId) {
+                images[blobId] = screenshotAvatar
+                return
+            }
             if let drawn = Self.demoAvatar(for: blobId) {
                 images[blobId] = drawn
                 return

@@ -101,6 +101,21 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
             </div>
             </body></html>
             """#
+        private static let appStoreDemoHtmlDocument = demoHtmlDocument
+            .replacingOccurrences(of: "#f2f2f7", with: "#171717")
+            .replacingOccurrences(of: "#12141a", with: "#ffffff")
+            .replacingOccurrences(of: "#9a9aa2", with: "#6b6b72")
+            .replacingOccurrences(of: "#2a2d36", with: "#dedee3")
+            .replacingOccurrences(of: "Quarterly sales", with: "Build performance")
+            .replacingOccurrences(of: "2026 · thousands · sample data", with: "Last four releases · sample data")
+            .replacingOccurrences(of: ">Q1<", with: ">R1<")
+            .replacingOccurrences(of: ">Q2<", with: ">R2<")
+            .replacingOccurrences(of: ">Q3<", with: ">R3<")
+            .replacingOccurrences(of: ">Q4<", with: ">R4<")
+            .replacingOccurrences(of: "full year", with: "total builds")
+            .replacingOccurrences(of: "year over year", with: "faster checks")
+            .replacingOccurrences(of: "quarter mean", with: "avg. score")
+            .replacingOccurrences(of: ">103<", with: ">98<")
     #endif
 
     private let dynamicRoute: DynamicRoute
@@ -217,9 +232,12 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
             if blobId == Self.demoHtmlBlobId,
                 ProcessInfo.processInfo.arguments.contains(Self.demoHtmlArg)
             {
+                let document = AppStoreScreenshotData.requested
+                    ? Self.appStoreDemoHtmlDocument
+                    : Self.demoHtmlDocument
                 finish(
                     task: task, url: url, status: 200,
-                    data: Data(Self.demoHtmlDocument.utf8), response: .htmlPreview)
+                    data: Data(document.utf8), response: .htmlPreview)
                 return
             }
         #endif

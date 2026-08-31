@@ -35,6 +35,11 @@ struct ProjectBoardScreen: View {
     init(projectId: String, store: ProjectsStore) {
         self.projectId = projectId
         _projects = ObservedObject(wrappedValue: store)
+        #if DEBUG
+            if AppStoreScreenshotData.launchesBoard {
+                _stage = State(initialValue: .done)
+            }
+        #endif
     }
 
     struct Toast: Equatable {

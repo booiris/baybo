@@ -265,6 +265,17 @@ without touching `app/ios` at all.
   screenshot headlessly; add **`-baybo-home-tab <agents|projects|chats|settings>`**
   to preselect a section.
 
+- **`-baybo-appstore-data`** — add it to `-baybo-open-home` for the denser,
+  English-only App Store chat-list fixture. It keeps the ordinary six-row UI-test
+  seed unchanged and expands only the release screenshot launch to ten realistic
+  conversations derived from the device's existing subjects. On Projects it
+  serves the copied, English-normalized device mirrors without a gateway refresh,
+  opens the archived rows, and resolves Agent images from the temporary
+  `Application Support/baybo/appstore-avatars` screenshot cache. That cache is
+  simulator data only; no personal project or avatar asset enters the App bundle.
+  Add **`-baybo-appstore-board`** to open the mirrored `rglide` board directly on
+  Done, where a dense English task set and the full Agent roster fit one frame.
+
 - **`-baybo-demo-pin`** (with `-baybo-open-home`) seeds nothing pinned, then pins
   the bottom row (demo-1) ~2s in so the reorder is recordable in isolation
   (`simctl io recordVideo` + ffmpeg montage of the transition window). The
@@ -413,9 +424,10 @@ without touching `app/ios` at all.
   "waiting for approval", then tap Approve/Deny for the verdict labels.
 
 - **`-baybo-demo-html`** (DEBUG, with `-baybo-open-chat`) pushes one agent turn
-  whose answer carries a `baybo-html` marker, so the inline preview card, its
-  fullscreen expansion and the left-edge swipe out of it are drivable with no
-  gateway. The bytes behind the marker are served by `TranscriptSchemeHandler`
+  whose answer carries rendered LaTeX followed by a `baybo-html` marker, so one
+  release scene shows both rich-output paths while the inline preview card, its
+  fullscreen expansion and the left-edge swipe out of it remain drivable with
+  no gateway. The bytes behind the marker are served by `TranscriptSchemeHandler`
   under the SAME flag (a demo session has no leg, so a real blob read could only
   ever answer `notFound` and the reader would get the failure document);
   `app/ios/UITests/HtmlPreviewUITests.swift` drives the swipe. That test is the
@@ -431,7 +443,9 @@ without touching `app/ios` at all.
   reserved the home indicator in `--color-paper`, and no screenshot of a white
   page could ever show that band. The same suite now samples the screenshot's
   bottom rows for brightness, so a white fixture would take that assertion with
-  it.
+  it. `-baybo-appstore-data` is the screenshot-only exception: it serves a
+  light-colour derivative of the same self-contained document while leaving
+  the dark UI-test fixture unchanged.
 
 - **`-baybo-demo-models`** (DEBUG, with `-baybo-open-chat`) seeds a canned model
   catalog into `ModelCatalog` — gpt-5.5 deliberately via TWO provider entries,

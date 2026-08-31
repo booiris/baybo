@@ -99,7 +99,7 @@ final class ProjectsStore: ObservableObject {
     /// network or the disk. Always false in a release build.
     private var isDemo: Bool {
         #if DEBUG
-            return Self.demoRequested
+            return Self.demoRequested || AppStoreScreenshotData.requested
         #else
             return false
         #endif
