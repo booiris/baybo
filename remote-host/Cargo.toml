@@ -6,7 +6,7 @@
 # and Noise ciphertext, never plaintext, so it deliberately does NOT depend on
 # any `baybo-*` crate — the `/notify` payload is agreed by its JSON contract.
 #
-# See docs/mobile-remote-host.md and docs/todo/mobile/phase1.md.
+# See docs/modules/mobile/companion.md and docs/modules/mobile/relay-push-security.md.
 [workspace]
 resolver = "2"
 members = ["crates/push", "crates/relay", "crates/dashboard", "crates/server", "crates/admission", "crates/protocol", "crates/edge"]

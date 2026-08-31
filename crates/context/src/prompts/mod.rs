@@ -1,7 +1,6 @@
 //! Prompt framing the agent injects into the LLM transcript, consolidated so
 //! every piece of model-facing framing has one home rather than being
-//! scattered across the agent loop. See
-//! `docs/todo/prompt-framing-to-context.md` for the migration plan.
+//! scattered across the agent loop.
 
 pub mod background_notification;
 pub mod cancelled_turn;

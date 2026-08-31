@@ -5,7 +5,7 @@
 //! that threat: C had to read the pairing *code* to route the rendezvous, and
 //! that code was *also* the SPAKE2 password, so C held the password by
 //! construction and could mount a persistent man-in-the-middle (see
-//! `docs/todo/mobile/pairing-mitm-xxpsk.md`).
+//! `docs/modules/mobile/pairing-security.md`).
 //!
 //! The fix splits the one value into two:
 //!
