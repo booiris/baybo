@@ -857,13 +857,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "No cards here yet."
+            "value": "Nothing in %@."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "这里还没有卡片。"
+            "value": "%@ 里什么都没有。"
           }
         }
       }
