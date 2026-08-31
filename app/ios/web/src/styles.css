@@ -808,6 +808,15 @@ html.html-preview-maximized body {
    ALL of them on the way in AND on the way out — the whole page twitching as
    the box opened, and rows above it shifting as it closed. */
 .md:has(.html-preview.is-maximized) { overflow: visible; }
+/* `content-visibility: auto` gives every offscreen row layout/paint containment,
+   which also makes it the containing block for a fixed descendant. Left on the
+   host row, "full screen" is only the row's width and starts at the row's top;
+   on a tall phone that leaves the exact paper band the pixel UI test guards.
+   Lift containment only for the one live host row. */
+.msg-group:has(.html-preview.is-maximized) {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
 /* Fullscreen is CSS-fixed, never reparented — the SAME iframe stays mounted, so
    the page keeps its JS state and never reloads.
    `left/top/width/height` (not `inset`) because those are the four properties
