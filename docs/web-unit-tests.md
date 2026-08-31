@@ -5,8 +5,7 @@ keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
 Scope: `app/web` only. `app/ios/web` is a **separate** pnpm workspace with its own
-vitest suite over the iOS transcript reducers, nominally gated by the `ios-web` CI job
-(currently `if: false`) — it
+vitest suite over the iOS transcript reducers, gated by the `ios-web` CI job — it
 follows the same pure-logic style but is not covered here.
 
 For **raising** coverage further — the remaining components, drag, real reload —

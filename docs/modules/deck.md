@@ -444,7 +444,7 @@ Creation is live: `DeckChanged` fires only after the dry-run gate has stored the
 
 ### Client build, localization, CI
 
-The tab label has `Localizable.xcstrings` keys (en `Deck` + the zh-Hans kanban term), plus the deck-native strings (the empty-board prompt and action, `deck.editDone`, and the delete-confirm set); the shell carries its own tiny en/zh string table for card overlays fed by a `setLanguage` bridge call (deliberately not the transcript's i18next — the shell is dependency-free vanilla TS). Packaging: the shell is a second entry in the SAME dist, so `build-app.sh`'s existing `web/dist → App/Resources/transcript/` copy ships it with no new step and `project.yml` is untouched. CI: no filter changes — the shell lives under the already-filtered `app/ios/web`, and `crates/deck` is not an ffi dependency (the iOS jobs are currently disabled anyway, so the tiers run by hand and the PR body says so).
+The tab label has `Localizable.xcstrings` keys (en `Deck` + the zh-Hans kanban term), plus the deck-native strings (the empty-board prompt and action, `deck.editDone`, and the delete-confirm set); the shell carries its own tiny en/zh string table for card overlays fed by a `setLanguage` bridge call (deliberately not the transcript's i18next — the shell is dependency-free vanilla TS). Packaging: the shell is a second entry in the SAME dist, so `build-app.sh`'s existing `web/dist → App/Resources/transcript/` copy ships it with no new step and `project.yml` is untouched. CI: no filter changes — the shell lives under the already-filtered `app/ios/web`, and `crates/deck` is not an ffi dependency, so `ios-web` picks the shell up with no gate work.
 
 ## Authoring pipeline
 

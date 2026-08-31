@@ -234,22 +234,30 @@ Demo flags are only hermetic with it.
 
 ## CI
 
-CI (`.github/workflows/ci.yml`) defines three iOS jobs and **runs none of them**
-— all three are `if: false` while the Actions quota is out. Every tier below is
-run by hand; say so in the PR body, because no check anywhere will.
+CI (`.github/workflows/ci.yml`) defines three iOS jobs and **runs all three**.
+They were `if: false` for a stretch while the Actions quota was out; what that
+period established is that the cost is real and unevenly spread, which is why
+each job is gated on the filter matching its own price rather than one shared
+gate.
 
-- `ios-web` (ubuntu, 1×) — **off, and the cheapest to restore.** `pnpm lint &&
-  pnpm test && pnpm build` in `app/ios/web`. `pnpm build` is
-  `tsc --noEmit && vite build`, and that typecheck is the only place the two
-  compile-time drift sentinels are ever evaluated: `src/wireSentinel.ts` (frame
-  mirrors ⇄ the ts-rs contract in `crates/wire`) and `src/restSentinel.ts`
-  (`TranscriptRowItem` ⇄ the gateway's `ChatTranscriptItem`). Until it is back
-  on, both sentinels only fire on a laptop.
-- `ios-core` (ubuntu, 1×) — **`if: false`.** Would run `cargo fmt` / `clippy` /
-  `nextest` over the ffi workspace. Off because it shares no cache with the root
-  workspace and pays a cold ~286-crate build.
-- `ios-sim` (macos-26, 10×) — **`if: false`.** Would run the build + unit tests
-  and the non-gating UI smokes.
+- `ios-web` (ubuntu, 1×, gated on `ios`) — `pnpm lint && pnpm test && pnpm build`
+  in `app/ios/web`. `pnpm build` is `tsc --noEmit && vite build`, and that
+  typecheck is the only place the two compile-time drift sentinels are ever
+  evaluated: `src/wireSentinel.ts` (frame mirrors ⇄ the ts-rs contract in
+  `crates/wire`) and `src/restSentinel.ts` (`TranscriptRowItem` ⇄ the gateway's
+  `ChatTranscriptItem`). Nothing else has a runtime component that would catch
+  either.
+- `ios-core` (ubuntu, 1×, gated on `ios`) — `cargo fmt` / `clippy` / `nextest`
+  over the ffi workspace. It shares no cache with the root workspace, so a cold
+  run pays a ~286-crate build: 1× minutes, but ~15-25 of them.
+- `ios-sim` (macos-26, 10×, gated on `ios_native`) — the build + unit tests, and
+  the UI smokes **non-gating**. This is the expensive one, and `ios_native`
+  deliberately fires on `crates/{wire,device-proto,model}` and `remote-host/`
+  too, so a PR with nothing iOS-shaped about it can still put a Mac on the
+  clock.
+
+What no job reaches is **a physical device**. The device checklist below is
+still hand-run, and a green CI does not stand in for it.
 
 All three are path-filtered — and the filter deliberately includes
 `crates/{wire,device-proto,model}`, `remote-host/` and `docs/openapi.json`,

@@ -64,11 +64,12 @@ side: `gh pr checks --watch` on a draft reports every job as `skipping` and
 confirm the gating jobs actually say `pass`. If they say `skipping`, CI has never
 seen the code.
 
-The macOS jobs cost 10× Linux minutes, which is why the iOS jobs are currently
-`if: false` (see `61eb9246`). While that holds, **nothing under `app/ios` is
-covered by CI** — the Rust core, the transcript bundle, and the Swift suite are
-all local-only. Run them by hand and say so in the PR body; do not let a green
-check imply coverage it does not have.
+The three iOS jobs are ON again, so `app/ios` is covered by CI: `ios-web` and
+`ios-core` on ubuntu, `ios-sim` on `macos-26`. They were `if: false` for a while
+(see `61eb9246`) because the macOS job bills at 10× Linux minutes, so keep the
+cost in view — each is gated on the `changes` filter that matches its price, and
+widening `IOS_DEPS` puts more PRs on a Mac. Coverage still stops at the
+simulator: no job touches a device, and the UI smokes are non-gating.
 
 ## Code Style
 

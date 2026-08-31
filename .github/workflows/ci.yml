@@ -13,8 +13,8 @@ name: CI
 # One run per merge to master populates that scope, so every PR afterwards
 # starts warm — and the master run is itself warm from the previous one, so the
 # steady-state cost of this line is a few minutes, not another 48. Only the
-# jobs whose caches PRs actually reuse run on push; the path-filtered and
-# `if: false` ones below stay PR-only.
+# jobs whose caches PRs actually reuse run on push; the path-filtered ones
+# below stay PR-only.
 #
 # The other half is `cache-save-if` on each rust job: master WRITES, a PR only
 # restores. A PR-scoped cache is unreadable by any other PR, so writing one buys
@@ -309,13 +309,13 @@ jobs:
   # tests had never run anywhere but a laptop) and `app/ios/web` is its own pnpm
   # workspace (`packages: []`, so the root `frontend` job never adopts it).
   #
-  # Three jobs, split by what each one costs, because cost is what decides which
-  # of them run: the transcript bundle needs neither Rust nor a Mac (`ios-web`,
-  # ~2 min at 1x, ON), the app's own cargo workspace needs Rust but no Mac
-  # (`ios-core`, 1x but slow, OFF), and only the Swift/Xcode half needs a Mac
-  # (`ios-sim`, 10x, OFF). While the latter two are off, nothing under app/ios
-  # is covered except the transcript bundle — say so in the PR body rather than
-  # letting a green tick imply more.
+  # Three jobs, split by what each one costs, because cost is what decides how
+  # narrowly each is gated: the transcript bundle needs neither Rust nor a Mac
+  # (`ios-web`, ~2 min at 1x), the app's own cargo workspace needs Rust but no
+  # Mac (`ios-core`, 1x but slow), and only the Swift/Xcode half needs a Mac
+  # (`ios-sim`, 10x). All three are ON, each behind the `changes` filter that
+  # matches its own cost: `ios` for the two Linux jobs, `ios_native` for the Mac
+  # one, so a docs-only change under app/ios never reaches the 10x runner.
   # ---------------------------------------------------------------------------
 
   # The cheapest third of the iOS suite: no Rust toolchain, no Mac, ~2 min on a
@@ -331,25 +331,15 @@ jobs:
   # docs/openapi.json. All three are `tsc --noEmit` assertions with no runtime
   # component, so this job is the only thing anywhere that evaluates them.
   #
-  # The third one is the strongest argument yet for turning this back on: it
+  # The third one is what settled the argument for turning this back on: it
   # caught three wrong hand-written mirrors on the day it was added, every one
   # of which fails silently at runtime as a missing `@handle` rather than as an
   # error anybody would see.
-  # OFF ONLY BECAUSE THE ACTIONS QUOTA IS EXHAUSTED — not because it is slow, not
-  # because it is flaky, and not for the reason the two jobs below are off. This
-  # is the cheap one. To turn it back on, replace the `if: false` with the gate
-  # kept below it; nothing else needs changing.
-  #
-  # What stays unenforced meanwhile: all three `tsc --noEmit` sentinels. None has
-  # a runtime component, so no other job anywhere evaluates them — a PR that adds
-  # a field to `ChatTranscriptItem` or `IssueDto` and forgets the iOS mirror goes
-  # green.
   ios-web:
     name: iOS transcript bundle (lint + test + build)
     needs: changes
     runs-on: ubuntu-latest
-    if: false
-    # if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -377,20 +367,19 @@ jobs:
       - run: pnpm build
         working-directory: app/ios/web
 
-  # STILL DISABLED — this half is what exhausted the Actions budget: a cold
-  # `cargo clippy --all-targets --all-features` plus `nextest` over app/ios's
-  # own ~286-crate workspace, which shares no cache with the root one, is
-  # ~15-25 min of 1x runner per cold PR (the setup-rust-toolchain cache only
-  # helps once the key is warm, and it re-cold-starts on any Cargo.lock or
-  # toolchain move). Turning it back on means paying that on every PR that
-  # touches app/ios/, crates/{wire,device-proto,model}/ or remote-host/.
-  # To restore, put the original gate back:
-  #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+  # The expensive Linux half, and what exhausted the Actions budget the first
+  # time round: a cold `cargo clippy --all-targets --all-features` plus `nextest`
+  # over app/ios's own ~286-crate workspace, which shares no cache with the root
+  # one, is ~15-25 min of 1x runner per cold PR (the setup-rust-toolchain cache
+  # only helps once its key is warm, and it re-cold-starts on any Cargo.lock or
+  # toolchain move). That price is paid on every PR touching app/ios/,
+  # crates/{wire,device-proto,model}/ or remote-host/ — budget for it before
+  # widening `IOS_DEPS`.
   ios-core:
     name: iOS core (rust)
     needs: changes
     runs-on: ubuntu-latest
-    if: false
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
     steps:
       - uses: actions/checkout@v4
       # No toolchain file under app/ios — rustup walks UP to the root
@@ -421,13 +410,13 @@ jobs:
     # no -downloadPlatform needed. (Coverage of the actual 18.x floor would need
     # an older runtime download — not done here.)
     runs-on: macos-26
-    # TEMPORARILY DISABLED — this is the one that actually hurt: a macOS runner is
-    # billed at 10x Linux minutes (40-minute timeout), and `ios_native` fires on
-    # any change under crates/{wire,device-proto,model}/ or remote-host/, so plenty
-    # of PRs with nothing iOS-shaped about them were paying for it.
-    # To restore, put the original gate back:
-    #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
-    if: false
+    # The costly one: a macOS runner is billed at 10x Linux minutes (40-minute
+    # timeout), and `ios_native` fires on any change under
+    # crates/{wire,device-proto,model}/ or remote-host/ too — so a PR with
+    # nothing iOS-shaped about it can still pay for a Mac. That is the price of
+    # the gate having no hole where the wire contract lives; narrow the filter
+    # before narrowing this.
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
     timeout-minutes: 40
     defaults:
       run:
