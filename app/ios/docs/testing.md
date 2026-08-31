@@ -5,7 +5,8 @@
 ## The four tiers
 
 Four tiers. The whole base — Rust + the transcript bundle — is plain Linux work
-and runs on ubuntu in CI at 1x; only the Swift half pays the macOS 10x.
+and runs on ubuntu in CI; only the Swift half needs a Mac, and that is the slow
+tier for it.
 
 ```bash
 # Rust core (app/ios workspace — the ROOT workspace excludes it, so the root
@@ -234,22 +235,47 @@ Demo flags are only hermetic with it.
 
 ## CI
 
-CI (`.github/workflows/ci.yml`) defines three iOS jobs and **runs none of them**
-— all three are `if: false` while the Actions quota is out. Every tier below is
-run by hand; say so in the PR body, because no check anywhere will.
+CI (`.github/workflows/ci.yml`) defines three iOS jobs and **runs all three**.
+They were `if: false` for a stretch while the Actions quota was out. That is
+over: the repo is public, and standard GitHub-hosted runners — `macos-26`
+included — are free and unlimited on a public repo. **Minutes are no longer a
+reason to skip anything here.**
 
-- `ios-web` (ubuntu, 1×) — **off, and the cheapest to restore.** `pnpm lint &&
-  pnpm test && pnpm build` in `app/ios/web`. `pnpm build` is
-  `tsc --noEmit && vite build`, and that typecheck is the only place the two
-  compile-time drift sentinels are ever evaluated: `src/wireSentinel.ts` (frame
-  mirrors ⇄ the ts-rs contract in `crates/wire`) and `src/restSentinel.ts`
-  (`TranscriptRowItem` ⇄ the gateway's `ChatTranscriptItem`). Until it is back
-  on, both sentinels only fire on a laptop.
-- `ios-core` (ubuntu, 1×) — **`if: false`.** Would run `cargo fmt` / `clippy` /
-  `nextest` over the ffi workspace. Off because it shares no cache with the root
-  workspace and pays a cold ~286-crate build.
-- `ios-sim` (macos-26, 10×) — **`if: false`.** Would run the build + unit tests
-  and the non-gating UI smokes.
+What the gating still defends is time and the macOS queue: the free plan runs
+20 concurrent jobs but only **5 concurrent macOS** ones account-wide, so each
+job is filtered to the change it actually answers for.
+
+- `ios-web` (ubuntu, gated on `ios`, ~2 min) — `pnpm lint && pnpm test &&
+  pnpm build` in `app/ios/web`. `pnpm build` is `tsc --noEmit && vite build`,
+  and that typecheck is the only place the compile-time drift sentinels are ever
+  evaluated: `src/wireSentinel.ts` (frame mirrors ⇄ the ts-rs contract in
+  `crates/wire`), `src/restSentinel.ts` (`TranscriptRowItem` ⇄ the gateway's
+  `ChatTranscriptItem`) and `src/issue/issueSentinel.ts`. Nothing else has a
+  runtime component that would catch any of them.
+- `ios-core` (ubuntu, gated on `ios`, ~15-25 min cold) — `cargo fmt` / `clippy` /
+  `nextest` over the ffi workspace. It shares no cache with the root workspace,
+  so a cold run pays a full ~286-crate build.
+- `ios-sim` (macos-26, gated on `ios_native`, ~25-40 min cold) — the build +
+  unit tests, with the UI smokes **non-gating**. The slow one, and the only one
+  that takes a macOS slot. `ios_native` deliberately fires on
+  `crates/{wire,device-proto,model}` and `remote-host/` too, so a PR with
+  nothing iOS-shaped about it can still queue for a Mac — that is the cost of
+  the gate having no hole where the wire contract lives.
+
+Two things a green CI does **not** mean:
+
+- **No job reaches a physical device.** The device checklist below is still
+  hand-run.
+- **A draft PR reports `skipping` and exits 0.** Every job carries
+  `draft == false`, so `gh pr checks --watch` on a draft is indistinguishable
+  from green. `scripts/dev-merge-sync.sh` refuses to merge on that, and now
+  requires the three iOS checks whenever the PR's own diff says they should
+  have run.
+
+Because the repo is public, workflow logs and the `ios-xcresult` artifact are
+readable by anyone. The xcresult carries UI-test screenshots — of demo fixtures
+today, so nothing sensitive, but that is a fact to re-check before pointing a
+test at real data.
 
 All three are path-filtered — and the filter deliberately includes
 `crates/{wire,device-proto,model}`, `remote-host/` and `docs/openapi.json`,
@@ -264,6 +290,17 @@ without touching `app/ios` at all.
   conversation (seeds a few demo list rows), so the menu bar / header / sections
   screenshot headlessly; add **`-baybo-home-tab <agents|projects|chats|settings>`**
   to preselect a section.
+
+- **`-baybo-appstore-data`** — add it to `-baybo-open-home` for the denser,
+  English-only App Store chat-list fixture. It keeps the ordinary six-row UI-test
+  seed unchanged and expands only the release screenshot launch to ten realistic
+  conversations derived from the device's existing subjects. On Projects it
+  serves the copied, English-normalized device mirrors without a gateway refresh,
+  opens the archived rows, and resolves Agent images from the temporary
+  `Application Support/baybo/appstore-avatars` screenshot cache. That cache is
+  simulator data only; no personal project or avatar asset enters the App bundle.
+  Add **`-baybo-appstore-board`** to open the mirrored `rglide` board directly on
+  Done, where a dense English task set and the full Agent roster fit one frame.
 
 - **`-baybo-demo-pin`** (with `-baybo-open-home`) seeds nothing pinned, then pins
   the bottom row (demo-1) ~2s in so the reorder is recordable in isolation
@@ -413,9 +450,10 @@ without touching `app/ios` at all.
   "waiting for approval", then tap Approve/Deny for the verdict labels.
 
 - **`-baybo-demo-html`** (DEBUG, with `-baybo-open-chat`) pushes one agent turn
-  whose answer carries a `baybo-html` marker, so the inline preview card, its
-  fullscreen expansion and the left-edge swipe out of it are drivable with no
-  gateway. The bytes behind the marker are served by `TranscriptSchemeHandler`
+  whose answer carries rendered LaTeX followed by a `baybo-html` marker, so one
+  release scene shows both rich-output paths while the inline preview card, its
+  fullscreen expansion and the left-edge swipe out of it remain drivable with
+  no gateway. The bytes behind the marker are served by `TranscriptSchemeHandler`
   under the SAME flag (a demo session has no leg, so a real blob read could only
   ever answer `notFound` and the reader would get the failure document);
   `app/ios/UITests/HtmlPreviewUITests.swift` drives the swipe. That test is the
@@ -431,7 +469,9 @@ without touching `app/ios` at all.
   reserved the home indicator in `--color-paper`, and no screenshot of a white
   page could ever show that band. The same suite now samples the screenshot's
   bottom rows for brightness, so a white fixture would take that assertion with
-  it.
+  it. `-baybo-appstore-data` is the screenshot-only exception: it serves a
+  light-colour derivative of the same self-contained document while leaving
+  the dark UI-test fixture unchanged.
 
 - **`-baybo-demo-models`** (DEBUG, with `-baybo-open-chat`) seeds a canned model
   catalog into `ModelCatalog` — gpt-5.5 deliberately via TWO provider entries,

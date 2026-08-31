@@ -782,11 +782,33 @@
             guard ProcessInfo.processInfo.arguments.contains(Self.demoHtmlArg) else { return }
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
-                pushDemoUserSent(msgId: "demo-html-u1", text: "Make me a small sales dashboard")
-                pushDemo(["kind": "turn_state", "active": true])
+                let appStoreData = AppStoreScreenshotData.requested
+                let userText = appStoreData
+                    ? "Make me a small build dashboard"
+                    : "Make me a small sales dashboard"
+                pushDemoUserSent(msgId: "demo-html-u1", text: userText)
                 try? await Task.sleep(for: .milliseconds(500))
-                let answer = #"""
-                    Here it is — tap the expand control for the full screen.
+                let answer =
+                    appStoreData
+                    ? #"""
+                    Here it is. The build score is:
+
+                    $$S = \sum_{i=1}^{n} w_i x_i$$
+
+                    Tap the expand control to explore the live HTML dashboard.
+
+                    ```baybo-html
+                    \#(TranscriptSchemeHandler.demoHtmlBlobId)
+                    ```
+
+                    Want it broken down by test suite as well?
+                    """#
+                    : #"""
+                    Here it is. The forecast uses compound growth:
+
+                    $$R(t) = R_0(1 + g)^t$$
+
+                    Tap the expand control to explore the live HTML dashboard.
 
                     ```baybo-html
                     \#(TranscriptSchemeHandler.demoHtmlBlobId)
@@ -798,7 +820,6 @@
                     "kind": "message", "role": "assistant", "content": answer,
                     "platform_msg_id": "demo-html-1", "ordinal": 1,
                 ])
-                pushDemo(["kind": "turn_state", "active": false])
             }
         }
 

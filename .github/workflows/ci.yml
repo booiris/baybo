@@ -2,19 +2,41 @@ name: CI
 
 # PRs, plus master — and master is here for the CACHE, not for a second opinion.
 #
+# WHAT THIS REPO PAYS FOR, since almost every note below used to be about
+# money: `booiris/baybo` is PUBLIC, and standard GitHub-hosted runners are free
+# and unlimited on public repos — ubuntu-latest AND macos-26 alike (macos-26 is
+# a standard 3-CPU arm64 runner; only the `-large`/`-xlarge` LARGER runners are
+# billed on a public repo, and this workflow uses none). So minutes are not a
+# constraint here and the old 10x macOS multiplier is not a bill any more.
+#
+# Three things still are, and they are what the comments below now defend:
+#   - WALL-CLOCK. A cold `ios-sim` is ~25-40 min; a cold `test` is ~15. Nobody
+#     waits less because the minutes are free.
+#   - macOS CONCURRENCY. The free plan allows 20 concurrent jobs but only 5
+#     concurrent macOS ones, shared across the account. That, not minutes, is
+#     what a fleet of iOS PRs actually contends for.
+#   - THE 10 GB CACHE BUDGET, which is per-repo and unchanged by visibility.
+#     It is the whole reason for the cache design described next.
+#
+# Also worth knowing now that the repo is public: workflow logs and uploaded
+# artifacts need only READ access, which everyone now has. `ios-sim` uploads
+# `ios-xcresult` on every run, and an xcresult carries UI-test screenshots — of
+# demo fixtures today, so nothing sensitive, but check that again before
+# pointing a test at real data.
+#
 # A run may restore caches from its own ref's scope or from the DEFAULT
 # branch's, and nothing else. While CI ran on PRs only, every cache lived under
 # `refs/pull/N/merge`, master's scope stayed permanently empty, and so the first
 # run of every new PR was cold: measured on PR #239, cargo test 19m47s, ts-rs
-# bindings 15m45s, clippy 10m34s — ~48 billed minutes rebuilding the same deps
+# bindings 15m45s, clippy 10m34s — ~48 runner-minutes rebuilding the same deps
 # in four separate target dirs. (`[profile.dev.package."*"] opt-level = 2` is
 # what makes a cold dep build that expensive; see the `test` job.)
 #
 # One run per merge to master populates that scope, so every PR afterwards
 # starts warm — and the master run is itself warm from the previous one, so the
 # steady-state cost of this line is a few minutes, not another 48. Only the
-# jobs whose caches PRs actually reuse run on push; the path-filtered and
-# `if: false` ones below stay PR-only.
+# jobs whose caches PRs actually reuse run on push; the path-filtered ones
+# below stay PR-only.
 #
 # The other half is `cache-save-if` on each rust job: master WRITES, a PR only
 # restores. A PR-scoped cache is unreadable by any other PR, so writing one buys
@@ -40,7 +62,7 @@ name: CI
 # day this trigger landed, silently, including the ones that must not.
 #
 # Draft PRs still fire opened/synchronize, but the per-job `if` skips them (a
-# skipped job spins up no runner → zero billed minutes); marking a PR "Ready
+# skipped job spins up no runner and no queue slot); marking a PR "Ready
 # for review" fires ready_for_review and lets CI through.
 on:
   pull_request:
@@ -119,8 +141,9 @@ jobs:
     # test burns all 360 minutes before the runner is reclaimed — which is what
     # `chat_api::chat_search_finds_a_chinese_word_inside_a_han_run` did on PR
     # #234 (3000/3001 tests green, one test `SLOW [>21120.000s]`, job killed at
-    # the ceiling and reported `cancelled`, not `failure`). This repo runs CI on
-    # PRs only, so that is a bill worth capping.
+    # the ceiling and reported `cancelled`, not `failure`). Free minutes do not
+    # make that cheap: it holds a concurrency slot for six hours and blocks the
+    # merge behind it, which is what the cap is really for.
     #
     # A hung *test* is no longer what this cap catches: `.config/nextest.toml`
     # terminates any test still running at 4 x 30s, which fails the run in two
@@ -157,9 +180,10 @@ jobs:
       - run: cargo nextest run --workspace --locked
 
   # Detects which expensive, path-scoped stacks this PR touches, so the jobs
-  # below can be skipped entirely — a skipped job spins up no runner, so a PR
-  # that touches neither the TUI nor the iOS app pays zero minutes for both.
-  # This matters most for `ios-sim`: macOS runners bill at 10x.
+  # below can be skipped entirely. Runner minutes are free on this public repo,
+  # so what a skip buys is TIME and a macOS queue slot: `ios-sim` is the slow
+  # one (~25-40 min cold) and the free plan runs only 5 concurrent macOS jobs
+  # account-wide, so a PR that needs no Mac should not hold one.
   changes:
     name: detect changes
     runs-on: ubuntu-latest
@@ -204,8 +228,8 @@ jobs:
           fi
 
           # A Mac is needed only for the Swift/Xcode half. A change confined to
-          # app/ios docs (CLAUDE.md) leaves ios_native false and skips the 10x
-          # runner entirely.
+          # app/ios docs (CLAUDE.md) leaves ios_native false and never queues
+          # for a macOS runner at all.
           if changed "^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/"; then
             echo "ios_native=true" >> "$GITHUB_OUTPUT"
           else
@@ -309,18 +333,20 @@ jobs:
   # tests had never run anywhere but a laptop) and `app/ios/web` is its own pnpm
   # workspace (`packages: []`, so the root `frontend` job never adopts it).
   #
-  # Three jobs, split by what each one costs, because cost is what decides which
-  # of them run: the transcript bundle needs neither Rust nor a Mac (`ios-web`,
-  # ~2 min at 1x, ON), the app's own cargo workspace needs Rust but no Mac
-  # (`ios-core`, 1x but slow, OFF), and only the Swift/Xcode half needs a Mac
-  # (`ios-sim`, 10x, OFF). While the latter two are off, nothing under app/ios
-  # is covered except the transcript bundle — say so in the PR body rather than
-  # letting a green tick imply more.
+  # Three jobs, split by what each one NEEDS, which is also what decides how
+  # narrowly each is gated: the transcript bundle needs neither Rust nor a Mac
+  # (`ios-web`, ~2 min), the app's own cargo workspace needs Rust but no Mac
+  # (`ios-core`, slow), and only the Swift/Xcode half needs a Mac (`ios-sim`,
+  # slowest, and the only one that takes one of the 5 macOS slots). All three
+  # are ON, each behind its matching `changes` filter: `ios` for the two Linux
+  # jobs, `ios_native` for the Mac one, so a docs-only change under app/ios
+  # never queues for a Mac.
   # ---------------------------------------------------------------------------
 
-  # The cheapest third of the iOS suite: no Rust toolchain, no Mac, ~2 min on a
-  # 1x runner. It was originally disabled as collateral damage — it shared a job
-  # with the cargo half below, which is what actually ate the budget.
+  # The fastest third of the iOS suite: no Rust toolchain, no Mac, ~2 min. It
+  # was originally disabled as collateral damage — it shared a job with the
+  # cargo half below, which is what actually ate the Actions budget back when
+  # this repo was private and there was a budget to eat.
   #
   # It also carries the THREE compile-time drift sentinels, which is why running
   # it matters beyond this bundle: `src/wireSentinel.ts` pins the hand-written
@@ -331,25 +357,15 @@ jobs:
   # docs/openapi.json. All three are `tsc --noEmit` assertions with no runtime
   # component, so this job is the only thing anywhere that evaluates them.
   #
-  # The third one is the strongest argument yet for turning this back on: it
+  # The third one is what settled the argument for turning this back on: it
   # caught three wrong hand-written mirrors on the day it was added, every one
   # of which fails silently at runtime as a missing `@handle` rather than as an
   # error anybody would see.
-  # OFF ONLY BECAUSE THE ACTIONS QUOTA IS EXHAUSTED — not because it is slow, not
-  # because it is flaky, and not for the reason the two jobs below are off. This
-  # is the cheap one. To turn it back on, replace the `if: false` with the gate
-  # kept below it; nothing else needs changing.
-  #
-  # What stays unenforced meanwhile: all three `tsc --noEmit` sentinels. None has
-  # a runtime component, so no other job anywhere evaluates them — a PR that adds
-  # a field to `ChatTranscriptItem` or `IssueDto` and forgets the iOS mirror goes
-  # green.
   ios-web:
     name: iOS transcript bundle (lint + test + build)
     needs: changes
     runs-on: ubuntu-latest
-    if: false
-    # if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -377,20 +393,19 @@ jobs:
       - run: pnpm build
         working-directory: app/ios/web
 
-  # STILL DISABLED — this half is what exhausted the Actions budget: a cold
-  # `cargo clippy --all-targets --all-features` plus `nextest` over app/ios's
-  # own ~286-crate workspace, which shares no cache with the root one, is
-  # ~15-25 min of 1x runner per cold PR (the setup-rust-toolchain cache only
-  # helps once the key is warm, and it re-cold-starts on any Cargo.lock or
-  # toolchain move). Turning it back on means paying that on every PR that
-  # touches app/ios/, crates/{wire,device-proto,model}/ or remote-host/.
-  # To restore, put the original gate back:
-  #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+  # The slow Linux half, and what exhausted the Actions budget back when this
+  # repo was private: a cold `cargo clippy --all-targets --all-features` plus
+  # `nextest` over app/ios's own ~286-crate workspace, which shares no cache
+  # with the root one, is ~15-25 min per cold PR (the setup-rust-toolchain cache
+  # only helps once its key is warm, and it re-cold-starts on any Cargo.lock or
+  # toolchain move). The minutes are free now; the ~20 minutes a reviewer waits
+  # are not, and every PR touching app/ios/, crates/{wire,device-proto,model}/
+  # or remote-host/ waits them — so widening `IOS_DEPS` is still a decision.
   ios-core:
     name: iOS core (rust)
     needs: changes
     runs-on: ubuntu-latest
-    if: false
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
     steps:
       - uses: actions/checkout@v4
       # No toolchain file under app/ios — rustup walks UP to the root
@@ -421,19 +436,21 @@ jobs:
     # no -downloadPlatform needed. (Coverage of the actual 18.x floor would need
     # an older runtime download — not done here.)
     runs-on: macos-26
-    # TEMPORARILY DISABLED — this is the one that actually hurt: a macOS runner is
-    # billed at 10x Linux minutes (40-minute timeout), and `ios_native` fires on
-    # any change under crates/{wire,device-proto,model}/ or remote-host/, so plenty
-    # of PRs with nothing iOS-shaped about them were paying for it.
-    # To restore, put the original gate back:
-    #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
-    if: false
+    # The slow one, and the only job here that needs a Mac. Standard macOS
+    # runners are free on a public repo, so the old 10x multiplier is no longer
+    # a bill — what it costs now is ~25-40 min cold and one of the 5 concurrent
+    # macOS slots the free plan allows account-wide. `ios_native` fires on any
+    # change under crates/{wire,device-proto,model}/ or remote-host/ too, so a
+    # PR with nothing iOS-shaped about it can still queue for a Mac. That is the
+    # price of the gate having no hole where the wire contract lives; narrow the
+    # filter before narrowing this.
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
     timeout-minutes: 40
     defaults:
       run:
         working-directory: app/ios
     env:
-      # `brew update` alone burns 1-3 min, billed at 10x.
+      # `brew update` alone burns 1-3 min of the slowest job's wall-clock.
       HOMEBREW_NO_AUTO_UPDATE: 1
     steps:
       - uses: actions/checkout@v4
@@ -451,10 +468,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: app/ios/web/pnpm-lock.yaml
 
-      # The single biggest cost lever on this job. build-core.sh compiles the
+      # The single biggest time lever on this job. build-core.sh compiles the
       # ~286-crate graph TWICE (once for aarch64-apple-ios-sim, once for the
       # host cdylib that uniffi-bindgen reads) with no sharing between them —
-      # ~8-12 min cold, at 10x. Most iOS PRs touch only Swift or the web bundle,
+      # ~8-12 min cold. Most iOS PRs touch only Swift or the web bundle,
       # so key the products on the ffi inputs and skip the whole chain on a hit.
       - id: core-cache
         uses: actions/cache@v4
@@ -524,8 +541,9 @@ jobs:
       # gating once they have proven stable over a few weeks of real runs.
       #
       # A step-level continue-on-error rather than a second job: a separate macOS
-      # job would re-pay runner boot + toolchain setup at 10x to run 4 minutes of
-      # tests it already has the built products for.
+      # job would re-pay runner boot + toolchain setup, and take a second one of
+      # the 5 macOS slots, to run 4 minutes of tests it already has the built
+      # products for.
       - name: UI smokes (non-gating)
         continue-on-error: true
         run: |

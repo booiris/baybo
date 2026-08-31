@@ -30,10 +30,11 @@ set -euo pipefail
 # a private repo.)
 #
 # Deliberately not required: "detect changes" (a path-filter helper for the
-# other jobs), "tmux render tests (non-gating)" (named non-gating; flaky under
-# load, and conditional), and the two iOS jobs — they are `if: false`, so
-# NOTHING under app/ios is covered (see /CLAUDE.md). Re-enable them there and
-# they belong in this list.
+# other jobs) and "tmux render tests (non-gating)" (named non-gating; flaky
+# under load, and conditional).
+#
+# The three iOS jobs ARE required, but only when this PR should have run them —
+# see the path filters below.
 REQUIRED_CHECKS=(
   "rustfmt"
   "clippy"
@@ -41,6 +42,20 @@ REQUIRED_CHECKS=(
   "ts-rs bindings sync"
   "frontend (typecheck + build + test)"
 )
+
+# The iOS jobs are path-filtered by ci.yml's "detect changes", so a skip is
+# legitimate on a PR that touches nothing iOS — which is why they cannot simply
+# join the list above. The failure mode this guards is the other one: PR #206
+# merged with the five checks above green and BOTH iOS jobs skipped, on a PR
+# that was ~half app/ios (the final catch-up merge's incremental diff was
+# non-iOS, so the filter said false). A skip is only acceptable here if this
+# PR's own diff agrees it should be one.
+#
+# The two patterns MUST mirror `IOS_DEPS` and the ios_native filter in
+# .github/workflows/ci.yml. They differ on purpose: a docs-only change under
+# app/ios runs the two Linux jobs but never queues for the Mac one.
+IOS_DEPS_PATTERN='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
+IOS_NATIVE_PATTERN='^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/'
 
 BASE="master"
 ASSUME_YES=0
@@ -68,6 +83,16 @@ AHEAD="$(git rev-list --count "origin/$BASE..$DEV")"
 [ "$AHEAD" -gt 0 ] || die "'$DEV' has no commits over origin/$BASE — nothing to ship"
 [ "$(git rev-list --count "$DEV..origin/$BASE")" -eq 0 ] || die "'$DEV' is behind origin/$BASE — rebase/merge it first"
 echo "==> $AHEAD commit(s) to ship"
+
+CHANGED="$(git diff --name-only "origin/$BASE...$DEV")"
+if printf '%s\n' "$CHANGED" | grep -qE "$IOS_DEPS_PATTERN"; then
+  REQUIRED_CHECKS+=("iOS transcript bundle (lint + test + build)" "iOS core (rust)")
+  echo "==> diff touches iOS deps: requiring the two Linux iOS checks"
+fi
+if printf '%s\n' "$CHANGED" | grep -qE "$IOS_NATIVE_PATTERN"; then
+  REQUIRED_CHECKS+=("iOS app (build + unit tests; UI smokes non-gating)")
+  echo "==> diff touches the Swift/ffi half: requiring the macOS iOS check"
+fi
 
 git push -u origin "$DEV"
 

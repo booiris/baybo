@@ -612,6 +612,14 @@ by `exists` and `isHittable` the band was invisible, the box was full screen and
 the iframe was in it. The demo document is deliberately DARK for the same
 reason; a white one takes the assertion with it.
 
+The message row hosting a maximized preview also opts out of
+`content-visibility: auto` while the preview is up. That optimization implies
+layout/paint containment, so it otherwise becomes the containing block for the
+`position: fixed` card: the preview starts at the message row instead of the
+viewport and cannot reach the screen bottom. The exception is scoped with
+`:has(.html-preview.is-maximized)` to that one row; every other offscreen row
+keeps its rendering containment.
+
 Two ways out, both the same morph home:
 
 - the toolbar's close button; and

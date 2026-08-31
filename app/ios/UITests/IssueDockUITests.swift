@@ -117,6 +117,15 @@ final class IssueDockUITests: BayboUITestCase {
 
     func testThePlusPanelFloatsOverTheJumpDisc() {
         let app = openCard()
+        let scrollTop = app.buttons["issue-scroll-top"]
+        XCTAssertTrue(
+            scrollTop.waitForExistence(timeout: Self.webviewTimeout),
+            "the card never exposed its scroll-to-top action")
+        scrollTop.tap()
+        XCTAssertTrue(
+            scrollTop.waitForNonExistence(timeout: 5),
+            "the card did not reach the top before checking its jump disc")
+
         let jump = app.buttons["issue-jump"]
         XCTAssertTrue(
             jump.waitForExistence(timeout: Self.webviewTimeout),

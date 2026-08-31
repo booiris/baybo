@@ -9,6 +9,9 @@ struct ProjectsScreen: View {
 
     init(store: ProjectsStore) {
         _projects = ObservedObject(wrappedValue: store)
+        #if DEBUG
+            _showsArchived = State(initialValue: AppStoreScreenshotData.requested)
+        #endif
     }
 
     private var live: [ProjectInfo] {

@@ -308,7 +308,8 @@ final class AppStore: ObservableObject {
         /// it so they can only ever write into this throwaway conversation — a
         /// demo turn pushed into a REAL session (`-baybo-open-session`) would land
         /// in that session's durable mirror and registry row.
-        static let debugSessionId = "debug-session"
+        static let debugSessionId =
+            AppStoreScreenshotData.requested ? "appstore-safe-html-v2" : "debug-session"
     #endif
 
     /// XCTest sets this in the host app's environment; the unit bundle is HOSTED
@@ -400,18 +401,35 @@ final class AppStore: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-home") {
             demoHomeMode = true
             let args = ProcessInfo.processInfo.arguments
+            let appStoreData = AppStoreScreenshotData.requested
+            let rowCount = appStoreData ? 10 : 6
+            let appStorePreviews = [
+                "demo-1": "Connected the knowledge base through MCP and indexed the Markdown sources.",
+                "demo-2": "Mapped a quiet three-day route with trains, stays, and local food.",
+                "demo-3": "Compared memory benchmarks and summarized the reproducible findings.",
+                "demo-4": "Processed the transcript and captured the key software design principles.",
+                "demo-5": "Compared developer tools and summarized the most useful engineering patterns.",
+                "demo-6": "Reviewed the paper and mapped its architecture to practical agent harnesses.",
+                "demo-7": "Compiled test coverage, crash reports, and performance signals for the week.",
+                "demo-8": "Built an interactive HTML dashboard with live quality metrics.",
+                "demo-9": "Verified the archive, signing, entitlements, and App Store screenshots.",
+                "demo-10": "Seven specialist agents completed the implementation and review cycle.",
+            ]
             // `-baybo-demo-pin` records the pin reorder in isolation: the bottom
             // row (demo-1, oldest) springs to the top ~2s in. Start with nothing
             // pinned so it lands at the very top, not below demo-3.
             let demoPin = args.contains("-baybo-demo-pin")
-            for i in 1...6 {
+            for i in 1...rowCount {
                 SessionIndex.shared.recordUserSend(
-                    sessionId: "demo-\(i)", text: "Demo conversation number \(i)")
+                    sessionId: "demo-\(i)",
+                    text: appStoreData
+                        ? appStorePreviews["demo-\(i)"] ?? ""
+                        : "Demo conversation number \(i)")
             }
             // Normalize archive state so repeated headless runs start identical
             // (the container persists across suite runs, and a UI test
             // deliberately leaves rows archived): only demo-2 starts archived.
-            for i in 1...6 {
+            for i in 1...rowCount {
                 SessionIndex.shared.setArchivedFlag("demo-\(i)", archived: i == 2)
                 SessionIndex.shared.setPinnedFlag("demo-\(i)", pinned: !demoPin && i == 3)
             }
@@ -420,20 +438,34 @@ final class AppStore: ObservableObject {
             // stays untitled to exercise the single-line fallback. Past-dated
             // activity bumps unread WITHOUT reordering (`at` isn't newer than the
             // row's `lastActive`), so the pin-reorder demo's ordering is intact.
-            let demoTitles = [
-                "demo-1": "Ship the iOS chat list",
-                "demo-2": "Weekend trip planning",
-                "demo-3": "Refactor the sync loop",
-                "demo-4": "Groceries and errands",
-                "demo-5": "Design review notes",
-            ]
+            let demoTitles =
+                appStoreData
+                ? [
+                    "demo-1": "LLM Wiki integration",
+                    "demo-2": "Weekend trip planning",
+                    "demo-3": "Memory benchmark review",
+                    "demo-4": "Save interview notes to memory",
+                    "demo-5": "Developer toolkit review",
+                    "demo-6": "HGM paper and harness evolution",
+                    "demo-7": "Release quality weekly",
+                    "demo-8": "Interactive release dashboard",
+                    "demo-9": "iOS release readiness",
+                    "demo-10": "Agent team architecture",
+                ]
+                : [
+                    "demo-1": "Ship the iOS chat list",
+                    "demo-2": "Weekend trip planning",
+                    "demo-3": "Refactor the sync loop",
+                    "demo-4": "Groceries and errands",
+                    "demo-5": "Design review notes",
+                ]
             for (id, title) in demoTitles {
                 SessionIndex.shared.applyTitle(sessionId: id, title: title)
             }
             // Reset unread first so repeated headless launches show a stable
             // count (it persists in sessions.json, so an unbalanced bump would
             // accumulate across runs), then seed exactly one on two rows.
-            for i in 1...6 {
+            for i in 1...rowCount {
                 SessionIndex.shared.clearUnread("demo-\(i)")
             }
             // Badge demo-1 / demo-5 (not the pinned demo-3) so the screenshot
@@ -517,6 +549,14 @@ final class AppStore: ObservableObject {
                     .projectIssue(
                         ProjectIssueRoute(projectId: ProjectsStore.demoBoardId, number: 41)),
                 ]
+            }
+            if AppStoreScreenshotData.launchesBoard,
+                let project = projectsStore.projects.first(where: {
+                    $0.name == AppStoreScreenshotData.boardProjectName
+                })
+            {
+                homeTab = .projects
+                chatPath = [.projectBoard(project.id)]
             }
             route = .home
             if args.contains("-baybo-demo-projects") { issueHostPool.prewarm() }

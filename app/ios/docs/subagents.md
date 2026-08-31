@@ -304,10 +304,10 @@ look at a child session.
 
 ## Testing
 
-`app/ios` has **no CI** — all three iOS jobs are `if: false` while the Actions
-quota is out, and a draft PR reports `skipping` with exit 0, which reads exactly
-like green. Every tier here is laptop-only; say in the PR body what you actually
-ran.
+`app/ios` has CI again — all three iOS jobs are on — but a **draft** PR still
+reports `skipping` with exit 0, which reads exactly like green. Confirm the jobs
+say `pass` before trusting them, and say in the PR body what you ran on a device,
+which no job does.
 
 The predicate is the part worth real tests, gateway-side, and those exist in
 `crates/gateway/tests/chat_api.rs`: a non-`owner` root, a hidden one-shot cron

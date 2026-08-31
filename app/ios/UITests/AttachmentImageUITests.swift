@@ -21,6 +21,7 @@ final class AttachmentImageUITests: BayboUITestCase {
     private static let declaredVectorIndex = 4
     private static let viewBoxVectorIndex = 5
     private static let cardCount = 6
+    private static let loadingLabel = "Loading image…"
 
     /// The transcript is a webview, but each decoded image card surfaces as a
     /// Button — labelled, not identified, since the label is what the web side
@@ -29,19 +30,24 @@ final class AttachmentImageUITests: BayboUITestCase {
         app.buttons.matching(NSPredicate(format: "label == %@", "View image"))
     }
 
-    /// Every card of the demo turn, decoded. A card's button only exists once
-    /// its blob has landed (the demo serves them 2s in), so the count IS the
-    /// readiness signal.
+    /// Every card of the demo turn, decoded. The button appears when its blob
+    /// URL lands, before the image's `onLoad` retires the loading frame. Waiting
+    /// for both prevents a tap from landing while the decoded cards reflow.
     private func waitForCards(_ app: XCUIApplication) -> [XCUIElement] {
         let all = cards(app)
+        let loading = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", Self.loadingLabel))
         let deadline = Date().addingTimeInterval(Self.webviewTimeout)
         repeat {
-            if all.count >= Self.cardCount { break }
+            if all.count >= Self.cardCount && loading.count == 0 { break }
             RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         } while Date() < deadline
         XCTAssertEqual(
             all.count, Self.cardCount,
             "the demo turn's image cards never all decoded")
+        XCTAssertEqual(
+            loading.count, 0,
+            "the demo turn's image cards never finished decoding")
         return all.allElementsBoundByIndex
     }
 
@@ -81,14 +87,26 @@ final class AttachmentImageUITests: BayboUITestCase {
     }
 
     /// A tap lands on the element's CENTRE, and the demo turn is taller than the
-    /// screen — the thread opens at its newest edge, so the earliest cards sit
-    /// ABOVE the viewport (measured: the banner at y = -72) where that centre is
-    /// off screen and the tap silently hits nothing. Scroll it into view first.
+    /// screen — the thread opens at its newest edge, so the earliest cards can
+    /// sit under the header. XCUITest still calls a partly clipped web element
+    /// hittable, so use the actual header and dock as the interactive viewport.
     private func tap(_ card: XCUIElement, in app: XCUIApplication) {
-        for _ in 0..<6 where !card.isHittable {
-            if card.frame.midY < app.frame.midY { app.swipeDown() } else { app.swipeUp() }
+        let visibleTop = app.buttons["Back to conversations"].frame.maxY
+        let visibleBottom = app.buttons["composer-attach"].frame.minY
+        for _ in 0..<6 {
+            let frame = card.frame
+            if card.isHittable && frame.minY >= visibleTop && frame.maxY <= visibleBottom {
+                break
+            }
+            if frame.midY < (visibleTop + visibleBottom) / 2 {
+                app.swipeDown()
+            } else {
+                app.swipeUp()
+            }
         }
-        XCTAssertTrue(card.isHittable, "the card never came into view to be tapped")
+        XCTAssertTrue(
+            card.isHittable && card.frame.minY >= visibleTop && card.frame.maxY <= visibleBottom,
+            "the card never cleared the header and dock to be tapped")
         card.tap()
     }
 
