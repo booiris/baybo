@@ -27,6 +27,8 @@ origin_channel_plugin
 # editor / tooling
 .idea
 .zed/
+.vscode/
+.githooks/
 .claude/agents
 .claude/commands
 .claude/settings.json
