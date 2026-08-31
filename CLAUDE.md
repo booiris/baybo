@@ -64,12 +64,19 @@ side: `gh pr checks --watch` on a draft reports every job as `skipping` and
 confirm the gating jobs actually say `pass`. If they say `skipping`, CI has never
 seen the code.
 
-The three iOS jobs are ON again, so `app/ios` is covered by CI: `ios-web` and
+The three iOS jobs are ON, so `app/ios` is covered by CI: `ios-web` and
 `ios-core` on ubuntu, `ios-sim` on `macos-26`. They were `if: false` for a while
-(see `61eb9246`) because the macOS job bills at 10× Linux minutes, so keep the
-cost in view — each is gated on the `changes` filter that matches its price, and
-widening `IOS_DEPS` puts more PRs on a Mac. Coverage still stops at the
-simulator: no job touches a device, and the UI smokes are non-gating.
+(see `61eb9246`) when this repo was private and the Actions quota ran out. **The
+repo is public now and standard runners — `macos-26` included — are free and
+unlimited, so minutes are not a reason to skip a job.** What the path filters
+still buy is wall-clock and macOS queue slots (the free plan allows 20 concurrent
+jobs but only 5 macOS), so widening `IOS_DEPS` is a latency decision, not a
+billing one.
+
+Coverage stops at the simulator: no job touches a device, and the UI smokes are
+non-gating. And because the repo is public, workflow logs and uploaded artifacts
+are readable by anyone — `ios-sim` publishes an xcresult with UI-test
+screenshots on every run.
 
 ## Code Style
 

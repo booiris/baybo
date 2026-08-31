@@ -5,7 +5,8 @@
 ## The four tiers
 
 Four tiers. The whole base — Rust + the transcript bundle — is plain Linux work
-and runs on ubuntu in CI at 1x; only the Swift half pays the macOS 10x.
+and runs on ubuntu in CI; only the Swift half needs a Mac, and that is the slow
+tier for it.
 
 ```bash
 # Rust core (app/ios workspace — the ROOT workspace excludes it, so the root
@@ -235,29 +236,46 @@ Demo flags are only hermetic with it.
 ## CI
 
 CI (`.github/workflows/ci.yml`) defines three iOS jobs and **runs all three**.
-They were `if: false` for a stretch while the Actions quota was out; what that
-period established is that the cost is real and unevenly spread, which is why
-each job is gated on the filter matching its own price rather than one shared
-gate.
+They were `if: false` for a stretch while the Actions quota was out. That is
+over: the repo is public, and standard GitHub-hosted runners — `macos-26`
+included — are free and unlimited on a public repo. **Minutes are no longer a
+reason to skip anything here.**
 
-- `ios-web` (ubuntu, 1×, gated on `ios`) — `pnpm lint && pnpm test && pnpm build`
-  in `app/ios/web`. `pnpm build` is `tsc --noEmit && vite build`, and that
-  typecheck is the only place the two compile-time drift sentinels are ever
+What the gating still defends is time and the macOS queue: the free plan runs
+20 concurrent jobs but only **5 concurrent macOS** ones account-wide, so each
+job is filtered to the change it actually answers for.
+
+- `ios-web` (ubuntu, gated on `ios`, ~2 min) — `pnpm lint && pnpm test &&
+  pnpm build` in `app/ios/web`. `pnpm build` is `tsc --noEmit && vite build`,
+  and that typecheck is the only place the compile-time drift sentinels are ever
   evaluated: `src/wireSentinel.ts` (frame mirrors ⇄ the ts-rs contract in
-  `crates/wire`) and `src/restSentinel.ts` (`TranscriptRowItem` ⇄ the gateway's
-  `ChatTranscriptItem`). Nothing else has a runtime component that would catch
-  either.
-- `ios-core` (ubuntu, 1×, gated on `ios`) — `cargo fmt` / `clippy` / `nextest`
-  over the ffi workspace. It shares no cache with the root workspace, so a cold
-  run pays a ~286-crate build: 1× minutes, but ~15-25 of them.
-- `ios-sim` (macos-26, 10×, gated on `ios_native`) — the build + unit tests, and
-  the UI smokes **non-gating**. This is the expensive one, and `ios_native`
-  deliberately fires on `crates/{wire,device-proto,model}` and `remote-host/`
-  too, so a PR with nothing iOS-shaped about it can still put a Mac on the
-  clock.
+  `crates/wire`), `src/restSentinel.ts` (`TranscriptRowItem` ⇄ the gateway's
+  `ChatTranscriptItem`) and `src/issue/issueSentinel.ts`. Nothing else has a
+  runtime component that would catch any of them.
+- `ios-core` (ubuntu, gated on `ios`, ~15-25 min cold) — `cargo fmt` / `clippy` /
+  `nextest` over the ffi workspace. It shares no cache with the root workspace,
+  so a cold run pays a full ~286-crate build.
+- `ios-sim` (macos-26, gated on `ios_native`, ~25-40 min cold) — the build +
+  unit tests, with the UI smokes **non-gating**. The slow one, and the only one
+  that takes a macOS slot. `ios_native` deliberately fires on
+  `crates/{wire,device-proto,model}` and `remote-host/` too, so a PR with
+  nothing iOS-shaped about it can still queue for a Mac — that is the cost of
+  the gate having no hole where the wire contract lives.
 
-What no job reaches is **a physical device**. The device checklist below is
-still hand-run, and a green CI does not stand in for it.
+Two things a green CI does **not** mean:
+
+- **No job reaches a physical device.** The device checklist below is still
+  hand-run.
+- **A draft PR reports `skipping` and exits 0.** Every job carries
+  `draft == false`, so `gh pr checks --watch` on a draft is indistinguishable
+  from green. `scripts/dev-merge-sync.sh` refuses to merge on that, and now
+  requires the three iOS checks whenever the PR's own diff says they should
+  have run.
+
+Because the repo is public, workflow logs and the `ios-xcresult` artifact are
+readable by anyone. The xcresult carries UI-test screenshots — of demo fixtures
+today, so nothing sensitive, but that is a fact to re-check before pointing a
+test at real data.
 
 All three are path-filtered — and the filter deliberately includes
 `crates/{wire,device-proto,model}`, `remote-host/` and `docs/openapi.json`,
