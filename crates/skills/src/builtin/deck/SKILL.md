@@ -67,15 +67,18 @@ cards need no `src/` — write `card.html` directly.
 }
 ```
 
-- `size`: `small` (1×1) | `wide` (2×1) | `large` (2×2). The install-time
-  default; the user's layout owns it afterwards. Must be a member of `sizes`.
+- `size`: the tile's footprint on the deck's 2-column grid, written
+  columns × rows — `small` (1×1, half width) | `wide` (2×1, full width) |
+  `large` (2×2, full width and double height). The install-time default; the
+  user's layout owns it afterwards. Must be a member of `sizes`.
 - `sizes` (optional): every grid size your `card.html` actually adapts to.
-  The user's ⤢ resize cycle is confined to this set, so **only list a size
-  you have laid out** — a size you declare but don't handle renders clipped.
-  Omit it for a single-size card (equivalent to `["<size>"]`); the ⤢ control
-  hides. Pick sizes that suit the data: one hero number fits `small`; a hero
-  plus a few rows wants `wide`; two rows of that or a small chart wants
-  `large`.
+  The user's resize cycle is confined to this set, so **only list a size you
+  have laid out** — a size you declare but don't handle renders clipped. They
+  cycle it with the ⤢ on the tile, which appears only after they tap **Edit**
+  in the Deck header; omit `sizes` for a single-size card (equivalent to
+  `["<size>"]`) and the ⤢ never shows. Pick sizes that suit the data: one
+  hero number fits `small`; a hero plus a few rows wants `wide`; two rows of
+  that or a small chart wants `large`.
 - `maximize` (optional, default false): declare `true` only if you provide a
   full-screen `"max"` layout (see below). It adds a ⛶ button in the tile's
   **top-right** — so if you set it, keep the top-right ~34×34pt of every
@@ -507,7 +510,12 @@ Every install/update/purge is auto-committed to a git repo under the deck
 root, so the operator can diff and roll back a card by hand — you don't
 manage that, but it's why editing from the real source matters.
 
-Tell the user the card is on their Deck once the install succeeds. Do
-not fabricate data sources: if the user's request needs an API you can't
-reach or credentials that don't exist, say so and build the closest
-honest card instead.
+Tell the user the card is on their Deck once the install succeeds, and name
+the grid sizes it can be shown at — `small` (1×1, half width), `wide` (2×1,
+full width), `large` (2×2, full width and double height) — listing the ones
+you put in `sizes` and what each looks like. If there is more than one, say
+how to switch: tap **Edit** in the Deck header, then ⤢ on the tile. If there
+is only one, say the card is fixed at that size rather than implying a resize
+that isn't there. Do not fabricate data sources: if the user's request needs
+an API you can't reach or credentials that don't exist, say so and build the
+closest honest card instead.

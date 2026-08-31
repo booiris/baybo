@@ -440,7 +440,7 @@ Layout lives **server-side** (`deck_cards.position`/`size`) with the `SessionInd
 
 ### Install UX
 
-Creation is live: `DeckChanged` fires only after the dry-run gate has stored the first snapshot, so the card arrives on the deck **already populated** — the refetch it triggers carries the snapshot, and any loading face lasts only the iframe-boot instant — typically before the agent's chat reply lands. The reply says so in words — the skill has the agent tell the user the card is on their Deck; there is no deep link (the tab is one tap away). No modal and no per-card phone confirmation, consistent with the trust model.
+Creation is live: `DeckChanged` fires only after the dry-run gate has stored the first snapshot, so the card arrives on the deck **already populated** — the refetch it triggers carries the snapshot, and any loading face lasts only the iframe-boot instant — typically before the agent's chat reply lands. The reply says so in words — the skill has the agent tell the user the card is on their Deck and name the grid sizes it can be shown at (and, when it has more than one, that Edit → ⤢ switches between them); there is no deep link (the tab is one tap away). No modal and no per-card phone confirmation, consistent with the trust model.
 
 ### Client build, localization, CI
 
