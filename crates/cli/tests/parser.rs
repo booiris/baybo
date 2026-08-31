@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use baybo_cli::cli::{
-    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, DeviceCmd, LlmCmd, LogCmd, SessionCmd,
-    ShellKind, SkillsCmd, TurnCmd, TurnStatusArg,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, DeviceCmd, GatewayCmd, LlmCmd, LogCmd,
+    SessionCmd, ShellKind, SkillsCmd, TurnCmd, TurnStatusArg,
 };
 use clap::Parser;
 
@@ -173,6 +173,17 @@ fn device_pair_parses_separate_proxy_and_push_urls() {
 fn setup_takes_no_args() {
     let cli = parse(&["setup"]);
     assert!(matches!(cli.command, Some(Commands::Setup)));
+}
+
+#[test]
+fn gateway_restart_parses() {
+    let cli = parse(&["gateway", "restart"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Gateway {
+            cmd: GatewayCmd::Restart
+        })
+    ));
 }
 
 #[test]

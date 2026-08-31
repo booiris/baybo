@@ -103,12 +103,17 @@ impl ServiceInstaller for SystemdInstaller {
     }
 
     fn enable(&self) -> Result<()> {
-        self.systemctl(&["enable", UNIT_NAME])?;
+        self.systemctl(&["enable", "--now", UNIT_NAME])?;
+        Ok(())
+    }
+
+    fn restart(&self) -> Result<()> {
+        self.systemctl(&["restart", UNIT_NAME])?;
         Ok(())
     }
 
     fn disable(&self) -> Result<()> {
-        self.systemctl(&["disable", UNIT_NAME])?;
+        self.systemctl(&["disable", "--now", UNIT_NAME])?;
         Ok(())
     }
 

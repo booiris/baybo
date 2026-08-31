@@ -86,6 +86,7 @@ pub trait ServiceInstaller {
     fn render_unit(&self, ctx: &InstallContext) -> String;
     fn install(&self, ctx: &InstallContext) -> Result<PathBuf>;
     fn enable(&self) -> Result<()>;
+    fn restart(&self) -> Result<()>;
     fn disable(&self) -> Result<()>;
     fn uninstall(&self) -> Result<()>;
     fn status(&self) -> Result<ServiceStatus>;

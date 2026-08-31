@@ -16,7 +16,8 @@
 //! The gateway is driven by the CLI command tree `baybo gateway ...`:
 //! `start` runs both listeners in the foreground; `install` writes a
 //! platform service unit; `enable` mints the admin token (if absent) and
-//! marks the service to autostart at boot.
+//! enables and starts the service; `restart` and `disable` manage the
+//! running service lifecycle.
 
 pub mod api;
 pub mod auth;

@@ -924,9 +924,11 @@ pub enum GatewayCmd {
         #[arg(long)]
         exec_start: Option<String>,
     },
-    /// Mint the auth token if absent and enable autostart at boot.
+    /// Mint the auth token if absent, enable autostart, and start the service.
     Enable,
-    /// Disable autostart at boot. Leaves the unit file in place.
+    /// Restart the installed gateway service.
+    Restart,
+    /// Disable autostart and stop the service. Leaves the unit file in place.
     Disable,
     /// Remove the service unit. The vault-stored token is left in
     /// place — use `token rotate` to invalidate a leaked one.

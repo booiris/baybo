@@ -48,8 +48,8 @@ to the same mpsc, so the pump is the single serialisation point onto the
 wire.
 
 The gateway is driven by the `baybo gateway …` command tree. `start` runs
-both listeners in the foreground; `install` / `enable` / `disable` /
-`uninstall` / `status` manage the platform service unit; `token
+both listeners in the foreground; `install` / `enable` / `restart` /
+`disable` / `uninstall` / `status` manage the platform service unit; `token
 {show|rotate}` manages the admin bearer token. The binary entrypoint
 intercepts `Commands::Gateway` in `crates/baybo/src/main.rs` before the CLI dispatcher
 and routes it to `crates/baybo/src/gateway_cmd.rs` — same pattern as `Commands::Tui`.
@@ -509,6 +509,7 @@ trait ServiceInstaller {
     fn render_unit(&self, ctx: &InstallContext) -> String;
     fn install(&self, ctx: &InstallContext) -> Result<PathBuf>;
     fn enable(&self) -> Result<()>;
+    fn restart(&self) -> Result<()>;
     fn disable(&self) -> Result<()>;
     fn uninstall(&self) -> Result<()>;
     fn status(&self) -> Result<ServiceStatus>;
@@ -553,9 +554,10 @@ before dispatch.
 | Subcommand                                | Effect                                                                                               | Mutating |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------- |
 | `start`                                   | Run the server in the foreground. Prints the dashboard URL (`http://<bind>`) and the admin token on separate lines — deliberately not a `?token=` URL, which would leak the token into the access log. | —        |
-| `install [--system] [--exec-start <p>]`   | Write the platform service unit. `--system` flips from user mode to root/system-wide.                 | yes      |
-| `enable`                                  | Mint the auth token if absent; best-effort enable the service for autostart.                          | yes      |
-| `disable`                                 | Mark the service as not autostarting at boot.                                                         | yes      |
+| `install [--system] [--exec-start <p>]`   | Write the platform service unit. A user-mode install prints `baybo gateway enable` as the next step. `--system` flips from user mode to root/system-wide. | yes      |
+| `enable`                                  | Mint the auth token if absent, enable the service for autostart, and start it immediately.            | yes      |
+| `restart`                                 | Restart the installed user service through the platform service manager.                              | yes      |
+| `disable`                                 | Disable autostart and stop the service immediately, leaving the unit file installed.                  | yes      |
 | `uninstall [--yes]`                       | Remove the service unit. The vault token is left in place; use `token rotate` to invalidate a leaked one. | yes      |
 | `status`                                  | Report `NotInstalled` / `Installed` / `Enabled` / `Running` / `Unknown`.                              | —        |
 | `token show`                              | Print the current token. Errors if none minted yet.                                                   | —        |

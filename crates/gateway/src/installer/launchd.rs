@@ -46,6 +46,12 @@ impl LaunchdInstaller {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+
+    fn service_target(&self) -> String {
+        // Safety: `getuid` cannot fail per POSIX.
+        let uid = unsafe { libc::getuid() };
+        format!("gui/{uid}/{LABEL}")
+    }
 }
 
 impl ServiceInstaller for LaunchdInstaller {
@@ -115,6 +121,12 @@ impl ServiceInstaller for LaunchdInstaller {
     fn enable(&self) -> Result<()> {
         let path = self.plist_path();
         self.launchctl(&["load", "-w", path.to_str().unwrap_or_default()])?;
+        self.launchctl(&["kickstart", "-k", &self.service_target()])?;
+        Ok(())
+    }
+
+    fn restart(&self) -> Result<()> {
+        self.launchctl(&["kickstart", "-k", &self.service_target()])?;
         Ok(())
     }
 

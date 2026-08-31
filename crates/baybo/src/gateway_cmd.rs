@@ -2,10 +2,10 @@
 //!
 //! Intercepted from `main.rs` before the normal argv dispatch path
 //! (same pattern as `Commands::Tui`). The non-serving subcommands
-//! (`install`, `disable`, `uninstall`, `status`, `enable`, `token`) run
-//! here with a lightweight boot: they need only the config for path
-//! resolution, plus — for the auth-token branch — a `SecretVault`
-//! opened against the project's sqlite store.
+//! (`install`, `enable`, `restart`, `disable`, `uninstall`, `status`,
+//! `token`) run here with a lightweight boot: they need only the config
+//! for path resolution, plus — for the auth-token branch — a
+//! `SecretVault` opened against the project's sqlite store.
 //!
 //! `start` is a long-running server: it acquires the per-workspace
 //! singleton, builds the full manager graph via [`crate::runtime`]
@@ -67,6 +67,7 @@ pub async fn run(cmd: GatewayCmd) -> anyhow::Result<()> {
             install_service(&config, system, exec_start.map(PathBuf::from))
         }
         GatewayCmd::Enable => enable(&config).await,
+        GatewayCmd::Restart => restart(&config),
         GatewayCmd::Disable => disable(&config),
         GatewayCmd::Uninstall { yes: _ } => uninstall(&config).await,
         GatewayCmd::Status => status(&config),
@@ -166,6 +167,18 @@ fn install_service(
         .install(&ctx)
         .map_err(|e| anyhow::anyhow!("install failed: {e}"))?;
     println!("installed {}", path.display());
+    if !system {
+        println!("next: run `baybo gateway enable` to enable and start the service");
+    }
+    Ok(())
+}
+
+fn restart(_config: &BayboConfig) -> anyhow::Result<()> {
+    let installer = make_installer(true)?;
+    installer
+        .restart()
+        .map_err(|e| anyhow::anyhow!("restart failed: {e}"))?;
+    println!("gateway restarted");
     Ok(())
 }
 
@@ -174,7 +187,7 @@ fn disable(_config: &BayboConfig) -> anyhow::Result<()> {
     installer
         .disable()
         .map_err(|e| anyhow::anyhow!("disable failed: {e}"))?;
-    println!("disabled");
+    println!("gateway disabled and stopped");
     Ok(())
 }
 
@@ -203,18 +216,12 @@ async fn enable(config: &BayboConfig) -> anyhow::Result<()> {
     let token_mgr = AdminToken::new(vault);
     let token = token_mgr.mint_if_absent().await?;
 
-    // Best-effort mark the unit enabled — not fatal if the service
-    // isn't installed yet; `enable` is allowed before `install`.
-    match make_installer(true) {
-        Ok(installer) => {
-            if let Err(e) = installer.enable() {
-                tracing::warn!(error = %e, "unit not enabled; run `baybo gateway install` first");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "no installer available"),
-    }
+    let installer = make_installer(true)?;
+    installer
+        .enable()
+        .map_err(|e| anyhow::anyhow!("enable failed: {e}"))?;
 
-    println!("gateway enabled; token: {token}");
+    println!("gateway enabled and started; token: {token}");
     Ok(())
 }
 
