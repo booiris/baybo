@@ -29,7 +29,7 @@ Bottom-up along the dependency graph:
 ### Capability and Governance Layer
 
 - **[process](process.md)** — Unified Unix subprocess ownership: process groups, managed child guards, bounded shutdown, force-exit reaping, and token-validated crash ledgers. Runtime code may not call raw `Command::spawn` outside this crate.
-- **llm** — LLM provider wrapping and response parsing. Subscription/OAuth flavoured providers documented in [`llm-openai-subscription.md`](llm-openai-subscription.md).
+- **llm** — LLM provider wrapping and response parsing. The ChatGPT/Codex subscription provider (`openai-subscription`: Codex OAuth plus the Codex Responses API, no API key) is documented in [`llm-openai-subscription.md`](llm-openai-subscription.md).
 - **tools** — Tool abstraction, registration, capability declarations, runtime routing. The `mcp` submodule ships an MCP client (config in `<workspace>/.mcp.json`, OAuth via rmcp) that surfaces every server's tools to the agent loop as `<server>/<tool>`; the `McpReconciler` keeps the registry in sync without a gateway restart.
 - **[sandbox](sandbox.md)** — OS-native per-invocation isolation for tools declaring `ToolCapability::ExecCommand`. `bwrap` on Linux, `sandbox-exec` on macOS, `docker` as a cross-platform fallback when the native backend is unavailable; the `ToolExecutor` injects a `SandboxAdapter` into `ToolContext.sandbox` when available. If Baybo detects an outer container/sandbox, Bash silently skips the inner sandbox; if no backend is available on a non-container host, Bash warns before running without it. Filesystem-scoped to the workspace; network gated all-or-nothing on the manifest's `Http` capability.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.

@@ -193,6 +193,14 @@ a `?token=` URL, which would leak it into the access log).
   "medium"`, without checking whether the selected provider or model supports
   thinking. Providers with no effort wiring ignore the preference; if support
   is added later, the entry already carries the setup default.
+- Every entry also carries a `lite_model`. For most providers it names the
+  entry's own model and is inert; an `openai-subscription` entry instead gets
+  `gpt-5.6-terra` plus the matching `model_list` row that config validation
+  requires (`lite_seed` in `flow/llm.rs` decides both together, because a
+  mismatch would fail `config.validate()` *after* the OAuth bundle is already
+  in the vault). The seed falls back to the inert form when the live catalog
+  doesn't offer the model — including when model discovery failed outright.
+  See §"lite_model" in [`config.md`](config.md).
 - The Full-only channel step always offers `Add (another) / Skip`
   because the runner calls it with `allow_skip = true`.
 - Quick setup does not inspect or mutate channel or external-agent
@@ -303,7 +311,7 @@ pub mod test_support {
 | -------------------- | ----------------------------------------------------------------------- |
 | `baybo-config`        | `BayboConfig` (load/validate/write), `LlmEntry`, `BrowserConfig`         |
 | `baybo-security`      | `EncryptionKey::new`, `SecretVault::new`/`store_secret`                 |
-| `baybo-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`). (The provider picker is driven by `LlmProviderRegistry::with_default_providers().provider_names()`, so registry additions appear automatically.) |
+| `baybo-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, `LITE_MODEL`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`). (The provider picker is driven by `LlmProviderRegistry::with_default_providers().provider_names()`, so registry additions appear automatically — and **registration order is picker order**, which is why `openai-subscription` is registered first: it is the only keyless provider and the menu viewport shows ~12 of the 19 rows.) |
 | `baybo-channels`      | `register_wire::*`, `registration::Prompter` + `RegistrationResult`     |
 | `baybo-storage`       | `Store::open`, `retry_on_busy`. (`ChannelBotStore` is defined in `baybo-store` and imported via `baybo_store::ChannelBotStore`.) |
 | `baybo-workspace`     | `WorkspacePaths`, `ensure_layout`, `default_workspace_root` |

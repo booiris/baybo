@@ -1,6 +1,7 @@
 //! OpenAI ChatGPT/Codex subscription provider. See
 //! `docs/modules/llm-openai-subscription.md` for design rationale.
 
+mod catalog;
 mod completion_model;
 mod factory;
 mod oauth;
@@ -16,6 +17,7 @@ pub const PROVIDER_NAME: &str = "openai-subscription";
 /// Vault key the OAuth bundle is persisted under (single profile).
 pub const VAULT_KEY_TOKENS: &str = "llm.openai-subscription.tokens";
 
+pub use catalog::LITE_MODEL;
 pub use completion_model::{DEFAULT_BASE_URL, OpenAiSubscriptionCompletionModel};
 pub use factory::{OpenAiSubscriptionProviderFactory, UNSAFE_BASE_URL_ENV_VAR};
 pub use oauth::{

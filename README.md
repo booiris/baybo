@@ -28,7 +28,8 @@ with per-call cost accounting.
 - **Multi-channel** — web dashboard, terminal UI, one-shot CLI, Telegram and WeChat
   bots, and an end-to-end-encrypted iOS companion app. New channels plug in through a
   TypeScript sidecar SDK.
-- **19 LLM providers** — Anthropic, OpenAI (API and ChatGPT-subscription OAuth), Gemini,
+- **19 LLM providers** — Anthropic, OpenAI (API key, or your ChatGPT/Codex
+  subscription over OAuth — the Codex Responses API, no API key), Gemini,
   DeepSeek, xAI, Mistral, Groq, Ollama, llamafile, and more; per-session model
   switching, live config reload.
 - **Tools & MCP** — built-in `Read`/`Write`/`Edit`/`Bash`/`Grep`/`WebFetch`/`WebSearch`

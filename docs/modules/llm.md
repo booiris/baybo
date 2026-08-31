@@ -20,7 +20,7 @@ Core responsibilities:
 
 `OpenAiSubscription` bypasses the rig adapter: it speaks the Codex Responses API directly over HTTP with its own OAuth dance; it plugs into the same enum dispatch as the rig providers — `LlmClient` builds the rig `CompletionRequest` normally, and `OpenAiSubscriptionCompletionModel` converts it into a Codex Responses API request with custom auth and 401-refresh handling.
 
-Subprocess-driven agents (the `claude` binary) are **not** LLM providers and live outside this crate. See [`external-agents.md`](../external-agents.md).
+Subprocess-driven agents (the `claude` and `codex` binaries) are **not** LLM providers and live outside this crate. See [`external-agents.md`](../external-agents.md). In particular the `codex` external agent is a different thing from the `openai-subscription` provider: one shells out to a host CLI, the other speaks the Codex Responses API in-process. They bill against the same ChatGPT plan and share nothing else.
 
 ### Streaming
 
@@ -28,7 +28,7 @@ Subprocess-driven agents (the `claude` binary) are **not** LLM providers and liv
 
 ### Provider registry pattern
 
-`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic, Gemini, MiniMax, DeepSeek, xAI, Mistral, Cohere, Perplexity, Moonshot, Z.ai, XiaomiMiMo, Groq, Together, Ollama, llamafile, Hyperbolic, HuggingFace, OpenAI-subscription) are registered by the crate itself. New providers are added by implementing `LlmProviderFactory` and registering it.
+`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI-subscription, OpenAI, Anthropic, Gemini, MiniMax, DeepSeek, xAI, Mistral, Cohere, Perplexity, Moonshot, Z.ai, XiaomiMiMo, Groq, Together, Ollama, llamafile, Hyperbolic, HuggingFace) are registered by the crate itself. Registration order is picker order — `provider_names()` returns it verbatim and the setup wizard renders that — so `openai-subscription` is registered first: it is the only provider that needs no API key, and the wizard's menu shows ~12 of the 19 rows at a time. New providers are added by implementing `LlmProviderFactory` and registering it.
 
 ### Multimodal support
 

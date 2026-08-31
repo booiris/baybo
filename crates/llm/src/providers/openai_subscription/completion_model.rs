@@ -17,6 +17,7 @@ use rig::message::Message;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use super::catalog;
 use super::oauth::ORIGINATOR;
 use super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
 use super::token_bundle::OAuthTokenBundle;
@@ -241,7 +242,9 @@ impl OpenAiSubscriptionCompletionModel {
         Ok(self.adapt_response(response))
     }
 
-    /// Live model discovery against `<base>/codex/models`.
+    /// Live model discovery against `<base>/codex/models`, widened by
+    /// [`catalog::supplement`] with the gpt-5.6 slugs the endpoint may
+    /// not list yet.
     pub async fn list_remote_models(&self) -> crate::Result<Vec<crate::LiveModelInfo>> {
         let url = format!(
             "{}/codex/models?client_version={}",
@@ -264,7 +267,7 @@ impl OpenAiSubscriptionCompletionModel {
                 format!("openai-subscription: GET /codex/models returned {status}: {body}"),
             ));
         }
-        parse_models_response(resp).await
+        Ok(catalog::supplement(parse_models_response(resp).await?))
     }
 
     async fn send_models_get(
