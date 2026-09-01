@@ -395,11 +395,13 @@ declared aux assets next to it), then the supervisor polls
 `ChannelBotStore` on a 2s discovery tick and starts one supervised task
 per embedded channel type the first time it reports ≥1 registered bot (a
 channel with no bots never spawns); each task runs
-`Command::new("bun").arg(bundle).spawn()` through `ChannelSpawner` and
+`Command::new(bun).arg(bundle).spawn()` through `ChannelSpawner` and
 restarts on exit with exponential backoff
 (500ms → 30s, reset after ≥60s of stable uptime). The `bun` executable
-is resolved from `PATH`; set `BAYBO_BUN_BIN` to point at a specific
-install. Shutdown fans out via the shared `ShutdownSignal` — children
+is located by `baybo_process::HostTool::bun()` — `BAYBO_BUN_BIN` if set,
+else `PATH`, else the well-known per-user install roots — re-resolved on
+every attempt, so installing a missing `bun` mid-backoff brings the
+sidecar up without restarting the gateway. Shutdown fans out via the shared `ShutdownSignal` — children
 are SIGKILLed and awaited. Bringing up a custom sidecar out-of-tree is
 still possible: export the two env vars yourself (or pass `wsUrl` /
 `token` to `runChannel`) and run the process however you like.

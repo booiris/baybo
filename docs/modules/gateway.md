@@ -533,6 +533,70 @@ real footgun from early versions and the refusal is intentional.
 under `EnvironmentVariables` in the launchd plist). systemd does not
 inherit the invoking shell's env, so the capture is load-bearing.
 
+### `PATH` is generated, never snapshotted
+
+The same "no inherited env" rule bites harder for `PATH`, and silently:
+a systemd **user** unit runs with the user manager's default
+(`/usr/local/bin:/usr/bin`), so every host tool installed under `$HOME`
+— `bun`, `uv`, the external-agent CLIs — is missing from the daemon
+while the operator runs them fine from their own shell. Both generators
+therefore emit a `PATH`, built by `installer::resolve_service_path()`.
+
+It is derived from **need**, not inheritance: walk the installing
+process's `PATH` in order, keep only the dirs that actually contain one
+of `SERVICE_PATH_TOOLS` (the runtime inventory in
+[`docs/external-commands.md`](../external-commands.md)), then append the
+system bin dirs. Keeping `PATH` order means the service resolves the
+same `bun` the operator's shell does; keeping only tool-bearing dirs is
+what makes the result durable.
+
+Snapshotting the operator's `PATH` whole was rejected. A real one is
+20+ entries of toolchain shims, SDK dirs and editor-server paths whose
+names embed a commit hash or version — they rot on the next upgrade, and
+baking them into a unit file means nothing notices. On the machine this
+was designed against, generation kept 2 of 15 non-system entries and
+dropped every hash-bearing one. Probing the login shell
+(`$SHELL -lc 'echo $PATH'`) was rejected too: it runs the operator's rc
+files at install time, and this repo's own `.zshrc` sources `$PWD/.env`,
+which would make the generated `PATH` depend on the directory `install`
+happened to run from.
+
+The complement lives in `baybo_process::HostTool`, which falls back to
+the well-known per-user install roots when `PATH` misses. That is what
+rescues a unit installed *before* this existed — the population a
+generator change cannot reach, because their unit file is already on
+disk. Repair those by re-running `baybo gateway install`, or with a
+`baybo-gateway.service.d/` drop-in.
+
+### `--system` names the account, or refuses
+
+A `[Service]` block with no `User=` runs as **root**. The paths baked
+into that same unit, though, came from whoever ran the install —
+`log_dir` from `config.workspace.path`, `config_path` from the invoking
+env. So the natural default was a root daemon writing a user-owned
+workspace, leaving root-owned `storage.db`, vault and `personas/` that
+the user's own CLI and TUI can then no longer write.
+
+`installer::resolve_service_user()` resolves the account and
+`InstallContext.run_as` carries it; `Some` renders `User=`, `None` (a
+per-user install) renders nothing, because a user unit naming an account
+is an error. `Group=` is deliberately never emitted — systemd defaults
+it to the user's primary group, which is both what we want and the one
+thing we cannot get wrong.
+
+The resolution order is `--run-as` → `SUDO_USER` → `PKEXEC_UID`, and
+`getuid()` is deliberately **absent** from it: `--system` writes
+`/etc/systemd/system`, so it only succeeds when already root, which
+makes `getuid()` return 0 in every real invocation — `User=0` is root,
+i.e. exactly the bug. When nothing resolves (a plain root login, a
+container, a provisioning script) the install **fails** before writing
+anything rather than falling back to root. A root-owned deployment
+stays reachable, just never by accident: `--run-as root`.
+
+Note `--system` is a no-op shape on macOS — `for_current_platform`
+returns the `LaunchdInstaller` either way, and a LaunchAgent already
+runs as the user. `run_as` is ignored there.
+
 ### Service unit hardening — no restart-loop footgun
 
 Both unit files include a small restart delay (`RestartSec=2s` on

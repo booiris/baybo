@@ -2,8 +2,8 @@
 //!
 //! The gateway ships each in-tree sidecar (`sidecars/channel/*`) as a
 //! zstd-compressed JS bundle, baked in at build time by `build.rs`.
-//! Sidecars run on the host's `bun` binary (resolved from `PATH`,
-//! override with [`BUN_BINARY_ENV`]) — no JS runtime is shipped
+//! Sidecars run on the host's `bun` binary (located by
+//! [`baybo_process::HostTool`]) — no JS runtime is shipped
 //! inside the gateway binary. At boot the gateway materialises every
 //! embedded bundle to the user's cache directory (once per bundle
 //! hash) and hands [`ChannelSpawner`] a `Command` so every sidecar
@@ -30,5 +30,5 @@ pub(crate) mod pipe_pump;
 mod supervisor;
 
 pub use assets::{SidecarError, SidecarRuntime, domains};
-pub use embedded_mcp::{NODE_BINARY_ENV, collect_profiles, node_binary};
-pub use supervisor::{BUN_BINARY_ENV, SidecarSupervisor};
+pub use embedded_mcp::collect_profiles;
+pub use supervisor::SidecarSupervisor;

@@ -6,13 +6,12 @@
 //! `crates/cli/src/commands/channel/register.rs` — only the error
 //! type changed (`CliError` → `SetupError`).
 
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use baybo_channels::register_wire::{MAX_FRAME_BYTES, PromptKind, RegisterIn, RegisterOut};
 use baybo_channels::registration::{Prompter as ChannelPrompter, RegistrationResult};
-use baybo_gateway::{BUN_BINARY_ENV, SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
+use baybo_gateway::{SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
 use baybo_model::ChannelType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
@@ -39,7 +38,7 @@ pub async fn run_registration(
         ))
     })?;
 
-    let mut cmd = Command::new(bun_binary());
+    let mut cmd = Command::new(baybo_process::HostTool::bun().path());
     cmd.arg(bundle);
     scrubbed_env(&mut cmd);
     drive(
@@ -49,12 +48,6 @@ pub async fn run_registration(
         timeout,
     )
     .await
-}
-
-fn bun_binary() -> PathBuf {
-    std::env::var_os(BUN_BINARY_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("bun"))
 }
 
 async fn drive(
