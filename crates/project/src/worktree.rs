@@ -179,6 +179,12 @@ pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> 
     }
 
     let existing = branch_exists(repo, branch).await?;
+    // Only a *new* branch needs somewhere to start; re-opening one that
+    // already carries commits needs nothing of HEAD, and a card cut before
+    // this rule existed has to stay openable.
+    if !existing {
+        ensure_a_root_commit(repo).await?;
+    }
     let root_str = root.to_string_lossy().into_owned();
     let mut args: Vec<&str> = vec!["worktree", "add", "--quiet"];
     if !existing {
@@ -193,6 +199,111 @@ pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> 
         git(repo, &args).await?;
     }
     Ok(checkout)
+}
+
+/// Give a repository that has never been committed to the root commit a new
+/// branch has to be cut from, or say why only a person can.
+///
+/// `git worktree add -b` resolves HEAD to pick the new branch's start point,
+/// and an unborn HEAD has nothing to answer with. Git before 2.43 says so —
+/// `fatal: not a valid object name: 'HEAD'` — but 2.43 and later quietly cut
+/// an **orphan** instead, and that is the worse half: the checkout is of the
+/// empty tree, so a run on a repository full of the operator's files is handed
+/// an empty directory; the branch shares no history with any other card, so
+/// `merge` can only ever answer `refusing to merge unrelated histories`; and
+/// the auto-orphan stops the moment the first card commits, so the *next* card
+/// fails with `fatal: invalid reference: HEAD` and nothing explains why.
+///
+/// A repository with nothing in it is seeded, because an empty root commit is
+/// the only first commit it could have had. One with uncommitted work in it is
+/// refused: what belongs in a first commit is the operator's call, and baybo
+/// answering it for them would either commit files they never chose or hand
+/// the run an empty tree.
+pub(crate) async fn ensure_a_root_commit(repo: &Path) -> Result<()> {
+    if head_is_born(repo).await? {
+        return Ok(());
+    }
+    let pending = run(repo, &["status", "--porcelain"]).await?;
+    if !pending.status.success() {
+        return Err(ProjectError::Workdir(anyhow::anyhow!(
+            "`git status` in {} failed: {}",
+            repo.display(),
+            String::from_utf8_lossy(&pending.stderr).trim(),
+        )));
+    }
+    if !String::from_utf8_lossy(&pending.stdout).trim().is_empty() {
+        return Err(ProjectError::RepositoryHasNoCommits {
+            workdir: repo.display().to_string(),
+        });
+    }
+
+    let trunk = read(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
+    let empty_tree = read(repo, &["hash-object", "-t", "tree", "/dev/null"]).await?;
+    // The commit is built with `commit-tree` rather than `git commit` so that
+    // neither the index nor the working tree is read: whatever the operator
+    // had staged stays staged, and stays theirs to commit.
+    let (name, email) = resolve_identity(repo)
+        .await
+        .unwrap_or_else(|| identity_or_fallback(""));
+    let root = read(
+        repo,
+        &[
+            "-c",
+            &format!("user.name={name}"),
+            "-c",
+            &format!("user.email={email}"),
+            "commit-tree",
+            "-m",
+            ROOT_COMMIT_MESSAGE,
+            &empty_tree,
+        ],
+    )
+    .await?;
+
+    // The empty old value means "only if it does not exist yet", which is what
+    // makes two dispatchers arriving here at once safe: the loser is told the
+    // ref moved, and the ref it lost to is the one it wanted.
+    if git(
+        repo,
+        &["update-ref", &format!("refs/heads/{trunk}"), &root, ""],
+    )
+    .await
+    .is_err()
+        && !head_is_born(repo).await?
+    {
+        return Err(ProjectError::Workdir(anyhow::anyhow!(
+            "could not give {} a first commit for `{trunk}` to start from",
+            repo.display(),
+        )));
+    }
+    tracing::info!(repo = %repo.display(), branch = %trunk, "gave a commit-less project repository its first commit");
+    Ok(())
+}
+
+/// What an empty repository's one possible commit is called.
+const ROOT_COMMIT_MESSAGE: &str = "Initial commit";
+
+/// Whether the repository has a commit for a new branch to start from.
+async fn head_is_born(repo: &Path) -> Result<bool> {
+    Ok(run(repo, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .await?
+        .status
+        .success())
+}
+
+/// Run a git command that answers with one line, and take that line.
+async fn read(repo: &Path, args: &[&str]) -> Result<String> {
+    let out = run(repo, args).await?;
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if !out.status.success() || said.is_empty() {
+        return Err(ProjectError::Workdir(anyhow::anyhow!(
+            "`git {}` in {} answered nothing: {}",
+            args.join(" "),
+            repo.display(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
+    }
+    Ok(said)
 }
 
 /// Where a project's repository is on disk.
@@ -868,8 +979,11 @@ mod tests {
         );
     }
 
+    /// The card that made this a bug report: an empty repository is seeded
+    /// rather than orphaned, so the checkout is a real branch off a real
+    /// trunk.
     #[tokio::test]
-    async fn a_project_with_no_commits_still_gets_a_worktree() {
+    async fn a_project_with_no_commits_gets_a_first_commit_and_a_worktree() {
         let repo = fresh_repo().await;
         let root = repo.path().join("wt-parent").join("1");
         let checkout = ensure(repo.path(), &root, "issue/1-first")
@@ -878,6 +992,79 @@ mod tests {
         assert_eq!(checkout.root, root);
         assert_eq!(checkout.repo, repo.path());
         assert!(root.join(".git").exists(), "worktree must be checked out");
+        assert!(
+            head_is_born(repo.path()).await.expect("head"),
+            "the trunk has to have something for the next card to branch from"
+        );
+        assert_eq!(
+            branch_of(&root).await.as_deref(),
+            Some("issue/1-first"),
+            "an orphan checkout answers None here, and that is the state this avoids"
+        );
+    }
+
+    /// The failure the report described, end to end: on git 2.43+ the *first*
+    /// card is auto-orphaned and only the second one dies, so a fixture that
+    /// cuts one checkout cannot see this.
+    #[tokio::test]
+    async fn a_second_card_can_still_be_cut_after_the_first_one_commits() {
+        let repo = fresh_repo().await;
+        let first = repo.path().join("wt").join("1");
+        ensure(repo.path(), &first, "issue/1-x").await.expect("cut");
+        tokio::fs::write(first.join("a.txt"), b"work")
+            .await
+            .expect("write");
+        commit(&first, "the first card's work").await;
+
+        let second = repo.path().join("wt").join("2");
+        ensure(repo.path(), &second, "issue/2-x")
+            .await
+            .expect("a commit on one card must not cost the board every later card");
+        assert!(second.join(".git").exists());
+    }
+
+    /// An orphan branch shares no history with anything, so this merge is the
+    /// one the old behaviour could never do.
+    #[tokio::test]
+    async fn a_card_cut_on_a_commit_less_project_can_still_land() {
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("1");
+        ensure(repo.path(), &root, "issue/1-x").await.expect("cut");
+        tokio::fs::write(root.join("a.txt"), b"work")
+            .await
+            .expect("write");
+        commit(&root, "the work").await;
+
+        let merged = merge(repo.path(), &root, "issue/1-x", "Merge #1: the work")
+            .await
+            .expect("merge");
+        assert!(
+            matches!(merged, Merged::Landed { .. }),
+            "a board that cannot land its own first card is not a board: {merged:?}"
+        );
+    }
+
+    /// A repository the operator has put work into is theirs to commit first.
+    /// Cutting a checkout anyway would hand the run an empty tree for a
+    /// project full of files, which is the silent half of the same bug.
+    #[tokio::test]
+    async fn a_repository_with_uncommitted_work_is_refused_rather_than_committed_for() {
+        let repo = fresh_repo().await;
+        tokio::fs::write(repo.path().join("main.rs"), b"fn main() {}")
+            .await
+            .expect("the operator's code");
+
+        let err = ensure(repo.path(), &repo.path().join("wt").join("1"), "issue/1-x")
+            .await
+            .expect_err("baybo does not decide what a first commit contains");
+        assert!(
+            matches!(&err, ProjectError::RepositoryHasNoCommits { .. }),
+            "the refusal has to be the one the gateway answers 400 for: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("first commit"),
+            "and it has to name the remedy: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1071,7 +1258,7 @@ mod tests {
 
         ensure(repo.path(), &repo.path().join("wt").join("1"), "issue/1-x")
             .await
-            .expect("worktree");
+            .expect_err("staged work is the operator's to commit");
 
         let log = run(repo.path(), &["log", "--all", "--oneline"])
             .await
@@ -1089,6 +1276,40 @@ mod tests {
             "wip.txt",
             "the user's index must be exactly as they left it"
         );
+    }
+
+    /// The seed is built from the empty tree, so it cannot pick anything up
+    /// even when the refusal above does not fire — and the empty repository
+    /// it lands in is left with a trunk, not with a file.
+    #[tokio::test]
+    async fn the_first_commit_a_bootstrap_makes_is_empty() {
+        let repo = fresh_repo().await;
+        ensure_a_root_commit(repo.path())
+            .await
+            .expect("seed an empty repository");
+
+        let listed = run(repo.path(), &["ls-tree", "-r", "--name-only", "HEAD"])
+            .await
+            .expect("ls-tree");
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+            "the root commit must carry no files: {}",
+            String::from_utf8_lossy(&listed.stdout)
+        );
+        assert_eq!(commits_ahead(repo.path(), "issue/1-x").await, None);
+    }
+
+    #[tokio::test]
+    async fn seeding_a_repository_that_already_has_a_commit_leaves_it_alone() {
+        let repo = repo_with_commit().await;
+        let before = run(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .expect("head");
+        ensure_a_root_commit(repo.path()).await.expect("no-op");
+        let after = run(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .expect("head");
+        assert_eq!(before.stdout, after.stdout, "a born HEAD is never moved");
     }
 
     #[tokio::test]
@@ -1165,15 +1386,32 @@ mod tests {
         );
     }
 
+    /// Cards cut before the trunk was seeded are on orphan branches that no
+    /// longer come out of `ensure`, but they are still on operators' disks —
+    /// and reclaiming one must not be an error.
     #[tokio::test]
-    async fn an_orphan_worktree_leaves_no_branch_to_delete() {
+    async fn a_legacy_orphan_worktree_can_still_be_reclaimed() {
         let repo = fresh_repo().await;
         let root = repo.path().join("wt").join("6b");
-        ensure(repo.path(), &root, "issue/6-x").await.expect("cut");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--orphan",
+                "-b",
+                "issue/6-x",
+                &root.to_string_lossy(),
+            ],
+        )
+        .await
+        .expect("cut the shape the old code produced");
         assert!(
             !branch_exists(repo.path(), "issue/6-x")
                 .await
-                .expect("check")
+                .expect("check"),
+            "an unborn branch is not a ref yet"
         );
         assert_eq!(
             reclaim(repo.path(), &root, "issue/6-x")

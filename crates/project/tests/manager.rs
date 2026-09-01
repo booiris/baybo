@@ -9492,3 +9492,52 @@ async fn a_repeat_of_a_scheduled_check_files_nothing_on_its_origin() {
          guards"
     );
 }
+
+/// The bug this pins, in the shape it was reported: a project baybo creates
+/// for itself is `git init`-fresh, and every card after the first one to
+/// commit used to die at `git worktree add` with `fatal: invalid reference:
+/// HEAD` — surfacing only as "could not open the issue's checkout".
+#[tokio::test]
+async fn two_cards_in_a_row_can_be_cut_on_a_project_baybo_created() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Fresh"))
+        .await
+        .expect("create");
+    let repo = std::path::PathBuf::from(&project.workdir);
+
+    let mut cut = Vec::new();
+    for (title, file) in [("First card", "first.txt"), ("Second card", "second.txt")] {
+        let issue = f
+            .manager
+            .create_issue(&project.id, IssueActor::User, new_issue(title))
+            .await
+            .expect("create issue")
+            .into_issue();
+        let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
+        let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
+        baybo_project::worktree::ensure(&repo, &root, &branch)
+            .await
+            .unwrap_or_else(|e| panic!("cut a checkout for {title}: {e}"));
+        // The first card commits, which is what used to take the auto-orphan
+        // shortcut away from the second one.
+        write_and_commit(&root, file, title).await;
+        cut.push((root, branch));
+    }
+
+    for (root, branch) in &cut {
+        assert!(
+            root.join(".git").exists(),
+            "{} is not a checkout",
+            root.display()
+        );
+        let merged = baybo_project::worktree::merge(&repo, root, branch, "Merge it")
+            .await
+            .expect("merge");
+        assert!(
+            matches!(merged, baybo_project::worktree::Merged::Landed { .. }),
+            "a card cut on a fresh project has to be landable, not an unrelated history: {merged:?}"
+        );
+    }
+}

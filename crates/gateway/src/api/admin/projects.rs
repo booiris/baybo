@@ -58,6 +58,10 @@ pub(super) fn project_err(e: ProjectError) -> GatewayError {
         // board is still there, it just isn't taking writes.
         ProjectError::Archived(_) => GatewayError::Conflict(e.to_string()),
         ProjectError::Storage(e) => GatewayError::Internal(format!("project storage: {e}")),
+        // Like Archived: a state of the operator's own repository, with a
+        // sentence naming the command that clears it. Reporting it as a
+        // server failure sends them to the logs instead.
+        ProjectError::RepositoryHasNoCommits { .. } => GatewayError::BadRequest(e.to_string()),
         ProjectError::Workdir(e) => GatewayError::Internal(format!("project workdir: {e}")),
     }
 }
