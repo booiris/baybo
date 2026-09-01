@@ -16,6 +16,7 @@
 //! the user approved still lands in the history.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_workspace::WorkspacePaths;
@@ -27,6 +28,7 @@ use super::managed_repo::{
     write_managed_file,
 };
 use super::paths::require_absolute;
+use super::permission::LivePermissionMode;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 /// Named once: `name()`, rejection messages, the `Tool:` trailer of every
@@ -37,12 +39,14 @@ pub const WRITE_TOOL_NAME: &str = "Write";
 
 pub struct WriteTool {
     roots: ManagedRoots,
+    permission: Arc<LivePermissionMode>,
 }
 
 impl WriteTool {
-    pub fn new(workspace_paths: WorkspacePaths) -> Self {
+    pub fn new(workspace_paths: WorkspacePaths, permission: Arc<LivePermissionMode>) -> Self {
         Self {
             roots: ManagedRoots::new(&workspace_paths),
+            permission,
         }
     }
 }
@@ -92,9 +96,9 @@ impl Tool for WriteTool {
         // match Bash's bypass for non-destructive ops inside `work/`, and
         // memory files skip it because their accountability is the audit
         // commit. Everything else (an identity file, config/, $HOME, /tmp,
-        // …) keeps
-        // the prompt as a backstop.
-        if self.roots.write_bypasses_approval(&path) {
+        // …) keeps the prompt as a backstop — unless the operator turned the
+        // gate off wholesale, which is what `permission = free` says.
+        if self.permission.get().waives_approval() || self.roots.write_bypasses_approval(&path) {
             return Vec::new();
         }
         vec![ResourceAccess::WriteFile { path }]
@@ -173,7 +177,9 @@ impl Tool for WriteTool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::permission::PermissionMode;
     use super::*;
+    use crate::builtin::symlinked_root;
     use baybo_model::{ChannelType, User};
     use std::time::Duration;
 
@@ -200,7 +206,15 @@ mod tests {
     }
 
     fn tool() -> WriteTool {
-        WriteTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
+        rooted(baybo_workspace::WorkspacePaths::new("/tmp"))
+    }
+
+    fn rooted(paths: WorkspacePaths) -> WriteTool {
+        under(paths, PermissionMode::default())
+    }
+
+    fn under(paths: WorkspacePaths, permission: PermissionMode) -> WriteTool {
+        WriteTool::new(paths, Arc::new(LivePermissionMode::new(permission)))
     }
 
     #[tokio::test]
@@ -314,7 +328,7 @@ mod tests {
     #[test]
     fn accessed_resources_skips_writefile_inside_work_dir() {
         let paths = baybo_workspace::WorkspacePaths::new("/var/baybo");
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
         let in_work = paths.work_dir().join("scratch.txt");
         assert!(
             write
@@ -327,7 +341,7 @@ mod tests {
     #[test]
     fn accessed_resources_keeps_writefile_outside_work_dir() {
         let paths = baybo_workspace::WorkspacePaths::new("/var/baybo");
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
 
         let in_personas = paths.persona_identity_file(
             baybo_workspace::paths::BUILTIN_PERSONA_DIR,
@@ -354,7 +368,7 @@ mod tests {
     #[test]
     fn accessed_resources_skips_approval_for_memory_files() {
         let paths = baybo_workspace::WorkspacePaths::new("/var/baybo");
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
 
         for memory_file in [
             paths.persona_memory_dir("baybo").join("cat-name.md"),
@@ -408,7 +422,7 @@ mod tests {
     async fn saving_a_memory_commits_it_with_the_write_tool_named() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = memory_workspace(tmp.path()).await;
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
         // A freely-named file: the memory tier is location-keyed, with no
         // filename allowlist of the kind the identity store has.
         let fact = paths.persona_memory_dir(AGENT).join("cat-name.md");
@@ -443,7 +457,7 @@ mod tests {
     async fn rewriting_a_memory_with_identical_bytes_warns_about_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = memory_workspace(tmp.path()).await;
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
         let fact = paths.persona_memory_dir(AGENT).join("cat-name.md");
         let params = json!({ "file_path": fact.to_string_lossy(), "content": "Mochi.\n" });
 
@@ -471,7 +485,7 @@ mod tests {
         // the more destructive verb of the two.
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = memory_workspace(tmp.path()).await;
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
         let theirs = paths.persona_identity_file("01JSCOUT", baybo_workspace::IdentityKind::Soul);
         tokio::fs::create_dir_all(paths.persona_dir("01JSCOUT"))
             .await
@@ -499,7 +513,7 @@ mod tests {
         // user approved must still land in the history the tier exists for.
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = memory_workspace(tmp.path()).await;
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
         let mine = paths.persona_identity_file(AGENT, baybo_workspace::IdentityKind::Soul);
         tokio::fs::create_dir_all(paths.persona_dir(AGENT))
             .await
@@ -534,7 +548,7 @@ mod tests {
         // overwrite reaches it too, and it is the more destructive verb.
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = memory_workspace(tmp.path()).await;
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
         let hired = "project-01JDEV";
         let named = "# Who Am I?\n\n* **Name:** Dev\n";
         let mine = paths.persona_identity_file(hired, baybo_workspace::IdentityKind::Identity);
@@ -584,7 +598,7 @@ mod tests {
     async fn a_memory_body_over_the_cap_is_refused_before_the_write() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = memory_workspace(tmp.path()).await;
-        let write = WriteTool::new(paths.clone());
+        let write = rooted(paths.clone());
         let fact = paths.persona_memory_dir(AGENT).join("huge.md");
         let body = "x".repeat((super::super::managed_repo::MAX_MANAGED_FILE_BYTES + 1) as usize);
 
@@ -598,5 +612,47 @@ mod tests {
 
         assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
         assert!(!fact.exists(), "the refused write must not land");
+    }
+
+    /// The checkout an issue run is told to work in, named the way its own
+    /// brief names it. `ManagedRoots` resolves its roots, so before the path
+    /// was resolved on the same terms this declared `WriteFile` and every
+    /// file the run touched raised a separate prompt.
+    #[test]
+    fn a_checkout_under_a_symlinked_root_still_skips_the_gate() {
+        let (_tmp, real) = symlinked_root::canonical_tempdir();
+        let linked = symlinked_root::workspace(&real);
+        let write = rooted(linked.clone());
+
+        let checkout = linked
+            .work_dir()
+            .join(".worktrees")
+            .join("01M1E94QY306MFQSFH1DQX2V78")
+            .join("1")
+            .join("src")
+            .join("types.ts");
+        assert!(
+            write
+                .accessed_resources(&json!({ "file_path": checkout.to_string_lossy() }))
+                .is_empty(),
+            "{} is inside work/ whichever spelling names it",
+            checkout.display(),
+        );
+    }
+
+    /// `permission = free` is the operator saying the gate is off. Bash has
+    /// always read it that way; a file write is not the exception.
+    #[test]
+    fn permission_free_waives_the_gate_outside_work_too() {
+        let paths = baybo_workspace::WorkspacePaths::new("/var/baybo");
+        for (permission, waived) in [
+            (PermissionMode::Free, true),
+            (PermissionMode::Auto, false),
+            (PermissionMode::Manual, false),
+        ] {
+            let declared = under(paths.clone(), permission)
+                .accessed_resources(&json!({ "file_path": "/tmp/random.txt" }));
+            assert_eq!(declared.is_empty(), waived, "under {permission:?}");
+        }
     }
 }

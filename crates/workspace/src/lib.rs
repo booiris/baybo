@@ -1,5 +1,5 @@
 pub mod paths;
-pub use paths::{IdentityKind, WorkspacePaths, absolutise};
+pub use paths::{IdentityKind, WorkspacePaths, absolutise, absolutise_target};
 pub mod name;
 pub use name::{display_name, rejected_name_removal, rejected_rename, with_display_name};
 pub mod prompt;

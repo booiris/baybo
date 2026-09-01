@@ -32,7 +32,7 @@ use baybo_workspace::paths::{
     IdentityKind, PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, SKILLS_DIR,
     classify_persona_path, escapes_upward, has_git_component,
 };
-use baybo_workspace::{WorkspacePaths, absolutise};
+use baybo_workspace::{WorkspacePaths, absolutise, absolutise_target};
 use tokio::process::Command;
 
 use crate::ToolError;
@@ -77,27 +77,76 @@ impl ChangeKind {
     }
 }
 
-/// The absolutised workspace roots that get special write treatment.
+/// A workspace root in both of its spellings.
+///
 /// Built once per tool, because `starts_with` against a relative root
 /// silently never matches — the debug-build default workspace root is
 /// `./.baybo`, while the paths the model passes come from the system
 /// prompt and are absolute.
+///
+/// Both spellings, because the two questions asked of a root want different
+/// ones and answering either with the wrong one fails silently. *Where does
+/// this path land* is [`Self::resolved`]'s, and the paths compared against it
+/// go through [`absolutise_target`] so the comparison is like-for-like.
+/// *How far up may a walk go* is [`Self::as_written`]'s: a walk that has to
+/// name the component that was a link must step through the spelling it was
+/// handed, and bounding that walk with a resolved root stops it before it
+/// starts whenever the workspace root is itself a symlink — which the
+/// release default `$HOME/.baybo` routinely is.
+struct Root {
+    resolved: PathBuf,
+    as_written: PathBuf,
+}
+
+impl Root {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            resolved: absolutise(&dir),
+            as_written: dir,
+        }
+    }
+
+    /// Whether `file_path` is this root's business at all — named as being
+    /// in here, or landing in here.
+    ///
+    /// Deliberately wider than [`ManagedRoots::locate`], which additionally
+    /// refuses `..` and `.git`. A path that reaches into a managed tree by a
+    /// route this module will not serve is still *that tree's* question, and
+    /// has to be refused by name rather than fall through and be treated as
+    /// some ordinary file elsewhere on disk.
+    fn claims(&self, file_path: &Path) -> bool {
+        file_path.starts_with(&self.as_written)
+            || file_path.starts_with(&self.resolved)
+            || absolutise_target(file_path).starts_with(&self.resolved)
+    }
+
+    /// The spelling of this root that bounds a walk up `file_path`.
+    fn bounding(&self, file_path: &Path) -> &Path {
+        if file_path.starts_with(&self.as_written) {
+            &self.as_written
+        } else {
+            &self.resolved
+        }
+    }
+}
+
+/// The workspace roots that get special write treatment.
 pub(crate) struct ManagedRoots {
-    personas_dir: PathBuf,
-    work_dir: PathBuf,
+    personas: Root,
+    work: Root,
 }
 
 impl ManagedRoots {
     pub(crate) fn new(paths: &WorkspacePaths) -> Self {
         Self {
-            personas_dir: absolutise(&paths.personas_dir()),
-            work_dir: absolutise(&paths.work_dir()),
+            personas: Root::new(paths.personas_dir()),
+            work: Root::new(paths.work_dir()),
         }
     }
 
     /// The repo every audited write is committed into.
     pub(crate) fn personas_dir(&self) -> &Path {
-        &self.personas_dir
+        &self.personas.resolved
     }
 
     /// Whether a write here skips the approval gate: an identity file, a
@@ -113,13 +162,22 @@ impl ManagedRoots {
     pub(crate) fn bypasses_approval(&self, file_path: &Path) -> bool {
         self.is_identity_shape(file_path)
             || self.is_memory_shape(file_path)
-            || self.is_inside(&self.work_dir, file_path)
+            || self.is_inside(&self.work.resolved, file_path)
     }
 
-    /// What `file_path` is, or [`PersonaPath::Other`] when it is not a
-    /// recognised file under `personas/` at all.
-    fn shape<'a>(&self, file_path: &'a Path) -> PersonaPath<'a> {
-        match self.locate(&self.personas_dir, file_path) {
+    /// Where `file_path` sits inside `personas/`, if it does at all.
+    fn under_personas(&self, file_path: &Path) -> Option<PathBuf> {
+        self.locate(&self.personas.resolved, file_path)
+    }
+
+    /// What a [`Self::under_personas`] result is, or [`PersonaPath::Other`]
+    /// when the path is not a recognised file under `personas/` at all.
+    ///
+    /// Takes the located path rather than deriving it, because
+    /// [`PersonaPath`] borrows the agent id out of that path — resolving it
+    /// inside here would return a view onto a buffer this function dropped.
+    fn shape(rel: Option<&Path>) -> PersonaPath<'_> {
+        match rel {
             Some(rel) => classify_persona_path(rel),
             None => PersonaPath::Other,
         }
@@ -128,15 +186,17 @@ impl ManagedRoots {
     /// Whether `file_path` looks like the shared `personas/USER.md` or an
     /// identity file in either persona layout.
     fn is_identity_shape(&self, file_path: &Path) -> bool {
+        let rel = self.under_personas(file_path);
         matches!(
-            self.shape(file_path),
+            Self::shape(rel.as_deref()),
             PersonaPath::SharedUser | PersonaPath::Identity { .. }
         )
     }
 
     /// Whether `file_path` looks like a memory file in either persona layout.
     pub(crate) fn is_memory_shape(&self, file_path: &Path) -> bool {
-        matches!(self.shape(file_path), PersonaPath::Memory { .. })
+        let rel = self.under_personas(file_path);
+        matches!(Self::shape(rel.as_deref()), PersonaPath::Memory { .. })
     }
 
     /// `Write`'s narrower bypass: its own memory tree, or `work/`.
@@ -147,7 +207,7 @@ impl ManagedRoots {
     /// than in the tool so the `..` / `.git` / symlink guards have one
     /// implementation instead of a third copy.
     pub(crate) fn write_bypasses_approval(&self, file_path: &Path) -> bool {
-        self.is_memory_shape(file_path) || self.is_inside(&self.work_dir, file_path)
+        self.is_memory_shape(file_path) || self.is_inside(&self.work.resolved, file_path)
     }
 
     fn is_inside(&self, root: &Path, file_path: &Path) -> bool {
@@ -157,36 +217,53 @@ impl ManagedRoots {
     /// The components of `file_path` below `root`, or `None` when it is not
     /// really in there.
     ///
-    /// "Really" is the whole job. `Path::starts_with` is purely lexical, so
+    /// "Really" is the whole job. `strip_prefix` is purely lexical, so
     /// membership is only as strong as what is checked around it:
     ///
-    /// - `..` is refused outright — [`absolutise`] leaves it intact, so
-    ///   `<personas>/../config/baybo.json` would otherwise satisfy the
-    ///   prefix test.
+    /// - both sides are resolved on the same terms. The roots went through
+    ///   [`absolutise`] in [`Self::new`], which resolves symlinks, so the
+    ///   resolved spelling is the only one a lexical prefix test accepts —
+    ///   and the path the model hands a tool is whatever spelling it was
+    ///   given, which under the release-default `$HOME/.baybo` root is
+    ///   routinely the *unresolved* one. Comparing those two directly is
+    ///   how `work/`'s approval bypass silently stopped applying to a run's
+    ///   own checkout. [`absolutise_target`] is the half of the pair that
+    ///   handles a file which does not exist yet.
+    /// - `..` is refused outright, before resolution rather than by it: a
+    ///   `..` names a route out of the tree, and resolving one here would
+    ///   quietly turn `<personas>/../config/baybo.json` into an accepted
+    ///   path somewhere else instead of the refusal it has to be.
     /// - a `.git` component is refused — `personas/` *is* a git repo, and
     ///   its own metadata must never be writable through the tier the repo
     ///   exists to audit. `core.fsmonitor` or a `filter.*.clean` command in
     ///   `.git/config` runs an arbitrary program on the very next `git add`,
     ///   which the audit commit itself performs; a deleted `.git/HEAD` turns
-    ///   every later audit into a warning line.
+    ///   every later audit into a warning line. Checked on both spellings,
+    ///   since resolution is what can *introduce* the component.
     ///
-    /// Symlinks are handled separately, by [`reject_symlinked_path`] at
-    /// execute time, so the refusal can name the component that was a link.
-    fn locate<'a>(&self, root: &Path, file_path: &'a Path) -> Option<&'a Path> {
+    /// Resolution answers where a path lands, not whether getting there
+    /// crossed a link. Naming the component that was a link stays
+    /// [`reject_symlinked_path`]'s job at execute time.
+    fn locate(&self, root: &Path, file_path: &Path) -> Option<PathBuf> {
         if !file_path.is_absolute() || escapes_upward(file_path) || has_git_component(file_path) {
             return None;
         }
-        file_path.strip_prefix(root).ok()
+        let resolved = absolutise_target(file_path);
+        if has_git_component(&resolved) {
+            return None;
+        }
+        resolved.strip_prefix(root).map(Path::to_path_buf).ok()
+    }
+
+    /// Refuse a path into `personas/` that traverses a symlink.
+    fn reject_symlinked(&self, file_path: &Path) -> ToolResult<()> {
+        reject_symlinked_path(file_path, self.personas.bounding(file_path))
     }
 
     /// The repo-relative pathspec `git add --` should stage, or `None` when
     /// the path is not one this repo can name.
-    fn pathspec(&self, file_path: &Path) -> Option<String> {
-        Some(
-            self.locate(&self.personas_dir, file_path)?
-                .to_str()?
-                .to_string(),
-        )
+    fn pathspec(rel: Option<&Path>) -> Option<String> {
+        Some(rel?.to_str()?.to_string())
     }
 
     /// Resolve an audited write to the path that records it: memory file
@@ -212,10 +289,16 @@ impl ManagedRoots {
         file_path: &Path,
         agent: &AgentProfileId,
     ) -> ToolResult<Option<ManagedTarget>> {
-        if !file_path.starts_with(&self.personas_dir) {
+        if !self.personas.claims(file_path) {
             return Ok(None);
         }
-        let shape = self.shape(file_path);
+        // Before classification, not after. [`Self::locate`] resolves the
+        // path, so a link out of the tree stops looking like an identity file
+        // at all — and would collect the generic "not writable here" refusal
+        // instead of the one that names the link.
+        self.reject_symlinked(file_path)?;
+        let rel = self.under_personas(file_path);
+        let shape = Self::shape(rel.as_deref());
         // The shared human profile belongs to no agent, so every agent may
         // write it: what one of them learns about the person is worth the
         // others knowing. That does make it a channel between agents — the
@@ -235,9 +318,8 @@ impl ManagedRoots {
                 file_path.display()
             )));
         }
-        reject_symlinked_path(file_path, &self.personas_dir)?;
         Ok(Some(ManagedTarget {
-            rel_path: self.pathspec(file_path).ok_or_else(unnameable)?,
+            rel_path: Self::pathspec(rel.as_deref()).ok_or_else(unnameable)?,
             self_image: matches!(
                 shape,
                 PersonaPath::Identity {
@@ -259,7 +341,12 @@ impl ManagedRoots {
         file_path: &Path,
         agent: &AgentProfileId,
     ) -> ToolResult<Option<ManagedTarget>> {
-        let PersonaPath::Memory { agent_id } = self.shape(file_path) else {
+        if !self.personas.claims(file_path) {
+            return Ok(None);
+        }
+        self.reject_symlinked(file_path)?;
+        let rel = self.under_personas(file_path);
+        let PersonaPath::Memory { agent_id } = Self::shape(rel.as_deref()) else {
             return Ok(None);
         };
         if agent_id != agent.as_str() {
@@ -268,9 +355,8 @@ impl ManagedRoots {
                 file_path.display()
             )));
         }
-        reject_symlinked_path(file_path, &self.personas_dir)?;
         Ok(Some(ManagedTarget {
-            rel_path: self.pathspec(file_path).ok_or_else(unnameable)?,
+            rel_path: Self::pathspec(rel.as_deref()).ok_or_else(unnameable)?,
             // A memory file may be called anything, `IDENTITY.md` included —
             // it is still a memory, and the naming rule has no business in it.
             self_image: false,
@@ -531,6 +617,7 @@ async fn run_git(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtin::symlinked_root;
     use baybo_workspace::IdentityKind;
 
     fn roots(root: &Path) -> ManagedRoots {
@@ -832,5 +919,107 @@ mod tests {
                 .expect("resolve")
                 .is_none()
         );
+    }
+
+    /// The regression this module's `absolutise`/`strip_prefix` pairing was
+    /// silently failing: a run's checkout, named the way the run itself was
+    /// told to name it.
+    ///
+    /// `ManagedRoots` resolves its roots and the model's path is whatever
+    /// spelling it was handed, so before both sides were resolved on the same
+    /// terms this returned `false` and every write into a run's own worktree
+    /// raised an approval prompt — per file, for the whole run.
+    #[test]
+    fn a_symlinked_root_does_not_cost_a_work_path_its_bypass() {
+        let (_tmp, real) = symlinked_root::canonical_tempdir();
+        let linked = symlinked_root::workspace(&real);
+        let r = ManagedRoots::new(&linked);
+
+        let checkout = linked
+            .work_dir()
+            .join(".worktrees")
+            .join("01M1E94QY306MFQSFH1DQX2V78")
+            .join("1")
+            .join("src")
+            .join("types.ts");
+        assert!(
+            r.write_bypasses_approval(&checkout),
+            "{} is inside work/ whichever spelling names it",
+            checkout.display(),
+        );
+        assert!(r.bypasses_approval(&checkout));
+    }
+
+    /// The same asymmetry cost `personas/` both of its halves, not just the
+    /// prompt: an unresolved spelling classified as [`PersonaPath::Other`],
+    /// so a memory write took the gate *and* went unaudited.
+    #[test]
+    fn a_symlinked_root_does_not_cost_a_memory_file_its_audit() {
+        let (_tmp, real) = symlinked_root::canonical_tempdir();
+        let linked = symlinked_root::workspace(&real);
+        let r = ManagedRoots::new(&linked);
+
+        let memory = linked.persona_memory_dir("baybo").join("fact.md");
+        assert!(r.write_bypasses_approval(&memory));
+        let target = r
+            .audit_target(&memory, &agent("baybo"))
+            .expect("resolve")
+            .expect("a memory file is audited");
+        assert_eq!(target.rel_path, "baybo/memory/fact.md");
+    }
+
+    /// Resolution answers *where the write lands*, which is the question the
+    /// bypass was always asking. A link inside `work/` pointing out of it
+    /// names a file the operator never agreed to, so it keeps the prompt —
+    /// where the old lexical test handed over the bypass on the strength of
+    /// the spelling alone.
+    ///
+    /// Deliberately on a plain root, not the symlinked fixture: under a
+    /// linked root every spelling missed, so this would pass for the wrong
+    /// reason and go on passing if resolution were removed again.
+    #[test]
+    fn a_link_out_of_work_cannot_carry_the_bypass_with_it() {
+        let (_tmp, real) = symlinked_root::canonical_tempdir();
+        let paths = WorkspacePaths::new(real.clone());
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let r = ManagedRoots::new(&paths);
+
+        let outside = real.join("outside.txt");
+        std::fs::write(&outside, "").expect("target");
+        let escape = paths.work_dir().join("escape.txt");
+        std::os::unix::fs::symlink(&outside, &escape).expect("symlink");
+
+        // The control: an ordinary file beside it does keep the bypass, so a
+        // blanket refusal cannot be what makes this test pass.
+        assert!(r.write_bypasses_approval(&paths.work_dir().join("real.txt")));
+        assert!(
+            !r.write_bypasses_approval(&escape),
+            "a link is only inside work/ if what it names is",
+        );
+    }
+
+    /// Resolving both sides is what makes the `personas/` tier reachable
+    /// through a linked root at all — so the guard that refuses a *link
+    /// inside* that tier has to be reachable there too. It walks the
+    /// spelling it was handed, and with only the resolved root to stop
+    /// against it would step over its own bound and pass everything.
+    #[test]
+    fn a_symlinked_root_does_not_disarm_the_symlink_guard_inside_personas() {
+        let (_tmp, real) = symlinked_root::canonical_tempdir();
+        let linked = symlinked_root::workspace(&real);
+        let r = ManagedRoots::new(&linked);
+
+        let outside = real.join("secret.txt");
+        std::fs::write(&outside, "not a memory").expect("write");
+        let planted = linked.persona_memory_dir("baybo").join("note.md");
+        std::os::unix::fs::symlink(&outside, &planted).expect("symlink");
+
+        match r.memory_target(&planted, &agent("baybo")) {
+            Err(ToolError::InvalidParams(msg)) => {
+                assert!(msg.contains("is a symlink"), "must name the link: {msg}")
+            }
+            Err(other) => panic!("wrong refusal: {other:?}"),
+            Ok(_) => panic!("a link in the memory tree must be refused"),
+        }
     }
 }

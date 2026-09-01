@@ -292,10 +292,12 @@ pub const ENV_CONFIG_PATH: &str = "BAYBO_CONFIG_PATH";
 /// OS resolves it correctly on access and proper normalisation
 /// requires a real filesystem walk.
 ///
-/// Callers that compare paths via [`Path::starts_with`] should route
-/// both sides through this helper so a relative workspace root (e.g.
-/// the debug-build default `./.baybo`) does not turn the comparison
-/// into a silent miss.
+/// Callers that compare paths via [`Path::starts_with`] must route
+/// **both** sides through this pair, so neither a relative workspace root
+/// (e.g. the debug-build default `./.baybo`) nor a symlinked one turns the
+/// comparison into a silent miss. This side is for roots, which exist by
+/// the time anything compares against them; the other side — the path
+/// being tested, which may not exist yet — is [`absolutise_target`].
 pub fn absolutise(p: &Path) -> PathBuf {
     if let Ok(canonical) = p.canonicalize() {
         return canonical;
@@ -308,6 +310,47 @@ pub fn absolutise(p: &Path) -> PathBuf {
         }
     }
     cleaned
+}
+
+/// [`absolutise`] for a path that may not exist yet — the file a tool is
+/// about to create, most of all.
+///
+/// The two are a pair and have to be used as one. `absolutise` resolves a
+/// root through symlinks, so the resolved spelling becomes the *only* one a
+/// `starts_with` / `strip_prefix` against that root will accept; a caller
+/// that resolves the root and then compares it against a raw path the model
+/// typed has written a test that silently fails for every other spelling of
+/// the same file. The release-default root `$HOME/.baybo` is a symlink on
+/// plenty of hosts, which makes "every other spelling" the common case
+/// rather than the exotic one.
+///
+/// `canonicalize` alone cannot do it: a file being created does not exist,
+/// so resolve the deepest ancestor that does and re-append the rest.
+///
+/// **Resolves the final component too**, when it exists — a symlink at the
+/// leaf names a file somewhere else, and a membership test that answered
+/// for the link rather than its target would be answering about the wrong
+/// file. `..` is *not* neutralised here (it never reaches this on the paths
+/// that matter — callers refuse it outright); nothing about the result is a
+/// substitute for a caller's own symlink guard, which has to name the
+/// component that was a link and so must do its own walk.
+pub fn absolutise_target(p: &Path) -> PathBuf {
+    if let Ok(canonical) = p.canonicalize() {
+        return canonical;
+    }
+    let absolute = absolutise(p);
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = absolute.as_path();
+    while let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) {
+        tail.push(name);
+        if let Ok(resolved) = parent.canonicalize() {
+            let mut out = resolved;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        cursor = parent;
+    }
+    absolute
 }
 
 /// Default workspace root: `~/.baybo` in release, `<cwd>/.baybo` in
@@ -788,6 +831,56 @@ pub fn sanitize_session_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pairing the whole thing exists for: a root resolved by
+    /// [`absolutise`] and a path spelled through the link that names it must
+    /// still compare equal, or every `starts_with` against that root is a
+    /// silent miss.
+    #[test]
+    fn a_path_through_a_linked_root_resolves_onto_the_absolutised_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().canonicalize().expect("canonical tempdir");
+        let store = real.join("store");
+        std::fs::create_dir_all(store.join("work")).expect("mkdir");
+        let linked = real.join("link");
+        std::os::unix::fs::symlink(&store, &linked).expect("symlink");
+
+        let root = absolutise(&linked.join("work"));
+        assert_eq!(root, store.join("work"));
+
+        // The file does not exist yet — the common case for a create.
+        let unborn = absolutise_target(&linked.join("work").join("sub").join("new.txt"));
+        assert!(
+            unborn.starts_with(&root),
+            "{} must resolve under {}",
+            unborn.display(),
+            root.display(),
+        );
+    }
+
+    /// Resolution answers where a write lands, so a link is only "inside" a
+    /// root when what it names is.
+    #[test]
+    fn a_link_is_resolved_to_what_it_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().canonicalize().expect("canonical tempdir");
+        let inside = real.join("inside");
+        let outside = real.join("outside.txt");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        std::fs::write(&outside, "").expect("write");
+        let escape = inside.join("escape.txt");
+        std::os::unix::fs::symlink(&outside, &escape).expect("symlink");
+
+        assert_eq!(absolutise_target(&escape), outside);
+        assert!(!absolutise_target(&escape).starts_with(&inside));
+    }
+
+    /// Nothing on disk to resolve: still absolute, still the path asked about.
+    #[test]
+    fn a_wholly_absent_path_survives_intact() {
+        let p = PathBuf::from("/definitely/not/here/file.txt");
+        assert_eq!(absolutise_target(&p), p);
+    }
 
     #[test]
     fn a_transcript_path_can_name_where_to_start_reading() {

@@ -564,7 +564,7 @@ mod tests {
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             proxy: None,
             permission: Arc::new(crate::builtin::LivePermissionMode::new(
-                crate::builtin::BashPermissionMode::Manual,
+                crate::builtin::PermissionMode::Manual,
             )),
             builtin_memory: true,
         })
@@ -582,7 +582,7 @@ mod tests {
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             proxy: None,
             permission: Arc::new(crate::builtin::LivePermissionMode::new(
-                crate::builtin::BashPermissionMode::Manual,
+                crate::builtin::PermissionMode::Manual,
             )),
             builtin_memory: false,
         });
@@ -1178,7 +1178,7 @@ mod offered_schema_tests {
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             proxy: None,
             permission: Arc::new(crate::builtin::LivePermissionMode::new(
-                crate::builtin::BashPermissionMode::Manual,
+                crate::builtin::PermissionMode::Manual,
             )),
             builtin_memory: true,
         })

@@ -146,7 +146,7 @@ output.
 The sandbox gates filesystem/network but **not** credentials, yet we do **not**
 add an approval prompt for secret injection: the user already chose to store the
 secret and the agent only names it. `BashTool::accessed_resources` is unchanged
-(approval prompting is governed by `BashPermissionMode`, not by `secret_env`).
+(approval prompting is governed by `PermissionMode`, not by `secret_env`).
 When `secret_env` is used, the tool emits an audit event via `ctx.events`
 recording the secret **names** (never values); the existing event-drain
 (`tools.md` event sink → `SpanEventKind::ToolEvent`) already runs payloads
