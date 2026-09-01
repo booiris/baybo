@@ -52,6 +52,7 @@
 //! only sanctioned writer.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_workspace::WorkspacePaths;
@@ -80,16 +81,19 @@ use super::managed_repo::{
     write_managed_file,
 };
 use super::paths::require_absolute;
+use super::permission::LivePermissionMode;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct EditTool {
     roots: ManagedRoots,
+    permission: Arc<LivePermissionMode>,
 }
 
 impl EditTool {
-    pub fn new(workspace_paths: WorkspacePaths) -> Self {
+    pub fn new(workspace_paths: WorkspacePaths, permission: Arc<LivePermissionMode>) -> Self {
         Self {
             roots: ManagedRoots::new(&workspace_paths),
+            permission,
         }
     }
 }
@@ -145,8 +149,9 @@ impl Tool for EditTool {
         // managed roots: identity files under `personas/` (audit trail
         // is the per-edit git commit, not a user prompt), and any path
         // under `work/` or `skills/` (agent scratch / managed skill
-        // content). Anything else still goes through the gate.
-        if self.roots.bypasses_approval(&path) {
+        // content). Anything else still goes through the gate — unless the
+        // operator turned the gate off wholesale with `permission = free`.
+        if self.permission.get().waives_approval() || self.roots.bypasses_approval(&path) {
             return vec![ResourceAccess::ReadFile { path }];
         }
         vec![
@@ -254,7 +259,9 @@ impl Tool for EditTool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::permission::PermissionMode;
     use super::*;
+    use crate::builtin::symlinked_root;
     use baybo_model::AgentProfileId;
 
     /// The schema spells its parameter names inline, and `baybo-agent` reads
@@ -262,7 +269,7 @@ mod tests {
     /// Two spellings of one name is exactly the drift worth a cheap guard.
     #[test]
     fn the_shared_arg_consts_match_the_schema() {
-        let schema = EditTool::new(WorkspacePaths::new("/tmp")).parameters_schema();
+        let schema = tool().parameters_schema();
         let required = schema["required"]
             .as_array()
             .expect("required is a list")
@@ -318,11 +325,15 @@ mod tests {
     }
 
     fn tool() -> EditTool {
-        EditTool::new(WorkspacePaths::new("/tmp"))
+        tool_with(WorkspacePaths::new("/tmp"))
     }
 
     fn tool_with(paths: WorkspacePaths) -> EditTool {
-        EditTool::new(paths)
+        under(paths, PermissionMode::default())
+    }
+
+    fn under(paths: WorkspacePaths, permission: PermissionMode) -> EditTool {
+        EditTool::new(paths, Arc::new(LivePermissionMode::new(permission)))
     }
 
     async fn run_git_quiet(dir: &Path, args: &[&str]) {
@@ -833,5 +844,50 @@ mod tests {
             "alpha\n",
             "file must not be modified on guard reject"
         );
+    }
+
+    #[test]
+    fn a_checkout_under_a_symlinked_root_still_skips_the_gate() {
+        let (_tmp, real) = symlinked_root::canonical_tempdir();
+        let linked = symlinked_root::workspace(&real);
+        let edit = tool_with(linked.clone());
+
+        let checkout = linked
+            .work_dir()
+            .join(".worktrees")
+            .join("01M1E94QY306MFQSFH1DQX2V78")
+            .join("1")
+            .join("src")
+            .join("types.ts");
+        let declared = edit.accessed_resources(&json!({ "file_path": checkout.to_string_lossy() }));
+        assert!(
+            !declared
+                .iter()
+                .any(|r| matches!(r, ResourceAccess::WriteFile { .. })),
+            "{} is inside work/ whichever spelling names it, got {declared:?}",
+            checkout.display(),
+        );
+    }
+
+    /// `permission = free` is the operator saying the gate is off. Bash has
+    /// always read it that way; a file edit is not the exception.
+    #[test]
+    fn permission_free_waives_the_gate_outside_work_too() {
+        let paths = WorkspacePaths::new("/var/baybo");
+        for (permission, waived) in [
+            (PermissionMode::Free, true),
+            (PermissionMode::Auto, false),
+            (PermissionMode::Manual, false),
+        ] {
+            let declared = under(paths.clone(), permission)
+                .accessed_resources(&json!({ "file_path": "/tmp/random.txt" }));
+            assert_eq!(
+                !declared
+                    .iter()
+                    .any(|r| matches!(r, ResourceAccess::WriteFile { .. })),
+                waived,
+                "under {permission:?}",
+            );
+        }
     }
 }

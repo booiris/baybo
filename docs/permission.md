@@ -1,9 +1,9 @@
-# Bash Permission Policy
+# Permission Policy
 
 ## Scope
 
-`permission` is the top-level `baybo.json` field that controls Bash approval
-and OS-sandbox usage:
+`permission` is the top-level `baybo.json` field that controls approval
+prompting and Bash's OS-sandbox usage:
 
 ```json
 {
@@ -17,12 +17,18 @@ Accepted values are:
 | --- | --- |
 | `auto` | Default. Judge risky deletes and sandbox escapes, prompt only when the judge cannot approve automatically. |
 | `manual` | Human approval before every executable Bash command, and again before any unsandboxed retry. |
-| `free` | Run Bash directly without Bash approval or the OS sandbox. |
+| `free` | No approval gate at all. Bash also runs directly, without the OS sandbox. |
 
 `open` and `none` are legacy aliases for `free`.
 
-`permission` only controls the Bash tool. Other tools keep their own
-validation and approval rules.
+The **isolation** half of `permission` — sandbox route, escalation, the
+work-dir jail — is Bash's alone. The **approval** half is not: `free` waives
+the approval gate for `Write` and `Edit` too, since an operator who turned
+prompting off did not mean "except for file writes". Under `auto` and
+`manual` those two are unaffected — they gate on *where* the path is, not on
+this setting (see [`modules/tools.md`](modules/tools.md)).
+
+Every other tool keeps its own validation and approval rules.
 
 MCP tools are outside it in both directions: they never consult `permission`,
 and as of the lazy-loading change they raise no approval prompt at all — see
@@ -146,9 +152,14 @@ force the model to replace them with `Read` or `Edit`.
 
 ### `free`
 
-`free` bypasses Bash approval and the OS sandbox. It is intended for trusted
-hosts or containers where the outer environment is already the isolation
-boundary.
+`free` bypasses the approval gate and the OS sandbox. It is intended for
+trusted hosts or containers where the outer environment is already the
+isolation boundary.
+
+The gate is off for every tool that raises it through
+`Tool::accessed_resources` and reads the mode — `Bash`, `Write`, `Edit`. A
+tool that refuses a path outright still refuses it: `free` says nobody will
+be *asked*, not that everything is permitted.
 
 The Bash tool still applies its normal tool-layer guards. In particular, cwd
 and any absolute command-path argument must remain inside the configured work

@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
             // no config reloader on this path, so use the default Bash
             // permission policy.
             permission: Arc::new(baybo_tools::builtin::LivePermissionMode::new(
-                baybo_tools::builtin::BashPermissionMode::default(),
+                baybo_tools::builtin::PermissionMode::default(),
             )),
             builtin_memory: config.memory.builtin.enabled,
         },

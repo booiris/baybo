@@ -39,7 +39,7 @@ branch was explicitly closed to them.
    session — a broader grant than any prompt asked for, handed out by answering
    a narrow-looking question.
 3. **It ignored the operator's stated policy.** `permission` (`baybo.json`)
-   reaches only `BashPermissionMode` and the OS sandbox
+   reaches only `PermissionMode` and the OS sandbox
    (`crates/baybo/src/boot.rs`, `crates/baybo/src/sandbox_boot.rs`). Under
    `permission: "free"` — "run Bash directly, no sandbox, no approval" — an
    `rm -rf` went through unquestioned while a cloud-API read prompted. The two

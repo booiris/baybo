@@ -264,13 +264,13 @@ pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
 /// ([`crate::reload`]) so both map identically.
 pub fn to_bash_permission(
     permission: baybo_config::PermissionPolicy,
-) -> baybo_tools::builtin::BashPermissionMode {
-    use baybo_tools::builtin::BashPermissionMode;
+) -> baybo_tools::builtin::PermissionMode {
+    use baybo_tools::builtin::PermissionMode;
 
     match permission {
-        baybo_config::PermissionPolicy::Auto => BashPermissionMode::Auto,
-        baybo_config::PermissionPolicy::Manual => BashPermissionMode::Manual,
-        baybo_config::PermissionPolicy::Free => BashPermissionMode::Free,
+        baybo_config::PermissionPolicy::Auto => PermissionMode::Auto,
+        baybo_config::PermissionPolicy::Manual => PermissionMode::Manual,
+        baybo_config::PermissionPolicy::Free => PermissionMode::Free,
     }
 }
 

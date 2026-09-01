@@ -57,6 +57,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::paths::require_absolute;
+use super::permission::{LivePermissionMode, PermissionMode};
 use std::sync::Arc;
 
 use baybo_model::new_background_handle;
@@ -186,24 +187,14 @@ const BENCH_APPROVAL: &str = r#"APPROVAL: There is no approval gate."#;
 /// bench prompt, and no approval gate.
 const BENCH: bool = cfg!(feature = "bench-bash");
 
-fn permission_skips_os_sandbox(permission: BashPermissionMode) -> bool {
-    BENCH || permission == BashPermissionMode::Free
-}
-
-/// How Bash handles approval and sandbox escape.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum BashPermissionMode {
-    #[default]
-    Auto = 0,
-    Manual = 1,
-    Free = 2,
+fn permission_skips_os_sandbox(permission: PermissionMode) -> bool {
+    BENCH || permission == PermissionMode::Free
 }
 
 /// Per-call override of the configured Bash sandbox route. When the configured
 /// mode would otherwise use the OS sandbox, `RequireEscalated` raises a fresh,
 /// uncached approval prompt before selecting the unsandboxed route. It is a
-/// no-op when [`BashPermissionMode::Free`] already selects that route.
+/// no-op when [`PermissionMode::Free`] already selects that route.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SandboxPermissions {
@@ -213,43 +204,8 @@ enum SandboxPermissions {
 }
 
 impl SandboxPermissions {
-    fn requires_approval(self, permission: BashPermissionMode) -> bool {
+    fn requires_approval(self, permission: PermissionMode) -> bool {
         self == Self::RequireEscalated && !permission_skips_os_sandbox(permission)
-    }
-}
-
-impl BashPermissionMode {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => BashPermissionMode::Manual,
-            2 => BashPermissionMode::Free,
-            _ => BashPermissionMode::Auto,
-        }
-    }
-
-    fn encode(self) -> u8 {
-        self as u8
-    }
-}
-
-/// Shared, hot-swappable Bash permission mode. A config reload calls [`Self::set`] and
-/// every `BashTool` holding the `Arc` sees it on its next call — both the
-/// execution path and the live-rendered tool description. Lock-free: the mode
-/// is a single byte read on the per-command hot path.
-pub struct LivePermissionMode(std::sync::atomic::AtomicU8);
-
-impl LivePermissionMode {
-    pub fn new(permission: BashPermissionMode) -> Self {
-        Self(std::sync::atomic::AtomicU8::new(permission.encode()))
-    }
-
-    pub fn get(&self) -> BashPermissionMode {
-        BashPermissionMode::from_u8(self.0.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    pub fn set(&self, permission: BashPermissionMode) {
-        self.0
-            .store(permission.encode(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -325,7 +281,7 @@ const GIT_COMMIT_TRAILER_SHIM_TEMPLATE: &str = r##"git() {
 "##;
 
 pub struct BashTool {
-    /// Tool descriptions pre-rendered per [`BashPermissionMode`], indexed by
+    /// Tool descriptions pre-rendered per [`PermissionMode`], indexed by
     /// the permission's encoded byte. [`Tool::description`] returns the one for the
     /// current hot-swappable permission, so a `permission` reload re-skins the prompt
     /// the LLM sees without rebuilding the tool. The `bench-bash` build has a
@@ -378,14 +334,14 @@ impl BashTool {
             work_dir,
             uv_env_prefix: build_uv_env_exports(&paths, resolve_uv_bin_dir().as_deref()),
             process_manager,
-            permission: Arc::new(LivePermissionMode::new(BashPermissionMode::default())),
+            permission: Arc::new(LivePermissionMode::new(PermissionMode::default())),
         }
     }
 
     /// Pin a fixed permission mode via a fresh (non-shared) handle. For callers
     /// that don't participate in hot-reload — mainly tests.
     #[cfg(test)]
-    pub fn with_permission(mut self, permission: BashPermissionMode) -> Self {
+    pub fn with_permission(mut self, permission: PermissionMode) -> Self {
         self.permission = Arc::new(LivePermissionMode::new(permission));
         self
     }
@@ -398,7 +354,7 @@ impl BashTool {
         self
     }
 
-    fn permission(&self) -> BashPermissionMode {
+    fn permission(&self) -> PermissionMode {
         self.permission.get()
     }
 
@@ -437,7 +393,7 @@ impl BashTool {
     }
 }
 
-/// Render the three [`BashPermissionMode`] descriptions, indexed by the
+/// Render the three [`PermissionMode`] descriptions, indexed by the
 /// encoded permission byte. `free` drops only the OS sandbox; the work-dir jail
 /// and uv shim stay. Compiled out under `bench-bash` (which renders one fixed
 /// prompt — see `render_bench_description`).
@@ -445,13 +401,9 @@ impl BashTool {
 fn build_descriptions(work_dir: &Path, platform: &str) -> [String; 3] {
     let mut out: [String; 3] = Default::default();
     for (permission, isolation, approval) in [
-        (BashPermissionMode::Auto, SANDBOXED_ISOLATION, AUTO_APPROVAL),
-        (
-            BashPermissionMode::Manual,
-            SANDBOXED_ISOLATION,
-            MANUAL_APPROVAL,
-        ),
-        (BashPermissionMode::Free, FREE_ISOLATION, FREE_APPROVAL),
+        (PermissionMode::Auto, SANDBOXED_ISOLATION, AUTO_APPROVAL),
+        (PermissionMode::Manual, SANDBOXED_ISOLATION, MANUAL_APPROVAL),
+        (PermissionMode::Free, FREE_ISOLATION, FREE_APPROVAL),
     ] {
         out[permission.encode() as usize] = render_description(
             isolation,
@@ -665,7 +617,7 @@ impl BashTool {
             WorkspacePaths::new("/tmp"),
             baybo_process::ProcessManager::transient(),
         );
-        tool.permission = Arc::new(LivePermissionMode::new(BashPermissionMode::Manual));
+        tool.permission = Arc::new(LivePermissionMode::new(PermissionMode::Manual));
         tool
     }
 }
@@ -809,7 +761,7 @@ impl Tool for BashTool {
         // sandboxed command must never authorize its unsandboxed form.
         if BENCH
             || sandbox_permissions_from_params(params) == SandboxPermissions::RequireEscalated
-            || self.permission() != BashPermissionMode::Manual
+            || self.permission() != PermissionMode::Manual
         {
             return Vec::new();
         }
@@ -1690,7 +1642,7 @@ fn baybo_cli_rejection_template(route: BashExecutionRoute) -> Option<&'static st
 
 /// What the command line appears to be relative to the gateway's own `baybo`
 /// CLI. This enum deliberately does not mention sandboxing; the final execution
-/// route also depends on [`BashPermissionMode`].
+/// route also depends on [`PermissionMode`].
 ///
 /// The sandbox masks the Baybo state dir (`~/.baybo`/`$BAYBO_HOME`), so a
 /// sandboxed `baybo …` can't reach the gateway's config or session
@@ -1794,7 +1746,7 @@ impl BashExecutionRoute {
 
 fn bash_execution_route_for_kind_and_permissions(
     kind: BayboCliCommandKind,
-    permission: BashPermissionMode,
+    permission: PermissionMode,
     sandbox_permissions: SandboxPermissions,
 ) -> BashExecutionRoute {
     let default_route = bash_execution_route_for_kind(kind, permission);
@@ -1814,7 +1766,7 @@ fn bash_execution_route_for_kind_and_permissions(
 fn bash_execution_route_with_bin(
     command: &str,
     bin: &Path,
-    permission: BashPermissionMode,
+    permission: PermissionMode,
 ) -> BashExecutionRoute {
     bash_execution_route_for_kind(
         classify_baybo_cli_command_with_bin(command, bin),
@@ -1824,7 +1776,7 @@ fn bash_execution_route_with_bin(
 
 fn bash_execution_route_for_kind(
     kind: BayboCliCommandKind,
-    permission: BashPermissionMode,
+    permission: PermissionMode,
 ) -> BashExecutionRoute {
     match kind {
         BayboCliCommandKind::CanonicalSelfInvocation => BashExecutionRoute::RunBayboCliUnsandboxed,
@@ -1840,15 +1792,15 @@ fn bash_execution_route_for_kind(
             BashExecutionRoute::RunUnsandboxed
         }
         BayboCliCommandKind::OtherCommand => match permission {
-            BashPermissionMode::Auto => BashExecutionRoute::RunSandboxed {
+            PermissionMode::Auto => BashExecutionRoute::RunSandboxed {
                 pre_exec_judge: true,
                 escape_policy: SandboxEscapePolicy::AutoJudge,
             },
-            BashPermissionMode::Manual => BashExecutionRoute::RunSandboxed {
+            PermissionMode::Manual => BashExecutionRoute::RunSandboxed {
                 pre_exec_judge: false,
                 escape_policy: SandboxEscapePolicy::ManualApproval,
             },
-            BashPermissionMode::Free => BashExecutionRoute::RunUnsandboxed,
+            PermissionMode::Free => BashExecutionRoute::RunUnsandboxed,
         },
     }
 }
@@ -2865,11 +2817,11 @@ mod tests {
         classify_baybo_cli_command_with_bin(command, bin)
     }
 
-    fn auto_permission() -> BashPermissionMode {
-        BashPermissionMode::Auto
+    fn auto_permission() -> PermissionMode {
+        PermissionMode::Auto
     }
 
-    fn route(command: &str, bin: &Path, permission: BashPermissionMode) -> BashExecutionRoute {
+    fn route(command: &str, bin: &Path, permission: PermissionMode) -> BashExecutionRoute {
         bash_execution_route_with_bin(command, bin, permission)
     }
 
@@ -2877,19 +2829,19 @@ mod tests {
     fn execution_route_combines_baybo_cli_match_with_permission() {
         let bin = Path::new("/usr/local/bin/baybo");
         assert_eq!(
-            route("/usr/local/bin/baybo cost", bin, BashPermissionMode::Auto,),
+            route("/usr/local/bin/baybo cost", bin, PermissionMode::Auto,),
             BashExecutionRoute::RunBayboCliUnsandboxed,
         );
         assert_eq!(
-            route("baybo cost", bin, BashPermissionMode::Auto,),
+            route("baybo cost", bin, PermissionMode::Auto,),
             BashExecutionRoute::RejectNonCanonicalBayboCliPath,
         );
         assert_eq!(
-            route("ls -la", bin, BashPermissionMode::Free,),
+            route("ls -la", bin, PermissionMode::Free,),
             BashExecutionRoute::RunUnsandboxed,
         );
         assert_eq!(
-            route("ls -la", bin, BashPermissionMode::Manual,),
+            route("ls -la", bin, PermissionMode::Manual,),
             BashExecutionRoute::RunSandboxed {
                 pre_exec_judge: false,
                 escape_policy: SandboxEscapePolicy::ManualApproval,
@@ -2902,7 +2854,7 @@ mod tests {
             );
         } else {
             assert_eq!(
-                route("ls -la", bin, BashPermissionMode::Manual,),
+                route("ls -la", bin, PermissionMode::Manual,),
                 BashExecutionRoute::RunSandboxed {
                     pre_exec_judge: false,
                     escape_policy: SandboxEscapePolicy::ManualApproval,
@@ -2916,7 +2868,7 @@ mod tests {
                 },
             );
             assert_eq!(
-                route("ls -la", bin, BashPermissionMode::Free,),
+                route("ls -la", bin, PermissionMode::Free,),
                 BashExecutionRoute::RunUnsandboxed,
             );
         }
@@ -3228,9 +3180,9 @@ mod tests {
         // accepting the shape there teaches a command form that breaks the
         // moment the same session runs under `auto`/`manual`.
         for permission in [
-            BashPermissionMode::Auto,
-            BashPermissionMode::Manual,
-            BashPermissionMode::Free,
+            PermissionMode::Auto,
+            PermissionMode::Manual,
+            PermissionMode::Free,
         ] {
             assert_eq!(
                 bash_execution_route_for_kind(
@@ -3342,7 +3294,7 @@ mod tests {
             baybo_workspace::WorkspacePaths::new("/some/ws"),
             baybo_process::ProcessManager::transient(),
         )
-        .with_permission(BashPermissionMode::Manual)
+        .with_permission(PermissionMode::Manual)
         .description();
         assert!(
             !d.contains("{{"),
@@ -3389,7 +3341,7 @@ mod tests {
             baybo_workspace::WorkspacePaths::new("/tmp"),
             baybo_process::ProcessManager::transient(),
         )
-        .with_permission(BashPermissionMode::Free);
+        .with_permission(PermissionMode::Free);
         let ctx = ctx_with(None);
 
         // In-work command runs directly, no sandbox backend required.
@@ -3420,7 +3372,7 @@ mod tests {
             baybo_workspace::WorkspacePaths::new("/some/ws"),
             baybo_process::ProcessManager::transient(),
         )
-        .with_permission(BashPermissionMode::Free);
+        .with_permission(PermissionMode::Free);
         let d = free.description();
         assert!(
             !d.contains("{{"),
@@ -3469,7 +3421,7 @@ mod tests {
 
     #[test]
     fn permission_hot_swap_reskins_description_and_behavior() {
-        let handle = Arc::new(LivePermissionMode::new(BashPermissionMode::Manual));
+        let handle = Arc::new(LivePermissionMode::new(PermissionMode::Manual));
         let tool = BashTool::new(
             baybo_workspace::WorkspacePaths::new("/some/ws"),
             baybo_process::ProcessManager::transient(),
@@ -3481,7 +3433,7 @@ mod tests {
 
         // Hot-swap to free via the shared handle: the SAME tool now skips the OS
         // sandbox but keeps uv + the work-dir scope — no rebuild.
-        handle.set(BashPermissionMode::Free);
+        handle.set(PermissionMode::Free);
         assert!(tool.skip_os_sandbox());
         assert!(!tool.description().contains(SANDBOXED_MARKER));
         assert!(tool.description().contains("OS sandbox is OFF"));
@@ -3501,7 +3453,7 @@ mod tests {
             baybo_workspace::WorkspacePaths::new("/tmp"),
             baybo_process::ProcessManager::transient(),
         )
-        .with_permission(BashPermissionMode::Free);
+        .with_permission(PermissionMode::Free);
         let wrapped = free.wrap_command("python -c 'x'", &ToolContext::for_test());
         assert!(
             wrapped.contains("uv run python"),
@@ -3832,7 +3784,7 @@ mod tests {
         // `free` (would never judge), but the per-command snapshot captured
         // AutoJudge (permission was `auto` at execute() entry). escalate must act
         // on the snapshot it was handed, not re-read the now-swapped permission.
-        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
+        let tool = BashTool::for_test().with_permission(PermissionMode::Free);
         let mut ctx = ctx_with(None);
         ctx.lite_llm = Some(judge_llm(V_SAFE));
         let (out, note) = tool
@@ -4136,7 +4088,7 @@ mod tests {
     async fn execute_with_free_permission_can_background_unsandboxed_command() {
         let (mut ctx, seen) = ctx_for_detached();
         ctx.sandbox = None;
-        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
+        let tool = BashTool::for_test().with_permission(PermissionMode::Free);
 
         let out = tool
             .execute(
@@ -4170,7 +4122,7 @@ mod tests {
         let (mut ctx, seen) = ctx_for_detached();
         ctx.sandbox = None;
         ctx.background_eligible = false;
-        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
+        let tool = BashTool::for_test().with_permission(PermissionMode::Free);
 
         let err = tool
             .execute(
@@ -4198,7 +4150,7 @@ mod tests {
         let (mut ctx, seen) = ctx_for_detached();
         ctx.sandbox = None;
         ctx.secrets = Some(Arc::new(StubSecrets));
-        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
+        let tool = BashTool::for_test().with_permission(PermissionMode::Free);
 
         let out = tool
             .execute(
@@ -4917,7 +4869,7 @@ mod tests {
         });
 
         let out = BashTool::for_test()
-            .with_permission(BashPermissionMode::Free)
+            .with_permission(PermissionMode::Free)
             .execute(
                 json!({
                     "command": "printf 'already-unsandboxed\\n'",
@@ -5860,7 +5812,7 @@ mod tests {
             "sandbox_permissions": "require_escalated",
         });
 
-        let manual = BashTool::for_test().with_permission(BashPermissionMode::Manual);
+        let manual = BashTool::for_test().with_permission(PermissionMode::Manual);
         assert_eq!(manual.accessed_resources(&destructive).len(), 1);
         assert_eq!(manual.accessed_resources(&benign).len(), 1);
         assert!(
@@ -5872,7 +5824,7 @@ mod tests {
         assert!(auto.accessed_resources(&destructive).is_empty());
         assert!(auto.accessed_resources(&benign).is_empty());
 
-        let free = BashTool::for_test().with_permission(BashPermissionMode::Free);
+        let free = BashTool::for_test().with_permission(PermissionMode::Free);
         assert!(free.accessed_resources(&destructive).is_empty());
         assert!(free.accessed_resources(&benign).is_empty());
     }
