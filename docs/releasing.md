@@ -98,6 +98,19 @@ for the full reasoning. In short:
   Ubuntu 22.04. `rust:bookworm` looks like the careful choice and is worse than
   it appears: 2.36 still excludes the whole 2.34 cluster. 2.28 loads everywhere
   tested. The `redhat/ubi9` smoke step exists to catch a regression here.
+- **The toolchain that builds the binary is pinned, and nothing is piped from a
+  URL into a shell.** The build images carry a digest, not a tag — v0.1.0 was
+  built inside an image whose `latest` had been re-pointed twenty minutes
+  earlier, which meant a registry chose the compiler of a binary strangers pipe
+  into their shells. `NODE_VERSION` is a full `x.y.z` for the same reason: it
+  used to be a major that the build resolved against nodejs.org at run time, so
+  two builds of one commit were not the same build. node and bun are now
+  downloaded and checked against the `SHASUMS256.txt` each project publishes
+  beside the artifact. Be honest about what that buys: the digest travels from
+  the same origin over the same TLS session, so it catches corruption and a
+  tampered mirror, not a compromised upstream. rustup is left alone on purpose —
+  its channel manifest already hashes every component it installs.
+
 - **The workflow writes nothing to the Actions cache.** The repo already sits at
   roughly 13 GB against a 10 GB per-repo budget and is evicting continuously; a
   release-profile entry would evict the ones that keep every PR's `test` job
@@ -177,12 +190,27 @@ Every published target is verified against the real release before it is allowed
 to stand: `verify-install` installs into three Linux containers (one of them
 through the unpinned `/releases/latest/` path) and `verify-install-macos`
 installs natively on `macos-26` and asserts the binary is a `Mach-O 64-bit
-executable arm64`. If either fails, `unpublish-on-failure` deletes the release
-and its tag. That cleanup is one job rather than a step in each verifier,
-because two verifiers racing to delete the same release would leave the loser
-red for no reason — and it is guarded on `needs.release.result == 'success'`,
-since an `if:` overrides the usual skip-with-your-dependency rule and a build
-failure would otherwise reach it with no release to delete.
+executable arm64`. If either fails, `delist-unverified` marks the release a
+prerelease, which takes it out of `/releases/latest/download/`.
+
+It de-lists rather than deletes, and that is a deliberate reversal of the
+original design. The trigger cannot tell "install.sh is broken" from "Docker Hub
+rate-limited us", and deletion paid out by destroying the assets, the notes, the
+download counts and — via `--cleanup-tag` — the only ref pinning the shipped
+commit. De-listing removes the entire user-facing harm and leaves everything a
+human needs to diagnose it; `gh release edit <tag> --prerelease=false --latest`
+undoes it. Reserve deletion for a person who has looked. The verifiers also
+carry `timeout-minutes` (they would otherwise inherit the 6-hour default and act
+on a release long after users had it) and retry their container runs three
+times, because pulling images anonymously from Docker Hub and running apt/dnf
+against public mirrors is the flakiest thing in the workflow.
+
+The job is one, not a step in each verifier, because two verifiers racing on the
+same release would leave the loser red for no reason. It is guarded on
+`needs.release.result == 'success'` — an `if:` overrides the usual
+skip-with-your-dependency rule, so a build failure would otherwise reach it with
+no release to act on — and on `!cancelled()` rather than `failure()`, since a
+cancelled verifier also leaves a release that nothing confirmed.
 
 One gap remains: `--version <old-tag>` runs today's installer against an old
 release's assets, so asset naming is frozen forever once a release is public.

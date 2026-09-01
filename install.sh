@@ -91,7 +91,7 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --version) VERSION="${2:-}"; [ -n "$VERSION" ] || err "--version needs a tag"; shift 2 ;;
+        --version) VERSION="${2:-}"; shift 2 ;;
         --bin-dir) INSTALL_DIR="${2:-}"; [ -n "$INSTALL_DIR" ] || err "--bin-dir needs a path"; shift 2 ;;
         --no-modify-path) NO_MODIFY_PATH=1; shift ;;
         --uninstall) DO_UNINSTALL=1; shift ;;
@@ -291,9 +291,15 @@ git) and re-run. Override with BAYBO_SKIP_DEP_CHECK=1 if you know better."
 # ---------------------------------------------------------------------------
 
 main() {
-    for cmd in curl tar mktemp uname install grep; do
+    # awk parses SHA256SUMS below; without it `expected` comes back empty and
+    # the script accuses the RELEASE of being incomplete when the gap is on this
+    # machine. A hasher is required for the same reason the gate exists at all —
+    # see the checksum block.
+    for cmd in curl tar mktemp uname install grep awk; do
         has "$cmd" || err "$cmd is required but not installed"
     done
+    has sha256sum || has shasum ||
+        err "sha256sum or shasum is required to verify the download"
 
     target="$(detect_target)"
     check_glibc
@@ -301,6 +307,23 @@ main() {
 
     asset="${BIN_NAME}-${target}.tar.gz"
     if [ -n "$VERSION" ]; then
+        # curl normalises dot-segments client-side, so an unvalidated version
+        # walks straight out of this repo's release path: `--version
+        # ../../someone/else/releases/download/v1` fetches the tarball AND the
+        # SHA256SUMS from there, and because the two agree with each other the
+        # checksum gate passes and the binary is installed and run. Nothing in
+        # this repo feeds untrusted input here today, but the README recommends
+        # this script for other people's automation, where a release tag from a
+        # workflow input is exactly the shape that would.
+        #
+        # The slash case has to come FIRST and be its own arm: a glob `*`
+        # matches `/` too, so `v0.1.0/../../evil` satisfies the version-shaped
+        # pattern below on its own.
+        case "$VERSION" in
+            */*|*..*) err "--version must not contain a path (got: ${VERSION})" ;;
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) err "--version must be a release tag like v0.1.0 (got: ${VERSION:-<empty>})" ;;
+        esac
         url="${BASE_URL}/download/${VERSION}/${asset}"
         sums_url="${BASE_URL}/download/${VERSION}/SHA256SUMS"
     else
@@ -339,17 +362,17 @@ that should not be trusted. Re-run to retry."
 The release is incomplete or the asset was renamed; refusing to install
 something unverified."
 
-    # No hashing tool is the one case that stays a warning: it is a genuine
-    # minimal-image situation and nothing an attacker gets to choose.
+    # A hasher is guaranteed present by the preflight, so there is no
+    # no-verification path left. There used to be: with neither tool installed
+    # this set `actual=""` and the guard below short-circuited, so the tarball
+    # was extracted, installed and executed unverified — while the comment above
+    # and the docs both claimed the gate failed closed.
     if has sha256sum; then
         actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
-    elif has shasum; then
-        actual="$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')"
     else
-        actual=""
-        warn "neither sha256sum nor shasum found; cannot verify the download."
+        actual="$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')"
     fi
-    if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
+    if [ "$actual" != "$expected" ]; then
         err "checksum mismatch for ${asset}
   expected ${expected}
   actual   ${actual}

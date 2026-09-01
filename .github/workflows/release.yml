@@ -101,14 +101,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The build images are pinned by DIGEST, not by tag — and certainly
+          # not bare, which resolves `:latest`. v0.1.0 was built in an image
+          # whose `latest` had been re-pointed 20 minutes earlier; that is the
+          # whole toolchain of a binary strangers pipe into a shell, chosen by
+          # whatever a registry happened to be serving that morning. pypa
+          # publishes dated immutable tags, kept here beside the digest so a
+          # human can see how old the pin is. Pinning also freezes the image's
+          # dnf repo snapshot for free.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-            image: quay.io/pypa/manylinux_2_28_x86_64
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.09.01-1@sha256:94c816d38ad56d2dc1df2f28007d18d306b0f5d05096c6f6b9141345df504d3e
           - target: aarch64-unknown-linux-gnu
             # A native arm64 standard runner, free on public repos. qemu would
             # turn a full-LTO build into hours.
             runner: ubuntu-24.04-arm
-            image: quay.io/pypa/manylinux_2_28_aarch64
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.09.01-1@sha256:45ea412cfbd2cc5e51323cecab614ea8e4e5522b4d4f668946c54056b40152f6
           - target: aarch64-apple-darwin
             # macos-26 is a standard 3-CPU arm64 runner, free on a public repo.
             # No container: macOS has no glibc floor to pin, Xcode's SDK is
@@ -216,6 +224,7 @@ jobs:
       # Nothing is created until both builds pass, so a failed build still
       # leaves no tag; the cleanup step covers a failure after this point.
       - name: tag ${{ needs.gate.outputs.tag }}
+        id: tag
         run: |
           git tag "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/$TAG"
@@ -229,15 +238,31 @@ jobs:
       # the draft if any upload fails), but the tag push above is not part of
       # that transaction. Without this, a failed publish strands a tag that the
       # gate would then reject on every retry.
+      # Only if THIS run pushed the tag, and only if it still points where we
+      # put it. Unguarded, the window this covers is a 25-120 minute build
+      # during which a human can push the same tag by hand: the push above then
+      # fails (no --force), and the cleanup deleted their tag instead — signature
+      # and all. `|| true` used to hide that entirely; a stranded tag the gate
+      # rejects is a far better failure than a silently deleted one.
       - name: drop the tag if publishing failed
-        if: failure()
-        run: git push --delete origin "refs/tags/$TAG" || true
+        if: ${{ failure() && steps.tag.outcome == 'success' }}
+        run: |
+          remote_sha="$(git ls-remote origin "refs/tags/$TAG" | cut -f1)"
+          if [ "$remote_sha" != "$GITHUB_SHA" ]; then
+            echo "::warning::${TAG} points at ${remote_sha:-nothing}, not this run's ${GITHUB_SHA}; leaving it alone"
+            exit 0
+          fi
+          git push --delete origin "refs/tags/$TAG"
 
   verify-install:
     name: verify install.sh
     needs: [gate, release]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-24.04
+    # Without this the job inherits GitHub's 6-hour default. This job feeds a
+    # step that de-lists a published release, so a wedged runner would act on
+    # the release six hours after users started installing it.
+    timeout-minutes: 20
     env:
       TAG: ${{ needs.gate.outputs.tag }}
       VERSION: ${{ needs.gate.outputs.version }}
@@ -271,12 +296,27 @@ jobs:
               debian:12) pin="" ;;              # resolves via /releases/latest/
               *) pin="--version '${TAG}'" ;;
             esac
-            docker run --rm -v "$PWD/install.sh:/install.sh:ro" "$image" sh -c "
-              set -eu
-              ${prep} >/dev/null
-              sh /install.sh ${pin} --no-modify-path
-              \"\$HOME/.local/bin/baybo\" --version | grep -F '${VERSION}'
-            "
+            # Retry the whole container run: pulling three images anonymously
+            # from Docker Hub and then running apt/dnf against public mirrors
+            # is the flakiest thing in this workflow, and its failure feeds a
+            # step that acts on a published release. A genuine install failure
+            # still fails — it just fails three times first.
+            for attempt in 1 2 3; do
+              if docker run --rm -v "$PWD/install.sh:/install.sh:ro" "$image" sh -c "
+                set -eu
+                ${prep} >/dev/null
+                sh /install.sh ${pin} --no-modify-path
+                \"\$HOME/.local/bin/baybo\" --version | grep -F '${VERSION}'
+              "; then
+                break
+              fi
+              if [ "$attempt" = 3 ]; then
+                echo "::error::install.sh failed on ${image} after 3 attempts"
+                exit 1
+              fi
+              echo "attempt ${attempt} failed on ${image}; retrying"
+              sleep 15
+            done
             echo "::endgroup::"
           done
 
@@ -290,6 +330,7 @@ jobs:
     needs: [gate, release]
     if: ${{ !inputs.dry_run }}
     runs-on: macos-26
+    timeout-minutes: 20
     env:
       TAG: ${{ needs.gate.outputs.tag }}
       VERSION: ${{ needs.gate.outputs.version }}
@@ -316,16 +357,32 @@ jobs:
   # verifier, because with two of them the first delete would win and the second
   # would fail on an already-deleted release, turning a clean self-heal into a
   # confusing red job.
-  unpublish-on-failure:
-    name: unpublish a release the installer cannot use
+  # A release is public and marked `latest` the moment `publish` finishes, so an
+  # unverified one has to stop being what `/releases/latest/download/` serves.
+  #
+  # It is DE-LISTED, not deleted. Deleting was the original design and it was
+  # wrong: the trigger cannot tell "install.sh is broken" from "Docker Hub rate-
+  # limited us", and it paid out by destroying the assets, the notes, the
+  # download counts and — via --cleanup-tag — the only ref pinning the shipped
+  # commit. Marking the release a prerelease removes it from the `latest` URL,
+  # which is the entire user-facing harm, while leaving everything a human needs
+  # to diagnose it. It is one `gh release edit --latest` to undo. Reserve
+  # deletion for a person who has looked.
+  #
+  # `needs.release.result == 'success'` is load-bearing, not belt-and-braces: an
+  # `if:` overrides the normal "a skipped dependency skips the dependent" rule,
+  # so without it a failure in `build` — where `release` never ran and no
+  # release exists — would still reach this job. `!cancelled()` rather than
+  # `failure()` so a cancelled verify job de-lists too: a release nothing
+  # confirmed is not a release to leave standing as `latest`.
+  delist-unverified:
+    name: de-list a release the installer could not use
     needs: [gate, release, verify-install, verify-install-macos]
-    # `needs.release.result == 'success'` is load-bearing, not belt-and-braces:
-    # an `if:` overrides the normal "a skipped dependency skips the dependent"
-    # rule, so without it a failure in `build` — where `release` never ran and
-    # no release exists — would still reach this job and fail trying to delete
-    # nothing. A build failure needs no cleanup; the tag is not pushed until the
-    # publish step.
-    if: ${{ failure() && !inputs.dry_run && needs.release.result == 'success' }}
+    if: >-
+      ${{ !cancelled() && !inputs.dry_run
+          && needs.release.result == 'success'
+          && (needs.verify-install.result != 'success'
+              || needs.verify-install-macos.result != 'success') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -334,5 +391,7 @@ jobs:
       TAG: ${{ needs.gate.outputs.tag }}
     steps:
       - run: |
-          echo "::error::install.sh failed against ${TAG}; deleting the release and tag"
-          gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY"
+          echo "::error::install.sh could not use ${TAG}; marking it a prerelease so /releases/latest/ stops serving it"
+          gh release edit "$TAG" --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
+          echo "${TAG} de-listed. Assets, notes and the tag are intact for diagnosis." >> "$GITHUB_STEP_SUMMARY"
+          echo "Undo with: gh release edit ${TAG} --prerelease=false --latest" >> "$GITHUB_STEP_SUMMARY"
