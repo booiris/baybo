@@ -255,7 +255,14 @@ const SERVICE_PATH_TOOLS: &[&str] = &[
 
 /// System bin dirs appended after the discovered ones, so a tool
 /// installed *after* the install still resolves.
+///
+/// `/opt/homebrew` is Homebrew's prefix on Apple silicon — which is every
+/// macOS machine this project ships a binary for — and is where `brew install
+/// node` puts things. `/usr/local` only covers Intel Macs. Non-existent dirs
+/// are filtered out below, so both cost nothing on Linux.
 const SERVICE_PATH_SYSTEM_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
     "/usr/local/bin",
     "/usr/local/sbin",
     "/usr/bin",
@@ -277,6 +284,25 @@ const SERVICE_PATH_SYSTEM_DIRS: &[&str] = &[
 pub fn resolve_service_path() -> String {
     let path = std::env::var_os("PATH").unwrap_or_default();
     service_path_from(std::env::split_paths(&path))
+}
+
+/// Per-user tool roots to append, resolved against `$HOME`.
+///
+/// These close an ordering trap rather than a missing-dir one. The selection
+/// above keeps a `PATH` entry only when it *already* holds one of
+/// [`SERVICE_PATH_TOOLS`], so a `~/.local/bin` containing nothing but a
+/// freshly-installed `baybo` is dropped — and then `uv`, installed there an
+/// hour later on the advice of the installer's own warnings, is invisible to
+/// the daemon forever. `HostTool` consults exactly these dirs at spawn time, so
+/// a unit that cannot see them contradicts the resolver it is running.
+fn home_tool_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    baybo_process::HOME_INSTALL_DIRS
+        .iter()
+        .map(|dir| PathBuf::from(&home).join(dir))
+        .collect()
 }
 
 /// The selection itself, over an explicit candidate list so it is
@@ -307,6 +333,12 @@ fn service_path_from(candidates: impl Iterator<Item = PathBuf>) -> String {
         if dir.is_dir() {
             push(&mut dirs, dir);
         }
+    }
+    // Last, so a packaged tool still wins — the same precedence `HostTool`
+    // applies, and unconditional because the point is the dir a tool has not
+    // been installed into *yet*.
+    for dir in home_tool_dirs() {
+        push(&mut dirs, dir);
     }
 
     // `join_paths` only fails on a `:` inside an entry, which would also
@@ -384,6 +416,34 @@ mod tests {
     /// …and a dir that *does* hold one is kept, ahead of the system
     /// dirs, so the service resolves the same binary the operator's
     /// shell does.
+    #[test]
+    fn service_path_carries_the_user_tool_roots_even_when_empty() {
+        // The outage this reproduces: `install.sh` drops the binary into
+        // ~/.local/bin and then tells the user to run `baybo gateway install`
+        // at step 3 and to install the tools it warned about afterwards. At
+        // step 3 that dir holds only `baybo`, which is not in
+        // SERVICE_PATH_TOOLS, so the selection dropped it — and `uv` installed
+        // there later was invisible to the daemon for good.
+        let home = tempfile::tempdir().expect("tempdir");
+        // SAFETY: single-threaded test; HOME is restored by the guard below.
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let path = service_path_from(std::iter::empty());
+        match previous {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let entries: Vec<PathBuf> = path.split(':').map(PathBuf::from).collect();
+        for dir in baybo_process::HOME_INSTALL_DIRS {
+            let expected = home.path().join(dir);
+            assert!(
+                entries.contains(&expected),
+                "the unit PATH must carry {expected:?} even though nothing is installed there yet, got {path:?}"
+            );
+        }
+    }
+
     #[test]
     fn service_path_keeps_tool_dir_ahead_of_system_dirs() {
         let dir = tempfile::tempdir().expect("tempdir");

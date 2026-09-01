@@ -28,7 +28,12 @@ pub const NODE_BINARY_ENV: &str = "BAYBO_NODE_BIN";
 /// `$HOME`-relative dirs a JS runtime lands in when installed by its own
 /// installer rather than a distro package. Consulted only after `PATH`
 /// misses, so a packaged install always wins.
-const HOME_INSTALL_DIRS: &[&str] = &[".local/bin", ".bun/bin"];
+///
+/// `pub` because the service installer has to bake the same dirs into the
+/// generated unit's `PATH`: a daemon that resolves `bun` here while its unit
+/// cannot see the directory is the same class of outage as an inherited empty
+/// `PATH`. One list, two consumers — see `baybo_gateway::installer`.
+pub const HOME_INSTALL_DIRS: &[&str] = &[".local/bin", ".bun/bin"];
 
 /// A host binary the runtime spawns, resolved to a concrete path.
 ///
