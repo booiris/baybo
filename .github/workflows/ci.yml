@@ -192,6 +192,7 @@ jobs:
       render: ${{ steps.filter.outputs.render }}
       ios: ${{ steps.filter.outputs.ios }}
       ios_native: ${{ steps.filter.outputs.ios_native }}
+      install: ${{ steps.filter.outputs.install }}
     steps:
       # Full history so the merge-base diff against the PR base resolves.
       - uses: actions/checkout@v4
@@ -236,6 +237,18 @@ jobs:
             echo "ios_native=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # The install/release shell stack. Nothing else in CI ever executes
+          # it: install.sh only has something to install once a release exists,
+          # and .github/workflows/release.yml is dispatch-only.
+          # deploy/docker/Dockerfile is in here because release-build.sh reads
+          # the node/bun/pnpm pins out of it — an edit that moves those ARG
+          # lines would otherwise only surface 25 minutes into a release build.
+          if changed '^(install\.sh|scripts/(release-build|test-install)\.sh|\.github/workflows/release\.yml|deploy/docker/Dockerfile)$'; then
+            echo "install=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "install=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # The tmux-driven render/smoke tests are flaky under load, so they're
   # `#[ignore]` and run here out of the gating `test` job. Gated on `changes`:
   # only runs when the render stack (tui / term-harness) is actually touched.
@@ -270,6 +283,29 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y tmux lld
       - run: cargo test -p baybo-tui --test chat_render --locked -- --include-ignored
       - run: cargo test -p baybo-term-harness --lib --locked -- --include-ignored
+
+  # install.sh is the only user-facing file in the repo that no other gate can
+  # run: before a release exists it has nothing to install, and release.yml is
+  # dispatch-only. scripts/test-install.sh closes that gap by serving a fake
+  # release from localhost and installing it inside real distro containers —
+  # including the two refusals that matter (musl, and a box with no git, whose
+  # absence would otherwise surface as a raw `spawn git init` error on the
+  # user's very first command).
+  install-script:
+    name: install.sh (shellcheck + container matrix)
+    needs: changes
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.install == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
+      - run: shellcheck -s sh install.sh
+      - run: shellcheck scripts/release-build.sh scripts/test-install.sh
+      # The release build reads its node/bun/pnpm pins out of
+      # deploy/docker/Dockerfile so the container and the tarball cannot drift
+      # apart. This proves that lookup still resolves.
+      - run: scripts/release-build.sh --print-pins
+      - run: scripts/test-install.sh
 
   ts-bindings:
     name: ts-rs bindings sync
