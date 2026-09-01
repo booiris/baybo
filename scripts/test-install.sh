@@ -22,7 +22,7 @@ PORT="${PORT:-8731}"
 TAG="v0.0.0-harness"
 DISTROS=("$@")
 if [ ${#DISTROS[@]} -eq 0 ]; then
-    DISTROS=(debian12 ubuntu2204 ubi9 alpine nogit)
+    DISTROS=(debian12 ubuntu2204 ubi9 alpine nogit nohash)
 fi
 
 pass=0; fail=0
@@ -85,6 +85,10 @@ case " ${DISTROS[*]} " in *" alpine "*)    ensure_image alpine    alpine:latest 
 # Deliberately no git: install.sh must refuse rather than install a binary whose
 # very first command dies on `spawn git init`.
 case " ${DISTROS[*]} " in *" nogit "*)     ensure_image nogit     debian:12    'apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*' ;; esac
+# No sha256sum and no shasum. The checksum gate used to fail OPEN here — it set
+# an empty digest, short-circuited its own comparison, and installed the tarball
+# unverified while claiming in a comment to fail closed.
+case " ${DISTROS[*]} " in *" nohash "*)    ensure_image nohash    debian:12    "$APT_PREP"' && rm -f /usr/bin/sha256sum /bin/sha256sum /usr/bin/shasum' ;; esac
 
 # RUN_TTY=1 allocates a pty, which is the only way to reach install.sh's rc-file
 # editing: it skips that when stdout is not a terminal, precisely so a piped
@@ -221,11 +225,30 @@ for d in "${DISTROS[@]}"; do
         debian12|ubuntu2204|ubi9) expect_install "$d" ;;
         alpine) expect_refusal alpine "musl is not a published target" "musl" ;;
         nogit)  expect_refusal nogit  "git is required at startup"     "git is required" ;;
+        nohash) expect_refusal nohash "no hasher means no verification" "sha256sum or shasum is required" ;;
         *) bad "unknown distro: $d" ;;
     esac
 done
 
-case " ${DISTROS[*]} " in *" debian12 "*) expect_checksum_refusal ;; esac
+expect_version_refusals() {
+    head_ "--version is validated before it reaches a URL"
+    local out
+    # curl normalises `..` client-side, so an unvalidated tag redirects both the
+    # tarball AND its checksums to another origin — self-consistent, so the
+    # fail-closed gate waves it through.
+    for bad in '../../someone/else/releases/download/v1' 'v1.2.3/../../evil' 'latest'; do
+        if out="$(run_in debian12 "sh /install.sh --version '${bad}' --no-modify-path")"; then
+            bad "accepted --version '${bad}'"
+        elif printf '%s' "$out" | grep -q -- '--version must'; then
+            ok "rejected --version '${bad}'"
+        else
+            bad "rejected --version '${bad}' for the wrong reason"
+            printf '%s\n' "$out" | sed 's/^/    /'
+        fi
+    done
+}
+
+case " ${DISTROS[*]} " in *" debian12 "*) expect_checksum_refusal; expect_version_refusals ;; esac
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

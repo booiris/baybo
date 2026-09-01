@@ -54,9 +54,12 @@ if [ "${1:-}" = "--print-pins" ]; then
 fi
 
 case "$(uname -s)/$(uname -m)" in
-    Linux/x86_64)   RUST_TARGET="x86_64-unknown-linux-gnu";  NODE_PLAT="linux-x64"    ;;
-    Linux/aarch64)  RUST_TARGET="aarch64-unknown-linux-gnu"; NODE_PLAT="linux-arm64"  ;;
-    Darwin/arm64)   RUST_TARGET="aarch64-apple-darwin";      NODE_PLAT="darwin-arm64" ;;
+    Linux/x86_64)   RUST_TARGET="x86_64-unknown-linux-gnu"
+                    NODE_PLAT="linux-x64";    BUN_PLAT="linux-x64"       ;;
+    Linux/aarch64)  RUST_TARGET="aarch64-unknown-linux-gnu"
+                    NODE_PLAT="linux-arm64";  BUN_PLAT="linux-aarch64"   ;;
+    Darwin/arm64)   RUST_TARGET="aarch64-apple-darwin"
+                    NODE_PLAT="darwin-arm64"; BUN_PLAT="darwin-aarch64"  ;;
     *) echo "release-build: unsupported build host $(uname -s)/$(uname -m)" >&2; exit 1 ;;
 esac
 
@@ -78,21 +81,63 @@ export RUSTC_WRAPPER=""
 # taken at a prompt nobody is watching.
 export CI=1
 
-# Resolve a concrete node release from the major pinned in the Dockerfile.
-node_tarball_url() {
-    local series="${NODE_VERSION%%.*}" full
-    full="$(curl -fsSL https://nodejs.org/dist/index.json \
-        | grep -o "\"version\":\"v${series}\.[0-9.]*\"" | head -n1 | cut -d'"' -f4)"
-    if [ -z "$full" ]; then
-        echo "release-build: no node ${series}.x release found upstream" >&2
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+}
+
+# Download $1 to $2 and check it against the entry for its basename in the
+# checksum manifest at $3.
+#
+# This is a corruption and MITM check, not a supply-chain guarantee: the digest
+# comes from the same origin over the same TLS session as the file. What it does
+# buy is that no byte reaches the compiler without SOME recorded digest, which
+# is the property the published SHA256SUMS is meant to stand for — and the
+# reason the toolchain is no longer installed by piping a URL into a shell,
+# where there is nothing to check at all.
+fetch_verified() {
+    local url="$1" out="$2" sums_url="$3" name expected actual
+    name="$(basename "$out")"
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$out" "$url"
+    expected="$(curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$sums_url" \
+        | grep "  ${name}\$" | head -n1 | awk '{print $1}')"
+    if [ -z "$expected" ]; then
+        echo "release-build: no checksum for ${name} in ${sums_url}" >&2
         exit 1
     fi
-    printf 'https://nodejs.org/dist/%s/node-%s-%s.tar.xz\n' "$full" "$full" "$NODE_PLAT"
+    actual="$(sha256 "$out" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        echo "release-build: checksum mismatch for ${name}" >&2
+        echo "  expected ${expected}" >&2
+        echo "  actual   ${actual}" >&2
+        exit 1
+    fi
+}
+
+# NODE_VERSION is a full x.y.z from the Dockerfile, not a major. It used to be a
+# major that this script resolved against nodejs.org at build time, which meant
+# a remote server picked the compiler of the embedded dashboard and two builds
+# of the same commit were not the same build.
+install_node() {
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+    fetch_verified \
+        "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_PLAT}.tar.xz" \
+        "$tmp/node-v${NODE_VERSION}-${NODE_PLAT}.tar.xz" \
+        "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"
+    tar -xJ -C "$dest" --strip-components=1 -f "$tmp"/node-*.tar.xz
+    rm -rf "$tmp"
 }
 
 install_bun() {
     if [ "$(bun --version 2>/dev/null)" = "$BUN_VERSION" ]; then return 0; fi
-    curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" >/dev/null
+    local tmp base="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}"
+    tmp="$(mktemp -d)"
+    fetch_verified "${base}/bun-${BUN_PLAT}.zip" "$tmp/bun-${BUN_PLAT}.zip" \
+        "${base}/SHASUMS256.txt"
+    unzip -q -o "$tmp/bun-${BUN_PLAT}.zip" -d "$tmp"
+    mkdir -p "$HOME/.bun/bin"
+    install -m 0755 "$tmp/bun-${BUN_PLAT}/bun" "$HOME/.bun/bin/bun"
+    rm -rf "$tmp"
 }
 
 # Provisioning is the ONE thing that genuinely differs between the two hosts —
@@ -115,7 +160,7 @@ provision_linux() {
     export PATH="/root/.cargo/bin:$PATH"
 
     log "node ${NODE_VERSION}"
-    curl -fsSL "$(node_tarball_url)" | tar -xJ -C /usr/local --strip-components=1
+    install_node /usr/local
 
     log "pnpm ${PNPM_VERSION}"
     npm install --global --silent "pnpm@${PNPM_VERSION}"
@@ -138,7 +183,7 @@ provision_macos() {
     case "$("$prefix/bin/node" --version 2>/dev/null)" in
         "v${NODE_VERSION}."*) ;;
         *) log "node ${NODE_VERSION}"
-           curl -fsSL "$(node_tarball_url)" | tar -xJ -C "$prefix" --strip-components=1 ;;
+           install_node "$prefix" ;;
     esac
     export PATH="$prefix/bin:$PATH"
 
@@ -227,13 +272,9 @@ tarball="$OUT_DIR/baybo-${RUST_TARGET}.tar.gz"
 # Bare binary at the tar root: install.sh then extracts without globbing a
 # version-stamped directory out of the path.
 tar -czf "$tarball" -C "$staging" baybo
-# macOS has no sha256sum; `shasum -a 256` emits the same "<hash>  <name>" shape
-# that install.sh greps for, so the SHA256SUMS file is identical either way.
-if command -v sha256sum >/dev/null 2>&1; then
-    sha256() { sha256sum "$@"; }
-else
-    sha256() { shasum -a 256 "$@"; }
-fi
+# `sha256` (defined above) papers over macOS having no sha256sum; `shasum -a 256`
+# emits the same "<hash>  <name>" shape that install.sh greps for, so the
+# SHA256SUMS file is identical on either host.
 ( cd "$OUT_DIR" && sha256 "$(basename "$tarball")" > "$(basename "$tarball").sha256" )
 
 log "built $(du -h "$tarball" | cut -f1) -> $tarball"
