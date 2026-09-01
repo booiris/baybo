@@ -80,7 +80,18 @@ Baybo targets **Linux and macOS** only.
 | `node` | browser tool sidecar only |
 | `bwrap` / `sandbox-exec` / `docker` | OS sandbox for shell commands (recommended) |
 
-## Build
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/booiris/baybo/master/install.sh | sh
+```
+
+Linux x86_64/aarch64 (glibc 2.28+) and Apple-silicon macOS. Checksum-verified
+into `~/.local/bin`, and warns about anything missing from the table above.
+`--version <tag>` pins a release, `--uninstall` removes it. Intel Macs: build
+from source.
+
+## Build from source
 
 ```bash
 git clone https://github.com/booiris/baybo && cd baybo
