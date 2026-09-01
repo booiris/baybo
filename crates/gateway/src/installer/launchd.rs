@@ -60,18 +60,29 @@ impl ServiceInstaller for LaunchdInstaller {
     }
 
     fn render_unit(&self, ctx: &InstallContext) -> String {
-        let exec = ctx.exec_start.display().to_string();
-        let log = ctx.log_dir.display().to_string();
-        let mut env_block = String::new();
+        let exec = xml_escape(&ctx.exec_start.display().to_string());
+        let log = xml_escape(&ctx.log_dir.display().to_string());
+        // Always emitted now: a launchd agent's default `PATH` is
+        // narrower than systemd's (no `/usr/local/bin`, so not even
+        // Homebrew), which leaves every host tool baybo shells out to
+        // unresolvable. See `resolve_service_path`.
+        let mut env_block = String::from("    <key>EnvironmentVariables</key>\n    <dict>\n");
+        env_block.push_str("      <key>PATH</key>\n");
+        env_block.push_str(&format!(
+            "      <string>{}</string>\n",
+            xml_escape(&ctx.path_env)
+        ));
         if let Some(cfg) = &ctx.config_path {
-            env_block.push_str("    <key>EnvironmentVariables</key>\n    <dict>\n");
             env_block.push_str(&format!(
                 "      <key>{}</key>\n",
                 baybo_workspace::paths::ENV_CONFIG_PATH
             ));
-            env_block.push_str(&format!("      <string>{}</string>\n", cfg.display()));
-            env_block.push_str("    </dict>\n");
+            env_block.push_str(&format!(
+                "      <string>{}</string>\n",
+                xml_escape(&cfg.display().to_string())
+            ));
         }
+        env_block.push_str("    </dict>\n");
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -163,6 +174,16 @@ impl ServiceInstaller for LaunchdInstaller {
     }
 }
 
+/// Minimal XML text escaping for the values interpolated into the
+/// plist. A `PATH` is a concatenation of arbitrary operator directory
+/// names, so an unescaped `&` in one of them would render a plist
+/// `launchctl` refuses to load — with no hint as to why.
+fn xml_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +193,8 @@ mod tests {
             exec_start: PathBuf::from("/usr/local/bin/baybo"),
             config_path: Some(PathBuf::from("/Users/me/.baybo/config/baybo.json")),
             log_dir: PathBuf::from("/Users/me/.baybo/logs"),
-            user_mode: true,
+            path_env: "/opt/homebrew/bin:/usr/local/bin:/usr/bin".to_string(),
+            run_as: None,
         }
     }
 

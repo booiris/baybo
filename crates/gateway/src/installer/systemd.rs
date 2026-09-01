@@ -65,9 +65,22 @@ impl ServiceInstaller for SystemdInstaller {
             "ExecStart={} gateway start\n",
             ctx.exec_start.display()
         ));
+        // System-wide unit: drop to the operator's account. Absent this,
+        // systemd runs the daemon as root against a workspace owned by
+        // whoever ran the install. `Group=` is left out on purpose —
+        // systemd defaults it to the user's primary group, which is
+        // what we want and cannot get wrong.
+        if let Some(user) = &ctx.run_as {
+            out.push_str(&format!("User={}\n", user.as_str()));
+        }
         out.push_str("Restart=on-failure\n");
         out.push_str("RestartSec=2\n");
         out.push_str("TimeoutStopSec=30\n");
+        // Without this the unit inherits the user manager's default
+        // (`/usr/local/bin:/usr/bin`) and every host tool installed under
+        // $HOME — bun, uv, the external-agent CLIs — becomes invisible to
+        // a daemon whose operator can run all of them from their shell.
+        out.push_str(&format!("Environment=PATH={}\n", ctx.path_env));
         if let Some(cfg) = &ctx.config_path {
             out.push_str(&format!(
                 "Environment={}={}\n",
@@ -156,7 +169,8 @@ mod tests {
             exec_start: PathBuf::from("/usr/local/bin/baybo"),
             config_path: Some(PathBuf::from("/home/user/.baybo/config/baybo.json")),
             log_dir: PathBuf::from("/home/user/.baybo/logs"),
-            user_mode: true,
+            path_env: "/home/user/.local/bin:/usr/local/bin:/usr/bin".to_string(),
+            run_as: None,
         }
     }
 
@@ -170,6 +184,58 @@ mod tests {
         assert!(body.contains("RestartSec=2"));
     }
 
+    /// The unit must pin `PATH`. Without it systemd hands the daemon
+    /// `/usr/local/bin:/usr/bin` and every `$HOME`-installed host tool
+    /// (bun, uv, the external-agent CLIs) goes missing — the deck
+    /// services and channel sidecars die on ENOENT while the operator's
+    /// own shell runs the same binaries fine.
+    #[test]
+    fn render_unit_pins_path() {
+        let inst = SystemdInstaller::new(true);
+        let body = inst.render_unit(&ctx());
+        assert!(
+            body.contains("Environment=PATH=/home/user/.local/bin:/usr/local/bin:/usr/bin"),
+            "unit must carry the resolved service PATH, got:\n{body}"
+        );
+    }
+
+    /// A per-user unit must NOT name an account — the user manager
+    /// already runs as the user, and a stray `User=` there is an error.
+    #[test]
+    fn user_unit_names_no_account() {
+        let inst = SystemdInstaller::new(true);
+        let body = inst.render_unit(&ctx());
+        assert!(
+            !body.contains("User="),
+            "a per-user unit must not carry User=, got:\n{body}"
+        );
+    }
+
+    /// A system-wide unit must drop to the operator's account. With no
+    /// `User=` systemd runs the daemon as root against a workspace owned
+    /// by whoever ran the install, leaving root-owned `storage.db`,
+    /// vault and `personas/` that the user's own CLI can no longer
+    /// write. `Group=` is intentionally absent: systemd defaults it to
+    /// the user's primary group.
+    #[test]
+    fn system_unit_drops_to_the_resolved_account() {
+        let inst = SystemdInstaller::new(false);
+        let mut c = ctx();
+        c.run_as = Some(crate::installer::resolve_service_user(Some("booiris")).expect("resolve"));
+        let body = inst.render_unit(&c);
+        assert!(
+            body.contains("\nUser=booiris\n"),
+            "system unit must drop to the resolved account, got:\n{body}"
+        );
+        assert!(
+            !body.contains("Group="),
+            "Group= is left to systemd's default (the user's primary group), got:\n{body}"
+        );
+    }
+
+    /// `PATH` is not optional the way the config path is: a unit with no
+    /// config still boots on defaults, a unit with no `PATH` cannot run
+    /// a single sidecar.
     #[test]
     fn render_unit_without_config_path() {
         let inst = SystemdInstaller::new(true);
@@ -177,5 +243,6 @@ mod tests {
         c.config_path = None;
         let body = inst.render_unit(&c);
         assert!(!body.contains("BAYBO_CONFIG_PATH"));
+        assert!(body.contains("Environment=PATH="));
     }
 }

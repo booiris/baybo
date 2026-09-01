@@ -2,32 +2,17 @@
 //!
 //! The protocol-policy types (`EmbeddedMcpProfile`, `browser_mcp_profile`,
 //! `embedded_servers`) live in [`baybo_tools::mcp::profile`]. This
-//! module owns the host-tool integration: where to find the host's
-//! `node` binary, which materialised bundle path each profile gets,
-//! and the per-domain composition that turns the operator's
-//! [`BayboConfig`] into the profile list the reconciler consumes.
-
-use std::path::PathBuf;
+//! module owns the host-tool integration: locating the host's `node`
+//! binary (via [`baybo_process::HostTool`]), which materialised bundle
+//! path each profile gets, and the per-domain composition that turns
+//! the operator's [`BayboConfig`] into the profile list the reconciler
+//! consumes.
 
 use baybo_config::BayboConfig;
 use baybo_tools::mcp::{BrowserProfileParams, EmbeddedMcpProfile, browser_mcp_profile};
 use baybo_workspace::WorkspacePaths;
 
 use crate::sidecar::SidecarRuntime;
-
-pub const NODE_BINARY_ENV: &str = "BAYBO_NODE_BIN";
-
-/// Resolve the node binary used to spawn embedded MCP-server children.
-/// Override with `BAYBO_NODE_BIN`; defaults to `node` on `PATH`.
-///
-/// `BAYBO_NODE_BIN` is intentionally still env-driven: it's a host-tool
-/// pointer (where to find a `node` binary), not a runtime policy knob.
-/// Mirrors `BAYBO_BUN_BIN` for channel sidecars.
-pub fn node_binary() -> PathBuf {
-    std::env::var_os(NODE_BINARY_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("node"))
-}
 
 /// Walk every tool-domain family and collect the [`EmbeddedMcpProfile`]
 /// list to hand to [`baybo_tools::mcp::embedded_servers`].
@@ -51,7 +36,7 @@ pub fn collect_profiles(
     config: &BayboConfig,
     workspace_paths: &WorkspacePaths,
 ) -> Vec<EmbeddedMcpProfile> {
-    let node_cmd = node_binary().display().to_string();
+    let node_cmd = baybo_process::HostTool::node().path().display().to_string();
     let browser_font_dir = workspace_paths.browser_fonts_dir();
     // Pin the Chrome profile under the workspace by default so it sits
     // next to other workspace-scoped state (logs, uv cache, …) and
@@ -98,6 +83,8 @@ pub fn collect_profiles(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use baybo_config::BayboConfig;
 

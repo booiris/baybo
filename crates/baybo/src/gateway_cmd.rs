@@ -63,9 +63,11 @@ pub async fn run(cmd: GatewayCmd) -> anyhow::Result<()> {
 
     match cmd {
         GatewayCmd::Start => start(config).await,
-        GatewayCmd::Install { system, exec_start } => {
-            install_service(&config, system, exec_start.map(PathBuf::from))
-        }
+        GatewayCmd::Install {
+            system,
+            exec_start,
+            run_as,
+        } => install_service(&config, system, exec_start.map(PathBuf::from), run_as),
         GatewayCmd::Enable => enable(&config).await,
         GatewayCmd::Restart => restart(&config),
         GatewayCmd::Disable => disable(&config),
@@ -88,6 +90,7 @@ fn make_installer(user_mode: bool) -> anyhow::Result<Box<dyn ServiceInstaller>> 
 fn install_context(
     config: &BayboConfig,
     explicit_exec: Option<PathBuf>,
+    run_as: Option<installer::ServiceUser>,
 ) -> anyhow::Result<InstallContext> {
     let exec_start = installer::resolve_exec_start(explicit_exec.as_deref())
         .map_err(|e| anyhow::anyhow!("cannot resolve executable path: {e}"))?;
@@ -98,7 +101,8 @@ fn install_context(
         exec_start,
         config_path,
         log_dir,
-        user_mode: true,
+        path_env: installer::resolve_service_path(),
+        run_as,
     })
 }
 
@@ -159,14 +163,28 @@ fn install_service(
     config: &BayboConfig,
     system: bool,
     explicit_exec: Option<PathBuf>,
+    run_as: Option<String>,
 ) -> anyhow::Result<()> {
+    // Resolved before anything is written: a system unit that cannot
+    // name its account must not be installed at all, because the
+    // fallback systemd applies is root.
+    let run_as = if system {
+        Some(installer::resolve_service_user(run_as.as_deref())?)
+    } else {
+        if run_as.is_some() {
+            anyhow::bail!("--run-as only applies to --system; a per-user unit already runs as you");
+        }
+        None
+    };
     let installer = make_installer(!system)?;
-    let mut ctx = install_context(config, explicit_exec)?;
-    ctx.user_mode = !system;
+    let ctx = install_context(config, explicit_exec, run_as)?;
     let path = installer
         .install(&ctx)
         .map_err(|e| anyhow::anyhow!("install failed: {e}"))?;
     println!("installed {}", path.display());
+    if let Some(user) = &ctx.run_as {
+        println!("service will run as {}", user.as_str());
+    }
     if !system {
         println!("next: run `baybo gateway enable` to enable and start the service");
     }
