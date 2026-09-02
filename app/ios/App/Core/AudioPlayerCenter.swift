@@ -8,11 +8,11 @@ import MediaPlayer
 ///
 /// Native rather than an in-webview `<audio>` on purpose: the bytes never
 /// cross the bridge as base64, `.playback` means the ringer switch can't
-/// silence it, and — with the `audio` background mode — a track keeps playing
-/// through lock/background while the user stays in the chat, controllable
-/// from Control Center (Now Playing + remote commands below). Backing out to
-/// the chat LIST stops it (`AppStore.chatPath`'s didSet): audio with no
-/// visible card to control it reads as a bug.
+/// silence it, and Now Playing mirrors the active track to system media
+/// controls. Playback is foreground-only: the app intentionally declares no
+/// audio background mode. Backing out to the chat LIST stops it
+/// (`AppStore.chatPath`'s didSet): audio with no visible card to control it
+/// reads as a bug.
 ///
 /// One player app-wide: starting a track stops whatever else was playing and
 /// tells the usurped card it `stopped`.
@@ -258,8 +258,7 @@ final class AudioPlayerCenter {
         return max(0, duration.seconds)
     }
 
-    /// `.playback`: audible past the ringer switch, and — with the `audio`
-    /// background mode — past lock/background.
+    /// `.playback` keeps foreground media audible past the ringer switch.
     private func activateSession() {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default)
@@ -271,8 +270,10 @@ final class AudioPlayerCenter {
             false, options: .notifyOthersOnDeactivation)
     }
 
-    /// Lock-screen / Control Center transport. Installed once; the targets read
-    /// whatever track currently owns the player.
+    /// Control Center transport for the FOREGROUND player — with no audio
+    /// background mode there is no locked/backgrounded playback to drive.
+    /// Installed once; the targets read whatever track currently owns the
+    /// player.
     private func installRemoteCommands() {
         guard !remoteCommandsInstalled else { return }
         remoteCommandsInstalled = true
