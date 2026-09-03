@@ -109,6 +109,15 @@ impl BayboConfig {
 
 impl BayboConfig {
     /// Read, parse, and validate a config file.
+    ///
+    /// A document that does not pin `workspace.path` takes the root implied by
+    /// its own location. `WorkspaceConfig`'s `serde(default)` would otherwise
+    /// resolve it against the CURRENT PROCESS's cwd, and a debug build's
+    /// default root is cwd-relative — so the same config file read by the
+    /// gateway and by a child running elsewhere (a deck card's `ctx.exec`,
+    /// cwd'd into its scratch dir) yields two different workspaces, the second
+    /// of them freshly bootstrapped and empty. Passing `BAYBO_CONFIG_PATH`
+    /// down is not enough on its own; this is the other half.
     pub async fn load_from_file(path: &Path) -> Result<Self> {
         let contents =
             tokio::fs::read_to_string(path)
@@ -117,7 +126,30 @@ impl BayboConfig {
                     path: path.display().to_string(),
                     reason: e.to_string(),
                 })?;
-        Self::load_from_str(&contents)
+        let mut config = Self::load_from_str(&contents)?;
+        if !Self::declares_workspace_path(&contents)
+            && let Some(root) = std::path::absolute(path)
+                .ok()
+                .as_deref()
+                .and_then(baybo_workspace::paths::workspace_root_for_config_file)
+        {
+            config.workspace.path = root.to_string_lossy().into_owned();
+        }
+        Ok(config)
+    }
+
+    /// Whether the document itself pins `workspace.path`. After
+    /// deserialization that is unanswerable — `serde(default)` makes an absent
+    /// block indistinguishable from one that happens to hold the default — and
+    /// the two must behave differently, so it is asked of the raw text.
+    fn declares_workspace_path(json: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+            return false;
+        };
+        value
+            .get("workspace")
+            .and_then(|workspace| workspace.get("path"))
+            .is_some()
     }
 
     /// Parse and validate a config from a JSON string.
