@@ -642,6 +642,15 @@ final class AppStore: ObservableObject {
         // offline deserves the next live leg.
         resumeStrandedSends()
         resumePendingSessionMutations()
+        // The deck's only live refresh signal is `DeckChanged`, and the gateway
+        // broadcasts it to whoever is connected at that instant — no buffer, no
+        // replay. A card installed while this device's leg was down therefore
+        // never reaches an already-warm shell, which then shows it blank (or
+        // not at all) until the app is relaunched, because `requestRefresh`
+        // otherwise fires only on bridge-ready, on `DeckChanged` itself, and on
+        // a layout rollback. One coalesced REST call per foreground closes that
+        // whole class.
+        deckStore.requestRefresh()
         if route == .home {
             prewarmTranscriptHost()
             prewarmDeckHost()
