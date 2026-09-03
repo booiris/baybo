@@ -85,7 +85,17 @@ Baybo 只支持 **Linux 和 macOS**。
 | `node` | 仅浏览器工具 sidecar |
 | `bwrap` / `sandbox-exec` / `docker` | Shell 命令 OS 沙箱(推荐) |
 
-## 构建
+## 安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/booiris/baybo/master/install.sh | sh
+```
+
+支持 Linux x86_64/aarch64(glibc 2.28+)与 Apple 芯片 macOS。二进制校验 checksum
+后装进 `~/.local/bin`,上表中缺失的依赖会逐项提示。`--version <tag>` 可指定某个
+release,`--uninstall` 卸载。Intel Mac 请从源码构建。
+
+## 从源码构建
 
 ```bash
 git clone https://github.com/booiris/baybo && cd baybo
