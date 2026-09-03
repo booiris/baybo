@@ -341,6 +341,32 @@ you, so a `max` layout needs no exit control of its own. The maximized layout **
 (it's the whole screen, not a tile) and is where a card earns its detail: a
 full history, a chart, a table. Rules:
 
+- **The scrolling is already built — do not build your own.** At `max` the
+  injected base turns the document into the scroll surface and gives `.card`
+  an auto height, so a layout taller than the screen scrolls with zero CSS
+  from you. This is what actually runs, ahead of your fragment:
+
+  ```css
+  body { height: 100vh; overflow: hidden; }   /* a tile clips; it never scrolls */
+  .card { display: flex; flex-direction: column; height: 100%; padding: 10px 12px; }
+
+  html[data-deck-size="max"] body { height: auto; overflow: visible; }
+  html[data-deck-size="max"] .card {
+    height: auto; min-height: 100vh; overflow: visible;
+    padding-top: var(--deck-header-clearance);
+    padding-bottom: var(--deck-tab-bar-clearance);
+  }
+  ```
+
+  So: **never declare `height`, `min-height`, `overflow`, or `position` on
+  `.card` in a `max`-scoped rule.** Those are the scroll container, not
+  styling. `[data-size="max"] .card { height: auto; overflow: auto }` reads
+  like it enables scrolling and is the one thing that reliably kills it — a
+  content-height box has nothing to overflow, so the scroller has nothing to
+  scroll and the page below the fold becomes unreachable. Clip or scroll a
+  child of your own instead. "Tiles clip, they never scroll" above is a rule
+  about the grid sizes; if you implement it with a bare `.card { overflow:
+  hidden }`, that declaration must not follow you into `max`.
 - **Leave the tile's top-right for the ⛶ in the grid sizes.** In `small` /
   `wide` / `large`, the ⛶ sits in the tile's top-right (~40pt) — keep your own
   tappable controls / key numbers out of that corner (e.g. a top row that
