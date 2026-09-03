@@ -105,9 +105,47 @@ fn card_summary(card: &CardView) -> Value {
     })
 }
 
+/// Count the snapshot's leaf scalars, and how many of them carry anything.
+/// Zero, empty string, false and null are all "carries nothing" — the point is
+/// to answer "did this card actually read its data source" WITHOUT copying a
+/// user's numbers into the agent transcript. A card wired to the wrong
+/// workspace, or one whose service silently swallowed an upstream failure,
+/// returns a perfectly schema-valid snapshot of zeros, and every other field
+/// of this summary looks identical to a healthy one.
+fn count_leaves(value: &Value, leaves: &mut u64, populated: &mut u64) {
+    match value {
+        Value::Object(map) => {
+            for nested in map.values() {
+                count_leaves(nested, leaves, populated);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                count_leaves(nested, leaves, populated);
+            }
+        }
+        scalar => {
+            *leaves += 1;
+            let carries = match scalar {
+                Value::Null => false,
+                Value::Bool(b) => *b,
+                Value::Number(n) => n.as_f64().is_none_or(|f| f != 0.0),
+                Value::String(s) => !s.is_empty(),
+                _ => false,
+            };
+            if carries {
+                *populated += 1;
+            }
+        }
+    }
+}
+
 fn first_snapshot_summary(snapshot: &Value) -> Value {
     let bytes = snapshot.to_string().len();
-    let mut keys = snapshot
+    // `serde_json::Map` is a `BTreeMap` here (no `preserve_order` feature in
+    // the workspace), so `keys()` is already sorted and the cap takes the
+    // lexicographically first ones.
+    let keys = snapshot
         .as_object()
         .map(|object| {
             object
@@ -117,7 +155,6 @@ fn first_snapshot_summary(snapshot: &Value) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    keys.sort();
     let keys_truncated = snapshot
         .as_object()
         .is_some_and(|object| object.len() > MAX_FIRST_SNAPSHOT_KEYS);
@@ -129,12 +166,15 @@ fn first_snapshot_summary(snapshot: &Value) -> Value {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     };
+    let (mut leaves, mut populated) = (0, 0);
+    count_leaves(snapshot, &mut leaves, &mut populated);
     json!({
-        "response_schema": "passed",
         "bytes": bytes,
         "json_type": json_type,
         "top_level_keys": keys,
         "top_level_keys_truncated": keys_truncated,
+        "leaf_values": leaves,
+        "populated_values": populated,
     })
 }
 
@@ -402,10 +442,39 @@ mod tests {
         let snapshot = json!({"count": 3, "status": "ok"});
         let summary = first_snapshot_summary(&snapshot);
 
-        assert_eq!(summary["response_schema"], "passed");
         assert_eq!(summary["json_type"], "object");
         assert_eq!(summary["top_level_keys"], json!(["count", "status"]));
         assert!(summary.get("value").is_none());
+    }
+
+    /// The signal that separates a working card from one reading the wrong
+    /// data source: both pass the schema and have identical shape, so without
+    /// this the agent has nothing to tell them apart and reports success.
+    #[test]
+    fn first_snapshot_summary_counts_populated_leaves_without_showing_them() {
+        let healthy = first_snapshot_summary(&json!({
+            "today": {"calls": 49, "total": 5708754},
+            "days": [{"total": 0}, {"total": 5708754}],
+        }));
+        assert_eq!(healthy["leaf_values"], 4);
+        assert_eq!(healthy["populated_values"], 3);
+
+        let empty = first_snapshot_summary(&json!({
+            "today": {"calls": 0, "total": 0},
+            "days": [{"total": 0}, {"total": 0}],
+        }));
+        assert_eq!(empty["leaf_values"], 4);
+        assert_eq!(empty["populated_values"], 0);
+        assert_eq!(
+            empty["top_level_keys"], healthy["top_level_keys"],
+            "shape alone cannot tell these apart — that is why the count exists"
+        );
+
+        for summary in [&healthy, &empty] {
+            let text = summary.to_string();
+            assert!(!text.contains("5708754"), "must not copy values: {text}");
+            assert!(!text.contains("49"), "must not copy values: {text}");
+        }
     }
 
     #[test]

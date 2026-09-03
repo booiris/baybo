@@ -278,7 +278,11 @@ pub(crate) mod test_fixtures {
         )
         .unwrap();
         std::fs::write(dir.join(SERVICE_FILE), service_body).unwrap();
-        std::fs::write(dir.join(CARD_FILE), "<div id=x></div>").unwrap();
+        std::fs::write(
+            dir.join(CARD_FILE),
+            "<div class=\"card\"><div id=\"x\">–</div></div>\n<script>deck.onData(function (s) { document.getElementById(\"x\").textContent = JSON.stringify(s); });</script>",
+        )
+        .unwrap();
     }
 }
 

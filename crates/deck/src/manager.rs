@@ -1054,9 +1054,24 @@ impl DeckManager {
     /// the resident card's server).
     async fn dry_run(&self, bundle: &DeckBundle, uploader_card_id: &str) -> Result<Value> {
         let gate_id = format!("{GATE_SCRATCH_PREFIX}{}", uuid::Uuid::new_v4());
-        let outcome = self.dry_run_exec(bundle, &gate_id, uploader_card_id).await;
+        // Everything the gate creates under `gate_id` — the service's scratch,
+        // its tmux sockets, the render harness — has to exist before the reap
+        // and nothing may write there after it, or the gate leaks a directory
+        // per run. So the whole verdict is computed first, then reaped once.
+        let verdict = self
+            .dry_run_verdict(bundle, &gate_id, uploader_card_id)
+            .await;
         self.reap_card_runtime(&gate_id).await;
-        let snapshot = outcome?;
+        verdict
+    }
+
+    async fn dry_run_verdict(
+        &self,
+        bundle: &DeckBundle,
+        gate_id: &str,
+        uploader_card_id: &str,
+    ) -> Result<Value> {
+        let snapshot = self.dry_run_exec(bundle, gate_id, uploader_card_id).await?;
         if snapshot.is_null() {
             return Err(DeckError::DryRun(
                 "refresh op returned null — a card's refresh must return its snapshot JSON".into(),
@@ -1067,7 +1082,17 @@ impl DeckManager {
             .validate_result(&bundle.manifest.refresh.op, &snapshot)
             .map_err(DeckError::DryRun)?
         {
-            OpResultKind::Success => Ok(snapshot),
+            OpResultKind::Success => {
+                crate::render::check_renders_its_data(
+                    bundle,
+                    &snapshot,
+                    &self.scratch_root.join(gate_id),
+                    &self.process_manager,
+                    uploader_card_id,
+                )
+                .await?;
+                Ok(snapshot)
+            }
             OpResultKind::Error => Err(DeckError::DryRun(format!(
                 "refresh op returned an error result: {}",
                 gate_error_summary(&snapshot)

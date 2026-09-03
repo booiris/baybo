@@ -13,6 +13,7 @@ pub mod bundle;
 pub mod error;
 pub mod host;
 pub mod manager;
+mod render;
 mod repo;
 pub mod service;
 pub mod spec;

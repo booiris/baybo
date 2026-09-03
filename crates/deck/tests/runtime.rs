@@ -158,7 +158,10 @@ fn stage_bundle(dir: &Path, service_js: &str) {
     )
     .unwrap();
     std::fs::write(dir.join("service.js"), service_js).unwrap();
-    std::fs::write(dir.join("card.html"), "<div id=x></div>").unwrap();
+    // A card that consumes its snapshot: the install gate now renders
+    // card.html and refuses one that displays nothing when handed data,
+    // so a fixture standing in for a valid bundle has to be a real card.
+    std::fs::write(dir.join("card.html"), MINIMAL_CARD).unwrap();
 }
 
 fn set_success_response_schema(dir: &Path, path: &str, method: &str, schema: Value) {
@@ -183,6 +186,11 @@ fn strip_response_schemas(dir: &Path) {
     }
     std::fs::write(openapi_path, openapi.to_string()).unwrap();
 }
+
+const MINIMAL_CARD: &str = r#"<div class="card"><div id="x">–</div></div>
+<script>deck.onData(function (s) {
+  document.getElementById("x").textContent = JSON.stringify(s);
+});</script>"#;
 
 const GOOD_SERVICE: &str = r#"
 export const ops = {
@@ -1081,5 +1089,59 @@ async fn boot_does_not_quarantine_a_bundle_it_cannot_load() {
     assert!(
         snapshot.error.is_some(),
         "the load failure must reach the error face, not just the log"
+    );
+}
+
+/// The frontend half of the gate. `card.html` used to be read, capped and
+/// hashed and nothing more, so a card that never displayed its data — the
+/// shape a weak model reaches for when it wires the markup but not
+/// `deck.onData`, or reads a field the service does not emit — installed
+/// cleanly and reached the user as a page of placeholders.
+#[tokio::test]
+async fn install_refuses_a_card_that_never_shows_its_data() {
+    let Some(h) = harness_or_skip("install_refuses_a_card_that_never_shows_its_data").await else {
+        return;
+    };
+
+    // Wires nothing: the markup exists, the snapshot arrives, nothing changes.
+    let inert = tempfile::tempdir().unwrap();
+    stage_bundle(inert.path(), GOOD_SERVICE);
+    std::fs::write(inert.path().join("card.html"), "<div id=x>–</div>").unwrap();
+    let message = h
+        .manager
+        .install(inert.path())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("did not render"), "{message}");
+    assert!(message.contains("deck.onData"), "{message}");
+
+    // Reads a field `service.js` never emits — the same symptom, a different
+    // cause, and the one the agent has no way to see without running it.
+    let wrong_field = tempfile::tempdir().unwrap();
+    stage_bundle(wrong_field.path(), GOOD_SERVICE);
+    std::fs::write(
+        wrong_field.path().join("card.html"),
+        r#"<div id="x">–</div>
+<script>deck.onData(function (s) {
+  document.getElementById("x").textContent = s.totals.today;
+});</script>"#,
+    )
+    .unwrap();
+    let message = h
+        .manager
+        .install(wrong_field.path())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("did not render"), "{message}");
+    assert!(
+        message.contains("totals"),
+        "the reason must name the bad read: {message}"
+    );
+
+    assert!(
+        h.manager.deck_view().await.unwrap().cards.is_empty(),
+        "neither refusal may leave a row behind"
     );
 }
