@@ -24,10 +24,13 @@ set -euo pipefail
 # list exists: every job in ci.yml carries `if: draft == false`, so on a draft
 # PR they all skip — and `gh pr checks --watch --fail-fast` reports each one as
 # `skipping` and exits 0, which is indistinguishable from green. This script
-# would then merge code CI has never compiled. (GitHub's own required-status
-# checks would not save us either: a skipped check counts as satisfied — and
-# this repo can't have them anyway, since rulesets/branch protection need Pro on
-# a private repo.)
+# would then merge code CI has never compiled. GitHub's own required-status
+# checks would not save us either: a skipped check counts as SATISFIED, which is
+# the same hole. (The repo is public now, so rulesets ARE available and one is
+# active on master — "Protect master": no deletion, no force-push, PR required
+# with 1 approval. It carries no required-status-checks rule, and the owner is a
+# bypass actor so a solo merge is not blocked on a second reviewer. None of that
+# checks CI; this list is still the only thing that does.)
 #
 # Deliberately not required: "detect changes" (a path-filter helper for the
 # other jobs) and "tmux render tests (non-gating)" (named non-gating; flaky

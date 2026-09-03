@@ -144,7 +144,19 @@ struct ChatStoreStrandedSendTests {
 
         store.resumePersistedSends()
 
-        #expect(await waitUntil { outbox.entries().first?.lastSentAt == 0 })
+        // Two lookups resolve this entry, not one: the pre-listing reconcile,
+        // and then `connect()`'s own — which re-marks every unconfirmed entry
+        // `.unknown` before allowing any resend. Stepping the sweep inside that
+        // second window is worse than a no-op: `sweepOutbox` skips `.unknown`,
+        // concludes the outbox is idle and CANCELS the retry timer. The lookup
+        // re-arms it, but the first tick is a `retryTick` (3 s) away — past this
+        // helper's 2 s budget, so the test could never recover. Wait for the
+        // second lookup to put the entry back in `.sending`.
+        #expect(await waitUntil {
+            client.lookupCalls.count == 2
+                && outbox.entries().first?.state == .sending
+                && store.connState == .connected
+        })
         store.sweepOutbox()
         #expect(await waitUntil { client.transmissions.map(\.msgId) == [Self.msgId] })
     }

@@ -45,6 +45,14 @@ UI、Telegram、微信或已配对的 iOS 应用与它对话——所有入口�
 原生 iOS 客户端([`app/ios`](app/ios)):扫码与 gateway 配对,之后通过端到端加密
 传输聊天 —— 推送通知预览同样加密,中继和 Apple 只见密文。
 
+**Baybo iOS 版现已上线 App Store。**
+
+<p align="center">
+  <a href="https://apps.apple.com/app/id6787324071">
+    <img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/zh-cn?size=250x83" alt="在 App Store 下载 Baybo" height="48">
+  </a>
+</p>
+
 ```bash
 baybo device pair    # 打印二维码;App 内扫码,两端确认配对码
 ```
@@ -59,8 +67,8 @@ baybo device pair --proxy-url cn-proxy.baybo.space
 ```
 
 生产使用请自建中继([`remote-host/DEPLOY.md`](remote-host/DEPLOY.md)),并传入自己
-的 `--proxy-url` / `--push-url` / `--remote-api-key`。App 从 [`app/ios`](app/ios)
-构建安装;详见
+的 `--proxy-url` / `--push-url` / `--remote-api-key`。也可以从 [`app/ios`](app/ios)
+自行构建安装;详见
 [`docs/modules/mobile/companion.md`](docs/modules/mobile/companion.md)。
 
 ## 环境要求
@@ -77,7 +85,17 @@ Baybo 只支持 **Linux 和 macOS**。
 | `node` | 仅浏览器工具 sidecar |
 | `bwrap` / `sandbox-exec` / `docker` | Shell 命令 OS 沙箱(推荐) |
 
-## 构建
+## 安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/booiris/baybo/master/install.sh | sh
+```
+
+支持 Linux x86_64/aarch64(glibc 2.28+)与 Apple 芯片 macOS。二进制校验 checksum
+后装进 `~/.local/bin`,上表中缺失的依赖会逐项提示。`--version <tag>` 可指定某个
+release,`--uninstall` 卸载。Intel Mac 请从源码构建。
+
+## 从源码构建
 
 ```bash
 git clone https://github.com/booiris/baybo && cd baybo

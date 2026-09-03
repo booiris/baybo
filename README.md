@@ -51,6 +51,14 @@ A native iOS client ([`app/ios`](app/ios)): scan a QR to pair with your gateway,
 chat over an end-to-end-encrypted transport — push-notification previews are encrypted
 too, so the relay and Apple only ever see ciphertext.
 
+**Baybo for iOS is now available on the App Store.**
+
+<p align="center">
+  <a href="https://apps.apple.com/app/id6787324071">
+    <img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="Download Baybo on the App Store" height="48">
+  </a>
+</p>
+
 ```bash
 baybo device pair    # prints a QR; scan it in the app, confirm the code on both sides
 ```
@@ -62,8 +70,8 @@ built-in trial key; **it is provided for trial use only, with no stability guara
 
 For production use, self-host the relay
 ([`remote-host/DEPLOY.md`](remote-host/DEPLOY.md)) and pass your own
-`--proxy-url` / `--push-url` / `--remote-api-key`. Build and install the app from
-[`app/ios`](app/ios); details in
+`--proxy-url` / `--push-url` / `--remote-api-key`. You can also build and install the
+app from [`app/ios`](app/ios); details in
 [`docs/modules/mobile/companion.md`](docs/modules/mobile/companion.md).
 
 ## Requirements

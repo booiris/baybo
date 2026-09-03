@@ -124,7 +124,7 @@ The probe must not trust headers or extensions (measured on synthetic 240s files
 
 The ENGINE is native — `AudioPlayerCenter` (`app/ios/App/Core/AudioPlayerCenter.swift`), ONE `AVPlayer` app-wide — driven over the bridge (`audioToggle`/`audioSeek`/`queryAudioState` in, `audioState` pushes out: play/pause flips, 2 Hz position ticks, `stopped` on end/usurp).
 
-Native rather than an in-webview `<audio>` because the bytes never cross the bridge as base64, AVAudioSession `.playback` means the ringer switch can't silence it, and — with `UIBackgroundModes: audio` (`app/ios/project.yml`) + Now Playing + remote commands — a track keeps playing through lock/background with Control Center transport while the user stays IN the chat.
+Native rather than an in-webview `<audio>` because the bytes never cross the bridge as base64 and AVAudioSession `.playback` means the ringer switch can't silence foreground media. The app intentionally declares no audio background mode, so playback is not promised past lock/background; Now Playing and remote commands only mirror the active foreground player.
 
 Backing out to the chat LIST stops it (`AppStore.chatPath`'s didSet, when the last `.session` route leaves the stack — **NOT** `ChatScreen.onDisappear`, which also fires under fullScreenCovers like the image viewer): audio with no visible card to control it reads as a bug. The composer's draft is checkpointed off that same didSet, for the mirror-image reason — see [The draft belongs to the SESSION](#the-draft-belongs-to-the-session-not-to-the-composer-frame).
 
