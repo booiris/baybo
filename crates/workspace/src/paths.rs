@@ -385,6 +385,19 @@ pub fn default_config_file() -> PathBuf {
         .join(WORKSPACE_CONFIG_FILE)
 }
 
+/// Config path inherited by child processes that may invoke the Baybo CLI.
+///
+/// Resolve it in the parent before changing the child's cwd: debug builds use
+/// a cwd-relative default workspace, so resolving after a child moves into a
+/// scratch directory would point it at a different `./.baybo` tree.
+pub fn config_file_for_child_process() -> PathBuf {
+    let raw = std::env::var_os(ENV_CONFIG_PATH)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_file);
+    std::path::absolute(&raw).unwrap_or(raw)
+}
+
 /// System-level baybo cache root: `$XDG_CACHE_HOME/baybo`, falling back to
 /// `$HOME/.cache/baybo`. `None` if neither env var is set — callers map
 /// this to their own error type.
@@ -1140,5 +1153,10 @@ mod tests {
         let cfg = default_config_file();
         let root = default_workspace_root();
         assert_eq!(cfg, root.join(CONFIG_DIR).join(WORKSPACE_CONFIG_FILE));
+    }
+
+    #[test]
+    fn child_process_config_file_is_absolute() {
+        assert!(config_file_for_child_process().is_absolute());
     }
 }

@@ -620,6 +620,7 @@ pub async fn build_managers(
         blob: stores.blob.clone(),
         deck_root: workspace_paths.deck_dir(),
         scratch_root: workspace_paths.state_dir().join("deck-scratch"),
+        baybo_config_path: baybo_workspace::paths::config_file_for_child_process(),
     });
     // All four DeckCard* tools register deferred — policy owned by the
     // batch in `baybo-deck`.

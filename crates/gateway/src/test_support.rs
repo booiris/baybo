@@ -233,6 +233,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         blob: stores.blob.clone(),
         deck_root: tempdir.path().join("deck"),
         scratch_root: tempdir.path().join("deck-scratch"),
+        baybo_config_path: tempdir.path().join("config/baybo.json"),
     });
 
     let project_manager = Arc::new(baybo_project::ProjectManager::new(

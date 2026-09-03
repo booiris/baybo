@@ -267,7 +267,12 @@ pub(crate) mod test_fixtures {
             dir.join(OPENAPI_FILE),
             serde_json::json!({
                 "openapi": "3.1.0",
-                "paths": {"/refresh": {"get": {"x-baybo-retryable": true}}}
+                "paths": {"/refresh": {"get": {
+                    "x-baybo-retryable": true,
+                    "responses": {"200": {"content": {"application/json": {
+                        "schema": {"type": "object"}
+                    }}}}
+                }}}
             })
             .to_string(),
         )

@@ -1,6 +1,6 @@
 ---
 name: deck
-version: 0.4.0
+version: 0.5.0
 description: "Create, install, or update persistent Deck dashboard cards from ordinary-language requests."
 when_to_use: "Use when the user asks to create, add, modify, fix, or redesign a persistent Deck/dashboard card — such as a Claude/Codex quota monitor, machine-status board, or API watcher — whether they use /deck or ordinary language."
 command: deck
@@ -29,9 +29,12 @@ A deck card is a self-contained bundle of exactly four plain files. You
 write them in a scratch directory with your normal file tools, then
 install with `DeckCardCreate(path)`. Install runs a **dry-run gate**:
 your `service.js` is booted for real on the host and the refresh op
-is invoked once — failures (including the service's stderr) come back in
-the tool result so you can fix and retry in the same turn. On success
-the card appears on the user's deck already showing data.
+is invoked once, its result must match the op's declared success schema,
+and a top-level `{error: ...}` is refused even when it matches the declared
+graceful-error schema. Failures (including the service's stderr) come back in
+the tool result so you can fix and retry in the same turn. On success the tool
+returns a checked summary of the first snapshot and the card appears on the
+user's deck already showing that data.
 
 ## The bundle
 
@@ -90,15 +93,27 @@ cards need no `src/` — write `card.html` directly.
 
 ### openapi.json — the op contract
 
-Every call that crosses the gateway is validated against this document
-**before** your code sees it: unknown ops 404, unknown/mistyped/missing
-params 400. Declare each op as `paths./<name>.get` (or `post`) with
-typed parameters. Op names: `[a-z][a-z0-9_]*`.
+Every call that crosses the gateway is validated against this document on
+both sides: unknown/mistyped/missing params are rejected before your code
+runs, and the returned JSON is rejected before the gateway forwards it.
+`ctx.emit` payloads are checked against the refresh op's response contract
+before they become snapshots. Declare each op as `paths./<name>.get` (or
+`post`) with typed parameters and response schemas. Op names:
+`[a-z][a-z0-9_]*`.
 
 Each parameter's `schema` is **standard JSON Schema** — scalars, enums,
 and also `array` and `object` params with nested typing and constraints
 (`items`, `properties`, `minimum`, `maxItems`, …) all validate. Keep it
-inline: `$ref` is rejected.
+inline: `$ref` is rejected in both parameter and response schemas.
+
+**Every op MUST declare a successful JSON result schema at
+`responses.200.content.application/json.schema` — install fails without
+it.** Deck supports only response keys `"200"` and optional `"default"`.
+The top-level field `error` is reserved as the graceful-error discriminator:
+if an op may return `{error: "..."}` while the card is already running,
+declare its shape under `responses.default...schema`. The install/update gate
+still refuses an error result because a new revision must demonstrate one real
+successful refresh before it can go live.
 
 **Every op MUST declare `x-baybo-retryable` (boolean) — install fails
 without it.** It answers one question: if this op ran but its response
@@ -112,10 +127,44 @@ card instead of being replayed.
 {
   "openapi": "3.1.0",
   "paths": {
-    "/refresh": { "get": { "x-baybo-retryable": true } },
-    "/history": { "get": { "x-baybo-retryable": true, "parameters": [
-      { "name": "days", "required": true, "schema": { "type": "integer" } }
-    ] } }
+    "/refresh": { "get": {
+      "x-baybo-retryable": true,
+      "responses": {
+        "200": { "description": "Current quota snapshot", "content": {
+          "application/json": { "schema": {
+            "type": "object",
+            "required": ["used", "limit", "at"],
+            "properties": {
+              "used": { "type": "number" },
+              "limit": { "type": "number" },
+              "at": { "type": "integer" }
+            },
+            "additionalProperties": false
+          } }
+        } },
+        "default": { "description": "Temporary upstream failure", "content": {
+          "application/json": { "schema": {
+            "type": "object",
+            "required": ["error"],
+            "properties": { "error": { "type": "string" } },
+            "additionalProperties": false
+          } }
+        } }
+      }
+    } },
+    "/history": { "get": {
+      "x-baybo-retryable": true,
+      "parameters": [
+        { "name": "days", "required": true, "schema": { "type": "integer" } }
+      ],
+      "responses": {
+        "200": { "description": "Daily history", "content": {
+          "application/json": { "schema": {
+            "type": "array", "items": { "type": "object" }
+          } }
+        } }
+      }
+    } }
   }
 }
 ```
@@ -142,8 +191,11 @@ snapshot JSON (not null).**
   the host with the inherited environment (installed CLIs and credential
   dirs resolve, network available), 30s cap, 4MB output cap. Use for
   host state and CLIs: `df -k`, `uptime`, `ps`, `git -C <dir> log`,
-  `codex …`, etc.
-- `ctx.emit(json)` — push a fresh snapshot to the phone (rate-policed).
+  `codex …`, etc. `$BAYBO_CONFIG_PATH` is pinned to the gateway's active
+  config before the scratch cwd is selected; invoke the Baybo CLI without
+  hard-coding or passing its config path.
+- `ctx.emit(json)` — push a fresh snapshot to the phone (rate-policed and
+  validated against the refresh op's `200`/`default` response schema).
 - `ctx.log(msg)` — diagnostic logging (console.log also routes here).
 
 Blobs (files/images). Bytes stay out of your service — you pass around a
@@ -176,7 +228,7 @@ Per-op calls have a 30s budget; a timeout fails the call, not the
 process. Repeated crashes/timeouts quarantine the card (visible error
 face + Re-enable), so keep ops fast and handle upstream errors — return
 `{error: "..."}`-style JSON rather than throwing when the upstream is
-merely down.
+merely down, and declare that object under the op's `default` response.
 
 ### Driving a terminal CLI through tmux — use the injected private socket
 
@@ -509,6 +561,11 @@ export function start(ctx) {
 2. `DeckCardCreate(path: "<absolute staging dir>")`.
 3. If the gate fails, read the error (it includes your service's
    stderr), edit the files, and call `DeckCardCreate` again.
+4. On success, inspect `first_snapshot.response_schema`, `json_type`, byte
+   count, and bounded `top_level_keys` in the tool result. Confirm that the
+   observed shape matches the card you intended to build before reporting
+   completion. Snapshot values remain on the Deck data plane and are not
+   copied into the agent's tool result.
 
 ## Updating an existing card
 
@@ -528,9 +585,10 @@ Instead, edit its real source:
 3. Make the surgical change the user asked for (edit the relevant file; leave
    the rest byte-for-byte).
 4. `DeckCardUpdate(card_id, path)` — same dry-run gate as create; on
-   success the service restarts on the new code. The user's title, size,
-   and layout are owned by the card after install, so the manifest's
-   values do **not** overwrite them.
+   success inspect its `first_snapshot` summary before reporting completion,
+   then the service restarts on the new code. The user's title, size, and
+   layout are owned by the card after install, so the manifest's values do
+   **not** overwrite them.
 
 Every install/update/purge is auto-committed to a git repo under the deck
 root, so the operator can diff and roll back a card by hand — you don't

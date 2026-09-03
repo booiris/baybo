@@ -12,6 +12,7 @@ baybo-model = { workspace = true }
 baybo-store = { workspace = true }
 baybo-security = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-workspace = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

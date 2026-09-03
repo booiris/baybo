@@ -90,6 +90,11 @@ The `ENV_CONFIG_PATH` constant holds the env-var name `BAYBO_CONFIG_PATH`; setti
 - explicit `BAYBO_CONFIG_PATH` pointing at a non-existent file → hard error.
 - default path absent → silently fall back to `BayboConfig::default()` and log the resolved path that was checked.
 
+`config_file_for_child_process()` applies the same precedence and resolves the
+candidate to an absolute path before a child changes cwd. Bash and Deck
+`ctx.exec` share this helper so a debug-build child running in scratch cannot
+silently derive a second `./.baybo` workspace.
+
 ## Design Decisions
 
 ### Identity file responsibilities

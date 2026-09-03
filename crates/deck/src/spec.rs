@@ -4,17 +4,19 @@
 //! invocations — is validated against the card's own `openapi.json`
 //! *before* anything reaches agent-written code. The document wrapper is
 //! a deliberately constrained OpenAPI subset (op existence, `get`/`post`
-//! only, mandatory `x-baybo-retryable`); the per-op parameter check is
-//! **standard JSON Schema**, compiled once at install by the
-//! `jsonschema` crate into a validator per op: each declared parameter's
-//! `schema` is taken verbatim as a subschema inside
-//! `{type: object, properties, required, additionalProperties: false}`,
+//! only, mandatory `x-baybo-retryable`, mandatory JSON `200` response);
+//! the per-op parameter and result checks are **standard JSON Schema**,
+//! compiled once at install by the `jsonschema` crate into validators per
+//! op: each declared parameter's `schema` is taken verbatim as a subschema
+//! inside `{type: object, properties, required, additionalProperties: false}`,
 //! so required-param presence, typing, enums, and unknown-param
-//! rejection all fall out of the library. `$ref` (and `$dynamicRef`) are
-//! rejected at admission — the crate's remote resolvers are compiled out
+//! rejection all fall out of the library, while results validate against
+//! `responses.200.content.application/json.schema` (or the optional
+//! `default` response for a top-level `{error: ...}` result). `$ref` and
+//! `$dynamicRef` are rejected at admission — the crate's remote resolvers are compiled out
 //! (`default-features = false`), and an agent-written schema must never
-//! reference anything outside its own document. Off-schema requests die
-//! at the gateway.
+//! reference anything outside its own document. Off-schema requests and
+//! results die at the gateway.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -34,10 +36,22 @@ pub const MAX_PARAMS_PER_OP: usize = 128;
 pub const MAX_CALL_PARAMS_BYTES: usize = 1024 * 1024;
 /// Validation errors quoted back to the caller per rejected call.
 const MAX_REPORTED_ERRORS: usize = 3;
+/// A top-level field reserved as the graceful-error result discriminator.
+pub(crate) const RESULT_ERROR_FIELD: &str = "error";
+const SUCCESS_RESPONSE: &str = "200";
+const ERROR_RESPONSE: &str = "default";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpResultKind {
+    Success,
+    Error,
+}
 
 #[derive(Clone)]
 struct OpSpec {
-    validator: Arc<jsonschema::Validator>,
+    params_validator: Arc<jsonschema::Validator>,
+    success_validator: Arc<jsonschema::Validator>,
+    error_validator: Option<Arc<jsonschema::Validator>>,
     /// The author's MANDATORY `x-baybo-retryable` declaration: running this
     /// op twice is harmless (pure read / recompute), so a transport that
     /// lost the response mid-flight may replay it. No default on purpose —
@@ -97,6 +111,41 @@ fn reject_refs(schema: &Value, ctx: &str) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+fn compile_response_validator(
+    response: &Value,
+    path: &str,
+    status: &str,
+) -> Result<Arc<jsonschema::Validator>> {
+    let ctx = format!("paths.{path}.responses.{status}.content.application/json.schema");
+    let schema = response
+        .get("content")
+        .and_then(|content| content.get("application/json"))
+        .and_then(|media| media.get("schema"))
+        .ok_or_else(|| DeckError::InvalidBundle(format!("{ctx} is required")))?;
+    if !schema.is_object() {
+        return Err(DeckError::InvalidBundle(format!("{ctx} must be an object")));
+    }
+    reject_refs(schema, &ctx)?;
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|e| DeckError::InvalidBundle(format!("{ctx} does not compile: {e}")))?;
+    Ok(Arc::new(validator))
+}
+
+fn validation_errors(validator: &jsonschema::Validator, instance: &Value) -> Vec<String> {
+    validator
+        .iter_errors(instance)
+        .take(MAX_REPORTED_ERRORS)
+        .map(|e| {
+            let at = e.instance_path().to_string();
+            if at.is_empty() {
+                e.to_string()
+            } else {
+                format!("{at}: {e}")
+            }
+        })
+        .collect()
 }
 
 impl CardSpec {
@@ -206,10 +255,38 @@ impl CardSpec {
                     "paths.{path}: parameter schema does not compile: {e}"
                 ))
             })?;
+            let responses = method_item
+                .get("responses")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    DeckError::InvalidBundle(format!(
+                        "paths.{path}.responses must be an object with a `{SUCCESS_RESPONSE}` JSON response schema"
+                    ))
+                })?;
+            for status in responses.keys() {
+                if status != SUCCESS_RESPONSE && status != ERROR_RESPONSE {
+                    return Err(DeckError::InvalidBundle(format!(
+                        "paths.{path}.responses.{status} is unsupported — Deck ops use only `{SUCCESS_RESPONSE}` and optional `{ERROR_RESPONSE}`"
+                    )));
+                }
+            }
+            let success_response = responses.get(SUCCESS_RESPONSE).ok_or_else(|| {
+                DeckError::InvalidBundle(format!(
+                    "paths.{path}.responses.{SUCCESS_RESPONSE} is required"
+                ))
+            })?;
+            let success_validator =
+                compile_response_validator(success_response, path, SUCCESS_RESPONSE)?;
+            let error_validator = responses
+                .get(ERROR_RESPONSE)
+                .map(|response| compile_response_validator(response, path, ERROR_RESPONSE))
+                .transpose()?;
             ops.insert(
                 op_name.to_string(),
                 OpSpec {
-                    validator: Arc::new(validator),
+                    params_validator: Arc::new(validator),
+                    success_validator,
+                    error_validator,
                     retryable,
                 },
             );
@@ -267,19 +344,7 @@ impl CardSpec {
                 "params exceed {MAX_CALL_PARAMS_BYTES} bytes"
             )));
         }
-        let errors: Vec<String> = spec
-            .validator
-            .iter_errors(instance)
-            .take(MAX_REPORTED_ERRORS)
-            .map(|e| {
-                let at = e.instance_path().to_string();
-                if at.is_empty() {
-                    e.to_string()
-                } else {
-                    format!("{at}: {e}")
-                }
-            })
-            .collect();
+        let errors = validation_errors(&spec.params_validator, instance);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -287,6 +352,47 @@ impl CardSpec {
                 "op `{op}`: {}",
                 errors.join("; ")
             )))
+        }
+    }
+
+    /// Validate a service result and classify it using Deck's reserved
+    /// top-level `error` discriminator. Successful results use the mandatory
+    /// `200` schema; graceful errors require and use the optional `default`
+    /// schema.
+    pub fn validate_result(
+        &self,
+        op: &str,
+        result: &Value,
+    ) -> std::result::Result<OpResultKind, String> {
+        let spec = self
+            .ops
+            .get(op)
+            .ok_or_else(|| format!("unknown op `{op}`"))?;
+        let is_error = result
+            .as_object()
+            .is_some_and(|object| object.contains_key(RESULT_ERROR_FIELD));
+        let (kind, status, validator) = if is_error {
+            let validator = spec.error_validator.as_ref().ok_or_else(|| {
+                format!(
+                    "op `{op}` returned a top-level `{RESULT_ERROR_FIELD}` result, but no `{ERROR_RESPONSE}` JSON response schema is declared"
+                )
+            })?;
+            (OpResultKind::Error, ERROR_RESPONSE, validator.as_ref())
+        } else {
+            (
+                OpResultKind::Success,
+                SUCCESS_RESPONSE,
+                spec.success_validator.as_ref(),
+            )
+        };
+        let errors = validation_errors(validator, result);
+        if errors.is_empty() {
+            Ok(kind)
+        } else {
+            Err(format!(
+                "op `{op}` result does not match its `{status}` response schema: {}",
+                errors.join("; ")
+            ))
         }
     }
 }
@@ -307,6 +413,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn object_responses() -> Value {
+        json!({
+            "200": {
+                "content": {
+                    "application/json": {"schema": {"type": "object"}}
+                }
+            }
+        })
+    }
+
     fn quota_spec() -> CardSpec {
         CardSpec::parse(
             json!({
@@ -319,10 +435,14 @@ mod tests {
                                 {"name": "provider", "required": true,
                                  "schema": {"type": "string", "enum": ["anthropic", "openai"]}},
                                 {"name": "days", "schema": {"type": "integer"}}
-                            ]
+                            ],
+                            "responses": object_responses()
                         }
                     },
-                    "/history": {"post": {"x-baybo-retryable": false}}
+                    "/history": {"post": {
+                        "x-baybo-retryable": false,
+                        "responses": object_responses()
+                    }}
                 }
             })
             .to_string()
@@ -435,7 +555,8 @@ mod tests {
                         "properties": {"warn": {"type": "number"}, "crit": {"type": "number"}},
                         "additionalProperties": false
                     }}
-                ]
+                ],
+                "responses": object_responses()
             }}}})
             .to_string()
             .as_bytes(),
@@ -524,6 +645,113 @@ mod tests {
                 .as_bytes()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn success_response_schema_is_mandatory() {
+        let err = CardSpec::parse(
+            json!({"paths": {"/op": {"get": {"x-baybo-retryable": true}}}})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("responses"), "{err}");
+
+        let err = CardSpec::parse(
+            json!({"paths": {"/op": {"get": {
+                "x-baybo-retryable": true,
+                "responses": {"200": {}}
+            }}}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("application/json.schema"), "{err}");
+    }
+
+    #[test]
+    fn validates_success_and_graceful_error_results() {
+        let spec = CardSpec::parse(
+            json!({"paths": {"/refresh": {"get": {
+                "x-baybo-retryable": true,
+                "responses": {
+                    "200": {"content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["count"],
+                        "properties": {"count": {"type": "integer"}},
+                        "additionalProperties": false
+                    }}}},
+                    "default": {"content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["error"],
+                        "properties": {"error": {"type": "string"}},
+                        "additionalProperties": false
+                    }}}}
+                }
+            }}}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.validate_result("refresh", &json!({"count": 3})),
+            Ok(OpResultKind::Success)
+        );
+        assert_eq!(
+            spec.validate_result("refresh", &json!({"error": "offline"})),
+            Ok(OpResultKind::Error)
+        );
+        assert!(
+            spec.validate_result("refresh", &json!({"count": "three"}))
+                .is_err()
+        );
+        assert!(
+            spec.validate_result("refresh", &json!({"error": 3}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn error_result_requires_default_schema() {
+        let spec = quota_spec();
+        let err = spec
+            .validate_result("quota", &json!({"error": "offline"}))
+            .unwrap_err();
+        assert!(err.contains("default"), "{err}");
+    }
+
+    #[test]
+    fn response_refs_and_unsupported_statuses_are_rejected() {
+        let external_ref = CardSpec::parse(
+            json!({"paths": {"/op": {"get": {
+                "x-baybo-retryable": true,
+                "responses": {"200": {"content": {"application/json": {
+                    "schema": {"$ref": "https://evil.example/result.json"}
+                }}}}
+            }}}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(external_ref.to_string().contains("$ref"), "{external_ref}");
+
+        let unsupported = CardSpec::parse(
+            json!({"paths": {"/op": {"get": {
+                "x-baybo-retryable": true,
+                "responses": {
+                    "200": {"content": {"application/json": {"schema": {"type": "object"}}}},
+                    "400": {"content": {"application/json": {"schema": {"type": "object"}}}}
+                }
+            }}}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            unsupported.to_string().contains("unsupported"),
+            "{unsupported}"
         );
     }
 }

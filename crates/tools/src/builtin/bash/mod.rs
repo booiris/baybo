@@ -1431,6 +1431,8 @@ fn require_command_paths_within_work_dir(
     exempt_roots: &[PathBuf],
     leading_baybo_bin: Option<&Path>,
 ) -> crate::Result<()> {
+    let should_hint_baybo_config =
+        leading_baybo_bin.is_some() && has_explicit_baybo_config_arg(command);
     for (sub_index, sub) in split_into_subcommands(command).into_iter().enumerate() {
         let mut leader_argv0_pending = sub_index == 0;
         for tok in sub {
@@ -1451,11 +1453,41 @@ fn require_command_paths_within_work_dir(
                 if p.is_absolute() && exempt_roots.iter().any(|root| p.starts_with(root)) {
                     continue;
                 }
-                require_within_work_dir(p, workspace_root, work_dir, "command argument")?;
+                if let Err(error) =
+                    require_within_work_dir(p, workspace_root, work_dir, "command argument")
+                {
+                    return Err(if should_hint_baybo_config {
+                        with_baybo_config_hint(error)
+                    } else {
+                        error
+                    });
+                }
             }
         }
     }
     Ok(())
+}
+
+const BAYBO_CONFIG_PATH_HINT: &str = "The Baybo self-CLI already receives the active config through `BAYBO_CONFIG_PATH`; omit an explicit `--config` argument.";
+
+fn has_explicit_baybo_config_arg(command: &str) -> bool {
+    const CONFIG_ARG: &str = "--config";
+    split_into_subcommands(command)
+        .first()
+        .into_iter()
+        .flat_map(|sub| sub.iter())
+        .filter_map(|token| shell_words::split(token).ok())
+        .flatten()
+        .any(|word| word == CONFIG_ARG || word.starts_with("--config="))
+}
+
+fn with_baybo_config_hint(error: ToolError) -> ToolError {
+    match error {
+        ToolError::InvalidParams(reason) => {
+            ToolError::InvalidParams(format!("{reason} {BAYBO_CONFIG_PATH_HINT}"))
+        }
+        other => other,
+    }
 }
 
 /// Map common diagnostic-tool exit codes to a human-readable hint so
@@ -1547,15 +1579,8 @@ fn interpret_exit(command: &str, exit_code: i32) -> Option<&'static str> {
 /// effect. The win is that the agent can compose `baybo …` commands
 /// naturally — no per-call argv token, no LLM tool-shape change.
 fn inject_baybo_env(command: &str) -> String {
-    let raw = std::env::var_os(baybo_workspace::paths::ENV_CONFIG_PATH)
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(baybo_workspace::paths::default_config_file);
-    // Syntactic absolutize — fast, doesn't touch the FS, doesn't
-    // fail when the file is missing (which is the normal case in
-    // fresh deployments before `baybo setup` runs).
-    let abs = std::path::absolute(&raw).unwrap_or(raw);
-    inject_baybo_env_with(command, abs.as_os_str())
+    let config_path = baybo_workspace::paths::config_file_for_child_process();
+    inject_baybo_env_with(command, config_path.as_os_str())
 }
 
 /// Pure variant of [`inject_baybo_env`] that takes an already-resolved
@@ -5476,6 +5501,32 @@ mod tests {
                 "non-argv0 workspace paths must remain guarded: {command}"
             );
         }
+
+        let err = require_command_paths_within_work_dir(
+            r#"'/tmp/bin/baybo' --config /tmp/config/baybo.json"#,
+            ws,
+            work,
+            &[],
+            Some(bin),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref message) if message.contains("BAYBO_CONFIG_PATH") && message.contains("omit")),
+            "self-CLI config rejection should teach the supported invocation: {err}"
+        );
+
+        let err = require_command_paths_within_work_dir(
+            r#"'/tmp/bin/baybo' status /tmp/config/baybo.json"#,
+            ws,
+            work,
+            &[],
+            Some(bin),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref message) if !message.contains("BAYBO_CONFIG_PATH")),
+            "an unrelated path rejection should not carry the config hint: {err}"
+        );
     }
 
     #[tokio::test]

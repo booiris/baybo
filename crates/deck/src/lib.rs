@@ -22,5 +22,6 @@ pub mod tools;
 pub use bundle::{DeckManifest, RefreshSpec, SDK_VERSION};
 pub use error::{DeckError, Result};
 pub use manager::{
-    BundleFiles, CardView, DeckEvents, DeckManager, DeckManagerConfig, DeckView, NoopDeckEvents,
+    BundleFiles, CardView, DeckEvents, DeckManager, DeckManagerConfig, DeckMutationResult,
+    DeckView, NoopDeckEvents,
 };
