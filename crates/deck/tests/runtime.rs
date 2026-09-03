@@ -170,6 +170,20 @@ fn set_success_response_schema(dir: &Path, path: &str, method: &str, schema: Val
     std::fs::write(openapi_path, openapi.to_string()).unwrap();
 }
 
+/// Strip every op's `responses`, reproducing a bundle installed before
+/// result schemas were part of the contract.
+fn strip_response_schemas(dir: &Path) {
+    let openapi_path = dir.join("openapi.json");
+    let mut openapi: Value =
+        serde_json::from_slice(&std::fs::read(&openapi_path).unwrap()).unwrap();
+    for methods in openapi["paths"].as_object_mut().unwrap().values_mut() {
+        for item in methods.as_object_mut().unwrap().values_mut() {
+            item.as_object_mut().unwrap().remove("responses");
+        }
+    }
+    std::fs::write(openapi_path, openapi.to_string()).unwrap();
+}
+
 const GOOD_SERVICE: &str = r#"
 export const ops = {
   refresh: async () => ({ ok: true, n: 42 }),
@@ -995,4 +1009,77 @@ export function start(ctx) {
     );
 
     h.manager.shutdown().await;
+}
+
+/// The admission half of the pre-contract leniency: loading such a bundle
+/// works so an already-installed card keeps running, but staging one as NEW
+/// code is refused. Deliberately not behind `harness_or_skip` — it fails
+/// before any service boots, so it guards the contract on a runner without
+/// bun too.
+#[tokio::test]
+async fn install_refuses_a_bundle_that_declares_no_result_schema() {
+    let h = harness().await;
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), GOOD_SERVICE);
+    strip_response_schemas(staged.path());
+
+    let message = h
+        .manager
+        .install(staged.path())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("responses.200"), "{message}");
+    assert!(message.contains("refresh"), "{message}");
+    assert!(
+        h.manager.deck_view().await.unwrap().cards.is_empty(),
+        "a refused install must leave no row behind"
+    );
+}
+
+/// A bundle the gateway can no longer load is a fault in the code the operator
+/// upgraded into. Quarantining it there is a one-way latch — `boot` skips
+/// quarantined rows on every later boot, so the card never retries — which is
+/// how a contract change would take a working deck down permanently.
+#[tokio::test]
+async fn boot_does_not_quarantine_a_bundle_it_cannot_load() {
+    let Some(h) = harness_or_skip("boot_does_not_quarantine_a_bundle_it_cannot_load").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), GOOD_SERVICE);
+    let card = h.manager.install(staged.path()).await.unwrap().card;
+    h.manager.shutdown().await;
+
+    std::fs::write(
+        h.root
+            .path()
+            .join("deck")
+            .join(&card.id)
+            .join("openapi.json"),
+        "{ not json",
+    )
+    .unwrap();
+
+    h.manager.boot().await;
+
+    let view = h.manager.deck_view().await.unwrap();
+    let row = view.cards.iter().find(|c| c.id == card.id).unwrap();
+    assert!(
+        row.enabled,
+        "an unloadable bundle must not disable the card"
+    );
+    assert!(
+        row.quarantined_at.is_none(),
+        "an unloadable bundle is a host fault and must not quarantine"
+    );
+    let snapshot = view
+        .snapshots
+        .iter()
+        .find(|s| s.card_id == card.id)
+        .expect("the card keeps a snapshot row");
+    assert!(
+        snapshot.error.is_some(),
+        "the load failure must reach the error face, not just the log"
+    );
 }

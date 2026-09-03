@@ -472,6 +472,7 @@ impl DeckManager {
         card_id: &str,
     ) -> Result<(DeckBundle, Value)> {
         let bundle = load_bundle(staged_dir)?;
+        require_declared_results(&bundle)?;
         let first = self.dry_run(&bundle, card_id).await?;
 
         let dest = self.bundle_dir(card_id);
@@ -521,6 +522,7 @@ impl DeckManager {
     pub async fn update(&self, card_id: &str, staged_dir: &Path) -> Result<DeckMutationResult> {
         let row = self.live_row(card_id).await?;
         let bundle = load_bundle(staged_dir)?;
+        require_declared_results(&bundle)?;
         let first = self.dry_run(&bundle, card_id).await?;
 
         self.supervisor().stop(card_id).await;
@@ -609,9 +611,20 @@ impl DeckManager {
     /// failed gate leaves the card quarantined with a refreshed error).
     pub async fn enable(&self, card_id: &str) -> Result<()> {
         let _row = self.live_row(card_id).await?;
-        let bundle = load_bundle(&self.bundle_dir(card_id))?;
-        match self.dry_run(&bundle, card_id).await {
-            Ok(first) => {
+        // `load_bundle` belongs INSIDE the verdict. Taking its `?` early
+        // return skipped the arm below that refreshes the error face, so
+        // after an upgrade that made a bundle unloadable — the commonest way
+        // re-admission fails — Re-enable returned the same stale error and
+        // looked like a dead button.
+        let gated = match load_bundle(&self.bundle_dir(card_id)) {
+            Ok(bundle) => self
+                .dry_run(&bundle, card_id)
+                .await
+                .map(|first| (bundle, first)),
+            Err(e) => Err(e),
+        };
+        match gated {
+            Ok((bundle, first)) => {
                 self.store.set_enabled(card_id, true).await?;
                 self.store.set_quarantined(card_id, None).await?;
                 let text = first.to_string();
@@ -752,7 +765,7 @@ impl DeckManager {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(card = %row.id, "deck: boot bundle load failed: {e}");
-                    self.quarantine_with_reason(&row.id, &e.to_string()).await;
+                    self.mark_unloadable(&row.id, &e.to_string()).await;
                     continue;
                 }
             };
@@ -868,6 +881,25 @@ impl DeckManager {
                 card = %card_id, event = %event, "deck git commit skipped: {reason}"
             ),
         }
+    }
+
+    /// A bundle the gateway can no longer LOAD is a fault in the code the
+    /// operator upgraded into, not misbehaviour by the card — and
+    /// `docs/modules/deck.md` says a host fault never quarantines. Leave the
+    /// row enabled and unstamped so the next boot retries and `enable` can
+    /// re-admit it once the bundle is repaired; spend the error face on
+    /// saying what is wrong. Quarantine stays for a card that loads and then
+    /// misbehaves, which the supervisor decides.
+    async fn mark_unloadable(&self, card_id: &str, reason: &str) {
+        provenance("unloadable", card_id, reason);
+        if let Err(e) = self
+            .store
+            .record_snapshot(card_id, "", Some(reason), Utc::now())
+            .await
+        {
+            tracing::warn!(card = %card_id, "deck: unloadable snapshot failed: {e}");
+        }
+        self.events.deck_changed();
     }
 
     async fn quarantine_with_reason(&self, card_id: &str, reason: &str) {
@@ -1099,6 +1131,21 @@ impl DeckManager {
         let _ = (&mut exited).await;
         outcome.map_err(|e| DeckError::DryRun(format!("refresh op failed: {e}")))
     }
+}
+
+/// Install and update refuse a bundle whose ops declare no result contract.
+/// Loading one still succeeds — a card installed before the contract existed
+/// keeps running unchecked, see `spec::ResponseSpec` — but that leniency is
+/// for bundles already on the user's deck, never for new code entering it.
+fn require_declared_results(bundle: &DeckBundle) -> Result<()> {
+    let undeclared = bundle.spec.ops_without_declared_results();
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    Err(DeckError::InvalidBundle(format!(
+        "these ops declare no success result schema at `responses.200.content.application/json.schema`: {}",
+        undeclared.join(", ")
+    )))
 }
 
 fn gate_error_summary(snapshot: &Value) -> String {
