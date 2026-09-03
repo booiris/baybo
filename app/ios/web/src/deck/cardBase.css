@@ -43,9 +43,26 @@ body {
   padding: 10px 12px;
 }
 
-html[data-deck-size="max"] .card {
-  overflow-y: auto;
+/* At `max` the document itself scrolls and `.card` is an ordinary block, NOT
+   the scroll container. Unlike the rest of this file these two rules are
+   load-bearing rather than additive: they declare `height` and `overflow`
+   precisely so a card cannot strand its own content by overriding them. The
+   margin is specificity — this is (0,2,1), while the idioms a card actually
+   writes are `.card { overflow: hidden }` (0,1,0) and
+   `[data-size="max"] .card { height: auto }` (0,2,0). That is also why the
+   size attribute a card sets for itself is `data-size` and the shell's is
+   `data-deck-size`: keeping them distinct keeps card selectors one notch
+   below these. */
+html[data-deck-size="max"] body {
+  height: auto;
+  overflow: visible;
   overscroll-behavior-y: contain;
+}
+
+html[data-deck-size="max"] .card {
+  height: auto;
+  min-height: 100vh;
+  overflow: visible;
   padding-top: var(--deck-header-clearance);
   padding-bottom: var(--deck-tab-bar-clearance);
 }

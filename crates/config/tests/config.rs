@@ -420,6 +420,57 @@ fn encryption_key_file_is_required() {
     assert!(c.validate().is_ok());
 }
 
+/// A config that does not pin `workspace.path` must take the root implied by
+/// its own location, not one derived from the reading process's cwd. Two
+/// processes sharing one config file — the gateway, and a child it spawned
+/// with a different cwd, such as a deck card's `ctx.exec` — would otherwise
+/// resolve two different workspaces, and the child's would be a freshly
+/// bootstrapped empty one whose queries answer zero.
+#[test]
+fn a_config_without_a_workspace_block_takes_the_root_it_sits_in()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let config_dir = root.path().join("config");
+    std::fs::create_dir_all(&config_dir)?;
+    let file = config_dir.join("baybo.json");
+    std::fs::write(&file, r#"{"llm": [], "default-llm": ""}"#)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let config = rt.block_on(BayboConfig::load_from_file(&file))?;
+
+    assert_eq!(
+        std::path::Path::new(&config.workspace.path),
+        root.path(),
+        "the root must come from the file's location, not the process cwd"
+    );
+    Ok(())
+}
+
+/// The inference is a fallback, never an override: a document that states its
+/// own root keeps it even when it sits somewhere else entirely.
+#[test]
+fn an_explicit_workspace_path_survives_being_read_from_elsewhere()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let config_dir = root.path().join("config");
+    std::fs::create_dir_all(&config_dir)?;
+    let file = config_dir.join("baybo.json");
+    std::fs::write(
+        &file,
+        r#"{"llm": [], "default-llm": "", "workspace": {"path": "/srv/pinned"}}"#,
+    )?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let config = rt.block_on(BayboConfig::load_from_file(&file))?;
+
+    assert_eq!(config.workspace.path, "/srv/pinned");
+    Ok(())
+}
+
 #[test]
 fn workspace_path_rejects_relative_value() {
     let mut c = BayboConfig::default();

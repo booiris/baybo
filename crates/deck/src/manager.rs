@@ -29,7 +29,7 @@ use crate::bundle::{
 use crate::error::{DeckError, Result};
 use crate::host::DeckHost;
 use crate::service::{EmitSink, RunningService, SNAPSHOT_MAX_BYTES, StrikeRecorder, spawn_service};
-use crate::spec::CardSpec;
+use crate::spec::{CardSpec, OpResultKind, RESULT_ERROR_FIELD};
 use crate::supervisor::{DeckSupervisor, QuarantineSink};
 
 /// Hard cap on live (non-deleted) cards; installs and restores past it
@@ -52,6 +52,9 @@ const TMUX_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 /// legitimately in-flight gate can already exist at sweep time; only
 /// entries old enough to be certain residue are touched.
 const BOOT_REAP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+const RESIDUE_REMOVE_MAX_ATTEMPTS: usize = 3;
+const RESIDUE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(20);
+const MAX_GATE_ERROR_CHARS: usize = 1_000;
 
 /// Deck push hooks; the gateway broadcasts `Frame::DeckCardData` /
 /// `Frame::DeckChanged` on the owner channel from these.
@@ -133,6 +136,12 @@ pub struct DeckView {
     pub snapshots: Vec<DeckSnapshotRow>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DeckMutationResult {
+    pub card: CardView,
+    pub first_snapshot: Value,
+}
+
 /// A live card's source, verbatim from its installed bundle — the seed for
 /// editing a card across chats (`DeckCardGet`). The four required files plus
 /// any `src/` pre-build sources kept alongside them (relative path →
@@ -162,6 +171,8 @@ pub struct DeckManagerConfig {
     pub deck_root: PathBuf,
     /// Scratch root for service + exec working dirs.
     pub scratch_root: PathBuf,
+    /// Active Baybo config inherited by every service `ctx.exec` child.
+    pub baybo_config_path: PathBuf,
 }
 
 struct ManagerEmitSink {
@@ -169,13 +180,33 @@ struct ManagerEmitSink {
     events: Arc<dyn DeckEvents>,
 }
 
+struct ResultValidatingEmitSink {
+    spec: Arc<CardSpec>,
+    snapshot_op: String,
+    inner: Arc<dyn EmitSink>,
+}
+
+#[async_trait]
+impl EmitSink for ResultValidatingEmitSink {
+    async fn emit(&self, card_id: &str, payload: Value) -> std::result::Result<(), String> {
+        if payload.to_string().len() > SNAPSHOT_MAX_BYTES {
+            return Err(format!("emit payload exceeds {SNAPSHOT_MAX_BYTES} bytes"));
+        }
+        self.spec
+            .validate_result(&self.snapshot_op, &payload)
+            .map_err(|e| format!("invalid snapshot: {e}"))?;
+        self.inner.emit(card_id, payload).await
+    }
+
+    async fn reject(&self, card_id: &str, reason: &str) {
+        self.inner.reject(card_id, reason).await;
+    }
+}
+
 #[async_trait]
 impl EmitSink for ManagerEmitSink {
     async fn emit(&self, card_id: &str, payload: Value) -> std::result::Result<(), String> {
         let text = payload.to_string();
-        if text.len() > SNAPSHOT_MAX_BYTES {
-            return Err(format!("emit payload exceeds {SNAPSHOT_MAX_BYTES} bytes"));
-        }
         let seq = self
             .store
             .record_snapshot(card_id, &text, None, Utc::now())
@@ -183,6 +214,22 @@ impl EmitSink for ManagerEmitSink {
             .map_err(|e| e.to_string())?;
         self.events.card_data(card_id, seq, &text);
         Ok(())
+    }
+
+    async fn reject(&self, card_id: &str, reason: &str) {
+        // The same visible shape a quarantine leaves: empty payload, reason
+        // in the error column. `card_data` cannot carry it — that frame
+        // broadcasts payloads — so the client re-reads on `deck_changed`.
+        match self
+            .store
+            .record_snapshot(card_id, "", Some(reason), Utc::now())
+            .await
+        {
+            Ok(_) => self.events.deck_changed(),
+            Err(e) => {
+                tracing::warn!(card = %card_id, "deck: rejected-emit snapshot failed: {e}");
+            }
+        }
     }
 }
 
@@ -242,6 +289,7 @@ impl DeckManager {
             blob,
             deck_root,
             scratch_root,
+            baybo_config_path,
         } = config;
         // Card services run on the host (no sandbox), so the runtime is
         // always available — a missing `bun` surfaces as a spawn error at
@@ -250,15 +298,12 @@ impl DeckManager {
             vault,
             Arc::clone(&process_manager),
             scratch_root.clone(),
+            baybo_config_path,
             blob.clone(),
             &deck_root,
         ));
         let supervisor = Arc::new(DeckSupervisor::new(
             host.clone(),
-            Arc::new(ManagerEmitSink {
-                store: store.clone(),
-                events: events.clone(),
-            }),
             Arc::new(ManagerQuarantine {
                 store: store.clone(),
                 events: events.clone(),
@@ -364,7 +409,10 @@ impl DeckManager {
         }
         let spec = self.spec_for(card_id).await?;
         spec.validate_call(op, &params)?;
-        self.supervisor().call(card_id, op, params).await
+        let result = self.supervisor().call(card_id, op, params).await?;
+        spec.validate_result(op, &result)
+            .map_err(|e| DeckError::ServiceUnavailable(format!("invalid service result: {e}")))?;
+        Ok(result)
     }
 
     // ---- lifecycle ----------------------------------------------------
@@ -373,8 +421,8 @@ impl DeckManager {
     /// as a brand-new card. Runs the dry-run gate against the staged
     /// bundle, copies it under the deck root (stage-then-rename), inserts
     /// the row, stores the gate's first snapshot, starts the service, and
-    /// broadcasts. Returns the new card.
-    pub async fn install(&self, staged_dir: &Path) -> Result<CardView> {
+    /// broadcasts. Returns the new card and the checked first snapshot.
+    pub async fn install(&self, staged_dir: &Path) -> Result<DeckMutationResult> {
         let live = self.store.count_live().await? as usize;
         if live >= MAX_CARDS {
             return Err(DeckError::DeckFull(MAX_CARDS));
@@ -406,7 +454,11 @@ impl DeckManager {
 
         self.start_service(&card_id, &installed).await?;
         self.events.deck_changed();
-        self.row_view(&card_id).await
+        let card = self.row_view(&card_id).await?;
+        Ok(DeckMutationResult {
+            card,
+            first_snapshot: first,
+        })
     }
 
     /// The pre-create half of [`Self::install`]: run the dry-run gate,
@@ -420,6 +472,7 @@ impl DeckManager {
         card_id: &str,
     ) -> Result<(DeckBundle, Value)> {
         let bundle = load_bundle(staged_dir)?;
+        require_declared_results(&bundle)?;
         let first = self.dry_run(&bundle, card_id).await?;
 
         let dest = self.bundle_dir(card_id);
@@ -466,9 +519,10 @@ impl DeckManager {
     /// size / layout (the row is authoritative post-install); only
     /// `spec_hash` moves. The service restarts on the new code iff the
     /// card is enabled.
-    pub async fn update(&self, card_id: &str, staged_dir: &Path) -> Result<CardView> {
+    pub async fn update(&self, card_id: &str, staged_dir: &Path) -> Result<DeckMutationResult> {
         let row = self.live_row(card_id).await?;
         let bundle = load_bundle(staged_dir)?;
+        require_declared_results(&bundle)?;
         let first = self.dry_run(&bundle, card_id).await?;
 
         self.supervisor().stop(card_id).await;
@@ -517,7 +571,11 @@ impl DeckManager {
             self.start_service(card_id, &installed).await?;
         }
         self.events.deck_changed();
-        self.row_view(card_id).await
+        let card = self.row_view(card_id).await?;
+        Ok(DeckMutationResult {
+            card,
+            first_snapshot: first,
+        })
     }
 
     pub async fn set_layout(&self, entries: &[DeckLayoutEntry]) -> Result<()> {
@@ -553,9 +611,20 @@ impl DeckManager {
     /// failed gate leaves the card quarantined with a refreshed error).
     pub async fn enable(&self, card_id: &str) -> Result<()> {
         let _row = self.live_row(card_id).await?;
-        let bundle = load_bundle(&self.bundle_dir(card_id))?;
-        match self.dry_run(&bundle, card_id).await {
-            Ok(first) => {
+        // `load_bundle` belongs INSIDE the verdict. Taking its `?` early
+        // return skipped the arm below that refreshes the error face, so
+        // after an upgrade that made a bundle unloadable — the commonest way
+        // re-admission fails — Re-enable returned the same stale error and
+        // looked like a dead button.
+        let gated = match load_bundle(&self.bundle_dir(card_id)) {
+            Ok(bundle) => self
+                .dry_run(&bundle, card_id)
+                .await
+                .map(|first| (bundle, first)),
+            Err(e) => Err(e),
+        };
+        match gated {
+            Ok((bundle, first)) => {
                 self.store.set_enabled(card_id, true).await?;
                 self.store.set_quarantined(card_id, None).await?;
                 let text = first.to_string();
@@ -696,7 +765,7 @@ impl DeckManager {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(card = %row.id, "deck: boot bundle load failed: {e}");
-                    self.quarantine_with_reason(&row.id, &e.to_string()).await;
+                    self.mark_unloadable(&row.id, &e.to_string()).await;
                     continue;
                 }
             };
@@ -750,8 +819,8 @@ impl DeckManager {
     async fn reap_card_runtime(&self, card_id: &str) {
         let socks = self.host.tmux_dir(card_id);
         kill_tmux_servers(&self.process_manager, &socks).await;
-        remove_residue_dir(&socks);
-        remove_residue_dir(&self.scratch_root.join(card_id));
+        remove_residue_dir(&socks).await;
+        remove_residue_dir(&self.scratch_root.join(card_id)).await;
     }
 
     /// Boot-time orphan sweep: runtime dirs (tmux socket dirs, exec
@@ -778,10 +847,10 @@ impl DeckManager {
         }
         for dir in stale_orphan_dirs(self.host.tmux_socks_root(), &existing) {
             kill_tmux_servers(&self.process_manager, &dir).await;
-            remove_residue_dir(&dir);
+            remove_residue_dir(&dir).await;
         }
         for dir in stale_orphan_dirs(&self.scratch_root, &existing) {
-            remove_residue_dir(&dir);
+            remove_residue_dir(&dir).await;
         }
     }
 
@@ -812,6 +881,25 @@ impl DeckManager {
                 card = %card_id, event = %event, "deck git commit skipped: {reason}"
             ),
         }
+    }
+
+    /// A bundle the gateway can no longer LOAD is a fault in the code the
+    /// operator upgraded into, not misbehaviour by the card — and
+    /// `docs/modules/deck.md` says a host fault never quarantines. Leave the
+    /// row enabled and unstamped so the next boot retries and `enable` can
+    /// re-admit it once the bundle is repaired; spend the error face on
+    /// saying what is wrong. Quarantine stays for a card that loads and then
+    /// misbehaves, which the supervisor decides.
+    async fn mark_unloadable(&self, card_id: &str, reason: &str) {
+        provenance("unloadable", card_id, reason);
+        if let Err(e) = self
+            .store
+            .record_snapshot(card_id, "", Some(reason), Utc::now())
+            .await
+        {
+            tracing::warn!(card = %card_id, "deck: unloadable snapshot failed: {e}");
+        }
+        self.events.deck_changed();
     }
 
     async fn quarantine_with_reason(&self, card_id: &str, reason: &str) {
@@ -929,10 +1017,19 @@ impl DeckManager {
 
     async fn start_service(&self, card_id: &str, bundle: &DeckBundle) -> Result<()> {
         let sup = self.supervisor();
+        let emit_sink: Arc<dyn EmitSink> = Arc::new(ResultValidatingEmitSink {
+            spec: Arc::new(bundle.spec.clone()),
+            snapshot_op: bundle.manifest.refresh.op.clone(),
+            inner: Arc::new(ManagerEmitSink {
+                store: self.store.clone(),
+                events: self.events.clone(),
+            }),
+        });
         sup.start(
             card_id,
             self.bundle_dir(card_id),
             Duration::from_secs(bundle.emit_interval_secs()),
+            emit_sink,
         )
         .await;
         Ok(())
@@ -941,7 +1038,7 @@ impl DeckManager {
     /// The dry-run gate's execution half: boot the service on the host
     /// against the bundle's own directory, invoke the refresh op once,
     /// and check the returned snapshot. Kills the throwaway process
-    /// before returning. Emits during the dry run are discarded.
+    /// before returning. Emits during the dry run are validated, then discarded.
     ///
     /// `uploader_card_id` is the card's EVENTUAL real id (minted before the
     /// gate on install; the known id on update/enable/boot). The gate's
@@ -957,15 +1054,50 @@ impl DeckManager {
     /// the resident card's server).
     async fn dry_run(&self, bundle: &DeckBundle, uploader_card_id: &str) -> Result<Value> {
         let gate_id = format!("{GATE_SCRATCH_PREFIX}{}", uuid::Uuid::new_v4());
-        let outcome = self.dry_run_exec(bundle, &gate_id, uploader_card_id).await;
+        // Everything the gate creates under `gate_id` — the service's scratch,
+        // its tmux sockets, the render harness — has to exist before the reap
+        // and nothing may write there after it, or the gate leaks a directory
+        // per run. So the whole verdict is computed first, then reaped once.
+        let verdict = self
+            .dry_run_verdict(bundle, &gate_id, uploader_card_id)
+            .await;
         self.reap_card_runtime(&gate_id).await;
-        let snapshot = outcome?;
+        verdict
+    }
+
+    async fn dry_run_verdict(
+        &self,
+        bundle: &DeckBundle,
+        gate_id: &str,
+        uploader_card_id: &str,
+    ) -> Result<Value> {
+        let snapshot = self.dry_run_exec(bundle, gate_id, uploader_card_id).await?;
         if snapshot.is_null() {
             return Err(DeckError::DryRun(
                 "refresh op returned null — a card's refresh must return its snapshot JSON".into(),
             ));
         }
-        Ok(snapshot)
+        match bundle
+            .spec
+            .validate_result(&bundle.manifest.refresh.op, &snapshot)
+            .map_err(DeckError::DryRun)?
+        {
+            OpResultKind::Success => {
+                crate::render::check_renders_its_data(
+                    bundle,
+                    &snapshot,
+                    &self.scratch_root.join(gate_id),
+                    &self.process_manager,
+                    uploader_card_id,
+                )
+                .await?;
+                Ok(snapshot)
+            }
+            OpResultKind::Error => Err(DeckError::DryRun(format!(
+                "refresh op returned an error result: {}",
+                gate_error_summary(&snapshot)
+            ))),
+        }
     }
 
     async fn dry_run_exec(
@@ -984,8 +1116,15 @@ impl DeckManager {
             ) -> std::result::Result<(), String> {
                 Ok(())
             }
+
+            async fn reject(&self, _card_id: &str, _reason: &str) {}
         }
 
+        let emit_sink: Arc<dyn EmitSink> = Arc::new(ResultValidatingEmitSink {
+            spec: Arc::new(bundle.spec.clone()),
+            snapshot_op: bundle.manifest.refresh.op.clone(),
+            inner: Arc::new(DiscardEmits),
+        });
         let running = spawn_service(
             crate::service::SpawnConfig {
                 card_id: gate_id.to_string(),
@@ -996,7 +1135,7 @@ impl DeckManager {
                 process_manager: Arc::clone(&self.process_manager),
             },
             self.host.clone(),
-            Arc::new(DiscardEmits),
+            emit_sink,
             Arc::new(StrikeRecorder::default()),
         )
         .await?;
@@ -1017,6 +1156,35 @@ impl DeckManager {
         let _ = (&mut exited).await;
         outcome.map_err(|e| DeckError::DryRun(format!("refresh op failed: {e}")))
     }
+}
+
+/// Install and update refuse a bundle whose ops declare no result contract.
+/// Loading one still succeeds — a card installed before the contract existed
+/// keeps running unchecked, see `spec::ResponseSpec` — but that leniency is
+/// for bundles already on the user's deck, never for new code entering it.
+fn require_declared_results(bundle: &DeckBundle) -> Result<()> {
+    let undeclared = bundle.spec.ops_without_declared_results();
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    Err(DeckError::InvalidBundle(format!(
+        "these ops declare no success result schema at `responses.200.content.application/json.schema`: {}",
+        undeclared.join(", ")
+    )))
+}
+
+fn gate_error_summary(snapshot: &Value) -> String {
+    let raw = snapshot
+        .get(RESULT_ERROR_FIELD)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| snapshot.to_string());
+    let mut chars = raw.chars();
+    let mut summary: String = chars.by_ref().take(MAX_GATE_ERROR_CHARS).collect();
+    if chars.next().is_some() {
+        summary.push('…');
+    }
+    summary
 }
 
 /// `tmux -S <sock> kill-server` every eligible `*.sock` entry in `socks`
@@ -1107,12 +1275,29 @@ fn clamp_size(current: DeckSize, sizes: &[DeckSize], default: DeckSize) -> Optio
 /// Remove a runtime-residue dir, tolerating its absence (the common case)
 /// and logging — never propagating — anything else: residue cleanup must
 /// not fail the lifecycle operation it rides on.
-fn remove_residue_dir(dir: &Path) {
-    match std::fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            tracing::warn!(dir = %dir.display(), "deck: residue cleanup failed: {e}");
+async fn remove_residue_dir(dir: &Path) {
+    remove_residue_dir_with(dir, tokio::fs::remove_dir_all).await;
+}
+
+async fn remove_residue_dir_with<F, Fut>(dir: &Path, mut remove: F)
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    for attempt in 1..=RESIDUE_REMOVE_MAX_ATTEMPTS {
+        match remove(dir.to_path_buf()).await {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && attempt < RESIDUE_REMOVE_MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(RESIDUE_REMOVE_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), attempts = attempt, "deck: residue cleanup failed: {e}");
+                return;
+            }
         }
     }
 }
@@ -1301,6 +1486,24 @@ mod tests {
         );
         assert!(older_than(dir.path(), Duration::ZERO));
         assert!(!older_than(&dir.path().join("missing"), Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn residue_cleanup_retries_directory_not_empty() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        remove_residue_dir_with(Path::new("/unused"), |_| {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(if attempt + 1 < RESIDUE_REMOVE_MAX_ATTEMPTS {
+                Err(std::io::ErrorKind::DirectoryNotEmpty.into())
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            RESIDUE_REMOVE_MAX_ATTEMPTS
+        );
     }
 
     #[test]

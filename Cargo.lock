@@ -554,6 +554,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -641,6 +642,7 @@ dependencies = [
  "baybo-storage",
  "baybo-store",
  "baybo-tools",
+ "baybo-workspace",
  "bytes",
  "chrono",
  "futures",

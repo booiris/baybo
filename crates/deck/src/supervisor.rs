@@ -86,7 +86,6 @@ struct ServiceEntry {
 
 pub(crate) struct DeckSupervisor {
     host: Arc<dyn HostServices>,
-    emit_sink: Arc<dyn EmitSink>,
     quarantine: Arc<dyn QuarantineSink>,
     process_manager: Arc<baybo_process::ProcessManager>,
     /// Per-card scratch dirs live under here.
@@ -97,14 +96,12 @@ pub(crate) struct DeckSupervisor {
 impl DeckSupervisor {
     pub fn new(
         host: Arc<dyn HostServices>,
-        emit_sink: Arc<dyn EmitSink>,
         quarantine: Arc<dyn QuarantineSink>,
         process_manager: Arc<baybo_process::ProcessManager>,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
             host,
-            emit_sink,
             quarantine,
             process_manager,
             scratch_root,
@@ -114,13 +111,18 @@ impl DeckSupervisor {
 
     /// Start (or restart) the supervision loop for one card. Replaces any
     /// existing loop for the id.
-    pub async fn start(&self, card_id: &str, bundle_dir: PathBuf, emit_interval: Duration) {
+    pub async fn start(
+        &self,
+        card_id: &str,
+        bundle_dir: PathBuf,
+        emit_interval: Duration,
+        emit_sink: Arc<dyn EmitSink>,
+    ) {
         self.stop(card_id).await;
 
         let slot: Arc<Mutex<Option<ServiceHandle>>> = Arc::new(Mutex::new(None));
         let cancel = CancellationToken::new();
         let host = self.host.clone();
-        let emit_sink = self.emit_sink.clone();
         let quarantine = self.quarantine.clone();
         let scratch_dir = self.scratch_root.join(card_id);
         let process_manager = Arc::clone(&self.process_manager);

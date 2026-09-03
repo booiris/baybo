@@ -32,6 +32,46 @@
           port.postMessage({ type: "log", level: "error", message: String(err) });
       }
     }
+    scheduleReachCheck();
+  }
+
+  // A `max` layout taller than the viewport that nothing can scroll strands
+  // its own content: the page looks cut off and no gesture reaches the rest.
+  // Nothing upstream can catch this — the install gate never renders
+  // `card.html` — and every cause presents identically here (CSS that clips
+  // or fixes the box, a JS-set inline style, an absolutely positioned child),
+  // so this measures the rendered result instead of predicting it. Reported
+  // through the existing log channel; a card re-rendering every tick reports
+  // only when the shortfall changes.
+  let lastStranded = 0;
+  function checkReachable() {
+    if (size !== "max" || !port) return;
+    const root = document.scrollingElement || document.documentElement;
+    const stranded = document.body.scrollHeight - window.innerHeight;
+    if (stranded > 4 && root.scrollHeight - root.clientHeight <= 1) {
+      if (stranded === lastStranded) return;
+      lastStranded = stranded;
+      port.postMessage({
+        type: "log",
+        level: "error",
+        message:
+          "max layout: " +
+          stranded +
+          "px of content sits below the viewport and nothing scrolls to it — " +
+          "the card's own CSS is overriding the injected scroll container " +
+          "(do not set height/overflow/position on .card in a max rule)",
+      });
+    } else if (stranded <= 4) {
+      lastStranded = 0;
+    }
+  }
+
+  // Two frames: the card renders synchronously off onSizeChange/onData, and
+  // layout must settle before the measurement means anything.
+  function scheduleReachCheck() {
+    requestAnimationFrame(function () {
+      requestAnimationFrame(checkReachable);
+    });
   }
 
   // Coerce `pickBlob({accept})` to plain strings ONLY so the port's structured
@@ -61,6 +101,7 @@
           port.postMessage({ type: "log", level: "error", message: String(err) });
         }
       }
+      scheduleReachCheck();
     } else if (msg.type === "call_result") {
       const p = pending.get(msg.id);
       if (!p) return;

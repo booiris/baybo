@@ -23,6 +23,7 @@ use tokio::process::Command;
 use baybo_security::{PlaceholderMinter, SecretVault};
 use baybo_store::blob::{MAX_BLOB_BYTES, deck_uploader_identity};
 use baybo_store::{BlobStore, ByteStream};
+use baybo_workspace::paths::ENV_CONFIG_PATH;
 
 use crate::service::{
     HostBlobPutFileRequest, HostBlobRef, HostExecResponse, HostFetchRequest, HostFetchResponse,
@@ -66,6 +67,8 @@ pub(crate) struct DeckHost {
     process_manager: Arc<baybo_process::ProcessManager>,
     /// Scratch root for exec working dirs (per card).
     scratch_root: PathBuf,
+    /// Active Baybo config, resolved before a child switches to its scratch cwd.
+    baybo_config_path: PathBuf,
     /// Shared blob store — the same one chat attachments use. Deck blobs are
     /// stamped `deck:<card_id>` so GC can find them without touching chat data.
     blob: Arc<dyn BlobStore>,
@@ -79,6 +82,7 @@ impl DeckHost {
         vault: Arc<SecretVault>,
         process_manager: Arc<baybo_process::ProcessManager>,
         scratch_root: PathBuf,
+        baybo_config_path: PathBuf,
         blob: Arc<dyn BlobStore>,
         deck_root: &Path,
     ) -> Self {
@@ -86,6 +90,7 @@ impl DeckHost {
             vault,
             process_manager,
             scratch_root,
+            baybo_config_path,
             blob,
             tmux_socks_root: deck_root.join(TMUX_SOCKS_SUBDIR),
         }
@@ -448,6 +453,7 @@ impl HostServices for DeckHost {
             .arg("-c")
             .arg(&cmd)
             .current_dir(&scratch)
+            .env(ENV_CONFIG_PATH, &self.baybo_config_path)
             .env(DECK_TMUX_DIR_ENV, self.tmux_dir(card_id))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

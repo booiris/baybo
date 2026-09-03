@@ -1,6 +1,6 @@
 ---
 name: deck
-version: 0.4.0
+version: 0.5.0
 description: "Create, install, or update persistent Deck dashboard cards from ordinary-language requests."
 when_to_use: "Use when the user asks to create, add, modify, fix, or redesign a persistent Deck/dashboard card — such as a Claude/Codex quota monitor, machine-status board, or API watcher — whether they use /deck or ordinary language."
 command: deck
@@ -27,11 +27,18 @@ show or change, ask before writing anything.
 
 A deck card is a self-contained bundle of exactly four plain files. You
 write them in a scratch directory with your normal file tools, then
-install with `DeckCardCreate(path)`. Install runs a **dry-run gate**:
-your `service.js` is booted for real on the host and the refresh op
-is invoked once — failures (including the service's stderr) come back in
-the tool result so you can fix and retry in the same turn. On success
-the card appears on the user's deck already showing data.
+install with `DeckCardCreate(path)`. Install runs a **dry-run gate** over
+BOTH halves of the bundle. Backend: your `service.js` is booted for real on the
+host and the refresh op is invoked once, its result must match the op's
+declared success schema, and a top-level `{error: ...}` is refused even when it
+matches the declared graceful-error schema. Frontend: your `card.html` is then
+executed against that same snapshot and must actually display it — see
+[card.html](#cardhtml--the-frontend). Failures (including the service's stderr
+and the card's own exception) come back in the tool result so you can fix and
+retry in the same turn. On success the tool returns a checked summary of the
+first snapshot — including how many of its values are non-empty, so a card
+wired to the wrong data source is visible as a wall of zeros — and the card
+appears on the user's deck already showing that data.
 
 ## The bundle
 
@@ -90,15 +97,27 @@ cards need no `src/` — write `card.html` directly.
 
 ### openapi.json — the op contract
 
-Every call that crosses the gateway is validated against this document
-**before** your code sees it: unknown ops 404, unknown/mistyped/missing
-params 400. Declare each op as `paths./<name>.get` (or `post`) with
-typed parameters. Op names: `[a-z][a-z0-9_]*`.
+Every call that crosses the gateway is validated against this document on
+both sides: unknown/mistyped/missing params are rejected before your code
+runs, and the returned JSON is rejected before the gateway forwards it.
+`ctx.emit` payloads are checked against the refresh op's response contract
+before they become snapshots. Declare each op as `paths./<name>.get` (or
+`post`) with typed parameters and response schemas. Op names:
+`[a-z][a-z0-9_]*`.
 
 Each parameter's `schema` is **standard JSON Schema** — scalars, enums,
 and also `array` and `object` params with nested typing and constraints
 (`items`, `properties`, `minimum`, `maxItems`, …) all validate. Keep it
-inline: `$ref` is rejected.
+inline: `$ref` is rejected in both parameter and response schemas.
+
+**Every op MUST declare a successful JSON result schema at
+`responses.200.content.application/json.schema` — install fails without
+it.** Deck supports only response keys `"200"` and optional `"default"`.
+The top-level field `error` is reserved as the graceful-error discriminator:
+if an op may return `{error: "..."}` while the card is already running,
+declare its shape under `responses.default...schema`. The install/update gate
+still refuses an error result because a new revision must demonstrate one real
+successful refresh before it can go live.
 
 **Every op MUST declare `x-baybo-retryable` (boolean) — install fails
 without it.** It answers one question: if this op ran but its response
@@ -112,10 +131,44 @@ card instead of being replayed.
 {
   "openapi": "3.1.0",
   "paths": {
-    "/refresh": { "get": { "x-baybo-retryable": true } },
-    "/history": { "get": { "x-baybo-retryable": true, "parameters": [
-      { "name": "days", "required": true, "schema": { "type": "integer" } }
-    ] } }
+    "/refresh": { "get": {
+      "x-baybo-retryable": true,
+      "responses": {
+        "200": { "description": "Current quota snapshot", "content": {
+          "application/json": { "schema": {
+            "type": "object",
+            "required": ["used", "limit", "at"],
+            "properties": {
+              "used": { "type": "number" },
+              "limit": { "type": "number" },
+              "at": { "type": "integer" }
+            },
+            "additionalProperties": false
+          } }
+        } },
+        "default": { "description": "Temporary upstream failure", "content": {
+          "application/json": { "schema": {
+            "type": "object",
+            "required": ["error"],
+            "properties": { "error": { "type": "string" } },
+            "additionalProperties": false
+          } }
+        } }
+      }
+    } },
+    "/history": { "get": {
+      "x-baybo-retryable": true,
+      "parameters": [
+        { "name": "days", "required": true, "schema": { "type": "integer" } }
+      ],
+      "responses": {
+        "200": { "description": "Daily history", "content": {
+          "application/json": { "schema": {
+            "type": "array", "items": { "type": "object" }
+          } }
+        } }
+      }
+    } }
   }
 }
 ```
@@ -142,8 +195,11 @@ snapshot JSON (not null).**
   the host with the inherited environment (installed CLIs and credential
   dirs resolve, network available), 30s cap, 4MB output cap. Use for
   host state and CLIs: `df -k`, `uptime`, `ps`, `git -C <dir> log`,
-  `codex …`, etc.
-- `ctx.emit(json)` — push a fresh snapshot to the phone (rate-policed).
+  `codex …`, etc. `$BAYBO_CONFIG_PATH` is pinned to the gateway's active
+  config before the scratch cwd is selected; invoke the Baybo CLI without
+  hard-coding or passing its config path.
+- `ctx.emit(json)` — push a fresh snapshot to the phone (rate-policed and
+  validated against the refresh op's `200`/`default` response schema).
 - `ctx.log(msg)` — diagnostic logging (console.log also routes here).
 
 Blobs (files/images). Bytes stay out of your service — you pass around a
@@ -176,7 +232,7 @@ Per-op calls have a 30s budget; a timeout fails the call, not the
 process. Repeated crashes/timeouts quarantine the card (visible error
 face + Re-enable), so keep ops fast and handle upstream errors — return
 `{error: "..."}`-style JSON rather than throwing when the upstream is
-merely down.
+merely down, and declare that object under the op's `default` response.
 
 ### Driving a terminal CLI through tmux — use the injected private socket
 
@@ -221,8 +277,57 @@ refresh: async (_p, ctx) => {
 
 A fragment rendered inside a sandboxed iframe (opaque origin, CSP: no
 network except displaying stored blobs via `deck.blobUrl`, no external
-resources, inline `<script>`/`<style>` + `data:`/blob images). The shell
-injects a `deck` global before your code runs:
+resources, inline `<script>`/`<style>` + `data:`/blob images).
+
+**The install gate RUNS this file.** After your refresh op returns, the gate
+executes your script against that real snapshot, through the same `deck` SDK
+the phone injects, and refuses the install unless **handing your card its data
+changed something the card displays**. So these all fail at install rather than
+on the user's phone: a script that throws, a read of a field your service never
+emits, an `id` your markup does not define, and markup that renders but never
+wires `deck.onData`. The failure comes back with the exact error, so fix and
+retry in the same turn. It is not a browser — it has no layout and no cascade,
+so it cannot tell you whether the card *looks* right, only that it responded.
+
+Start from this skeleton; it is the shape the gate expects.
+
+```html
+<style>
+  /* Only layout of your own. The injected base (below) already styles
+     .card/.label/.hero/.row/.foot and owns the box at every size. */
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .detail { display: none; }
+  [data-size="large"] .detail, [data-size="max"] .detail { display: block; }
+</style>
+
+<div class="card">
+  <div class="label">Card title</div>
+  <div class="hero" id="value">—</div>
+  <div class="detail" id="detail"></div>
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function render(s) {
+    // Every snapshot your service can emit arrives here, INCLUDING the
+    // graceful `{error}` one — render that as a muted line, never a red wall.
+    if (!s || s.error) {
+      $("value").textContent = "—";
+      $("foot").textContent = s && s.error ? String(s.error) : "no data yet";
+      return;
+    }
+    $("value").textContent = String(s.used);      // read only fields your
+    $("foot").textContent = `of ${s.limit}`;      // openapi.json 200 declares
+  }
+
+  deck.onData(render);
+  deck.onSizeChange((size) => { document.documentElement.dataset.size = size; });
+</script>
+```
+
+The shell injects a `deck` global before your code runs:
 
 - `deck.onData(fn)` — called with the latest snapshot immediately (the
   cached one) and again on every live push. Render from here.
@@ -293,17 +398,144 @@ security, size-adaptation, clipping, or maximize-layout requirements.
 To keep default-styled cards in the app's visual language, the shell injects a
 **base stylesheet before your fragment** — body font/color defaults plus:
 
-- Tokens: `--ink` `--muted` `--line` `--ok` `--bad`.
-- Classes: `.card` (flex column filling the tile, padded),
-  `.label` (small muted caption row), `.hero` (the one big number),
-  `.row` (space-between line), `.divider`, `.foot` (bottom-pinned muted
-  footer), `.dot` / `.dot.bad` (status dot), `.bar > i` (thin progress,
-  set the `i` width in %).
+This is the whole of it, verbatim — you are writing CSS that lands on top of
+these exact rules, so read them rather than guessing what they do:
+
+```css
+/* Deck card base — injected into every card's srcdoc AHEAD of the
+   agent-written fragment, so the app's design language ships once
+   instead of being re-authored per card. Everything is overridable:
+   the card's own <style> comes later in the cascade, and the palette
+   is custom properties. Keep this additive-only — installed cards
+   assume it. */
+
+:root {
+  --ink: #1c1b19;
+  --muted: rgba(28, 27, 25, 0.55);
+  --line: rgba(28, 27, 25, 0.14);
+  --ok: #2e7d4f;
+  --bad: #b43c28;
+  --deck-header-clearance: calc(env(safe-area-inset-top) + 54px);
+  --deck-tab-bar-clearance: calc(env(safe-area-inset-bottom) + 64px);
+}
+
+html,
+body {
+  margin: 0;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+body {
+  height: 100vh;
+  overflow: hidden;
+  font: 13px -apple-system, "SF Pro Text", sans-serif;
+  color: var(--ink);
+  -webkit-text-size-adjust: none;
+}
+
+/* Column filling the tile; .foot pins to the bottom via margin-top. */
+.card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 10px 12px;
+}
+
+/* At `max` the document itself scrolls and `.card` is an ordinary block, NOT
+   the scroll container. Unlike the rest of this file these two rules are
+   load-bearing rather than additive: they declare `height` and `overflow`
+   precisely so a card cannot strand its own content by overriding them. The
+   margin is specificity — this is (0,2,1), while the idioms a card actually
+   writes are `.card { overflow: hidden }` (0,1,0) and
+   `[data-size="max"] .card { height: auto }` (0,2,0). That is also why the
+   size attribute a card sets for itself is `data-size` and the shell's is
+   `data-deck-size`: keeping them distinct keeps card selectors one notch
+   below these. */
+html[data-deck-size="max"] body {
+  height: auto;
+  overflow: visible;
+  overscroll-behavior-y: contain;
+}
+
+html[data-deck-size="max"] .card {
+  height: auto;
+  min-height: 100vh;
+  overflow: visible;
+  padding-top: var(--deck-header-clearance);
+  padding-bottom: var(--deck-tab-bar-clearance);
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.hero {
+  font-size: 26px;
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.divider {
+  border-top: 1px solid var(--line);
+  margin: 6px 0;
+}
+
+.foot {
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+.dot.bad {
+  background: var(--bad);
+}
+
+.bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  height: 100%;
+  background: var(--ink);
+}
+```
 
 **Prefer the classes; write only layout CSS of your own.** Everything
 is overridable — your `<style>` comes after the base in the cascade,
 and the palette is custom properties — but overriding the look is the
-exception, not the norm.
+exception, not the norm. The two `html[data-deck-size="max"]` rules are the
+exception to the exception: they are the maximized scroll container, and the
+Maximizing section below says what not to do to them.
 
 As a suggested type scale, use `10px` at weight `400` for the card title
 (`.label`) and size the primary number (`.hero`) at weight `400`: `24px` in
@@ -341,6 +573,32 @@ you, so a `max` layout needs no exit control of its own. The maximized layout **
 (it's the whole screen, not a tile) and is where a card earns its detail: a
 full history, a chart, a table. Rules:
 
+- **The scrolling is already built — do not build your own.** At `max` the
+  injected base turns the document into the scroll surface and gives `.card`
+  an auto height, so a layout taller than the screen scrolls with zero CSS
+  from you. This is what actually runs, ahead of your fragment:
+
+  ```css
+  body { height: 100vh; overflow: hidden; }   /* a tile clips; it never scrolls */
+  .card { display: flex; flex-direction: column; height: 100%; padding: 10px 12px; }
+
+  html[data-deck-size="max"] body { height: auto; overflow: visible; }
+  html[data-deck-size="max"] .card {
+    height: auto; min-height: 100vh; overflow: visible;
+    padding-top: var(--deck-header-clearance);
+    padding-bottom: var(--deck-tab-bar-clearance);
+  }
+  ```
+
+  So: **never declare `height`, `min-height`, `overflow`, or `position` on
+  `.card` in a `max`-scoped rule.** Those are the scroll container, not
+  styling. `[data-size="max"] .card { height: auto; overflow: auto }` reads
+  like it enables scrolling and is the one thing that reliably kills it — a
+  content-height box has nothing to overflow, so the scroller has nothing to
+  scroll and the page below the fold becomes unreachable. Clip or scroll a
+  child of your own instead. "Tiles clip, they never scroll" above is a rule
+  about the grid sizes; if you implement it with a bare `.card { overflow:
+  hidden }`, that declaration must not follow you into `max`.
 - **Leave the tile's top-right for the ⛶ in the grid sizes.** In `small` /
   `wide` / `large`, the ⛶ sits in the tile's top-right (~40pt) — keep your own
   tappable controls / key numbers out of that corner (e.g. a top row that
@@ -483,6 +741,11 @@ export function start(ctx) {
 2. `DeckCardCreate(path: "<absolute staging dir>")`.
 3. If the gate fails, read the error (it includes your service's
    stderr), edit the files, and call `DeckCardCreate` again.
+4. On success, inspect `first_snapshot.response_schema`, `json_type`, byte
+   count, and bounded `top_level_keys` in the tool result. Confirm that the
+   observed shape matches the card you intended to build before reporting
+   completion. Snapshot values remain on the Deck data plane and are not
+   copied into the agent's tool result.
 
 ## Updating an existing card
 
@@ -502,9 +765,10 @@ Instead, edit its real source:
 3. Make the surgical change the user asked for (edit the relevant file; leave
    the rest byte-for-byte).
 4. `DeckCardUpdate(card_id, path)` — same dry-run gate as create; on
-   success the service restarts on the new code. The user's title, size,
-   and layout are owned by the card after install, so the manifest's
-   values do **not** overwrite them.
+   success inspect its `first_snapshot` summary before reporting completion,
+   then the service restarts on the new code. The user's title, size, and
+   layout are owned by the card after install, so the manifest's values do
+   **not** overwrite them.
 
 Every install/update/purge is auto-committed to a git repo under the deck
 root, so the operator can diff and roll back a card by hand — you don't

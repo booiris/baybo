@@ -385,6 +385,31 @@ pub fn default_config_file() -> PathBuf {
         .join(WORKSPACE_CONFIG_FILE)
 }
 
+/// The workspace root a config file implies, by inverting
+/// [`default_config_file`]'s `<root>/config/baybo.json` shape. `None` for a
+/// path not shaped that way — the caller then keeps whatever the config
+/// declared, rather than relocating a workspace on a guess.
+pub fn workspace_root_for_config_file(config_file: &Path) -> Option<PathBuf> {
+    let config_dir = config_file.parent()?;
+    if config_dir.file_name()? != CONFIG_DIR {
+        return None;
+    }
+    Some(config_dir.parent()?.to_path_buf())
+}
+
+/// Config path inherited by child processes that may invoke the Baybo CLI.
+///
+/// Resolve it in the parent before changing the child's cwd: debug builds use
+/// a cwd-relative default workspace, so resolving after a child moves into a
+/// scratch directory would point it at a different `./.baybo` tree.
+pub fn config_file_for_child_process() -> PathBuf {
+    let raw = std::env::var_os(ENV_CONFIG_PATH)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_file);
+    std::path::absolute(&raw).unwrap_or(raw)
+}
+
 /// System-level baybo cache root: `$XDG_CACHE_HOME/baybo`, falling back to
 /// `$HOME/.cache/baybo`. `None` if neither env var is set — callers map
 /// this to their own error type.
@@ -1140,5 +1165,28 @@ mod tests {
         let cfg = default_config_file();
         let root = default_workspace_root();
         assert_eq!(cfg, root.join(CONFIG_DIR).join(WORKSPACE_CONFIG_FILE));
+    }
+
+    #[test]
+    fn child_process_config_file_is_absolute() {
+        assert!(config_file_for_child_process().is_absolute());
+    }
+
+    #[test]
+    fn workspace_root_inverts_the_default_config_path() {
+        let root = PathBuf::from("/srv/baybo");
+        let config = root.join(CONFIG_DIR).join(WORKSPACE_CONFIG_FILE);
+        assert_eq!(workspace_root_for_config_file(&config), Some(root));
+    }
+
+    #[test]
+    fn workspace_root_declines_a_path_of_another_shape() {
+        for path in ["/srv/baybo.json", "/srv/etc/baybo.json", "baybo.json"] {
+            assert_eq!(
+                workspace_root_for_config_file(Path::new(path)),
+                None,
+                "{path} is not `<root>/config/<file>` and must not relocate a workspace"
+            );
+        }
     }
 }

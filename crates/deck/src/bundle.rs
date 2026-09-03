@@ -267,13 +267,22 @@ pub(crate) mod test_fixtures {
             dir.join(OPENAPI_FILE),
             serde_json::json!({
                 "openapi": "3.1.0",
-                "paths": {"/refresh": {"get": {"x-baybo-retryable": true}}}
+                "paths": {"/refresh": {"get": {
+                    "x-baybo-retryable": true,
+                    "responses": {"200": {"content": {"application/json": {
+                        "schema": {"type": "object"}
+                    }}}}
+                }}}
             })
             .to_string(),
         )
         .unwrap();
         std::fs::write(dir.join(SERVICE_FILE), service_body).unwrap();
-        std::fs::write(dir.join(CARD_FILE), "<div id=x></div>").unwrap();
+        std::fs::write(
+            dir.join(CARD_FILE),
+            "<div class=\"card\"><div id=\"x\">–</div></div>\n<script>deck.onData(function (s) { document.getElementById(\"x\").textContent = JSON.stringify(s); });</script>",
+        )
+        .unwrap();
     }
 }
 

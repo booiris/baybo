@@ -27,3 +27,4 @@ parking_lot = { workspace = true }
 # `baybo-workspace` (paths only — `default-features = false` keeps the I/O
 # layer out of the dep graph).
 baybo-tools = { workspace = true }
+tempfile = { workspace = true }
