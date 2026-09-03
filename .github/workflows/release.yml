@@ -1,0 +1,397 @@
+name: Release
+
+# Cuts a GitHub Release with prebuilt Linux binaries and publishes install.sh.
+#
+# TRIGGER. Dispatch only, deliberately. A `push: branches: [master]` trigger was
+# the obvious alternative and is worse here: master takes ~10 pushes a day, so
+# an unfiltered version-gate would add ~3,600 no-op runs and check rows a year
+# to buy one avoided button-click per release. Dispatch also takes a ref for
+# free, so a failed release can be re-cut from the same commit without a new PR.
+# If the click ever grates, `push: {branches: [master], paths: [Cargo.toml]}` is
+# two lines and the gate below is already idempotent.
+#
+# TAGGING. The tag is created LAST — in the publish job, after both builds are
+# green — not first. Two separate hazards shape that. A tag pushed by a workflow
+# using GITHUB_TOKEN raises no events, so the usual "tag here, build on the tag
+# over there" split is silently dead on arrival: the tag lands and nothing ever
+# builds. And tagging last means a build that dies at minute 40 leaves nothing
+# behind, so a re-run just works instead of needing a manual tag delete. See the
+# `tag` step for why it is a plain `git push` rather than `--target <sha>`.
+#
+# WHAT THIS BUILDS THAT NOTHING ELSE DOES. Both Rust jobs in ci.yml set
+# BAYBO_SKIP_WEBUI=1, so no CI job has ever compiled the shape a user receives:
+# dashboard baked in, sidecars bundled. This workflow is the only place that
+# does, which is also why it carries its own asset assertions and smoke tests
+# rather than trusting a green build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and smoke-test, but publish nothing"
+        type: boolean
+        default: false
+
+# The repo default for workflow permissions is READ, and a workflow-level block
+# REPLACES the default rather than extending it. Only the publishing job gets
+# write, and it gets it at job level.
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      # A shallow checkout is enough: the tag check below asks the REMOTE rather
+      # than the local clone, which is what makes it immune to the classic
+      # version of this bug — a default checkout fetches no tags, so a local
+      # `git tag` check finds nothing, the first run happily creates the tag,
+      # and the duplicate only surfaces on the second release.
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read [workspace.package] version from Cargo.toml"
+            exit 1
+          fi
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            # A dry run must stay useful when you are debugging the workflow
+            # itself, which is exactly when the version has usually shipped
+            # already. Publishing is what the tag guards, and a dry run
+            # publishes nothing.
+            echo "DRY RUN — building ${tag}, publishing nothing" >> "$GITHUB_STEP_SUMMARY"
+          elif git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::${tag} already exists. Bump [workspace.package] version in Cargo.toml first."
+            exit 1
+          else
+            echo "releasing ${tag}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: refuse to publish from a non-master ref
+        if: ${{ !inputs.dry_run && github.ref != 'refs/heads/master' }}
+        run: |
+          echo "::error::releases are cut from master only (this run is on ${{ github.ref }})"
+          exit 1
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    # The release profile is lto = true + codegen-units = 1, which defers all
+    # machine-code generation for a ~500-package graph into ONE serial LLVM
+    # unit. Estimates for a 4-vCPU runner range from ~25 to ~80 minutes and the
+    # first real run is the measurement, so this cap is a runaway backstop well
+    # above the top of that range — not a target. Do not tighten it to "about
+    # how long it took last time".
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The build images are pinned by DIGEST, not by tag — and certainly
+          # not bare, which resolves `:latest`. v0.1.0 was built in an image
+          # whose `latest` had been re-pointed 20 minutes earlier; that is the
+          # whole toolchain of a binary strangers pipe into a shell, chosen by
+          # whatever a registry happened to be serving that morning. pypa
+          # publishes dated immutable tags, kept here beside the digest so a
+          # human can see how old the pin is. Pinning also freezes the image's
+          # dnf repo snapshot for free.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.09.01-1@sha256:94c816d38ad56d2dc1df2f28007d18d306b0f5d05096c6f6b9141345df504d3e
+          - target: aarch64-unknown-linux-gnu
+            # A native arm64 standard runner, free on public repos. qemu would
+            # turn a full-LTO build into hours.
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.09.01-1@sha256:45ea412cfbd2cc5e51323cecab614ea8e4e5522b4d4f668946c54056b40152f6
+          - target: aarch64-apple-darwin
+            # macos-26 is a standard 3-CPU arm64 runner, free on a public repo.
+            # No container: macOS has no glibc floor to pin, Xcode's SDK is
+            # already on the image, and release-build.sh provisions the pinned
+            # JS toolchain itself.
+            runner: macos-26
+            image: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # Everything that compiles happens inside the container: the glibc floor
+      # of the artifact is a property of the machine that links it, and the
+      # runner's own glibc (2.39) would exclude RHEL 9, Amazon Linux 2023,
+      # Debian 12 and Ubuntu 22.04. See scripts/release-build.sh.
+      #
+      # No toolchain action runs here, so nothing writes to the Actions cache.
+      # That is not incidental: the repo is already at ~13 GB against a 10 GB
+      # per-repo budget and evicting continuously, and a release-profile entry
+      # would evict the ones that keep every PR's `test` job warm.
+      - name: build in ${{ matrix.image }}
+        if: ${{ matrix.image != '' }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/w" -w /w \
+            -e OUT_DIR=/w/dist \
+            -e CI=1 \
+            "${{ matrix.image }}" \
+            bash scripts/release-build.sh
+
+      # No container on macOS. The script's own post-strip `--version` check is
+      # the equivalent smoke test there: on arm64 a Mach-O must carry a valid
+      # signature to execute at all, and stripping rewrites the binary.
+      - name: build natively
+        if: ${{ matrix.image == '' }}
+        env:
+          OUT_DIR: ${{ github.workspace }}/dist
+        run: bash scripts/release-build.sh
+
+      # The one check that can catch a glibc-floor regression. It fails in the
+      # dynamic loader, before main(), so no error path in the binary can ever
+      # report it and a green build proves nothing. ubi9 is glibc 2.34 — the
+      # oldest of the common server bases.
+      - name: smoke — runs on glibc 2.34 (RHEL 9)
+        if: ${{ matrix.image != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke && tar -xzf "dist/baybo-${{ matrix.target }}.tar.gz" -C smoke
+          docker run --rm -v "$PWD/smoke:/s:ro" redhat/ubi9 /s/baybo --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baybo-${{ matrix.target }}
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
+          # v4 artifact names are unique per RUN, not per attempt, so without
+          # this a "Re-run all jobs" fails with a 409 on the upload — after the
+          # whole build. ("Re-run failed jobs" was always fine: download-artifact
+          # reads previous attempts too.) The two matrix names are distinct, so
+          # this cannot race.
+          overwrite: true
+
+  release:
+    name: publish
+    needs: [gate, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: collect checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          cat ./*.tar.gz.sha256 > SHA256SUMS
+          rm -f ./*.tar.gz.sha256
+          # install.sh is published as a release asset too, and is the one file
+          # users pipe straight into a shell — so give it a digest they can
+          # check by hand. Hashed from the repo root rather than as
+          # `../install.sh`, because sha256sum records whatever argument string
+          # it was handed: a `../` entry makes `sha256sum -c SHA256SUMS` fail on
+          # the very line added to make verification possible.
+          ( cd "$GITHUB_WORKSPACE" && sha256sum install.sh ) >> SHA256SUMS
+          cat SHA256SUMS
+      # The tag is pushed HERE — after both builds are green, and as a separate
+      # step from `gh release create` rather than via its `--target <sha>`.
+      #
+      # `--target <sha>` walks into a rule GITHUB_TOKEN cannot satisfy: GitHub
+      # demands the `workflow` scope to create a release whose target SHA both
+      # touches a file under .github/workflows/ AND has no ref of its own, and
+      # `workflow` is not a settable key in a `permissions:` block, so no edit
+      # to this file would fix it. The SHA has a ref at dispatch time and loses
+      # it when master moves — which it does roughly ten times a day, i.e.
+      # routinely inside a 25-120 minute build. Pushing the tag first gives the
+      # SHA a permanent ref and the rule stops applying.
+      #
+      # Nothing is created until both builds pass, so a failed build still
+      # leaves no tag; the cleanup step covers a failure after this point.
+      - name: tag ${{ needs.gate.outputs.tag }}
+        id: tag
+        run: |
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+      - name: create release
+        run: |
+          gh release create "$TAG" --verify-tag \
+            --title "$TAG" \
+            --generate-notes \
+            artifacts/*.tar.gz artifacts/SHA256SUMS install.sh
+      # `gh release create` is itself atomic (it uploads to a draft and deletes
+      # the draft if any upload fails), but the tag push above is not part of
+      # that transaction. Without this, a failed publish strands a tag that the
+      # gate would then reject on every retry.
+      # Only if THIS run pushed the tag, and only if it still points where we
+      # put it. Unguarded, the window this covers is a 25-120 minute build
+      # during which a human can push the same tag by hand: the push above then
+      # fails (no --force), and the cleanup deleted their tag instead — signature
+      # and all. `|| true` used to hide that entirely; a stranded tag the gate
+      # rejects is a far better failure than a silently deleted one.
+      - name: drop the tag if publishing failed
+        if: ${{ failure() && steps.tag.outcome == 'success' }}
+        run: |
+          remote_sha="$(git ls-remote origin "refs/tags/$TAG" | cut -f1)"
+          if [ "$remote_sha" != "$GITHUB_SHA" ]; then
+            echo "::warning::${TAG} points at ${remote_sha:-nothing}, not this run's ${GITHUB_SHA}; leaving it alone"
+            exit 0
+          fi
+          git push --delete origin "refs/tags/$TAG"
+
+  verify-install:
+    name: verify install.sh
+    needs: [gate, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    # Without this the job inherits GitHub's 6-hour default. This job feeds a
+    # step that de-lists a published release, so a wedged runner would act on
+    # the release six hours after users started installing it.
+    timeout-minutes: 20
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # The asset names live in scripts/release-build.sh and in install.sh, in
+      # two languages that cannot share a constant. This job is the only thing
+      # that ever proves the two still agree — without it, a rename ships a
+      # 404 to every user while CI stays green.
+      #
+      # The images need git, curl and ca-certificates installed first: install.sh
+      # refuses without git (baybo cannot start without it), and a stock distro
+      # image has none of the three.
+      #
+      # ONE of the three deliberately passes no --version. That exercises the
+      # /releases/latest/download/ path, which is the URL every `curl | sh` user
+      # actually hits and which the local harness cannot fake. The other two pin
+      # the tag, which is the path a user gets from `--version`.
+      - name: install from the published release
+        run: |
+          set -euo pipefail
+          for image in debian:12 ubuntu:22.04 redhat/ubi9; do
+            echo "::group::${image}"
+            case "$image" in
+              # ubi9 already ships curl-minimal, which owns /usr/bin/curl;
+              # asking for `curl` as well is a package conflict.
+              redhat/*) prep="dnf install -y -q git ca-certificates" ;;
+              *) prep="{ apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca-certificates; }" ;;
+            esac
+            case "$image" in
+              debian:12) pin="" ;;              # resolves via /releases/latest/
+              *) pin="--version '${TAG}'" ;;
+            esac
+            # Retry the whole container run: pulling three images anonymously
+            # from Docker Hub and then running apt/dnf against public mirrors
+            # is the flakiest thing in this workflow, and its failure feeds a
+            # step that acts on a published release. A genuine install failure
+            # still fails — it just fails three times first.
+            for attempt in 1 2 3; do
+              if docker run --rm -v "$PWD/install.sh:/install.sh:ro" "$image" sh -c "
+                set -eu
+                ${prep} >/dev/null
+                sh /install.sh ${pin} --no-modify-path
+                \"\$HOME/.local/bin/baybo\" --version | grep -F '${VERSION}'
+              "; then
+                break
+              fi
+              if [ "$attempt" = 3 ]; then
+                echo "::error::install.sh failed on ${image} after 3 attempts"
+                exit 1
+              fi
+              echo "attempt ${attempt} failed on ${image}; retrying"
+              sleep 15
+            done
+            echo "::endgroup::"
+          done
+
+  # The Linux job above proves nothing about the darwin tarball: its three
+  # containers are all Linux, and macOS cannot be containerised. Without this
+  # job a third of the published surface — the target with the fewest prior
+  # runs anywhere — would ship gated only by whatever a maintainer remembered
+  # to try by hand.
+  verify-install-macos:
+    name: verify install.sh (macOS)
+    needs: [gate, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # Installs into a scratch dir with --no-modify-path: this asserts the
+      # install path works, not that a runner's shell profile can be edited.
+      # git and curl are already on the image, which is what install.sh gates on.
+      - name: install from the published release
+        run: |
+          set -euo pipefail
+          BAYBO_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh --version "$TAG" --no-modify-path
+          "$RUNNER_TEMP/bin/baybo" --version | grep -F "$VERSION"
+          file "$RUNNER_TEMP/bin/baybo" | grep -F 'Mach-O 64-bit executable arm64'
+
+  # A release is already public and marked `latest` once `release` finishes, so
+  # a verification failure means every `curl | sh` user is hitting a broken
+  # install until someone notices. Unpublishing is the only self-healing option
+  # that still lets the checks above use the real, unauthenticated `latest` URL
+  # — and it clears the tag too, so the gate does not then reject the corrected
+  # re-run.
+  #
+  # This lives in its own job rather than as an `if: failure()` step inside each
+  # verifier, because with two of them the first delete would win and the second
+  # would fail on an already-deleted release, turning a clean self-heal into a
+  # confusing red job.
+  # A release is public and marked `latest` the moment `publish` finishes, so an
+  # unverified one has to stop being what `/releases/latest/download/` serves.
+  #
+  # It is DE-LISTED, not deleted. Deleting was the original design and it was
+  # wrong: the trigger cannot tell "install.sh is broken" from "Docker Hub rate-
+  # limited us", and it paid out by destroying the assets, the notes, the
+  # download counts and — via --cleanup-tag — the only ref pinning the shipped
+  # commit. Marking the release a prerelease removes it from the `latest` URL,
+  # which is the entire user-facing harm, while leaving everything a human needs
+  # to diagnose it. It is one `gh release edit --latest` to undo. Reserve
+  # deletion for a person who has looked.
+  #
+  # `needs.release.result == 'success'` is load-bearing, not belt-and-braces: an
+  # `if:` overrides the normal "a skipped dependency skips the dependent" rule,
+  # so without it a failure in `build` — where `release` never ran and no
+  # release exists — would still reach this job. `!cancelled()` rather than
+  # `failure()` so a cancelled verify job de-lists too: a release nothing
+  # confirmed is not a release to leave standing as `latest`.
+  delist-unverified:
+    name: de-list a release the installer could not use
+    needs: [gate, release, verify-install, verify-install-macos]
+    if: >-
+      ${{ !cancelled() && !inputs.dry_run
+          && needs.release.result == 'success'
+          && (needs.verify-install.result != 'success'
+              || needs.verify-install-macos.result != 'success') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - run: |
+          echo "::error::install.sh could not use ${TAG}; marking it a prerelease so /releases/latest/ stops serving it"
+          gh release edit "$TAG" --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
+          echo "${TAG} de-listed. Assets, notes and the tag are intact for diagnosis." >> "$GITHUB_STEP_SUMMARY"
+          echo "Undo with: gh release edit ${TAG} --prerelease=false --latest" >> "$GITHUB_STEP_SUMMARY"

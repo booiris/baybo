@@ -2479,6 +2479,11 @@ impl ProjectManager {
             .await
             .map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
         git_init(&dir).await?;
+        // `git init` alone leaves an unborn HEAD, which no card can cut a
+        // branch from. The directory is one this call just created and
+        // checked is empty, so the first commit is not a decision anybody
+        // could disagree with.
+        crate::worktree::ensure_a_root_commit(&dir).await?;
         Ok(dir.to_string_lossy().into_owned())
     }
 

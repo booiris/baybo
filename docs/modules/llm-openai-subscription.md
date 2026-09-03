@@ -1,8 +1,8 @@
-# llm-codex-oauth — ChatGPT/Codex OAuth as an LLM provider
+# llm-openai-subscription — the ChatGPT/Codex subscription as an LLM provider
 
 ## Goal
 
-Let baybo users drive `gpt-5`-class models with their **OpenAI ChatGPT/Codex subscription** instead of an `OPENAI_API_KEY`. The HTTP path is `chatgpt.com/backend-api/codex/responses` (Codex Responses API), the credential is a ChatGPT OAuth bearer minted via PKCE against `auth.openai.com`. This is OpenClaw's "Codex OAuth via PI" route — the equivalent for baybo's own agent runtime, not the heavier "wrap the Codex CLI app-server" route (that's the C track, deferred).
+Let baybo users drive `gpt-5`/`gpt-5.6`-class models with their **OpenAI ChatGPT/Codex subscription** instead of an `OPENAI_API_KEY`. The HTTP path is `chatgpt.com/backend-api/codex/responses` (Codex Responses API), the credential is a ChatGPT OAuth bearer minted via PKCE against `auth.openai.com`. This is OpenClaw's "Codex OAuth via PI" route — the equivalent for baybo's own agent runtime, not the heavier "wrap the Codex CLI app-server" route (that's the C track, deferred).
 
 Public-knowledge inputs: `client_id = app_EMoamEEZ73f0CkXaXp7hrann`, issuer `https://auth.openai.com`, scopes `openid profile email offline_access api.connectors.read api.connectors.invoke`, with the Codex CLI's extra parameters (`id_token_add_organizations=true`, `codex_cli_simplified_flow=true`, `originator=codex_cli_rs`). Source: `openai/codex` repo, `codex-rs/login/`.
 
@@ -32,7 +32,9 @@ Selected via `baybo.json`:
 }
 ```
 
-Naming rationale: this is the explicit "use your OpenAI subscription" path, distinct from `openai` (API-key, pay-per-token billing). The leading `openai-` keeps it grouped with `openai`/`openai-codex`-style ids in the `baybo llm add` provider picker and `baybo llm status` listings and avoids putting a vendor product brand (`chatgpt`) directly in operator-facing config. Open question — could equally be `chatgpt`, `openai-oauth`, or `openai-codex`; final decision deferred to review.
+Naming rationale: this is the explicit "use your OpenAI subscription" path, distinct from `openai` (API-key, pay-per-token billing). The leading `openai-` keeps it grouped with `openai`/`openai-codex`-style ids in the `baybo llm add` provider picker and `baybo llm status` listings and avoids putting a vendor product brand (`chatgpt`) directly in operator-facing config.
+
+This is **not** the `codex` external agent ([`../external-agents.md`](../external-agents.md)), which shells out to the host `codex` CLI. Same ChatGPT plan, different mechanism, different config block (`external_agents.codex` vs an `llm[]` entry) — and this one needs no binary installed.
 
 No `api_key_env` is consulted; tokens come from the vault. `base_url` defaults to `https://chatgpt.com/backend-api`. **Default-deny on the bearer destination**: an override is accepted only if the parsed host suffix is on the allowlist (`chatgpt.com` and its subdomains, `auth.openai.com`). Anything else fails at provider construction with `LlmError::Config` so the misconfiguration surfaces at boot rather than leaking the bearer at first request. To deliberately override (operator owns the TOS and credential-leak risk), set the env var `BAYBO_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL=1` — env rather than `baybo.json` field on purpose, so flipping a bypass requires an explicit shell action.
 
@@ -71,7 +73,7 @@ OAuth login is not a separate `auth` subcommand; it's wired into the existing en
 
 | Command | What it does |
 |---|---|
-| `baybo llm add` (pick `openai-subscription` provider) | Prompts the operator to choose between two login methods: **PKCE** (default on a TTY) opens `https://auth.openai.com/oauth/authorize?...` and runs a one-shot HTTP listener on `127.0.0.1:1455` for the callback; **Device code** (auto-selected on non-TTY stdin, also offered on TTY for headless boxes) hits `/api/accounts/deviceauth/usercode` + polled `/deviceauth/token`. The exchanged bundle is persisted in the vault under a single shared key (one profile per workspace). After the login the flow continues with model + reasoning-effort selection. |
+| `baybo llm add` (pick `openai-subscription` provider) | Prompts the operator to choose between two login methods: **PKCE** (default on a TTY) opens `https://auth.openai.com/oauth/authorize?...` and runs a one-shot HTTP listener on `127.0.0.1:1455` for the callback; **Device code** (auto-selected on non-TTY stdin, also offered on TTY for headless boxes) hits `/api/accounts/deviceauth/usercode` + polled `/deviceauth/token`. The exchanged bundle is persisted in the vault under a single shared key (one profile per workspace). `openai-subscription` is rendered **first** in the provider picker — it is the only provider that needs no API key, and the menu viewport shows ~12 of the 19 rows at a time. After the login the flow continues with model selection (§"Model catalog") and the entry is seeded `lite_model = gpt-5.6-terra`, with that model materialised into `model_list` so config validation passes (§"lite_model" in [`config.md`](config.md)). |
 | `baybo llm edit` → `OAuth login (re-authenticate)` | Re-runs the same PKCE / device-code dialog and overwrites the vault bundle. Used to recover from a stale refresh token without removing the entry. |
 | `baybo llm remove` (entry whose provider is `openai-subscription`) | Deletes the config entry; if no other `openai-subscription` entries remain, also calls `/oauth/revoke` (RFC 7009, best-effort — logs but does not fail the command) and clears the vault entry. **Vault clear failure is logged but not fatal**: the config entry is gone, so the runtime no longer routes through this provider; the next process won't see the token. Server-side revoke success is reflected in the JSON output (`subscription_revoked: true\|false`). |
 | `baybo llm status` | Lists every registered entry (name / provider / model / api_key_env). It does **not** surface OAuth token state (expiry, account email, plan type, override state) today — that data is printed once at login time and is otherwise only visible in tracing events. A richer status view is future work. |
@@ -88,6 +90,7 @@ openai_subscription/
 ├── token_bundle.rs         — OAuthTokenBundle, JWT parsing (exp + chatgpt_account_id)
 ├── token_store.rs          — VaultTokenStore (SecretVault wrapper) + CredentialKey
 ├── oauth.rs                — pkce_login(), device_code_login(), refresh(), revoke()
+├── catalog.rs              — static gpt-5.6 supplement + LITE_MODEL (the wizard's lite seed)
 ├── reasoning.rs            — allowed_efforts_for() (reasoning-effort allow-list)
 ├── refresh_coordinator.rs  — per-credential token cache, single-flight gate, background loop
 ├── factory.rs              — OpenAiSubscriptionProviderFactory + base-url validator
@@ -170,6 +173,16 @@ Content-Type: application/json
 Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.delta`, `response.output_item.added` / `response.output_item.done`, `response.function_call_arguments.*`, `response.completed`, `response.error` events into `StreamEvent`s.
 
 `originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...` — the Responses call sends no User-Agent at all, and only the OAuth endpoints carry baybo's own UA. This is the minimum needed for the route, no more.
+
+### Model catalog
+
+`GET <base>/codex/models?client_version=<pkg version>` is the model list, requested with the same bearer + `originator` headers as a completion and retried once on a 401 through the shared refresh coordinator. `project_models_body` maps Codex's `{ "models": [...] }` into `LiveModelInfo` — `slug` → `id`, `context_window` falling back to `max_context_window`, `input_modalities` containing `image` → `supports_vision`, `supports_tools` hard-coded true (every Codex-served model takes tools; `supports_parallel_tool_calls` is a different question). The whole raw entry is kept in `extras`, so `baybo llm live-model --json` shows the ~25 fields baybo doesn't model. Slugs are bare (`gpt-5`, `gpt-5-codex`) — no vendor prefix, so they never line up with the OpenRouter snapshot's `openai/…` keys, which is one reason this provider is deliberately absent from `openrouter_prefix.rs`.
+
+`list_remote_models` then widens the result through `catalog::supplement`, which appends the gpt-5.6 family (`luna`, `terra`, `sol`, each with a `-pro` sibling; 1,050,000-token context, vision on) for any slug the endpoint didn't already return. The merge is one-way and case-insensitive on the slug: **the endpoint always wins**, so the table can only add ids, never mask, reorder or rewrite a real one, and endpoint rows keep their leading position in the picker. Supplemented rows carry `extras.source = "baybo-catalog-supplement"` and say so in their description.
+
+The trade this makes: the endpoint reports what a plan is *provisioned* for, so a supplemented id the plan can't serve looks pickable and fails at the first chat call rather than at pick time. That is the cost of making the family selectable without waiting on the catalog. `reasoning.rs` needs no companion change — every `gpt-5.6-*` slug lands on the `gpt-5.2+` row (`none`/`low`/`medium`/`high`/`xhigh`) through the existing `gpt-5.` prefix arm.
+
+One known gap: `LiveModelInfo.context_window` is used for the picker label but is *not* written into the created entry, and this provider has no OpenRouter snapshot row to fall back on — so a wizard-created gpt-5.6 entry reports the shared 256,000-token factory default rather than 1,050,000 until an operator adds a `model_list` `context_window` override by hand.
 
 ### Prompt cache
 

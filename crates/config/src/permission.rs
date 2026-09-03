@@ -1,7 +1,10 @@
-//! Permission policy for shell-out tools (today: `Bash`).
+//! Permission policy: how much a tool must ask before acting.
 //!
-//! `permission` controls the combined approval/isolation shape for shell
-//! commands.
+//! Two halves, and they belong to different sets of tools. The **isolation**
+//! half — which route a shell command takes, and whether it is sandboxed — is
+//! `Bash`'s alone. The **approval** half applies wherever the gate does:
+//! `free` waives it for `Bash`, `Write` and `Edit` alike, because an operator
+//! who turned prompting off did not mean "except for file writes".
 
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +20,7 @@ pub enum PermissionPolicy {
     /// Ask a human for every Bash command, then ask again before any
     /// unsandboxed retry after sandbox failure.
     Manual,
-    /// Run directly without sandboxing or Bash approval.
+    /// No approval gate at all, and no OS sandbox for Bash.
     #[serde(alias = "Free", alias = "open", alias = "none")]
     Free,
 }

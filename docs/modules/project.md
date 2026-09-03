@@ -1304,8 +1304,27 @@ Every issue that runs gets its own git worktree of the project's repository at
 `work/.worktrees/<project>/<number>`, on a branch `issue/<number>-<slug>`. Two
 cards worked at the same time cannot see each other's edits.
 
-Three details that are easy to get wrong and are pinned by tests:
+Four details that are easy to get wrong and are pinned by tests:
 
+- **A branch needs somewhere to start, so the repository needs a commit.**
+  `git worktree add -b` resolves HEAD to pick the new branch's start point.
+  Git before 2.43 refuses an unborn HEAD outright; 2.43 and later quietly cut
+  an **orphan** instead, and only while the repository still has zero refs — so
+  the moment the first card commits, the next card dies with `fatal: invalid
+  reference: HEAD` and nothing on the board explains it. The orphan is the
+  worse half even when it works: the checkout is of the empty tree, so a run on
+  a repository full of files gets an empty directory, and the branch shares no
+  history with anything, so `merge` can only ever answer `refusing to merge
+  unrelated histories`. `worktree::ensure_a_root_commit` is the one home for
+  that question, and it has exactly two answers. A repository with **nothing in
+  it** is seeded — an empty root commit built with `commit-tree` from the empty
+  tree, so neither the index nor the working tree is read and staged work stays
+  staged, published with `update-ref <ref> <new> ""` so two dispatchers racing
+  here cannot both win. A repository with **uncommitted work in it** is refused
+  with `ProjectError::RepositoryHasNoCommits` (a 400, not a 500): what belongs
+  in a first commit is the operator's call. `materialise_workdir` seeds at
+  creation for the same reason — a `git init` baybo did itself hands back a
+  repository no card can branch from.
 - **The directory is keyed on the number, the branch keeps the slug.** A title
   is editable, so a slug-derived path would strand the worktree on a retitle.
   A branch name is read once by a human and never renamed.

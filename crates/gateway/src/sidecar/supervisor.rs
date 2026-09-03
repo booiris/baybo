@@ -5,7 +5,7 @@
 //! supervisor polls [`ChannelBotStore`] on a short tick, and the first
 //! time a channel reports live bots it materialises a
 //! `tokio::process::Command` pointed at `bun <bundle>` (with `bun`
-//! resolved from `PATH` or [`BUN_BINARY_ENV`]), hands it to
+//! located by [`baybo_process::HostTool`]), hands it to
 //! [`ChannelSpawner`] (which injects the channel WS URL + a fresh
 //! capability token via env vars — see `spawn.rs`), and starts waiting
 //! on the child. On exit, back off and restart. On shutdown, SIGKILL
@@ -63,11 +63,6 @@ use super::assets::SidecarRuntime;
 
 const SIDECAR_PIPE_LINE_MAX_BYTES: usize = 1024;
 
-/// Override for the `bun` binary used to run sidecars. Resolved
-/// lazily at spawn time so a bun install elsewhere on disk can be
-/// pointed at without rebuilding. Defaults to `bun` from `PATH`.
-pub const BUN_BINARY_ENV: &str = "BAYBO_BUN_BIN";
-
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Uptime above which a child's next crash resets backoff to the
@@ -80,15 +75,6 @@ const UPTIME_RESET_THRESHOLD: Duration = Duration::from_secs(60);
 const BOT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 type ChannelLogWriter = Arc<RedactingMakeWriter<NonBlocking>>;
-
-/// Resolve the `bun` executable path used to run sidecars. Honours
-/// the `BAYBO_BUN_BIN` override; otherwise relies on `PATH` resolution
-/// inside `Command::new`.
-pub(crate) fn bun_binary() -> PathBuf {
-    std::env::var_os(BUN_BINARY_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("bun"))
-}
 
 /// Drives the restart loop for every embedded sidecar that has at
 /// least one registered bot. Clone-cheap (everything is `Arc` / small
@@ -212,11 +198,13 @@ impl SidecarSupervisor {
             Some(p) => p.to_owned(),
             None => return,
         };
-        let bun = bun_binary();
-
         let mut backoff = BACKOFF_MIN;
         while !shutdown.is_shutdown() {
-            let mut cmd = Command::new(&bun);
+            // Re-resolved per attempt: an operator who installs the
+            // missing bun mid-backoff gets the sidecar back without
+            // restarting the gateway.
+            let bun = baybo_process::HostTool::bun();
+            let mut cmd = Command::new(bun.path());
             cmd.arg(&bundle);
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
@@ -229,8 +217,8 @@ impl SidecarSupervisor {
                 Err(e) => {
                     tracing::error!(
                         %channel_type,
-                        error = %e,
-                        "spawn sidecar failed; backing off",
+                        "spawn sidecar failed; backing off: {}",
+                        bun.launch_failure(&e),
                     );
                     if !wait_or_shutdown(&shutdown, backoff).await {
                         return;

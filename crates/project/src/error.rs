@@ -31,6 +31,18 @@ pub enum ProjectError {
     #[error(transparent)]
     Storage(StorageError),
 
+    /// The project's repository has never been committed to and holds work
+    /// only a person can decide the shape of, so no checkout can be cut from
+    /// it. Its own variant rather than [`Self::Workdir`], which is a server
+    /// failure the operator did not cause; this one is a state they fix with
+    /// one command, and the message says which.
+    #[error(
+        "{workdir} has no commits yet, and it has uncommitted work in it — \
+         a run's checkout would be empty. Make the repository's first commit \
+         there, then start the card again."
+    )]
+    RepositoryHasNoCommits { workdir: String },
+
     /// Materialising the project's working directory failed. Distinct from
     /// [`Self::Storage`] because the two fail for unrelated reasons, and a
     /// filesystem failure means the row was never written.

@@ -28,7 +28,8 @@ with per-call cost accounting.
 - **Multi-channel** — web dashboard, terminal UI, one-shot CLI, Telegram and WeChat
   bots, and an end-to-end-encrypted iOS companion app. New channels plug in through a
   TypeScript sidecar SDK.
-- **19 LLM providers** — Anthropic, OpenAI (API and ChatGPT-subscription OAuth), Gemini,
+- **19 LLM providers** — Anthropic, OpenAI (API key, or your ChatGPT/Codex
+  subscription over OAuth — the Codex Responses API, no API key), Gemini,
   DeepSeek, xAI, Mistral, Groq, Ollama, llamafile, and more; per-session model
   switching, live config reload.
 - **Tools & MCP** — built-in `Read`/`Write`/`Edit`/`Bash`/`Grep`/`WebFetch`/`WebSearch`
@@ -87,7 +88,18 @@ Baybo targets **Linux and macOS** only.
 | `node` | browser tool sidecar only |
 | `bwrap` / `sandbox-exec` / `docker` | OS sandbox for shell commands (recommended) |
 
-## Build
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/booiris/baybo/master/install.sh | sh
+```
+
+Linux x86_64/aarch64 (glibc 2.28+) and Apple-silicon macOS. Checksum-verified
+into `~/.local/bin`, and warns about anything missing from the table above.
+`--version <tag>` pins a release, `--uninstall` removes it. Intel Macs: build
+from source.
+
+## Build from source
 
 ```bash
 git clone https://github.com/booiris/baybo && cd baybo

@@ -923,6 +923,13 @@ pub enum GatewayCmd {
         /// binary lives somewhere other than `$PATH`.
         #[arg(long)]
         exec_start: Option<String>,
+        /// Account a `--system` unit runs as. Defaults to whoever
+        /// escalated (`SUDO_USER` / `PKEXEC_UID`); install refuses
+        /// rather than silently running the daemon as root, since a
+        /// root daemon would write root-owned files into the workspace
+        /// the unit points at. Pass `--run-as root` to opt into that.
+        #[arg(long)]
+        run_as: Option<String>,
     },
     /// Mint the auth token if absent, enable autostart, and start the service.
     Enable,

@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use baybo_config::{BayboConfig, LlmEntry};
+use baybo_config::{BayboConfig, LlmEntry, LlmModelSpec};
 use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
 use baybo_llm::effort::ReasoningEffort;
 use baybo_llm::providers::openai_subscription::{
-    DeviceCode, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS, VaultTokenStore,
-    device_code_login, pkce_login,
+    DeviceCode, LITE_MODEL as SUB_LITE_MODEL, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS,
+    VaultTokenStore, device_code_login, pkce_login,
 };
 use baybo_llm::{
     LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, default_base_url_for_provider,
@@ -155,24 +155,24 @@ async fn add_entry<P: Prompter>(
         live[model_idx].id.clone()
     };
 
+    let (lite_model, model_list) = lite_seed(&provider, &model, &live);
+
     let entry = LlmEntry {
         name: name.clone().into(),
         provider: provider.clone(),
         model: model.clone(),
-        // The wizard configures one model at a time; operators add further
-        // models by editing baybo.json (`model_list`) directly.
-        model_list: Vec::new(),
-        // Seeded to the entry's own model, which makes it a behavioural
-        // no-op — `resolve_lite` hands back the entry's default client,
-        // exactly as it would with the field unset. It is written anyway
-        // because the alternative is invisible: `lite_model` is
-        // `skip_serializing_if = "Option::is_none"`, so an operator who
-        // never reads the module docs has no way to learn from their own
-        // config file that the auxiliary calls (the Bash risk judges,
-        // WebFetch's page summary, title generation) can be moved to a
-        // cheaper model. Present-and-inert is a knob they can find and
-        // edit; absent is a feature they never discover.
-        lite_model: Some(model.clone()),
+        model_list,
+        // Usually the entry's own model, which makes the field a
+        // behavioural no-op — `resolve_lite` hands back the entry's
+        // default client, exactly as it would with the field unset. It is
+        // written anyway because the alternative is invisible:
+        // `lite_model` is `skip_serializing_if = "Option::is_none"`, so an
+        // operator who never reads the module docs has no way to learn
+        // from their own config file that the auxiliary calls (the Bash
+        // risk judges, WebFetch's page summary, title generation) can be
+        // moved to a cheaper model. Present-and-inert is a knob they can
+        // find and edit; absent is a feature they never discover.
+        lite_model: Some(lite_model),
         api_key_env,
         base_url,
         reasoning_effort: Some(ReasoningEffort::Medium.to_string()),
@@ -204,6 +204,35 @@ async fn add_entry<P: Prompter>(
         .map_err(|e| SetupError::Config(format!("config validation failed: {e}")))?;
 
     Ok(LlmStepOutcome::Added(Box::new(entry)))
+}
+
+/// The `lite_model` / `model_list` pair a freshly-created entry lands
+/// with. They are decided together because config validation rejects a
+/// `lite_model` that isn't one of the entry's own models, and
+/// `configure_llm_step` validates before it returns — a mismatch here
+/// fails the wizard *after* the OAuth bundle is already in the vault.
+///
+/// A subscription entry is the one case where the pair is worth
+/// spending: the auxiliary calls that hang off every turn run on
+/// [`SUB_LITE_MODEL`] instead of on whatever flagship the operator
+/// picked for chat. Everyone else gets the inert seed. The live catalog
+/// gates it, so a plan that doesn't serve the model — and a discovery
+/// failure, which reaches here as an empty `live` — falls back rather
+/// than writing a `model_list` row that only fails at the first judge
+/// call, where the Bash gate is fail-closed and would silently turn
+/// `permission = auto` into a prompt on every destructive command.
+fn lite_seed(provider: &str, model: &str, live: &[LiveModelInfo]) -> (String, Vec<LlmModelSpec>) {
+    let subscription_lite = provider == SUB_PROVIDER_NAME
+        && model != SUB_LITE_MODEL
+        && live.iter().any(|m| m.id == SUB_LITE_MODEL);
+    if subscription_lite {
+        (
+            SUB_LITE_MODEL.to_string(),
+            vec![LlmModelSpec::bare(SUB_LITE_MODEL)],
+        )
+    } else {
+        (model.to_string(), Vec::new())
+    }
 }
 
 fn unique_default_name(provider: &str, existing: &[LlmEntry]) -> String {
@@ -303,9 +332,24 @@ mod tests {
     use baybo_security::test_support::MemorySecretStore;
     use baybo_security::{EncryptionKey, SecretVault};
 
-    use super::{LlmStepOutcome, ReasoningEffort, configure_llm_step};
+    use super::{
+        LiveModelInfo, LlmEntry, LlmModelSpec, LlmStepOutcome, ReasoningEffort, SUB_LITE_MODEL,
+        SUB_PROVIDER_NAME, configure_llm_step, lite_seed,
+    };
     use crate::flow::pick_add_or_skip;
     use crate::test_support::MockPrompter;
+
+    fn live(id: &str) -> LiveModelInfo {
+        LiveModelInfo {
+            id: id.to_string(),
+            display_name: None,
+            description: None,
+            context_window: None,
+            supports_vision: None,
+            supports_tools: None,
+            extras: serde_json::Value::Null,
+        }
+    }
 
     #[test]
     fn first_run_no_skip_returns_add_without_prompt() {
@@ -327,6 +371,82 @@ mod tests {
         let mut prompter = MockPrompter::new().push_select(0);
         let go = pick_add_or_skip(&mut prompter, "L:", "add", "skip", true).unwrap();
         assert!(go);
+    }
+
+    /// A key-based provider keeps the inert seed: lite names the entry's
+    /// own model and nothing lands in `model_list`.
+    #[test]
+    fn a_key_based_provider_seeds_lite_to_its_own_model() {
+        let (lite, list) = lite_seed("openai", "gpt-5", &[live("gpt-5"), live(SUB_LITE_MODEL)]);
+        assert_eq!(lite, "gpt-5");
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn a_subscription_entry_seeds_lite_to_the_family_middle_tier() {
+        let (lite, list) = lite_seed(
+            SUB_PROVIDER_NAME,
+            "gpt-5.6-sol",
+            &[live("gpt-5.6-sol"), live(SUB_LITE_MODEL)],
+        );
+        assert_eq!(lite, SUB_LITE_MODEL);
+        assert_eq!(list, vec![LlmModelSpec::bare(SUB_LITE_MODEL)]);
+    }
+
+    /// Live discovery failing reaches `add_entry` as an empty catalog, and
+    /// the operator then types a custom model id. Seeding the lite model
+    /// off a catalog nobody could read would write a `model_list` row that
+    /// only fails later, at the first risk-judge call.
+    #[test]
+    fn a_subscription_entry_falls_back_when_the_catalog_is_unavailable() {
+        let (lite, list) = lite_seed(SUB_PROVIDER_NAME, "gpt-5", &[]);
+        assert_eq!(lite, "gpt-5");
+        assert!(list.is_empty());
+    }
+
+    /// Picking the lite model as the chat model too collapses back to the
+    /// inert seed — a `model_list` row duplicating `model` is noise.
+    #[test]
+    fn a_subscription_entry_that_chats_on_the_lite_model_writes_no_model_list() {
+        let (lite, list) = lite_seed(SUB_PROVIDER_NAME, SUB_LITE_MODEL, &[live(SUB_LITE_MODEL)]);
+        assert_eq!(lite, SUB_LITE_MODEL);
+        assert!(list.is_empty());
+    }
+
+    /// `configure_llm_step` validates before returning, so a seed whose
+    /// `lite_model` isn't among the entry's models would fail the wizard
+    /// *after* the OAuth bundle is already written to the vault.
+    #[test]
+    fn the_subscription_seed_passes_config_validation() {
+        let (lite_model, model_list) = lite_seed(
+            SUB_PROVIDER_NAME,
+            "gpt-5.6-sol",
+            &[live("gpt-5.6-sol"), live(SUB_LITE_MODEL)],
+        );
+        let mut config = BayboConfig::default();
+        config.llm.push(LlmEntry {
+            name: "sub".into(),
+            provider: SUB_PROVIDER_NAME.to_string(),
+            model: "gpt-5.6-sol".into(),
+            model_list,
+            lite_model: Some(lite_model),
+            api_key_env: None,
+            base_url: None,
+            reasoning_effort: Some(ReasoningEffort::Medium.to_string()),
+        });
+        config.default_llm = "sub".into();
+        config
+            .validate()
+            .expect("wizard-written entry must validate");
+    }
+
+    /// The picker renders `provider_names()` verbatim, so the keyless
+    /// provider leading the list is a property of the registry, asserted
+    /// here because this is the surface it exists for.
+    #[test]
+    fn the_provider_picker_opens_on_the_subscription_provider() {
+        let registry = LlmProviderRegistry::with_default_providers();
+        assert_eq!(registry.provider_names().first(), Some(&SUB_PROVIDER_NAME));
     }
 
     #[tokio::test]

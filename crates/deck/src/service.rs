@@ -5,8 +5,11 @@
 //! The child runs directly on the host (no sandbox — the card author is
 //! the operator's own trusted agent, the same one trusted to run `Bash`;
 //! see the trust model in `docs/modules/deck.md`), inheriting the host
-//! environment so `bun` resolves off the login `PATH` exactly like the
-//! channel sidecars. Effects still funnel through the parent by
+//! environment so a card reaches host state and CLIs exactly like the
+//! channel sidecars. `bun` itself is located by
+//! [`baybo_process::HostTool`], not by the inherited `PATH` alone — a
+//! daemon under a service manager gets that manager's `PATH`, not the
+//! operator's. Effects still funnel through the parent by
 //! convention — `ctx.fetch` is a host-mediated stdio round-trip so the
 //! secret-placeholder reveal + audit keep working — but that is now a
 //! convenience of the SDK, not an enforced boundary. Per-call timeouts
@@ -41,19 +44,8 @@ pub const SNAPSHOT_MAX_BYTES: usize = 5 * 1024 * 1024;
 /// doesn't trip quarantine — only a pathological tight loop does.
 pub const EMIT_FLOOD_MAX: u64 = 1000;
 
-/// Override for the `bun` binary used to run card services. Shares the
-/// channel-sidecar override name (`sidecar::supervisor::BUN_BINARY_ENV`)
-/// deliberately — "the bun that runs embedded JS" is one operator concept.
-pub const DECK_BUN_ENV: &str = "BAYBO_BUN_BIN";
-
 const PREAMBLE_JS: &str = include_str!("sdk/preamble.js");
 const PREAMBLE_FILE: &str = "preamble.js";
-
-pub(crate) fn bun_binary() -> PathBuf {
-    std::env::var_os(DECK_BUN_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("bun"))
-}
 
 /// Host-side capability RPCs served to the child. Implemented by
 /// [`crate::host::DeckHost`] (fetch with SSRF floor + placeholder reveal; host
@@ -268,10 +260,10 @@ pub(crate) async fn spawn_service(
     std::fs::write(&preamble_path, PREAMBLE_JS)?;
     let service_js = cfg.bundle_dir.join(crate::bundle::SERVICE_FILE);
 
-    // Runs directly on the host, inheriting the environment so `bun`
-    // resolves off the login `PATH` (same as the channel sidecars) and a
-    // card can reach host state and CLIs. `TMPDIR` etc. are inherited.
-    let mut cmd = Command::new(bun_binary());
+    // Runs directly on the host, inheriting the environment so a card
+    // can reach host state and CLIs. `TMPDIR` etc. are inherited.
+    let bun = baybo_process::HostTool::bun();
+    let mut cmd = Command::new(bun.path());
     cmd.arg(&preamble_path)
         .arg(&service_js)
         .current_dir(&cfg.bundle_dir)
@@ -281,13 +273,7 @@ pub(crate) async fn spawn_service(
     let mut child = cfg
         .process_manager
         .spawn(&mut cmd, format!("deck-service:{}", cfg.card_id))
-        .map_err(|e| {
-            DeckError::ServiceUnavailable(format!(
-                "failed to launch `{}` ({e}); is bun installed and on PATH? \
-             (override with {DECK_BUN_ENV})",
-                bun_binary().display()
-            ))
-        })?;
+        .map_err(|e| DeckError::HostToolMissing(bun.launch_failure(&e)))?;
     let stdin = child
         .take_stdin()
         .ok_or_else(|| DeckError::Internal("child stdin unavailable".into()))?;

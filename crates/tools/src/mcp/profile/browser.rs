@@ -77,7 +77,7 @@ pub struct BrowserProfileParams<'a> {
 ///   `BAYBO_BROWSER_VIEWPORT=<W>x<H>`. The TS wrapper passes this to
 ///   CDDM as `viewport: { width, height }`.
 /// - `command`: typically the resolved host `node` binary
-///   (`baybo_gateway::node_binary().display().to_string()`).
+///   (`baybo_process::HostTool::node()`).
 /// - `bundle_path`: the materialised `dist/bundle.mjs` path
 ///   (`runtime.bundle_for("browser")`).
 /// - `extra_font_dirs`: directories to add to the Chrome's fontconfig

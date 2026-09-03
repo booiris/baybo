@@ -31,7 +31,7 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 | Function | Maps |
 |----------|------|
 | `to_assessment_mode` | `RiskCheckConfig` → `baybo_skills_assessor::AssessmentMode` |
-| `to_bash_permission` | `baybo_config::PermissionPolicy` → `baybo_tools::builtin::BashPermissionMode` (shared by initial wiring and hot-reload) |
+| `to_bash_permission` | `baybo_config::PermissionPolicy` → `baybo_tools::builtin::PermissionMode` (shared by initial wiring and hot-reload) |
 | `proxy_settings` | `BayboConfig` → `Option<baybo_security::http::ProxySettings>` (`None` = direct connections) |
 | `build_leak_detector` | `SecurityConfig` → `baybo_security::LeakDetector` (the base detector). A second `runtime::build_leak_detector(security, gateway_tokens)` wraps this one to also add per-token redaction rules for the live gateway tokens; `boot`'s version is the config-only base. |
 | `storage_db_path` | `WorkspaceConfig` → `PathBuf` at `<workspace.path>/state/storage.db` (the workspace root is itself the baybo data directory) |

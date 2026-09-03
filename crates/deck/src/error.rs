@@ -31,6 +31,18 @@ pub enum DeckError {
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
+    /// The JS runtime the card service needs could not be launched at
+    /// all — the card's own code never ran, so nothing about this is the
+    /// card's fault and it is identical for every card on the host.
+    ///
+    /// Kept distinct from [`DeckError::ServiceUnavailable`] because the
+    /// supervisor must NOT spend the card's crash budget on it: a
+    /// quarantine here fixes nothing (the next card fails the same way)
+    /// and writes durable state the operator has to undo by hand once
+    /// the host is repaired.
+    #[error("host tool unavailable: {0}")]
+    HostToolMissing(String),
+
     #[error("storage: {0}")]
     Storage(#[from] baybo_store::StorageError),
 

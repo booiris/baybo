@@ -61,9 +61,82 @@ pub struct InstallContext {
     pub config_path: Option<PathBuf>,
     /// Log directory; surfaced as a hint in the rendered unit file.
     pub log_dir: PathBuf,
-    /// User-mode install (`--user` on Linux). `false` writes to the
-    /// system unit directory (requires root).
-    pub user_mode: bool,
+    /// `PATH` the service manager must hand the daemon, rendered into
+    /// the unit. Built by [`resolve_service_path`] at install time —
+    /// service managers supply their own minimal `PATH` (a systemd user
+    /// unit gets `/usr/local/bin:/usr/bin`), never the operator's, so
+    /// without this line the daemon cannot find any host tool installed
+    /// under `$HOME`.
+    pub path_env: String,
+    /// The account a **system-wide** unit must drop to, resolved by
+    /// [`resolve_service_user`]. `None` for a per-user install, where
+    /// the service manager already runs as the right user and the unit
+    /// must not name one.
+    pub run_as: Option<ServiceUser>,
+}
+
+/// The account a system-wide unit runs the gateway as.
+///
+/// A `[Service]` block with no `User=` runs as **root** — while the
+/// paths baked into that same unit came from whoever ran the install.
+/// The default is therefore a root daemon writing a user-owned
+/// workspace, leaving root-owned `storage.db`, vault and `personas/`
+/// that the user's own CLI and TUI can no longer write. Construction
+/// goes through [`resolve_service_user`] so that outcome can only ever
+/// be reached by asking for it.
+#[derive(Debug, Clone)]
+pub struct ServiceUser(String);
+
+impl ServiceUser {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Resolve the account a `--system` install pins the service to.
+///
+/// `getuid()` is deliberately **not** consulted. `--system` writes
+/// `/etc/systemd/system`, so it can only succeed when already root, and
+/// `User=0` is root — the exact bug this exists to prevent. The real
+/// operator is whoever escalated: `SUDO_USER` under `sudo`,
+/// `PKEXEC_UID` under `pkexec` (numeric, which systemd accepts).
+///
+/// When neither is present — a plain root login, a container, a
+/// provisioning script — there is no honest answer, so this **fails**
+/// and points at `--run-as`. Silently emitting a root unit is what got
+/// us here; making the operator name the account takes one flag and
+/// makes a root daemon an explicit choice (`--run-as root`) instead of
+/// the default nobody picked.
+pub fn resolve_service_user(explicit: Option<&str>) -> Result<ServiceUser> {
+    fn accept(raw: &str, source: &str) -> Result<ServiceUser> {
+        let name = raw.trim();
+        // The value lands verbatim on a `User=` line; anything with
+        // whitespace or a separator in it would silently produce a unit
+        // that means something other than what it says.
+        if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c == '=') {
+            return Err(InstallerError::Other(format!(
+                "{source} is not a usable account name ({raw:?}); pass --run-as <user>"
+            )));
+        }
+        Ok(ServiceUser(name.to_string()))
+    }
+
+    if let Some(name) = explicit {
+        return accept(name, "--run-as");
+    }
+    if let Some(name) = std::env::var_os("SUDO_USER").and_then(|v| v.into_string().ok()) {
+        return accept(&name, "SUDO_USER");
+    }
+    if let Some(uid) = std::env::var_os("PKEXEC_UID").and_then(|v| v.into_string().ok()) {
+        return accept(&uid, "PKEXEC_UID");
+    }
+    Err(InstallerError::Other(
+        "cannot tell which account the system service should run as: neither SUDO_USER nor \
+         PKEXEC_UID is set. A system unit with no `User=` runs as root and would write \
+         root-owned files into the workspace this unit points at. Re-run with \
+         `--run-as <user>` (use `--run-as root` if a root-owned workspace is what you want)."
+            .into(),
+    ))
 }
 
 /// Runtime status of the installed service.
@@ -152,12 +225,246 @@ pub fn resolve_exec_start(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn which_baybo() -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        let candidate = dir.join("baybo");
-        if candidate.is_file() {
-            return Some(candidate);
+    baybo_process::lookup_on_path("baybo")
+}
+
+/// Host binaries the gateway shells out to at runtime. Kept in sync with
+/// the inventory in `docs/external-commands.md`; the daemon's `PATH` is
+/// derived from where *these* actually live, never from a snapshot of
+/// the operator's own `PATH`.
+///
+/// Two entries are load-bearing beyond baybo's own spawns: `claude` and
+/// `codex` are probed by name from deck cards and skills via `sh -c`,
+/// so dropping them here would revive the "CLI is not installed" class
+/// of failure one layer above the ones baybo spawns itself.
+const SERVICE_PATH_TOOLS: &[&str] = &[
+    "bun",
+    "node",
+    "uv",
+    "git",
+    "rg",
+    "sh",
+    "tmux",
+    "bwrap",
+    "sandbox-exec",
+    "docker",
+    "systemd-run",
+    "claude",
+    "codex",
+];
+
+/// System bin dirs appended after the discovered ones, so a tool
+/// installed *after* the install still resolves.
+///
+/// `/opt/homebrew` is Homebrew's prefix on Apple silicon — which is every
+/// macOS machine this project ships a binary for — and is where `brew install
+/// node` puts things. `/usr/local` only covers Intel Macs. Non-existent dirs
+/// are filtered out below, so both cost nothing on Linux.
+const SERVICE_PATH_SYSTEM_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
+];
+
+/// Build the `PATH` to bake into the generated unit.
+///
+/// Derived from *need*, not from inheritance: walk the installing
+/// process's `PATH` in order and keep only the dirs that actually hold
+/// one of [`SERVICE_PATH_TOOLS`], then append the system bin dirs. A
+/// real operator `PATH` is 20+ entries of toolchain shims, SDK dirs and
+/// editor-server paths carrying an embedded commit hash — snapshotting
+/// it whole would bake in entries that are stale by the next upgrade,
+/// while keeping the order means the service resolves the same `bun` the
+/// operator's shell does.
+pub fn resolve_service_path() -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    service_path_from(std::env::split_paths(&path))
+}
+
+/// Per-user tool roots to append, resolved against `$HOME`.
+///
+/// These close an ordering trap rather than a missing-dir one. The selection
+/// above keeps a `PATH` entry only when it *already* holds one of
+/// [`SERVICE_PATH_TOOLS`], so a `~/.local/bin` containing nothing but a
+/// freshly-installed `baybo` is dropped — and then `uv`, installed there an
+/// hour later on the advice of the installer's own warnings, is invisible to
+/// the daemon forever. `HostTool` consults exactly these dirs at spawn time, so
+/// a unit that cannot see them contradicts the resolver it is running.
+fn home_tool_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    baybo_process::HOME_INSTALL_DIRS
+        .iter()
+        .map(|dir| PathBuf::from(&home).join(dir))
+        .collect()
+}
+
+/// The selection itself, over an explicit candidate list so it is
+/// testable without mutating the process's `PATH`.
+fn service_path_from(candidates: impl Iterator<Item = PathBuf>) -> String {
+    fn push(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
         }
     }
-    None
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in candidates {
+        // A relative entry would resolve against the daemon's cwd, which
+        // is not the operator's — never propagate one into a unit.
+        if !dir.is_absolute() {
+            continue;
+        }
+        if SERVICE_PATH_TOOLS
+            .iter()
+            .any(|tool| baybo_process::is_executable(&dir.join(tool)))
+        {
+            push(&mut dirs, dir);
+        }
+    }
+    for dir in SERVICE_PATH_SYSTEM_DIRS {
+        let dir = PathBuf::from(dir);
+        if dir.is_dir() {
+            push(&mut dirs, dir);
+        }
+    }
+    // Last, so a packaged tool still wins — the same precedence `HostTool`
+    // applies, and unconditional because the point is the dir a tool has not
+    // been installed into *yet*.
+    for dir in home_tool_dirs() {
+        push(&mut dirs, dir);
+    }
+
+    // `join_paths` only fails on a `:` inside an entry, which would also
+    // have corrupted the unit — fall back to the system dirs alone.
+    std::env::join_paths(&dirs)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| SERVICE_PATH_SYSTEM_DIRS.join(":"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generated `PATH` must be usable as-is: non-empty, and every
+    /// entry absolute.
+    #[test]
+    fn resolved_service_path_is_absolute_and_non_empty() {
+        let path = resolve_service_path();
+        assert!(!path.is_empty(), "service PATH must never render empty");
+        for dir in path.split(':') {
+            assert!(
+                dir.starts_with('/'),
+                "service PATH entry {dir:?} is not absolute (from {path:?})"
+            );
+        }
+    }
+
+    /// Discovery is keyed on the tools, not on inheritance: a dir holding
+    /// none of them is dropped rather than copied into the unit, so
+    /// editor-server and SDK dirs (whose names embed a version or commit
+    /// hash) never get baked in to rot.
+    #[test]
+    fn service_path_drops_dirs_without_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let junk = dir.path().join("vscode-server-abc123");
+        std::fs::create_dir_all(&junk).expect("mkdir");
+        let path = service_path_from(std::iter::once(junk));
+        assert!(
+            !path.contains("vscode-server-abc123"),
+            "a dir holding no service tool must not reach the unit, got {path:?}"
+        );
+    }
+
+    /// An explicit `--run-as` always wins, including the deliberate
+    /// `--run-as root` for a genuinely root-owned deployment.
+    #[test]
+    fn explicit_run_as_wins() {
+        assert_eq!(
+            resolve_service_user(Some("booiris"))
+                .expect("explicit")
+                .as_str(),
+            "booiris"
+        );
+        assert_eq!(
+            resolve_service_user(Some("root"))
+                .expect("explicit root")
+                .as_str(),
+            "root",
+            "a root service must remain reachable, just never by default"
+        );
+    }
+
+    /// A value that would change the meaning of the `User=` line is
+    /// rejected rather than rendered.
+    #[test]
+    fn run_as_rejects_values_that_would_corrupt_the_unit() {
+        for bad in ["", "  ", "me and you", "me\nExecStart=/bin/sh", "a=b"] {
+            assert!(
+                resolve_service_user(Some(bad)).is_err(),
+                "{bad:?} must not reach a User= line"
+            );
+        }
+    }
+
+    /// …and a dir that *does* hold one is kept, ahead of the system
+    /// dirs, so the service resolves the same binary the operator's
+    /// shell does.
+    #[test]
+    fn service_path_carries_the_user_tool_roots_even_when_empty() {
+        // The outage this reproduces: `install.sh` drops the binary into
+        // ~/.local/bin and then tells the user to run `baybo gateway install`
+        // at step 3 and to install the tools it warned about afterwards. At
+        // step 3 that dir holds only `baybo`, which is not in
+        // SERVICE_PATH_TOOLS, so the selection dropped it — and `uv` installed
+        // there later was invisible to the daemon for good.
+        let home = tempfile::tempdir().expect("tempdir");
+        // SAFETY: single-threaded test; HOME is restored by the guard below.
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let path = service_path_from(std::iter::empty());
+        match previous {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let entries: Vec<PathBuf> = path.split(':').map(PathBuf::from).collect();
+        for dir in baybo_process::HOME_INSTALL_DIRS {
+            let expected = home.path().join(dir);
+            assert!(
+                entries.contains(&expected),
+                "the unit PATH must carry {expected:?} even though nothing is installed there yet, got {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_path_keeps_tool_dir_ahead_of_system_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let bun = bin.join("bun");
+        std::fs::write(&bun, "#!/bin/sh\n").expect("write");
+        let mut perms = std::fs::metadata(&bun).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&bun, perms).expect("chmod");
+
+        let path = service_path_from(std::iter::once(bin.clone()));
+        let entries: Vec<&str> = path.split(':').collect();
+        assert_eq!(
+            entries.first().map(PathBuf::from),
+            Some(bin),
+            "a discovered tool dir must lead the service PATH, got {path:?}"
+        );
+        assert!(
+            entries.contains(&"/usr/bin"),
+            "system dirs must still be appended, got {path:?}"
+        );
+    }
 }

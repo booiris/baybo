@@ -10,6 +10,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
+pub mod host_tool;
+
+pub use host_tool::{
+    BUN_BINARY_ENV, HOME_INSTALL_DIRS, HostTool, NODE_BINARY_ENV, is_executable, lookup_on_path,
+};
+
 pub const PROCESS_TOKEN_ENV: &str = "BAYBO_PROCESS_TOKEN";
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);

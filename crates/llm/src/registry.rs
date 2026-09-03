@@ -192,10 +192,9 @@ pub struct LiveModelInfo {
 /// by looking up the factory matching the config's `provider` field.
 ///
 /// `order` tracks insertion order so [`Self::provider_names`] returns a
-/// stable list — what the setup wizard renders and what cross-process
-/// surfaces (TS bindings, logs) iterate. `register` keeps `order` in
-/// sync (and de-dupes on re-registration so a replaced factory doesn't
-/// duplicate its name).
+/// stable list — which is what the setup wizard renders, so registration
+/// order is picker order. `register` keeps `order` in sync (and de-dupes
+/// on re-registration so a replaced factory doesn't duplicate its name).
 pub struct LlmProviderRegistry {
     factories: HashMap<String, Box<dyn LlmProviderFactory>>,
     order: Vec<String>,
@@ -213,6 +212,12 @@ impl LlmProviderRegistry {
     /// Creates a registry preloaded with the built-in providers.
     pub fn with_default_providers() -> Self {
         let mut registry = Self::new();
+        // First on purpose: the picker renders this order, only ~12 of the
+        // rows fit on screen at once, and this is the one provider that
+        // needs no API key — an operator with a ChatGPT/Codex plan and
+        // nothing else should not have to scroll past 18 key-gated
+        // providers to find the one they can actually use.
+        registry.register(OpenAiSubscriptionProviderFactory);
         registry.register(OpenAIProviderFactory);
         registry.register(AnthropicProviderFactory);
         registry.register(GeminiProviderFactory);
@@ -231,7 +236,6 @@ impl LlmProviderRegistry {
         registry.register(LlamafileProviderFactory);
         registry.register(HyperbolicProviderFactory);
         registry.register(HuggingFaceProviderFactory);
-        registry.register(OpenAiSubscriptionProviderFactory);
         registry
     }
 

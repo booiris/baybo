@@ -69,11 +69,19 @@ impl DeckEvents for NoopDeckEvents {
 }
 
 /// Card provenance / lifecycle transition record. Emitted as structured
-/// tracing events under the `deck::provenance` target — the greppable
-/// audit spine for "what code ran when" (install / update with hash
-/// before→after / delete / restore / purge / quarantine).
+/// tracing events under the `baybo_deck::provenance` target — the
+/// greppable audit spine for "what code ran when" (install / update with
+/// hash before→after / delete / restore / purge / quarantine).
+///
+/// The `baybo_deck::` prefix is load-bearing, not decoration: the
+/// default filter is `baybo=info` and `EnvFilter` matches a directive
+/// against the target as a plain prefix, so a target that does not start
+/// with `baybo` is dropped on the floor — an audit spine that records
+/// nothing while reading, in the source, exactly as if it worked.
+const PROVENANCE_TARGET: &str = "baybo_deck::provenance";
+
 fn provenance(event: &str, card_id: &str, detail: &str) {
-    tracing::info!(target: "deck::provenance", card = %card_id, event = %event, detail = %detail, "deck provenance");
+    tracing::info!(target: PROVENANCE_TARGET, card = %card_id, event = %event, detail = %detail, "deck provenance");
 }
 
 #[derive(Debug, Clone)]
@@ -795,12 +803,12 @@ impl DeckManager {
         .await
         {
             Ok(Some(sha)) => tracing::debug!(
-                target: "deck::provenance",
+                target: PROVENANCE_TARGET,
                 card = %card_id, event = %event, %sha, "deck bundle committed"
             ),
             Ok(None) => {}
             Err(reason) => tracing::warn!(
-                target: "deck::provenance",
+                target: PROVENANCE_TARGET,
                 card = %card_id, event = %event, "deck git commit skipped: {reason}"
             ),
         }
@@ -1304,5 +1312,21 @@ mod tests {
         let to = tempfile::tempdir().unwrap();
         let err = copy_src_tree(&src, &to.path().join(SRC_DIR)).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// The provenance target must stay under the `baybo` prefix.
+    ///
+    /// The default filter is `baybo=info` and `EnvFilter` matches a
+    /// directive against the target as a plain prefix, so a target of
+    /// `deck::provenance` compiles, reads correctly, emits nothing, and
+    /// leaves install / delete / quarantine unrecorded — which is
+    /// exactly what shipped until a deck outage turned up an audit
+    /// trail with zero entries in it.
+    #[test]
+    fn provenance_target_is_reachable_by_the_default_filter() {
+        assert!(
+            PROVENANCE_TARGET.starts_with("baybo"),
+            "target {PROVENANCE_TARGET:?} is invisible to the default `baybo=info` filter"
+        );
     }
 }

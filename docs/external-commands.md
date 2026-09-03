@@ -14,20 +14,56 @@ container cleanup that originates in `Drop` is queued to a sandbox-owned async
 supervisor and drained before the process sweep. Fully-awaited workspace
 bootstrap git calls remain leaf-local.
 
+## The daemon's `PATH` is not the operator's
+
+Nothing below resolves off the shell you launched baybo from. A service
+manager hands the daemon a `PATH` of its own: a systemd **user** unit
+inherits the user manager's default (`/usr/local/bin:/usr/bin`), a
+launchd agent gets less. Anything installed under `$HOME` — `bun` and
+`uv` land in `~/.local/bin` or `~/.bun/bin`, so do the external-agent
+CLIs — is invisible to the daemon while the operator runs it fine from
+their own shell.
+
+Two mechanisms keep that from biting, and they cover different
+populations:
+
+- **`baybo gateway install` bakes a `PATH` into the unit**
+  (`installer::resolve_service_path`). It is derived from *need*: walk
+  the installing process's `PATH`, keep only the dirs that actually hold
+  one of the tools in this inventory, then append the system bin dirs. A
+  whole-`PATH` snapshot is deliberately *not* taken — a real operator
+  `PATH` carries editor-server and SDK dirs whose names embed a commit
+  hash or version, which are stale by the next upgrade.
+- **`baybo_process::HostTool` falls back to the well-known per-user
+  install roots** when `PATH` misses. This is what rescues a unit
+  installed *before* the above existed — the population that cannot be
+  fixed by changing the generator, because their unit file is already on
+  disk.
+
+An already-installed unit is repaired by re-running `baybo gateway
+install` (it rewrites the unit and reloads the manager), or by hand with
+a drop-in:
+
+```ini
+# ~/.config/systemd/user/baybo-gateway.service.d/path.conf
+[Service]
+Environment=PATH=/home/<user>/.local/bin:/usr/local/bin:/usr/bin
+```
+
 ## Inventory
 
 | Command | Status | Invoked by | Purpose |
 |---------|--------|-----------|---------|
-| `git` | **Required at startup** | `baybo-workspace` (`manager.rs`) | `git init` of the workspace identity repos (`config/`, `personas/`, `agents/`). Baybo surfaces a startup error if it's genuinely missing. Also used best-effort by `baybo-workspace` to commit a persona when it is materialised, and by the Edit tool to auto-commit `personas/` identity-file edits (failure degrades to a `commit_warning` in the tool output), and by `baybo-deck` (`repo.rs`) to auto-commit each card-bundle mutation (install/update/purge) into a `workspace/deck/` repo for version history (failure degrades to a `deck::provenance` warn; the deck operation still succeeds). |
+| `git` | **Required at startup** | `baybo-workspace` (`manager.rs`) | `git init` of the workspace identity repos (`config/`, `personas/`, `agents/`). Baybo surfaces a startup error if it's genuinely missing. Also used best-effort by `baybo-workspace` to commit a persona when it is materialised, and by the Edit tool to auto-commit `personas/` identity-file edits (failure degrades to a `commit_warning` in the tool output), and by `baybo-deck` (`repo.rs`) to auto-commit each card-bundle mutation (install/update/purge) into a `workspace/deck/` repo for version history (failure degrades to a `baybo_deck::provenance` warn; the deck operation still succeeds). |
 | `sh` | **Required** | `baybo-tools` Bash (`bash/mod.rs`) + `baybo-deck` (`host.rs`) | Every Bash-tool command runs as `sh -c "…"`; a deck card's `ctx.exec` runs `/bin/sh -c` directly on the host (unsandboxed, 10s + output caps). |
 | `rg` (ripgrep) | Required **for the `Grep` and `Glob` tools** | `baybo-tools` (`builtin/rg.rs`, shared by `grep.rs` / `glob_tool.rs`) | The agent's regex content-search and file-glob tools both shell out to `rg`. Absent → each returns *"ripgrep (`rg`) not found on PATH; install it"* and the agent must fall back to Bash `grep`/`find`/`python`. Baybo itself still runs. |
 | one of `bwrap` / `sandbox-exec` / `docker` | Optional but recommended for `permission = auto` / `manual` | `baybo-sandbox` | The inner OS sandbox backend: `bwrap` (Linux), `sandbox-exec` (macOS, ships with the OS), or `docker`. With none present on a non-container host, Bash emits a notice and runs without the inner OS sandbox under the configured approval policy; inside a detected outer container/sandbox, it skips the inner sandbox silently. (Deck card services do not use this — they run on the host; see the `bun` row.) |
 | `systemd-run` | Optional | `baybo-sandbox` (`bwrap.rs`) | cgroup resource limits for `bwrap` when available. |
 | `systemctl` / `launchctl` | Optional (only for `baybo gateway install`-family subcommands) | `baybo-gateway` (`installer/systemd.rs`, `installer/launchd.rs`) | Install/manage the gateway as a systemd unit (Linux) or launchd service (macOS). |
 | `uv` | Optional | `baybo-tools` (`bash/mod.rs` prewarm) | Python tool prewarm / the uv shim. Non-fatal if absent (a startup `WARN`). |
-| `bun` | Required **for channel sidecars and deck card services** | `baybo-gateway` (sidecar supervisor) + `baybo-setup` (channel registration flow) + `baybo-deck` (`service.rs`) — all honoring the one `BAYBO_BUN_BIN` override | Runs the bundled JS channel sidecars (Telegram/Discord/…) and every enabled deck card's resident service (one bun child per card, run directly on the host — like the sidecars, inheriting the login `PATH` — spawned at gateway boot and per install dry-run). Only when those channels are configured / any deck card is installed. |
-| `node` | Required **for embedded MCP / tool sidecars** (e.g. the browser sidecar) | `baybo-gateway` (`sidecar/embedded_mcp.rs`) | Runs embedded MCP-server sidecar bundles (`node <bundle.mjs>`); resolved from `PATH`, overridable via `BAYBO_NODE_BIN`. Only when a tool-sidecar domain (e.g. `browser.enable`) is configured. |
-| `claude` / `codex` | Optional | `baybo-agent` external-agent delegation | Probed on `PATH` at boot; registered only when installed. |
+| `bun` | Required **for channel sidecars and deck card services** | `baybo-gateway` (sidecar supervisor) + `baybo-setup` (channel registration flow) + `baybo-deck` (`service.rs`) — all three via the one `baybo_process::HostTool::bun()` resolver and its `BAYBO_BUN_BIN` override | Runs the bundled JS channel sidecars (Telegram/Discord/…) and every enabled deck card's resident service (one bun child per card, run directly on the host — like the sidecars — spawned at gateway boot and per install dry-run). Only when those channels are configured / any deck card is installed. |
+| `node` | Required **for embedded MCP / tool sidecars** (e.g. the browser sidecar) | `baybo-gateway` (`sidecar/embedded_mcp.rs`) | Runs embedded MCP-server sidecar bundles (`node <bundle.mjs>`); located by `baybo_process::HostTool::node()`, overridable via `BAYBO_NODE_BIN`. Only when a tool-sidecar domain (e.g. `browser.enable`) is configured. |
+| `claude` / `codex` | Optional | `baybo-agent` external-agent delegation | Probed on `PATH` at boot; registered only when installed. The `openai-subscription` LLM provider needs **neither** — it reaches the Codex backend over HTTP, so a ChatGPT/Codex subscription is usable with nothing installed. |
 | *(per-skill binaries)* | Per-skill | `baybo-skills` (`registry.rs`) | A skill manifest may declare any required binary; checked at load. |
 
 Build/test-only (not runtime): `cargo`, `pnpm` (web build), `musl-gcc` (bench

@@ -36,6 +36,48 @@ pub(crate) trait QuarantineSink: Send + Sync + 'static {
     async fn quarantine(&self, card_id: &str, reason: &str);
 }
 
+/// What ended one turn of a card's supervision loop.
+enum Outcome {
+    /// Cancelled by us (stop/replace); no restart, no strike.
+    Stopped,
+    /// The card's own service died, or failed the SDK handshake. This is
+    /// what the strike budget exists to bound.
+    Crashed(String),
+    /// The host could not launch the JS runtime at all. Retried forever
+    /// with backoff and never quarantined — see
+    /// [`crate::error::DeckError::HostToolMissing`].
+    HostFault(String),
+}
+
+impl Outcome {
+    /// Why the card is not running, or `None` when we stopped it
+    /// ourselves and there is nothing to report or retry.
+    fn failure(&self) -> Option<&str> {
+        match self {
+            Outcome::Stopped => None,
+            Outcome::Crashed(reason) | Outcome::HostFault(reason) => Some(reason),
+        }
+    }
+
+    /// Whether this turn costs the card a strike.
+    ///
+    /// A host fault never does. The card's code did not run, the same
+    /// fault hits every card on the box, and quarantining fixes none of
+    /// it — it just writes durable state the operator has to undo by
+    /// hand after repairing the host.
+    fn spends_strike(&self) -> bool {
+        matches!(self, Outcome::Crashed(_))
+    }
+}
+
+/// The reason stamped on a quarantined card. The budget running out is
+/// the trigger, not the explanation — carry the failure that actually
+/// caused it, because this string is what the operator sees on the
+/// card's error face and it is the only copy that outlives the log.
+fn quarantine_reason(cause: &str) -> String {
+    format!("crash budget exhausted: {cause}")
+}
+
 struct ServiceEntry {
     slot: Arc<Mutex<Option<ServiceHandle>>>,
     cancel: CancellationToken,
@@ -90,6 +132,12 @@ impl DeckSupervisor {
         let task = tokio::spawn(async move {
             let strikes = Arc::new(StrikeRecorder::default());
             let mut backoff = BACKOFF_MIN;
+            // Why the card is not running right now, in the words the
+            // operator needs. Carried to the quarantine sink so the
+            // stored reason names the actual cause instead of the
+            // budget that ran out, and used to keep a stuck host from
+            // reprinting one identical line every backoff tick.
+            let mut last_failure: Option<String> = None;
             loop {
                 if task_cancel.is_cancelled() {
                     break;
@@ -107,7 +155,7 @@ impl DeckSupervisor {
                 let started = Instant::now();
                 let spawn =
                     spawn_service(cfg, host.clone(), emit_sink.clone(), strikes.clone()).await;
-                let crashed = match spawn {
+                let outcome = match spawn {
                     Ok(RunningService {
                         handle,
                         mut exited,
@@ -115,36 +163,51 @@ impl DeckSupervisor {
                     }) => {
                         *task_slot.lock() = Some(handle);
                         let died = tokio::select! {
-                            code = &mut exited => {
-                                tracing::warn!(card = %card_id, code = ?code, "deck service exited");
-                                true
-                            }
+                            code = &mut exited => Some(format!("service exited ({code:?})")),
                             _ = task_cancel.cancelled() => {
                                 let _ = kill.send(()).await;
                                 let _ = exited.await;
-                                false
+                                None
                             }
                         };
                         *task_slot.lock() = None;
-                        died
+                        match died {
+                            Some(reason) => Outcome::Crashed(reason),
+                            None => Outcome::Stopped,
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(card = %card_id, "deck service spawn failed: {e}");
-                        true
-                    }
+                    // The card's code never loaded, so this says nothing
+                    // about the card — it is the host's fault and every
+                    // card on the box fails identically. Back off and keep
+                    // retrying, but spend no strikes: see
+                    // `DeckError::HostToolMissing`.
+                    Err(e @ DeckError::HostToolMissing(_)) => Outcome::HostFault(e.to_string()),
+                    Err(e) => Outcome::Crashed(e.to_string()),
                 };
-                if !crashed {
+                let Some(failure) = outcome.failure() else {
                     break;
-                }
+                };
                 if started.elapsed() >= STABLE_UPTIME {
                     backoff = BACKOFF_MIN;
+                    // Ran fine for a while first, so this is a fresh
+                    // problem however familiar the text — say so at WARN
+                    // rather than deduping it against hours-old history.
+                    last_failure = None;
                 }
-                if strikes.record_crash() {
+                // A host that stays broken would otherwise reprint the
+                // same line every backoff tick, forever.
+                if last_failure.as_deref() == Some(failure) {
+                    tracing::debug!(card = %card_id, "deck service still down: {failure}");
+                } else {
+                    tracing::warn!(card = %card_id, "deck service down: {failure}");
+                }
+                if outcome.spends_strike() && strikes.record_crash() {
                     quarantine
-                        .quarantine(&card_id, "crash budget exhausted")
+                        .quarantine(&card_id, &quarantine_reason(failure))
                         .await;
                     break;
                 }
+                last_failure = Some(failure.to_string());
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = task_cancel.cancelled() => break,
@@ -205,5 +268,51 @@ impl DeckSupervisor {
         Err(DeckError::ServiceUnavailable(
             "service is not running (disabled, quarantined, or restarting)".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host that cannot launch the JS runtime must never quarantine a
+    /// card. The regression this guards is real and cost a whole deck:
+    /// moving the gateway under systemd changed its `PATH`, `bun` went
+    /// missing, and five retries later every card on the box was
+    /// disabled with `quarantined_at` stamped — durable state no
+    /// operator asked for, describing a fault none of the cards had.
+    #[test]
+    fn host_fault_never_spends_a_strike() {
+        let outcome = Outcome::HostFault("bun is not on PATH".into());
+        assert!(!outcome.spends_strike());
+        assert_eq!(outcome.failure(), Some("bun is not on PATH"));
+    }
+
+    /// The card's own failures are exactly what the budget is for.
+    #[test]
+    fn card_crash_spends_a_strike() {
+        let outcome = Outcome::Crashed("service exited (Some(1))".into());
+        assert!(outcome.spends_strike());
+        assert_eq!(outcome.failure(), Some("service exited (Some(1))"));
+    }
+
+    /// A deliberate stop is not a failure: nothing to log, nothing to
+    /// retry, no strike.
+    #[test]
+    fn deliberate_stop_is_not_a_failure() {
+        assert_eq!(Outcome::Stopped.failure(), None);
+        assert!(!Outcome::Stopped.spends_strike());
+    }
+
+    /// The stored reason must name the cause, not just the trigger.
+    /// "crash budget exhausted" on its own is what the operator reads
+    /// off the card's error face, and it explains nothing.
+    #[test]
+    fn quarantine_reason_carries_the_cause() {
+        let reason = quarantine_reason("failed to launch `bun` (No such file or directory)");
+        assert!(
+            reason.contains("failed to launch `bun`"),
+            "quarantine reason dropped the cause: {reason}"
+        );
     }
 }

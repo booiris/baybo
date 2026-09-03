@@ -43,6 +43,7 @@ pub(crate) mod managed_repo;
 pub mod memory_delete;
 pub mod now;
 pub(crate) mod paths;
+pub mod permission;
 mod put_blob;
 pub mod read;
 mod rg;
@@ -56,7 +57,7 @@ pub mod write;
 pub mod echo;
 
 pub use background_jobs::{JobListTool, JobStopTool};
-pub use bash::{BashPermissionMode, BashTool, LivePermissionMode};
+pub use bash::BashTool;
 #[cfg(debug_assertions)]
 pub use echo::EchoTool;
 pub use edit::EditTool;
@@ -64,6 +65,7 @@ pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use memory_delete::MemoryDeleteTool;
 pub use now::NowTool;
+pub use permission::{LivePermissionMode, PermissionMode};
 pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
@@ -92,7 +94,7 @@ pub struct DefaultToolsConfig {
     pub process_manager: Arc<baybo_process::ProcessManager>,
     pub workspace_paths: WorkspacePaths,
     pub proxy: Option<reqwest::Proxy>,
-    pub permission: Arc<bash::LivePermissionMode>,
+    pub permission: Arc<permission::LivePermissionMode>,
     /// `memory.builtin.enabled`. With built-in memory off nothing ever
     /// mentions a memory directory to the model, so offering it a verb for
     /// tidying one would describe a place that does not exist in its prompt.
@@ -113,16 +115,16 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
         trusted(ReadTool, vec![ToolCapability::ReadFile]),
         trusted(
-            WriteTool::new(workspace_paths.clone()),
+            WriteTool::new(workspace_paths.clone(), Arc::clone(&permission)),
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
-            EditTool::new(workspace_paths.clone()),
+            EditTool::new(workspace_paths.clone(), Arc::clone(&permission)),
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
             BashTool::new(workspace_paths.clone(), Arc::clone(&process_manager))
-                .with_permission_handle(permission),
+                .with_permission_handle(Arc::clone(&permission)),
             vec![ToolCapability::ExecCommand],
         ),
         trusted(
@@ -171,4 +173,44 @@ pub(crate) fn trusted<T: Tool + 'static>(
         channels: Vec::new(),
     };
     (Arc::new(tool), manifest)
+}
+
+/// Fixtures for the one workspace shape the membership tests in this module
+/// tree turn on: a root reached through a symlink.
+///
+/// Shared because three test modules need it and each would otherwise grow
+/// its own subtly different copy — and the subtlety is the whole test. The
+/// directories have to really exist (`absolutise` only resolves what it can
+/// `canonicalize`, so a fixture naming a directory that was never created
+/// takes the fallback branch and both sides keep the spelling they came
+/// with), and the tempdir has to be canonicalised first (`tempfile` can hand
+/// back a path that is itself reached through a link — `/var` on macOS —
+/// which would make the fixture's own symlink indistinguishable from the
+/// platform's).
+#[cfg(test)]
+pub(crate) mod symlinked_root {
+    use baybo_workspace::WorkspacePaths;
+    use std::path::{Path, PathBuf};
+
+    /// A tempdir guard plus its resolved path. Keep the guard alive: dropping
+    /// it deletes the tree.
+    pub(crate) fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().canonicalize().expect("canonical tempdir");
+        (tmp, real)
+    }
+
+    /// A workspace laid out at `<real>/store`, addressed as
+    /// `<real>/home-dot-baybo` — the shape of the release-default
+    /// `$HOME/.baybo` on any host where that is a link. Returns the linked
+    /// spelling, which is what a run is handed and what the model types.
+    pub(crate) fn workspace(real: &Path) -> WorkspacePaths {
+        let store = real.join("store");
+        let laid_out = WorkspacePaths::new(store.clone());
+        std::fs::create_dir_all(laid_out.work_dir()).expect("work dir");
+        std::fs::create_dir_all(laid_out.persona_memory_dir("baybo")).expect("memory dir");
+        let linked = real.join("home-dot-baybo");
+        std::os::unix::fs::symlink(&store, &linked).expect("symlink");
+        WorkspacePaths::new(linked)
+    }
 }
