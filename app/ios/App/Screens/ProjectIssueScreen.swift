@@ -54,7 +54,6 @@ struct ProjectIssueScreen: View {
             guard let run = store.runs.first(where: { $0.attempt == attempt }) else { return }
             show(run)
         }
-        .onChange(of: lang.current.lproj) { _, code in store.setLanguage(code) }
         .onAppear {
             ComposerPasteTarget.shared.attach(store.staging)
         }

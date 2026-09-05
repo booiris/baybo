@@ -257,6 +257,33 @@ delivering other traffic is left alone and only this connect fails.
 `jumpToLatest` / `jumpToMessage` / `outlineLoadOlder` / `requestOutlineHere` /
 `requestSync` / `collapseHtmlPreview` / `flushPersist`.
 
+**Language rides two of those, and the second one is not optional.** Everything
+inside the webview — the copy-confirm pill, the code-block tooltips, the
+work-block labels — is rendered by the bundle's own i18next, so native has to
+say which language to speak. `init` carries it, and `setLanguage` pushes a
+change. For a long time `setLanguage` had NO caller, and `init` is not enough on
+its own: `retarget` skips `deliverInit` when the store is unchanged, which is
+exactly what re-entering the SAME conversation does — so an EN/中 toggle
+re-rendered every native string on the screen and left the transcript speaking
+the old language until the reader opened a different chat.
+
+The watch lives on the **bridge** (`TranscriptBridge.init` subscribes to
+`Lang.shared.$code`), not on the screen, and that placement is the point: three
+screens own a `TranscriptBridge` — the chat, the subagent child transcript, and
+a project run — so a `.onChange` on one of them fixes one webview and leaves the
+next author to remember. `DeckBridge` carries the same watch for the same
+reason, and there the failure was the mirror image: its push lived in
+`DeckContent.body`, which has not necessarily ever run, because the deck shell
+is prewarmed at home. `dropFirst()` on both, since `init` already carries the
+current value.
+
+Two things this does NOT reach, because they are frozen at mint time rather than
+translated at render: the compaction status line inside a work block
+(`pushWorkStep` stores the rendered string) and client-minted notice rows
+(`appendNotice` takes an already-rendered sentence). Both are persisted into the
+mirror, so they keep their original language across cold opens forever. Fixing
+either means storing the KEY beside the text and re-resolving at render.
+
 **web→native:**
 `ready` / `shown` / `sync` / `mark_read` / `persist` (`stateJson`, stringified in the
 WebContent process) / `fetchHistory` / `requestBlob` /
@@ -619,6 +646,19 @@ layout/paint containment, so it otherwise becomes the containing block for the
 viewport and cannot reach the screen bottom. The exception is scoped with
 `:has(.html-preview.is-maximized)` to that one row; every other offscreen row
 keeps its rendering containment.
+
+**Paint containment is the general trap, and it applies while the row is on
+screen too**: it clips the row to its own box, so anything a row deliberately
+paints OUTSIDE itself is erased — correct node, correct rect, no pixels. Two
+marks do exactly that and were both silently gone until
+`:has(.copy-toast, .jump-ring)` gave them the same one-row opt-out: the copy
+pill (which hangs above the bubble, or below it near the top of the scroll)
+painted nothing at all in its default placement and kept only ~7px of 19px when
+flipped below, and the jump ring's `inset: -4px` paper channel lost its top and
+right edges on a user row and the entire ring on an assistant one. Any future
+mark that hangs outside its row needs the same treatment, and only a PIXEL
+assertion can catch its absence — `CopyPillUITests` reads ink out of the band
+above the bubble for precisely that reason.
 
 Two ways out, both the same morph home:
 

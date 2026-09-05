@@ -19,9 +19,18 @@ enum PushKeyStore {
 
     /// The keychain access group. MUST match the `keychain-access-groups`
     /// entitlement shared by the app target and this extension target.
+    ///
+    /// Rejects a value beginning with `.` for the same reason the Rust core's
+    /// `access_group_rule::resolve` does, and it has to be the SAME rule on both
+    /// sides: signing is what expands `$(AppIdentifierPrefix)`, so an unsigned
+    /// build leaves a bare leading dot in this key. Taking that literally while
+    /// the app falls back to its compiled group puts the writer and the reader in
+    /// different groups — and the miss then reports as `absent`, which is
+    /// documented as a steady state rather than a fault, so a broken unsigned
+    /// build looks exactly like one that was simply never paired.
     static var accessGroup: String? {
         guard let value = Bundle.main.object(forInfoDictionaryKey: accessGroupInfoKey) as? String,
-              !value.isEmpty
+              !value.isEmpty, !value.hasPrefix(".")
         else {
             return nil
         }

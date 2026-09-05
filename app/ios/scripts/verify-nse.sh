@@ -111,9 +111,17 @@ grep -E 'error|warning: |BUILD' "$XCLOG" || true
 [ -d "$APP" ] || { echo "✗ built app not found at $APP"; exit 1; }
 [ -d "$APP/$APPEX" ] || { echo "✗ NSE appex not embedded at $APP/$APPEX"; exit 1; }
 
-# With signing disabled, $(AppIdentifierPrefix) expands to nothing, so the NSE's
-# BayboKeychainAccessGroup Info.plist key (its runtime access-group lookup)
-# would read "com.baybo.app" — patch both plists to the real group.
+# READ the id off the app rather than naming it: a Debug build carries the
+# `.dev` sibling id (project.yml's BAYBO_BUNDLE_ID), and a hardcoded
+# com.baybo.app here would drive simctl at whatever OTHER Baybo is installed.
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist")"
+[ -n "$BUNDLE_ID" ] || { echo "✗ could not read CFBundleIdentifier from $APP/Info.plist"; exit 1; }
+echo "▸ bundle id: $BUNDLE_ID"
+
+# With signing disabled, $(AppIdentifierPrefix) expands to nothing, so the
+# BayboKeychainAccessGroup key would read as a bare ".<bundle id>". BOTH sides
+# read it now — the NSE for its lookup, and the Rust core for the group it
+# writes the push key to — so patch both plists to the real group.
 for PLIST in "$APP/Info.plist" "$APP/$APPEX/Info.plist"; do
   /usr/libexec/PlistBuddy -c "Set :BayboKeychainAccessGroup $KEYCHAIN_GROUP" "$PLIST" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Add :BayboKeychainAccessGroup string $KEYCHAIN_GROUP" "$PLIST"
@@ -152,10 +160,10 @@ UDID="${BAYBO_SIM_UDID:-$(xcrun simctl create baybo-verify \
 xcrun simctl boot "$UDID" 2>/dev/null || true
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
-xcrun simctl uninstall "$UDID" com.baybo.app 2>/dev/null || true
+xcrun simctl uninstall "$UDID" "$BUNDLE_ID" 2>/dev/null || true
 xcrun simctl install "$UDID" "$APP"
 echo "▸ installed; launching with the fixture seed…"
-if ! SIMCTL_CHILD_BAYBO_SEED_PUSH_KEY="$BID:$KEY" xcrun simctl launch "$UDID" com.baybo.app >/dev/null 2>&1; then
+if ! SIMCTL_CHILD_BAYBO_SEED_PUSH_KEY="$BID:$KEY" xcrun simctl launch "$UDID" "$BUNDLE_ID" >/dev/null 2>&1; then
   cat <<'GUIDE'
 
 ✗ The app would not launch — the simulator rejects the App Group entitlement
@@ -177,7 +185,7 @@ GUIDE
   exit 1
 fi
 
-DATA="$(xcrun simctl get_app_container "$UDID" com.baybo.app data)"
+DATA="$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)"
 for _ in $(seq 1 10); do [ -f "$DATA/tmp/baybo-seed-result.txt" ] && break; sleep 1; done
 echo "▸ keychain self-check: $(cat "$DATA/tmp/baybo-seed-result.txt" 2>/dev/null || echo '(missing)')"
 echo "  (expected: store=ok readback=match)"
@@ -186,8 +194,8 @@ PAYLOAD="$(mktemp -t baybo-push).json"
 cat > "$PAYLOAD" <<JSON
 {"aps":{"alert":{"title":"New message","body":"Open Baybo"},"mutable-content":1},"enc":"$ENC","n":"$NONCE_B64","bid":"$BID"}
 JSON
-xcrun simctl terminate "$UDID" com.baybo.app 2>/dev/null || true
-xcrun simctl push "$UDID" com.baybo.app "$PAYLOAD"
+xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
+xcrun simctl push "$UDID" "$BUNDLE_ID" "$PAYLOAD"
 open -a Simulator
 echo
 echo "▸ Open Notification Center on the simulator (swipe down from the top, or the"

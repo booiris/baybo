@@ -41,9 +41,6 @@ private struct DeckContent: View {
             // card that's expanded); see `header`.
             header
         }
-        .onChange(of: lang.code) { _, code in
-            host.bridge.setLanguage(code)
-        }
         .alert(
             Text(verbatim: lang.t("deck.deleteTitle")),
             isPresented: Binding(

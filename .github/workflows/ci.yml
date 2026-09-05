@@ -481,7 +481,16 @@ jobs:
     # price of the gate having no hole where the wire contract lives; narrow the
     # filter before narrowing this.
     if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
-    timeout-minutes: 40
+    # Sized from what the job actually does, because "non-gating" was not true:
+    # the UI smokes take ~30 min on their own (29m22s on the last green master
+    # run) and the gating half — xcframework, bundle, build-for-testing,
+    # BayboTests — plus the post steps is ~11 more. That left ~3 minutes of head
+    # room under a 40 cap, so the next test anyone added anywhere went over, the
+    # JOB hit its timeout mid-smoke, and a job timeout CANCELS rather than fails
+    # — which `continue-on-error` on the step does not absorb. The gating half
+    # had already passed and reported red anyway.
+    # So the step below carries its own cap and this one only has to clear it.
+    timeout-minutes: 50
     defaults:
       run:
         working-directory: app/ios
@@ -581,6 +590,13 @@ jobs:
       # the 5 macOS slots, to run 4 minutes of tests it already has the built
       # products for.
       - name: UI smokes (non-gating)
+        # What makes the label true. A STEP that overruns fails the step, which
+        # `continue-on-error` swallows; only a JOB overrun cancels, and a
+        # cancelled job reports red no matter what already passed inside it. Set
+        # below the job's cap so the smokes can never take the gating result with
+        # them. If this fires, the smokes are the thing to make cheaper — raising
+        # it just moves the same wall.
+        timeout-minutes: 35
         continue-on-error: true
         run: |
           set -o pipefail

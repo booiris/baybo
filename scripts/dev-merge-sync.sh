@@ -28,16 +28,21 @@ set -euo pipefail
 # checks would not save us either: a skipped check counts as SATISFIED, which is
 # the same hole. (The repo is public now, so rulesets ARE available and one is
 # active on master — "Protect master": no deletion, no force-push, PR required
-# with 1 approval. It carries no required-status-checks rule, and the owner is a
-# bypass actor so a solo merge is not blocked on a second reviewer. None of that
-# checks CI; this list is still the only thing that does.)
+# with 1 approval. It carries no required-status-checks rule, so it does not
+# check CI either; this list is still the only thing that does. The owner IS a
+# bypass actor with `bypass_mode: always` — but `gh pr merge` does not exercise
+# that bypass unless it is handed `--admin`, and GitHub forbids approving your
+# own PR, so the merge below stops on "the base branch policy prohibits the
+# merge" and finishing a solo ship is a deliberate manual step. Left that way on
+# purpose: stepping over branch protection should be a decision made each time,
+# not a flag this script carries.)
 #
 # Deliberately not required: "detect changes" (a path-filter helper for the
 # other jobs) and "tmux render tests (non-gating)" (named non-gating; flaky
 # under load, and conditional).
 #
-# The three iOS jobs ARE required, but only when this PR should have run them —
-# see the path filters below.
+# The three iOS jobs and the install.sh job ARE required, but only when this PR
+# should have run them — see the path filters below.
 REQUIRED_CHECKS=(
   "rustfmt"
   "clippy"
@@ -59,6 +64,15 @@ REQUIRED_CHECKS=(
 # app/ios runs the two Linux jobs but never queues for the Mac one.
 IOS_DEPS_PATTERN='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
 IOS_NATIVE_PATTERN='^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/'
+
+# Same shape, same reason, for the install/release shell stack — and the sharper
+# edge of the two: `install.sh` is the only user-facing file no other gate can
+# run (before a release exists it has nothing to install, and release.yml is
+# dispatch-only), so its container matrix is the only thing between a broken
+# one-liner and every new user. MUST mirror the `install` filter in
+# .github/workflows/ci.yml. `deploy/docker/Dockerfile` belongs to it because
+# release-build.sh reads the node/bun/pnpm pins out of that file.
+INSTALL_PATTERN='^(install\.sh|scripts/(release-build|test-install)\.sh|\.github/workflows/release\.yml|deploy/docker/Dockerfile)$'
 
 BASE="master"
 ASSUME_YES=0
@@ -95,6 +109,10 @@ fi
 if printf '%s\n' "$CHANGED" | grep -qE "$IOS_NATIVE_PATTERN"; then
   REQUIRED_CHECKS+=("iOS app (build + unit tests; UI smokes non-gating)")
   echo "==> diff touches the Swift/ffi half: requiring the macOS iOS check"
+fi
+if printf '%s\n' "$CHANGED" | grep -qE "$INSTALL_PATTERN"; then
+  REQUIRED_CHECKS+=("install.sh (shellcheck + container matrix)")
+  echo "==> diff touches the install/release shell stack: requiring the install.sh check"
 fi
 
 git push -u origin "$DEV"

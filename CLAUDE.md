@@ -94,6 +94,28 @@ Cargo.toml first"*, so a hand-pushed `vX.Y.Z` is precisely the thing that stops
 Bumping it is a normal PR — and it moves 40 `Cargo.lock` entries with it, so
 refresh the lockfile in the same commit.
 
+**The version is an input to three generated files, and the bump commit has to
+carry all of them:**
+
+```bash
+cargo update -w                                                     # root Cargo.lock
+(cd app/ios && cargo update -w)                                     # app/ios is its OWN workspace
+UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync   # docs/openapi.json info.version
+```
+
+0.1.1 shipped without the second and third, and both landed on master:
+`docs/openapi.json` still said `0.1.0`, and `app/ios/Cargo.lock` still pinned the
+old crate versions, where `--locked` refuses to update it. They fail on the NEXT
+PR that touches those paths rather than on the release PR, which is what makes
+this worth a checklist rather than a habit:
+
+- `openapi_json_is_in_sync` DID fail on the release PR (#314's `cargo test` is
+  red in the record) and it was merged anyway. A red gating check on a release PR
+  is the signal, not noise.
+- `ios-core` could not have caught its half at all: it is path-filtered on
+  `IOS_DEPS`, which a commit touching only `CLAUDE.md` / `Cargo.toml` /
+  `Cargo.lock` never matches, so the job never ran.
+
 Cutting a release, in order:
 
 ```bash

@@ -521,8 +521,10 @@ without touching `app/ios` at all.
   screenshot-verifiable (each thread must show ONLY its own tag; the `demo-b`
   screenshot showing any `demo-a` text is a cross-session bleed). NOTE: the demo
   ids are fixed, so the persisted transcript mirror ACCUMULATES across runs —
-  `simctl uninstall com.baybo.app` (wipes the data container) before a clean
-  single-turn check.
+  `simctl uninstall com.baybo.app.dev` (wipes the data container) before a
+  clean single-turn check — `.dev` because every local configuration carries the
+  sibling id, and only `Distribution` is `com.baybo.app` (see the root
+  [`CLAUDE.md`](../CLAUDE.md) § Local vs shipped identity).
 
 `app/ios/scripts/build-app.sh` pins products at
 `build/DerivedData/Build/Products/<config>-<sdk>/Baybo.app` for `simctl install`.

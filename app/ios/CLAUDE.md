@@ -64,11 +64,21 @@ shim for one, and don't cite one as a reason for anything. Breaking any bullet
 below silently loses a real user's device identity, pairing, and push key — no
 error they can act on, no way back but a re-pair.
 
+Every clause is about the **shipped** identity, which only the `Distribution`
+configuration builds — `scripts/release.mjs` is alone in building it, and it
+re-asserts the whole identity against the exported ipa. `Debug` and `Release`
+carry a `.dev` sibling instead (`BAYBO_BUNDLE_ID` in `project.yml`), so a local
+`node scripts/install.mjs` lands **beside** the App Store app rather than
+replacing it; see [Local vs shipped identity](#local-vs-shipped-identity) below.
+
 - Bundle ids `com.baybo.app` / `com.baybo.app.NotificationExtension`; team
   `KLK5BP5YS6`.
 - `keychain-access-groups`: `$(AppIdentifierPrefix)com.baybo.app` stays the
   FIRST (only) entry — the five app-private keychain items live in the default
-  group, which is the first entitlement entry.
+  group, which is the first entitlement entry — and the list stays ONE entry,
+  because a groupless query searches every ENTITLED group, not just the default
+  one. A second entry would let whatever holds it read and delete the other
+  app's items.
 - Keychain items set **no `kSecAttrService`** (a query with any service string
   finds nothing). Accounts: `baybo.push-key.<bid>` (shared group,
   AfterFirstUnlock), `baybo.paired-gateway`, `baybo.device-identity`,
@@ -76,7 +86,11 @@ error they can act on, no way back but a re-pair.
   `baybo.active-binding` (all ThisDeviceOnly). What is frozen in
   `ffi/src/keychain.rs` is every input to item IDENTITY — account names, the
   absent `kSecAttrService`, the access group, the accessibility class. Change one
-  and an existing install stops finding its own items. (Error handling is not
+  and an existing install stops finding its own items. What is frozen is the
+  VALUE, not where it is read from: the group moved from a compile-time constant
+  to the app's own `BayboKeychainAccessGroup` Info key, and the shipped app
+  resolves the same string it always did (see
+  [Local vs shipped identity](#local-vs-shipped-identity)). (Error handling is not
   identity and is fair game: a read distinguishes `errSecItemNotFound` from a
   failure precisely so a transient one can't be mistaken for absence — see
   `classify_read`.)
@@ -101,6 +115,65 @@ error they can act on, no way back but a re-pair.
   `BayboApnsEnvironment` Info key, which Swift passes through
   `ClientConfig.apnsEnv`. Never infer it from Swift `DEBUG` or Rust
   `cfg!(debug_assertions)` — optimization and signing environment are independent.
+
+### Local vs shipped identity
+
+`BAYBO_BUNDLE_ID` in `project.yml` is the one switch: `com.baybo.app` under
+`Distribution`, `com.baybo.app.dev` everywhere else, with `BAYBO_DISPLAY_NAME`
+following it so the two are told apart on the home screen. It reaches the app's
+bundle id, the NSE's, the `keychain-access-groups` entitlement on both, and the
+`BayboKeychainAccessGroup` Info key on both — one variable, and every identity
+downstream of it moves together.
+
+**The keychain group is resolved at RUNTIME, off that Info key, and it has to
+be.** One xcframework serves every configuration, so a group compiled into the
+core (`option_env!`, which is what this used to be) can only ever name one app.
+That leaves no good option for a build with a different bundle id: entitle it to
+the shipped group and it can store its push key — but every app-private item
+goes through a query with NO access group, and a groupless query searches every
+group the app is entitled to, so it would also read the shipped install's device
+identity, pairing and sign key, and delete them on its next unpair. Entitle it
+only to its own group and `store_push_key` fails, which aborts pairing outright
+(`persist push key` is a `?`). Reading the group off the app's own Info key —
+which is how the NSE has always found it — removes the choice: each build sits
+in exactly one group of its own, and the shipped app resolves the identical
+value it always has. `ffi/build.rs`'s baked-in value survives as the fallback
+for embedders with no USABLE key — host tests, and any unsigned build, where
+`$(AppIdentifierPrefix)` never expanded and the key is a bare leading dot.
+(`verify-nse.sh` is not one of those: it patches the key in both plists so the
+runtime path is what it tests.)
+`keychain::access_group_rule` is that decision as a pure function, pinned by
+host tests including the unsigned-build case where `$(AppIdentifierPrefix)`
+never expanded.
+
+Everything else is deliberately NOT per-configuration: the app group
+`group.com.baybo.app`, the keychain account names, and the push payload
+contract are identical in both.
+
+Two things a local build needs that a shipped one does not:
+
+- **`-allowProvisioningUpdates`** on every device-signing `xcodebuild`
+  (`scripts/install.mjs`, and `build-app.sh`'s `--device` path). The local
+  bundle id is an App ID that does not exist until someone builds it, and its
+  Push Notifications + App Groups capabilities have to be registered; without
+  the flag xcodebuild may not reach the portal, falls back to the team wildcard
+  profile, and dies with *"doesn't include the App Groups capability"* before it
+  compiles anything. The first such build needs a signed-in Apple ID and may
+  prompt for 2FA, so run it from a GUI session. Simulator builds sign locally
+  and never consult a profile.
+- **Nothing carried over.** The local app is a fresh install: its own container,
+  its own keychain group, not signed in, not paired. Push to it needs the
+  relay's APNs `topic` pointed at the `.dev` id, and a relay serves one topic,
+  so push works on one of the two at a time.
+
+A phone that has been carrying local builds under `com.baybo.app` is holding the
+App Store app's slot: delete that one and install from the App Store to get the
+real app back.
+
+`scripts/release.mjs` re-asserts the whole shipped identity — bundle ids,
+display name, the Info key's group, and that the SIGNED entitlement carries
+exactly one keychain group — against the archive and the exported ipa, so none
+of this can travel the wrong way.
 
 ## Docs
 
