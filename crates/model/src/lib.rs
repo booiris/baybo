@@ -66,7 +66,7 @@ pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundNotificationDelivery, BackgroundNotificationGroup, BackgroundNotificationState,
     ChannelType, Lineage, LineageKind, MAX_SESSION_TITLE_LEN, Session, SessionState, TriggerKind,
-    TriggerSource, User,
+    TriggerSource, User, cap_session_title, collapse_session_title,
 };
 pub use spawn_protocol::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_DISPATCH_YIELD_GUIDANCE,

@@ -398,6 +398,36 @@ pub struct Session {
 /// so both writers land the same shape.
 pub const MAX_SESSION_TITLE_LEN: usize = 80;
 
+/// Collapse a conversation title's whitespace: interior runs become one space,
+/// the ends are trimmed.
+///
+/// Here rather than in either caller because both the gateway and the phone
+/// clients have to agree on the answer, and they use it for different things.
+/// `baybo_session`'s `validate_session_title` collapses and then REJECTS what
+/// is left if it is empty or too long; the mobile core collapses and then
+/// TRUNCATES, because it is keeping the user from typing into a rejection while
+/// rendering the same value optimistically. Two policies, one notion of what a
+/// title's whitespace means — a title is drawn on one line everywhere, so a
+/// stored `\n` only ever surfaces as a layout bug on whichever surface forgot
+/// to strip it.
+pub fn collapse_session_title(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Clip a title to [`MAX_SESSION_TITLE_LEN`], counted in Unicode scalars.
+///
+/// Scalars, not grapheme clusters, and that is the interop detail: Rust's
+/// `chars()` yields scalars and Swift's `unicodeScalars` counts them, so a CJK
+/// or emoji title agrees with the server about where the cap falls. Counting
+/// Swift's default `String.count` (grapheme clusters) instead would let a
+/// flag-emoji title pass the client and fail the server.
+pub fn cap_session_title(title: &str) -> String {
+    if title.chars().count() <= MAX_SESSION_TITLE_LEN {
+        return title.to_string();
+    }
+    title.chars().take(MAX_SESSION_TITLE_LEN).collect()
+}
+
 impl Session {
     /// Whether a background job's completion notification could land here —
     /// the **session** half of the background-job gate (detached subagents

@@ -83,12 +83,13 @@ fn validate_folder_name(name: String) -> Result<String> {
 
 /// Normalize and bound a user-submitted conversation title.
 ///
-/// Collapses interior whitespace the same way the auto-titler's `sanitize_title`
-/// does, so a renamed conversation and a generated one hold the same shape — a
-/// title is rendered on one line in every client, and a stored `\n` would only
-/// show up as a layout bug on whichever surface forgets to strip it.
+/// The collapse itself is `baybo_model::collapse_session_title`, shared with the
+/// phone clients so the value they render optimistically is the value this
+/// stores. What stays here is the POLICY: the server rejects an empty or
+/// over-long title, where a client truncates rather than letting the user type
+/// into a rejection.
 fn validate_session_title(title: String) -> Result<String> {
-    let collapsed = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = baybo_model::collapse_session_title(&title);
     if collapsed.is_empty() {
         return Err(SessionError::InvalidArgument(
             "conversation title cannot be empty".to_owned(),

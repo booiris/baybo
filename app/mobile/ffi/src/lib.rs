@@ -25,6 +25,7 @@ mod relay;
 mod runtime;
 mod secure_store;
 mod server_cache;
+mod stores;
 mod tls;
 mod transport;
 
