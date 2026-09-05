@@ -161,12 +161,15 @@ mod tests {
         assert!(!waiter.is_finished());
 
         drop(guard); // turn settled → deregistered
-        tokio::time::sleep(Duration::from_millis(30)).await; // > IDLE_POLL_INTERVAL
-        assert!(
-            waiter.is_finished(),
-            "wait must resolve once the guard drops"
-        );
-        waiter.await.expect("waiter task");
+        // Await the waiter under a generous ceiling rather than sleeping one
+        // poll interval and asserting `is_finished`. The sleep above is a
+        // different thing and stays: it asserts the waiter has NOT resolved, so
+        // it is correctly bounded. This one asserts it DOES, and a fixed budget
+        // for that only has to lose once on a loaded runner.
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("wait must resolve once the guard drops")
+            .expect("waiter task");
     }
 
     #[tokio::test]

@@ -257,7 +257,7 @@ struct DeckStoreTests {
         store.requestPick(id: "a", cardId: "c1", accept: "application/pdf")
         #expect(store.consumePick()?.id == "a")
         store.finishFilePick(id: "a", cardId: "c1", url: url)
-        try await Task.sleep(nanoseconds: 60_000_000)
+        await store.pickUploadTask?.value
 
         // The bytes rode the PATH, and the card id is what makes the blob
         // `deck:<card>` — reclaimable at purge instead of an immortal device:*.
@@ -287,7 +287,7 @@ struct DeckStoreTests {
         store.requestPick(id: "a", cardId: "c1", accept: "*/*")
         #expect(store.consumePick()?.id == "a")
         store.finishFilePick(id: "a", cardId: "c1", url: url)
-        try await Task.sleep(nanoseconds: 60_000_000)
+        await store.pickUploadTask?.value
         #expect(fake.deckFileUploadCalls.first?.mimeType == DeckStore.defaultBlobMime)
     }
 
@@ -310,7 +310,7 @@ struct DeckStoreTests {
         fake.cachedBlobs[blobId] = bytes
         let store = makeStore(fake)
         store.requestShare(blobId: blobId, filename: "note.txt", contentType: "text/plain")
-        try await Task.sleep(nanoseconds: 60_000_000)  // fetch + materialize
+        await store.shareTask?.value
         let url = try #require(store.shareItem?.url)
         #expect(url.lastPathComponent == "note.txt")
         #expect(FileManager.default.fileExists(atPath: url.path))

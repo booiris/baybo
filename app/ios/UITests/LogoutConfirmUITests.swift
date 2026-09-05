@@ -20,12 +20,12 @@ final class LogoutConfirmUITests: BayboUITestCase {
         let cancel = app.buttons["Cancel"]
         XCTAssertTrue(cancel.waitForExistence(timeout: 3), "confirm did not present")
 
-        // Scrim tap: the top strip is always outside the centered card. Let the
-        // entrance grace period lapse first — inside it scrim taps are ignored.
-        Thread.sleep(forTimeInterval: 0.6)
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)).tap()
-        XCTAssertTrue(
-            cancel.waitForNonExistence(timeout: 3), "scrim tap did not cancel")
+        // Scrim tap: the top strip is always outside the centered card. Taps
+        // inside the entrance grace are swallowed, so tap until one takes rather
+        // than sleeping past a deadline measured on the wrong clock.
+        tapUntilGone(cancel) {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)).tap()
+        }
 
         logoutPill.tap()
         XCTAssertTrue(
@@ -117,13 +117,16 @@ final class LogoutConfirmUITests: BayboUITestCase {
         logoutPill.tap()
         let cancel = app.buttons["Cancel"]
         XCTAssertTrue(cancel.waitForExistence(timeout: 3), "confirm did not present")
-        Thread.sleep(forTimeInterval: 0.6)
 
         // Tap the Chats tab item's own center. The scrim owns the whole field,
         // so this reads as a scrim-cancel — the dialog closes — but it must
-        // NOT reach the bar: the section stays Settings.
-        app.coordinate(withNormalizedOffset: .zero)
-            .withOffset(CGVector(dx: chatsCenter.x, dy: chatsCenter.y)).tap()
+        // NOT reach the bar: the section stays Settings. Every tap before the
+        // scrim arms is swallowed and reaches nothing either, so retrying keeps
+        // that claim intact.
+        tapUntilGone(cancel) {
+            app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: chatsCenter.x, dy: chatsCenter.y)).tap()
+        }
         XCTAssertTrue(cancel.waitForNonExistence(timeout: 3), "scrim tap did not cancel")
         XCTAssertTrue(
             logoutPill.waitForExistence(timeout: 2),

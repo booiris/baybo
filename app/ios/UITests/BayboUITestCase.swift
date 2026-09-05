@@ -114,6 +114,29 @@ class BayboUITestCase: XCTestCase {
             "the demo download drive never reached ready")
     }
 
+    /// Repeat a tap until it takes, instead of sleeping until it should.
+    ///
+    /// `ConfirmDialog` swallows scrim taps for its first `scrimGraceMs` (400) so
+    /// a dialog the user never saw cannot be cancelled by the tap that opened
+    /// it — an early tap only pulses. Sleeping 600ms past that compared two
+    /// different clocks: the sleep starts when XCUITest OBSERVED the Cancel
+    /// button, an accessibility round trip after the dialog's `.task` actually
+    /// armed, and 200ms of margin does not survive a runner this class already
+    /// documents as several times slower than a dev Mac. Retrying costs nothing
+    /// when the first tap lands, and the ceiling does the waiting — the same
+    /// bargain `waitForDemoDownload` makes above.
+    func tapUntilGone(
+        _ element: XCUIElement, timeout: TimeInterval = 10,
+        file: StaticString = #filePath, line: UInt = #line, _ tap: () -> Void
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            tap()
+            if element.waitForNonExistence(timeout: 0.5) { return }
+        } while Date() < deadline
+        XCTFail("the repeated tap never dismissed the element", file: file, line: line)
+    }
+
     /// What a screenshot actually PAINTS, which every other assertion in these
     /// suites is blind to: they read `exists` / `isHittable` / frames, all of
     /// which a laid-out-but-invisible element satisfies perfectly (see the

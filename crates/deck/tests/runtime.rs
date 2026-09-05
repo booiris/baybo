@@ -994,13 +994,20 @@ export function start(ctx) {
     );
     let card = h.manager.install(staged.path()).await.unwrap().card;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let view = h.manager.deck_view().await.unwrap();
-    let snapshot = view
-        .snapshots
-        .iter()
-        .find(|row| row.card_id == card.id)
-        .unwrap();
+    // Poll like the sibling case above rather than betting 500ms is enough for a
+    // resident service to emit, be rejected, and have the rejection stored.
+    let mut snapshot = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let view = h.manager.deck_view().await.unwrap();
+        if let Some(row) = view.snapshots.iter().find(|row| row.card_id == card.id)
+            && row.seq > 1
+        {
+            snapshot = Some(row.clone());
+            break;
+        }
+    }
+    let snapshot = snapshot.expect("the rejection never landed as a snapshot");
     assert_ne!(
         snapshot.payload, r#"{"tick":"bad"}"#,
         "an off-schema emit must never become the card's data"
