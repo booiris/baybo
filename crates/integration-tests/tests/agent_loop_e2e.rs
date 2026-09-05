@@ -1342,7 +1342,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         })
         .expect("text block on notice");
     assert!(
-        text.contains("<background_results>"),
+        text.contains(r#"<background_results count="1">"#),
         "XML notice missing: {text}"
     );
     assert!(text.contains("bg-42"));
@@ -1457,7 +1457,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         .iter()
         .find(|row| {
             row.message.content.iter().any(|block| {
-                matches!(block, ContentBlock::Text(text) if text.contains("<background_results>"))
+                matches!(block, ContentBlock::Text(text) if text.contains("<background_results"))
             })
         })
         .map(|row| row.ordinal)
@@ -1495,6 +1495,131 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         )),
         "proactive reply must reach the channel"
     );
+
+    harness.shutdown().await;
+}
+
+/// Several **ungrouped** results draining into one turn is the shape production
+/// actually produces — a fan-out whose members each cross the foreground wait
+/// and convert, then finish while a user turn is running. Every other
+/// multi-result case here goes through a group barrier, and grouped spawns can
+/// never reach this path (`spawn_subagent` forces `background` when a `group`
+/// is set), so without this test the batch framing has no coverage at all.
+#[tokio::test(start_paused = true)]
+async fn several_ungrouped_results_drain_into_one_batch_framed_with_its_count() {
+    let cap = capture_tracing();
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    harness.stub_llm.push_stream(vec![StreamEvent::Text(
+        "## 1. trace the empty patch\none topic only".into(),
+    )]);
+
+    let labels = [
+        "trace the empty patch",
+        "trace the regression",
+        "trace sympy",
+    ];
+    for (index, label) in labels.iter().enumerate() {
+        harness
+            .mailbox
+            .send(AgentMessage::BackgroundJobFinished(Box::new(
+                PendingBackgroundResult::subagent(
+                    format!("bg-{index}"),
+                    "explorer",
+                    *label,
+                    SessionId::from(format!("child-{index}")),
+                    format!("{label}: findings"),
+                    SubagentExitStatus::Completed,
+                ),
+            )))
+            .await
+            .expect("inject BackgroundJobFinished");
+    }
+
+    let outputs = harness.drain_outputs(Duration::from_millis(500)).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(
+        captured.len(),
+        1,
+        "three results queued behind each other must land in ONE notification turn"
+    );
+    let text = captured[0]
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .and_then(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+        })
+        .expect("user-role notice present");
+    assert!(text.contains(r#"<background_results count="3">"#), "{text}");
+    assert!(text.contains("3 background tasks finished"), "{text}");
+    assert!(
+        text.contains("Return exactly 3 Markdown sections"),
+        "{text}"
+    );
+    for label in labels {
+        assert!(text.contains(label), "batch dropped {label}: {text}");
+    }
+    assert!(
+        outputs.iter().any(|output| matches!(
+            &output.event,
+            AgentEvent::Notice { text, .. }
+                if text == "Background work has finished. I'm reviewing the 3 results now."
+        )),
+        "the acknowledgement must state the same count as the batch framing: {outputs:?}"
+    );
+
+    // The reply provided the required heading for one of the three, which is
+    // exactly what settles the whole batch today: `is_blank_reply` is the only
+    // gate, and a partial report passes it. The ledger clears regardless — the
+    // audit warns, it does not re-deliver.
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present");
+    assert!(
+        stored
+            .state
+            .background_notifications
+            .active_delivery
+            .is_none(),
+        "a partial report still settles the batch"
+    );
+    assert!(
+        stored
+            .state
+            .background_notifications
+            .buffered_results
+            .is_empty()
+    );
+    let coverage_warn = cap
+        .at_level(Level::WARN)
+        .into_iter()
+        .find(|event| event.message.contains("omitted required result sections"))
+        .expect("partial report must emit a coverage warning");
+    assert!(
+        coverage_warn
+            .fields
+            .iter()
+            .any(|(name, value)| name == "unreported_indices" && value == "[2, 3]"),
+        "coverage warning must identify only the omitted indices: {coverage_warn:?}"
+    );
+    for label in labels {
+        assert!(
+            !coverage_warn
+                .fields
+                .iter()
+                .any(|(_, value)| value.contains(label)),
+            "coverage warning leaked task label {label:?}: {coverage_warn:?}"
+        );
+    }
 
     harness.shutdown().await;
 }
@@ -2098,6 +2223,7 @@ async fn completed_user_turn_settles_open_ledger_without_a_retry() {
     // cue. Settlement keys off the actor's own knowledge that the turn
     // COMPLETED — transcript rows can't carry that (a failed turn's salvage
     // row is indistinguishable from a delivered final reply).
+    let cap = capture_tracing();
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
@@ -2106,9 +2232,9 @@ async fn completed_user_turn_settles_open_ledger_without_a_retry() {
         .push_stream_results(vec![Err(LlmError::Internal(anyhow::anyhow!(
             "provider blip"
         )))]);
-    harness
-        .stub_llm
-        .push_stream(vec![StreamEvent::Text("answering you".into())]);
+    harness.stub_llm.push_stream(vec![StreamEvent::Text(
+        "## 1. find X\nanswering you".into(),
+    )]);
 
     harness
         .mailbox
@@ -2124,6 +2250,20 @@ async fn completed_user_turn_settles_open_ledger_without_a_retry() {
         )))
         .await
         .expect("inject BackgroundJobFinished");
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-settle-2",
+                "explorer",
+                "find Y",
+                SessionId::from("child-S2"),
+                "found Y",
+                SubagentExitStatus::Completed,
+            ),
+        )))
+        .await
+        .expect("inject second BackgroundJobFinished");
     harness.drain_outputs(Duration::from_millis(300)).await;
 
     harness.send_text("hello?").await.expect("user turn");
@@ -2157,6 +2297,18 @@ async fn completed_user_turn_settles_open_ledger_without_a_retry() {
     assert_eq!(
         replies, 1,
         "exactly one reply (the user turn's), no duplicate report"
+    );
+    let coverage_warn = cap
+        .at_level(Level::WARN)
+        .into_iter()
+        .find(|event| event.message.contains("omitted required result sections"))
+        .expect("the passive user-turn settlement must run the coverage audit");
+    assert!(
+        coverage_warn
+            .fields
+            .iter()
+            .any(|(name, value)| name == "unreported_indices" && value == "[2]"),
+        "passive settlement must identify the omitted second result: {coverage_warn:?}"
     );
 
     harness.shutdown().await;

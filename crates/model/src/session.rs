@@ -674,6 +674,15 @@ pub struct BackgroundNotificationDelivery {
     /// while this batch is awaiting retry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handle_ids: Vec<String>,
+    /// Task labels this batch carries, in prompt order — the audit counterpart
+    /// to `handle_ids`. A handle never appears in user-facing prose, so it
+    /// cannot answer "did the analysed report account for every result this
+    /// delivery settles"; the labels let the framing require and audit one
+    /// numbered verbatim heading per result.
+    /// Absent on ledgers written before the audit existed: such a batch still
+    /// delivers, it just cannot be audited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_labels: Vec<String>,
     /// The framed notification prompt, exactly as persisted.
     pub content: Vec<crate::ContentBlock>,
     /// `session_messages` ordinal of the persisted prompt row. Dangles after
@@ -877,6 +886,7 @@ mod tests {
         );
         state.background_notifications.active_delivery = Some(BackgroundNotificationDelivery {
             handle_ids: vec!["bg-active".into()],
+            result_labels: vec!["summarise the ledger".into()],
             content: vec![crate::ContentBlock::Text("report".into())],
             prompt_ordinal: 7,
             failed_attempts: 2,
@@ -889,11 +899,12 @@ mod tests {
         assert!(json.get("pending_notification_turn").is_some());
 
         let mut legacy_json = json.clone();
-        legacy_json
+        let legacy_delivery = legacy_json
             .get_mut("pending_notification_turn")
             .and_then(Value::as_object_mut)
-            .expect("serialized delivery object")
-            .remove("handle_ids");
+            .expect("serialized delivery object");
+        legacy_delivery.remove("handle_ids");
+        legacy_delivery.remove("result_labels");
 
         let restored: SessionState =
             serde_json::from_value(legacy_json).expect("deserialize flat legacy-compatible state");
@@ -922,6 +933,10 @@ mod tests {
             delivery.handle_ids.is_empty(),
             "legacy ledgers predate cross-stage handle dedup"
         );
+        assert!(
+            delivery.result_labels.is_empty(),
+            "legacy ledgers predate the coverage audit"
+        );
 
         let current: SessionState =
             serde_json::from_value(json).expect("deserialize current flat state");
@@ -940,6 +955,7 @@ mod tests {
         let notifications = BackgroundNotificationState {
             active_delivery: Some(BackgroundNotificationDelivery {
                 handle_ids: vec!["bg-active".into()],
+                result_labels: Vec::new(),
                 content: vec![],
                 prompt_ordinal: 1,
                 failed_attempts: 0,

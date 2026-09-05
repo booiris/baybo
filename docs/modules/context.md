@@ -63,7 +63,8 @@ ContextManager (struct)
     │                        against the standing skill listing)
     ├── cron.rs            — frame_cron_prompt / original_cron_prompt
     ├── background_notification.rs — build_completion_reply +
-    │                              build_notification_content
+    │                              build_notification_content +
+    │                              unreported_result_indices
     │                              (<background_results> notification XML)
     ├── interjection.rs    — wrap_interjections (mid-turn steering envelope)
     ├── recalled_memory.rs — wrap_recalled_memories (recall envelope)
