@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "baybo-workspace",
  "chrono",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-workspace"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bitflags"
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "device-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "baybo-model",
  "chrono",
