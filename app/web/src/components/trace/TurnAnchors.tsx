@@ -73,6 +73,9 @@ export function TurnAnchors({
           >
             <div className="flex items-center gap-1.5 min-w-0">
               <span className="font-mono text-[0.75rem] font-bold shrink-0">{labels[i].short}</span>
+              {labels[i].kind != null && (
+                <span className="font-mono text-[0.62rem] font-bold text-ink-soft shrink-0">{labels[i].kind}</span>
+              )}
               <span className="font-mono text-[0.62rem] text-ink-soft truncate">{j.turn_status_kind}</span>
               {rollup.hasFailure && <span className="ml-auto shrink-0 w-1.5 h-1.5 rounded-full bg-err" />}
             </div>

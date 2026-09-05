@@ -30,12 +30,29 @@ export function attention(state: LifecycleState): boolean {
 export interface TurnLabel {
   short: string;
   long: string;
+  /**
+   * What kind of turn this is, for rows that are not the ordinary chat kind —
+   * `null` when they are. The outline previews a turn by the text that started
+   * it, which for an autonomous turn is agent-injected framing that reads the
+   * same on every one of them; the kind is what tells two of them apart at a
+   * glance.
+   */
+  kind: string | null;
 }
 
-/** Labels for maintenance turns that need a more precise title than `Turn`. */
-const NON_CHAT_TURN_LABEL: Partial<Record<TurnInputKind, string>> = {
+/**
+ * Turn kinds that need a more precise title than `Turn`.
+ *
+ * Deliberately not keyed off `isChatTurn`: that answers whether the user saw
+ * the turn in the conversation, and a background notification did — its reply
+ * is an ordinary bubble. What it does not have is a question of its own on
+ * screen, so the outline previews it with agent-injected framing that reads
+ * identically on every one of them. Naming the kind is what tells two apart.
+ */
+const TURN_KIND_LABEL: Partial<Record<TurnInputKind, string>> = {
   compact: 'Compaction',
   cron_notification: 'Cron delivery',
+  subagent_notification: 'Background results',
 };
 
 /**
@@ -51,10 +68,11 @@ const NON_CHAT_TURN_LABEL: Partial<Record<TurnInputKind, string>> = {
 export function turnLabels(turns: TraceTurnSummary[]): TurnLabel[] {
   return turns.map((turn, index) => {
     const number = index + 1;
-    const title = isChatTurn(turn.turn_input_kind)
-      ? 'Turn'
-      : (NON_CHAT_TURN_LABEL[turn.turn_input_kind] ?? turn.turn_input_kind);
-    return { short: `#${number}`, long: `${title} #${number}` };
+    const kind = TURN_KIND_LABEL[turn.turn_input_kind] ?? null;
+    // An unlabelled kind still says what it is when it is not a chat turn;
+    // labelling every one of those by hand is what the fallback avoids.
+    const title = kind ?? (isChatTurn(turn.turn_input_kind) ? 'Turn' : turn.turn_input_kind);
+    return { short: `#${number}`, long: `${title} #${number}`, kind };
   });
 }
 
