@@ -567,10 +567,6 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         bottomInset = value
     }
 
-    func setLanguage(_ code: String) {
-        bridge?.setLanguage(code)
-    }
-
     func jumpToLatest() {
         bridge?.jumpToLatest()
     }

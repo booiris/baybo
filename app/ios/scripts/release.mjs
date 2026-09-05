@@ -357,7 +357,11 @@ const verifyExport = (exportPath, version, buildNumber) => {
   assertKeychainGroups("app", appEntitlements);
   // The extension's App Store profile carries no aps-environment at all — only
   // the host app routes push, so asserting one here would reject every build.
-  assertDistributionSigned("extension", extension, scratchDir);
+  // The extension's signed groups matter as much as the app's: it is the half
+  // that READS the push key, and project.yml defines the shipped identity on
+  // both targets. Asserting only the app would leave the doc sentence about
+  // "the whole shipped identity" a claim the checks do not keep.
+  assertKeychainGroups("extension", assertDistributionSigned("extension", extension, scratchDir));
 
   const appInfo = join(app, "Info.plist");
   assertEqual(

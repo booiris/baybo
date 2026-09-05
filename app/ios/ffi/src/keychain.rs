@@ -61,6 +61,12 @@ mod access_group_rule {
     /// build-time fallback from `ffi/build.rs`. The Info key wins whenever it
     /// says anything usable, because it is the only one that can name the build
     /// actually running; the fallback answers embedders that have no bundle.
+    ///
+    /// "Usable" excludes a leading dot: signing is what expands
+    /// `$(AppIdentifierPrefix)`, so an unsigned build leaves one behind.
+    /// `PushKeyStore.accessGroup` rejects it identically — the writer and the
+    /// reader have to apply the SAME rule, or they land in different groups and
+    /// the miss reports as plain absence.
     pub(super) fn resolve(info: Option<String>, compiled: Option<&str>) -> Option<String> {
         info.filter(|group| !group.is_empty() && !group.starts_with('.'))
             .or_else(|| compiled.map(str::to_string))

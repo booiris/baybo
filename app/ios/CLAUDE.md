@@ -137,9 +137,11 @@ only to its own group and `store_push_key` fails, which aborts pairing outright
 (`persist push key` is a `?`). Reading the group off the app's own Info key —
 which is how the NSE has always found it — removes the choice: each build sits
 in exactly one group of its own, and the shipped app resolves the identical
-value it always has. `ffi/build.rs`'s baked-in value survives only as the
-fallback for embedders with no bundle (host tests, and `verify-nse.sh`'s
-hand-signed simulator app, which passes the group explicitly).
+value it always has. `ffi/build.rs`'s baked-in value survives as the fallback
+for embedders with no USABLE key — host tests, and any unsigned build, where
+`$(AppIdentifierPrefix)` never expanded and the key is a bare leading dot.
+(`verify-nse.sh` is not one of those: it patches the key in both plists so the
+runtime path is what it tests.)
 `keychain::access_group_rule` is that decision as a pure function, pinned by
 host tests including the unsigned-build case where `$(AppIdentifierPrefix)`
 never expanded.

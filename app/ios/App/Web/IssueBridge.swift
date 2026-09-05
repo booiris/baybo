@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import UIKit
 import WebKit
@@ -16,6 +17,22 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     private var lastBottomInset = Int.min
     private var composerTop: CGFloat?
     private var targetId: String?
+    /// Live language pushes. On the BRIDGE for the same two reasons the
+    /// transcript's and the deck's are: the renderer outlives the screen (it is
+    /// pooled — `IssueHostPool`), and `retarget` returns early when the target is
+    /// unchanged, so `deliverInit` — the only other carrier of the language —
+    /// does not fire when the reader reopens the SAME card.
+    private var languageWatch: AnyCancellable?
+
+    override init() {
+        super.init()
+        // `lproj`, not `code`: this bridge's `init` payload spells the language
+        // that way (see `deliverInit`), and the two have to agree.
+        // `dropFirst` because that payload already carries the current value.
+        languageWatch = Lang.shared.$code.dropFirst().sink { [weak self] _ in
+            self?.setLanguage(Lang.shared.current.lproj)
+        }
+    }
 
     func userContentController(
         _ userContentController: WKUserContentController,

@@ -4,9 +4,13 @@ use std::env;
 /// group at RUNTIME from its own `BayboKeychainAccessGroup` Info key (see
 /// `keychain::imp::access_group`) — it has to, because one xcframework serves
 /// every configuration and a local build carries a different bundle id. What is
-/// baked in here only answers embedders that have no Info key at all: host
-/// tests, and `scripts/verify-nse.sh`'s manually-signed simulator app, which
-/// passes `BAYBO_IOS_KEYCHAIN_ACCESS_GROUP` explicitly.
+/// baked in here answers embedders with no USABLE Info key: host tests, and any
+/// build where `$(AppIdentifierPrefix)` never expanded (it is signing that
+/// expands it, so an unsigned build leaves a bare leading dot).
+/// `scripts/verify-nse.sh` is NOT such a case and must not be read as one — it
+/// patches `BayboKeychainAccessGroup` in both plists precisely so the RUNTIME
+/// path is the one under test. Delete that patch and this fallback takes over
+/// on one side only, which is a silent NSE decrypt failure.
 const KEYCHAIN_ACCESS_GROUP_SUFFIX: &str = "com.baybo.app";
 
 fn main() {

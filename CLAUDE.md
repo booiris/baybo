@@ -94,6 +94,15 @@ Cargo.toml first"*, so a hand-pushed `vX.Y.Z` is precisely the thing that stops
 Bumping it is a normal PR — and it moves 40 `Cargo.lock` entries with it, so
 refresh the lockfile in the same commit.
 
+**Both lockfiles.** `app/ios` is its own cargo workspace and consumes four of
+those crates by path, so a bump leaves `app/ios/Cargo.lock` pinning the old
+version. CI cannot catch it on the release PR: `ios-core` is path-filtered on
+`IOS_DEPS`, which a commit touching only `CLAUDE.md` / `Cargo.toml` /
+`Cargo.lock` never matches — so the job does not run, and the stale lock lands on
+master to break the NEXT PR that touches `app/ios/`, where `--locked` refuses to
+update it. That is exactly how 0.1.1 shipped a broken `app/ios/Cargo.lock`.
+Regenerate both, in the bump commit.
+
 Cutting a release, in order:
 
 ```bash
