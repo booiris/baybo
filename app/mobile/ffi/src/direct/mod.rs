@@ -361,7 +361,7 @@ impl DirectHttpCache {
         let device =
             HeaderValue::from_str(&key.device_id).map_err(|e| format!("bad device id: {e}"))?;
         headers.insert(HeaderName::from_static(DEVICE_ID_HEADER), device);
-        let client = reqwest::Client::builder()
+        let client = crate::tls::http_client_builder()
             .default_headers(headers.clone())
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .build()

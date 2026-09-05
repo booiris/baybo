@@ -48,10 +48,22 @@ enum Baybo {
             .first?
             .appendingPathComponent("Logs", isDirectory: true)
             .path
-        return BayboClient(
+        // `secureStore: nil` and `try!` are both load-bearing, and neither is a
+        // shortcut. The core keeps ONE exported signature for both shells
+        // because uniffi-bindgen generates them from a single host cdylib, so
+        // the store is an argument even on the platform that does not use one:
+        // iOS credentials go through the Security framework inside the core,
+        // whose keychain item identity the continuity contract freezes. The
+        // constructor's only failure is refusing a missing store, and that arm
+        // is compiled out under `target_os = "ios"` — there is no error this
+        // call can return, and turning a real one into an optional would only
+        // hide it. Android passes a KeystoreSecureStore here and gets the
+        // refusal if it ever forgets.
+        return try! BayboClient(
             config: ClientConfig(
                 logDir: logDir,
-                blobCacheDir: ServerCache.blobDirectory(in: SessionIndex.supportDirectory())))
+                blobCacheDir: ServerCache.blobDirectory(in: SessionIndex.supportDirectory())),
+            secureStore: nil)
     }()
 }
 

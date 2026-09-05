@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "lib"]
 doctest = false
 
 [dependencies]
+base64 = { workspace = true }
 baybo-model = { workspace = true }
 device-proto = { workspace = true }
 wire = { workspace = true }
@@ -43,3 +44,7 @@ tokio = { workspace = true, features = ["test-util"] }
 [target.'cfg(target_os = "ios")'.dependencies]
 core-foundation = { workspace = true }
 core-foundation-sys = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-roots = { workspace = true }
+android_log-sys = { workspace = true }

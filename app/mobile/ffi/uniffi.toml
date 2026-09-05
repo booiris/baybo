@@ -1,3 +1,17 @@
 [bindings.swift]
 module_name = "BayboCore"
 generate_immutable_records = true
+
+[bindings.kotlin]
+# Not the default `uniffi.baybo_ffi`: the Android `:core` module owns this
+# namespace and the shell imports from it.
+package_name = "com.baybo.core"
+# What JNA resolves at `Native.load` — the [lib] name, which is frozen. Pinned
+# explicitly rather than inferred from the --library filename so a bindgen
+# invoked with a different path still emits a loadable binding.
+cdylib_name = "baybo_ffi"
+# Selects the SystemCleaner-backed object cleaner (API 34+, JNA cleaner below)
+# and pulls androidx.annotation onto the module's classpath.
+android = true
+# Parity with the Swift bindings: records come out with `val` fields.
+generate_immutable_records = true

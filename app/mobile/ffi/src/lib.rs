@@ -19,10 +19,13 @@ mod gateway_client;
 mod keychain;
 mod logging;
 mod push;
+mod push_preview;
 mod qr;
 mod relay;
 mod runtime;
+mod secure_store;
 mod server_cache;
+mod tls;
 mod transport;
 
 use std::sync::Arc;
@@ -38,8 +41,9 @@ pub use api::{
     IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog,
     LlmModelInfo, MessageLookup, NewIssue, NewProject, PairAbortListener, PairChallenge,
     PairTarget, PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings,
-    ProjectSink, PushToken, RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch,
-    SubIssueProgress, SubagentCursor, TeamMemberInfo,
+    ProjectSink, PushPreview, PushToken, RunStatus, RunTrigger, SecureStore, SecureStoreError,
+    SessionListSink, SessionModelPin, StringPatch, SubIssueProgress, SubagentCursor,
+    TeamMemberInfo,
 };
 use binding::{ActiveLeg, active_leg};
 use gateway_client::ActiveGatewayClient;
@@ -94,11 +98,39 @@ impl BayboClient {
 
 #[uniffi::export]
 impl BayboClient {
-    /// Build the client: selects the process crypto provider (rustls/ring —
-    /// without it the first `wss://` dial panics), installs the log bridge, and
-    /// seeds the debug push key when asked (simulator NSE testing).
+    /// Build the client: installs the secure store, selects the process crypto
+    /// provider (rustls/ring — without it the first `wss://` dial panics),
+    /// installs the log bridge, and seeds the debug push key when asked
+    /// (simulator NSE testing).
+    ///
+    /// `secure_store` is required off iOS and ignored on it, and the asymmetry
+    /// is forced rather than chosen: iOS keeps its Security-framework path in
+    /// Rust because the keychain item identity is frozen by the continuity
+    /// contract, while every other target has to be handed a store by its
+    /// shell. It cannot be a per-platform signature either — `uniffi-bindgen`
+    /// generates both shells' bindings from ONE host cdylib, so a `cfg`-split
+    /// export would emit bindings that disagree with the library they call.
+    /// Hence `Option` plus a construction-time refusal: an Android client
+    /// without a store fails here, loudly, rather than at the first read.
     #[uniffi::constructor]
-    pub fn new(config: ClientConfig) -> Arc<Self> {
+    pub fn new(
+        config: ClientConfig,
+        secure_store: Option<Arc<dyn SecureStore>>,
+    ) -> Result<Arc<Self>, BayboError> {
+        match secure_store {
+            Some(store) => secure_store::install(store),
+            #[cfg(not(target_os = "ios"))]
+            None => {
+                return Err(BayboError::Other {
+                    message: format!(
+                        "{}: this platform stores credentials through the shell",
+                        secure_store::NOT_INSTALLED_MSG
+                    ),
+                });
+            }
+            #[cfg(target_os = "ios")]
+            None => {}
+        }
         install_crypto_provider();
         logging::install(config.log_dir);
         if let Some(dir) = config.blob_cache_dir {
@@ -107,17 +139,38 @@ impl BayboClient {
         #[cfg(all(debug_assertions, target_os = "ios"))]
         debug_seed_push_key();
         let push = Arc::new(PushState::new());
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             relay: relay::RelaySessions::new(),
             direct: direct::DirectSessions::default(),
             pairing: relay::PairingSessions::default(),
             push,
-        })
+        }))
     }
 
     /// Store the current provider-tagged device token delivered by the platform.
     pub fn set_push_token(&self, token: PushToken) {
         self.push.set_token(token);
+    }
+
+    /// Open a lock-screen push preview with this device's stored push key.
+    ///
+    /// A method rather than a free function so it cannot be reached before a
+    /// client exists — which is what guarantees the secure store is installed.
+    /// On Android the caller is `FirebaseMessagingService.onMessageReceived`,
+    /// whose data-only message carries exactly the three arguments; iOS decrypts
+    /// in its extension process instead and never calls this.
+    ///
+    /// `None` means "post the generic fallback notification": no key for `bid`,
+    /// a payload that does not decode, or a tag that does not verify. An `Err`
+    /// is the secure store itself failing, and the shell must not treat it as an
+    /// absent key.
+    pub fn decrypt_push_preview(
+        &self,
+        bid: String,
+        enc_b64: String,
+        nonce_b64: String,
+    ) -> Result<Option<PushPreview>, BayboError> {
+        push_preview::decrypt_push_preview(&bid, &enc_b64, &nonce_b64).map_err(BayboError::from_msg)
     }
 
     /// Retarget the content-addressed blob cache after a binding changes.

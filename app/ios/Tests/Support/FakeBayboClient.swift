@@ -940,6 +940,14 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func pairedDevice() -> String? { nil }
     func registerPush() async throws -> String? { throw Self.unsupported }
+
+    /// Android's messaging service decrypts previews through the core; on iOS
+    /// the Notification Service Extension does it out of process with CryptoKit
+    /// and nothing in this app target calls this. Present only to satisfy the
+    /// generated protocol.
+    func decryptPushPreview(bid: String, encB64: String, nonceB64: String) throws -> PushPreview? {
+        throw Self.unsupported
+    }
     func relayInvalidateApiLegs() { lock.withLock { apiLegInvalidations += 1 } }
     func relayPreconnect() async throws { throw Self.unsupported }
     func setPushToken(token: PushToken) {}

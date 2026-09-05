@@ -6,8 +6,13 @@
 //! this is the matching WRITE side. It calls the Security framework
 //! (`SecItemAdd`) directly from Rust — the framework is already linked into the
 //! app (`Security.framework` in `project.yml`), so no extra Swift in the app
-//! target is needed. On non-iOS targets (the desktop dev build of the shell)
-//! it is a no-op: there is no keychain off-device.
+//! target is needed.
+//!
+//! Every other target routes the same six primitives to the
+//! [`SecureStore`](crate::api::SecureStore) the shell installs at construction —
+//! Android over the Keystore, host tests over an in-memory map. Only the iOS
+//! path is frozen by the continuity contract; what both paths share is the rule
+//! that absence and failure never collapse into each other.
 
 use device_proto::aead::KEY_LEN;
 
@@ -90,7 +95,9 @@ mod imp {
     use super::read_status::{ERR_SEC_ITEM_NOT_FOUND, ERR_SEC_SUCCESS, ReadOutcome, classify_read};
 
     const MISSING_ACCESS_GROUP: &str = "missing BAYBO_IOS_KEYCHAIN_ACCESS_GROUP; build through Xcode or set BAYBO_IOS_KEYCHAIN_ACCESS_GROUP explicitly";
-    const ACCOUNT_PREFIX: &str = "baybo.push-key.";
+    // Hoisted to the module so the non-iOS `imp` addresses the same account.
+    // Two spellings of a frozen account name is the shape that loses a push key.
+    use super::ACCOUNT_PREFIX;
 
     /// Wrap a `static` Security-framework `CFStringRef` constant as a borrowed
     /// `CFString` (get-rule: we don't own it, so don't release it).
@@ -262,46 +269,78 @@ mod imp {
     }
 }
 
-// The `imp` below is a SILENT no-op: every store returns `Ok(())`, every read
-// `Ok(None)`. That is fine for host tests, which never assert persistence, and
-// it is a data-loss bug on a real platform: `pair_confirm` / `direct_login`
-// would return `Ok`, `binding::active_leg` would then read nothing back, and
-// every later call would fail with `NotBound` while the device identity and
-// push key are re-minted per call. Android reaches this arm, so refuse to build
-// for it until the `SecureStore` seam replaces the stub — an `.so` that loses a
-// pairing is worse than one that does not exist.
-// See `docs/todo/android-companion.md` § Rust core (phase P2), which deletes
-// both this guard and the stub's Android reachability.
-#[cfg(target_os = "android")]
-compile_error!(
-    "baybo-mobile-ffi has no Android secure store yet: this build would link the \
-     silent no-op keychain stub and lose the device identity, pairing and push \
-     key on every call. Implement the SecureStore seam first — see \
-     docs/todo/android-companion.md, phase P2."
-);
-
+/// Every non-iOS target routes these six primitives to the [`SecureStore`] the
+/// shell installed at construction.
+///
+/// This arm used to be a silent no-op — every store `Ok(())`, every read
+/// `Ok(None)` — which was harmless only because nothing but host tests reached
+/// it. On a real platform it is data loss wearing a success code: pairing
+/// "succeeds", `binding::active_leg` then reads nothing back, every later call
+/// fails `NotBound`, and the device identity and push key are re-minted on each
+/// attempt. Absence and failure are kept apart here (the store's contract) so
+/// `load_or_create_*` can never mint over a key it merely failed to read.
+///
+/// [`SecureStore`]: crate::api::SecureStore
 #[cfg(not(target_os = "ios"))]
 mod imp {
-    use super::KEY_LEN;
-    pub(super) fn store_push_key(_bid: &str, _key: &[u8; KEY_LEN]) -> Result<(), String> {
-        Ok(())
+    use super::{ACCOUNT_PREFIX, KEY_LEN};
+    use crate::secure_store::{get, storage_key, to_msg};
+
+    fn read(account: &str) -> Result<Option<Vec<u8>>, String> {
+        get()?.get(storage_key(account)).map_err(to_msg)
     }
-    pub(super) fn read_push_key(_bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
-        Ok(None)
+
+    fn write(account: &str, bytes: &[u8]) -> Result<(), String> {
+        get()?
+            .put(storage_key(account), bytes.to_vec())
+            .map_err(to_msg)
     }
-    pub(super) fn store_private_blob(_account: &str, _bytes: &[u8]) -> Result<(), String> {
-        Ok(())
+
+    fn remove(account: &str) -> Result<(), String> {
+        get()?.delete(storage_key(account)).map_err(to_msg)
     }
-    pub(super) fn read_private_blob(_account: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(None)
+
+    fn push_key_account(bid: &str) -> String {
+        format!("{ACCOUNT_PREFIX}{bid}")
     }
-    pub(super) fn delete_private_blob(_account: &str) -> Result<(), String> {
-        Ok(())
+
+    pub(super) fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
+        write(&push_key_account(bid), key)
     }
-    pub(super) fn delete_push_key(_bid: &str) -> Result<(), String> {
-        Ok(())
+
+    pub(super) fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
+        match read(&push_key_account(bid))? {
+            Some(bytes) => bytes
+                .as_slice()
+                .try_into()
+                .map(Some)
+                .map_err(|_| "stored push key has the wrong length".to_string()),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn store_private_blob(account: &str, bytes: &[u8]) -> Result<(), String> {
+        write(account, bytes)
+    }
+
+    pub(super) fn read_private_blob(account: &str) -> Result<Option<Vec<u8>>, String> {
+        read(account)
+    }
+
+    pub(super) fn delete_private_blob(account: &str) -> Result<(), String> {
+        remove(account)
+    }
+
+    pub(super) fn delete_push_key(bid: &str) -> Result<(), String> {
+        remove(&push_key_account(bid))
     }
 }
+
+/// The push key's account is `baybo.push-key.<device_id>` — one frozen account
+/// name like the five below, but assembled rather than literal. Module-level so
+/// the iOS `imp` and the SecureStore-backed one address the same item; two
+/// spellings would silently split a device's push key across two slots.
+const ACCOUNT_PREFIX: &str = "baybo.push-key.";
 
 /// Write the device's push key to the shared App Group keychain at account
 /// `baybo.push-key.<bid>`. `bid` is the device id the gateway stamps into every
@@ -314,9 +353,10 @@ pub fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
 /// persisting a fresh random one on first use. Read back rather than regenerated,
 /// so it is **stable** across re-registers — the NSE never holds a key that
 /// mismatches an in-flight push, and re-registering on each foreground is a no-op.
-/// Mirrors [`load_or_create_device_sign_key`]. (On the non-iOS dev build there is
-/// no keychain, so the read is always empty and a fresh ephemeral key is minted
-/// per call — fine off-device, where push never fires.)
+/// Mirrors [`load_or_create_device_sign_key`]. Off iOS the read goes through the
+/// installed [`SecureStore`](crate::api::SecureStore), which persists like the
+/// keychain does — the mint branch is reached only on genuine absence, never on
+/// a failed read.
 pub fn load_or_create_push_key(bid: &str) -> Result<[u8; KEY_LEN], String> {
     if let Some(key) = imp::read_push_key(bid)? {
         return Ok(key);
@@ -479,7 +519,6 @@ pub fn delete_push_key(bid: &str) -> Result<(), String> {
 
 /// Debug self-check: read the key back (the same lookup the NSE does) to prove
 /// the access-group round-trip works on-device. iOS debug builds only.
-#[cfg(all(debug_assertions, target_os = "ios"))]
 pub fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
     imp::read_push_key(bid)
 }

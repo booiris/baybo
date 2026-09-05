@@ -22,6 +22,7 @@ wire = { path = "../../crates/wire" }
 device-proto = { path = "../../crates/device-proto" }
 # The remote-host (C) wire contract: relay route/URL builders + header names.
 remote-host-protocol = { path = "../../remote-host/crates/protocol" }
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -42,6 +43,13 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # cleanly for iOS device + simulator) and install it in `BayboClient::new`.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
+# Android-only. `webpki-roots` supplies the same Mozilla root program the wss
+# legs already bake in (see ffi/src/tls.rs); `android_log-sys` is the logcat
+# write side — native fd 2 is /dev/null under the zygote, so the stderr mirror
+# reaches nobody. Not `android_logger`: it installs its own global logger and
+# would fight the file bridge in ffi/src/logging.rs.
+webpki-roots = "0.26"
+android_log-sys = "0.3"
 # `std` for `set_boxed_logger` (the file/stderr log bridge in ffi/src/logging.rs).
 log = { version = "0.4", features = ["std"] }
 parking_lot = "0.12"

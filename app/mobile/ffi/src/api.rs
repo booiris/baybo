@@ -46,6 +46,68 @@ impl BayboError {
     }
 }
 
+/// What a [`SecureStore`] implementation may fail with.
+///
+/// Its own type rather than [`BayboError`] for one reason, and it is the reason
+/// the whole seam holds: a foreign-trait method that throws anything the
+/// signature does not declare is routed to uniffi's
+/// `handle_callback_unexpected_error`, whose default implementation is
+/// `panic!`. Only an error type carrying `From<UnexpectedUniFFICallbackError>`
+/// turns a stray Kotlin exception into an `Err` the Rust side can classify. The
+/// absence-vs-failure invariant below is therefore only as real as this impl.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum SecureStoreError {
+    /// The store could not answer. NOT "the item is absent" — see [`SecureStore`].
+    #[error("secure store failed: {reason}")]
+    Failed { reason: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for SecureStoreError {
+    fn from(error: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Failed {
+            reason: error.reason,
+        }
+    }
+}
+
+/// The platform's durable secret storage, implemented by the shell on every
+/// target that is not iOS (iOS calls the Security framework from Rust — see
+/// `keychain.rs`, whose item identity is frozen by the continuity contract).
+///
+/// **`get` returns `Ok(None)` if and ONLY IF the item is absent.** Every other
+/// outcome — the keystore unavailable, a decrypt that fails its tag, a corrupt
+/// file, a transient platform error — is `Err`. Reporting a failure as absence
+/// is not a degraded read, it is data loss: `load_or_create_device_identity`
+/// and `load_or_create_device_sign_key` take their mint-and-persist branch on
+/// `None`, so a phone that briefly cannot read its own store would rotate the
+/// identity out from under a live pairing, stop matching the gateway's
+/// `device_id`, and lose the signing key that is never otherwise deleted. This
+/// is the same rule `classify_read` enforces on the iOS side.
+///
+/// `key` is derived by the core (`secure_store::storage_key`) and is already
+/// safe to use verbatim as a filename or preferences key; the shell must not
+/// re-derive, sanitize or prettify it.
+#[uniffi::export(with_foreign)]
+pub trait SecureStore: Send + Sync {
+    /// `Ok(None)` = absent. Anything else that went wrong is `Err`.
+    fn get(&self, key: String) -> Result<Option<Vec<u8>>, SecureStoreError>;
+    /// Replace whatever is stored under `key`.
+    fn put(&self, key: String, bytes: Vec<u8>) -> Result<(), SecureStoreError>;
+    /// Remove `key`. Deleting an absent key is success, not an error.
+    fn delete(&self, key: String) -> Result<(), SecureStoreError>;
+}
+
+/// A decrypted lock-screen preview. Optional fields are optional on the wire:
+/// a gateway predating tap-routing omits `session_id`, one predating the icon
+/// badge omits `badge`, and the pinned interop fixture carries neither.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PushPreview {
+    pub title: String,
+    pub body: String,
+    pub session_id: Option<String>,
+    pub badge: Option<u32>,
+}
+
 /// APNs environment attached to an Apple push token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum ApnsEnvironment {

@@ -1,14 +1,21 @@
 # Mobile shared core
 
-> **Status:** P0 skeleton, written before any of the code it describes.
-> The sections, the binding rules, and the platform matrix are settled here;
-> the sections marked **stub** carry a one-line note about what fills them and
-> are written out in P2 as the seams land. The plan this implements is
+> **Status:** P1 and the first half of P2 have landed. The relocation to
+> `app/mobile/` is done, and so are the three platform seams: the `SecureStore`
+> foreign trait with its `SecureStoreError`, the Android TLS branch in
+> `ffi/src/tls.rs`, and the logcat mirror. The sections still marked **stub**
+> describe what has not been written yet — the Kotlin-side contract, the store
+> push-downs, and the halves lifted from `app/ios/docs/`. Sections describing
+> landed code are in the present tense and cite it. The plan this implements is
 > [`../../todo/android-companion.md`](../../todo/android-companion.md). Where
 > that plan and the code disagree, the code wins and this file records the
-> code. Paths are written as they are **today** (`app/mobile/ffi/…`); P1 moves the
-> shared halves to `app/mobile/ffi/…` without changing a line of what is
-> described below.
+> code.
+>
+> Two things the plan said that the code did not bear out, corrected here and
+> there: `blob_cache_dir` stays `Option` (the Android `temp_dir()` fallback the
+> change was justified by is writable on Android 13+), and the storage-key
+> derivation exists for one-home-per-rule rather than to sanitise a
+> gateway-supplied id — the device id is derived locally and never was one.
 
 The shared mobile core is the Rust half of the phone app: the two chat
 transport legs (relay Noise E2E and direct raw-msgpack), scan-to-pair, secure
@@ -117,12 +124,16 @@ rustls `ring` provider (without it the first `wss://` dial panics), install
 the log bridge, seed the blob cache dir, and on an iOS debug build seed the
 NSE self-check push key (`lib.rs:108`).
 
-P2 changes two things.
+P2 changed the constructor and left the record alone.
 
-**`blob_cache_dir` becomes `String` (required).** The `Option` today buys a
-`std::env::temp_dir()` fallback (`blob_helper.rs:74`), which iOS purges under
-storage pressure — wrong for a file the user asked to keep. That fallback
-leaves non-test builds with the field.
+**`blob_cache_dir` stays `Option`.** The plan meant to make it required because
+the `std::env::temp_dir()` fallback (`blob_helper.rs:74`) looked unusable on
+Android; it is not — the framework points `TMPDIR` at the app's cache dir from
+API 33. What remained was a second breaking change to the same record plus a
+decision Swift does not make today, since `ServerCache.blobDirectory(in:)`
+returns `nil` on either a failed `createDirectory` or a failed
+backup-exclusion flag. Both shells pass a real path; the fallback is a net, not
+a plan.
 
 **The secure store becomes a constructor argument:**
 

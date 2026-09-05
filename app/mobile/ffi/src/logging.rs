@@ -21,6 +21,11 @@ const LOG_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Rotated files kept beside the live one (`baybo.log.1`, `baybo.log.2`).
 const LOG_FILES_KEPT: usize = 2;
 
+/// What `adb logcat -s` filters on. Matches the log file's own name so a bug
+/// report and a live capture read the same.
+#[cfg(target_os = "android")]
+const LOGCAT_TAG: &str = "baybo";
+
 /// Crates logged at Debug; everything else at Warn.
 const DEBUG_TARGETS: [&str; 2] = ["baybo_ffi", "baybo_ffi::core"];
 
@@ -63,6 +68,42 @@ impl CoreLogger {
     }
 }
 
+/// The live mirror beside the rotating file: Xcode's console on Apple targets,
+/// logcat on Android.
+///
+/// Android needs its own arm rather than the `eprint!` every other target uses,
+/// and not for taste: an app process inherits the zygote's stdio, so fd 2 is
+/// `/dev/null` and anything written there reaches nobody. Only the Java
+/// `System.err` stream is rerouted, and this crate does not go through it.
+#[cfg(not(target_os = "android"))]
+fn mirror(_level: Level, line: &str) {
+    eprint!("{line}");
+}
+
+#[cfg(target_os = "android")]
+fn mirror(level: Level, line: &str) {
+    use android_log_sys::LogPriority;
+    use std::ffi::CString;
+
+    let priority = match level {
+        Level::Error => LogPriority::ERROR,
+        Level::Warn => LogPriority::WARN,
+        Level::Info => LogPriority::INFO,
+        Level::Debug => LogPriority::DEBUG,
+        Level::Trace => LogPriority::VERBOSE,
+    };
+    // logcat is line-oriented and NUL-terminated; a message carrying an interior
+    // NUL is dropped rather than truncated at it.
+    let (Ok(tag), Ok(message)) = (CString::new(LOGCAT_TAG), CString::new(line.trim_end())) else {
+        return;
+    };
+    // SAFETY: both pointers are valid NUL-terminated C strings that outlive the
+    // call, which is what liblog's contract asks for.
+    unsafe {
+        android_log_sys::__android_log_write(priority as i32, tag.as_ptr(), message.as_ptr());
+    }
+}
+
 impl log::Log for CoreLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         let max = if DEBUG_TARGETS
@@ -87,7 +128,7 @@ impl log::Log for CoreLogger {
             record.target(),
             record.args()
         );
-        eprint!("{line}");
+        mirror(record.level(), &line);
         let Some(dir) = &self.dir else { return };
         let mut guard = self.file.lock();
         if guard.is_none() {

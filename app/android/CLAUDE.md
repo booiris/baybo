@@ -170,14 +170,17 @@ section as read-only.
   because its public half **is** the `device_id`, and the gateway's
   `baybo.push-key.<device_id>` row is addressed by it.
 - **Rust derives the on-disk storage key from the account; Kotlin never sees the
-  account string.** `secure_store.rs` (P2) owns account → filesystem-safe key;
+  account string.** `ffi/src/secure_store.rs` owns account → filesystem-safe key;
   `KeystoreSecureStore` receives an opaque key and stores the bytes verbatim
-  under it. Two reasons, and both are load-bearing. `baybo.push-key.<bid>`
-  embeds a gateway-supplied device id, and a gateway-supplied string used
-  directly as a filename is a path-traversal shape. And a sanitizer written on
-  both sides is a rule with two homes, which the root `CLAUDE.md` calls a bug
-  waiting to happen — the second spelling would differ, and the difference would
-  surface as an install that cannot find its own pairing.
+  under it. The key is a lowercase hex SHA-256 of the account, and **that
+  output is the on-disk name, so a different hash or encoding orphans every
+  stored item.** The reason is not sanitisation of a hostile input: the device
+  id in `baybo.push-key.<bid>` is derived locally
+  (`device_proto::delegation::device_id_for` — `device-` plus 64 hex chars) and
+  was never a filesystem hazard. The reason is that "what characters are safe
+  here" is a rule, and a rule answered on both sides of an FFI is answered
+  differently on the second side eventually — surfacing as an install that
+  cannot find its own pairing. One total function, one home, host-testable.
 - **`get` returns null ONLY for not-found.** Keystore unavailable, a corrupt
   ciphertext file, a transient `KeyStoreException`, a decrypt that fails its tag
   — every one of those **throws**, and Rust lifts it to `SecureStoreError`
