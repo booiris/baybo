@@ -620,6 +620,19 @@ viewport and cannot reach the screen bottom. The exception is scoped with
 `:has(.html-preview.is-maximized)` to that one row; every other offscreen row
 keeps its rendering containment.
 
+**Paint containment is the general trap, and it applies while the row is on
+screen too**: it clips the row to its own box, so anything a row deliberately
+paints OUTSIDE itself is erased — correct node, correct rect, no pixels. Two
+marks do exactly that and were both silently gone until
+`:has(.copy-toast, .jump-ring)` gave them the same one-row opt-out: the copy
+pill (which hangs above the bubble, or below it near the top of the scroll)
+painted nothing at all in its default placement and kept only ~7px of 19px when
+flipped below, and the jump ring's `inset: -4px` paper channel lost its top and
+right edges on a user row and the entire ring on an assistant one. Any future
+mark that hangs outside its row needs the same treatment, and only a PIXEL
+assertion can catch its absence — `CopyPillUITests` reads ink out of the band
+above the bubble for precisely that reason.
+
 Two ways out, both the same morph home:
 
 - the toolbar's close button; and

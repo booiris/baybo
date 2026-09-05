@@ -457,6 +457,19 @@ html.retargeting #root { visibility: hidden; }
   content-visibility: auto;
   contain-intrinsic-size: auto 160px;
 }
+/* PAINT containment rides along with `content-visibility: auto` even while the
+   row is on screen, and it clips to the row's box — so the two marks a row
+   deliberately paints OUTSIDE itself both vanished the day containment landed:
+   the copied pill (which hangs in the gap above the bubble, or below it near
+   the top of the scroll) lost all 19px of itself above and all but ~7px below,
+   and the jump ring's `inset: -4px` paper channel lost its top and right edges
+   on a user row and the whole ring on an assistant one. Both are transient, so
+   lift containment only for the row currently showing one — the same shape as
+   the maximized preview's host row below. */
+.msg-group:has(.copy-toast, .jump-ring) {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
 .md-stream > .md + .md { margin-top: var(--md-block-gap); }
 /* The raw source, shown when the markdown pipeline threw (see `MarkdownFallback`
    in Markdown.tsx). Newlines are all the structure that is left, so keep them. */
