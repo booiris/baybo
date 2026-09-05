@@ -74,6 +74,12 @@ fn background_reanchor_source_event_id_for(handle_ids: &[String], prompt_ordinal
     }
 }
 
+/// Results of a settling batch whose required headings the reply omitted.
+struct CoverageGap {
+    batch: usize,
+    indices: Vec<usize>,
+}
+
 /// Per-actor retry cadence. Inbound work resets it; consecutive timer attempts
 /// double it while notification work remains.
 pub(super) struct BackgroundNotificationRetrySchedule {
@@ -124,10 +130,14 @@ impl AgentActor {
             return;
         }
 
+        // No label: for a detached `Bash` job it is the command line verbatim
+        // (`PendingBackgroundResult::command` stores `label: command.clone()`),
+        // so it routinely carries credentials — and logs are served over an
+        // HTTP endpoint. `handle_id` already identifies the result, and the
+        // label is reachable from the durable row for anyone who needs it.
         debug!(
             session_id = %self.durable.session.id,
             handle_id = %pending.handle_id,
-            label = %pending.label,
             "accepted background result into notification pipeline"
         );
 
@@ -318,10 +328,10 @@ impl AgentActor {
             return;
         }
 
-        let handle_ids: Vec<String> = pending
+        let (handle_ids, result_labels): (Vec<String>, Vec<String>) = pending
             .iter()
-            .map(|result| result.handle_id.clone())
-            .collect();
+            .map(|result| (result.handle_id.clone(), result.label.clone()))
+            .unzip();
         let content = baybo_context::prompts::background_notification::build_notification_content(
             &pending,
             &self.volatile.workspace,
@@ -431,6 +441,7 @@ impl AgentActor {
             .background_notifications
             .active_delivery = Some(BackgroundNotificationDelivery {
             handle_ids,
+            result_labels,
             content: content.clone(),
             prompt_ordinal,
             failed_attempts: 0,
@@ -648,6 +659,14 @@ impl AgentActor {
                     .as_ref()
                     .map(|delivery| delivery.failed_attempts)
                     .unwrap_or(0);
+                if let Some(gap) = self.unreported_background_results(&response.content) {
+                    warn!(
+                        session_id = %self.durable.session.id,
+                        batch = gap.batch,
+                        unreported_indices = ?gap.indices,
+                        "background notification reply omitted required result sections"
+                    );
+                }
                 self.durable
                     .session
                     .state
@@ -696,6 +715,54 @@ impl AgentActor {
         }
     }
 
+    /// Which results of the batch about to settle are missing their required
+    /// heading in `reply`, or `None` when the batch is fully covered, carries
+    /// no auditable labels (a ledger written before the audit), or is a single
+    /// result (never asked for a heading).
+    ///
+    /// Reports indices, never labels. A label is the task summary for a
+    /// subagent but the **command line** for a detached `Bash` job
+    /// (`PendingBackgroundResult::command` stores `label: command.clone()`),
+    /// which routinely carries credentials — and the only consumer here is a
+    /// log line, served over an HTTP endpoint.
+    ///
+    /// Observation only: every caller still settles. Re-delivering the missing
+    /// results would need a narrowed prompt built from fresh
+    /// `PendingBackgroundResult`s under its own source-event key, not a
+    /// narrowed `handle_ids` beside the frozen whole-batch `content` (that key
+    /// is also the crash-replay idempotency key and the terminal-event dedup
+    /// set). Until then this is what makes "reported 1 of 3" visible at all:
+    /// the settle path is otherwise silent, and only `is_blank_reply` — which
+    /// a partial report passes — stands between a batch and its retirement.
+    fn unreported_background_results(&self, reply: &[ContentBlock]) -> Option<CoverageGap> {
+        let delivery = self
+            .durable
+            .session
+            .state
+            .background_notifications
+            .active_delivery
+            .as_ref()?;
+        let reply_text = reply
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let indices = baybo_context::prompts::background_notification::unreported_result_indices(
+            &delivery.result_labels,
+            &reply_text,
+        );
+        if indices.is_empty() {
+            return None;
+        }
+        Some(CoverageGap {
+            batch: delivery.result_labels.len(),
+            indices,
+        })
+    }
+
     /// A successful user reply already saw the active prompt row in its
     /// request. Settle that delivery passively so the timer cannot produce a
     /// duplicate proactive report. Stopped or blank turns did not deliver a
@@ -722,6 +789,19 @@ impl AgentActor {
             session_id = %self.durable.session.id,
             "user turn completed over active background notification; settling passively"
         );
+        // Reaching here means an earlier proactive attempt failed or was
+        // interrupted: the ledger opens and clears inside one actor message,
+        // so no user turn can interleave with a delivery that is going well.
+        // The batch is therefore retiring with nobody having reported it,
+        // which is the same anomaly the proactive path warns about.
+        if let Some(gap) = self.unreported_background_results(response_content) {
+            warn!(
+                session_id = %self.durable.session.id,
+                batch = gap.batch,
+                unreported_indices = ?gap.indices,
+                "background notification reply omitted required result sections"
+            );
+        }
         self.durable
             .session
             .state
@@ -753,6 +833,7 @@ mod tests {
 
         let delivery = BackgroundNotificationDelivery {
             handle_ids: first,
+            result_labels: Vec::new(),
             content: Vec::new(),
             prompt_ordinal: 7,
             failed_attempts: 1,
@@ -765,6 +846,7 @@ mod tests {
 
         let legacy = BackgroundNotificationDelivery {
             handle_ids: Vec::new(),
+            result_labels: Vec::new(),
             content: Vec::new(),
             prompt_ordinal: 11,
             failed_attempts: 1,

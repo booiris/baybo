@@ -113,6 +113,21 @@ takes the entire buffer as one batch. `baybo-context` builds both the
 user-facing acknowledgement and the hidden `<background_results>` analysis
 prompt.
 
+The batch size is whatever the buffer holds — a fan-out whose members finish
+while a user turn runs arrives as one batch, not as one turn each. So the
+framing is chosen by that size. One result keeps the historical sentence, which
+asks for "the useful outcome". Two or more get `BATCH_FRAMING`, which states
+the count, repeats it in the block's `count` attribute, and requires one
+numbered Markdown section per `<result>`, headed by that result's one-based
+index and `<task>` **verbatim**. The acknowledgement also states the exact
+plural count, so the framing never claims the user saw a number it did not
+receive. The numbered verbatim heading is what the coverage audit in §4
+measures; without it the audit could only guess at paraphrase, and identical
+labels could not be distinguished. It stops short of claiming an omitted
+result is lost, because it is not: the prompt row stays in the transcript,
+retry re-anchors it past a compaction, and every result names a readable path
+to its full text.
+
 The ordering is load-bearing:
 
 1. Derive the batch's stable operation key from the sorted handle IDs:
@@ -207,6 +222,40 @@ its working indicator instead of raw reasoning text.
 - Failure: increment `failed_attempts`, persist it, and leave the delivery
   active for the timer.
 
+Success is "the turn returned", not "the report was complete". `is_blank_reply`
+is the only content gate, so a reply covering one result of three settles all
+three, and `failed_attempts` never moves — the attempt cap governs whether an
+answer arrived at all, never whether it answered everything. Before clearing a
+batch the actor therefore audits it: `unreported_result_indices` returns the
+one-based result indices whose required heading is absent, and a non-empty
+result logs a warning with those indices. Labels are deliberately excluded from
+the log because a detached command's label *is* its command line, which
+routinely carries credentials, and logs are served over an HTTP endpoint.
+
+The heading match is looser than the framing's `## <index>. <task>`: any
+heading level, any punctuation after the number, and any emphasis count. A
+tripwire that fires on well-formed reports is worse than one that misses,
+because the reader learns to skip it and the real partial report goes unnoticed
+with it. What stays required is that the line be a heading (prose mentioning
+the task is not the requested section), that the number open it (`## 11.`
+cannot answer for result 1), and that the task text share the line in either
+its raw or XML-escaped spelling.
+
+Both proactive notification turns and successful user turns that passively
+settle an open delivery run the same audit at the same level. The passive case
+is not the routine one it looks like: a ledger opens and clears inside a single
+actor message, so a user turn can only interleave with a delivery that already
+failed and is awaiting its timer. A batch retiring there has had no reporter at
+all, which is the same anomaly. Observation only — the
+delivery still settles. Narrowing a partial batch
+into a follow-up delivery needs a fresh prompt rendered from the un-named
+results under its own source-event key, because `handle_ids` is simultaneously
+the crash-replay idempotency key and the terminal-event dedup set, and
+`content` freezes the whole batch; trimming either in place would resend what
+was already reported and break replay. A batch of one is never audited: its
+framing asks for no verbatim heading, so it cannot be short one. Ledgers
+written before `result_labels` existed deliver but do not audit.
+
 The actor starts with a 60-second retry delay and doubles it after each timer
 attempt up to 300 seconds. Any inbound actor message resets the schedule.
 Retries happen only on this timer; the post-message drain never retries an
@@ -300,3 +349,8 @@ transcript or command output remains intact.
   interrupt path.
 - Notification framing is per-turn content, not part of the system prompt, so
   the normal prompt-cache prefix remains stable.
+- The framing that imposes a coverage duty and the predicate that audits it
+  live in the same module, so an instruction the report is not held to, or a
+  check for something never asked, is a single-file edit away from being
+  caught. Every successful reply that settles a batch runs the check first;
+  failure-cap degradation has no reply to audit.

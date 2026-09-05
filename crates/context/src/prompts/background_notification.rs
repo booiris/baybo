@@ -12,14 +12,37 @@ use baybo_workspace::WorkspacePaths;
 
 /// Assistant-reply lead sent before the parent starts analysing a finished
 /// background batch. Carries no result content (see [`build_completion_reply`]);
-/// `{{count_noun}}` is pluralised per batch size ("result" / "results").
+/// `{{count_noun}}` is either "result" or an exact plural count.
 const BACKGROUND_COMPLETION_REPLY_LEAD: &str =
     "Background work has finished. I'm reviewing the {{count_noun}} now.";
 
-/// Opening framing for a notification turn's content. Lives in per-turn
-/// content (never the system prompt) so the prompt-cache prefix is identical
-/// to a normal main-path turn.
-const BACKGROUND_NOTIFICATION_FRAMING: &str = "[background task(s) finished since your last turn. A brief completion acknowledgement has already been sent to the user. Analyze the results now and report the useful outcome as the next fresh, proactive message; do not repeat the acknowledgement.]";
+/// Opening framing for a notification turn carrying one result. Lives in
+/// per-turn content (never the system prompt) so the prompt-cache prefix is
+/// identical to a normal main-path turn.
+const SINGLE_RESULT_FRAMING: &str = "[background task(s) finished since your last turn. A brief completion acknowledgement has already been sent to the user. Analyze the results now and report the useful outcome as the next fresh, proactive message; do not repeat the acknowledgement.]";
+
+/// Opening framing for a batch. It differs from [`SINGLE_RESULT_FRAMING`] in
+/// the only way that matters at N > 1: it states the count and spends its
+/// second half demanding that the report account for every `<result>`.
+///
+/// The one-result text asks for "the useful outcome" — singular, definite, and
+/// byte-identical no matter how many results follow it. Handed three unrelated
+/// 8–15 KB reports under that sentence, a model that answers one of them and
+/// moves on has read the instruction correctly; nothing downstream can tell
+/// that apart from a complete report, because the acknowledgement rides the
+/// control-event plane and structurally cannot reach the model.
+///
+/// The numbered verbatim-`<task>` heading is load-bearing beyond legibility:
+/// it is what makes [`unreported_result_indices`] a contract the reply can be
+/// held to rather than a guess about paraphrase. The index also distinguishes
+/// two results whose labels happen to be identical.
+///
+/// It deliberately stops short of "a result you omit is lost". That is false —
+/// the prompt row stays in the transcript, the retry path re-anchors it after a
+/// compaction, and every `<result>` names a `Read`-able absolute path holding
+/// the whole of it. Claiming otherwise would trade a real affordance for
+/// urgency.
+const BATCH_FRAMING: &str = r#"[{{count}} background tasks finished since your last turn. A brief completion acknowledgement has already told the user that {{count}} results arrived. Analyze them now and report the useful outcome as the next fresh, proactive message; do not repeat the acknowledgement. Return exactly {{count}} Markdown sections in the order below. Each section must start with the heading `## <index>. <task>`, copying that result's index and <task> text verbatim. A result with nothing worth reporting still gets its heading and one line saying so. Do not omit or merge results, and do not defer one to a later turn.]"#;
 
 /// Per-result body budget, matching what the SAME report would have kept had
 /// the job finished inside its foreground wait and come back as a tool result.
@@ -35,11 +58,16 @@ const MAX_RESULT_BYTES: usize = baybo_model::MAX_TOOL_OUTPUT_BYTES;
 /// every result still gets the full per-result budget.
 const MAX_BATCH_BYTES: usize = 4 * MAX_RESULT_BYTES;
 
+/// Opening tag of the results block. `{{count}}` is the batch size, so the
+/// count the framing states is also readable from the structure.
+const BACKGROUND_RESULTS_OPEN: &str = r#"<background_results count="{{count}}">
+"#;
+
 /// Per-result element of the nested `<background_results>` block. Metadata
 /// rides as attributes; `task` / `output` (and the kind-specific `detail`)
 /// are child elements so multi-line free text with quotes needs no attribute
 /// escaping.
-const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="{{type}}" status="{{status}}">
+const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result index="{{index}}" handle="{{handle}}" type="{{type}}" status="{{status}}">
     <task>{{task}}</task>
     <output>{{output}}</output>
 {{detail}}  </result>
@@ -76,11 +104,11 @@ const RETRY_CUE: &str = "[the user has received only the completion acknowledgem
 /// transcript row.
 pub fn build_completion_reply(pending: &[PendingBackgroundResult]) -> String {
     let count_noun = if pending.len() > 1 {
-        "results"
+        format!("{} results", pending.len())
     } else {
-        "result"
+        "result".to_string()
     };
-    BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", count_noun)
+    BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", &count_noun)
 }
 
 /// The request-time retry cue (see [`RETRY_CUE`]). Stateless — the same for
@@ -100,9 +128,16 @@ pub fn build_notification_content(
     workspace: &WorkspacePaths,
 ) -> Vec<ContentBlock> {
     let budget = result_budget(pending.len());
-    let mut xml = String::from(BACKGROUND_NOTIFICATION_FRAMING);
-    xml.push_str("\n\n<background_results>\n");
-    for p in pending {
+    let count = pending.len().to_string();
+    let mut xml = if pending.len() > 1 {
+        BATCH_FRAMING.replace("{{count}}", &count)
+    } else {
+        SINGLE_RESULT_FRAMING.to_string()
+    };
+    xml.push_str("\n\n");
+    xml.push_str(&BACKGROUND_RESULTS_OPEN.replace("{{count}}", &count));
+    for (offset, p) in pending.iter().enumerate() {
+        let index = offset + 1;
         let (type_attr, full_text, detail) = match &p.kind {
             BackgroundJobKind::Subagent {
                 child_session_id,
@@ -141,6 +176,7 @@ pub fn build_notification_content(
         };
         xml.push_str(
             &BACKGROUND_RESULT_TEMPLATE
+                .replace("{{index}}", &index.to_string())
                 .replace("{{handle}}", &xml_escape(&p.handle_id))
                 .replace("{{type}}", &xml_escape(&type_attr))
                 .replace("{{status}}", pending_status_label(&p.status))
@@ -154,6 +190,73 @@ pub fn build_notification_content(
     }
     xml.push_str("</background_results>");
     vec![ContentBlock::Text(xml)]
+}
+
+/// One-based result indices from a settled batch whose required heading is
+/// absent from its analysed reply.
+///
+/// Audits exactly what [`BATCH_FRAMING`] demands, and therefore audits nothing
+/// else: a batch of one is never asked for a verbatim `<task>` heading, so it
+/// can never be short one. Keeping that rule here rather than at the call site
+/// is what stops the audit and the instruction from drifting apart.
+///
+/// This is the floor the framing can be held to, not proof of substantive
+/// coverage — a reply can provide the heading and say nothing useful below it.
+/// Requiring a complete heading line is still stronger than a substring: a
+/// preamble that merely lists every task no longer passes, and duplicate labels
+/// remain independently auditable through their indices.
+///
+/// Either spelling of a heading counts. A label is free text the spawning model
+/// wrote, so `&` in one is ordinary; the prompt shows it XML-escaped while the
+/// ledger keeps it raw, and a reply may echo whichever it saw.
+pub fn unreported_result_indices(labels: &[String], reply: &str) -> Vec<usize> {
+    if labels.len() < 2 {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = reply.lines().map(str::trim).collect();
+    labels
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, label)| {
+            let index = offset + 1;
+            let escaped = xml_escape(label);
+            (!lines
+                .iter()
+                .any(|line| heading_opens_result(line, index, label, &escaped)))
+            .then_some(index)
+        })
+        .collect()
+}
+
+/// Whether `line` is the heading that opens result `index`.
+///
+/// Deliberately looser than the exact `## <index>. <task>` the framing asks
+/// for, because the check is a tripwire and a false trip is worse than a
+/// missed one: a warning that fires on well-formed reports gets ignored, and
+/// then the real partial report goes unnoticed too. Heading level, the
+/// punctuation after the number, and any emphasis are therefore free — models
+/// substitute `)` for `.`, deepen the heading, or bold the task without being
+/// asked, and none of that means a result went unreported.
+///
+/// What stays load-bearing is the three things that make it a contract rather
+/// than a coincidence: it must be a heading (a prose sentence mentioning the
+/// task is not the requested section), the number must open that heading (so
+/// `## 11.` cannot answer for result 1), and the task text must be on the same
+/// line in one of its two spellings (the ledger keeps the label raw, the prompt
+/// showed it XML-escaped, and a reply may echo either).
+fn heading_opens_result(line: &str, index: usize, label: &str, escaped: &str) -> bool {
+    let after_hashes = line.trim_start_matches('#');
+    if after_hashes.len() == line.len() {
+        return false;
+    }
+    let head = after_hashes.trim_start();
+    let Some(rest) = head.strip_prefix(index.to_string().as_str()) else {
+        return false;
+    };
+    if rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    rest.contains(label) || rest.contains(escaped)
 }
 
 /// Bytes each result in a batch of `count` may spend on its body.
@@ -250,7 +353,7 @@ mod tests {
     /// `MAX_TOOL_OUTPUT_BYTES`.
     #[test]
     fn a_report_that_fits_a_tool_result_is_not_cut_by_the_notification() {
-        let report = "彤程新材".repeat(1024); // ~12 KiB, the incident's size
+        let report = "季度报表".repeat(1024); // ~12 KiB, the incident's size
         assert!(report.len() <= baybo_model::MAX_TOOL_OUTPUT_BYTES);
         let pending = vec![PendingBackgroundResult::subagent(
             "h1",
@@ -284,10 +387,10 @@ mod tests {
     /// a broken code point — the incident's report was Chinese throughout.
     #[test]
     fn truncation_cuts_on_a_char_boundary() {
-        let text = "彤".repeat(64); // 3 bytes each
+        let text = "报".repeat(64); // 3 bytes each
         let out = truncate_for_notice(&text, 100, Path::new("/ws/x.jsonl"));
-        assert!(out.starts_with(&"彤".repeat(33)));
-        assert!(!out.starts_with(&"彤".repeat(34)));
+        assert!(out.starts_with(&"报".repeat(33)));
+        assert!(!out.starts_with(&"报".repeat(34)));
     }
 
     #[test]
@@ -304,8 +407,8 @@ mod tests {
         let ContentBlock::Text(xml) = &blocks[0] else {
             panic!("expected text block");
         };
-        assert!(xml.starts_with(BACKGROUND_NOTIFICATION_FRAMING));
-        assert!(xml.contains("<background_results>"));
+        assert!(xml.starts_with(SINGLE_RESULT_FRAMING));
+        assert!(xml.contains(r#"<background_results count="1">"#));
         assert!(xml.contains("status=\"completed\""));
         assert!(xml.contains("type=\"claude\""));
         // Free text is XML-escaped.
@@ -319,6 +422,167 @@ mod tests {
             xml.contains("<transcript_file>/ws/logs/sessions/child-1.jsonl</transcript_file>"),
             "missing transcript pointer: {xml}"
         );
+    }
+
+    fn batch(labels: &[&str]) -> Vec<PendingBackgroundResult> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                PendingBackgroundResult::subagent(
+                    format!("h{i}"),
+                    "explorer",
+                    *label,
+                    baybo_model::SessionId::from(format!("child-{i}")),
+                    format!("{label} body"),
+                    SubagentExitStatus::Completed,
+                )
+            })
+            .collect()
+    }
+
+    fn rendered(pending: &[PendingBackgroundResult]) -> String {
+        let blocks = build_notification_content(pending, &workspace());
+        let ContentBlock::Text(xml) = &blocks[0] else {
+            panic!("expected text block");
+        };
+        xml.clone()
+    }
+
+    /// A batch's framing must state its size and demand a section per result.
+    /// The one-result text asks for "the useful outcome" — a model handed three
+    /// unrelated reports under it can answer one and be locally correct.
+    #[test]
+    fn a_batch_is_framed_with_its_count_and_a_coverage_duty() {
+        let xml = rendered(&batch(&["first task", "second task", "third task"]));
+        assert!(xml.starts_with('['), "framing must lead the content: {xml}");
+        assert!(xml.contains("3 background tasks finished"));
+        assert!(xml.contains("told the user that 3 results arrived"));
+        assert!(xml.contains("Return exactly 3 Markdown sections"));
+        assert!(xml.contains("copying that result's index and <task> text verbatim"));
+        assert!(!xml.contains("{{count}}"), "unsubstituted placeholder");
+        assert!(xml.contains(r#"<background_results count="3">"#));
+        assert!(xml.contains(r#"<result index="1" handle="h0""#));
+        assert!(xml.contains(r#"<result index="2" handle="h1""#));
+        assert!(xml.contains(r#"<result index="3" handle="h2""#));
+    }
+
+    /// One result is never asked for a verbatim heading, so its framing must
+    /// stay exactly what it has always been.
+    #[test]
+    fn a_single_result_keeps_the_historical_framing() {
+        let xml = rendered(&batch(&["only task"]));
+        assert!(xml.starts_with(SINGLE_RESULT_FRAMING));
+        assert!(!xml.contains("Return exactly"));
+    }
+
+    /// The audit measures exactly the duty [`BATCH_FRAMING`] imposes: emit each
+    /// numbered task heading. This is the case the incident turned on — three
+    /// reports in one batch, a reply that covered one.
+    #[test]
+    fn unreported_result_indices_name_the_results_a_reply_skipped() {
+        let labels = [
+            "trace the runaway patch".to_string(),
+            "trace the sympy invariants".to_string(),
+            "trace the regression contracts".to_string(),
+        ];
+        let partial = "## 1. trace the runaway patch\nOnly one file changed.";
+        assert_eq!(unreported_result_indices(&labels, partial), [2, 3]);
+
+        let complete = format!(
+            "## 1. {}\nA\n## 2. {}\nB\n## 3. {}\nC",
+            labels[0], labels[1], labels[2]
+        );
+        assert!(unreported_result_indices(&labels, &complete).is_empty());
+    }
+
+    /// A batch of one carries no naming duty, so it can never be short one —
+    /// otherwise every single-result turn would warn.
+    #[test]
+    fn unreported_result_indices_audit_only_batches() {
+        let one = ["only task".to_string()];
+        assert!(unreported_result_indices(&one, "nothing like the label").is_empty());
+        assert!(unreported_result_indices(&[], "").is_empty());
+    }
+
+    /// The ledger keeps a label raw; the prompt shows it escaped. A reply that
+    /// echoed what it was shown has still named the result.
+    #[test]
+    fn unreported_result_indices_accept_the_escaped_spelling_the_prompt_showed() {
+        let labels = [
+            "compare A & B".to_string(),
+            "trace <Foo> parsing".to_string(),
+        ];
+        let echoed = "## 1. compare A &amp; B\n…\n## 2. trace &lt;Foo&gt; parsing\n…";
+        assert!(
+            unreported_result_indices(&labels, echoed).is_empty(),
+            "escaped echo must count as named"
+        );
+        assert_eq!(
+            unreported_result_indices(&labels, "## 1. compare A & B"),
+            [2],
+            "the raw spelling still counts, and a genuine omission still warns"
+        );
+    }
+
+    /// Heading level, the punctuation after the number, and emphasis are all
+    /// free — a false trip on a well-formed report would train the reader to
+    /// ignore the warning, and then a real partial report goes unnoticed too.
+    #[test]
+    fn a_well_formed_heading_counts_in_any_of_its_usual_spellings() {
+        let labels = [
+            "find the regression".to_string(),
+            "find the empty patch".to_string(),
+        ];
+        for reply in [
+            "## 1. find the regression\nA\n## 2. find the empty patch\nB",
+            "### 1. find the regression\nA\n### 2. find the empty patch\nB",
+            "## 1) find the regression\nA\n## 2) find the empty patch\nB",
+            "##   1.  **find the regression**\nA\n##   2.  **find the empty patch**\nB",
+        ] {
+            assert!(
+                unreported_result_indices(&labels, reply).is_empty(),
+                "spelling rejected: {reply}"
+            );
+        }
+    }
+
+    /// The number has to open the heading, or a two-digit batch would let
+    /// result 11's section answer for result 1.
+    #[test]
+    fn a_longer_index_cannot_answer_for_its_prefix() {
+        let mut labels: Vec<String> = (1..=11).map(|n| format!("task {n}")).collect();
+        labels[0] = "shared task".to_string();
+        labels[10] = "shared task".to_string();
+        let only_eleven = "## 11. shared task\nreported";
+        assert!(
+            unreported_result_indices(&labels, only_eleven).contains(&1),
+            "`## 11.` must not satisfy result 1"
+        );
+        assert!(!unreported_result_indices(&labels, only_eleven).contains(&11));
+    }
+
+    #[test]
+    fn audit_requires_headings_and_distinguishes_duplicate_labels() {
+        let labels = ["same task".to_string(), "same task".to_string()];
+        assert_eq!(
+            unreported_result_indices(&labels, "Reviewed same task and same task."),
+            [1, 2],
+            "mentioning labels in prose is not the requested section contract"
+        );
+        assert_eq!(
+            unreported_result_indices(&labels, "## 1. same task\nFirst result."),
+            [2],
+            "the index keeps identical labels independently auditable"
+        );
+    }
+
+    /// A blank reply names nothing, so every result in a batch is unreported —
+    /// the settle path suppresses the send but still retires the ledger.
+    #[test]
+    fn unreported_result_indices_flag_every_result_of_a_blank_reply() {
+        let labels = ["a task".to_string(), "b task".to_string()];
+        assert_eq!(unreported_result_indices(&labels, ""), [1, 2]);
     }
 
     #[test]
@@ -382,7 +646,7 @@ mod tests {
         let reply = build_completion_reply(&pending);
         assert_eq!(
             reply,
-            BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "results")
+            BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "2 results")
         );
         // Neither a result body nor a task label may leak into the batch
         // acknowledgement.
