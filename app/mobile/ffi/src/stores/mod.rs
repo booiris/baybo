@@ -11,4 +11,5 @@
 //! What does NOT belong here is anything the platform owns: pickers, media,
 //! WebView hosting, the observation wiring a shell's UI framework needs.
 
+pub(crate) mod snippet;
 pub(crate) mod title;

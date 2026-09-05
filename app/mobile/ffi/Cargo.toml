@@ -23,6 +23,7 @@ remote-host-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+unicode-segmentation = { workspace = true }
 hex = { workspace = true }
 snow = { workspace = true }
 sha2 = { workspace = true }

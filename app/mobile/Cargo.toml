@@ -23,6 +23,10 @@ device-proto = { path = "../../crates/device-proto" }
 # The remote-host (C) wire contract: relay route/URL builders + header names.
 remote-host-protocol = { path = "../../remote-host/crates/protocol" }
 base64 = "0.22"
+# Grapheme clusters for the search excerpt. Swift gets them for free
+# (`Character`) and the JS reference reaches for `Intl.Segmenter`; Rust needs
+# this, and the three must agree or the shared vectors fail.
+unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
