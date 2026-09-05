@@ -82,7 +82,9 @@ mod imp {
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::string::CFString;
     use core_foundation_sys::base::{CFGetTypeID, CFTypeRef, OSStatus};
-    use core_foundation_sys::bundle::{CFBundleGetMainBundle, CFBundleGetValueForInfoDictionaryKey};
+    use core_foundation_sys::bundle::{
+        CFBundleGetMainBundle, CFBundleGetValueForInfoDictionaryKey,
+    };
     use core_foundation_sys::dictionary::CFDictionaryRef;
     use core_foundation_sys::string::CFStringRef;
     use std::sync::OnceLock;
