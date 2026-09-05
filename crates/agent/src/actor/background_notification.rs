@@ -789,11 +789,16 @@ impl AgentActor {
             session_id = %self.durable.session.id,
             "user turn completed over active background notification; settling passively"
         );
-        // Reaching here means an earlier proactive attempt failed or was
-        // interrupted: the ledger opens and clears inside one actor message,
-        // so no user turn can interleave with a delivery that is going well.
-        // The batch is therefore retiring with nobody having reported it,
-        // which is the same anomaly the proactive path warns about.
+        // A ledger opens and clears inside one actor message, so reaching here
+        // means the proactive attempt failed, was cancelled, or was cut short
+        // by a restart — never that a healthy delivery is still pending.
+        //
+        // "Cancelled" is why this says nothing about how much reached the
+        // user: `/stop` is deliberately not a delivery failure (it leaves
+        // `failed_attempts` alone above), and that turn streamed through
+        // `response_tx`, so the user may well have read the first sections
+        // before stopping it. The warning claims only what it can see — this
+        // batch is retiring without a complete report.
         if let Some(gap) = self.unreported_background_results(response_content) {
             warn!(
                 session_id = %self.durable.session.id,

@@ -42,7 +42,7 @@ const SINGLE_RESULT_FRAMING: &str = "[background task(s) finished since your las
 /// compaction, and every `<result>` names a `Read`-able absolute path holding
 /// the whole of it. Claiming otherwise would trade a real affordance for
 /// urgency.
-const BATCH_FRAMING: &str = r#"[{{count}} background tasks finished since your last turn. A brief completion acknowledgement has already told the user that {{count}} results arrived. Analyze them now and report the useful outcome as the next fresh, proactive message; do not repeat the acknowledgement. Return exactly {{count}} Markdown sections in the order below. Each section must start with the heading `## <index>. <task>`, copying that result's index and <task> text verbatim. A result with nothing worth reporting still gets its heading and one line saying so. Do not omit or merge results, and do not defer one to a later turn.]"#;
+const BATCH_FRAMING: &str = r#"[{{count}} background tasks finished since your last turn. A brief completion acknowledgement has already told the user that {{count}} results arrived. Analyze them now and report the useful outcome as the next fresh, proactive message; do not repeat the acknowledgement. Return exactly {{count}} Markdown sections in the order below. Each section must start with the heading `## <index>. <task>`, copying that result's index and <task> text verbatim. If a <task> is long or spans several lines, shorten it in the heading — the index is what identifies the section. A result with nothing worth reporting still gets its heading and one line saying so. Do not omit or merge results, and do not defer one to a later turn.]"#;
 
 /// Per-result body budget, matching what the SAME report would have kept had
 /// the job finished inside its foreground wait and come back as a tool result.
@@ -219,13 +219,36 @@ pub fn unreported_result_indices(labels: &[String], reply: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(offset, label)| {
             let index = offset + 1;
-            let escaped = xml_escape(label);
+            let quotable = quotable_task(label);
+            let escaped = quotable.map(xml_escape);
             (!lines
                 .iter()
-                .any(|line| heading_opens_result(line, index, label, &escaped)))
+                .any(|line| heading_opens_result(line, index, quotable, escaped.as_deref())))
             .then_some(index)
         })
         .collect()
+}
+
+/// Longest task text a heading is asked to carry verbatim. A heading is one
+/// line of prose; past this it stops being a heading.
+const MAX_QUOTABLE_TASK_CHARS: usize = 120;
+
+/// The task text a heading can be required to quote, or `None` when no heading
+/// could contain it.
+///
+/// A subagent's label is its one-line description, so this is almost always
+/// `Some`. A detached `Bash` job's label is a different animal: it *is* the
+/// command line (`PendingBackgroundResult::command` stores
+/// `label: command.clone()`, uncapped and unflattened), so a heredoc or a
+/// `&& \`-continued pipeline arrives with newlines in it. A Markdown ATX
+/// heading is single-line by definition, which makes "quote the task verbatim"
+/// unsatisfiable for that result — and a requirement no reply can meet would
+/// fire the tripwire on every well-formed report in the batch, which is the
+/// one failure mode this check exists to avoid.
+fn quotable_task(label: &str) -> Option<&str> {
+    let task = label.trim();
+    (!task.is_empty() && !task.contains('\n') && task.chars().count() <= MAX_QUOTABLE_TASK_CHARS)
+        .then_some(task)
 }
 
 /// Whether `line` is the heading that opens result `index`.
@@ -238,25 +261,37 @@ pub fn unreported_result_indices(labels: &[String], reply: &str) -> Vec<usize> {
 /// substitute `)` for `.`, deepen the heading, or bold the task without being
 /// asked, and none of that means a result went unreported.
 ///
-/// What stays load-bearing is the three things that make it a contract rather
-/// than a coincidence: it must be a heading (a prose sentence mentioning the
-/// task is not the requested section), the number must open that heading (so
-/// `## 11.` cannot answer for result 1), and the task text must be on the same
-/// line in one of its two spellings (the ledger keeps the label raw, the prompt
-/// showed it XML-escaped, and a reply may echo either).
-fn heading_opens_result(line: &str, index: usize, label: &str, escaped: &str) -> bool {
+/// What stays load-bearing is that it must be a heading (a prose sentence
+/// mentioning the task is not the requested section) and that the number must
+/// open it, so `## 11.` cannot answer for result 1.
+///
+/// The task text is required on the same line only when it is quotable at all
+/// (see [`quotable_task`]); when it is not, the index carries the section on
+/// its own rather than the check demanding something no heading can hold.
+/// Either spelling counts when it is required — the ledger keeps the label
+/// raw, the prompt showed it XML-escaped, and a reply may echo either.
+fn heading_opens_result(
+    line: &str,
+    index: usize,
+    task: Option<&str>,
+    escaped: Option<&str>,
+) -> bool {
     let after_hashes = line.trim_start_matches('#');
     if after_hashes.len() == line.len() {
         return false;
     }
-    let head = after_hashes.trim_start();
+    // Emphasis wrapping the whole heading puts its markers before the number.
+    let head = after_hashes.trim_start().trim_start_matches(['*', '_']);
     let Some(rest) = head.strip_prefix(index.to_string().as_str()) else {
         return false;
     };
     if rest.starts_with(|c: char| c.is_ascii_digit()) {
         return false;
     }
-    rest.contains(label) || rest.contains(escaped)
+    match (task, escaped) {
+        (Some(task), Some(escaped)) => rest.contains(task) || rest.contains(escaped),
+        _ => true,
+    }
 }
 
 /// Bytes each result in a batch of `count` may spend on its body.
@@ -545,6 +580,71 @@ mod tests {
                 "spelling rejected: {reply}"
             );
         }
+    }
+
+    /// A detached `Bash` job's label is its command line verbatim, so a
+    /// heredoc arrives with newlines in it — and no Markdown heading can hold
+    /// those. Demanding it anyway would fire the tripwire on every well-formed
+    /// report in the batch, which is the one thing this check must not do.
+    #[test]
+    fn a_task_no_heading_could_hold_is_carried_by_its_index_alone() {
+        let labels = [
+            "audit the parser".to_string(),
+            "for f in *.log; do\n  grep ERROR \"$f\"\ndone".to_string(),
+        ];
+        assert!(
+            unreported_result_indices(&labels, "## 1. audit the parser\nA\n## 2. the log sweep\nB")
+                .is_empty(),
+            "a multi-line command label must not be unmatchable"
+        );
+        // The index still has to be there: it is the whole contract for such a
+        // result, so losing it is a real omission.
+        assert_eq!(
+            unreported_result_indices(&labels, "## 1. audit the parser\nA"),
+            [2]
+        );
+
+        let too_long = ["x".repeat(MAX_QUOTABLE_TASK_CHARS + 1), "short".to_string()];
+        assert!(
+            unreported_result_indices(&too_long, "## 1. summary\nA\n## 2. short\nB").is_empty(),
+            "a task past the heading budget is carried by its index too"
+        );
+    }
+
+    /// A label the spawner never trimmed must not become unquotable over a
+    /// trailing space no reply would reproduce.
+    #[test]
+    fn a_task_is_quoted_after_trimming_the_labels_own_whitespace() {
+        let labels = ["  find the bug \n".to_string(), "other task".to_string()];
+        assert!(
+            unreported_result_indices(&labels, "## 1. find the bug\nA\n## 2. other task\nB")
+                .is_empty()
+        );
+        assert_eq!(quotable_task("  find the bug \n"), Some("find the bug"));
+        assert_eq!(quotable_task("   "), None);
+    }
+
+    /// Emphasis wrapping the whole heading puts its markers before the number,
+    /// which the guard must look past — `docs/background-notifications.md`
+    /// promises emphasis is free, not free only after the number.
+    #[test]
+    fn emphasis_before_the_index_still_counts() {
+        let labels = ["first task".to_string(), "second task".to_string()];
+        for reply in [
+            "## **1. first task**\nA\n## **2. second task**\nB",
+            "## _1. first task_\nA\n## _2. second task_\nB",
+            "## **1.** first task\nA\n## **2.** second task\nB",
+        ] {
+            assert!(
+                unreported_result_indices(&labels, reply).is_empty(),
+                "emphasis rejected: {reply}"
+            );
+        }
+        // Looking past emphasis must not weaken the digit guard.
+        let mut wide: Vec<String> = (1..=11).map(|n| format!("task {n}")).collect();
+        wide[0] = "shared".to_string();
+        wide[10] = "shared".to_string();
+        assert!(unreported_result_indices(&wide, "## **11. shared**\nx").contains(&1));
     }
 
     /// The number has to open the heading, or a two-digit batch would let

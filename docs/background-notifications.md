@@ -237,16 +237,28 @@ heading level, any punctuation after the number, and any emphasis count. A
 tripwire that fires on well-formed reports is worse than one that misses,
 because the reader learns to skip it and the real partial report goes unnoticed
 with it. What stays required is that the line be a heading (prose mentioning
-the task is not the requested section), that the number open it (`## 11.`
-cannot answer for result 1), and that the task text share the line in either
-its raw or XML-escaped spelling.
+the task is not the requested section) and that the number open it (`## 11.`
+cannot answer for result 1).
+
+The task text is required on that line — in either its raw or XML-escaped
+spelling — only when a heading could hold it at all. A subagent's label is its
+one-line description, so it almost always can. A detached `Bash` job's label is
+its **command line**, stored uncapped and unflattened, so a heredoc or a
+`&& \`-continued pipeline arrives with newlines in it; a Markdown ATX heading
+is single-line by definition, and demanding one anyway would fire the tripwire
+on every well-formed report in that batch. Such a result is carried by its
+index alone, and the framing tells the model to shorten a long or multi-line
+task in the heading rather than attempt it.
 
 Both proactive notification turns and successful user turns that passively
 settle an open delivery run the same audit at the same level. The passive case
 is not the routine one it looks like: a ledger opens and clears inside a single
-actor message, so a user turn can only interleave with a delivery that already
-failed and is awaiting its timer. A batch retiring there has had no reporter at
-all, which is the same anomaly. Observation only — the
+actor message, so a user turn can only interleave with a delivery that failed,
+was cancelled, or was cut short by a restart — never with a healthy one. What
+the warning claims there is that the batch is retiring without a *complete*
+report, not that nothing reached the user: `/stop` is deliberately not counted
+as a delivery failure, and the turn it stopped had already been streaming, so
+its earlier sections may have been read. Observation only — the
 delivery still settles. Narrowing a partial batch
 into a follow-up delivery needs a fresh prompt rendered from the un-named
 results under its own source-event key, because `handle_ids` is simultaneously
