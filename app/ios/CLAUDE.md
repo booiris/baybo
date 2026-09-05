@@ -98,8 +98,10 @@ error they can act on, no way back but a re-pair.
   § Push preview).
 - APNs environment comes from the shared `BAYBO_APNS_ENVIRONMENT` build setting:
   it expands into both the signed `aps-environment` entitlement and the app's
-  `BayboApnsEnvironment` Info key, which Swift passes through
-  `ClientConfig.apnsEnv`. Never infer it from Swift `DEBUG` or Rust
+  `BayboApnsEnvironment` Info key. `Baybo.apnsEnvironment` reads that key and
+  `AppDelegate` hands it to the core inside `PushToken::Apns { environment }`
+  (`App/AppDelegate.swift:61-63`); `ClientConfig` carries only `log_dir` and
+  `blob_cache_dir`. Never infer it from Swift `DEBUG` or Rust
   `cfg!(debug_assertions)` — optimization and signing environment are independent.
 
 ## Docs

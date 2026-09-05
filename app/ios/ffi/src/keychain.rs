@@ -262,6 +262,24 @@ mod imp {
     }
 }
 
+// The `imp` below is a SILENT no-op: every store returns `Ok(())`, every read
+// `Ok(None)`. That is fine for host tests, which never assert persistence, and
+// it is a data-loss bug on a real platform: `pair_confirm` / `direct_login`
+// would return `Ok`, `binding::active_leg` would then read nothing back, and
+// every later call would fail with `NotBound` while the device identity and
+// push key are re-minted per call. Android reaches this arm, so refuse to build
+// for it until the `SecureStore` seam replaces the stub — an `.so` that loses a
+// pairing is worse than one that does not exist.
+// See `docs/todo/android-companion.md` § Rust core (phase P2), which deletes
+// both this guard and the stub's Android reachability.
+#[cfg(target_os = "android")]
+compile_error!(
+    "baybo-ios-ffi has no Android secure store yet: this build would link the \
+     silent no-op keychain stub and lose the device identity, pairing and push \
+     key on every call. Implement the SecureStore seam first — see \
+     docs/todo/android-companion.md, phase P2."
+);
+
 #[cfg(not(target_os = "ios"))]
 mod imp {
     use super::KEY_LEN;

@@ -205,9 +205,10 @@ mod tests {
     ///
     /// The policy's one home is the Swift handler that sets the header.
     /// Reaching across into `app/ios` is unusual here, and deliberate: that
-    /// tree is its own cargo workspace whose CI jobs are all `if: false`
-    /// (see `/CLAUDE.md`), so a gate living there would never run. This one
-    /// rides the root workspace's gating `cargo test`.
+    /// tree is its own cargo workspace, and its CI jobs are path-filtered
+    /// (see `/CLAUDE.md`), so a gate living there would sit out every change
+    /// to this skill — the diff that breaks the quote touches `crates/skills`,
+    /// not `app/ios`. This one rides the root workspace's gating `cargo test`.
     ///
     /// Compared as a SET of directives, so the skill stays free to wrap the
     /// policy across lines for readability and neither side's trailing `;`

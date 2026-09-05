@@ -251,7 +251,7 @@ The rest of the core changes:
 | `ffi/Cargo.toml` | Package rename; `[target.'cfg(target_os = "android")'.dependencies]` android_log-sys, webpki-roots; crate-type already includes cdylib |
 | `ffi/build.rs` | `emit_ios_keychain_access_group()` only when `CARGO_CFG_TARGET_OS == "ios"` |
 | `ffi/uniffi.toml` | `[bindings.kotlin] package_name = "com.baybo.core"`, `cdylib_name = "baybo_ffi"`, `android = true`, `generate_immutable_records = true` (keys verified in uniffi_bindgen 0.29.5 `gen_kotlin/mod.rs:63-79`) |
-| `ffi/src/api.rs` | SecureStore + SecureStoreError; `PushPreview { title, body, session_id: Option, badge: Option }`; `ClientConfig.blob_cache_dir: String` (required — `Baybo.swift` always passes it; its Swift type is `String?` and changes with it) |
+| `ffi/src/api.rs` | SecureStore + SecureStoreError; `PushPreview { title, body, session_id: Option, badge: Option }`; `ClientConfig.blob_cache_dir: String` (required). Not a type flip: `Baybo.swift` always passes the expression, but `ServerCache.blobDirectory(in:)` (`ServerCache.swift:36-50`) returns `String?` and yields `nil` when the directory cannot be created, logging "falling back to tmp" — the fallback `blob_helper.rs:73-75` provides. Making the field required decides something Swift does not decide today, so P2 owes an answer: a second location under Application Support, or a hard failure |
 | `ffi/src/keychain.rs` | Hoist `ACCOUNT_PREFIX`; non-iOS imp over SecureStore; **drop the `#[cfg(all(debug_assertions, target_os = "ios"))]` gate on `read_push_key` (line 464)** — today it is a verify-nse.sh self-check, and `decrypt_push_preview` needs it in Android release builds |
 | `ffi/src/lib.rs` | Constructor as above; export `decrypt_push_preview(bid, enc_b64, n_b64)` over `device_proto::aead::open` + `keychain::read_push_key`, tested with `device_proto::fixtures`; export `refresh_push_binding()` so a rotated FCM token is re-posted while idle (today the relay push refresh only fires on pair/connect edges: `lib.rs:217, 984, 1024, 1104`) |
 | `ffi/src/logging.rs` | File writer, rotation, `DEBUG_TARGETS` untouched; the stderr mirror branch becomes `__android_log_write` under `cfg(target_os = "android")` (native fd 2 is `/dev/null` on Android). Not the `android_logger` crate — it installs its own global logger and conflicts with `set_boxed_logger` |
@@ -385,7 +385,12 @@ splits three ways:
   - **Pushed down in P2** (all three clauses hold; ~800 lines of Swift in
     total): `RenameTitle` (already spelled twice — `RenameTitle.swift` and
     `app/web`'s `renameTitle.ts` — with the gateway's validator as a third),
-    `SearchSnippet` (shared vector file), `ChatApprovals.ApprovalQueue`,
+    `SearchSnippet` (shared vector file), the *fold* of
+    `ChatApprovals.ApprovalQueue` — only the fold: the file is `import SwiftUI`
+    and `apply` is `@MainActor` because `PendingApproval.from(frame:)`
+    localises the access lines through `Lang` as it reads them
+    (`ChatApprovals.swift:27-29, 94`), so the formatting half stays in each
+    shell,
     `OutboxStore` (persisted format + state machine + the 10 s / 3 tx / 30 s
     rules), the data half of `ModelCatalog`. Exported as uniffi objects and
     free functions; iOS keeps 50-150-line adapters; the literal fixtures in
@@ -394,8 +399,11 @@ splits three ways:
   - **Ported to Kotlin in P3, with the failing clause recorded**:
     `SessionIndex` (1,313 lines; welded to `@Published` and the transcript
     mirror writer), `ChatStore` (1,762 lines; welded to `TranscriptBridge`,
-    `@Published` and eight `ChatStore*Tests` suites), `DraftStore`, the MVP
-    subset of `AppStore`. Same JSON keys and file layout as iOS; the Kotlin
+    `@Published` and eight `ChatStore*Tests` suites), `DraftStore` (Foundation
+    only, so it passes clause (a); it fails clause (b) — the persisted
+    `DraftAttachment` embeds `bookmark: Data?`, an iOS security-scoped
+    bookmark, so the on-disk format is not portable as it stands,
+    `DraftStore.swift:19-22`), the MVP subset of `AppStore`. Same JSON keys and file layout as iOS; the Kotlin
     `PersistedFormatTest` reads the same JSON fixtures.
   - **Retired in P5** (not "evaluated"): `SessionIndex`'s merge rules and
     mutation pump move down if the two ports drift; `ChatStore`'s connState
