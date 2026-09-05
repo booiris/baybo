@@ -33,6 +33,17 @@ struct TranscriptLanguageTests {
 
     /// Nothing is mounted yet, so the push lands in the pending buffer — which
     /// is the same thing the webview would receive a moment later.
+    /// `Lang` is an app-wide singleton that persists to UserDefaults, and these
+    /// cases move it — so every one puts it back. Cycling rather than toggling
+    /// ONCE: `toggle()` is the only setter and it walks `Lang.supported`, so a
+    /// single toggle only returns home while exactly two languages exist. The
+    /// bound is what keeps a mistake here a failed test rather than a hung one.
+    private func restoreLanguage(to original: String) {
+        for _ in 0..<Lang.supported.count where Lang.shared.code != original {
+            Lang.shared.toggle()
+        }
+    }
+
     private func languagePushes(_ bridge: TranscriptBridge) -> [String] {
         bridge.pending.filter { $0.contains("setLanguage") }
     }
@@ -40,7 +51,7 @@ struct TranscriptLanguageTests {
     @Test func togglingTheLanguagePushesItIntoTheTranscript() {
         let bridge = makeBridge("lang-test")
         let original = Lang.shared.code
-        defer { if Lang.shared.code != original { Lang.shared.toggle() } }
+        defer { restoreLanguage(to: original) }
 
         #expect(languagePushes(bridge).isEmpty, "construction alone must push nothing")
 
@@ -68,7 +79,7 @@ struct TranscriptLanguageTests {
     @Test func theDeckShellFollowsTheToggleWithoutItsScreenEverAppearing() {
         let bridge = DeckBridge()
         let original = Lang.shared.code
-        defer { if Lang.shared.code != original { Lang.shared.toggle() } }
+        defer { restoreLanguage(to: original) }
 
         #expect(bridge.pending.filter { $0.contains("setLanguage") }.isEmpty)
 
