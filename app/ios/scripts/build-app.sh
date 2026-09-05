@@ -49,8 +49,18 @@ xcodegen generate
 # keep the unfiltered log for the failure case.
 mkdir -p build
 set +e
+# --device signs for real, and the local bundle id is an App ID that has to be
+# registered (with Push Notifications + App Groups) the first time anyone builds
+# it — without -allowProvisioningUpdates xcodebuild may not reach the portal and
+# fails on the team wildcard profile. Simulator builds sign locally and never
+# consult a profile, so the flag is device-only.
+PROVISIONING_FLAG=()
+if [[ "$SDK" == iphoneos ]]; then
+  PROVISIONING_FLAG=(-allowProvisioningUpdates)
+fi
 xcodebuild -project Baybo.xcodeproj -scheme Baybo -configuration "$CONFIGURATION" \
-  -sdk "$SDK" -destination "$DEST" -derivedDataPath build/DerivedData build \
+  -sdk "$SDK" -destination "$DEST" -derivedDataPath build/DerivedData \
+  ${PROVISIONING_FLAG[@]+"${PROVISIONING_FLAG[@]}"} build \
   | tee build/xcodebuild.log | grep -E 'error|warning: |BUILD'
 status=${PIPESTATUS[0]}
 set -e

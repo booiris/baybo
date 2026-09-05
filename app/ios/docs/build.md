@@ -21,6 +21,22 @@ Baybo scheme's Archive action uses `Distribution`. The setting feeds both the
 requested `aps-environment` entitlement and the app's runtime
 `BayboApnsEnvironment`, so the two can never be configured apart.
 
+**`Distribution` is also the only configuration that carries the shipped
+identity.** `BAYBO_BUNDLE_ID` is `com.baybo.app` there and `com.baybo.app.dev`
+in `Debug`/`Release`, so `install.mjs` puts a second, separately-named app on
+the phone instead of overwriting the App Store one — which is what it used to
+do, taking that install's home-screen slot and its keychain items with it. The
+`.dev` app is a fresh install: its own container, its own default keychain
+group, not signed in, not paired. `install.mjs` reads the id back off the
+archive rather than naming it, and `release.mjs` fails the release if the
+exported ipa is anything but `com.baybo.app` with exactly one keychain group.
+The keychain group follows the same variable — through the entitlement AND
+through the `BayboKeychainAccessGroup` Info key the Rust core now reads at
+runtime — so the two apps never share one. Device signing therefore needs
+`-allowProvisioningUpdates` (both scripts pass it): the local bundle id is an
+App ID that does not exist until someone builds it. The full rationale is in the
+root [`CLAUDE.md`](../CLAUDE.md) § Local vs shipped identity.
+
 They can still *end up* apart, and that is not a configuration bug: the
 entitlement actually carried by a signed artifact is whichever one the
 provisioning profile granted at signing time. An archive whose Info key says

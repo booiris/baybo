@@ -53,6 +53,21 @@ mod read_status {
     }
 }
 
+/// Which access group the SHARED items go in, as a pure decision so the rule can
+/// be pinned on the host. `imp::access_group` supplies the two inputs.
+#[cfg(any(target_os = "ios", test))]
+mod access_group_rule {
+    /// `info` is the app's `BayboKeychainAccessGroup` Info value, `compiled` the
+    /// build-time fallback from `ffi/build.rs`. The Info key wins whenever it
+    /// says anything usable, because it is the only one that can name the build
+    /// actually running; the fallback answers embedders that have no bundle.
+    pub(super) fn resolve(info: Option<String>, compiled: Option<&str>) -> Option<String> {
+        info.filter(|group| !group.is_empty() && !group.starts_with('.'))
+            .or_else(|| compiled.map(str::to_string))
+            .filter(|group| !group.is_empty())
+    }
+}
+
 #[cfg(target_os = "ios")]
 mod imp {
     use super::KEY_LEN;
@@ -60,9 +75,11 @@ mod imp {
     use core_foundation::data::CFData;
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::string::CFString;
-    use core_foundation_sys::base::{CFTypeRef, OSStatus};
+    use core_foundation_sys::base::{CFGetTypeID, CFTypeRef, OSStatus};
+    use core_foundation_sys::bundle::{CFBundleGetMainBundle, CFBundleGetValueForInfoDictionaryKey};
     use core_foundation_sys::dictionary::CFDictionaryRef;
     use core_foundation_sys::string::CFStringRef;
+    use std::sync::OnceLock;
 
     // The Security framework keychain item API. Hand-declared (rather than via a
     // -sys crate) to keep the dependency surface to core-foundation only.
@@ -89,8 +106,12 @@ mod imp {
 
     use super::read_status::{ERR_SEC_ITEM_NOT_FOUND, ERR_SEC_SUCCESS, ReadOutcome, classify_read};
 
-    const MISSING_ACCESS_GROUP: &str = "missing BAYBO_IOS_KEYCHAIN_ACCESS_GROUP; build through Xcode or set BAYBO_IOS_KEYCHAIN_ACCESS_GROUP explicitly";
+    const MISSING_ACCESS_GROUP: &str = "no keychain access group: the app's BayboKeychainAccessGroup Info key is absent or unexpanded, and the core was not built with BAYBO_IOS_KEYCHAIN_ACCESS_GROUP";
     const ACCOUNT_PREFIX: &str = "baybo.push-key.";
+    /// The app's own Info key naming its shared access group — the SAME key the
+    /// NSE reads (`PushKeyStore.accessGroupInfoKey`), so the two halves of the
+    /// push path cannot disagree.
+    const ACCESS_GROUP_INFO_KEY: &str = "BayboKeychainAccessGroup";
 
     /// Wrap a `static` Security-framework `CFStringRef` constant as a borrowed
     /// `CFString` (get-rule: we don't own it, so don't release it).
@@ -98,9 +119,51 @@ mod imp {
         unsafe { CFString::wrap_under_get_rule(r) }.as_CFType()
     }
 
+    /// Read the host app's `BayboKeychainAccessGroup` Info key. Returns `None`
+    /// when there is no main bundle (host tests), no key, or a value that is not
+    /// a string.
+    fn info_plist_access_group() -> Option<String> {
+        // SAFETY: both CFBundle calls are GET-rule — neither result is owned, so
+        // neither is released; `key` outlives the call that borrows it.
+        unsafe {
+            let bundle = CFBundleGetMainBundle();
+            if bundle.is_null() {
+                return None;
+            }
+            let key = CFString::new(ACCESS_GROUP_INFO_KEY);
+            let value = CFBundleGetValueForInfoDictionaryKey(bundle, key.as_concrete_TypeRef());
+            if value.is_null() || CFGetTypeID(value) != CFString::type_id() {
+                return None;
+            }
+            Some(CFString::wrap_under_get_rule(value as CFStringRef).to_string())
+        }
+    }
+
+    /// The group the SHARED items go in — today just the push key, which the NSE
+    /// reads across a process boundary and therefore cannot leave in the default
+    /// group.
+    ///
+    /// RUNTIME, not compile-time, and that is load-bearing rather than tidy. One
+    /// xcframework serves every configuration, so a group baked into the core
+    /// can only ever name ONE app; a local build carrying a different bundle id
+    /// would then have to be entitled to the shipped app's group to store its
+    /// push key at all — and a groupless query (which is every private item:
+    /// `store_blob`/`read_blob`/`delete_blob` with `shared = false`) searches
+    /// EVERY entitled group, so that entitlement would hand the local build the
+    /// shipped install's device identity, pairing and sign key, and delete them
+    /// on its next unpair. Reading the group off the app's own Info key keeps
+    /// each build inside a single group of its own. The shipped app resolves the
+    /// identical value it always has.
     fn access_group() -> Result<CFType, String> {
-        option_env!("BAYBO_IOS_KEYCHAIN_ACCESS_GROUP")
-            .filter(|group| !group.is_empty())
+        static RESOLVED: OnceLock<Option<String>> = OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                super::access_group_rule::resolve(
+                    info_plist_access_group(),
+                    option_env!("BAYBO_IOS_KEYCHAIN_ACCESS_GROUP"),
+                )
+            })
+            .as_deref()
             .map(|group| CFString::new(group).as_CFType())
             .ok_or_else(|| MISSING_ACCESS_GROUP.to_string())
     }
@@ -468,6 +531,47 @@ pub fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::access_group_rule::resolve;
+
+    const COMPILED: Option<&str> = Some("KLK5BP5YS6.com.baybo.app");
+
+    /// The Info key is what names the build that is actually running, so it wins
+    /// over the value compiled into a core shared by every configuration.
+    #[test]
+    fn the_info_key_beats_the_compiled_fallback() {
+        assert_eq!(
+            resolve(Some("KLK5BP5YS6.com.baybo.app.dev".into()), COMPILED).as_deref(),
+            Some("KLK5BP5YS6.com.baybo.app.dev"),
+        );
+    }
+
+    /// Signing is what expands `$(AppIdentifierPrefix)`, so an UNSIGNED build
+    /// leaves the key as a bare leading dot. Taking that literally would put the
+    /// push key in a group no entitlement names.
+    #[test]
+    fn an_unexpanded_prefix_is_not_a_group() {
+        assert_eq!(
+            resolve(Some(".com.baybo.app.dev".into()), COMPILED).as_deref(),
+            COMPILED,
+        );
+        assert_eq!(resolve(Some(String::new()), COMPILED).as_deref(), COMPILED);
+    }
+
+    /// Host tests and verify-nse.sh's hand-signed app have no usable Info key
+    /// and rely on the build-time value.
+    #[test]
+    fn no_info_key_falls_back_to_the_compiled_value() {
+        assert_eq!(resolve(None, COMPILED).as_deref(), COMPILED);
+    }
+
+    /// Neither source answering is an error the caller must report, never a
+    /// silent write into some default group.
+    #[test]
+    fn neither_source_answering_is_none() {
+        assert_eq!(resolve(None, None), None);
+        assert_eq!(resolve(Some(".x".into()), Some("")), None);
+    }
+
     use super::read_status::{ReadOutcome, classify_read};
 
     #[test]

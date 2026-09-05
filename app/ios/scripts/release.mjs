@@ -17,6 +17,21 @@ const CONFIGURATION = "Distribution";
 const APP_NAME = "Baybo.app";
 const EXTENSION_NAME = "NotificationExtension.appex";
 const EXPECTED_APNS_ENVIRONMENT = "production";
+// The SHIPPED identity, spelled out here so a release can never inherit it from
+// whatever project.yml happens to say. Local builds carry a `.dev` sibling id
+// (project.yml's BAYBO_BUNDLE_ID) precisely so a device install lands beside the
+// App Store app rather than replacing it, and the whole point of that split is
+// that it must never travel the other way: an App Store upload under
+// com.baybo.app.dev, or one entitled to a second keychain group, would strand
+// every existing install's device identity.
+const EXPECTED_BUNDLE_ID = "com.baybo.app";
+const EXPECTED_EXTENSION_BUNDLE_ID = `${EXPECTED_BUNDLE_ID}.NotificationExtension`;
+const EXPECTED_DISPLAY_NAME = "Baybo";
+const EXPECTED_KEYCHAIN_GROUP_SUFFIX = `.${EXPECTED_BUNDLE_ID}`;
+// The Rust core reads its shared access group off this Info key at runtime, so
+// the shipped value IS the group every already-installed device's push key sits
+// in. A build that shipped the local group here would strand every one of them.
+const KEYCHAIN_GROUP_INFO_KEY = "BayboKeychainAccessGroup";
 const DEBUG_SEED_SYMBOL = "debug_seed_push_key";
 const EXPORT_OPTIONS = join(ROOT, "scripts", "ExportOptions-AppStore.plist");
 const VERIFY_OPTIONS_NAME = "ExportOptions-Verify.plist";
@@ -168,6 +183,29 @@ const validateArchive = (archivePath, version, buildNumber) => {
     EXPECTED_APNS_ENVIRONMENT,
   );
   assertEqual(
+    "app bundle id",
+    plistValue(appInfo, "CFBundleIdentifier"),
+    EXPECTED_BUNDLE_ID,
+  );
+  assertEqual(
+    "extension bundle id",
+    plistValue(extensionInfo, "CFBundleIdentifier"),
+    EXPECTED_EXTENSION_BUNDLE_ID,
+  );
+  assertEqual(
+    "app display name",
+    plistValue(appInfo, "CFBundleDisplayName"),
+    EXPECTED_DISPLAY_NAME,
+  );
+  for (const [label, plist] of [["app", appInfo], ["extension", extensionInfo]]) {
+    const group = plistValue(plist, KEYCHAIN_GROUP_INFO_KEY);
+    if (!group.endsWith(EXPECTED_KEYCHAIN_GROUP_SUFFIX)) {
+      fail(
+        `${label} ${KEYCHAIN_GROUP_INFO_KEY}: ${group} does not end in ${EXPECTED_KEYCHAIN_GROUP_SUFFIX}`,
+      );
+    }
+  }
+  assertEqual(
     "app marketing version",
     plistValue(appInfo, "CFBundleShortVersionString"),
     version,
@@ -190,6 +228,8 @@ const validateArchive = (archivePath, version, buildNumber) => {
   assertReleaseCore(appBinary);
 
   console.log("\nArchive validation passed:");
+  console.log(`  bundle id: ${EXPECTED_BUNDLE_ID} ("${EXPECTED_DISPLAY_NAME}")`);
+  console.log(`  keychain group Info key: ${EXPECTED_KEYCHAIN_GROUP_SUFFIX.slice(1)}`);
   console.log(`  runtime APNs environment: ${EXPECTED_APNS_ENVIRONMENT}`);
   console.log(`  app + extension: ${version} (${buildNumber})`);
   console.log(`  debug seed symbol: absent`);
@@ -276,6 +316,18 @@ const assertDistributionSigned = (label, bundlePath, scratchDir) => {
   return entitlements;
 };
 
+const assertKeychainGroups = (label, entitlements) => {
+  const groups = entitlements["keychain-access-groups"];
+  if (!Array.isArray(groups) || groups.length !== 1) {
+    fail(
+      `${label}: signed keychain-access-groups must be exactly one entry, got ${JSON.stringify(groups)}`,
+    );
+  }
+  if (!groups[0].endsWith(EXPECTED_KEYCHAIN_GROUP_SUFFIX)) {
+    fail(`${label}: signed keychain group ${groups[0]} does not end in ${EXPECTED_KEYCHAIN_GROUP_SUFFIX}`);
+  }
+};
+
 const verifyExport = (exportPath, version, buildNumber) => {
   const ipa = exportedIpa(exportPath);
   const scratchDir = join(exportPath, "verify");
@@ -297,6 +349,12 @@ const verifyExport = (exportPath, version, buildNumber) => {
     appEntitlements["aps-environment"],
     EXPECTED_APNS_ENVIRONMENT,
   );
+  // Five keychain items carry no explicit access group, so iOS files them under
+  // the DEFAULT one — which is the FIRST entry of this list. A shipped build
+  // must therefore have exactly one entry, and it must be the shipped app's:
+  // a second entry ahead of it would silently move every existing install's
+  // device identity, pairing and sign key to a group they were never in.
+  assertKeychainGroups("app", appEntitlements);
   // The extension's App Store profile carries no aps-environment at all — only
   // the host app routes push, so asserting one here would reject every build.
   assertDistributionSigned("extension", extension, scratchDir);
@@ -317,9 +375,21 @@ const verifyExport = (exportPath, version, buildNumber) => {
     plistValue(appInfo, "BayboApnsEnvironment"),
     EXPECTED_APNS_ENVIRONMENT,
   );
+  assertEqual(
+    "exported app bundle id",
+    plistValue(appInfo, "CFBundleIdentifier"),
+    EXPECTED_BUNDLE_ID,
+  );
+  assertEqual(
+    "exported app display name",
+    plistValue(appInfo, "CFBundleDisplayName"),
+    EXPECTED_DISPLAY_NAME,
+  );
 
   console.log("\nExport verification passed:");
   console.log(`  ipa: ${ipa}`);
+  console.log(`  bundle id: ${EXPECTED_BUNDLE_ID} ("${EXPECTED_DISPLAY_NAME}")`);
+  console.log(`  signed keychain groups: one, ${EXPECTED_KEYCHAIN_GROUP_SUFFIX.slice(1)}`);
   console.log(`  signed aps-environment: ${EXPECTED_APNS_ENVIRONMENT}`);
   console.log(`  get-task-allow: not set`);
   console.log(`  identity: ${DISTRIBUTION_AUTHORITY.replace(":", "")}`);

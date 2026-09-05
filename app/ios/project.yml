@@ -5,7 +5,8 @@
 #
 # CONTINUITY CONTRACT with already-shipped installs — do not change any of
 # these or existing users silently lose their device identity, pairing, and
-# push key:
+# push key. Every clause below is about the SHIPPED identity, which is what the
+# `Distribution` configuration builds (see BAYBO_BUNDLE_ID under `settings`):
 #   * bundle ids: com.baybo.app + com.baybo.app.NotificationExtension
 #   * DEVELOPMENT_TEAM KLK5BP5YS6 (the App-Identifier prefix)
 #   * keychain-access-groups: $(AppIdentifierPrefix)com.baybo.app must stay the
@@ -15,6 +16,8 @@
 #     today, kept as cheap insurance)
 #   * NSE Info.plist key BayboKeychainAccessGroup (PushKeyStore reads the
 #     access group from it at runtime)
+# scripts/release.mjs re-asserts all of it against the exported ipa, so a dev
+# identity cannot reach the App Store even if this file drifts.
 name: Baybo
 options:
   deploymentTarget:
@@ -34,6 +37,15 @@ settings:
     # route. Local/debugging exports use development even when optimized
     # (`Release`); distribution builds override this to production.
     BAYBO_APNS_ENVIRONMENT: development
+    # A LOCAL build is a SEPARATE app on the phone, not a replacement for the
+    # App Store one: `scripts/install.mjs` used to export the shipped bundle id,
+    # so every device install overwrote the real install and took its home-screen
+    # slot with it. Only `Distribution` — which `scripts/release.mjs` is alone in
+    # building — carries the shipped identity; `Debug` and `Release` carry the
+    # `.dev` sibling, which gets its own container, its own default keychain
+    # group, and its own icon.
+    BAYBO_BUNDLE_ID: com.baybo.app.dev
+    BAYBO_DISPLAY_NAME: Baybo Dev
     SWIFT_VERSION: "5.0"
     ENABLE_BITCODE: NO
     ARCHS: arm64
@@ -41,6 +53,8 @@ settings:
   configs:
     Distribution:
       BAYBO_APNS_ENVIRONMENT: production
+      BAYBO_BUNDLE_ID: com.baybo.app
+      BAYBO_DISPLAY_NAME: Baybo
 # One explicit shared scheme so Xcode's Run button always targets the app —
 # without it Xcode auto-creates a scheme per target, and picking the
 # NotificationExtension one makes Run ask "choose an app to run" (an extension
@@ -87,7 +101,7 @@ targets:
       - target: NotificationExtension
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.baybo.app
+        PRODUCT_BUNDLE_IDENTIFIER: $(BAYBO_BUNDLE_ID)
         PRODUCT_NAME: Baybo
         TARGETED_DEVICE_FAMILY: "1"
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: YES
@@ -95,7 +109,7 @@ targets:
     info:
       path: App/Info.plist
       properties:
-        CFBundleDisplayName: Baybo
+        CFBundleDisplayName: "$(BAYBO_DISPLAY_NAME)"
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
@@ -112,7 +126,11 @@ targets:
         # Image" TERMINATES the app (add-only access still needs a purpose string).
         NSPhotoLibraryAddUsageDescription: "Baybo saves a chat image to your photo library when you share it there."
         ITSAppUsesNonExemptEncryption: false
-        BayboKeychainAccessGroup: "$(AppIdentifierPrefix)com.baybo.app"
+        # Follows the bundle id, and is the ONLY statement of this build's group:
+        # the NSE reads this key, and so does the Rust core at runtime. Both
+        # halves of the push path therefore cannot disagree, and a local build
+        # keeps its keychain to itself.
+        BayboKeychainAccessGroup: "$(AppIdentifierPrefix)$(BAYBO_BUNDLE_ID)"
         BayboApnsEnvironment: "$(BAYBO_APNS_ENVIRONMENT)"
         # Space Mono (OFL, App/Resources/Fonts) — the style guide's chrome face.
         UIAppFonts:
@@ -124,8 +142,14 @@ targets:
         aps-environment: "$(BAYBO_APNS_ENVIRONMENT)"
         com.apple.security.application-groups:
           - group.com.baybo.app
+        # ONE entry, and it follows the bundle id. One entry because a groupless
+        # keychain query — which is every app-private item — searches EVERY
+        # entitled group, not just the default one: a second entry naming the
+        # shipped app would let a local build read the shipped install's device
+        # identity and delete it on unpair. Distribution resolves this to
+        # $(AppIdentifierPrefix)com.baybo.app, exactly as it always has.
         keychain-access-groups:
-          - "$(AppIdentifierPrefix)com.baybo.app"
+          - "$(AppIdentifierPrefix)$(BAYBO_BUNDLE_ID)"
   # The unit bundle (swift-testing; XCTest stays for the UI smokes below —
   # swift-testing has no UI-testing API). HOSTED in the app, never hostless:
   #   * the xcframework wraps a STATIC lib already linked into the app, so a
@@ -192,24 +216,24 @@ targets:
       - sdk: UserNotifications.framework
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.baybo.app.NotificationExtension
+        PRODUCT_BUNDLE_IDENTIFIER: $(BAYBO_BUNDLE_ID).NotificationExtension
         PRODUCT_NAME: NotificationExtension
         SKIP_INSTALL: YES
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: NO
     info:
       path: NotificationExtension/Info.plist
       properties:
-        CFBundleDisplayName: Baybo
+        CFBundleDisplayName: "$(BAYBO_DISPLAY_NAME)"
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).NotificationService"
-        BayboKeychainAccessGroup: "$(AppIdentifierPrefix)com.baybo.app"
+        BayboKeychainAccessGroup: "$(AppIdentifierPrefix)$(BAYBO_BUNDLE_ID)"
     entitlements:
       path: NotificationExtension/NotificationExtension.entitlements
       properties:
         com.apple.security.application-groups:
           - group.com.baybo.app
         keychain-access-groups:
-          - "$(AppIdentifierPrefix)com.baybo.app"
+          - "$(AppIdentifierPrefix)$(BAYBO_BUNDLE_ID)"

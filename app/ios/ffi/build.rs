@@ -1,8 +1,12 @@
 use std::env;
 
-/// Suffix of the shared keychain access group — the NSE reads the push key from
-/// `<AppIdentifierPrefix>.com.baybo.app`. Must stay in sync with `project.yml`'s
-/// entitlements and the NSE's `BayboKeychainAccessGroup` Info.plist key.
+/// FALLBACK suffix for the shared keychain access group. An iOS app resolves its
+/// group at RUNTIME from its own `BayboKeychainAccessGroup` Info key (see
+/// `keychain::imp::access_group`) — it has to, because one xcframework serves
+/// every configuration and a local build carries a different bundle id. What is
+/// baked in here only answers embedders that have no Info key at all: host
+/// tests, and `scripts/verify-nse.sh`'s manually-signed simulator app, which
+/// passes `BAYBO_IOS_KEYCHAIN_ACCESS_GROUP` explicitly.
 const KEYCHAIN_ACCESS_GROUP_SUFFIX: &str = "com.baybo.app";
 
 fn main() {
