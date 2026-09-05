@@ -124,14 +124,20 @@ final class ProjectsUITests: BayboUITestCase {
         app.buttons["stage-todo"].tap()
 
         let bar = app.buttons["stage-todo"]
-        XCTAssertTrue(app.buttons["issue-row-43"].waitForExistence(timeout: 3))
-        let below = app.buttons["issue-row-51"]
-        XCTAssertFalse(below.exists, "the fixture's Todo fits on screen — nothing here scrolls")
+        // Prove the scroll by DISPLACEMENT rather than by which rows exist. The
+        // old shape asserted a particular row was absent, which made it a test
+        // of the fixture's row ORDER: `2a9a43fb` made a column read
+        // newest-touched first and moved that row into the first screenful, so
+        // the precondition became false everywhere. What this case is actually
+        // about is that the bar holds while the content moves under it.
+        let anchor = app.buttons["issue-row-50"]
+        XCTAssertTrue(anchor.waitForExistence(timeout: 5), "the Todo column never painted")
         let before = bar.frame
+        let rowBefore = anchor.frame.minY
 
         app.swipeUp()
-
-        XCTAssertTrue(below.waitForExistence(timeout: 3), "the board did not scroll")
+        XCTAssertLessThan(
+            anchor.frame.minY, rowBefore - 100, "the board did not scroll under the bar")
         XCTAssertEqual(
             bar.frame.minY, before.minY, accuracy: 0.5,
             "the stage bar scrolled away with the board")

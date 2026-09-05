@@ -14,7 +14,14 @@
 
         /// A fixed "now" the fixture hangs its ages off. Timestamps of `0`
         /// render as `20689d`, which is not a card anybody has ever seen.
-        private static var nowMs: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+        ///
+        /// `let`, and that is the whole point: as a computed property this was
+        /// re-read for every card, so two cards in the same age bucket tied only
+        /// when the millisecond clock happened not to tick between them. The
+        /// board reads newest-touched first, so that coin flip decided ROW ORDER
+        /// — and a test that names a row by position is then flaky by
+        /// construction. Captured once, the fixture has one order.
+        private static let nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
 
         func seedDemo() {
             let projects: [ProjectInfo] = [
