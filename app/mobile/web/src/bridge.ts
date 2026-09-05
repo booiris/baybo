@@ -1,7 +1,10 @@
 // The native<->web seam. Native drives the page through `window.baybo`
 // (installed synchronously below, before anything else runs); the page talks
-// back through `window.webkit.messageHandlers.baybo.postMessage`. In a plain
-// dev browser (no window.webkit) outbound posts degrade to console.log stubs.
+// back through the outbound channel `src/native/transport.ts` picks — a
+// WKScriptMessageHandler on iOS, a WebMessageListener on Android, and
+// console.log in a plain dev browser, where the page still runs.
+
+import { nativeChannel } from "./native/transport";
 
 import type { OutlineEntry, PersistedState, WireAttachment } from "./types";
 import {
@@ -91,6 +94,13 @@ type BayboGlobal = {
   videoPoster(payload: VideoPosterResultPayload): void;
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
+  /// The space the native header occupies above the document, in CSS px.
+  ///
+  /// Only Android calls it. `env(safe-area-inset-top)` is the whole story on
+  /// iOS, but on Android it reports a display cutout and nothing else — 0 on a
+  /// notch-less phone whose status bar still covers the first rows. Unset, the
+  /// stylesheets keep their `env()` expression, so iOS is unchanged.
+  setTopInset(px: number): void;
   jumpToLatest(): void;
   /// A row of the native message-index sheet was tapped — park that user
   /// message under the header veil. `rowId` is an `OutlineEntry.id`.
@@ -135,20 +145,14 @@ declare global {
     /// The card page's inbound handler (src/issue/bridge.ts). Declared here
     /// because a global interface may only be declared once per shape.
     issuePage?: import("./issue/bridge").IssueGlobal;
-    webkit?: {
-      messageHandlers?: {
-        baybo?: { postMessage(message: unknown): void };
-        /// The deck shell's handler (src/deck/bridge.ts) — declared here
-        /// because a global interface may only be declared once per shape.
-        deck?: { postMessage(message: unknown): void };
-      };
-    };
   }
 }
 
-const native = window.webkit?.messageHandlers?.baybo;
+/// Outbound pipe. `src/native/transport.ts` owns which host is listening and
+/// how it wants the payload; the shapes below are the same either way.
+const native = nativeChannel("baybo");
 
-export const hasNativeBridge = native !== undefined;
+export const hasNativeBridge = native.available;
 
 let nativeTargetId: string | null = null;
 
@@ -157,8 +161,7 @@ function post(message: Record<string, unknown>): void {
     nativeTargetId === null || typeof message.targetId === "string"
       ? message
       : { ...message, targetId: nativeTargetId };
-  if (native) native.postMessage(payload);
-  else console.log("[baybo bridge]", payload);
+  native.post(payload);
 }
 
 export function postToNative(message: Record<string, unknown>): void {
@@ -357,7 +360,7 @@ export function postHtmlPreviewMaximized(maximized: boolean): void {
 /// Markdown links must not navigate the transcript webview away — native opens
 /// them in the system browser instead. Dev browser: plain window.open.
 export function openUrl(url: string): void {
-  if (native) postSafe({ type: "openUrl", url });
+  if (hasNativeBridge) postSafe({ type: "openUrl", url });
   else window.open(url, "_blank", "noopener");
 }
 
@@ -366,7 +369,7 @@ export function openUrl(url: string): void {
 /// writes outside a live user gesture, and a long-press timer has none. Dev
 /// browser: best-effort clipboard write so the affordance still works there.
 export function copyText(text: string): void {
-  if (native) postSafe({ type: "copy", text });
+  if (hasNativeBridge) postSafe({ type: "copy", text });
   else void navigator.clipboard?.writeText(text).catch(() => {});
 }
 
@@ -435,7 +438,7 @@ const blobPending = new Map<
 /// an object URL for an <img> src. The caller owns the URL and must
 /// URL.revokeObjectURL it when done.
 export function blobObjectUrl(blobId: string, mimeType: string): Promise<string> {
-  if (!native) return Promise.reject(new Error("no native bridge"));
+  if (!hasNativeBridge) return Promise.reject(new Error("no native bridge"));
   blobReqId += 1;
   const id = blobReqId;
   return new Promise((resolve, reject) => {
@@ -576,7 +579,7 @@ export function requestVideoPoster(
   filename: string,
   mimeType: string,
 ): Promise<VideoPoster> {
-  if (!native) return Promise.reject(new Error("no native bridge"));
+  if (!hasNativeBridge) return Promise.reject(new Error("no native bridge"));
   posterReqId += 1;
   const id = posterReqId;
   return new Promise((resolve, reject) => {
@@ -811,6 +814,12 @@ window.baybo = {
   },
   setBottomInset(px) {
     dispatch({ kind: "bottomInset", px });
+  },
+  setTopInset(px) {
+    // A CSS variable rather than a dispatched event: every consumer is a
+    // stylesheet (`--thread-top-inset`, the issue page's padding, the deck
+    // grid), and none of them needs React to re-render to pick it up.
+    document.documentElement.style.setProperty("--native-top-inset", `${px}px`);
   },
   jumpToLatest() {
     dispatch({ kind: "jumpToLatest" });

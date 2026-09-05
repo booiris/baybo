@@ -70,7 +70,14 @@
      header (status bar + the 42pt glass bar), not under its icons. The
      status-bar part is device-correct via env() (the webview is full-bleed,
      viewport-fit=cover); the 54px covers the native bar height + breathing. */
-  --thread-top-inset: calc(env(safe-area-inset-top) + 58px);
+  /* `env(safe-area-inset-top)` is the whole story only on iOS. On Android it
+     reports a display cutout and nothing else — it is 0 on a notch-less phone
+     whose status bar still covers 24dp — so the host feeds the real value
+     through `window.baybo.setTopInset(px)` and this falls back to the iOS
+     expression until it does. */
+  --thread-top-inset: calc(
+    var(--native-top-inset, env(safe-area-inset-top)) + 58px
+  );
   /* Height of the webview's bottom edge covered by native chrome (composer +
      the keyboard it rides). The webview is full-bleed and NEVER resizes with
      the keyboard — native streams this per layout tick over the bridge and
@@ -109,6 +116,16 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; }
+
+/* The transcript re-pins the viewport by hand on every prepend, jump and
+   keyboard move (Transcript.tsx's row anchors). Blink runs its own scroll
+   anchoring on top of that and the two fight, landing a page off by a row.
+   WebKit never shipped the feature, so this is a no-op on iOS and load-bearing
+   on Android. */
+html,
+body {
+  overflow-anchor: none;
+}
 
 /* Don't let images be drag-ghosted out of the (otherwise native-feeling) app,
    and keep the save/copy callout off even inside now-selectable message rows. */

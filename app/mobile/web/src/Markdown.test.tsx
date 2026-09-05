@@ -155,7 +155,7 @@ describe("MarkdownBody HTML preview", () => {
     );
     expect(preview.container.querySelector("iframe")).toHaveAttribute(
       "src",
-      `baybo-transcript://localhost/html-preview/${blobId}?reload=0`,
+      `/html-preview/${blobId}?reload=0`,
     );
 
     const source = render(<MarkdownBody text={"```html\n<button>source</button>\n```"} />);

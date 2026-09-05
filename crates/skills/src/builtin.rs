@@ -203,7 +203,9 @@ mod tests {
     /// one is worse than the curated list it replaced: it reads as
     /// authoritative and is wrong in the direction the model trusts.
     ///
-    /// The policy's one home is the Swift handler that sets the header.
+    /// The policy's one home is the native handler that sets the header — the
+    /// Swift one today, and the Kotlin `TranscriptAssets` twin from P3, which
+    /// joins the HOSTS list below rather than getting a second test.
     /// Reaching across into `app/ios` is unusual here, and deliberate: that
     /// tree is its own cargo workspace, and its CI jobs are path-filtered
     /// (see `/CLAUDE.md`), so a gate living there would sit out every change
@@ -214,13 +216,41 @@ mod tests {
     /// policy across lines for readability and neither side's trailing `;`
     /// matters.
     #[test]
-    fn html_gen_quotes_the_preview_csp_the_ios_handler_actually_sends() {
+    fn html_gen_quotes_the_preview_csp_the_hosts_actually_send() {
         use std::collections::BTreeSet;
 
         const HANDLER: &str = "../../app/ios/App/Web/TranscriptSchemeHandler.swift";
+        /// What the skill writes where a host writes its own origin.
+        const ORIGIN_PLACEHOLDER: &str = "<app-origin>";
+
+        /// Fold an absolute `<scheme>://<host>` prefix back to the placeholder.
+        ///
+        /// The `/html-lib/` source cannot be relative and cannot be `'self'`:
+        /// the preview runs in a `sandbox="allow-scripts"` frame, so its origin
+        /// is opaque and CSP has nothing to resolve either against. Each host
+        /// therefore names its own — `baybo-transcript://localhost` on iOS, the
+        /// asset origin on Android — while the skill quotes the policy the two
+        /// share. That shared part is what this test pins.
+        fn neutralize_origin(csp: &str) -> String {
+            let mut out = String::with_capacity(csp.len());
+            let mut rest = csp;
+            while let Some(at) = rest.find("://") {
+                let scheme_start = rest[..at]
+                    .rfind(|c: char| c.is_whitespace())
+                    .map_or(0, |i| i + 1);
+                out.push_str(&rest[..scheme_start]);
+                let after = &rest[at + 3..];
+                let host_end = after.find(['/', ' ', ';']).unwrap_or(after.len());
+                out.push_str(ORIGIN_PLACEHOLDER);
+                rest = &after[host_end..];
+            }
+            out.push_str(rest);
+            out
+        }
 
         fn directives(csp: &str) -> BTreeSet<String> {
-            csp.split(';')
+            neutralize_origin(csp)
+                .split(';')
                 .map(|directive| directive.split_whitespace().collect::<Vec<_>>().join(" "))
                 .filter(|directive| !directive.is_empty())
                 .collect()
@@ -248,6 +278,20 @@ mod tests {
                 .find("```")
                 .expect("the quote sits in a fenced block");
         let quoted = &HTML_GEN_SKILL_MD[start..end];
+
+        // Prove the neutralizer actually fired before comparing: if it silently
+        // matched nothing, both sides would still agree and this test would
+        // pass while checking nothing.
+        assert!(
+            neutralize_origin(served).contains(&format!("{ORIGIN_PLACEHOLDER}/html-lib/")),
+            "the handler's script-src no longer names an origin-qualified \
+             /html-lib/ source; neutralize_origin needs revisiting ({})",
+            handler_path.display()
+        );
+        assert!(
+            served.contains("://"),
+            "the handler CSP is expected to carry a concrete origin"
+        );
 
         assert_eq!(
             directives(quoted),

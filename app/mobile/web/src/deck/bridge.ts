@@ -3,6 +3,8 @@
 // on the `deck` WKScriptMessageHandler. In a plain dev browser posts
 // degrade to console.log stubs.
 
+import { nativeChannel } from "../native/transport";
+
 import type { DeckCard, DeckSnapshot, LayoutEntry } from "./state";
 
 export type DeckStatePayload = {
@@ -42,26 +44,28 @@ export type DeckShellGlobal = {
   pickResult(payload: PickResultPayload): void;
   setEditMode(active: boolean): void;
   setLanguage(lang: string): void;
+  /// The space the native header occupies above the grid, in CSS px. Android
+  /// only — see the transcript bridge's `setTopInset` for why `env()` alone is
+  /// not enough there.
+  setTopInset(px: number): void;
   /// Native → web: the header's ✕ was tapped; collapse the maximized card.
   restoreMaximized(): void;
 };
 
 export type CardAction = "enable" | "disable" | "delete";
 
-// `Window.webkit` is declared once, in src/bridge.ts (a global interface
-// member may not be re-declared with a different shape); the `deck`
-// message handler is part of that declaration.
 declare global {
   interface Window {
     deckShell: DeckShellGlobal;
   }
 }
 
-const native = window.webkit?.messageHandlers?.deck;
+// Which host is listening, and how it wants the payload, is
+// `src/native/transport.ts`'s business; the shapes are the same either way.
+const native = nativeChannel("deck");
 
 function post(message: Record<string, unknown>): void {
-  if (native) native.postMessage(message);
-  else console.log("[deck bridge]", message);
+  native.post(message);
 }
 
 function postSafe(message: Record<string, unknown>): void {

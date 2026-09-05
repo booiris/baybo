@@ -217,7 +217,7 @@
     },
     /// Build a displayable URL for a blob the service produced/was handed
     /// (docs/modules/deck.md §Blobs). Point an `<img src>` at it — the shell's
-    /// custom scheme (allowed by the card CSP's `img-src baybo-transcript:`)
+    /// request interceptor (allowed by the card CSP's `img-src <host origin>`)
     /// serves the bytes through the native side, cache-first. Accepts a ref
     /// object ({blobId|blob_id, contentType|content_type|mime}) or a bare id
     /// string + optional contentType. The id rides the path RAW and the mime
@@ -237,7 +237,10 @@
       }
       if (!blobId) return "";
       const q = ct ? "?ct=" + encodeURIComponent(String(ct)) : "";
-      return "baybo-transcript://localhost/blob/" + String(blobId) + q;
+      // Root-relative: an `about:srcdoc` frame resolves against its parent
+      // document's base URL, so this lands on whichever origin the host serves
+      // the bundle from without the card knowing which shell it is in.
+      return "/blob/" + String(blobId) + q;
     },
     /// Offer a blob to the user via the native share sheet (save to Photos /
     /// Files, AirDrop, …). Fire-and-forget — native fetches the bytes

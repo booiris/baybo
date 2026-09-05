@@ -32,6 +32,12 @@ window.deckShell = {
   setEditMode(active) {
     shell.setEditMode(active);
   },
+  setTopInset(px) {
+    // Same shape as the transcript bridge's: a CSS variable the stylesheet
+    // already falls back from, not a shell method — nothing here needs to
+    // re-render to pick it up.
+    document.documentElement.style.setProperty("--native-top-inset", `${px}px`);
+  },
   setLanguage(lang) {
     shell.setLanguage(lang);
   },

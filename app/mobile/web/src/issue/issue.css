@@ -28,7 +28,7 @@
   word-break: break-word;
   overflow-wrap: anywhere;
   -webkit-overflow-scrolling: touch;
-  padding: calc(env(safe-area-inset-top, 0px) + 58px) 20px 0;
+  padding: calc(var(--native-top-inset, env(safe-area-inset-top, 0px)) + 58px) 20px 0;
   box-sizing: border-box;
   color: var(--color-ink);
   background: var(--color-paper);
@@ -478,7 +478,7 @@
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--color-err);
-  scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 70px);
+  scroll-margin-top: calc(var(--native-top-inset, env(safe-area-inset-top, 0px)) + 70px);
 }
 
 .issue-unread-rule::after {

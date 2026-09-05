@@ -14,7 +14,7 @@ body {
   margin: 0;
   background: var(--deck-paper);
   color: var(--deck-ink);
-  font-family: -apple-system, "SF Pro Text", sans-serif;
+  font-family: -apple-system, "SF Pro Text", system-ui, Roboto, sans-serif;
   -webkit-text-size-adjust: none;
   -webkit-tap-highlight-color: transparent;
 }
@@ -40,7 +40,7 @@ body {
   /* The webview is full-bleed under the native header (46pt bar + 8
      breathing); this padding is the resting offset, and scrolling runs
      the cards under the header's paper veil like the chat list. */
-  padding: calc(env(safe-area-inset-top) + 54px) 16px
+  padding: calc(var(--native-top-inset, env(safe-area-inset-top)) + 54px) 16px
     calc(env(safe-area-inset-bottom) + 24px);
 }
 

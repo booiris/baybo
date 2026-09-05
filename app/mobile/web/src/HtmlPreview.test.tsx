@@ -110,7 +110,7 @@ describe("HtmlPreview", () => {
     expect(frame).toHaveAttribute("loading", "lazy");
     expect(frame).toHaveAttribute(
       "src",
-      `baybo-transcript://localhost/html-preview/${BLOB_ID}?reload=0`,
+      `/html-preview/${BLOB_ID}?reload=0`,
     );
   });
 

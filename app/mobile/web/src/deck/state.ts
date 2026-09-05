@@ -249,15 +249,21 @@ export class PendingRegistry {
 }
 
 /// The card iframe's CSP: no network of any kind EXCEPT opaque blob-capability
-/// image GETs against the user's own gateway (the `baybo-transcript:` custom
-/// scheme, served by the app's own WKURLSchemeHandler — never a real socket).
-/// Inline script/style + `data:`/blob-scheme images only. Belt to the sandbox
-/// attribute's braces — the sandbox alone does NOT block a fire-and-forget
-/// fetch. `img-src` admits `baybo-transcript:` so a card can display a blob it
-/// produced or was handed (docs/modules/deck.md §Blobs); no other directive
-/// gains the scheme, so script/fetch/style still have zero network.
-export const CARD_CSP =
-  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: baybo-transcript:;";
+/// image GETs against the user's own gateway — served by the app's own request
+/// interceptor (a `WKURLSchemeHandler` on iOS, `shouldInterceptRequest` on
+/// Android), never a real socket. Inline script/style + `data:` images only.
+/// Belt to the sandbox attribute's braces — the sandbox alone does NOT block a
+/// fire-and-forget fetch. `img-src` admits the host origin so a card can display
+/// a blob it produced or was handed (docs/modules/deck.md §Blobs); no other
+/// directive gains it, so script/fetch/style still have zero network.
+///
+/// A function rather than a constant because it is the ONE place in the bundle
+/// that cannot use a root-relative URL: the card frame is
+/// `sandbox="allow-scripts"` without `allow-same-origin`, so its origin is
+/// opaque and `'self'` matches nothing. The shell passes [`hostOrigin`].
+export function cardCsp(hostOrigin: string): string {
+  return `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: ${hostOrigin};`;
+}
 
 /// Compose a card's srcdoc: CSP first, then the card-side SDK (so the
 /// `deck` global exists before any card inline script runs), then the
@@ -266,6 +272,7 @@ export function buildSrcdoc(
   cardHtml: string,
   sdkSource: string,
   baseCss: string,
+  hostOrigin: string,
 ): string {
   // `baseCss` (cardBase.css) is the injected design language: widget
   // behavior (no text selection / touch callout — WebKit would otherwise
@@ -275,7 +282,7 @@ export function buildSrcdoc(
   // overrides it in the cascade.
   return (
     `<!doctype html><html><head>` +
-    `<meta http-equiv="Content-Security-Policy" content="${CARD_CSP}">` +
+    `<meta http-equiv="Content-Security-Policy" content="${cardCsp(hostOrigin)}">` +
     `<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">` +
     `<style>${baseCss}</style>` +
     `</head><body>` +

@@ -7,6 +7,7 @@
 import sdkSource from "./sdkCard.js?raw";
 import cardBaseCss from "./cardBase.css?raw";
 import * as bridge from "./bridge";
+import { hostOrigin } from "../native/transport";
 import { en } from "../locales/en";
 import { zh } from "../locales/zh";
 import {
@@ -134,7 +135,7 @@ export class DeckShell {
     const frame = document.createElement("iframe");
     frame.className = "deck-card-frame";
     frame.setAttribute("sandbox", "allow-scripts");
-    frame.srcdoc = buildSrcdoc(cardHtml, sdkSource, cardBaseCss);
+    frame.srcdoc = buildSrcdoc(cardHtml, sdkSource, cardBaseCss, hostOrigin());
     frame.addEventListener("load", () => {
       // `tile.port` is recorded ONLY once the card has actually been handed
       // `port2`. Setting it first — with the handover behind an optional

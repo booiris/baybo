@@ -9,8 +9,12 @@ export const HTML_PREVIEW_DRAG_END_EVENT = "baybo:html-preview-drag-end";
 /// Set on <html> while a preview owns the screen — locks the thread's scroll
 /// and lifts the `.md` clip that would otherwise cut a fixed child.
 export const HTML_PREVIEW_MAXIMIZED_CLASS = "html-preview-maximized";
-export const HTML_PREVIEW_URL_PREFIX =
-  "baybo-transcript://localhost/html-preview/";
+/// Root-relative on purpose: the preview iframe resolves it against the
+/// document's own origin, which is the one its native host answers on —
+/// `baybo-transcript://localhost` under the iOS scheme handler,
+/// `https://appassets.androidplatform.net` under the Android asset
+/// interceptor. Spelling either one here would pin the bundle to one shell.
+export const HTML_PREVIEW_URL_PREFIX = "/html-preview/";
 
 const BLOB_ID_PATTERN = /^sha256:[0-9a-f]{64}\.[0-9a-f]+$/;
 

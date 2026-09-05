@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  CARD_CSP,
+  cardCsp,
   DeckCard,
   PendingRegistry,
   applyCardData,
@@ -130,8 +130,9 @@ describe("normalizeCard", () => {
 
 describe("srcdoc composition", () => {
   it("orders CSP, then base style, then SDK, then the card fragment", () => {
-    const doc = buildSrcdoc("<div id=card></div>", "/*sdk*/", "/*base*/");
-    expect(doc).toContain(CARD_CSP);
+    const origin = "baybo-transcript://localhost";
+    const doc = buildSrcdoc("<div id=card></div>", "/*sdk*/", "/*base*/", origin);
+    expect(doc).toContain(cardCsp(origin));
     const cspAt = doc.indexOf("Content-Security-Policy");
     const baseAt = doc.indexOf("/*base*/");
     const sdkAt = doc.indexOf("/*sdk*/");
@@ -144,7 +145,13 @@ describe("srcdoc composition", () => {
     expect(cardAt).toBeGreaterThan(sdkAt);
     // No network is reachable under this CSP even though sandbox alone
     // would allow a fire-and-forget fetch.
-    expect(CARD_CSP).toContain("default-src 'none'");
+    expect(cardCsp(origin)).toContain("default-src 'none'");
+    // The card frame is opaque-origin, so `'self'` would match nothing: the
+    // host's real origin is the only thing that lets a card show a blob.
+    expect(cardCsp(origin)).toContain(`img-src data: ${origin};`);
+    expect(cardCsp("https://appassets.androidplatform.net")).toContain(
+      "img-src data: https://appassets.androidplatform.net;",
+    );
   });
 });
 

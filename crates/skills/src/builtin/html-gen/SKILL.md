@@ -31,10 +31,14 @@ The document is served to an `<iframe sandbox="allow-scripts">` — no
 `allow-same-origin` — under exactly this response CSP:
 
 ```
-default-src 'none'; script-src 'unsafe-inline' baybo-transcript://localhost/html-lib/;
+default-src 'none'; script-src 'unsafe-inline' <app-origin>/html-lib/;
 style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none';
 object-src 'none'; base-uri 'none'; form-action 'none'
 ```
+
+`<app-origin>` is whatever origin the app serves the document from, and it
+differs per platform — you never write it out, because the only thing you may
+load from it is a `/html-lib/` bundle the app hands you by name.
 
 **Treat anything not granted above as unavailable**, and never put a
 control in the UI for something that cannot work — a button that does
