@@ -462,11 +462,25 @@ html.retargeting #root { visibility: hidden; }
    deliberately paints OUTSIDE itself both vanished the day containment landed:
    the copied pill (which hangs in the gap above the bubble, or below it near
    the top of the scroll) lost all 19px of itself above and all but ~7px below,
-   and the jump ring's `inset: -4px` paper channel lost its top and right edges
-   on a user row and the whole ring on an assistant one. Both are transient, so
-   lift containment only for the row currently showing one — the same shape as
-   the maximized preview's host row below. */
-.msg-group:has(.copy-toast, .jump-ring) {
+   the jump ring's `inset: -4px` paper channel lost its top and right edges on a
+   user row and the whole ring on an assistant one, and the send chrome — which
+   hangs ~20px to the LEFT of its host — lost the sending spinner and the failed
+   RETRY DOT entirely on an attachment-only send whose image fills the row (the
+   bubble's left edge is then the group's, so the mark is wholly outside it).
+   That last one cost a user the only way to retry a failed send.
+
+   Lift containment for the row currently showing any of them — the same shape as
+   the maximized preview's host row below. It costs nothing in practice: every
+   one of these marks lives on a row the reader is looking at, and containment
+   only ever skipped OFFSCREEN rows.
+
+   A mark has to RETIRE for that to stay bounded, and the ring did not: it is
+   keyed on a nonce that nothing reset, so the node lingered (invisible, at the
+   `forwards` end of its own fade) and would have held its row's exemption for
+   the rest of the session. `JUMP_RING_MS` in Transcript.tsx is what unmounts it.
+   A new mark that hangs outside its row belongs in this selector AND needs an
+   end of its own. */
+.msg-group:has(.copy-toast, .jump-ring, .send-spinner, .send-failed) {
   content-visibility: visible;
   contain-intrinsic-size: none;
 }

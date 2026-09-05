@@ -1656,6 +1656,12 @@ export function formatTimestampShort(iso: string): string {
 
 
 const COPY_TOAST_MS = 1300;
+/// How long the landing ring stays mounted. Matches the `jump-ring` keyframes in
+/// styles.css (820ms, `forwards`) plus a little slack, and it exists so the ring
+/// UNMOUNTS: its row is exempted from `content-visibility` while the ring is in
+/// the tree, and a ring that never leaves would hold that exemption — and the
+/// row's rendering memory — for the rest of the session.
+const JUMP_RING_MS = 1000;
 /// Below this gap between the bubble's top and the header-covered strip, the
 /// pill would render under the native header overlay — flip it below instead.
 const TOAST_HEADER_CLEARANCE_PX = 30;
@@ -2093,6 +2099,9 @@ export function Transcript({
   // Which row the jump ring is blooming around, and the replay nonce that lets
   // it bloom again on a repeat jump to the same row (see MessageRow's `flash`).
   const [flash, setFlash] = useState({ id: "", nonce: 0 });
+  // Retires the ring after it has bloomed — see JUMP_RING_MS.
+  const flashTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => clearTimeout(flashTimer.current), []);
   // A search hit whose row is not loaded yet: the ordinal to reach and how many
   // more pages may be spent reaching it. A ref, not state — the loop is driven
   // by frames landing, and re-rendering on each step would buy nothing.
@@ -3696,6 +3705,8 @@ export function Transcript({
     // loop all slam scrollTop to the bottom while this is true.
     followRef.current = false;
     setFlash((f) => ({ id: rowId, nonce: f.nonce + 1 }));
+    clearTimeout(flashTimer.current);
+    flashTimer.current = window.setTimeout(() => setFlash({ id: "", nonce: 0 }), JUMP_RING_MS);
     node.scrollIntoView({ block: "start", behavior: "instant" });
     // `showJump` is deliberately not forced on: for a near-bottom target onScroll
     // correctly recomputes it to false, and the native button would appear only
