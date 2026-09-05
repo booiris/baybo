@@ -56,9 +56,10 @@ REQUIRED_CHECKS=(
 #
 # The two patterns MUST mirror `IOS_DEPS` and the ios_native filter in
 # .github/workflows/ci.yml. They differ on purpose: a docs-only change under
-# app/ios runs the two Linux jobs but never queues for the Mac one.
-IOS_DEPS_PATTERN='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
-IOS_NATIVE_PATTERN='^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/'
+# app/ios runs the two Linux jobs but never queues for the Mac one. The
+# shared core and the transcript bundle live in app/mobile and queue all three.
+IOS_DEPS_PATTERN='^(app/(ios|mobile)/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
+IOS_NATIVE_PATTERN='^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/)|^app/mobile/(web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/'
 
 BASE="master"
 ASSUME_YES=0

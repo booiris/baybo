@@ -1,6 +1,6 @@
 # Deck (iOS shell)
 
-*`docs/modules/deck.md` is the source of truth for the Deck design; this document covers only the iOS half — `app/ios/App/Screens/DeckScreen.swift`, `app/ios/App/Core/DeckStore.swift`, `app/ios/App/Web/DeckBridge.swift`, and the `app/ios/web/src/deck/` shell.*
+*`docs/modules/deck.md` is the source of truth for the Deck design; this document covers only the iOS half — `app/ios/App/Screens/DeckScreen.swift`, `app/ios/App/Core/DeckStore.swift`, `app/ios/App/Web/DeckBridge.swift`, and the `app/mobile/web/src/deck/` shell.*
 
 ## The second webview
 
@@ -8,13 +8,13 @@ The Deck tab renders the app's SECOND webview (`DeckHost`), kept warm like
 `TranscriptHost` (see [transcript.md](transcript.md)) and torn down with the
 binding.
 
-It loads `deck.html` — a second Vite entry in the SAME `app/ios/web/` dist the
+It loads `deck.html` — a second Vite entry in the SAME `app/mobile/web/` dist the
 transcript uses, so it rides the existing `app/ios/App/Resources/transcript/`
 copy + scheme handler with no extra build step.
 
 ## The card sandbox
 
-The shell (`app/ios/web/src/deck/`) draws the 2-column size-class grid and hosts
+The shell (`app/mobile/web/src/deck/`) draws the 2-column size-class grid and hosts
 each card in an `<iframe sandbox="allow-scripts" srcdoc>` — opaque origin +
 injected CSP, so **no network** — with a per-card `MessagePort` as the card's
 identity.
@@ -49,7 +49,7 @@ if the active-leg request fails.
 
 ## Bridge
 
-`app/ios/App/Web/DeckBridge.swift` ⇄ `app/ios/web/src/deck/bridge.ts`.
+`app/ios/App/Web/DeckBridge.swift` ⇄ `app/mobile/web/src/deck/bridge.ts`.
 
 native→web:
 

@@ -1,9 +1,9 @@
 [package]
-name = "baybo-ios-ffi"
+name = "baybo-mobile-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Baybo iOS core: transport + pairing + keychain behind a UniFFI surface"
+description = "Baybo mobile core: transport + pairing + secure store behind a UniFFI surface"
 publish = false
 
 # `staticlib` is what the Xcode target links; `lib` keeps the crate

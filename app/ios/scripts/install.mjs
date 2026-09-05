@@ -41,8 +41,8 @@ const run = (cmd, cmdArgs, cwd = root) =>
 
 if (has("--prepare")) {
   run("bash", ["scripts/build-app.sh", "--device", ...(has("--debug") ? [] : ["--release"]), "--skip-web"]);
-  run("bash", ["-c", "cd web && pnpm install --silent && pnpm build"], root);
-  run("bash", ["-c", "rm -rf App/Resources/transcript && mkdir -p App/Resources/transcript && cp -R web/dist/. App/Resources/transcript/"], root);
+  run("bash", ["-c", "cd ../mobile/web && pnpm install --silent && pnpm build"], root);
+  run("bash", ["-c", "rm -rf App/Resources/transcript && mkdir -p App/Resources/transcript && cp -R ../mobile/web/dist/. App/Resources/transcript/"], root);
   run("xcodegen", ["generate"]);
 }
 

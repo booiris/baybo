@@ -535,7 +535,7 @@ The panel deliberately wears the **/chat band** — `ThreadView`, `MessageBubble
 `chat-prose` — rather than the card timeline's bordered `bg-brand/60` bubbles.
 That is admissible only because it *covers* the timeline instead of sitting
 beside it: re-skinning `MessageBubble` for the board would fork the one thread
-renderer, which is the state `app/ios/web/src/Transcript.tsx` is already in.
+renderer, which is the state `app/mobile/web/src/Transcript.tsx` is already in.
 Chrome on `canvas`, thread on `surface`, per the role split above.
 
 Read-only in the same sense the activity drawer is: no composer, and no

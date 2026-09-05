@@ -275,7 +275,7 @@ fn webm_duration_ms(path: &Path) -> Option<u32> {
 /// Pick the block variant by MIME, because the variant *is* the wire's
 /// `AttachmentKind` (`split_content` maps one to the other) and `kind` is what
 /// makes a surface render a thumbnail instead of a paperclip chip. This mirrors
-/// `attachmentKind` in `app/ios/web/src/types.ts` and the web chat's own
+/// `attachmentKind` in `app/mobile/web/src/types.ts` and the web chat's own
 /// bucketing, which that comment already names the gateway as sharing.
 ///
 /// No surface shows a name BESIDE a rendered image, but the name still rides

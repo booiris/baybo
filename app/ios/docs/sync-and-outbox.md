@@ -1,6 +1,6 @@
 # Transcript sync, mirror retention, and the send outbox
 
-*How the iOS chat transcript loads and recovers rows (sync-protocol v2), why the on-disk transcript mirror is never swept, and how sends survive a flaky leg — governs `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/OutboxStore.swift`, the transcript mirror store, and `app/ios/web/src/Transcript.tsx` + `app/ios/web/src/bridge.ts`.*
+*How the iOS chat transcript loads and recovers rows (sync-protocol v2), why the on-disk transcript mirror is never swept, and how sends survive a flaky leg — governs `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/OutboxStore.swift`, the transcript mirror store, and `app/mobile/web/src/Transcript.tsx` + `app/mobile/web/src/bridge.ts`.*
 
 ## Send path
 
@@ -108,7 +108,7 @@ has no `work_ended_at`) now costs one round trip per open and nothing on screen.
 
 ### The webview drives sync
 
-`app/ios/web/src/Transcript.tsx`'s `runSync()` posts
+`app/mobile/web/src/Transcript.tsx`'s `runSync()` posts
 `{type:"sync", sinceOrdinal, limit}` over the bridge; native
 (`ChatStore.requestSync`) fetches `GET …/sync` over the active leg and pushes a
 synthesized `sync_page` frame back.
@@ -331,7 +331,7 @@ filtering.
 React tree; opening a DIFFERENT session remounts `<Transcript key={sessionId}>`
 from that session's `restoredState`, then its mount effect runs one sync. A
 jetsam silently reloads → `ready` re-fires → re-mounts and re-syncs.
-Cross-session safety rests on `app/ios/web/src/bridge.ts` clearing
+Cross-session safety rests on `app/mobile/web/src/bridge.ts` clearing
 `buffer`/`blobPending`/`pendingPersist` on `init` and `persist` writes being
 session-tagged.
 
@@ -415,7 +415,7 @@ user-triggered and still per-session: nothing here sweeps.
 ### Never mint the orphan in the first place
 
 **An empty thread with no cursor never writes a mirror at all** (the persist
-effect in `app/ios/web/src/Transcript.tsx` bails). The transcript mounts for every
+effect in `app/mobile/web/src/Transcript.tsx` bails). The transcript mounts for every
 compose draft — including the throwaway one prewarmed at launch — each under a
 fresh uuid that never becomes a chat-list row, so persisting them minted a file
 per abandoned draft that nothing could ever reach again (no row → no delete → and

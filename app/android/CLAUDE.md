@@ -3,7 +3,7 @@
 A **Kotlin/Compose shell** whose screens, header, and composer are native — so
 the Android IME never touches web content — with **only the chat transcript**
 rendered in a WebView, over the same UniFFI Rust core the iOS app runs
-(`app/mobile/ffi` once the P1 relocation lands; `app/ios/ffi` until then).
+(`app/mobile/ffi` once the P1 relocation lands; `app/mobile/ffi` until then).
 
 For app behavior the root [`/CLAUDE.md`](../../CLAUDE.md) applies. The plan this
 shell implements — the move, the three platform seams, the phases, and the
@@ -156,12 +156,12 @@ section as read-only.
 
   | Slot | Literal | Where |
   |---|---|---|
-  | paired-gateway record | `baybo.paired-gateway` | `../ios/ffi/src/keychain.rs:314` |
-  | Noise static identity | `baybo.device-identity` | `../ios/ffi/src/keychain.rs:338` |
-  | Ed25519 push-signing seed | `baybo.device-sign-key` | `../ios/ffi/src/keychain.rs:372` |
-  | direct credentials | `baybo.direct-credentials` | `../ios/ffi/src/keychain.rs:413` |
-  | active-binding marker | `baybo.active-binding` | `../ios/ffi/src/keychain.rs:437` |
-  | per-device push key | `baybo.push-key.` + `bid` | `ACCOUNT_PREFIX`, `../ios/ffi/src/keychain.rs:93` |
+  | paired-gateway record | `baybo.paired-gateway` | `../mobile/ffi/src/keychain.rs:314` |
+  | Noise static identity | `baybo.device-identity` | `../mobile/ffi/src/keychain.rs:338` |
+  | Ed25519 push-signing seed | `baybo.device-sign-key` | `../mobile/ffi/src/keychain.rs:372` |
+  | direct credentials | `baybo.direct-credentials` | `../mobile/ffi/src/keychain.rs:413` |
+  | active-binding marker | `baybo.active-binding` | `../mobile/ffi/src/keychain.rs:437` |
+  | per-device push key | `baybo.push-key.` + `bid` | `ACCOUNT_PREFIX`, `../mobile/ffi/src/keychain.rs:93` |
 
   `ACCOUNT_PREFIX` is private to the iOS `imp` today; P2 hoists it to module
   level so the non-iOS `imp` shares it. That hoist is the *one* line exempted
@@ -182,12 +182,12 @@ section as read-only.
   ciphertext file, a transient `KeyStoreException`, a decrypt that fails its tag
   — every one of those **throws**, and Rust lifts it to `SecureStoreError`
   rather than to `Ok(None)`. Report a failure as absence and
-  `load_or_create_device_sign_key` (`../ios/ffi/src/keychain.rs:398-406`) and
+  `load_or_create_device_sign_key` (`../mobile/ffi/src/keychain.rs:398-406`) and
   the device-identity loader take their mint-and-**persist** branch: the phone
   rotates its identity out from under a paired install, its `device_id` stops
   matching the gateway's, push dies, and the never-deleted signing key is gone
   with it. That is precisely the bug `classify_read`
-  (`../ios/ffi/src/keychain.rs:32-53`) exists to prevent on iOS; Android gets
+  (`../mobile/ffi/src/keychain.rs:32-53`) exists to prevent on iOS; Android gets
   the same invariant through the throw, not through a second classifier. The
   `SecureStoreError` conversion is what makes it real — a foreign-trait method
   that throws an undeclared type is turned into a Rust `panic!` by uniffi's
@@ -217,24 +217,24 @@ section as read-only.
   iOS.** `PairedRecord` (`device_id`, `auth_token`, `gateway_static_pubkey`,
   `relay_node_id`, `relay_url`, `remote_api_key`, `noise_secret`,
   `noise_public`) and `DirectCredentials` (`base_url`, `token`, `server_key` —
-  `../ios/ffi/src/direct/mod.rs:53-58`). Renaming one is not a refactor; it
+  `../mobile/ffi/src/direct/mod.rs:53-58`). Renaming one is not a refactor; it
   silently loses the gateway binding of every install that upgrades. The
   golden-JSON tests are what stands in the way, and they assert the literal
   text, not a round-trip: `GOLDEN_RECORD_JSON` at
-  `../ios/ffi/src/relay/pairing.rs:631` with its suite at
-  `../ios/ffi/src/relay/pairing.rs:662-775`, and `GOLDEN_CREDENTIALS_JSON` at
-  `../ios/ffi/src/direct/mod.rs:567` with its suite at
-  `../ios/ffi/src/direct/mod.rs:616-661`. The 32-byte keys are JSON **arrays of
+  `../mobile/ffi/src/relay/pairing.rs:631` with its suite at
+  `../mobile/ffi/src/relay/pairing.rs:662-775`, and `GOLDEN_CREDENTIALS_JSON` at
+  `../mobile/ffi/src/direct/mod.rs:567` with its suite at
+  `../mobile/ffi/src/direct/mod.rs:616-661`. The 32-byte keys are JSON **arrays of
   numbers**; "cleaning them up" into hex reads back as a type error on every
   existing install. `server_key` is required — a record without it is signed out
   and must log in again rather than entering a non-canonical cache namespace.
 - **The cache namespace is `filesDir/baybo/servers/gateway-<gateway-static-public-key>/`**,
   with the same children the iOS shell writes under `Application
   Support/baybo/servers/…`. The key comes from Rust — `active_server_cache_key()`
-  (`../ios/ffi/src/lib.rs:66`) over `gateway_key()`
-  (`../ios/ffi/src/server_cache.rs:19-21`), which is `"gateway-"` plus the hex
+  (`../mobile/ffi/src/lib.rs:66`) over `gateway_key()`
+  (`../mobile/ffi/src/server_cache.rs:19-21`), which is `"gateway-"` plus the hex
   gateway Noise static public key; relay and direct bindings of one gateway
-  resolve to the same string (`../ios/ffi/src/server_cache.rs:29-32`). Kotlin
+  resolve to the same string (`../mobile/ffi/src/server_cache.rs:29-32`). Kotlin
   only joins the path, and applies the same component guard iOS does
   (`../ios/App/Core/ServerCache.swift:52-57`: non-empty, ≤128 chars, lowercase
   hex and `-` only). `None`, or a key that fails the guard, falls back to the
@@ -270,9 +270,9 @@ section as read-only.
   `Library/Logs`: `../ios/App/Core/Baybo.swift:46-53`). The format is fixed,
   because an exported log bundle has to stay comparable across builds and across
   platforms: `baybo.log`, rotated at **2 MiB** into `baybo.log.1` and
-  `baybo.log.2` and no further (`../ios/ffi/src/logging.rs:19-22`, rotation at
+  `baybo.log.2` and no further (`../mobile/ffi/src/logging.rs:19-22`, rotation at
   `:50-63`) — three files, 6 MiB ceiling. Levels are Warn globally and Debug for
-  `baybo_ffi` (`../ios/ffi/src/logging.rs:25`). Rust owns the writer; the shell
+  `baybo_ffi` (`../mobile/ffi/src/logging.rs:25`). Rust owns the writer; the shell
   contributes one FileProvider path and one Settings row that fires
   `ACTION_SEND`, or the first device bug report arrives without logs.
 - **FCM messages are data-only and carry exactly `enc`, `n`, `bid`.** No
@@ -299,10 +299,10 @@ section as read-only.
   every `#[uniffi::export(with_foreign)]` trait, so a Kotlin class of that name
   collides. The traits this applies to today are `BlobProgress`, `FrameSink`,
   `SessionListSink`, `DeckSink`, `PairAbortListener`, `ProjectSink`
-  (`../ios/ffi/src/api.rs:629-738`) and, from P2, `SecureStore`. Swift hit this
+  (`../mobile/ffi/src/api.rs:629-738`) and, from P2, `SecureStore`. Swift hit this
   first and dodges it by name — `SessionActivityHandler`
   (`../ios/App/Core/SessionIndex.swift:1167-1171`), and the warning is written
-  into the Rust doc comment at `../ios/ffi/src/api.rs:707-709`. Name the Kotlin
+  into the Rust doc comment at `../mobile/ffi/src/api.rs:707-709`. Name the Kotlin
   side for what it does (`KeystoreSecureStore`, not `SecureStoreImpl`).
 
 ## Docs
@@ -345,10 +345,10 @@ second half — *update that doc in the same PR*.
 ## Known gaps / follow-ups
 
 - **The shell does not exist.** Every path above is planned. Until P1 moves the
-  shared halves to `app/mobile/`, the ffi crate is `app/ios/ffi` and this
+  shared halves to `app/mobile/`, the ffi crate is `app/mobile/ffi` and this
   document's citations point there.
 - **The non-iOS `keychain.rs` stub is live and silently succeeds**
-  (`../ios/ffi/src/keychain.rs:265-286`): every store returns `Ok(())` and every
+  (`../mobile/ffi/src/keychain.rs:265-286`): every store returns `Ok(())` and every
   read `Ok(None)`. Cross-compiled for Android as-is, pairing "succeeds",
   nothing reads back, and the identity is re-minted on every call. The guard is
   a `#[cfg(target_os = "android")] compile_error!` landed right after the P0
@@ -367,7 +367,7 @@ second half — *update that doc in the same PR*.
 - **WebView floor: Chromium ≥ 111**, checked at startup with an "update Android
   System WebView" screen below it. The bundle's CSS uses `color-mix()` (111),
   `:has()` (105) and `dvh`/`svh` (108) — all three in `web/src/styles.css` —
-  and `vite build.target: es2021` (`../ios/web/vite.config.ts:13`) transpiles
+  and `vite build.target: es2021` (`../mobile/web/vite.config.ts:13`) transpiles
   JS only, never CSS. 111 is the binding constraint, and it comes from
   `color-mix()`.
 - **The notification channel ids are not chosen.** They are frozen the moment
@@ -387,5 +387,5 @@ second half — *update that doc in the same PR*.
 - **`app/ios/CLAUDE.md`'s last contract bullet is stale** and should be fixed on
   the way past: it says the APNs environment reaches Rust through
   `ClientConfig.apnsEnv`, but `ClientConfig` is `{log_dir, blob_cache_dir}`
-  (`../ios/ffi/src/api.rs:107-117`) and the environment rides on
+  (`../mobile/ffi/src/api.rs:107-117`) and the environment rides on
   `PushToken::Apns { environment }`.

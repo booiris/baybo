@@ -7,9 +7,9 @@
   `crates/device-proto/src/api_tunnel.rs`).
 - **Stage 1** — the client's framing hygiene: `LegIo`, request-id checking, the
   frame queue, non-2xx draining, empty-body normalization, and the first
-  per-request timeout (`app/ios/ffi/src/relay/{tunnel,api,blob}.rs`).
+  per-request timeout (`app/mobile/ffi/src/relay/{tunnel,api,blob}.rs`).
 - **Stage 2** — the leg pool and the `.background` barrier
-  (`app/ios/ffi/src/relay/leg_pool.rs`, `App/BayboApp.swift`).
+  (`app/mobile/ffi/src/relay/leg_pool.rs`, `App/BayboApp.swift`).
 - **Stage 3** — the pre-dialed warm leg and the decoupled APNs POST
   (`leg_pool::warm`, `apns.rs`).
 
@@ -19,7 +19,7 @@ because the reasoning only makes sense against it.
 ## What this replaced: one leg per request
 
 On the relay leg, **every** gateway REST call dials a brand-new Noise tunnel.
-`relay::api::request` (`app/ios/ffi/src/relay/api.rs:97`) does, per call:
+`relay::api::request` (`app/mobile/ffi/src/relay/api.rs:97`) does, per call:
 
 1. `load_paired_record()` (keychain),
 2. `dial_tunnel_leg` (`relay/tunnel.rs:20`) → `dial_content_join` (WSS to the
@@ -31,13 +31,13 @@ On the relay leg, **every** gateway REST call dials a brand-new Noise tunnel.
 That is roughly **five phone-side round trips** (WSS upgrade ≈3, Noise IK ≈1,
 Head/Body ≈1) for each of `chat_create_session`, `chat_list_sessions`,
 `chat_fetch_sync`, `chat_lookup_message`, `chat_mark_read`, `chat_set_archived`,
-`chat_set_pinned`, `chat_hide_session` (`app/ios/ffi/src/gateway_api.rs`,
+`chat_set_pinned`, `chat_hide_session` (`app/mobile/ffi/src/gateway_api.rs`,
 dispatched through `GatewayJsonClient`).
 
 The chat list refreshes on every appear and every foreground. Opening a chat runs
 a sync. The first send of a draft creates the session. All of them pay the full
 dial. The **direct** leg pays none of this — it holds a pooled `reqwest::Client`
-(`app/ios/ffi/src/direct/mod.rs:100`).
+(`app/mobile/ffi/src/direct/mod.rs:100`).
 
 The gateway side (`crates/gateway/src/channel/api_tunnel.rs`) mirrors the
 one-shot shape: `run_tunnel_session` does the responder handshake, reads
@@ -55,7 +55,7 @@ refresh) pay the dial once.
 ### Constraints that shape everything below
 
 1. **The Noise session is stateful and strictly ordered.** `ApiTunnelSession`
-   (`app/ios/ffi/src/core/api_tunnel.rs:11`) is a `TransportState` plus a
+   (`app/mobile/ffi/src/core/api_tunnel.rs:11`) is a `TransportState` plus a
    `FrameReassembler`, both `&mut`. Out-of-order decrypt is fatal. **Pipelining
    concurrent requests on one leg is impossible** without redesigning the crypto
    framing. Concurrency comes from *more legs*, never from sharing one.
@@ -336,7 +336,7 @@ TunnelResponse::Error ⇒ the leg is dead ⇒ discard, never pool.
 
 ### Client: the leg pool
 
-New file `app/ios/ffi/src/relay/leg_pool.rs`. **Wait-free, K-deep, serialized by
+New file `app/mobile/ffi/src/relay/leg_pool.rs`. **Wait-free, K-deep, serialized by
 ownership.**
 
 ```rust
@@ -465,7 +465,7 @@ Three layers, in order of reliability:
 **Layer 1 — a synchronous FFI barrier on `.background`.**
 
 ```rust
-// app/ios/ffi/src/lib.rs — NOT async: no runtime hop, no await
+// app/mobile/ffi/src/lib.rs — NOT async: no runtime hop, no await
 pub fn relay_invalidate_api_legs(&self) {
     relay::leg_pool::pool().invalidate();   // parking_lot lock + epoch += 1 + drain(Vec)
 }

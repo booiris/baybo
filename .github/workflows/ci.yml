@@ -210,9 +210,9 @@ jobs:
             echo "render=false" >> "$GITHUB_OUTPUT"
           fi
 
-          # `app/ios` is its own cargo workspace, but it PATH-DEPENDS on
+          # `app/mobile` is its own cargo workspace, but it PATH-DEPENDS on
           # crates/{wire,device-proto,model} and remote-host/ — so a root-crate
-          # change can break the iOS build without touching app/ios at all.
+          # change can break the iOS build without touching app/mobile at all.
           # Miss those prefixes and the iOS gate has a hole exactly where the
           # gateway/app wire contract lives. docs/openapi.json is here for the
           # same reason, one hop further out: the transcript bundle's
@@ -221,7 +221,7 @@ jobs:
           # of a `ChatTranscriptItem` field must reach this job. Note nothing
           # gates the freshness of app/web's committed schema against the spec;
           # its `gen:api` overwrites it in the runner and diffs nothing.
-          IOS_DEPS='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
+          IOS_DEPS='^(app/(ios|mobile)/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
           if changed "$IOS_DEPS"; then
             echo "ios=true" >> "$GITHUB_OUTPUT"
           else
@@ -231,7 +231,7 @@ jobs:
           # A Mac is needed only for the Swift/Xcode half. A change confined to
           # app/ios docs (CLAUDE.md) leaves ios_native false and never queues
           # for a macOS runner at all.
-          if changed "^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/"; then
+          if changed "^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/)|^app/mobile/(web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/"; then
             echo "ios_native=true" >> "$GITHUB_OUTPUT"
           else
             echo "ios_native=false" >> "$GITHUB_OUTPUT"
@@ -365,13 +365,14 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # iOS. The app lives in two islands the jobs above deliberately cannot see:
-  # `app/ios` is its own cargo workspace (the root one EXCLUDES it, so its unit
-  # tests had never run anywhere but a laptop) and `app/ios/web` is its own pnpm
+  # `app/mobile` is its own cargo workspace (the root one is simply not its
+  # parent, so its unit tests had never run anywhere but a laptop) and
+  # `app/mobile/web` is its own pnpm
   # workspace (`packages: []`, so the root `frontend` job never adopts it).
   #
   # Three jobs, split by what each one NEEDS, which is also what decides how
   # narrowly each is gated: the transcript bundle needs neither Rust nor a Mac
-  # (`ios-web`, ~2 min), the app's own cargo workspace needs Rust but no Mac
+  # (`ios-web`, ~2 min), the shared cargo workspace needs Rust but no Mac
   # (`ios-core`, slow), and only the Swift/Xcode half needs a Mac (`ios-sim`,
   # slowest, and the only one that takes one of the 5 macOS slots). All three
   # are ON, each behind its matching `changes` filter: `ios` for the two Linux
@@ -411,23 +412,23 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: app/ios/web/pnpm-lock.yaml
+          cache-dependency-path: app/mobile/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-        working-directory: app/ios/web
+        working-directory: app/mobile/web
       # eslint gates the wiring-bug class tsc + the pure-reducer suite can't see
       # (strict-boolean-expressions, no-unnecessary-condition, react-hooks); the
-      # existing backlog is tracked in app/ios/web/eslint-suppressions.json, so
+      # existing backlog is tracked in app/mobile/web/eslint-suppressions.json, so
       # only NEW violations fail. Mirrors the root frontend job's lint step.
       - run: pnpm lint
-        working-directory: app/ios/web
+        working-directory: app/mobile/web
       # vitest over the transcript reducers — the sync cursor, the work-block
       # folds, and the cross-session bridge isolation.
       - run: pnpm test
-        working-directory: app/ios/web
+        working-directory: app/mobile/web
       # `pnpm build` is `tsc --noEmit && vite build`, and the typecheck is the
       # point: it is what evaluates both drift sentinels.
       - run: pnpm build
-        working-directory: app/ios/web
+        working-directory: app/mobile/web
 
   # The slow Linux half, and what exhausted the Actions budget back when this
   # repo was private: a cold `cargo clippy --all-targets --all-features` plus
@@ -450,14 +451,14 @@ jobs:
       # shares nothing with the root workspace's cache.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          cache-workspaces: app/ios
+          cache-workspaces: app/mobile
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --all --check
-        working-directory: app/ios
+        working-directory: app/mobile
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-        working-directory: app/ios
+        working-directory: app/mobile
       - run: cargo nextest run --workspace --locked
-        working-directory: app/ios
+        working-directory: app/mobile
 
   ios-sim:
     name: iOS app (build + unit tests; UI smokes non-gating)
@@ -494,7 +495,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: aarch64-apple-ios-sim
-          cache-workspaces: app/ios
+          cache-workspaces: app/mobile
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -502,7 +503,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: app/ios/web/pnpm-lock.yaml
+          cache-dependency-path: app/mobile/web/pnpm-lock.yaml
 
       # The single biggest time lever on this job. build-core.sh compiles the
       # ~286-crate graph TWICE (once for aarch64-apple-ios-sim, once for the
@@ -515,7 +516,7 @@ jobs:
           path: |
             app/ios/Externals/BayboCore.xcframework
             app/ios/Generated/BayboCore.swift
-          key: bayboffi-${{ runner.os }}-${{ hashFiles('app/ios/ffi/**', 'app/ios/bindgen/**', 'app/ios/Cargo.lock', 'rust-toolchain.toml', 'crates/wire/**', 'crates/device-proto/**', 'crates/model/**', 'remote-host/**') }}
+          key: bayboffi2-${{ runner.os }}-${{ hashFiles('app/mobile/ffi/**', 'app/mobile/bindgen/**', 'app/mobile/Cargo.lock', 'rust-toolchain.toml', 'crates/wire/**', 'crates/device-proto/**', 'crates/model/**', 'remote-host/**') }}
 
       # --sim-only also SKIPS the codesign step, so this needs no keychain and no
       # Apple account (an unsigned xcframework is fine for a simulator build).
@@ -529,10 +530,10 @@ jobs:
       # cannot even be generated until all three exist.
       - name: Transcript bundle -> App/Resources/transcript
         run: |
-          (cd web && pnpm install --frozen-lockfile && pnpm build)
+          (cd ../mobile/web && pnpm install --frozen-lockfile && pnpm build)
           rm -rf App/Resources/transcript
           mkdir -p App/Resources/transcript
-          cp -R web/dist/. App/Resources/transcript/
+          cp -R ../mobile/web/dist/. App/Resources/transcript/
       - run: xcodegen generate
 
       # The entitlements carry aps-environment, an app group, and

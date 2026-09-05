@@ -406,7 +406,7 @@ refetch).
 
 The cursor rule itself — max-wins plus the rebase-dirty freeze — is *one*
 module written twice, because the two clients are separate pnpm workspace
-roots: `app/ios/web/src/transcript/cursor.ts` and
+roots: `app/mobile/web/src/transcript/cursor.ts` and
 `app/web/src/pages/chat/syncCursor.ts` are byte-identical past their `//`
 headers, and `app/web/src/pages/chat/mathDelimiters.port.test.ts` fails if one
 is edited without the other. Port a change to both; a freeze that holds on only
@@ -574,7 +574,7 @@ Cut-over shape (two artifacts, one seam):
    the backfill/reset/hydration-matrix machinery; the webview renders
    work/notice rows on every path (renderers already exist for the
    catch-up and live paths); the outbox lands. Include the relay codec
-   skip-unknown decode fix (`app/ios/ffi/src/core/content.rs:54-59`, to
+   skip-unknown decode fix (`app/mobile/ffi/src/core/content.rs:54-59`, to
    match `direct/chat.rs:33-38`) — no longer load-bearing for THIS cut
    (old builds are allowed to die), but it is cheap hygiene that makes the
    *next* protocol addition a non-event.

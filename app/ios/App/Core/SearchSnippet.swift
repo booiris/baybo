@@ -7,7 +7,7 @@ import Foundation
 /// (`SearchSnippetVectorTests`). The rules live in that file's comments; what
 /// follows is only how they land in Swift. Two ports and one contract is the
 /// arrangement everywhere the transcript already lives — see
-/// `app/ios/web/src/restSentinel.ts` — so the discipline is the fixture, not a
+/// `app/mobile/web/src/restSentinel.ts` — so the discipline is the fixture, not a
 /// second source of truth.
 ///
 /// Everything here works in GRAPHEME CLUSTER space, which Swift gives for free:

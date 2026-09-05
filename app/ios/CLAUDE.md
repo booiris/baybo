@@ -11,30 +11,37 @@ indexed under [Docs](#docs) below.
 ## Layout
 
 ```
-Cargo.toml            — own cargo workspace (root workspace excludes app/ios)
-ffi/                  — UniFFI core: transport legs, pairing, keychain, blobs.
-                        Exports BayboClient + parsePairQr.
-bindgen/              — uniffi-bindgen CLI (separate member so the `cli`
-                        feature never unifies into the lib build)
 project.yml           — xcodegen spec (the committed source of truth)
 App/                  — SwiftUI sources + resources
 NotificationExtension/ — NSE Swift sources
-web/                  — the transcript-only Vite/React bundle
 docs/                 — the subsystem docs indexed below
 scripts/              — build-core.sh, build-app.sh, install.mjs, verify-nse.sh
 Generated/ Externals/ — build products (gitignored): BayboCore.swift + .xcframework
+App/Resources/transcript/ — build product (gitignored): the web bundle's dist
 ```
 
+**The Rust core and the transcript bundle are not here.** They live next door in
+[`../mobile`](../mobile/CLAUDE.md) — `ffi/` (the UniFFI core), `bindgen/` (the
+uniffi-bindgen CLI) and `web/` (the Vite/React bundle) — because `app/android`
+links the same core and renders the same bundle. What stays in this directory is
+the Swift shell and the three build products the shell consumes.
+
 ## Build & test
+
+`app/ios` has no `Cargo.toml` of its own any more, and that has a sharp edge: a
+bare `cargo` command run from here does **not** fail, it walks UP to the root
+workspace and builds the gateway instead — successfully, and silently. Always
+name the workspace.
 
 ```bash
 scripts/build-app.sh             # web → rust xcframework → xcodegen → sim build
 scripts/build-app.sh --device --release
 node scripts/install.mjs         # archive + export + devicectl install (USB)
 
-cargo nextest run --workspace                            # ffi host tests
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-(cd web && pnpm lint && pnpm test && pnpm build)         # transcript bundle
+# the core's own gates live in the shared workspace, not here
+(cd ../mobile && cargo nextest run --workspace)
+(cd ../mobile && cargo clippy --workspace --all-targets --all-features -- -D warnings)
+(cd ../mobile/web && pnpm lint && pnpm test && pnpm build)   # transcript bundle
 ```
 
 Two traps that cost time every single loop, and are the reason
@@ -45,7 +52,8 @@ for Swift/web iteration), and the Swift tiers need `xcodegen generate` plus a
 `xcodebuild test`. Read [`docs/build.md`](docs/build.md) and
 [`docs/testing.md`](docs/testing.md) before running either half by hand.
 
-**`app/ios` is its own cargo workspace and its own pnpm project.** The root
+**The shared core at `app/mobile` is its own cargo workspace and its own pnpm
+project; `app/ios` is Swift only.** The root
 `cargo test --workspace` and the root `frontend` CI job have never covered any
 of it. Its CI is its own three jobs — `ios-web` and `ios-core` (ubuntu) and
 `ios-sim` (macos-26) — all three ON, each behind the `changes` filter matching
@@ -74,7 +82,7 @@ error they can act on, no way back but a re-pair.
   AfterFirstUnlock), `baybo.paired-gateway`, `baybo.device-identity`,
   `baybo.device-sign-key` (never deleted), `baybo.direct-credentials`,
   `baybo.active-binding` (all ThisDeviceOnly). What is frozen in
-  `ffi/src/keychain.rs` is every input to item IDENTITY — account names, the
+  `../mobile/ffi/src/keychain.rs` is every input to item IDENTITY — account names, the
   absent `kSecAttrService`, the access group, the accessibility class. Change one
   and an existing install stops finding its own items. (Error handling is not
   identity and is fair game: a read distinguishes `errSecItemNotFound` from a
@@ -83,7 +91,7 @@ error they can act on, no way back but a re-pair.
 - The `PairedRecord` / `DirectCredentials` JSON field names ARE the on-keychain
   byte format, shared with every already-shipped install. Renaming one is not a
   refactor — it silently loses the gateway binding of every device that
-  upgrades. The golden-JSON tests in `ffi/` are what stands in the way.
+  upgrades. The golden-JSON tests in `../mobile/ffi/` are what stands in the way.
   `server_key` is required; a record without it is signed out and must log in
   again rather than entering a non-canonical cache namespace.
 - Durable app caches live under
@@ -116,7 +124,7 @@ was tried and failed, and several name a bug that shipped once already.
   `BayboUITestCase` launch contract, CI's two jobs and their path filter, every
   `-baybo-*` demo flag for headless UI verification, and the device checklist.
 - [`docs/design-system.md`](docs/design-system.md) — the visual system:
-  monochrome soft line minimalism, the tokens (mirrored in `web/src/styles.css`
+  monochrome soft line minimalism, the tokens (mirrored in `../mobile/web/src/styles.css`
   and `App/Support/Theme.swift`), and the deliberate divergence from
   `app/web`'s brutalism.
 - [`docs/navigation.md`](docs/navigation.md) — the tabbed home shell, the outer
@@ -128,7 +136,7 @@ was tried and failed, and several name a bug that shipped once already.
   supervisor (one loop owns dial/death/subscription state), the `LegDialer`
   seam, the send gate, the ack judgment, and the Swift `connState`
   continuations. Shaped by the 2026-08-16 cold-start send black hole; read it
-  before touching `ffi/src/transport/` or the ChatStore dial paths.
+  before touching `../mobile/ffi/src/transport/` or the ChatStore dial paths.
 - [`docs/transcript.md`](docs/transcript.md) — the one reused WKWebView, store
   lifecycle and offscreen frame buffering, the native ⇄ web bridge, the keyboard
   inset, markdown/LaTeX rendering, and the message index.

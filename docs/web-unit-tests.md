@@ -4,7 +4,7 @@ The dashboard's vitest suite — **36 files, 597 tests** — and the conventions
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
-Scope: `app/web` only. `app/ios/web` is a **separate** pnpm workspace with its own
+Scope: `app/web` only. `app/mobile/web` is a **separate** pnpm workspace with its own
 vitest suite over the iOS transcript reducers, gated by the `ios-web` CI job — it
 follows the same pure-logic style but is not covered here.
 
@@ -32,7 +32,7 @@ Two files assert on **source text** rather than behaviour, because nothing else 
 see the invariant: `pages/chatMarkdown.test.tsx` pins the `katex.min.css` import in
 `main.tsx` (drop it and every equation silently renders twice — jsdom applies no
 stylesheets), and `pages/chat/mathDelimiters.port.test.ts` pins the math normalizer
-byte-identical to its `app/ios/web` original, which no CI job runs. Use the shape
+byte-identical to its `app/mobile/web` original, which no CI job runs. Use the shape
 sparingly; it is for invariants that live between files, not inside one.
 
 Why the split matters: the pure layer alone cannot see a **wiring** bug — a
@@ -161,8 +161,8 @@ says `pass`, not `skipping`, before trusting it.
 | `pages/chat/searchSnippet.test.ts` (12) | `searchSnippet.ts` — `queryChunks`, `snippet` | Transcript-search excerpt: AND-tokenize the query the way the server does, build the highlighted segment run. |
 | `pages/chat/syncCursor.test.ts` (5) | `syncCursor.ts` — `advanceFromSync`, `advanceFromLive`, `INITIAL_CURSOR` | Cursor is max-wins (never regresses) with a rebase-dirty flag. |
 | `pages/chat/sessionBuckets.test.ts` (20) | `sessionBuckets.ts` — `bucketSessions`, `withoutArchived`, `resolveCollapsed`, `cronCollapseKey`, `cronGroupUnread`, `collapsedByDefault` | Sidebar folder/cron grouping, collapse defaults + override, per-group unread rollup, and archived rows dropped ahead of every other rule (fed raw, so the bucketer itself is the guard). |
-| `pages/chat/mathDelimiters.test.ts` (14) | `mathDelimiters.ts` — `normalizeMath` | Assistant LaTeX normalized for `remark-math`: prose money stays literal, AMS `\(…\)`/`\[…\]` rewritten, own-line `$$` promoted (never inside a list/table), code masked, no super-linear time. Ported verbatim from `app/ios/web`. |
-| `pages/chat/mathDelimiters.port.test.ts` (3) | the `mathDelimiters` pair + `syncCursor.ts` ⇄ `transcript/cursor.ts` | Each web copy stays byte-identical to its `app/ios/web` original past the header — the only gate on a module duplicated across two pnpm projects. The cursor is here because web and device run the ONE sync loop: a rebase-dirty rule that holds on only one client loses rows. |
+| `pages/chat/mathDelimiters.test.ts` (14) | `mathDelimiters.ts` — `normalizeMath` | Assistant LaTeX normalized for `remark-math`: prose money stays literal, AMS `\(…\)`/`\[…\]` rewritten, own-line `$$` promoted (never inside a list/table), code masked, no super-linear time. Ported verbatim from `app/mobile/web`. |
+| `pages/chat/mathDelimiters.port.test.ts` (3) | the `mathDelimiters` pair + `syncCursor.ts` ⇄ `transcript/cursor.ts` | Each web copy stays byte-identical to its `app/mobile/web` original past the header — the only gate on a module duplicated across two pnpm projects. The cursor is here because web and device run the ONE sync loop: a rebase-dirty rule that holds on only one client loses rows. |
 | `pages/sessionPatch.test.ts` (6) | `ChatPage.tsx` — `applySessionPatch` | Archive merges in place (the row stays in state so a sparse unarchive patch has something to land on) while `hidden` still removes the row; cron grouping + group pin survive an unrelated patch. |
 | `pages/composerSend.test.ts` (6) | `ChatPage.tsx` — `decideComposerAction` | send / park / stop / noop rule; a non-empty queue never stalls an idle submit (the regression). |
 | `pages/composerPaste.test.ts` (12) | `ChatPage.tsx` — `clipboardAttachments`, `pastedFilename` | Paste-to-attach: a file-only clipboard stages, and a clipboard carrying real TEXT stays a text paste even when a bitmap of the selection rides along (Safari / Excel / Numbers) — the inversion would eat the paste and attach a picture of it. Plus the synthetic name a nameless blob gets, since `filename` rides the wire to the agent. |

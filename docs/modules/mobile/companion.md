@@ -13,7 +13,7 @@ user-facing features:
    and the phone decrypts locally in a Notification Service Extension (NSE).
 
 The app is a **SwiftUI** app (`app/ios`) whose native screens wrap a host-testable
-Rust core exposed over UniFFI (`baybo-ios-ffi`, `app/ios/ffi` — its own Cargo
+Rust core exposed over UniFFI (`baybo-mobile-ffi`, `app/mobile/ffi` — its own Cargo
 workspace); the protocol + crypto live in shared crates (`crates/wire`,
 `crates/device-proto`) so the phone and the gateway agree by construction.
 
@@ -121,7 +121,7 @@ out and must log in again.
     relay/push throttles all draw on; `crates/dashboard` —
     `remote-host-dashboard`, the operator read/control plane on its own listener
     (see Status).
-- `app/ios/ffi` (`baybo-ios-ffi`) — P-side UniFFI core: `PairingClient`,
+- `app/mobile/ffi` (`baybo-mobile-ffi`) — P-side UniFFI core: `PairingClient`,
   `ContentSession` (Noise self-pull), the relay/direct transport legs, the
   blob-leg client, and keychain persistence (`keychain.rs`); host-unit-testable
   (`lib` crate-type). The SwiftUI app (`app/ios/App`) consumes it as `BayboClient`
@@ -210,7 +210,7 @@ relay admission key, device identity, and `push_key`.
 
 **Direct-mode push (no pairing):** the direct transport has no pairing handshake,
 so it provisions the *same* binding over the admin-token REST surface instead.
-`direct::push::register` (`app/ios/ffi/src/direct/push.rs`) reuses the phone's stable
+`direct::push::register` (`app/mobile/ffi/src/direct/push.rs`) reuses the phone's stable
 Ed25519 identity, load-or-creates a stable `push_key` in the shared App Group
 keychain for its NSE (minted once, reused), fetches the gateway push key via `GET /v1/push/params`,
 signs the same delegation, and `POST /v1/push/register`s it (admin Bearer). The
@@ -287,7 +287,7 @@ shows a "remembered" view on launch. The chat survives a background round-trip,
 and the content session reconnects (then runs the sync loop —
 `docs/sync-protocol.md`) on every iOS foreground. It
 also reconnects on its own when a live leg drops mid-session: the Rust pump fires
-the sink's `onDisconnected` callback (`FrameSink`, `app/ios/ffi/src/transport.rs`)
+the sink's `onDisconnected` callback (`FrameSink`, `app/mobile/ffi/src/transport.rs`)
 on any unsolicited exit (socket close, the
 inbound-liveness lapse, a remote-host restart) — but not on a deliberate
 reconnect/disconnect, which aborts the task first — and the native chat store

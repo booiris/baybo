@@ -8,8 +8,8 @@ scripts/build-app.sh --device --release
 node scripts/install.mjs         # archive + export + devicectl install (USB)
 node scripts/release.mjs --version 0.1.0            # archive, export, verify
 node scripts/release.mjs --version 0.1.0 --upload   # …and deliver to App Store Connect
-cargo clippy --workspace --all-targets --all-features   # zero warnings
-cargo nextest run --workspace    # ffi host tests
+(cd ../mobile && cargo clippy --workspace --all-targets --all-features)  # zero warnings
+(cd ../mobile && cargo nextest run --workspace)   # core host tests
 (cd web && pnpm build)           # tsc --noEmit + vite build
 ```
 
@@ -134,7 +134,7 @@ codesign needs the unlocked login keychain, and a headless shell fails with
 unsigned bundle, and the next Xcode device Run fails with exactly the two errors
 above.
 
-- When iterating on Swift/web only (no `ffi/` changes), pass `--skip-rust`.
+- When iterating on Swift/web only (no `../mobile/ffi/` changes), pass `--skip-rust`.
 - After a full run does clobber it, restore with `scripts/build-core.sh` (no flags).
 
 Check the result with `codesign --verify` — a failed headless sign

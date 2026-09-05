@@ -48,7 +48,7 @@ cargo update -w
 UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync
 ```
 
-That PR also drags the iOS jobs along, because `app/ios/Cargo.lock` matches both
+That PR also drags the iOS jobs along, because `app/mobile/Cargo.lock` matches both
 `IOS_DEPS` and `ios_native` in `ci.yml` — one `ios-sim` run on `macos-26`, which
 takes one of the five macOS slots the free plan allows account-wide. Measured at
 ~21 runner-minutes for the whole PR. Merge it once green.

@@ -1,9 +1,9 @@
 [package]
-name = "baybo-ios-bindgen"
+name = "baybo-mobile-bindgen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "uniffi-bindgen CLI for the Baybo iOS core (kept out of the lib build)"
+description = "uniffi-bindgen CLI for the Baybo mobile core (kept out of the lib build)"
 publish = false
 
 [[bin]]

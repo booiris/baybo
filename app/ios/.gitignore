@@ -1,4 +1,3 @@
-/target
 /Generated
 /Externals
 *.xcodeproj
@@ -6,9 +5,4 @@
 xcuserdata/
 build/
 DerivedData/
-web/dist/
-# `tsc -b`'s incremental cache. Machine-local by construction — it records
-# absolute paths and mtimes, so a committed one is stale for everyone else.
-web/*.tsbuildinfo
-web/node_modules/
 App/Resources/transcript/

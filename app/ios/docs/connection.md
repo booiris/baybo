@@ -1,10 +1,10 @@
 # Connection lifecycle
 
-*The chat-leg connection supervisor — governs `app/ios/ffi/src/transport/`
+*The chat-leg connection supervisor — governs `app/mobile/ffi/src/transport/`
 (`mod.rs`: shared wire primitives + the seams + the `SessionRegistry` facade;
 `supervisor.rs`: the lifecycle actor; `pump.rs`: the hot path;
 `tests.rs`: the loopback suite), the per-leg dialers in
-`ffi/src/relay/chat.rs` / `ffi/src/direct/chat.rs`, and the Swift half of the
+`../mobile/ffi/src/relay/chat.rs` / `../mobile/ffi/src/direct/chat.rs`, and the Swift half of the
 state machine in `App/Core/ChatStore.swift` (connState, the dial
 continuations, the send paths).*
 

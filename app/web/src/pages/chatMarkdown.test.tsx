@@ -52,7 +52,7 @@ vi.mock('./chat/mathDelimiters', async (importOriginal) => {
   };
 });
 
-// Ported from `app/ios/web/src/Markdown.test.tsx`: the two clients render the
+// Ported from `app/mobile/web/src/Markdown.test.tsx`: the two clients render the
 // same assistant message, so they are held to the same cases.
 //
 // The math pipeline (normalizeMath -> remark-math -> rehype-katex -> KaTeX) is
@@ -370,7 +370,7 @@ describe('MarkdownBody failure fallback', () => {
   });
 });
 
-// Mirror of the iOS transcript's defenses (app/ios/web): highlighting a
+// Mirror of the iOS transcript's defenses (app/mobile/web): highlighting a
 // still-growing block per streaming tick is what ballooned the iOS WebContent
 // process to its 2.2GB jetsam limit; a desktop tab survives the
 // same construction but stalls for seconds. These pin defer-while-streaming,

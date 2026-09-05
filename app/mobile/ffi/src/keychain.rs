@@ -274,7 +274,7 @@ mod imp {
 // both this guard and the stub's Android reachability.
 #[cfg(target_os = "android")]
 compile_error!(
-    "baybo-ios-ffi has no Android secure store yet: this build would link the \
+    "baybo-mobile-ffi has no Android secure store yet: this build would link the \
      silent no-op keychain stub and lose the device identity, pairing and push \
      key on every call. Implement the SecureStore seam first — see \
      docs/todo/android-companion.md, phase P2."

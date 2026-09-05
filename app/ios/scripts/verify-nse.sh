@@ -91,10 +91,10 @@ echo "▸ keychain access group: $KEYCHAIN_GROUP"
 echo "▸ building (debug, iphonesimulator)…"
 if [ ! -f "$IOS_DIR/App/Resources/transcript/index.html" ]; then
   echo "▸ transcript web bundle missing — building it…"
-  ( cd "$IOS_DIR/web" && pnpm install --silent && pnpm build )
+  ( cd "$REPO_ROOT/app/mobile/web" && pnpm install --silent && pnpm build )
   rm -rf "$IOS_DIR/App/Resources/transcript"
   mkdir -p "$IOS_DIR/App/Resources/transcript"
-  cp -R "$IOS_DIR/web/dist/." "$IOS_DIR/App/Resources/transcript/"
+  cp -R "$REPO_ROOT/app/mobile/web/dist/." "$IOS_DIR/App/Resources/transcript/"
 fi
 # DEBUG profile on purpose: debug_seed_push_key is #[cfg(debug_assertions)].
 # The exported group is baked into the staticlib (ffi/build.rs) and must match

@@ -130,6 +130,6 @@ still allowed by the server contract.
   the hand-written DTO drift sentinel.
 - [`design-system.md`](design-system.md) owns visual tokens and state colours.
 
-The relevant local checks are the iOS FFI tests, the `app/ios/web` lint/test/
+The relevant local checks are the iOS FFI tests, the `app/mobile/web` lint/test/
 build, Swift unit tests, and the Projects UI tests. The root workspace and iOS
 workspace are separate; root Cargo commands do not cover this app.

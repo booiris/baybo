@@ -6,7 +6,7 @@
 > are written out in P2 as the seams land. The plan this implements is
 > [`../../todo/android-companion.md`](../../todo/android-companion.md). Where
 > that plan and the code disagree, the code wins and this file records the
-> code. Paths are written as they are **today** (`app/ios/ffi/…`); P1 moves the
+> code. Paths are written as they are **today** (`app/mobile/ffi/…`); P1 moves the
 > shared halves to `app/mobile/ffi/…` without changing a line of what is
 > described below.
 
@@ -17,7 +17,7 @@ download, and the push-token state machine — all exported over UniFFI to two
 shells, the SwiftUI one in `app/ios/App/` and the Kotlin/Compose one in
 `app/android/` (P3). One `BayboClient` instance owns the live legs, the
 in-flight pairing sessions, and the push state, and the pumps it spawns keep
-running between calls (`app/ios/ffi/src/lib.rs:70-91`).
+running between calls (`app/mobile/ffi/src/lib.rs:70-91`).
 
 It is **not** where the protocol lives. Frames, the `Noise_XXpsk0` pairing
 handshake, the Ed25519 push delegation and the preview AEAD are in
@@ -28,14 +28,14 @@ needs no new crypto: `decrypt_push_preview` goes through
 `device_proto::aead::open`, never a second ChaCha20-Poly1305 written in
 Kotlin.
 
-**It is its own cargo workspace** (`app/ios/Cargo.toml:10-12`), and stays one
+**It is its own cargo workspace** (`app/mobile/Cargo.toml:10-12`), and stays one
 after the move. The header comment states the first reason — the root
 `cargo clippy --all --all-features` gate must never build a phone-configured
 cdylib, and uniffi's `cli` feature must never unify into the lib build, which
-is why `bindgen/` is a separate member (`app/ios/Cargo.toml:1-9`). The reason
+is why `bindgen/` is a separate member (`app/mobile/Cargo.toml:1-9`). The reason
 with the sharpest teeth is TLS feature unification. The core pins reqwest with
 `default-features = false` plus `rustls-no-provider`
-(`app/ios/Cargo.toml:32-36`) and rustls with exactly one provider, `ring`
+(`app/mobile/Cargo.toml:32-36`) and rustls with exactly one provider, `ring`
 (`:43`), and installs it once in the constructor (`lib.rs:1623-1626`); the
 root workspace pins reqwest with its defaults plus `json`/`socks`
 (`Cargo.toml:202`) and rustls under `aws_lc_rs` (`Cargo.toml:208`). The
@@ -263,8 +263,8 @@ arrives without logs.
 ## Direct-leg TLS
 
 **The problem.** reqwest 0.13's `rustls-no-provider` feature — the one the
-core pins (`app/ios/Cargo.toml:32-36`) — hard-depends on
-`rustls-platform-verifier`; `app/ios/Cargo.lock:1586-1589` already resolves
+core pins (`app/mobile/Cargo.toml:32-36`) — hard-depends on
+`rustls-platform-verifier`; `app/mobile/Cargo.lock:1586-1589` already resolves
 `rustls-platform-verifier-android 0.1.1` in the graph. On Android that crate
 switches to a JNI-backed verifier that needs `android::init_with_env` called
 from Kotlin plus a bundled Kotlin component. Without it,
@@ -294,7 +294,7 @@ JNI route lands as the private-CA follow-up.
 
 **The wss legs are unaffected.** Both chat legs dial through
 `tokio-tungstenite`, pinned with `default-features = false` plus
-`rustls-tls-webpki-roots` (`app/ios/Cargo.toml:38`): they already carry baked-in
+`rustls-tls-webpki-roots` (`app/mobile/Cargo.toml:38`): they already carry baked-in
 webpki roots and never consult a platform verifier on any target. Only the
 direct leg's REST/blob HTTP client goes through reqwest, so only it is in
 scope here. The same manifest comment (`:39-43`) records why rustls is pulled
@@ -406,7 +406,7 @@ rename, and they become the guard for both platforms. And the cache namespace
 | Log mirror | `eprint!` to stderr (`logging.rs:90`), read by Xcode's console | `__android_log_write` under `cfg(target_os = "android")`; native fd 2 is `/dev/null` under the zygote |
 | Bindings language | Swift, module `BayboCore` (`ffi/uniffi.toml:1-3`) | Kotlin, package `com.baybo.core`, `android = true`; a `with_foreign` trait becomes an `interface` plus a generated `XImpl` class |
 | Build artefact | `BayboCore.xcframework` — device + simulator `libbaybo_ffi.a` with headers (`scripts/build-core.sh:62-66`), codesigned for device builds | `libbaybo_ffi.so` per ABI in `jniLibs`, loaded through JNA (`net.java.dev.jna:jna@aar`); 16 KiB alignment asserted on the packaged APK, not on the cargo output |
-| Panic behaviour | Unwinds. `app/ios/Cargo.toml` has **no** `[profile.release]`, so uniffi's `rust_call` turns a Rust panic into an FFI error through `catch_unwind` (`uniffi_core-0.29.5/src/ffi/rustcalls.rs:177`) | Unwinds today. If Android wants `panic = "abort"` it goes in a separate `[profile.android-release]` selected only by the Android build script — never in `[profile.release]`, which would make an iOS panic kill the app instead of surfacing as an error |
+| Panic behaviour | Unwinds. `app/mobile/Cargo.toml` has **no** `[profile.release]`, so uniffi's `rust_call` turns a Rust panic into an FFI error through `catch_unwind` (`uniffi_core-0.29.5/src/ffi/rustcalls.rs:177`) | Unwinds today. If Android wants `panic = "abort"` it goes in a separate `[profile.android-release]` selected only by the Android build script — never in `[profile.release]`, which would make an iOS panic kill the app instead of surfacing as an error |
 
 ## Sections to be filled in P2
 

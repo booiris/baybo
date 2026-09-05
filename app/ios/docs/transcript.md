@@ -1,6 +1,6 @@
 # The transcript webview
 
-_The single reused transcript `WKWebView` and everything that feeds it: `BayboClient`/`ChatStore` lifecycle, the native ⇄ web bridge, keyboard insets, markdown/LaTeX rendering, and the message index. Governs `app/ios/App/Core/TranscriptHost.swift`, `app/ios/App/Web/TranscriptBridge.swift`, `app/ios/App/Web/TranscriptWebView.swift`, `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/MessageOutline.swift`, `app/ios/App/Screens/MessageIndexSheet.swift`, and `app/ios/web/src/` (`bridge.ts`, `Transcript.tsx`, `mathDelimiters.ts`, `wireSentinel.ts`, `restSentinel.ts`)._
+_The single reused transcript `WKWebView` and everything that feeds it: `BayboClient`/`ChatStore` lifecycle, the native ⇄ web bridge, keyboard insets, markdown/LaTeX rendering, and the message index. Governs `app/ios/App/Core/TranscriptHost.swift`, `app/ios/App/Web/TranscriptBridge.swift`, `app/ios/App/Web/TranscriptWebView.swift`, `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/MessageOutline.swift`, `app/ios/App/Screens/MessageIndexSheet.swift`, and `app/mobile/web/src/` (`bridge.ts`, `Transcript.tsx`, `mathDelimiters.ts`, `wireSentinel.ts`, `restSentinel.ts`)._
 
 ## BayboClient and store lifecycle
 
@@ -249,7 +249,7 @@ delivering other traffic is left alone and only this connect fails.
 
 ## The native ⇄ web bridge
 
-`app/ios/App/Web/TranscriptBridge.swift` ⇄ `app/ios/web/src/bridge.ts`.
+`app/ios/App/Web/TranscriptBridge.swift` ⇄ `app/mobile/web/src/bridge.ts`.
 
 **native→web:**
 `init` / `pushFrame` / `setConnEpoch` / `userSent` / `sendFailed` / `blobResult` /
@@ -347,12 +347,12 @@ One signal covers keyboard, composer growth, and the notice line.
 Two compile-time pins, both type-only, both enforced by `pnpm build` (`ios-web` in CI is
 the only place they are ever evaluated):
 
-`app/ios/web/src/wireSentinel.ts` (and `app/web/src/api/wireSentinel.ts` for the web chat)
+`app/mobile/web/src/wireSentinel.ts` (and `app/web/src/api/wireSentinel.ts` for the web chat)
 pin the hand-written frame mirrors to the ts-rs-generated contract
 (`sidecars/sdk/channel-ts/src/generated/`) — a wire-side rename/retype fails the build.
 `bigint`→`number` is mapped (this bundle receives JSON, not the SDK's msgpack).
 
-`app/ios/web/src/restSentinel.ts` does the same for `TranscriptRowItem`, the shape the
+`app/mobile/web/src/restSentinel.ts` does the same for `TranscriptRowItem`, the shape the
 `sync_page` / `history_page` rows arrive in. That one is not a ts-rs type — the ffi passes
 each row through as an untouched `serde_json::Value`, so what lands here is the gateway's
 utoipa DTO `ChatTranscriptItem`, which `scripts/check-ts-bindings.sh` does not cover.
@@ -662,7 +662,7 @@ on the way in and again on the way out.
 
 **LaTeX math** renders via `remark-math` + `rehype-katex` + `katex` (CSS/fonts bundled by
 Vite, served by the transcript scheme handler — no CDN), preprocessed by `normalizeMath`
-(`app/ios/web/src/mathDelimiters.ts`):
+(`app/mobile/web/src/mathDelimiters.ts`):
 
 - `\(..\)` / `\[..\]` are rewritten to dollars in the raw source (CommonMark eats the
   backslashes before any remark plugin runs);

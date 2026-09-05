@@ -120,7 +120,7 @@ const assertEqual = (label, actual, expected) => {
 };
 
 const refreshTranscriptBundle = () => {
-  const webRoot = join(ROOT, "web");
+  const webRoot = join(ROOT, "..", "mobile", "web");
   const webBundle = join(webRoot, "dist");
   const appBundle = join(ROOT, "App", "Resources", "transcript");
 

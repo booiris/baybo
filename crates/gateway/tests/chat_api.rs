@@ -1121,7 +1121,7 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
     let (recurring_id, one_shot_id) = (fires[0].clone(), fires[1].clone());
 
     // Exactly what the iOS client fetches: `GET /v1/chat/sessions` under a
-    // device identity (see `app/ios/ffi/src/gateway_api.rs`).
+    // device identity (see `app/mobile/ffi/src/gateway_api.rs`).
     let router = build_router(build_admin_state(&tg));
     let response = router
         .oneshot(

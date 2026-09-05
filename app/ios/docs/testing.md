@@ -11,8 +11,8 @@ tier for it.
 ```bash
 # Rust core (app/ios workspace — the ROOT workspace excludes it, so the root
 # `cargo test --workspace` has never covered any of this)
-cargo nextest run --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+(cd ../mobile && cargo nextest run --workspace)
+(cd ../mobile && cargo clippy --workspace --all-targets --all-features -- -D warnings)
 
 # Transcript bundle (own pnpm workspace — the root `frontend` job never sees it)
 (cd web && pnpm lint)     # eslint: wiring-bug gate (suppression baseline)
@@ -29,7 +29,7 @@ xcodebuild test-without-building -project Baybo.xcodeproj -scheme Baybo \
   -derivedDataPath build/DerivedData -only-testing:BayboTests    # or :BayboUITests
 ```
 
-### `app/ios/ffi/`
+### `app/mobile/ffi/`
 
 Inline `#[cfg(test)] mod tests`. The load-bearing ones pin things no other check
 can see:
@@ -42,7 +42,7 @@ can see:
 - `since_ordinal` serializing as an **explicit null** (add `skip_serializing_if`
   and a baseline REPLACE quietly becomes an APPEND).
 
-### `app/ios/web/`
+### `app/mobile/web/`
 
 vitest + jsdom, mostly over the pure reducers. Bare jsdom cannot say anything
 about the scroll model — `scrollHeight` is 0 and `getBoundingClientRect` is all
@@ -51,7 +51,7 @@ transcript is tested through its extracted reducers, with the simulator demo
 flags (see [Headless UI verification](#headless-ui-verification)) covering what a
 reducer test cannot.
 
-`app/ios/web/src/transcriptScroll.test.tsx` is the one suite that mounts
+`app/mobile/web/src/transcriptScroll.test.tsx` is the one suite that mounts
 `<Transcript>`, and it does so **under a fake layout**: it stubs
 `document.scrollingElement`, the document's `scrollTop`/`scrollHeight`/
 `clientHeight`, and a per-row `getBoundingClientRect` derived from the row's
@@ -64,7 +64,7 @@ slammed them to the newest edge. It is **not** a WKWebView — momentum,
 rubber-band overscroll and the UI-process scroll thread stay device-only.
 
 A **small presentational component is fine to render** the plain way:
-`app/ios/web/src/WorkBlock.test.tsx` mounts `WorkBlockView` (React Testing
+`app/mobile/web/src/WorkBlock.test.tsx` mounts `WorkBlockView` (React Testing
 Library) for its active/closed/toggle wiring, with no layout stubs at all.
 
 `pnpm lint` (eslint, mirroring `app/web` — strict-boolean-expressions /
@@ -246,7 +246,7 @@ What the gating still defends is time and the macOS queue: the free plan runs
 job is filtered to the change it actually answers for.
 
 - `ios-web` (ubuntu, gated on `ios`, ~2 min) — `pnpm lint && pnpm test &&
-  pnpm build` in `app/ios/web`. `pnpm build` is `tsc --noEmit && vite build`,
+  pnpm build` in `app/mobile/web`. `pnpm build` is `tsc --noEmit && vite build`,
   and that typecheck is the only place the compile-time drift sentinels are ever
   evaluated: `src/wireSentinel.ts` (frame mirrors ⇄ the ts-rs contract in
   `crates/wire`), `src/restSentinel.ts` (`TranscriptRowItem` ⇄ the gateway's

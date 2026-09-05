@@ -12,7 +12,7 @@ import {
 
 // A turn renders as a LADDER: one `Worked Xs ›` run per stretch of work, each
 // timing itself from the model's previous remark to its next, with the remarks
-// between them at answer typography and never folded. `app/ios/web/src/
+// between them at answer typography and never folded. `app/mobile/web/src/
 // WorkBlock.test.tsx` pins the same behaviour on the transcript's
 // hand-duplicated renderer.
 

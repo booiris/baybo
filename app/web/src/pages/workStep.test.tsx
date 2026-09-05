@@ -7,7 +7,7 @@ import { WorkSpeechRun, WorkStepView, type WorkStep } from './ChatPage';
 // contract, not a styling detail: the model writes its reasoning in the same
 // markdown as its answer, so rendering it raw leaked `**` to the reader, while a
 // status line or a notice is our own string and must never be re-parsed.
-// `app/ios/web/src/WorkBlock.test.tsx` holds the iOS transcript to the same
+// `app/mobile/web/src/WorkBlock.test.tsx` holds the iOS transcript to the same
 // split — the two `WorkStepView`s are hand-duplicated with nothing else
 // gating the drift.
 

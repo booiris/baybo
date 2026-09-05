@@ -8,11 +8,19 @@
 #   Externals/BayboCore.xcframework    — device + simulator static libs with headers
 #
 # The keychain access group is baked into the staticlib at compile time
-# (ffi/build.rs); default it here explicitly so a plain shell build matches the
-# Xcode-signed entitlement (`$(AppIdentifierPrefix)com.baybo.app`).
+# (app/mobile/ffi/build.rs); default it here explicitly so a plain shell build
+# matches the Xcode-signed entitlement (`$(AppIdentifierPrefix)com.baybo.app`).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# The Rust core lives in the SHARED workspace next door; only its OUTPUTS
+# (Generated/, Externals/) belong to this shell. cwd stays app/ios so every
+# output path below is unchanged, and cargo is pointed across explicitly:
+# app/ios has no Cargo.toml of its own, so a bare `cargo build` here would walk
+# UP to the root workspace, quietly build the wrong graph, and exit 0.
+MOBILE_DIR="$(cd "$(dirname "$0")/../../mobile" && pwd)"
+MOBILE_MANIFEST="$MOBILE_DIR/Cargo.toml"
 
 # Cargo may inherit a global `RUSTC_WRAPPER=sccache`; in iOS build contexts that
 # wrapper can fail before rustc starts with "Operation not permitted".
@@ -41,16 +49,23 @@ if [[ "$SIM_ONLY" != 1 ]]; then
 fi
 
 for t in "${TARGETS[@]}"; do
-  cargo build -p baybo-ios-ffi --target "$t" ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
+  cargo build --manifest-path "$MOBILE_MANIFEST" -p baybo-mobile-ffi --target "$t" ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 done
 
 # Bindings are extracted from a host cdylib build (same interface metadata).
-cargo build -p baybo-ios-ffi ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
+cargo build --manifest-path "$MOBILE_MANIFEST" -p baybo-mobile-ffi ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 
 rm -rf Generated Externals/headers Externals/BayboCore.xcframework
 mkdir -p Generated Externals/headers
-cargo run -q -p baybo-ios-bindgen --bin uniffi-bindgen -- generate \
-  --library "target/$PROFILE/libbaybo_ffi.dylib" \
+# `--config` is not optional here, and its absence is silent: in library mode
+# uniffi-bindgen locates each crate's `uniffi.toml` by running `cargo metadata`
+# in the CURRENT directory, and this script's cwd is app/ios, which has no
+# Cargo.toml. Without it the swift `module_name = "BayboCore"` is never read and
+# the bindings come out as `Generated/baybo_ffi.swift` — a green build that
+# produces a file the Xcode target does not reference.
+cargo run -q --manifest-path "$MOBILE_MANIFEST" -p baybo-mobile-bindgen --bin uniffi-bindgen -- generate \
+  --library "$MOBILE_DIR/target/$PROFILE/libbaybo_ffi.dylib" \
+  --config "$MOBILE_DIR/ffi/uniffi.toml" \
   --language swift \
   --out-dir Generated
 
@@ -61,7 +76,7 @@ mv Generated/*.modulemap Externals/headers/module.modulemap
 
 XCF_ARGS=()
 for t in "${TARGETS[@]}"; do
-  XCF_ARGS+=(-library "target/$t/$PROFILE/libbaybo_ffi.a" -headers Externals/headers)
+  XCF_ARGS+=(-library "$MOBILE_DIR/target/$t/$PROFILE/libbaybo_ffi.a" -headers Externals/headers)
 done
 xcodebuild -create-xcframework ${XCF_ARGS[@]+"${XCF_ARGS[@]}"} -output Externals/BayboCore.xcframework | cat
 

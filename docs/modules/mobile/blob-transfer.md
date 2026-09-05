@@ -16,10 +16,10 @@ Implemented pieces:
   tunnel reuses the `/v1/blobs` HTTP routes through an in-process router rather
   than a separate blob service module — `crates/store`, `crates/storage`);
 - the shared tunnel protocol (`crates/device-proto/src/api_tunnel.rs`);
-- the iOS Rust FFI client (`app/ios/ffi/src/core/api_tunnel.rs`,
-  `app/ios/ffi/src/relay/blob.rs`, `app/ios/ffi/src/lib.rs` — `blob_upload_bytes` /
+- the iOS Rust FFI client (`app/mobile/ffi/src/core/api_tunnel.rs`,
+  `app/mobile/ffi/src/relay/blob.rs`, `app/mobile/ffi/src/lib.rs` — `blob_upload_bytes` /
   `blob_download_bytes` — plus the content-addressed on-device cache in
-  `app/ios/ffi/src/blob_helper.rs`).
+  `app/mobile/ffi/src/blob_helper.rs`).
 
 There is deliberately no background blob sweeper and no
 `BlobStore::purge_older_than`: device-uploaded blobs are durable. The upload
@@ -29,7 +29,7 @@ additional `BlobStore` surface.
 
 The mobile chat-view UI is wired in the SwiftUI app (`app/ios/App/Screens/ComposerView.swift`
 + the `ffi` crate): a `PhotosPicker` stages picked images and uploads them over a blob leg
-(`blob_upload_bytes` on `app/ios/ffi/src/lib.rs`), successful uploads seed the same
+(`blob_upload_bytes` on `app/mobile/ffi/src/lib.rs`), successful uploads seed the same
 content-addressed on-device cache used by downloads (`blob_helper.rs`), the outgoing
 `Frame::Message` carries the resulting `WireAttachment`s, and inbound/restored image
 attachments render via `blob_download_bytes` into that cache.
@@ -349,10 +349,10 @@ The upload path flipped the gateway's receive-only posture (`authorize_upload` n
 
 ## Mobile client
 
-The companion is a SwiftUI app (`app/ios/`): a Rust FFI core (`app/ios/ffi/`) that runs the
+The companion is a SwiftUI app (`app/ios/`): a Rust FFI core (`app/mobile/ffi/`) that runs the
 Noise IK **initiator**, and a native Swift UI.
 
-- **Rust core** (`app/ios/ffi/src/relay/blob.rs`): a blob-leg client that dials
+- **Rust core** (`app/mobile/ffi/src/relay/blob.rs`): a blob-leg client that dials
   `/content/join` with `x-relay-leg-class: blob`, runs the Noise IK initiator and the API
   tunnel protocol, writes response `Body` chunks to a temp file at `offset`, verifies
   `sha256` against the requested `blob_id` hex, and resumes by reissuing

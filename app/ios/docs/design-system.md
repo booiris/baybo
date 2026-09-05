@@ -3,7 +3,7 @@
 Governs the **visual design** of `app/ios` — a SwiftUI app whose screens, header, and
 composer are native, with only the chat transcript rendered in a WKWebView. The system is
 implemented twice: `app/ios/App/Support/Theme.swift` for the native chrome and
-`app/ios/web/src/styles.css` for the transcript bundle. This file is the prose that explains
+`app/mobile/web/src/styles.css` for the transcript bundle. This file is the prose that explains
 the intent so changes stay coherent. For app behavior/architecture, the root `/CLAUDE.md`
 and the sibling docs under `app/ios/docs/` still apply.
 
@@ -36,7 +36,7 @@ sharp corners, no bold-everything.
 
 The token set exists **TWICE**, and the two copies must be changed **together**:
 
-- **`app/ios/web/src/styles.css`** — the `:root` block, for the transcript webview. Its
+- **`app/mobile/web/src/styles.css`** — the `:root` block, for the transcript webview. Its
   header comment names the system and the token-name parity with `app/web`.
 - **`app/ios/App/Support/Theme.swift`** — the Swift-side mirror (`Theme.paper`,
   `Theme.ink`, `Theme.line`, …) plus the button styles, for every native surface: the
@@ -55,7 +55,7 @@ tokens and the deliberately overridable card-base `--ink` / `--muted` / `--line`
   transcript renders in the webview; everything else is native SwiftUI, so there is no
   utility-class layer and no `@theme` block. Tokens are ordinary custom properties on
   `:root`; write CSS classes that reference `var(--token)`.
-- **Standalone pnpm project** — `app/ios/web` has its own `pnpm-workspace.yaml` and is
+- **Standalone pnpm project** — `app/mobile/web` has its own `pnpm-workspace.yaml` and is
   intentionally NOT part of the root workspace. Run `pnpm install` / `pnpm build`
   (= `tsc --noEmit && vite build`) from that directory.
 
@@ -68,14 +68,14 @@ The rule is the app's offline / no-needless-network posture, and it holds on bot
   in `project.yml`. `Theme.mono` serves it through `Font.custom("Space Mono", …)`, which
   falls back to the system face if the TTFs ever go missing.
 - **Web:** Space Mono (400/700, latin + latin-ext) and Inter Variable ride `@fontsource`
-  packages imported in `web/src/main.tsx` and bundled by Vite — imported BEFORE
+  packages imported in `../mobile/web/src/main.tsx` and bundled by Vite — imported BEFORE
   `styles.css` so the `@font-face` families exist when the theme references them. KaTeX's
   math fonts are self-hosted the same way (`katex/dist/katex.min.css`, woff2 emitted into
   the bundle and served by the transcript scheme handler), so math renders offline.
 
 ## Design tokens
 
-From the live `:root` block in `app/ios/web/src/styles.css`:
+From the live `:root` block in `app/mobile/web/src/styles.css`:
 
 ```
 --color-paper #ffffff   --color-surface #fafafa
@@ -156,7 +156,7 @@ coloured one, and why the failed-send glyph is the one red thing in the thread.
 
 **One exception, and it is a STATE one** (2026-08-26): the project card page tints its
 status and priority chips, and the sub-issue dots that say the same thing
-(`web/src/issue/issue.css`, the `--state-*` / `--prio-*` table). A card's status and its
+(`../mobile/web/src/issue/issue.css`, the `--state-*` / `--prio-*` table). A card's status and its
 priority are what a board is scanned for — read in a glance rather than in a sentence —
 and in ink-soft a card in Review was indistinguishable from one in Backlog until you read
 the word. The rules that keep it from becoming decoration:
@@ -180,7 +180,7 @@ precedent.
 
 **Syntax highlighting is the second recorded exception** (2026-08-29), confined to fenced
 code under `.md-code-block`. Its Panda Syntax Light token colours encode grammar rather than
-product state. The palette lives only in `web/src/styles.css` because both chat and Projects
+product state. The palette lives only in `../mobile/web/src/styles.css` because both chat and Projects
 render code in webviews and no native surface renders source code. Do not reuse the syntax
 tokens for chrome, badges, or board state.
 
@@ -249,7 +249,7 @@ by-label UI smokes keep working and VoiceOver reads the pair (see
 ### Layout, safe areas, and the full-bleed webview
 
 Native SwiftUI owns all chrome and all safe-area handling for it. The transcript webview
-is **full-bleed** (`viewport-fit=cover` in `web/index.html`) and pads itself instead:
+is **full-bleed** (`viewport-fit=cover` in `../mobile/web/index.html`) and pads itself instead:
 
 - `--thread-top-inset: calc(env(safe-area-inset-top) + 58px)` — so the thread's oldest
   visible row starts below the native header (status bar + the 42pt glass bar), not under

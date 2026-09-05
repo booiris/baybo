@@ -1,6 +1,6 @@
 # Attachments: files, images, audio, video
 
-*How the transcript renders, downloads, and opens attachment payloads — the file card and its QuickLook preview, the image viewer and its size mirror, the native audio engine, and the video tile/player — plus how the composer stages an OUTBOUND one. Governs `app/ios/App/Screens/ImageViewer.swift`, `app/ios/App/Screens/VideoPlayerScreen.swift`, `app/ios/App/Core/AudioPlayerCenter.swift`, the `FilePreviewSheet` / blob-cache plumbing in `app/ios/App/Core/`, the staging half of `app/ios/App/Screens/ComposerView.swift`, `app/ios/App/Support/Pasteboard.swift`, the paste hook in `app/ios/App/AppDelegate.swift`, and the `AttachmentImage` / `AttachmentAudio` / `AttachmentVideo` cards in `app/ios/web/src/`.*
+*How the transcript renders, downloads, and opens attachment payloads — the file card and its QuickLook preview, the image viewer and its size mirror, the native audio engine, and the video tile/player — plus how the composer stages an OUTBOUND one. Governs `app/ios/App/Screens/ImageViewer.swift`, `app/ios/App/Screens/VideoPlayerScreen.swift`, `app/ios/App/Core/AudioPlayerCenter.swift`, the `FilePreviewSheet` / blob-cache plumbing in `app/ios/App/Core/`, the staging half of `app/ios/App/Screens/ComposerView.swift`, `app/ios/App/Support/Pasteboard.swift`, the paste hook in `app/ios/App/AppDelegate.swift`, and the `AttachmentImage` / `AttachmentAudio` / `AttachmentVideo` cards in `app/mobile/web/src/`.*
 
 ## File attachments
 
@@ -88,7 +88,7 @@ That share sheet is why the app carries **`NSPhotoLibraryAddUsageDescription`**:
 
 **An image the transcript has decoded before shows NO loading state at all.**
 
-Every decode records the image's natural `[w,h]` (keyed by the blob's sha256 DIGEST — the read token rotates, the digest doesn't) into `PersistedState.imageDims`, so it rides the per-session mirror to disk. On the next open the bubble is `sized`: `.attachment-bubble.sized` (`app/ios/web/src/styles.css`) solves the same contain-fit the `<img>` will (`min(100%, natural, --attachment-max-h × ratio)` + `aspect-ratio`) and reserves the EXACT final box from the first paint — no 12rem tile, no spinner, no release.
+Every decode records the image's natural `[w,h]` (keyed by the blob's sha256 DIGEST — the read token rotates, the digest doesn't) into `PersistedState.imageDims`, so it rides the per-session mirror to disk. On the next open the bubble is `sized`: `.attachment-bubble.sized` (`app/mobile/web/src/styles.css`) solves the same contain-fit the `<img>` will (`min(100%, natural, --attachment-max-h × ratio)` + `aspect-ratio`) and reserves the EXACT final box from the first paint — no 12rem tile, no spinner, no release.
 
 That release was the bug: a re-opened thread grew/shrank every image row as its bytes landed (measured: page height 3332 → 3396 px on ONE image), and WKWebView has no scroll anchoring to absorb it, so the page shook under the reader.
 
@@ -306,7 +306,7 @@ A spool belongs to a **`SpoolFile`, which unlinks it in `deinit`** — there is 
 
 **A notice the strip published is also RETRACTED when its tile leaves** (`noticeOwner` → `retractNotice`). The ✕ is the action that red line offers, so taking it has to silence it — otherwise "Send failed: …" sat over an empty strip until the user dismissed it by hand. The send gate's own line goes through the same owner (`noteBlocked` names the tile holding the message up), and `leaveConversation()` retracts whatever is left, so re-entering a chat can't open on a line about a failure that is stale by then — the tile it named still carries its own red retry affordance, and `noteBlocked` raises the line again the moment a send runs into it. The retraction is conditional on the published text still being the one on the dock: `notice` belongs to the whole screen — a model failure and a failed approval land on it too — and a ✕ may only take back what the strip put there.
 
-Cancellation stops a photo's `loadTransferable`, but **not an upload already on the wire**: the generated UniFFI async binding has no cancellation hook, so `blob_upload_file` runs to completion regardless. A pick removed mid-upload therefore still mints its blob on the gateway, and nothing sweeps chat blobs — that orphan is permanent. What cancellation buys is that the result reaches neither the strip nor the notice line; plumbing a real abort would have to start in `ffi/`.
+Cancellation stops a photo's `loadTransferable`, but **not an upload already on the wire**: the generated UniFFI async binding has no cancellation hook, so `blob_upload_file` runs to completion regardless. A pick removed mid-upload therefore still mints its blob on the gateway, and nothing sweeps chat blobs — that orphan is permanent. What cancellation buys is that the result reaches neither the strip nor the notice line; plumbing a real abort would have to start in `../mobile/ffi/`.
 
 `ChatStore.maxConcurrentUploads` (2) bounds how many run at once — the rest sit `queued`. Ten in parallel is ten sockets on one uplink and ten 100ms progress tickers hopping to the main actor, which defeats the coalescing the tick interval exists to provide.
 
@@ -328,4 +328,4 @@ The gateway's `last_message_preview` is `None` for a media-only turn, and `merge
 
 ### Known gap: outbound `duration_ms`
 
-`WireAttachment.duration_ms` — what the audio card's resting meta line and the video tile's chip read — is always `None` on a send: the FFI's `AttachmentRef` record (`app/ios/ffi/src/api.rs`) has no such field, and `From<AttachmentRef> for WireAttachment` hardcodes it. A user can now attach an `m4a` or an `mp4`, so probing it locally (`AVURLAsset`) is worth doing — but it needs the FFI record to carry it first, or the optimistic bubble would show a length that vanishes the moment the row comes back from a sync.
+`WireAttachment.duration_ms` — what the audio card's resting meta line and the video tile's chip read — is always `None` on a send: the FFI's `AttachmentRef` record (`app/mobile/ffi/src/api.rs`) has no such field, and `From<AttachmentRef> for WireAttachment` hardcodes it. A user can now attach an `m4a` or an `mp4`, so probing it locally (`AVURLAsset`) is worth doing — but it needs the FFI record to carry it first, or the optimistic bubble would show a length that vanishes the moment the row comes back from a sync.

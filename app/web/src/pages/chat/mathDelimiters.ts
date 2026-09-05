@@ -1,4 +1,4 @@
-// Ported verbatim from `app/ios/web/src/mathDelimiters.ts` (a separate pnpm
+// Ported verbatim from `app/mobile/web/src/mathDelimiters.ts` (a separate pnpm
 // workspace root, so the module can't simply be shared). The two clients must
 // render the same message identically — `diff` the pair before changing either.
 //

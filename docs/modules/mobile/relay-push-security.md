@@ -72,8 +72,8 @@ Relevant code:
 - Operator command: `crates/cli/src/commands/device.rs`
 - A-side pairing host: `crates/gateway/src/channel/relay_pair.rs`
 - A-side XXpsk0 driver: `crates/gateway/src/channel/device_pair.rs`
-- P-side scanner UI: `app/ios/App/Screens/ScanView.swift` (QR payload parse: `app/ios/ffi/src/qr.rs`)
-- P-side pairing pump: `app/ios/ffi/src/relay/pairing.rs`
+- P-side scanner UI: `app/ios/App/Screens/ScanView.swift` (QR payload parse: `app/mobile/ffi/src/qr.rs`)
+- P-side pairing pump: `app/mobile/ffi/src/relay/pairing.rs`
 
 The scan flow exists to deliver one high-entropy secret out of band and to bind
 the user-visible pairing action to a live cryptographic transcript.
@@ -376,8 +376,8 @@ gateway's push signing key, which it never holds.
 
 Relevant code:
 
-- P transport: `app/ios/ffi/src/relay/chat.rs` (generic frame pump: `app/ios/ffi/src/transport.rs`)
-- P crypto/session core: `app/ios/ffi/src/core/content.rs`
+- P transport: `app/mobile/ffi/src/relay/chat.rs` (generic frame pump: `app/mobile/ffi/src/transport.rs`)
+- P crypto/session core: `app/mobile/ffi/src/core/content.rs`
 - A relay control manager: `crates/gateway/src/channel/relay_content.rs`
 - A Noise responder: `crates/gateway/src/channel/device_content.rs`
 - C relay protocol: `remote-host/crates/protocol/src/relay.rs`
@@ -453,7 +453,7 @@ Relevant code:
 - A push dispatcher (preview + signed register/notify): `crates/gateway/src/push/mod.rs`
 - A delegation capture at pairing: `crates/gateway/src/channel/device_pair.rs`
 - A target refresh endpoint (`POST /v1/mobile/push-token`): `crates/gateway/src/api/admin/push.rs`
-- P platform-token capture: `app/ios/App/AppDelegate.swift` → `app/ios/ffi/src/push.rs` (`BayboClient::set_push_token`)
+- P platform-token capture: `app/ios/App/AppDelegate.swift` → `app/mobile/ffi/src/push.rs` (`BayboClient::set_push_token`)
 - Delegation crypto (A signs, C verifies, byte layout pinned):
   `crates/device-proto/src/delegation.rs`, `remote-host/crates/push/src/delegation.rs`
 - AEAD framing: `crates/device-proto/src/aead.rs`
@@ -696,13 +696,13 @@ guarantee.
 
 The sections above describe the **scan-to-pair** (Noise device) path. The
 **direct** transport — connect by typing a gateway URL + admin token, no pairing
-(see [`companion.md`](companion.md) and `app/ios/ffi/src/direct/`) — has
+(see [`companion.md`](companion.md) and `app/mobile/ffi/src/direct/`) — has
 no Noise handshake to bootstrap push from, yet can still deliver lock-screen
 pushes by provisioning the *same* binding over the admin-token TLS REST surface.
 
 Relevant code:
 
-- App registration: `app/ios/ffi/src/direct/push.rs` (`register`, exposed as
+- App registration: `app/mobile/ffi/src/direct/push.rs` (`register`, exposed as
   `BayboClient::register_push`).
 - Gateway endpoints: `crates/gateway/src/api/admin/push.rs`
   (`GET /v1/push/params`, `POST /v1/push/register`).

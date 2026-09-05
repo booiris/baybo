@@ -35,7 +35,7 @@ const RENDER_CHECK_FILE: &str = "render_check.js";
 /// the client's own source rather than vendored, so the gate can never drift
 /// into checking cards against an SDK the client no longer ships — a copy
 /// would rot silently, and a moved file is a compile error instead.
-const CARD_SDK_JS: &str = include_str!("../../../app/ios/web/src/deck/sdkCard.js");
+const CARD_SDK_JS: &str = include_str!("../../../app/mobile/web/src/deck/sdkCard.js");
 const CARD_SDK_FILE: &str = "sdkCard.js";
 /// Outer bound. The harness stops itself at 10s; this only covers a bun that
 /// never gets that far.

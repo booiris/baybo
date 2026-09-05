@@ -1,4 +1,4 @@
-// Ported verbatim from `app/ios/web/src/mathDelimiters.test.ts`, alongside the
+// Ported verbatim from `app/mobile/web/src/mathDelimiters.test.ts`, alongside the
 // module it covers — the two clients must agree case for case. Kept a byte copy
 // past this header; `mathDelimiters.port.test.ts` enforces that.
 import { describe, expect, it } from "vitest";

@@ -5491,7 +5491,7 @@ export function applySyncReplace(
   // rows behind the page — an ordinal-less first send below the reply that
   // outran it — and delete outright every ordinal-less row outside the kept
   // sets (a clientMsgId-less echo append most of all). Mirrors the identical
-  // guard in app/ios/web's applySyncReplace.
+  // guard in app/mobile/web's applySyncReplace.
   if (page.length === 0 && prev.length > 0) return prev;
   const pageSendIds = new Set<string>();
   for (const row of page) {

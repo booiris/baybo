@@ -1,4 +1,4 @@
-// Ported verbatim from `app/ios/web/src/transcript/cursor.ts` (a separate pnpm
+// Ported verbatim from `app/mobile/web/src/transcript/cursor.ts` (a separate pnpm
 // workspace root, so the module can't simply be shared). Two clients run the
 // one sync loop; a cursor rule that holds on only one of them is the same
 // silent, permanent data loss it exists to prevent — `diff` the pair before

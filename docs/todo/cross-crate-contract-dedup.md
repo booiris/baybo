@@ -11,7 +11,7 @@ names, then establish one source of truth where doing so preserves the boundary.
 
 ## Survey snapshot
 
-The initial read-only Rust survey covered the main workspace, `app/ios/ffi`, and
+The initial read-only Rust survey covered the main workspace, `app/mobile/ffi`, and
 `remote-host/crates`. Test directories and obvious test crates were excluded;
 the numbers are mechanical signals, not defect counts.
 
@@ -34,7 +34,7 @@ platform provider token:
 
 - `remote-host/crates/protocol/src/push.rs::PushTarget` is the canonical JSON and
   signing-contract type (`Apns { token, environment } | Fcm { token }`).
-- `app/ios/ffi/src/api.rs::PushToken` is the local UniFFI-facing mirror. A local
+- `app/mobile/ffi/src/api.rs::PushToken` is the local UniFFI-facing mirror. A local
   type is required at the Swift ABI boundary.
 - `crates/gateway/src/api/admin/push.rs::PushTargetRequest` is the OpenAPI request
   mirror and converts into the protocol type.
@@ -52,8 +52,8 @@ exist independently on the iOS, gateway, and remote-host paths.
   does not leak into domain crates and HTTP v1 changes stay explicit. It contains
   53 public DTO types. Keep the DTOs and their `From` conversions; use schema and
   conversion tests to detect drift.
-- `app/ios/ffi/src/api.rs` contains 50 public UniFFI records/enums, and
-  `app/ios/ffi/src/gateway_api.rs` contains 31 private `Wire*` types. These bridge
+- `app/mobile/ffi/src/api.rs` contains 50 public UniFFI records/enums, and
+  `app/mobile/ffi/src/gateway_api.rs` contains 31 private `Wire*` types. These bridge
   JSON and Swift ABI constraints. Do not replace them with external Rust types
   merely to reduce the declaration count.
 - `remote-host` is a separate workspace by design. Sharing a small contract
