@@ -89,7 +89,11 @@ Beyond those recorded gaps, planned work — all *todo*:
 - **Desktop app** — *on a branch*. A Tauri 2 thin client wrapping the web UI
   (`feat/desktop-app`); predates the repo-wide rename and directory moves, so it is
   heavily bitrotted.
-- **Android support** — *todo*. An Android counterpart to the iOS companion app.
+- **Android support** — *design*. An Android counterpart to the iOS companion app:
+  lift the shared Rust core and transcript bundle out of `app/ios` into
+  `app/mobile/`, add a Kotlin/Compose shell at `app/android/`, and ship a
+  production FCM sender in remote-host. Spec:
+  [`todo/android-companion.md`](todo/android-companion.md).
 - **Voice on iOS** — *todo*. Voice input/output in the iOS app.
 
 ## Remote-host
