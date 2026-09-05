@@ -17,6 +17,9 @@ use serde_json::{Value, json};
 
 use crate::manager::{CardView, DeckManager};
 
+const MAX_FIRST_SNAPSHOT_KEYS: usize = 32;
+const MAX_FIRST_SNAPSHOT_KEY_CHARS: usize = 128;
+
 /// Build the deck tools with manifests, ready for a `ToolRegistry`. All
 /// `Trusted`; the authoring pair (`Create`/`Update`) carries `ReadFile`
 /// because it reads the agent's staged bundle from disk, while the
@@ -100,6 +103,95 @@ fn card_summary(card: &CardView) -> Value {
         "position": card.position,
         "spec_hash": card.spec_hash,
     })
+}
+
+/// Count the snapshot's leaf scalars, and how many of them carry anything.
+/// Zero, empty string, false and null are all "carries nothing" — the point is
+/// to answer "did this card actually read its data source" WITHOUT copying a
+/// user's numbers into the agent transcript. A card wired to the wrong
+/// workspace, or one whose service silently swallowed an upstream failure,
+/// returns a perfectly schema-valid snapshot of zeros, and every other field
+/// of this summary looks identical to a healthy one.
+fn count_leaves(value: &Value, leaves: &mut u64, populated: &mut u64) {
+    match value {
+        Value::Object(map) => {
+            for nested in map.values() {
+                count_leaves(nested, leaves, populated);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                count_leaves(nested, leaves, populated);
+            }
+        }
+        scalar => {
+            *leaves += 1;
+            let carries = match scalar {
+                Value::Null => false,
+                Value::Bool(b) => *b,
+                Value::Number(n) => n.as_f64().is_none_or(|f| f != 0.0),
+                Value::String(s) => !s.is_empty(),
+                _ => false,
+            };
+            if carries {
+                *populated += 1;
+            }
+        }
+    }
+}
+
+fn first_snapshot_summary(snapshot: &Value) -> Value {
+    let bytes = snapshot.to_string().len();
+    // `serde_json::Map` is a `BTreeMap` here (no `preserve_order` feature in
+    // the workspace), so `keys()` is already sorted and the cap takes the
+    // lexicographically first ones.
+    let keys = snapshot
+        .as_object()
+        .map(|object| {
+            object
+                .keys()
+                .take(MAX_FIRST_SNAPSHOT_KEYS)
+                .map(|key| truncate_chars(key, MAX_FIRST_SNAPSHOT_KEY_CHARS))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let keys_truncated = snapshot
+        .as_object()
+        .is_some_and(|object| object.len() > MAX_FIRST_SNAPSHOT_KEYS);
+    let json_type = match snapshot {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    let (mut leaves, mut populated) = (0, 0);
+    count_leaves(snapshot, &mut leaves, &mut populated);
+    json!({
+        "bytes": bytes,
+        "json_type": json_type,
+        "top_level_keys": keys,
+        "top_level_keys_truncated": keys_truncated,
+        "leaf_values": leaves,
+        "populated_values": populated,
+    })
+}
+
+fn mutation_output(card_field: &str, card: &CardView, snapshot: &Value) -> Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert(card_field.to_string(), card_summary(card));
+    fields.insert("first_snapshot".into(), first_snapshot_summary(snapshot));
+    Value::Object(fields)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn map_err(e: crate::error::DeckError) -> ToolError {
@@ -238,7 +330,7 @@ impl Tool for DeckCardCreateTool {
     }
 
     fn description(&self) -> String {
-        "Install a new deck card from a staged bundle directory (absolute path). Runs the dry-run gate and returns any failure (including the service's stderr) so you can fix and retry. The deck skill carries the bundle contract and templates.".to_string()
+        "Install a new deck card from a staged bundle directory (absolute path). Runs the dry-run gate, returns any failure (including the service's stderr) for repair, and returns a schema-checked first-snapshot summary on success. The deck skill carries the bundle contract and templates.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -267,11 +359,12 @@ impl Tool for DeckCardCreateTool {
         if !params.path.is_absolute() {
             return Err(ToolError::InvalidParams("path must be absolute".into()));
         }
-        let card = self.manager.install(&params.path).await.map_err(map_err)?;
-        Ok(ToolOutput::Json(json!({
-            "installed": card_summary(&card),
-            "note": "The card is live on the user's deck with its first snapshot."
-        })))
+        let result = self.manager.install(&params.path).await.map_err(map_err)?;
+        Ok(ToolOutput::Json(mutation_output(
+            "installed",
+            &result.card,
+            &result.first_snapshot,
+        )))
     }
 }
 
@@ -297,7 +390,7 @@ impl Tool for DeckCardUpdateTool {
     }
 
     fn description(&self) -> String {
-        "Replace an existing card's bundle (card_id + staged directory of the same four files). Runs the same dry-run gate and restarts the service; the user's title/size/layout are preserved. See the deck skill.".to_string()
+        "Replace an existing card's bundle (card_id + staged directory of the same four files). Runs the same dry-run gate, returns a schema-checked first-snapshot summary, and restarts the service; the user's title/size/layout are preserved. See the deck skill.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -327,13 +420,76 @@ impl Tool for DeckCardUpdateTool {
         if !params.path.is_absolute() {
             return Err(ToolError::InvalidParams("path must be absolute".into()));
         }
-        let card = self
+        let result = self
             .manager
             .update(&params.card_id, &params.path)
             .await
             .map_err(map_err)?;
-        Ok(ToolOutput::Json(json!({
-            "updated": card_summary(&card),
-        })))
+        Ok(ToolOutput::Json(mutation_output(
+            "updated",
+            &result.card,
+            &result.first_snapshot,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_snapshot_summary_reports_shape_without_value() {
+        let snapshot = json!({"count": 3, "status": "ok"});
+        let summary = first_snapshot_summary(&snapshot);
+
+        assert_eq!(summary["json_type"], "object");
+        assert_eq!(summary["top_level_keys"], json!(["count", "status"]));
+        assert!(summary.get("value").is_none());
+    }
+
+    /// The signal that separates a working card from one reading the wrong
+    /// data source: both pass the schema and have identical shape, so without
+    /// this the agent has nothing to tell them apart and reports success.
+    #[test]
+    fn first_snapshot_summary_counts_populated_leaves_without_showing_them() {
+        let healthy = first_snapshot_summary(&json!({
+            "today": {"calls": 49, "total": 5708754},
+            "days": [{"total": 0}, {"total": 5708754}],
+        }));
+        assert_eq!(healthy["leaf_values"], 4);
+        assert_eq!(healthy["populated_values"], 3);
+
+        let empty = first_snapshot_summary(&json!({
+            "today": {"calls": 0, "total": 0},
+            "days": [{"total": 0}, {"total": 0}],
+        }));
+        assert_eq!(empty["leaf_values"], 4);
+        assert_eq!(empty["populated_values"], 0);
+        assert_eq!(
+            empty["top_level_keys"], healthy["top_level_keys"],
+            "shape alone cannot tell these apart — that is why the count exists"
+        );
+
+        for summary in [&healthy, &empty] {
+            let text = summary.to_string();
+            assert!(!text.contains("5708754"), "must not copy values: {text}");
+            assert!(!text.contains("49"), "must not copy values: {text}");
+        }
+    }
+
+    #[test]
+    fn first_snapshot_summary_bounds_top_level_keys() {
+        let snapshot = Value::Object(
+            (0..=MAX_FIRST_SNAPSHOT_KEYS)
+                .map(|index| (format!("key-{index:02}"), json!(index)))
+                .collect(),
+        );
+        let summary = first_snapshot_summary(&snapshot);
+
+        assert_eq!(
+            summary["top_level_keys"].as_array().map(Vec::len),
+            Some(MAX_FIRST_SNAPSHOT_KEYS)
+        );
+        assert_eq!(summary["top_level_keys_truncated"], true);
     }
 }

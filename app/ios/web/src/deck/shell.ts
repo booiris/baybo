@@ -56,6 +56,10 @@ export class DeckShell {
   private grid: HTMLElement;
   private state: DeckState = EMPTY_STATE;
   private tiles = new Map<string, Tile>();
+  /// Cards we have already asked native to re-fetch a snapshot for.
+  /// One ask per card until a snapshot actually lands, so a card that
+  /// legitimately has none cannot drive a refetch loop.
+  private refetchAsked = new Set<string>();
   // Correlates a native call/pick result back to the card generation that
   // asked (the port pin lives in PendingRegistry).
   private pending = new PendingRegistry();
@@ -132,17 +136,38 @@ export class DeckShell {
     frame.setAttribute("sandbox", "allow-scripts");
     frame.srcdoc = buildSrcdoc(cardHtml, sdkSource, cardBaseCss);
     frame.addEventListener("load", () => {
+      // `tile.port` is recorded ONLY once the card has actually been handed
+      // `port2`. Setting it first — with the handover behind an optional
+      // chain — meant a frame that loaded without a reachable
+      // `contentWindow` left the shell holding a port the card never got:
+      // `pushSnapshot`'s port check then passed and every push, forever,
+      // went into a channel with no listener. The iframe had loaded, so it
+      // sat there rendering its static placeholders with no error face, and
+      // nothing could rebuild it (`applyBundle` returns early once
+      // `tile.frame` is set, and `reconcileTiles` only tears a frame down on
+      // a spec change). Handing the port over is the step that can fail, so
+      // it is the step that decides.
+      const win = frame.contentWindow;
       const channel = new MessageChannel();
-      tile.port = channel.port1;
-      channel.port1.onmessage = (e) => this.onCardMessage(cardId, e.data);
       // A card whose iframe finishes loading while it is already maximized
       // must init at "max", not its grid size.
       const initSize = cardId === this.maximizedCardId ? "max" : tile.card.size;
-      frame.contentWindow?.postMessage(
-        { type: "deck_init", size: initSize },
-        "*",
-        [channel.port2],
-      );
+      try {
+        if (!win) throw new Error("iframe loaded without a contentWindow");
+        win.postMessage({ type: "deck_init", size: initSize }, "*", [channel.port2]);
+      } catch (err) {
+        channel.port1.close();
+        channel.port2.close();
+        bridge.log("error", `[deck ${cardId}] card init failed: ${String(err)}`);
+        // Drop the frame and let the next reconcile re-request the bundle,
+        // rather than keeping a card that can never be spoken to.
+        frame.remove();
+        tile.frame = null;
+        tile.bundleRequested = false;
+        return;
+      }
+      tile.port = channel.port1;
+      channel.port1.onmessage = (e) => this.onCardMessage(cardId, e.data);
       this.pushSnapshot(cardId);
     });
     tile.frame = frame;
@@ -211,8 +236,23 @@ export class DeckShell {
 
   private pushSnapshot(cardId: string): void {
     const tile = this.tiles.get(cardId);
+    if (!tile || !tile.port) return;
     const cell = this.state.snaps[cardId];
-    if (!tile || !tile.port || cell === undefined) return;
+    if (cell === undefined) {
+      // Mounted, listening, and we have nothing to give it. That happens when
+      // the `DeckCardData` carrying the card's first snapshot was broadcast
+      // while this device had no connection — the gateway keeps no buffer and
+      // replays nothing — and native re-fetches only on bridge-ready, on
+      // `DeckChanged`, and on a layout rollback. Without this the card shows
+      // its placeholders until the app is relaunched. Asked once per card, so
+      // a genuinely snapshot-less card cannot spin.
+      if (!this.refetchAsked.has(cardId)) {
+        this.refetchAsked.add(cardId);
+        bridge.postRefetch();
+      }
+      return;
+    }
+    this.refetchAsked.delete(cardId);
     tile.port.postMessage({ type: "data", payload: parsePayload(cell) });
   }
 

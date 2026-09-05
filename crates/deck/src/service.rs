@@ -125,11 +125,19 @@ pub(crate) struct HostBlobPutFileRequest {
     pub content_type: Option<String>,
 }
 
-/// Where accepted emits go (the manager: size check → snapshot row →
-/// broadcast). Returning `Err` marks the emit invalid (a strike).
+/// Where accepted emits go (the manager: size check → response-schema
+/// check → snapshot row → broadcast). Returning `Err` marks the emit
+/// invalid; the caller then reports it through [`EmitSink::reject`].
 #[async_trait]
 pub(crate) trait EmitSink: Send + Sync + 'static {
     async fn emit(&self, card_id: &str, payload: Value) -> std::result::Result<(), String>;
+
+    /// Surface an emit the gateway refused. Without this a rejected tick is
+    /// invisible: the tile keeps painting its last accepted snapshot, which
+    /// reads as "nothing changed" rather than "this card is broken", and a
+    /// card whose payload drifts off its own declared schema can sit frozen
+    /// for days behind a single `warn!`.
+    async fn reject(&self, card_id: &str, reason: &str);
 }
 
 /// Strike recorder the supervisor consults for quarantine decisions.
@@ -593,6 +601,7 @@ impl EmitPolicy {
     async fn accept(&self, payload: Value) {
         if let Err(e) = self.sink.emit(&self.card_id, payload).await {
             tracing::warn!(card = %self.card_id, "deck: emit rejected: {e}");
+            self.sink.reject(&self.card_id, &e).await;
         }
     }
 

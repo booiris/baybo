@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use baybo_deck::{DeckEvents, DeckManager, DeckManagerConfig};
 use baybo_security::{EncryptionKey, SecretVault};
@@ -81,6 +81,7 @@ async fn harness() -> Harness {
         blob: blob.clone(),
         deck_root: root.path().join("deck"),
         scratch_root: root.path().join("scratch"),
+        baybo_config_path: root.path().join("config/baybo.json"),
     });
     Harness {
         manager,
@@ -128,19 +129,68 @@ fn stage_bundle(dir: &Path, service_js: &str) {
         json!({
             "openapi": "3.1.0",
             "paths": {
-                "/refresh": {"get": {"x-baybo-retryable": true}},
+                "/refresh": {"get": {
+                    "x-baybo-retryable": true,
+                    "responses": {
+                        "200": {"content": {"application/json": {"schema": {"type": "object"}}}},
+                        "default": {"content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["error"],
+                            "properties": {"error": {"type": "string"}},
+                            "additionalProperties": true
+                        }}}}
+                    }
+                }},
                 "/add": {"post": {"x-baybo-retryable": false, "parameters": [
                     {"name": "a", "required": true, "schema": {"type": "integer"}},
                     {"name": "b", "required": true, "schema": {"type": "integer"}}
-                ]}}
+                ], "responses": {"200": {"content": {"application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["sum"],
+                        "properties": {"sum": {"type": "integer"}},
+                        "additionalProperties": false
+                    }
+                }}}}}}
             }
         })
         .to_string(),
     )
     .unwrap();
     std::fs::write(dir.join("service.js"), service_js).unwrap();
-    std::fs::write(dir.join("card.html"), "<div id=x></div>").unwrap();
+    // A card that consumes its snapshot: the install gate now renders
+    // card.html and refuses one that displays nothing when handed data,
+    // so a fixture standing in for a valid bundle has to be a real card.
+    std::fs::write(dir.join("card.html"), MINIMAL_CARD).unwrap();
 }
+
+fn set_success_response_schema(dir: &Path, path: &str, method: &str, schema: Value) {
+    let openapi_path = dir.join("openapi.json");
+    let mut openapi: Value =
+        serde_json::from_slice(&std::fs::read(&openapi_path).unwrap()).unwrap();
+    openapi["paths"][path][method]["responses"]["200"]["content"]["application/json"]["schema"] =
+        schema;
+    std::fs::write(openapi_path, openapi.to_string()).unwrap();
+}
+
+/// Strip every op's `responses`, reproducing a bundle installed before
+/// result schemas were part of the contract.
+fn strip_response_schemas(dir: &Path) {
+    let openapi_path = dir.join("openapi.json");
+    let mut openapi: Value =
+        serde_json::from_slice(&std::fs::read(&openapi_path).unwrap()).unwrap();
+    for methods in openapi["paths"].as_object_mut().unwrap().values_mut() {
+        for item in methods.as_object_mut().unwrap().values_mut() {
+            item.as_object_mut().unwrap().remove("responses");
+        }
+    }
+    std::fs::write(openapi_path, openapi.to_string()).unwrap();
+}
+
+const MINIMAL_CARD: &str = r#"<div class="card"><div id="x">–</div></div>
+<script>deck.onData(function (s) {
+  document.getElementById("x").textContent = JSON.stringify(s);
+});</script>"#;
 
 const GOOD_SERVICE: &str = r#"
 export const ops = {
@@ -178,7 +228,7 @@ async fn blob_plane_stores_exec_files() {
     // Install runs the dry-run gate, which invokes the refresh op once — so the
     // blobs are produced under the REAL (pre-minted) card id, and the stored
     // first snapshot carries their refs.
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap().card;
     let view = h.manager.deck_view().await.unwrap();
     let snap: serde_json::Value = serde_json::from_str(&view.snapshots[0].payload).unwrap();
 
@@ -205,7 +255,7 @@ async fn purge_reclaims_the_cards_blobs() {
     };
     let staged = tempfile::tempdir().unwrap();
     stage_bundle(staged.path(), BLOB_SERVICE);
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap().card;
 
     // The dry-run gate produced two blobs stamped deck:<card_id>.
     let view = h.manager.deck_view().await.unwrap();
@@ -285,11 +335,16 @@ async fn failed_install_reclaims_the_gate_blobs() {
     h.manager.shutdown().await;
 }
 
-const TMUX_DIR_SERVICE: &str = r#"
+const EXEC_ENV_SERVICE: &str = r#"
 export const ops = {
   refresh: async (_p, ctx) => {
-    const r = await ctx.exec('printf %s "$BAYBO_DECK_TMUX_DIR"');
-    return { ok: true, tmuxDir: (r.stdout || "").trim() };
+    const tmux = await ctx.exec('printf %s "$BAYBO_DECK_TMUX_DIR"');
+    const config = await ctx.exec('printf %s "$BAYBO_CONFIG_PATH"');
+    return {
+      ok: true,
+      tmuxDir: (tmux.stdout || "").trim(),
+      configPath: (config.stdout || "").trim(),
+    };
   },
   add: async ({ a, b }) => ({ sum: a + b }),
 };
@@ -350,7 +405,9 @@ async fn install_call_lifecycle() {
     stage_bundle(staged.path(), GOOD_SERVICE);
 
     // Install runs the dry-run gate; the first snapshot is stored.
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let installed = h.manager.install(staged.path()).await.unwrap();
+    assert_eq!(installed.first_snapshot, json!({"ok": true, "n": 42}));
+    let card = installed.card;
     assert_eq!(card.title, "Quota");
     assert!(card.enabled);
     let view = h.manager.deck_view().await.unwrap();
@@ -420,25 +477,34 @@ async fn install_call_lifecycle() {
     h.manager.shutdown().await;
 }
 
-/// Every `ctx.exec` is handed `BAYBO_DECK_TMUX_DIR` =
+/// Every `ctx.exec` inherits the active Baybo config and is handed
+/// `BAYBO_DECK_TMUX_DIR` =
 /// `<deck_root>/tmux-socks/<card_id>` — the card's own private-socket dir a
 /// tmux-driving card pins its session onto (off the user's default
 /// `/tmp/tmux-<uid>/default` socket, out of `/tmp`, and reapable per card
 /// at purge).
 #[tokio::test]
-async fn exec_sees_injected_per_card_tmux_socket_dir() {
-    let Some(h) = harness_or_skip("exec_sees_injected_per_card_tmux_socket_dir").await else {
+async fn exec_sees_injected_baybo_config_and_per_card_tmux_socket_dir() {
+    let Some(h) =
+        harness_or_skip("exec_sees_injected_baybo_config_and_per_card_tmux_socket_dir").await
+    else {
         return;
     };
     let staged = tempfile::tempdir().unwrap();
-    stage_bundle(staged.path(), TMUX_DIR_SERVICE);
+    stage_bundle(staged.path(), EXEC_ENV_SERVICE);
 
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap().card;
     let expected = h
         .manager
         .deck_root()
         .join("tmux-socks")
         .join(&card.id)
+        .to_string_lossy()
+        .into_owned();
+    let expected_config = h
+        .root
+        .path()
+        .join("config/baybo.json")
         .to_string_lossy()
         .into_owned();
 
@@ -452,6 +518,11 @@ async fn exec_sees_injected_per_card_tmux_socket_dir() {
         got["tmuxDir"].as_str(),
         Some(expected.as_str()),
         "exec should see BAYBO_DECK_TMUX_DIR={expected}"
+    );
+    assert_eq!(
+        got["configPath"].as_str(),
+        Some(expected_config.as_str()),
+        "exec should inherit the active BAYBO_CONFIG_PATH"
     );
 
     // The dry-run gate's exec ran under its throwaway gate id — still a
@@ -477,7 +548,7 @@ async fn update_from_persisted_bundle_round_trips() {
     };
     let staged = tempfile::tempdir().unwrap();
     stage_bundle(staged.path(), GOOD_SERVICE);
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap().card;
 
     // Discovery: a fresh chat resolves title -> card_id via the list.
     let listed = h.manager.deck_view().await.unwrap();
@@ -507,7 +578,7 @@ export const ops = {
 "#,
     )
     .unwrap();
-    let updated = h.manager.update(&card.id, edit.path()).await.unwrap();
+    let updated = h.manager.update(&card.id, edit.path()).await.unwrap().card;
     assert_eq!(updated.id, card.id, "same card, in place");
     assert_ne!(updated.spec_hash, card.spec_hash, "new code, new hash");
 
@@ -542,7 +613,7 @@ async fn set_layout_clamps_size_to_the_cards_implemented_set() {
         .to_string(),
     )
     .unwrap();
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap().card;
     assert_eq!(card.size, DeckSize::Wide);
 
     // small is not implemented → clamped to the current valid size.
@@ -600,6 +671,67 @@ async fn dry_run_gate_returns_boot_failures_to_the_agent() {
     );
     let err = h.manager.install(staged.path()).await.unwrap_err();
     assert!(err.to_string().contains("null"), "{err}");
+
+    // A schema-valid graceful error is useful after install, but it is never
+    // a valid first snapshot: the card must prove its happy path at the gate.
+    stage_bundle(
+        staged.path(),
+        "export const ops = { refresh: async () => ({ error: 'shell failed' }) };",
+    );
+    let err = h.manager.install(staged.path()).await.unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("error result"), "{message}");
+    assert!(message.contains("shell failed"), "{message}");
+
+    // A normal-looking result still has to match the declared success schema.
+    stage_bundle(
+        staged.path(),
+        "export const ops = { refresh: async () => ({ count: 'three' }) };",
+    );
+    set_success_response_schema(
+        staged.path(),
+        "/refresh",
+        "get",
+        json!({
+            "type": "object",
+            "required": ["count"],
+            "properties": {"count": {"type": "integer"}},
+            "additionalProperties": false
+        }),
+    );
+    let err = h.manager.install(staged.path()).await.unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("response schema"), "{message}");
+    assert!(message.contains("count"), "{message}");
+    assert!(h.manager.deck_view().await.unwrap().cards.is_empty());
+
+    h.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn runtime_op_result_must_match_its_response_schema() {
+    let Some(h) = harness_or_skip("runtime_op_result_must_match_its_response_schema").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(
+        staged.path(),
+        r#"
+export const ops = {
+  refresh: async () => ({ ok: true }),
+  add: async () => ({ sum: "five" }),
+};
+"#,
+    );
+    let card = h.manager.install(staged.path()).await.unwrap().card;
+    let err = h
+        .manager
+        .call_op(&card.id, "add", json!({"a": 2, "b": 3}))
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("invalid service result"), "{message}");
+    assert!(message.contains("response schema"), "{message}");
 
     h.manager.shutdown().await;
 }
@@ -677,7 +809,7 @@ async fn dry_run_gate_reaps_its_tmux_socket_dir() {
     };
     let staged = tempfile::tempdir().unwrap();
     stage_bundle(staged.path(), TMUX_SEEDING_SERVICE);
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap().card;
     let tmux_root = h.manager.deck_root().join("tmux-socks");
     assert_eq!(
         gate_entries(&tmux_root),
@@ -695,6 +827,21 @@ async fn dry_run_gate_reaps_its_tmux_socket_dir() {
     let restaged = tempfile::tempdir().unwrap();
     stage_bundle(restaged.path(), TMUX_SEEDING_NULL_SERVICE);
     assert!(h.manager.update(&card.id, restaged.path()).await.is_err());
+    let files = h.manager.bundle_files(&card.id).await.unwrap();
+    assert_eq!(
+        files.service_js, TMUX_SEEDING_SERVICE,
+        "a failed gate must leave the installed bundle untouched"
+    );
+    let view = h.manager.deck_view().await.unwrap();
+    let snapshot = view
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.card_id == card.id)
+        .unwrap();
+    assert!(
+        snapshot.payload.contains("\"ok\":true"),
+        "a failed gate must leave the previous snapshot untouched"
+    );
     assert_eq!(
         gate_entries(&tmux_root),
         Vec::<String>::new(),
@@ -795,7 +942,7 @@ export function start(ctx) {
 }
 "#,
     );
-    let card = h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap().card;
     // The start() emit lands as seq 2 (seq 1 is the gate's stored first
     // snapshot). Give the resident service a moment.
     let mut latest = None;
@@ -816,4 +963,185 @@ export function start(ctx) {
     assert_eq!(card.last_seq, 1);
 
     h.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn off_schema_self_timer_emit_surfaces_as_an_error_face() {
+    let Some(h) = harness_or_skip("off_schema_self_timer_emit_surfaces_as_an_error_face").await
+    else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(
+        staged.path(),
+        r#"
+export const ops = { refresh: async () => ({ tick: 0 }) };
+export function start(ctx) {
+  setTimeout(() => ctx.emit({ tick: "bad" }), 100);
+}
+"#,
+    );
+    set_success_response_schema(
+        staged.path(),
+        "/refresh",
+        "get",
+        json!({
+            "type": "object",
+            "required": ["tick"],
+            "properties": {"tick": {"type": "integer"}},
+            "additionalProperties": false
+        }),
+    );
+    let card = h.manager.install(staged.path()).await.unwrap().card;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let view = h.manager.deck_view().await.unwrap();
+    let snapshot = view
+        .snapshots
+        .iter()
+        .find(|row| row.card_id == card.id)
+        .unwrap();
+    assert_ne!(
+        snapshot.payload, r#"{"tick":"bad"}"#,
+        "an off-schema emit must never become the card's data"
+    );
+    assert!(
+        snapshot.seq > 1,
+        "the rejection must land as a new snapshot; a silent drop leaves the \
+         tile painting its last good data with nobody the wiser"
+    );
+    let error = snapshot.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("tick"),
+        "the error face must name the offending field, got {snapshot:?}"
+    );
+
+    h.manager.shutdown().await;
+}
+
+/// The admission half of the pre-contract leniency: loading such a bundle
+/// works so an already-installed card keeps running, but staging one as NEW
+/// code is refused. Deliberately not behind `harness_or_skip` — it fails
+/// before any service boots, so it guards the contract on a runner without
+/// bun too.
+#[tokio::test]
+async fn install_refuses_a_bundle_that_declares_no_result_schema() {
+    let h = harness().await;
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), GOOD_SERVICE);
+    strip_response_schemas(staged.path());
+
+    let message = h
+        .manager
+        .install(staged.path())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("responses.200"), "{message}");
+    assert!(message.contains("refresh"), "{message}");
+    assert!(
+        h.manager.deck_view().await.unwrap().cards.is_empty(),
+        "a refused install must leave no row behind"
+    );
+}
+
+/// A bundle the gateway can no longer load is a fault in the code the operator
+/// upgraded into. Quarantining it there is a one-way latch — `boot` skips
+/// quarantined rows on every later boot, so the card never retries — which is
+/// how a contract change would take a working deck down permanently.
+#[tokio::test]
+async fn boot_does_not_quarantine_a_bundle_it_cannot_load() {
+    let Some(h) = harness_or_skip("boot_does_not_quarantine_a_bundle_it_cannot_load").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), GOOD_SERVICE);
+    let card = h.manager.install(staged.path()).await.unwrap().card;
+    h.manager.shutdown().await;
+
+    std::fs::write(
+        h.root
+            .path()
+            .join("deck")
+            .join(&card.id)
+            .join("openapi.json"),
+        "{ not json",
+    )
+    .unwrap();
+
+    h.manager.boot().await;
+
+    let view = h.manager.deck_view().await.unwrap();
+    let row = view.cards.iter().find(|c| c.id == card.id).unwrap();
+    assert!(
+        row.enabled,
+        "an unloadable bundle must not disable the card"
+    );
+    assert!(
+        row.quarantined_at.is_none(),
+        "an unloadable bundle is a host fault and must not quarantine"
+    );
+    let snapshot = view
+        .snapshots
+        .iter()
+        .find(|s| s.card_id == card.id)
+        .expect("the card keeps a snapshot row");
+    assert!(
+        snapshot.error.is_some(),
+        "the load failure must reach the error face, not just the log"
+    );
+}
+
+/// The frontend half of the gate. `card.html` used to be read, capped and
+/// hashed and nothing more, so a card that never displayed its data — the
+/// shape a weak model reaches for when it wires the markup but not
+/// `deck.onData`, or reads a field the service does not emit — installed
+/// cleanly and reached the user as a page of placeholders.
+#[tokio::test]
+async fn install_refuses_a_card_that_never_shows_its_data() {
+    let Some(h) = harness_or_skip("install_refuses_a_card_that_never_shows_its_data").await else {
+        return;
+    };
+
+    // Wires nothing: the markup exists, the snapshot arrives, nothing changes.
+    let inert = tempfile::tempdir().unwrap();
+    stage_bundle(inert.path(), GOOD_SERVICE);
+    std::fs::write(inert.path().join("card.html"), "<div id=x>–</div>").unwrap();
+    let message = h
+        .manager
+        .install(inert.path())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("did not render"), "{message}");
+    assert!(message.contains("deck.onData"), "{message}");
+
+    // Reads a field `service.js` never emits — the same symptom, a different
+    // cause, and the one the agent has no way to see without running it.
+    let wrong_field = tempfile::tempdir().unwrap();
+    stage_bundle(wrong_field.path(), GOOD_SERVICE);
+    std::fs::write(
+        wrong_field.path().join("card.html"),
+        r#"<div id="x">–</div>
+<script>deck.onData(function (s) {
+  document.getElementById("x").textContent = s.totals.today;
+});</script>"#,
+    )
+    .unwrap();
+    let message = h
+        .manager
+        .install(wrong_field.path())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("did not render"), "{message}");
+    assert!(
+        message.contains("totals"),
+        "the reason must name the bad read: {message}"
+    );
+
+    assert!(
+        h.manager.deck_view().await.unwrap().cards.is_empty(),
+        "neither refusal may leave a row behind"
+    );
 }

@@ -78,6 +78,55 @@ non-gating. And because the repo is public, workflow logs and uploaded artifacts
 are readable by anyone — `ios-sim` publishes an xcresult with UI-test
 screenshots on every run.
 
+## Releases
+
+**Never create a version tag by hand.** `.github/workflows/release.yml` owns tag
+creation, and it creates the tag **last** — after both build jobs are green — so
+a build that dies at minute 40 leaves nothing behind and a re-run just works.
+Tagging by hand inverts that and then blocks the release outright: the
+workflow's gate does `git ls-remote --exit-code --tags origin refs/tags/$tag`
+and hard-errors with *"already exists. Bump [workspace.package] version in
+Cargo.toml first"*, so a hand-pushed `vX.Y.Z` is precisely the thing that stops
+`vX.Y.Z` from ever being published.
+
+**The version lives in one place: `[workspace.package] version` in the root
+`Cargo.toml`.** The tag is derived from it (`v${version}`), never the reverse.
+Bumping it is a normal PR — and it moves 40 `Cargo.lock` entries with it, so
+refresh the lockfile in the same commit.
+
+Cutting a release, in order:
+
+```bash
+# 1. bump [workspace.package] version + refresh Cargo.lock, via a PR to master
+# 2. then, from the Actions tab (or):
+gh workflow run release.yml --ref master        # dry_run input available
+```
+
+The dispatch is **the owner's call**, like marking a PR ready — it is what
+publishes binaries under their name.
+
+**The trigger is dispatch-only on purpose.** `push: branches: [master]` was the
+obvious alternative and is worse: master takes ~10 pushes a day, so an
+unfiltered version gate would add ~3,600 no-op runs a year to buy one avoided
+button click per release. Dispatch also takes a ref for free, so a failed
+release re-cuts from the same commit without a new PR.
+
+**This workflow is the only thing that builds what a user actually receives.**
+Both Rust jobs in `ci.yml` set `BAYBO_SKIP_WEBUI=1`, so no CI job has ever
+compiled the shipped shape — dashboard baked in, sidecars bundled. Green CI is
+not evidence the release artifact builds; that is why the workflow carries its
+own asset assertions and smoke tests instead of trusting the build.
+
+**`install.sh` installs release ASSETS, not tags.** It fetches
+`releases/download/<tag>/baybo-<target>.tar.gz` plus `SHA256SUMS`, defaulting to
+`releases/latest`. A tag with no release attached is invisible to
+`curl -fsSL …/install.sh | sh` — that command will happily reinstall the
+previous version and report success.
+
+**Installing does not restart anything.** A running gateway keeps serving the
+old code until `baybo gateway restart` (under the service manager, restart the
+unit). The installer says so and then exits; nobody else will.
+
 ## Code Style
 
 - Prefer `crate::` for cross-module imports; `super::` is fine in tests and intra-module refs
