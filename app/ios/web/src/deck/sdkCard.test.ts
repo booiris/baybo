@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import sdkSource from "./sdkCard.js?raw";
 
 describe("card iframe size injection", () => {
@@ -21,8 +21,15 @@ describe("card iframe size injection", () => {
     expect(document.documentElement.dataset.deckSize).toBe("max");
 
     channel.port1.postMessage({ type: "size", size: "large" });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(document.documentElement.dataset.deckSize).toBe("large");
+    // Wait for the EFFECT, never for one timer tick. jsdom implements no
+    // MessagePort at all, so `MessageChannel` here is Node's `worker_threads`
+    // one and its delivery rides libuv — a task source with no ordering
+    // relationship to `setTimeout`. A single tick happens to lose that race
+    // often enough to matter on a loaded runner, and the assertion then reads
+    // the size the `deck_init` above applied.
+    await vi.waitFor(() => {
+      expect(document.documentElement.dataset.deckSize).toBe("large");
+    });
   });
 
 });
