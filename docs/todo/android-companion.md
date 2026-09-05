@@ -599,7 +599,14 @@ not the shell's.
   `gen-strings.mjs --check`; **`cargo clippy -p baybo-mobile-ffi --all-targets
   --all-features --locked --target aarch64-linux-android -- -D warnings`** —
   `--all-targets` so test files are gated too, scoped to the ffi crate so the
-  `cli`-featured bindgen binary is not cross-compiled). `cache-save-if: false`:
+  `cli`-featured bindgen binary is not cross-compiled). **`ios-sim` needs the
+  same for `aarch64-apple-ios-sim`, and for a reason found the hard way in P2:
+  the host gate cannot see a target-only warning.** Every `cfg`-gated arm is
+  dead code on the platforms it is not for, so the secure-store helpers that
+  the host compiles and uses were four `never used` warnings on the iOS target
+  — invisible to `ios-core`, which lints the host, and to `ios-sim`, which
+  builds the target without `-D warnings`. Two targets with `cfg` arms means
+  two clippy runs, or the rule only holds on the third. `cache-save-if: false`:
   `changes` runs only on `pull_request`, so neither `ios-core` nor
   `android-build` ever runs on master and there is no master-warmed cache to
   share; the 10 GB budget is already tight. Optional non-gating

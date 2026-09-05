@@ -48,26 +48,21 @@ if [[ "$SIM_ONLY" != 1 ]]; then
   TARGETS+=(aarch64-apple-ios)
 fi
 
-for t in "${TARGETS[@]}"; do
-  cargo build --manifest-path "$MOBILE_MANIFEST" -p baybo-mobile-ffi --target "$t" ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
-done
-
-# Bindings are extracted from a host cdylib build (same interface metadata).
-cargo build --manifest-path "$MOBILE_MANIFEST" -p baybo-mobile-ffi ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
-
 rm -rf Generated Externals/headers Externals/BayboCore.xcframework
 mkdir -p Generated Externals/headers
-# `--config` is not optional here, and its absence is silent: in library mode
-# uniffi-bindgen locates each crate's `uniffi.toml` by running `cargo metadata`
-# in the CURRENT directory, and this script's cwd is app/ios, which has no
-# Cargo.toml. Without it the swift `module_name = "BayboCore"` is never read and
-# the bindings come out as `Generated/baybo_ffi.swift` — a green build that
-# produces a file the Xcode target does not reference.
-cargo run -q --manifest-path "$MOBILE_MANIFEST" -p baybo-mobile-bindgen --bin uniffi-bindgen -- generate \
-  --library "$MOBILE_DIR/target/$PROFILE/libbaybo_ffi.dylib" \
-  --config "$MOBILE_DIR/ffi/uniffi.toml" \
-  --language swift \
-  --out-dir Generated
+
+# The cargo builds and the bindgen invocation are the same work the Android
+# script does; only the packaging below differs. `--config` in particular is not
+# optional and its absence is silent — the shared script explains why.
+TARGET_FLAGS=()
+for t in "${TARGETS[@]}"; do
+  TARGET_FLAGS+=(--target "$t")
+done
+"$MOBILE_DIR/scripts/build-core.sh" \
+  "${TARGET_FLAGS[@]}" \
+  --lang swift \
+  --out-dir "$(pwd)/Generated" \
+  ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 
 # xcframework layout: the modulemap must be named module.modulemap inside each
 # headers dir; uniffi emits <namespace>FFI.modulemap.

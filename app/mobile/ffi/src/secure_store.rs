@@ -9,13 +9,21 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[cfg(not(target_os = "ios"))]
 use sha2::{Digest, Sha256};
 
-use crate::api::{SecureStore, SecureStoreError};
+use crate::api::SecureStore;
+#[cfg(not(target_os = "ios"))]
+use crate::api::SecureStoreError;
 
 /// What a caller sees when the shell never installed a store. Reachable only by
 /// a misconfigured embedder: [`crate::BayboClient::new`] refuses to construct
 /// without one on the targets that need it.
+///
+/// Gated with the three helpers below because iOS reads none of them — its
+/// credentials go through the Security framework inside `keychain.rs`, so on
+/// that target the store is accepted and never consulted.
+#[cfg(not(target_os = "ios"))]
 pub(crate) const NOT_INSTALLED_MSG: &str = "secure store not installed";
 
 static STORE: OnceLock<Arc<dyn SecureStore>> = OnceLock::new();
@@ -32,6 +40,7 @@ pub(crate) fn installed() -> bool {
     STORE.get().is_some()
 }
 
+#[cfg(not(target_os = "ios"))]
 pub(crate) fn get() -> Result<&'static Arc<dyn SecureStore>, String> {
     STORE.get().ok_or_else(|| NOT_INSTALLED_MSG.to_string())
 }
@@ -49,12 +58,14 @@ pub(crate) fn get() -> Result<&'static Arc<dyn SecureStore>, String> {
 ///
 /// **Frozen once an install ships**: the output is the on-disk name, so a
 /// different hash or encoding orphans every stored item.
+#[cfg(not(target_os = "ios"))]
 pub(crate) fn storage_key(account: &str) -> String {
     hex::encode(Sha256::digest(account.as_bytes()))
 }
 
 /// Fold the foreign error into the module's internal `String` channel. Kept
 /// separate so the absence-vs-failure boundary has exactly one crossing point.
+#[cfg(not(target_os = "ios"))]
 pub(crate) fn to_msg(error: SecureStoreError) -> String {
     match error {
         SecureStoreError::Failed { reason } => reason,

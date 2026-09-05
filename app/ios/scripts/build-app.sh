@@ -28,10 +28,7 @@ for arg in "$@"; do
 done
 
 if [[ "$SKIP_WEB" != 1 ]]; then
-  (cd ../mobile/web && pnpm install --silent && pnpm build)
-  rm -rf App/Resources/transcript
-  mkdir -p App/Resources/transcript
-  cp -R ../mobile/web/dist/. App/Resources/transcript/
+  ../mobile/scripts/sync-web.sh App/Resources/transcript
 fi
 
 if [[ "$SKIP_RUST" != 1 ]]; then
