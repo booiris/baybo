@@ -6,6 +6,7 @@ import type {
   Span,
   Step,
   StepKind,
+  TurnInputKind,
   TurnTrace,
 } from '../../types/trace';
 import {
@@ -115,6 +116,14 @@ describe('turnInputText / turnOutputText — meta steps riding the turn', () => 
     return { role: 'user', content: [{ Text: text }], source: 'user' };
   }
 
+  function injectedMsg(text: string): ChatMessage {
+    return { role: 'user', content: [{ Text: text }], source: 'agent' };
+  }
+
+  function assistantMsg(text: string): ChatMessage {
+    return { role: 'assistant', content: [{ Text: text }], source: 'agent' };
+  }
+
   function inlineLlmSpan(id: string, messages: ChatMessage[], output: string): Span {
     return {
       id,
@@ -138,8 +147,8 @@ describe('turnInputText / turnOutputText — meta steps riding the turn', () => 
     };
   }
 
-  function trace(steps: ReplayStep[]): TurnTrace {
-    return { turn_id: 'turn-1', session_id: 'sess-1', turn_status_kind: 'completed', turn_input_kind: 'user_chat', steps };
+  function trace(steps: ReplayStep[], kind: TurnInputKind = 'user_chat'): TurnTrace {
+    return { turn_id: 'turn-1', session_id: 'sess-1', turn_status_kind: 'completed', turn_input_kind: kind, steps };
   }
 
   // The title pass is spawned before the turn's first iteration, so its step
@@ -186,6 +195,77 @@ describe('turnInputText / turnOutputText — meta steps riding the turn', () => 
     ]);
     expect(turnInputText(t, [])).toBe('summarize the transcript');
     expect(turnOutputText(t)).toBe('Earlier: CI triage.');
+  });
+
+  // An autonomous turn's only new row is agent-injected, so demanding
+  // `source === 'user'` walked past it into an earlier question the user had
+  // already been answered — and the turn that consumed three finished
+  // background reports sat in the outline titled with somebody else's prompt.
+  it('reads an autonomous turn own injected prompt, not the last human question', () => {
+    const steps = [
+      replayStep('s0', { kind: 'llm_iteration' }, [
+        inlineLlmSpan(
+          'a',
+          [
+            userMsg('how did claude run those cases?'),
+            assistantMsg('Looking into it.'),
+            injectedMsg('[3 background tasks finished since your last turn.]'),
+          ],
+          'Here is what the three reports found.',
+        ),
+      ]),
+    ];
+    expect(turnInputText(trace(steps, 'subagent_notification'), [])).toBe(
+      '[3 background tasks finished since your last turn.]',
+    );
+  });
+
+  // `expand_slash_command` persists the rendered skill body as an agent row
+  // right AFTER the user's `/card …` line and before the first LLM call, so a
+  // backwards walk that took any agent row would title the turn with the
+  // template and show the request nowhere. Measured on the live store, 16 of
+  // 1132 chat turns sit in exactly this shape today.
+  it('keeps a slash command own line, not the skill body expanded after it', () => {
+    const t = trace([
+      replayStep('s0', { kind: 'llm_iteration' }, [
+        inlineLlmSpan(
+          'a',
+          [
+            userMsg('/card track the codex quota'),
+            injectedMsg('# Authoring a deck card\n\nThe user invoked `/card` — the text after the command is their request.'),
+          ],
+          'Building it.',
+        ),
+      ]),
+    ]);
+    expect(turnInputText(t, [])).toBe('/card track the codex quota');
+  });
+
+  // Cron, subagent and issue-run turns carry their real prompt under their own
+  // source, none of which is admitted — so the honest answer stays "nothing
+  // recorded" rather than whichever agent-injected reminder sits last.
+  it('reports nothing for a kind whose prompt is not an admitted source', () => {
+    const t = trace(
+      [
+        replayStep('s0', { kind: 'llm_iteration' }, [
+          inlineLlmSpan('a', [injectedMsg('<system-reminder>skills available: …')], 'done'),
+        ]),
+      ],
+      'cron',
+    );
+    expect(turnInputText(t, [])).toBeNull();
+  });
+
+  // `'agent'` is the catch-all source and assistant rows carry it too, so the
+  // role check is load-bearing: without it a turn reports the model's own
+  // reply as the question it was asked.
+  it('never reports an assistant row as the turn input', () => {
+    const t = trace([
+      replayStep('s0', { kind: 'llm_iteration' }, [
+        inlineLlmSpan('a', [userMsg('what broke the build?'), assistantMsg('The lint job failed.')], 'ok'),
+      ]),
+    ]);
+    expect(turnInputText(t, [])).toBe('what broke the build?');
   });
 
   // A turn that died before recording an iteration leaves the title step alone

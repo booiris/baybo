@@ -472,8 +472,6 @@ function conversationSteps(trace: TurnTrace): ReplayStep[] {
   return loop.length > 0 ? loop : own;
 }
 
-// Derive the user-facing input that kicked off the turn: the last message in
-// the *first* conversation LLM call's input_messages whose `source` is 'user'.
 /**
  * The prompt a turn was given, read straight off its transcript.
  *
@@ -494,6 +492,7 @@ export function transcriptInputText(rows: SessionMessageRow[]): string | null {
 }
 
 export function turnInputText(trace: TurnTrace, messageLog: SessionMessageRow[]): string | null {
+  const injectedIsTheAsk = trace.turn_input_kind === 'subagent_notification';
   for (const rs of conversationSteps(trace)) {
     for (const span of rs.spans) {
       if (span.kind.kind === 'llm_call') {
@@ -503,16 +502,46 @@ export function turnInputText(trace: TurnTrace, messageLog: SessionMessageRow[])
           span.started_at,
         );
         for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].source === 'user') {
-            const text = contentText(messages[i].content);
-            return text.length > 0 ? text : null;
-          }
+          if (!startsATurn(messages[i], injectedIsTheAsk)) continue;
+          const text = contentText(messages[i].content);
+          return text.length > 0 ? text : null;
         }
         return null;
       }
     }
   }
   return null;
+}
+
+/**
+ * Whether a row is the one that opens this turn.
+ *
+ * A background notification is the one kind with no human line of its own: its
+ * only new row is the injected `<background_results>` prompt, `user`-role but
+ * `'agent'`-sourced. Demanding `'user'` skipped it and walked back to a
+ * question the user had already been answered turns ago, so the turn that
+ * consumed three finished subagent reports sat in the outline under an
+ * unrelated title — which is how a batch nobody reported looks exactly like a
+ * batch that never arrived.
+ *
+ * `allowInjected` is therefore gated on the turn kind, not granted to every
+ * turn, because `'agent'` is the catch-all source and elsewhere it marks
+ * framing that sits *beside* a real ask rather than standing in for one. A
+ * slash command is the case that proves it: `expand_slash_command` persists
+ * the rendered skill body as an `'agent'` row immediately AFTER the user's
+ * `/card …` line and before the first LLM call, so a backwards walk that
+ * accepted it would title the turn with the skill template and show the
+ * request nowhere. Cron, subagent and issue-run turns each have their own
+ * source for their real prompt (`cron`, `subagent_seed`, `issue_brief`); with
+ * none of them admitted, the honest answer stays "no user input recorded"
+ * rather than whichever boilerplate reminder happens to sit last.
+ *
+ * The role check is not redundant: assistant rows carry `'agent'` too, so
+ * matching on source alone would return the model's own reply as the ask.
+ */
+function startsATurn(message: ChatMessage, allowInjected: boolean): boolean {
+  if (message.role !== 'user') return false;
+  return message.source === 'user' || (allowInjected && message.source === 'agent');
 }
 
 // Derive the final output text of the turn: the most recent conversation LLM

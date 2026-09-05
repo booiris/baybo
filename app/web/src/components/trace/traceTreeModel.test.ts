@@ -255,7 +255,27 @@ describe('turnLabels', () => {
       'Turn #1',
       'Cron delivery #2',
       'Turn #3',
-      'Turn #4',
+      'Background results #4',
+    ]);
+  });
+
+  // A background notification IS a chat turn — its reply is an ordinary bubble
+  // — so the kind cannot be derived from `isChatTurn`. It still needs a name:
+  // its outline preview is agent-injected framing that reads the same on every
+  // one of them, and a run of identical rows is what hid a turn that consumed
+  // three finished reports behind an unrelated question's title.
+  it('names the kinds whose own input is not a question the user typed', () => {
+    const turns = [
+      mkKindTurn('a', 'user_chat'),
+      mkKindTurn('b', 'subagent_notification'),
+      mkKindTurn('c', 'compact'),
+      mkKindTurn('d', 'issue_run'),
+    ];
+    expect(turnLabels(turns).map((l) => l.kind)).toEqual([
+      null,
+      'Background results',
+      'Compaction',
+      null,
     ]);
   });
 
