@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import UIKit
 import WebKit
@@ -13,7 +14,25 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
     weak var store: DeckStore?
 
     private var ready = false
-    private var pending: [String] = []
+    /// Readable (as on `TranscriptBridge`) so a test can see what the bridge
+    /// decided to send without standing up a WKWebView.
+    private(set) var pending: [String] = []
+    /// Live language pushes, held here rather than on the screen for the same
+    /// reason `TranscriptBridge` does: the deck shell is PREWARMED at home and
+    /// outlives every view, while `DeckContent.body` — where this used to be the
+    /// only `.onChange` — has not necessarily ever run. Toggle the language
+    /// before opening the Deck tab for the first time and the shell kept the
+    /// language it was prewarmed with.
+    private var languageWatch: AnyCancellable?
+
+    override init() {
+        super.init()
+        // `dropFirst`: the current value already rides `DeckStore`'s init
+        // payload; only CHANGES are news here.
+        languageWatch = Lang.shared.$code.dropFirst().sink { [weak self] code in
+            self?.setLanguage(code)
+        }
+    }
 
     func userContentController(
         _ userContentController: WKUserContentController,

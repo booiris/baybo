@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import UIKit
 import WebKit
@@ -17,7 +18,11 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     private weak var store: (any TranscriptTarget)?			
     weak var webView: WKWebView?
     private(set) var ready = false
-    private var pending: [String] = []
+    /// Calls buffered until the page posts `ready`. Readable (like `ready`) so a
+    /// test can see what the bridge decided to send without standing up a
+    /// WKWebView — which is the only way to observe a push that has no other
+    /// effect on the Swift side.
+    private(set) var pending: [String] = []
     /// Which conversation the mounted page is rendering. Held here rather than
     /// read off `store` because `store` is weak: the LRU can evict and
     /// deallocate a session's store while its transcript is still the page in
@@ -68,11 +73,26 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     /// trusted parent document, never inside the untrusted iframe.
     @Published private(set) var htmlPreviewMaximized = false
 
+    /// Live language pushes. Held by the BRIDGE rather than wired per screen
+    /// because every transcript webview needs it and there are three of them —
+    /// the chat, the subagent child transcript, and a project run — each with
+    /// its own bridge, so a `.onChange` on one screen fixes one of them and
+    /// leaves the next author to remember. The other reason is that `init` is
+    /// the only other thing that carries the language, and `retarget` skips it
+    /// when the store is unchanged: re-entering the SAME conversation after a
+    /// toggle would re-render every native string and none of the web ones.
+    private var languageWatch: AnyCancellable?
+
     init(store: any TranscriptTarget) {
         self.store = store
         shownSessionId = store.sessionId
         super.init()
         store.attachBridge(self)
+        // `dropFirst`: `@Published` replays the current value on subscribe, and
+        // `deliverInit` already carries it — only CHANGES are news here.
+        languageWatch = Lang.shared.$code.dropFirst().sink { [weak self] code in
+            self?.setLanguage(code)
+        }
     }
 
     func retarget(to newStore: any TranscriptTarget) {
