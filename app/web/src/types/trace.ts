@@ -589,7 +589,9 @@ export function hydratePersistedInput(
 /**
  * Visible marker prepended when the `prefix_len` tripwire fails — a
  * `system`-role message so the trace viewer renders it distinctly and
- * genuine-prompt detection (`source === 'user'`) never picks it up.
+ * genuine-prompt detection never picks it up. The **role** is what guarantees
+ * that: this row's source is `'agent'`, which `startsATurn` does admit on a
+ * background-notification turn.
  */
 function reconstructionWarning(
   expected: number,
