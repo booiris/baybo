@@ -598,6 +598,7 @@ jobs:
         # it just moves the same wall.
         timeout-minutes: 35
         continue-on-error: true
+        id: ui_smokes
         run: |
           set -o pipefail
           xcodebuild test-without-building \
@@ -608,6 +609,27 @@ jobs:
             -parallel-testing-enabled NO \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
             -resultBundlePath build/TestResults/ui.xcresult | xcbeautify
+
+      # `continue-on-error` reports a FAILED step as `success`, and a step killed
+      # by its own timeout as `success` too — so the step's conclusion says
+      # nothing, and a smoke run cut off two thirds through is indistinguishable
+      # from one that passed. That is a skipped-check-reads-as-green in another
+      # costume, which this repo has been bitten by twice. Non-gating means "does
+      # not block the merge", not "is never reported".
+      - name: UI smoke outcome (reported, still non-gating)
+        if: always()
+        run: |
+          echo "### iOS UI smokes: ${{ steps.ui_smokes.outcome }} (non-gating)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.ui_smokes.outcome }}" != "success" ]; then
+            echo "Tests failed, or the 35-minute step cap cut the run short." >> "$GITHUB_STEP_SUMMARY"
+            echo "Details are in the ios-xcresult artifact." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -d build/TestResults/ui.xcresult ]; then
+            xcrun xcresulttool get test-results summary --path build/TestResults/ui.xcresult \
+              | tee -a "$GITHUB_STEP_SUMMARY" || true
+          else
+            echo "no xcresult was produced" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
