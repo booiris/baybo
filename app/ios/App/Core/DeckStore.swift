@@ -224,6 +224,12 @@ final class DeckStore: ObservableObject {
     /// shared mirror the next case just removed.
     private(set) var refreshTask: Task<Void, Never>?
     private(set) var layoutTask: Task<Void, Never>?
+    /// Held for the same reason those two are: so a test can AWAIT the work
+    /// instead of sleeping a guess past it. Both cover real I/O — an upload, and
+    /// a blob fetch plus a file write — which is exactly the shape a fixed
+    /// budget gets wrong first on a loaded machine.
+    private(set) var pickUploadTask: Task<Void, Never>?
+    private(set) var shareTask: Task<Void, Never>?
     private(set) var actionTask: Task<Void, Never>?
 
     private var mirrorURL: URL {
@@ -566,7 +572,7 @@ final class DeckStore: ObservableObject {
             settlePick(id: id, ok: false, refJSON: nil, error: "too large")
             return
         }
-        Task { [weak self] in
+        pickUploadTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let blobId = try await upload(self.client)
@@ -629,7 +635,7 @@ final class DeckStore: ObservableObject {
     /// real filename, so Save-to-Photos / Files / AirDrop keep the encoding.
     /// Silently no-ops if the bytes can't be fetched (offline miss).
     func requestShare(blobId: String, filename: String?, contentType: String?) {
-        Task { [weak self] in
+        shareTask = Task { [weak self] in
             guard let self else { return }
             var data = await self.client.blobReadCached(blobId: blobId)
             if data == nil {

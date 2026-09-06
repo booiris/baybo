@@ -154,8 +154,11 @@ final class SearchModelTests: XCTestCase {
 
         model.update(query: "slow")
         // Let the debounce elapse so "slow" is genuinely in flight, then supersede
-        // it before its answer can land.
-        await settle(0.5)
+        // it before its answer can land. ASSERT that it went: without this the
+        // whole case degrades silently into "a query that never fired was
+        // superseded", which passes for the wrong reason forever.
+        await settle(1.5)
+        XCTAssertEqual(client.searchCalls, ["slow"], "the first query never left")
         model.update(query: "fast")
         await settle()
 

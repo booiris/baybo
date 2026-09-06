@@ -203,6 +203,15 @@ impl ApprovalGate for TimelineApprovalGate {
             actor: actor.clone(),
             cancel,
         });
+        // Live cancellation uses `Drop`; shutdown uses the awaited close path.
+        // Armed before the announce, not after: the announce is two awaits
+        // (the issue read and the append), and a run torn down inside them
+        // left the prompt in `open` with nothing to close it.
+        let _guard = AbandonGuard {
+            manager: Arc::clone(&self.manager),
+            open: Arc::clone(&self.open),
+            call_id: call_id.clone(),
+        };
         self.manager
             .record_event(
                 &project,
@@ -216,13 +225,6 @@ impl ApprovalGate for TimelineApprovalGate {
                 },
             )
             .await;
-
-        // Live cancellation uses `Drop`; shutdown uses the awaited close path.
-        let _guard = AbandonGuard {
-            manager: Arc::clone(&self.manager),
-            open: Arc::clone(&self.open),
-            call_id: call_id.clone(),
-        };
 
         let outcome = tokio::select! {
             biased;
