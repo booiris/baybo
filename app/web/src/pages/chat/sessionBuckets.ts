@@ -1,6 +1,6 @@
 import type { SessionSummary } from './types';
 
-// How the sidebar splits the flat, newest-first session list into the blocks
+// How the sidebar splits the flat, recency-ordered session list into the blocks
 // it renders: the lifted Pinned block, the derived cron groups, the per-folder
 // buckets, and the trailing Uncategorized bucket.
 //
@@ -163,7 +163,10 @@ export function bucketSessions(
 
   // Folders carry a user-chosen `position`; a cron group has none, so it sorts
   // by its newest visible member — when a job fires, its group floats to the
-  // top of the cron block. Ties fall back to the job id so the order is stable.
+  // top of the cron block, and so does any later activity on one of its fires,
+  // a user reply included (the server stamps `last_active` and pulses the new
+  // value back; the client-side move-to-front only reorders members *within*
+  // the group). Ties fall back to the job id so the order is stable.
   //
   // A PINNED group sorts ahead of all of them. That is the only thing the pin
   // buys: a job that fires often is already at the top of this block by recency

@@ -1477,7 +1477,20 @@ export function ChatPage() {
           let known = true;
           setSessions((prev) => {
             known = prev.some((s) => s.session_id === frame.session_id);
-            return applySessionActivity(prev, frame.session_id, frame.at, isForeground);
+            const merged = applySessionActivity(
+              prev,
+              frame.session_id,
+              frame.at,
+              isForeground,
+            );
+            // A user message that landed elsewhere (another tab, the phone)
+            // raises its conversation exactly like a send from here; an
+            // assistant pulse must not reshuffle the list under the user.
+            // This is the *only* such signal for a session this tab isn't
+            // subscribed to — the user echo reaches subscribers alone.
+            return frame.source === 'user'
+              ? bumpSessionToFront(merged, frame.session_id)
+              : merged;
           });
           if (!known) {
             // A conversation this tab has never seen just spoke — a recurring
@@ -2223,7 +2236,7 @@ export function ChatPage() {
         };
       });
       setSessions((prev) =>
-        applySessionUserText(prev, targetSessionId, trimmed || '[attachment]'),
+        applySessionUserMessage(prev, targetSessionId, trimmed || '[attachment]'),
       );
       // A user send starts (or extends) a turn in this session — arm auto-fire
       // for its completion and protect its bucket from LRU eviction.
@@ -2306,7 +2319,7 @@ export function ChatPage() {
       });
       const lastText = prepared[prepared.length - 1].text;
       setSessions((prev) =>
-        applySessionUserText(prev, targetSessionId, lastText || '[attachment]'),
+        applySessionUserMessage(prev, targetSessionId, lastText || '[attachment]'),
       );
       turnTokenRef.current.set(
         targetSessionId,
@@ -2399,7 +2412,7 @@ export function ChatPage() {
           },
         };
       });
-      setSessions((prev) => applySessionUserText(prev, sessionId, trimmed));
+      setSessions((prev) => applySessionUserMessage(prev, sessionId, trimmed));
       pinnedToBottomRef.current = true;
       setHasNewBelow(false);
       wsRef.current.sendMessage({
@@ -3833,7 +3846,7 @@ export function routeInboundFrame(
             ? frame.content
             : ((frame.attachments?.length ?? 0) > 0 ? '[attachment]' : '');
           if (preview) {
-            setSessions((prev) => applySessionUserText(prev, sid, preview));
+            setSessions((prev) => applySessionUserMessage(prev, sid, preview));
           }
         }
         setViews((prev) => {
@@ -3909,17 +3922,18 @@ export function routeInboundFrame(
       // updater because state setters are batched — checking outside
       // can't observe whether the updater found a match.
       const hasAttachments = (frame.attachments?.length ?? 0) > 0;
-      // Sidebar preview tracks the freshest user-authored text, so
-      // every live user echo (whether this tab sent it or a sibling
-      // did) feeds the sidebar — including the attachment-only case,
-      // where the placeholder string mirrors the bubble's "[attachment]"
-      // fallback so the row doesn't go blank on a media-only send.
+      // The sidebar row tracks the freshest user-authored text and rises
+      // to the front for it, so every live user echo (whether this tab
+      // sent it or a sibling did) feeds the sidebar — including the
+      // attachment-only case, where the placeholder string mirrors the
+      // bubble's "[attachment]" fallback so the row doesn't go blank on
+      // a media-only send.
       if (role === 'user') {
         const preview = frame.content.trim().length > 0
           ? frame.content
           : (hasAttachments ? '[attachment]' : '');
         if (preview) {
-          setSessions((prev) => applySessionUserText(prev, sid, preview));
+          setSessions((prev) => applySessionUserMessage(prev, sid, preview));
         }
       }
       if (role === 'user' && frame.platform_msg_id) {
@@ -5787,10 +5801,11 @@ function formatHttpError(err: unknown): string {
  *  * Otherwise present fields are merged in place — absent fields
  *    keep their previous values.
  *
- *  Row order is never touched: fields merge in place, so a live update
- *  (a session bumping its activity) cannot reposition the row. This is
- *  deliberate — concurrent replies must not reshuffle the list under the
- *  user. A genuinely new session is prepended (newest first). */
+ *  Row order is never touched here: fields merge in place, so a title,
+ *  a pin or an archive cannot reposition the row, and neither can the
+ *  reply traffic that rides on `last_active`. A genuinely new session is
+ *  prepended (newest first). The one thing that *does* move an existing
+ *  row is a user-authored message — see `bumpSessionToFront`. */
 export function applySessionPatch(
   prev: SessionSummary[],
   sessionId: string,
@@ -5869,10 +5884,12 @@ export function applySessionPatch(
  *  current without a list refetch) and bumps `unread` iff the activity
  *  isn't on the currently-foregrounded session. The row is updated in
  *  place — never repositioned — so concurrent replies don't reshuffle
- *  the list. Activity for sessions we don't know about (raced ahead of
- *  Created, or hidden in this tab) is dropped on the floor — Created
- *  arrives separately, and rehydration after a hide isn't worth
- *  optimising. */
+ *  the list; the caller repositions on `source: 'user'`, and has to do
+ *  it from outside because this returns `prev` untouched whenever
+ *  neither field moved. Activity for sessions we don't know about
+ *  (raced ahead of Created, or hidden in this tab) is dropped on the
+ *  floor — Created arrives separately, and rehydration after a hide
+ *  isn't worth optimising. */
 function applySessionActivity(
   prev: SessionSummary[],
   sessionId: string,
@@ -5893,6 +5910,28 @@ function applySessionActivity(
   return next;
 }
 
+/** Move `sessionId`'s row to the front of the list, fields untouched.
+ *
+ *  Position is the only thing this changes — notably not `last_active`.
+ *  The gateway stamps that itself on a user message and pulses it back as
+ *  a `SessionActivity`, so a locally invented timestamp would fight a
+ *  server value already on its way, and a browser clock running fast
+ *  would freeze the row's age string at `just now` for good.
+ *
+ *  Returns `prev` when there is nothing to move, so React bails out of
+ *  the re-render. */
+export function bumpSessionToFront(
+  prev: SessionSummary[],
+  sessionId: string,
+): SessionSummary[] {
+  const idx = prev.findIndex((s) => s.session_id === sessionId);
+  if (idx <= 0) return prev; // -1 absent, 0 already first
+  const next = prev.slice();
+  const [row] = next.splice(idx, 1);
+  next.unshift(row);
+  return next;
+}
+
 /** Soft cap on the sidebar preview length. Mirrors `PREVIEW_MAX_CHARS`
  *  on the gateway side — server-supplied previews already arrive
  *  pre-truncated, but local updates (this tab's send, sibling tab's
@@ -5900,13 +5939,21 @@ function applySessionActivity(
  *  regardless of which path filled it. */
 const PREVIEW_MAX_CHARS = 120;
 
-/** Replace `session_id`'s preview text with the freshest user turn.
+/** Fold a user-authored message into the sidebar list: replace the row's
+ *  preview text with the freshest user turn, and move the row to the front.
+ *
+ *  Both halves live here rather than at the five call sites (this tab's
+ *  send, the batched send, `/stop`, and the two inbound-echo arms) so a
+ *  sixth caller can't pick up one and forget the other. The move is
+ *  deliberately *not* conditional on the preview having changed — sending
+ *  the same string twice still raises the conversation.
+ *
  *  Collapses whitespace + truncates to mirror the server's
  *  `truncate_preview`. Returns `prev` unchanged when the target row
  *  isn't in the list (sidebar dropped it via hide, or the activity
  *  raced ahead of Created) — Created arrives separately and seeds the
  *  row, and the next list refresh will reseed the preview. */
-function applySessionUserText(
+export function applySessionUserMessage(
   prev: SessionSummary[],
   sessionId: string,
   text: string,
@@ -5919,9 +5966,12 @@ function applySessionUserText(
     collapsed.length > PREVIEW_MAX_CHARS
       ? `${collapsed.slice(0, PREVIEW_MAX_CHARS)}…`
       : collapsed;
-  if (prev[idx].last_user_text === truncated) return prev;
+  if (prev[idx].last_user_text === truncated) {
+    return bumpSessionToFront(prev, sessionId);
+  }
   const next = prev.slice();
-  next[idx] = { ...prev[idx], last_user_text: truncated };
+  next.splice(idx, 1);
+  next.unshift({ ...prev[idx], last_user_text: truncated });
   return next;
 }
 
