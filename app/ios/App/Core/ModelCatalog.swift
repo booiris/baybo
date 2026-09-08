@@ -180,11 +180,32 @@ final class ModelCatalog: ObservableObject {
         return result
     }
 
+    /// Replace the models an entry serves.
+    ///
+    /// The set is sent whole rather than as an add or a remove: model ids carry
+    /// slashes, and a whole-set write is idempotent, so a replayed leg
+    /// converges instead of double-adding. The gateway carries each surviving
+    /// id's overrides across, so sending plain ids never destroys them.
+    @discardableResult
+    func setModels(_ models: [String], of entry: String) async throws -> LlmMutateResult {
+        let epoch = epoch
+        let result = try await client.llmSetModelList(name: entry, models: models)
+        try await reload(expecting: epoch)
+        return result
+    }
+
     /// One real, billed completion against the provider — the only pre-flight
     /// in the system that touches the vendor. Reads nothing back: the probe
     /// changes no config.
     func test(entry: String) async throws -> LlmTestResult {
         try await client.llmTestModel(name: entry)
+    }
+
+    /// The provider's live catalog — what "add a model" picks from. Not cached
+    /// and not mirrored: it is a read of the vendor's current offering, and a
+    /// stale one would offer models the account may no longer have.
+    func catalog(of entry: String) async throws -> [LlmCatalogModel] {
+        try await client.llmCatalog(name: entry)
     }
 
     // MARK: - Mirror (`models.json` — a pure cache, never a source of truth)

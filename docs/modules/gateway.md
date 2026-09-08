@@ -693,6 +693,8 @@ DELETE /v1/agents/:agent_id
 GET    /v1/llm                          currently active provider/model
 GET    /v1/llm/models                   configured LLM entries + effective settings
 PUT    /v1/llm/models/:name             edit an entry (hot-reloaded in-process)
+PUT    /v1/llm/models/:name/model-list  replace the models it serves (whole set)
+GET    /v1/llm/models/:name/catalog     the provider's LIVE model catalog
 POST   /v1/llm/models/:name/test        probe the entry's provider
 PUT    /v1/llm/default                  set default-llm (hot-reloaded)
 GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregates

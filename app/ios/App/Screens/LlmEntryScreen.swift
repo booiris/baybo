@@ -42,10 +42,14 @@ struct LlmEntryScreen: View {
     /// when the key level OPENS rather than on appear: it costs a keychain read,
     /// and it is the only level that cares.
     @State private var cleartext = false
+    @State private var catalogItems: [LlmCatalogModel] = []
+    @State private var loadingCatalog = false
+    @State private var catalogFailure: String?
 
     private enum Level: Equatable {
         case fields
         case model
+        case addModel
         case effort
         case vision
         case baseUrl
@@ -75,6 +79,7 @@ struct LlmEntryScreen: View {
                         switch level {
                         case .fields: fieldsBody(entry)
                         case .model: modelLevel(entry)
+                        case .addModel: addModelLevel(entry)
                         case .effort: effortLevel(entry)
                         case .vision: visionLevel(entry)
                         case .baseUrl: baseUrlLevel(entry)
@@ -122,9 +127,14 @@ struct LlmEntryScreen: View {
                         // the fields level pops the screen. One affordance, two
                         // depths — the same contract the model panel's back row
                         // has.
-                        if level == .fields {
-                            dismiss()
-                        } else {
+                        switch level {
+                        case .fields: dismiss()
+                        // The catalog was opened FROM the model list, so back
+                        // means back one step, not all the way out.
+                        case .addModel:
+                            Haptics.tap()
+                            level = .model
+                        default:
                             Haptics.tap()
                             level = .fields
                         }
@@ -346,12 +356,67 @@ struct LlmEntryScreen: View {
                     // so the warning sits on the row that would cause it.
                     note: entry.liteModel == entry.model && model != entry.model
                         ? lang.t("llm.liteModelWarning") : nil,
+                    // The default cannot be dropped: the entry prepends it to
+                    // its own list, so removing it would not remove it.
+                    onRemove: model == entry.model ? nil : { removeModel(model, from: entry) },
                     identifier: "llm-option-\(model)"
                 ) {
                     commit(.model(model: model), field: lang.t("llm.model"))
                 }
             }
+            fieldRow(
+                label: lang.t("llm.addModel"), value: "", pinned: false,
+                identifier: "llm-add-model", a11yValue: ""
+            ) { openCatalog(entry) }
         }
+    }
+
+    /// The provider's live catalog. A PICK, never free text — nothing
+    /// gateway-side checks a model id against the vendor, so a typo would
+    /// build, list, validate, and only fail at the first real completion.
+    @ViewBuilder private func addModelLevel(_ entry: LlmModelInfo) -> some View {
+        levelTitle(lang.t("llm.addModel"))
+        if loadingCatalog {
+            HStack(spacing: 10) {
+                ProgressView().progressViewStyle(.circular).tint(Theme.inkSoft).scaleEffect(0.8)
+                Text(verbatim: lang.t("llm.catalogLoading"))
+                    .font(Theme.mono(12))
+                    .foregroundStyle(Theme.inkSoft)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
+        } else if let failure = catalogFailure {
+            // The provider's own words. This is one of the few places a
+            // gateway-side failure reaches the phone as prose, and it is
+            // usually the real diagnosis: a bad key, a bad base URL.
+            warning(failure)
+                .accessibilityIdentifier("llm-catalog-failure")
+        } else if catalogItems.isEmpty {
+            explain(lang.t("llm.catalogEmpty"))
+        } else {
+            explain(lang.t("llm.addModelExplain"))
+            VStack(spacing: 0) {
+                ForEach(catalogItems, id: \.id) { item in
+                    optionRow(
+                        title: item.id,
+                        selected: item.configured,
+                        note: catalogNote(item),
+                        identifier: "llm-catalog-\(item.id)"
+                    ) {
+                        addModel(item.id, to: entry)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The display name and window, when the provider supplies them — enough to
+    /// tell two similar ids apart without turning the row into a table.
+    private func catalogNote(_ item: LlmCatalogModel) -> String? {
+        var parts: [String] = []
+        if let name = item.displayName, name != item.id { parts.append(name) }
+        if let window = item.contextWindow { parts.append(numberText(window)) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     @ViewBuilder private func effortLevel(_ entry: LlmModelInfo) -> some View {
@@ -577,8 +642,14 @@ struct LlmEntryScreen: View {
                         ? lang.t("llm.a11yPinned", value) : lang.t("llm.a11yInherited", value))))
     }
 
+    /// `onRemove` puts a second, independent action on the row. It is a button
+    /// beside the label rather than a swipe: these rows are in a plain VStack,
+    /// not a `List`, so there is no `.swipeActions` to hang it on — and a
+    /// destructive gesture with no visible affordance is the wrong default for
+    /// config anyway.
     private func optionRow(
-        title: String, selected: Bool, note: String? = nil, identifier: String,
+        title: String, selected: Bool, note: String? = nil,
+        onRemove: (() -> Void)? = nil, identifier: String,
         action: @escaping () -> Void
     ) -> some View {
         Button {
@@ -597,6 +668,22 @@ struct LlmEntryScreen: View {
                         .foregroundStyle(Theme.ink)
                         .lineLimit(1)
                     Spacer(minLength: 6)
+                    if let onRemove {
+                        Button {
+                            guard !saving else { return }
+                            Haptics.tap()
+                            onRemove()
+                        } label: {
+                            Image(systemName: "minus.circle")
+                                .font(.system(size: 15, weight: .regular))
+                                .foregroundStyle(Theme.inkSoft)
+                                .frame(width: 34, height: 34)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("\(identifier)-remove")
+                        .accessibilityLabel(Text(verbatim: lang.t("llm.removeModel", title)))
+                    }
                     if selected {
                         Image(systemName: "checkmark")
                             .font(.system(size: 12, weight: .semibold))
@@ -792,6 +879,59 @@ struct LlmEntryScreen: View {
             } catch {
                 outcome = .failed(lang.t("llm.defaultFailed"))
                 NSLog("baybo: llm set default: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    /// Open the add-a-model level and fetch the provider's catalog for it. The
+    /// fetch is a real call out to the vendor, so the level renders its own
+    /// loading and failure states rather than blocking the transition.
+    private func openCatalog(_ entry: LlmModelInfo) {
+        catalogItems = []
+        catalogFailure = nil
+        loadingCatalog = true
+        level = .addModel
+        Task {
+            defer { loadingCatalog = false }
+            do {
+                catalogItems = try await catalog.catalog(of: entryName)
+            } catch {
+                catalogFailure = bayboErrorText(error)
+            }
+        }
+    }
+
+    /// Both list edits send the whole SET, because that is the endpoint's shape:
+    /// idempotent, and the gateway carries each surviving id's overrides across
+    /// so plain ids never destroy them.
+    private func addModel(_ model: String, to entry: LlmModelInfo) {
+        let models = catalog.models(of: entry)
+        guard !models.contains(model) else {
+            level = .model
+            return
+        }
+        writeModelList(models + [model], field: lang.t("llm.modelList"), returnTo: .model)
+    }
+
+    private func removeModel(_ model: String, from entry: LlmModelInfo) {
+        let models = catalog.models(of: entry).filter { $0 != model }
+        writeModelList(models, field: lang.t("llm.modelList"), returnTo: .model)
+    }
+
+    private func writeModelList(_ models: [String], field: String, returnTo: Level) {
+        saving = true
+        outcome = nil
+        Task {
+            defer { saving = false }
+            do {
+                let result = try await catalog.setModels(models, of: entryName)
+                staged = staged || result.requiresRestart
+                outcome = result.requiresRestart ? .staged(field) : .saved(field)
+                probe = nil
+                level = returnTo
+            } catch {
+                outcome = .failed(lang.t("llm.saveFailed", field))
+                NSLog("baybo: llm model list: %@", bayboErrorText(error))
             }
         }
     }

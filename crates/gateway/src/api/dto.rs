@@ -369,6 +369,48 @@ pub struct SetDefaultLlmRequest {
     pub name: String,
 }
 
+/// `PUT /v1/llm/models/{name}/model-list` body — the models this entry
+/// serves, as a SET, in picker order.
+///
+/// Replace rather than add/remove, for two reasons. Model ids routinely
+/// contain a slash (`meta-llama/Llama-3-70B`), which makes them unsafe as a
+/// path segment; and a whole-set PUT is idempotent, so a client whose request
+/// is replayed converges instead of double-adding.
+///
+/// **Replacing the list never destroys an override.** The handler keeps each
+/// surviving id's existing `LlmModelSpec` and only mints a bare one for an id
+/// that was not there — so a caller may send plain ids without knowing which
+/// overrides exist. Dropping an id DOES drop its overrides, which is the point
+/// of dropping it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetLlmModelListRequest {
+    pub models: Vec<String>,
+}
+
+/// One model as the provider's own catalog reports it
+/// (`GET /v1/llm/models/{name}/catalog`). A LIVE read over the provider's API,
+/// not config — so it can be slow, and it can fail for an entry whose
+/// credentials are not yet valid.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmCatalogModel {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    /// Whether this id is already in the entry's `model_list`, so a picker can
+    /// tell what it would be adding from what is already served.
+    pub configured: bool,
+}
+
+/// `GET /v1/llm/models/{name}/catalog` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmCatalogResponse {
+    pub items: Vec<LlmCatalogModel>,
+}
+
 /// `POST /v1/llm/models/{name}/test` response. Carries the latency and
 /// token usage from a one-shot `ping` probe.
 #[derive(Debug, Serialize, ToSchema)]

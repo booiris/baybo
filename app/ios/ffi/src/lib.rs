@@ -35,12 +35,12 @@ pub use api::{
     ChatSubagentList, ChatSubagentStatus, ChatSubagentSummary, ClientConfig, CronJobStatus,
     CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
     FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput,
-    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmEntryEdit,
-    LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, MessageLookup, NewIssue,
-    NewProject, PairAbortListener, PairChallenge, PairTarget, PairedSummary, ProjectActivity,
-    ProjectAttention, ProjectInfo, ProjectSettings, ProjectSink, PushToken, RunStatus, RunTrigger,
-    SessionListSink, SessionModelPin, StringPatch, SubIssueProgress, SubagentCursor,
-    TeamMemberInfo,
+    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmCatalogModel,
+    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, MessageLookup,
+    NewIssue, NewProject, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
+    ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings, ProjectSink, PushToken,
+    RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch, SubIssueProgress,
+    SubagentCursor, TeamMemberInfo,
 };
 use binding::{ActiveLeg, active_leg};
 use gateway_client::ActiveGatewayClient;
@@ -1374,6 +1374,45 @@ impl BayboClient {
             {
                 Ok(result) => result,
                 Err(_) => Err("the model did not answer in time".to_string()),
+            }
+        })
+        .await
+    }
+
+    /// Replace the models an LLM entry serves — the entry's own candidate set,
+    /// which is what the model pickers offer and what a session pin may name.
+    ///
+    /// A whole-set write, and idempotent: see [`LlmEntryEdit`] for why this
+    /// surface avoids read-modify-write, and note the gateway carries each
+    /// surviving id's overrides across, so plain ids are safe to send.
+    pub async fn llm_set_model_list(
+        self: Arc<Self>,
+        name: String,
+        models: Vec<String>,
+    ) -> Result<LlmMutateResult, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_llm_model_list(&client, name, models).await
+        })
+        .await
+    }
+
+    /// The provider's LIVE model catalog for one entry — what "add a model"
+    /// picks from, so an id is chosen rather than typed.
+    ///
+    /// Capped by [`LLM_PROBE_TIMEOUT`] for the same reason the probe is: this
+    /// calls out to the vendor, and neither leg bounds a slow provider.
+    pub async fn llm_catalog(
+        self: Arc<Self>,
+        name: String,
+    ) -> Result<Vec<LlmCatalogModel>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            match tokio::time::timeout(LLM_PROBE_TIMEOUT, gateway_api::llm_catalog(&client, name))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("the provider did not answer in time".to_string()),
             }
         })
         .await

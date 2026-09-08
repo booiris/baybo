@@ -12,10 +12,13 @@ device, and — for a session with no pin — from its next turn.
 
 ## Scope, and what is deliberately absent
 
-There is **no create and no delete**: `UpdateLlmModelRequest` is the entire
-write surface, and the gateway exposes no POST or DELETE for an `llm` entry at
-all. Adding an entry is a config-file edit or a CLI job. The editor is for
-entries that already exist, and the screen says nothing that implies otherwise.
+There is **no create and no delete for an ENTRY**: the gateway exposes no POST
+or DELETE for one. Adding an entry is `baybo llm add` or a config-file edit. The
+editor is for entries that already exist, and the screen says nothing that
+implies otherwise.
+
+The models an entry SERVES are a different question, and that one is managed
+here — see [The model list](#the-model-list).
 
 Two more absences, each load-bearing:
 
@@ -35,6 +38,11 @@ Two more absences, each load-bearing:
 `lite_model` and pricing are read-only over HTTP and are not rendered — a row
 you cannot act on is noise. `lite_model` earns its keep only as the Model
 picker's warning.
+
+Per-model overrides for a NON-default model are still config-file only:
+`PUT /llm/models/{name}` addresses the default model's spec and nothing else.
+Adding a model here makes it servable and pinnable; tuning its context window or
+vision flag means making it the default first, or editing the file.
 
 ## One row, one JSON key, one PUT
 
@@ -77,6 +85,47 @@ pre-flight that can reject it, so a request rotating a key alongside an
 unbuildable change returns 400 with the config untouched and the secret already
 replaced. Combined with the un-clearable key above, that is unrecoverable from
 the phone. A key that rides alone cannot be in such a request.
+
+## The model list
+
+`model_list` is the set of models an entry serves — what
+`LlmEntry::models()` returns, what the pickers offer, and what a session pin may
+name. It is also the per-model override table, which is why membership and
+overrides travel together.
+
+Until `PUT /llm/models/{name}/model-list` existed it could only GROW: the only
+writers were the config file, the setup wizard's `lite_seed` (which fires for
+one provider), and `default_spec_mut()` materialising a departing default. No
+HTTP route could shrink it, so a model the operator had moved off stayed in
+every picker forever.
+
+**The endpoint replaces the whole SET, and that is deliberate on two counts.**
+Model ids routinely carry a slash (`meta-llama/Llama-3-70B`), which rules out a
+path segment for add/remove; and a whole-set PUT is idempotent, so a relay leg
+that replays it converges instead of double-adding. Replacing never destroys an
+override — the handler carries each surviving id's spec across and only mints a
+bare one for an id that was not there — so a client may send plain ids without
+echoing back config it does not understand.
+
+Three refusals, each protecting something a silent success would break:
+
+- **the default model must stay in the list.** `models()` prepends it when
+  absent, so dropping it would not drop it — the write would report a set the
+  entry does not have;
+- **no duplicate ids.** `spec_for` returns the first match, so a second copy's
+  overrides would be permanently inert and invisible in every read-back;
+- **`lite_model` may not be stranded.** The config validator owns that rule and
+  its message already says how to fix it; the endpoint just has to run it before
+  writing.
+
+**Adding is a PICK from `GET /llm/models/{name}/catalog`, never free text.**
+That route asks the provider what it currently offers, marking what the entry
+already serves. It exists because nothing gateway-side checks a model id against
+the vendor: a typo builds a client, gets listed in `entry_model_ids`, passes the
+session-pin validator, and only fails at the first real completion. The read is
+live and uncached — a stale catalog would offer models the account may no longer
+have — and it carries the same 45s client budget as the probe, for the same
+reason.
 
 ## Not optimistic, and the write re-reads
 
@@ -184,10 +233,14 @@ non-2xx into a bare status code, so the copy is generic on purpose; the probe's
 
 ## Tests
 
+- `crates/gateway/tests/llm_endpoint.rs` — the list endpoint's add/remove, that
+  a surviving id keeps its overrides, the three refusals, and that a replay
+  converges rather than doubling.
 - `ffi/src/gateway_api.rs` — one key per body and explicit nulls, the empty-key
   refusal, `POST_ONCE` for the probe, `requires_restart` surviving the decode,
-  path escaping, and the widened narrow (both the override and effective
-  columns, and that a bare row keeps them apart).
+  path escaping, the widened narrow (both the override and effective columns,
+  and that a bare row keeps them apart), the list riding the body with its
+  slashes intact, and `configured` defaulting to false.
 - `Tests/LlmEntryEditorTests.swift` — the write re-reads rather than guessing, a
   cleared override takes the server's effective value, a failed write never
   reaches the mirror, a failed read-back keeps its rows, the logout straddle

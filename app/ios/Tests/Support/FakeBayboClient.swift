@@ -131,6 +131,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var llmProbes: [String] = []
     private var llmProbeResult: LlmTestResult?
     private var cleartextBinding = false
+    private var llmModelListSets: [LlmModelListCall] = []
+    private var llmCatalogCalls: [String] = []
+    private var llmCatalogItems: [LlmCatalogModel] = []
+    private var llmCatalogError: Error?
 
     /// The baseline answer to a sync: no rows, no cursor. Enough to unwind the
     /// webview's in-flight guard, and it confirms nothing in the outbox.
@@ -302,6 +306,19 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var llmEditCalls: [LlmEditCall] { lock.withLock { llmEdits } }
     var llmDefaultSetCalls: [String] { lock.withLock { llmDefaultSets } }
     var llmProbeCalls: [String] { lock.withLock { llmProbes } }
+
+    /// One recorded `llmSetModelList`. The whole SET is kept: this endpoint
+    /// replaces rather than appends, so what a test asserts on is the list the
+    /// screen decided to send.
+    struct LlmModelListCall: Equatable {
+        let entry: String
+        let models: [String]
+    }
+
+    var llmModelListCalls: [LlmModelListCall] { lock.withLock { llmModelListSets } }
+    var llmCatalogFetches: [String] { lock.withLock { llmCatalogCalls } }
+    func answerCatalog(_ items: [LlmCatalogModel]) { lock.withLock { llmCatalogItems = items } }
+    func failCatalog(with error: Error) { lock.withLock { llmCatalogError = error } }
 
     /// Push a frame into the session's live sink, exactly as the core's pump
     /// does. The sink hops to the main queue, so the caller must let the actor
@@ -499,6 +516,24 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         lock.withLock { llmProbes.append(name) }
         guard let result = lock.withLock({ llmProbeResult }) else { throw Self.unsupported }
         return result
+    }
+
+    func llmSetModelList(name: String, models: [String]) async throws -> LlmMutateResult {
+        let failure = lock.withLock {
+            llmModelListSets.append(LlmModelListCall(entry: name, models: models))
+            return llmWriteError
+        }
+        if let failure { throw failure }
+        return LlmMutateResult(requiresRestart: lock.withLock { llmRequiresRestart })
+    }
+
+    func llmCatalog(name: String) async throws -> [LlmCatalogModel] {
+        let (failure, items) = lock.withLock {
+            llmCatalogCalls.append(name)
+            return (llmCatalogError, llmCatalogItems)
+        }
+        if let failure { throw failure }
+        return items
     }
 
     func activeBindingIsCleartext() throws -> Bool { lock.withLock { cleartextBinding } }

@@ -9,8 +9,8 @@ use crate::api::{
     ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary, ChatSubagentList,
     ChatSubagentStatus, ChatSubagentSummary, CronJobStatus, CronJobSummary, DeckCardInfo,
     DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, HiredBy, IssueAttachmentInfo,
-    IssueAttachmentInput, IssueInfo, IssuePriority, IssueRunInfo, IssueStatus, LlmEntryEdit,
-    LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, ProjectActivity,
+    IssueAttachmentInput, IssueInfo, IssuePriority, IssueRunInfo, IssueStatus, LlmCatalogModel,
+    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, ProjectActivity,
     ProjectAttention, ProjectInfo, RunStatus, RunTrigger, SessionModelPin, SubIssueProgress,
     SubagentCursor, TeamMemberInfo,
 };
@@ -628,6 +628,30 @@ struct WireLlmTestResult {
 #[derive(Serialize)]
 struct SetDefaultLlmRequest<'a> {
     name: &'a str,
+}
+
+/// `PUT /v1/llm/models/{name}/model-list` body — the whole served SET.
+#[derive(Serialize)]
+struct SetLlmModelListRequest<'a> {
+    models: &'a [String],
+}
+
+/// `GET /v1/llm/models/{name}/catalog` response.
+#[derive(Deserialize)]
+struct WireLlmCatalog {
+    #[serde(default)]
+    items: Vec<WireLlmCatalogModel>,
+}
+
+#[derive(Deserialize)]
+struct WireLlmCatalogModel {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    configured: bool,
 }
 
 /// `GET /v1/chat/sessions/{id}?limit=1` read for the session meta only — the
@@ -1400,6 +1424,50 @@ pub(crate) async fn test_llm_model<C: GatewayJsonClient + Sync>(
         provider: wire.provider,
         model: wire.model,
     })
+}
+
+/// Replace the models an entry serves.
+///
+/// A whole-set PUT, not add/remove, for two reasons: model ids routinely carry
+/// a slash (`meta-llama/Llama-3-70B`) and would be unsafe in a path segment,
+/// and replacing a set is idempotent — a relay leg that replays this converges
+/// instead of double-adding. The gateway carries each surviving id's overrides
+/// across, so sending plain ids never destroys the operator's work.
+pub(crate) async fn set_llm_model_list<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+    models: Vec<String>,
+) -> Result<LlmMutateResult, String> {
+    validate_path_segment(&name, "llm entry name")?;
+    let body = serde_json::to_vec(&SetLlmModelListRequest { models: &models })
+        .map_err(|e| format!("encode set model list request: {e}"))?;
+    let path = format!("{PATH_LLM_MODELS}/{}/model-list", percent_encode(&name));
+    let wire: WireMutateResponse = client.put_json(&path, body).await?;
+    Ok(LlmMutateResult {
+        requires_restart: wire.requires_restart,
+    })
+}
+
+/// The provider's LIVE model catalog for one entry — the pick list behind
+/// "add a model". A real call out to the vendor, so it is slow and it fails
+/// for an entry whose credentials are not good yet.
+pub(crate) async fn llm_catalog<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+) -> Result<Vec<LlmCatalogModel>, String> {
+    validate_path_segment(&name, "llm entry name")?;
+    let path = format!("{PATH_LLM_MODELS}/{}/catalog", percent_encode(&name));
+    let wire: WireLlmCatalog = client.get_json(&path).await?;
+    Ok(wire
+        .items
+        .into_iter()
+        .map(|m| LlmCatalogModel {
+            id: m.id,
+            display_name: m.display_name,
+            context_window: m.context_window,
+            configured: m.configured,
+        })
+        .collect())
 }
 
 /// Move the gateway's `default-llm` to `name` — the GLOBAL entry every unpinned
@@ -3825,6 +3893,61 @@ mod tests {
         assert_eq!(result.latency_ms, None);
     }
 
+    /// A whole-set PUT, so a replay converges. The ids ride the BODY — model
+    /// ids routinely carry a slash, which a path segment could not hold.
+    #[tokio::test]
+    async fn the_model_list_is_replaced_as_a_whole_set() {
+        let client = RecordingClient::new(r#"{"requires_restart":false}"#);
+        set_llm_model_list(
+            &client,
+            "fast".to_string(),
+            vec![
+                "claude-haiku-4-5".to_string(),
+                "meta-llama/Llama-3-70B".to_string(),
+            ],
+        )
+        .await
+        .expect("set list");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/v1/llm/models/fast/model-list");
+        assert_eq!(
+            call.body,
+            r#"{"models":["claude-haiku-4-5","meta-llama/Llama-3-70B"]}"#
+        );
+    }
+
+    /// `configured` is what separates "already served" from "would be added" in
+    /// the add picker, and an absent one must read as NOT configured rather
+    /// than failing the decode.
+    #[tokio::test]
+    async fn the_catalog_marks_what_the_entry_already_serves() {
+        let client = RecordingClient::new(
+            r#"{"items":[
+                {"id":"gpt-5.5","display_name":"GPT-5.5","context_window":400000,"configured":true},
+                {"id":"o3","supports_vision":true},
+                {"id":"o4-mini","context_window":200000,"configured":false}
+            ]}"#,
+        );
+        let items = llm_catalog(&client, "gpt".to_string())
+            .await
+            .expect("catalog");
+
+        assert_eq!(client.only_call().path, "/v1/llm/models/gpt/catalog");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "gpt-5.5");
+        assert_eq!(items[0].display_name.as_deref(), Some("GPT-5.5"));
+        assert_eq!(items[0].context_window, Some(400_000));
+        assert!(items[0].configured);
+        // A row carrying only an id still decodes; the extra field the picker
+        // does not render is dropped rather than refused.
+        assert_eq!(items[1].id, "o3");
+        assert_eq!(items[1].context_window, None);
+        assert!(!items[1].configured);
+        assert!(!items[2].configured);
+    }
+
     /// The entry name reaches the PATH here (unlike the default endpoint), so
     /// it takes the same escaping guard every other path segment does.
     #[tokio::test]
@@ -3843,6 +3966,16 @@ mod tests {
             );
             assert!(
                 test_llm_model(&client, bad.to_string()).await.is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                set_llm_model_list(&client, bad.to_string(), Vec::new())
+                    .await
+                    .is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                llm_catalog(&client, bad.to_string()).await.is_err(),
                 "{bad:?} must be rejected"
             );
             assert!(client.calls.lock().is_empty());

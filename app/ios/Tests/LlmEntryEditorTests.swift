@@ -207,6 +207,76 @@ struct LlmEntryEditorTests {
         #expect(cold.entry(named: "claude")?.baseUrl == nil)
     }
 
+    // MARK: - The model list
+
+    /// The endpoint REPLACES the set, so an "add" has to send the existing
+    /// members alongside the newcomer. Sending only the newcomer would drop
+    /// every other model the entry serves.
+    @Test func addingAModelSendsTheWholeSet() async throws {
+        let catalog = await makeCatalog()
+
+        _ = try await catalog.setModels(["claude-sonnet-5", "claude-opus-4-8", "o3"], of: "claude")
+
+        #expect(
+            client.llmModelListCalls == [
+                .init(entry: "claude", models: ["claude-sonnet-5", "claude-opus-4-8", "o3"])
+            ])
+    }
+
+    /// A list write re-reads like every other write here: `model_list` feeds
+    /// `models()`, which is what the pickers offer, and the gateway may have
+    /// normalised what it stored.
+    @Test func aListWriteRepaintsFromTheServer() async throws {
+        let catalog = await makeCatalog()
+
+        client.answerModelCatalog(
+            LlmModelCatalog(
+                defaultName: "claude",
+                items: [
+                    LlmFixtures.entry(
+                        "claude", model: "claude-sonnet-5", candidates: ["o3"],
+                        efforts: ["low", "high"])
+                ]))
+        _ = try await catalog.setModels(["claude-sonnet-5", "o3"], of: "claude")
+
+        let entry = try #require(catalog.entry(named: "claude"))
+        #expect(catalog.models(of: entry) == ["claude-sonnet-5", "o3"])
+    }
+
+    @Test func aFailedListWriteLeavesTheCatalogAlone() async throws {
+        let catalog = await makeCatalog()
+        client.failLlmWrite(with: BayboError.Other(message: "HTTP 400"))
+
+        await #expect(throws: (any Error).self) {
+            _ = try await catalog.setModels(["claude-sonnet-5"], of: "claude")
+        }
+
+        let entry = try #require(catalog.entry(named: "claude"))
+        #expect(catalog.models(of: entry) == ["claude-sonnet-5", "claude-opus-4-8"])
+    }
+
+    /// The catalog is a LIVE read of the provider, deliberately uncached and
+    /// unmirrored — a stale one would offer models the account may no longer
+    /// have. So it must reach the core every time it is asked for.
+    @Test func theProviderCatalogIsFetchedLive() async throws {
+        let catalog = await makeCatalog()
+        client.answerCatalog([
+            LlmCatalogModel(
+                id: "claude-sonnet-5", displayName: "Sonnet 5", contextWindow: 200_000,
+                configured: true),
+            LlmCatalogModel(
+                id: "claude-haiku-4-5", displayName: nil, contextWindow: nil, configured: false),
+        ])
+
+        let first = try await catalog.catalog(of: "claude")
+        _ = try await catalog.catalog(of: "claude")
+
+        #expect(first.count == 2)
+        #expect(first[0].configured, "an already-served model is marked, not offered as new")
+        #expect(!first[1].configured)
+        #expect(client.llmCatalogFetches == ["claude", "claude"], "never cached")
+    }
+
     // MARK: - The probe
 
     @Test func theProbeReachesTheCoreAndCarriesTheProvidersProse() async throws {

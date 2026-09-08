@@ -3860,6 +3860,40 @@
         }
       }
     },
+    "llm.addModel": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add a model"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加模型"
+          }
+        }
+      }
+    },
+    "llm.addModelExplain": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pick from what this provider currently offers. Models already served are ticked."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从这个服务商当前提供的模型里选。已经在用的打勾。"
+          }
+        }
+      }
+    },
     "llm.apiKey": {
       "extractionState": "manual",
       "localizations": {
@@ -3941,6 +3975,40 @@
           "stringUnit": {
             "state": "translated",
             "value": "这个地址要到条目下次真正调用时才会被验证，填错了会在那时失败。"
+          }
+        }
+      }
+    },
+    "llm.catalogEmpty": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This provider returned no models."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这个服务商没有返回任何模型。"
+          }
+        }
+      }
+    },
+    "llm.catalogLoading": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Asking the provider…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在询问服务商…"
           }
         }
       }
@@ -4319,6 +4387,23 @@
         }
       }
     },
+    "llm.modelList": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Model list"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "模型列表"
+          }
+        }
+      }
+    },
     "llm.noKey": {
       "extractionState": "manual",
       "localizations": {
@@ -4485,6 +4570,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "服务商默认（开）"
+          }
+        }
+      }
+    },
+    "llm.removeModel": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stop serving %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "不再提供 %@"
           }
         }
       }

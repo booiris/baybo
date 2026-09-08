@@ -475,6 +475,23 @@ pub enum LlmEntryEdit {
     },
 }
 
+/// One model as the provider's own catalog reports it — the pick list behind
+/// "add a model", and a LIVE read over the provider's API rather than config.
+///
+/// It exists so adding a model is a PICK, not free text. Nothing gateway-side
+/// checks a model id against the vendor: a typo builds a client, gets listed in
+/// the entry's models, passes the session-pin validator, and only fails at the
+/// first real completion.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LlmCatalogModel {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub context_window: Option<u32>,
+    /// Whether this id is already in the entry's model list — what separates
+    /// "already served" from "would be added" in the picker.
+    pub configured: bool,
+}
+
 /// What a config mutation answers with.
 ///
 /// `requires_restart` means **persisted to disk but not live**: the reloader

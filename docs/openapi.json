@@ -3976,6 +3976,148 @@
         }
       }
     },
+    "/v1/llm/models/{name}/catalog": {
+      "get": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "get_catalog",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Entry name (matches `llm[*].name`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The provider's live model catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmCatalogResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The provider's catalog could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/models/{name}/model-list": {
+      "put": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "set_model_list",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Entry name (matches `llm[*].name`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLlmModelListRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Model list replaced and hot-reloaded in-process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty id, duplicate, or the default model missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Write failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/llm/models/{name}/test": {
       "post": {
         "tags": [
@@ -10433,6 +10575,57 @@
           }
         }
       },
+      "LlmCatalogModel": {
+        "type": "object",
+        "description": "One model as the provider's own catalog reports it\n(`GET /v1/llm/models/{name}/catalog`). A LIVE read over the provider's API,\nnot config — so it can be slow, and it can fail for an entry whose\ncredentials are not yet valid.",
+        "required": [
+          "id",
+          "configured"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "Whether this id is already in the entry's `model_list`, so a picker can\ntell what it would be adding from what is already served."
+          },
+          "context_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "supports_vision": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "LlmCatalogResponse": {
+        "type": "object",
+        "description": "`GET /v1/llm/models/{name}/catalog` response.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogModel"
+            }
+          }
+        }
+      },
       "LlmInfo": {
         "type": "object",
         "description": "Current LLM provider descriptor.",
@@ -11402,6 +11595,21 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "SetLlmModelListRequest": {
+        "type": "object",
+        "description": "`PUT /v1/llm/models/{name}/model-list` body — the models this entry\nserves, as a SET, in picker order.\n\nReplace rather than add/remove, for two reasons. Model ids routinely\ncontain a slash (`meta-llama/Llama-3-70B`), which makes them unsafe as a\npath segment; and a whole-set PUT is idempotent, so a client whose request\nis replayed converges instead of double-adding.\n\n**Replacing the list never destroys an override.** The handler keeps each\nsurviving id's existing `LlmModelSpec` and only mints a bare one for an id\nthat was not there — so a caller may send plain ids without knowing which\noverrides exist. Dropping an id DOES drop its overrides, which is the point\nof dropping it.",
+        "required": [
+          "models"
+        ],
+        "properties": {
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },

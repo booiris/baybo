@@ -133,6 +133,62 @@ final class LlmEntryUITests: BayboUITestCase {
         attachScreenshot(app, name: "llm-key-editor")
     }
 
+    /// The model list is now managed from the phone: every served model gets a
+    /// remove affordance except the default (the entry prepends it to its own
+    /// list, so removing it would not remove it), and "Add a model" opens the
+    /// provider's live catalog rather than a text field.
+    func testTheModelListOffersRemovalExceptForTheDefault() {
+        let app = openModels()
+        app.buttons["llm-entry-claude"].tap()
+        let model = app.buttons["llm-field-model"]
+        XCTAssertTrue(model.waitForExistence(timeout: 5))
+        model.tap()
+
+        let candidate = app.buttons["llm-option-claude-opus-4-8"]
+        XCTAssertTrue(candidate.waitForExistence(timeout: 5), "the model list never appeared")
+        XCTAssertTrue(
+            app.buttons["llm-option-claude-opus-4-8-remove"].exists,
+            "a non-default model must be removable")
+        XCTAssertFalse(
+            app.buttons["llm-option-claude-sonnet-5-remove"].exists,
+            "the default model must NOT offer removal")
+        XCTAssertTrue(app.buttons["llm-add-model"].exists)
+        attachScreenshot(app, name: "llm-model-list")
+    }
+
+    /// Adding is a PICK from what the provider currently offers, never free
+    /// text — nothing gateway-side checks an id against the vendor, so a typo
+    /// would survive every validation and fail at the first real completion.
+    /// With no gateway behind the demo catalog the fetch fails, and the level
+    /// has to say so rather than showing an empty list.
+    func testAddingAModelOpensTheProviderCatalog() {
+        let app = openModels()
+        app.buttons["llm-entry-claude"].tap()
+        app.buttons["llm-field-model"].tap()
+        let add = app.buttons["llm-add-model"]
+        XCTAssertTrue(add.waitForExistence(timeout: 5))
+        add.tap()
+
+        // Either the catalog rendered or it said why it could not. Asserting on
+        // an identifier rather than the prose: the failure text is the
+        // provider's or the transport's, and this smoke has no business
+        // pinning either one's wording.
+        let failure = app.staticTexts["llm-catalog-failure"]
+        let anyRow = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "llm-catalog-")).firstMatch
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline && !failure.exists && !anyRow.exists {
+            _ = failure.waitForExistence(timeout: 1)
+        }
+        XCTAssertTrue(
+            failure.exists || anyRow.exists,
+            "the catalog level must resolve to a list or a stated failure, not stay blank")
+        XCTAssertFalse(
+            app.textFields["llm-input-add-model"].exists,
+            "adding a model must never be free text")
+        attachScreenshot(app, name: "llm-add-model")
+    }
+
     /// A pick commits immediately — there is no Save button on the fields
     /// level — and with no gateway behind the demo catalog the write fails.
     /// What matters is that the failure SURFACES: a silent no-op here would
