@@ -415,6 +415,11 @@ pub struct LlmModelInfo {
     /// error when false: `ollama` takes an optional key and `llamafile` none
     /// at all, so a healthy local entry sits here permanently.
     pub api_key_configured: bool,
+    /// Whether a key is stored in the GATEWAY'S VAULT, as opposed to merely
+    /// resolving from an environment variable. Only a stored key can be
+    /// removed over HTTP, so this — not `api_key_configured` — is what decides
+    /// whether the editor may offer a delete.
+    pub api_key_in_vault: bool,
     /// The default model's `context_window` override; `None` = inherited.
     pub context_window_override: Option<u32>,
     /// What the override resolves to once the snapshot and factory defaults
@@ -454,10 +459,15 @@ pub enum LlmEntryEdit {
     BaseUrl {
         url: Option<String>,
     },
-    /// Store a key in the gateway's vault. Never empty: an empty string does
-    /// NOT clear the key — the handler logs and returns, leaving the prior
-    /// secret in place — so sending one would report success for a write that
-    /// did nothing. No HTTP path can clear a vault key at all.
+    /// Store a key in the gateway's vault. An EMPTY string DELETES the stored
+    /// key — the one place on this enum where `""` is a verb rather than an
+    /// accident, which is why the screen reaches it only from an explicit
+    /// remove action and never from a blank field.
+    ///
+    /// A delete removes only what the vault holds. If `api_key_env` or the
+    /// provider's default env var still resolves, the entry keeps working and
+    /// `api_key_configured` stays true — which is what `api_key_in_vault`
+    /// exists to tell apart.
     ApiKey {
         key: String,
     },

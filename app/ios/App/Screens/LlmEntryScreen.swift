@@ -45,6 +45,10 @@ struct LlmEntryScreen: View {
     @State private var catalogItems: [LlmCatalogModel] = []
     @State private var loadingCatalog = false
     @State private var catalogFailure: String?
+    /// Removing a stored key is irreversible from here — there is no read-back
+    /// to restore from, and the entry stops working for every device until a
+    /// new one is set. The one action on this screen that earns a confirm.
+    @State private var confirmingKeyRemoval = false
 
     private enum Level: Equatable {
         case fields
@@ -108,6 +112,16 @@ struct LlmEntryScreen: View {
         .background(Theme.paper)
         .background(PopGestureEnabler().frame(width: 0, height: 0))
         .onAppear { catalog.refreshIfNeeded() }
+        .alert(lang.t("llm.removeKeyTitle"), isPresented: $confirmingKeyRemoval) {
+            Button(lang.t("common.cancel"), role: .cancel) {}
+            Button(lang.t("llm.removeKeyCommit"), role: .destructive) {
+                // The one place an empty key is deliberate: it reaches the
+                // gateway verbatim and deletes the stored secret.
+                commit(.apiKey(key: ""), field: lang.t("llm.apiKey"))
+            }
+        } message: {
+            Text(verbatim: lang.t("llm.removeKeyExplain"))
+        }
     }
 
     // MARK: - Chrome
@@ -575,12 +589,26 @@ struct LlmEntryScreen: View {
             }
         }
 
-        // There is no clear/remove affordance because clearing is impossible:
-        // an empty value does NOT delete the stored key — the gateway logs the
-        // request and leaves the prior secret in place — and no HTTP route
-        // deletes a vault key at all. A button that cannot do what it says is
-        // worse than its absence.
-        hint(lang.t("llm.keyHint"))
+        // Offered on `apiKeyInVault`, NOT on `apiKeyConfigured`: the latter is
+        // also true when an env var supplies the key, and only what the vault
+        // holds can be deleted over HTTP. A remove button on an env-provided
+        // key would report success and change nothing.
+        if entry.apiKeyInVault && !cleartext {
+            Button {
+                Haptics.tap()
+                confirmingKeyRemoval = true
+            } label: {
+                Text(verbatim: lang.t("llm.removeKey"))
+            }
+            .buttonStyle(OutlinePillButtonStyle(color: Theme.err))
+            .disabled(saving)
+            .opacity(saving ? 0.5 : 1)
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .accessibilityIdentifier("llm-remove-key")
+        }
+
+        hint(lang.t(entry.apiKeyInVault ? "llm.keyHintStored" : "llm.keyHint"))
     }
 
     // MARK: - Row + control vocabulary

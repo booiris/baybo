@@ -130,7 +130,39 @@ final class LlmEntryUITests: BayboUITestCase {
         XCTAssertTrue(
             app.buttons["llm-clear-env"].exists,
             "clearing the shadowing env var is the documented escape hatch")
+        // `gpt`'s key comes from the environment, not the vault. Removal
+        // deletes only what the vault holds, so offering it here would be a
+        // button that reports success and changes nothing.
+        XCTAssertFalse(
+            app.buttons["llm-remove-key"].exists,
+            "an env-provided key must not offer removal")
         attachScreenshot(app, name: "llm-key-editor")
+    }
+
+    /// The mirror image: `claude` has a key in the vault, so removal is real
+    /// and offered. This is the affordance that could not exist while an empty
+    /// `api_key` was a silent no-op.
+    func testAStoredKeyOffersRemoval() {
+        let app = openModels()
+        app.buttons["llm-entry-claude"].tap()
+        let keyRow = app.buttons["llm-field-api-key"]
+        XCTAssertTrue(keyRow.waitForExistence(timeout: 5))
+        XCTAssertEqual(keyRow.value as? String, "Configured")
+        keyRow.tap()
+
+        let remove = app.buttons["llm-remove-key"]
+        XCTAssertTrue(remove.waitForExistence(timeout: 5), "a vault-stored key must be removable")
+        attachScreenshot(app, name: "llm-key-stored")
+
+        // Irreversible and unreadable-back, so it confirms rather than firing
+        // on the tap that reveals it.
+        remove.tap()
+        XCTAssertTrue(
+            app.buttons["Remove"].waitForExistence(timeout: 5),
+            "removing a key must confirm first")
+        XCTAssertTrue(app.buttons["Cancel"].exists)
+        attachScreenshot(app, name: "llm-key-remove-confirm")
+        app.buttons["Cancel"].tap()
     }
 
     /// The model list is now managed from the phone: every served model gets a

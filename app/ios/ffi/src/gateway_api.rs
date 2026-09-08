@@ -583,6 +583,8 @@ struct WireLlmModel {
     #[serde(default)]
     api_key_configured: bool,
     #[serde(default)]
+    api_key_in_vault: bool,
+    #[serde(default)]
     context_window_override: Option<u32>,
     #[serde(default)]
     effective_context_window: u32,
@@ -1346,6 +1348,7 @@ pub(crate) async fn list_llm_models<C: GatewayJsonClient + Sync>(
                 base_url: m.base_url,
                 api_key_env: m.api_key_env,
                 api_key_configured: m.api_key_configured,
+                api_key_in_vault: m.api_key_in_vault,
                 context_window_override: m.context_window_override,
                 effective_context_window: m.effective_context_window,
                 supports_vision_override: m.supports_vision_override,
@@ -1383,14 +1386,6 @@ pub(crate) async fn update_llm_model<C: GatewayJsonClient + Sync>(
     edit: LlmEntryEdit,
 ) -> Result<LlmMutateResult, String> {
     validate_path_segment(&name, "llm entry name")?;
-    // An empty key does NOT clear the vault: the gateway logs the request and
-    // returns with the prior secret intact. Sending it would report success for
-    // a write that did nothing, so it is refused here rather than on the wire.
-    if let LlmEntryEdit::ApiKey { key } = &edit
-        && key.trim().is_empty()
-    {
-        return Err("api key must not be empty".to_string());
-    }
     let body = serde_json::to_vec(&entry_edit_body(&edit))
         .map_err(|e| format!("encode llm entry edit: {e}"))?;
     let path = format!("{PATH_LLM_MODELS}/{}", percent_encode(&name));
@@ -3609,7 +3604,7 @@ mod tests {
         let client = RecordingClient::new(
             r#"{"default_name":"fast","items":[
                 {"name":"fast","provider":"anthropic","model":"claude-haiku-4-5","api_key_configured":true,"is_default":true,"effective_context_window":200000,"effective_supports_vision":true,"effective_pricing":{}},
-                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","available_efforts":["low","medium","high","xhigh","max"],"lite_model":"gpt-5.5-mini","base_url":"https://proxy.test/v1","api_key_env":"OPENAI_KEY","api_key_configured":false,"is_default":false,"context_window_override":400000,"effective_context_window":400000,"supports_vision_override":false,"effective_supports_vision":false,"effective_pricing":{}}
+                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","available_efforts":["low","medium","high","xhigh","max"],"lite_model":"gpt-5.5-mini","base_url":"https://proxy.test/v1","api_key_env":"OPENAI_KEY","api_key_configured":false,"api_key_in_vault":true,"is_default":false,"context_window_override":400000,"effective_context_window":400000,"supports_vision_override":false,"effective_supports_vision":false,"effective_pricing":{}}
             ]}"#,
         );
         let catalog = list_llm_models(&client).await.expect("models");
@@ -3663,6 +3658,10 @@ mod tests {
         assert!(bare.effective_supports_vision);
         assert!(bare.api_key_configured);
         assert_eq!(bare.base_url, None);
+        // Resolvable is not the same as stored: only a stored key can be
+        // deleted over HTTP, so only a stored key may be offered for deletion.
+        assert!(!bare.api_key_in_vault, "this row's key comes from the env");
+        assert!(entry.api_key_in_vault);
     }
 
     /// The pin read rides the session detail with `limit=1` — the smallest page
@@ -3831,27 +3830,21 @@ mod tests {
         }
     }
 
-    /// An empty key does NOT clear the vault — the gateway logs the request and
-    /// returns with the prior secret in place. Sending it would report success
-    /// for a write that did nothing, so it never reaches the wire.
+    /// An empty key is the DELETE verb, not an accident — it has to reach the
+    /// wire verbatim. (The screen only sends it from an explicit remove
+    /// action; a blank field commits nothing.)
     #[tokio::test]
-    async fn an_empty_api_key_is_refused_before_the_wire() {
-        for blank in ["", "   ", "\n"] {
-            let client = RecordingClient::empty();
-            assert!(
-                update_llm_model(
-                    &client,
-                    "fast".to_string(),
-                    LlmEntryEdit::ApiKey {
-                        key: blank.to_string()
-                    },
-                )
-                .await
-                .is_err(),
-                "{blank:?} must be refused"
-            );
-            assert!(client.calls.lock().is_empty(), "{blank:?} reached the wire");
-        }
+    async fn an_empty_api_key_is_the_delete_verb() {
+        let client = RecordingClient::new(r#"{"requires_restart":false}"#);
+        update_llm_model(
+            &client,
+            "fast".to_string(),
+            LlmEntryEdit::ApiKey { key: String::new() },
+        )
+        .await
+        .expect("clear");
+
+        assert_eq!(client.only_call().body, r#"{"api_key":""}"#);
     }
 
     /// The probe is a real billed completion, so it must never ride the leg the

@@ -49,6 +49,21 @@ async fn router_with_reloader(
     seed: BayboConfig,
     reloader_override: Option<Arc<dyn baybo_gateway::reload::ConfigReloader>>,
 ) -> (axum::Router, TempDir, std::path::PathBuf) {
+    let (router, dir, path, _vault) = router_with_vault(seed, reloader_override).await;
+    (router, dir, path)
+}
+
+/// As above, plus the secret vault the handlers write through — the api-key
+/// contract is about what is IN the vault, and no response body reports that.
+async fn router_with_vault(
+    seed: BayboConfig,
+    reloader_override: Option<Arc<dyn baybo_gateway::reload::ConfigReloader>>,
+) -> (
+    axum::Router,
+    TempDir,
+    std::path::PathBuf,
+    Arc<baybo_security::SecretVault>,
+) {
     let tg = build_test_deps(SocketAddr::from(([127, 0, 0, 1], 0))).await;
     let cfg_dir = tempfile::tempdir().expect("config tempdir");
     let cfg_path = cfg_dir.path().join("baybo.json");
@@ -76,8 +91,38 @@ async fn router_with_reloader(
     // tg.tempdir keeps sqlite alive — leak it so the cost store keeps
     // pointing at a live file for the duration of the test. Returning
     // the cfg_dir guarantees `cfg_path` stays live too.
+    let vault = tg.deps.secret_vault.clone();
     Box::leak(Box::new(tg));
-    (router, cfg_dir, cfg_path)
+    (router, cfg_dir, cfg_path, vault)
+}
+
+/// A second router over an EXISTING vault, so a test can store a key through a
+/// healthy handler and then drive a rejecting one against the same secrets.
+async fn rebuild_router_sharing_vault(
+    seed: BayboConfig,
+    vault: Arc<baybo_security::SecretVault>,
+    reloader: Arc<dyn baybo_gateway::reload::ConfigReloader>,
+) -> axum::Router {
+    let tg = build_test_deps(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+    let cfg_dir = tempfile::tempdir().expect("config tempdir");
+    let cfg_path = cfg_dir.path().join("baybo.json");
+    seed.write_to_file(&cfg_path).await.expect("write seed");
+
+    use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
+    let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
+    let state = baybo_gateway::server::AdminState {
+        config: Arc::new(seed),
+        config_path: Some(cfg_path),
+        config_reloader: reloader,
+        secret_vault: vault,
+        ..baybo_gateway::server::AdminState::from_deps(&tg.deps)
+    };
+    let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
+    let router = axum::Router::new().merge(admin_router.with_state(state).layer(
+        axum::middleware::from_fn_with_state(auth_state, require_admin_token),
+    ));
+    Box::leak(Box::new((tg, cfg_dir)));
+    router
 }
 
 fn entry(name: &str, provider: &str, model: &str) -> LlmEntry {
@@ -729,4 +774,202 @@ async fn set_model_list_404s_for_an_unknown_entry() {
     let (router, _dir, _path) = router_with_seed_config(seed_two_entries()).await;
     let (status, _) = put_model_list(&router, "nope", json!(["gpt-4o"])).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── api_key: store, clear, and the rollback ──────────────────────────
+
+async fn put_entry(router: &axum::Router, entry: &str, body: Value) -> (StatusCode, Value) {
+    let req = auth(
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/llm/models/{entry}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    );
+    read_json(router.clone().oneshot(req).await.unwrap()).await
+}
+
+async fn vault_key(vault: &baybo_security::SecretVault, entry: &str) -> Option<String> {
+    vault
+        .get_secret(&baybo_llm::credentials::vault_api_key_name(entry))
+        .await
+        .expect("vault read")
+        .map(|v| String::from_utf8(v.as_bytes().to_vec()).expect("utf8 key"))
+}
+
+/// The documented contract, which used to be a lie: an empty `api_key` DELETES
+/// the stored key. The handler previously logged the request and returned,
+/// leaving the prior secret in place while reporting success — and the DTO
+/// promising otherwise had already generated into the TS client.
+#[tokio::test]
+async fn an_empty_api_key_clears_the_stored_key() {
+    let (router, _dir, _path, vault) = router_with_vault(seed_two_entries(), None).await;
+
+    let (status, _) = put_entry(&router, "primary", json!({ "api_key": "sk-live" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        vault_key(&vault, "primary").await.as_deref(),
+        Some("sk-live")
+    );
+
+    let (status, _) = put_entry(&router, "primary", json!({ "api_key": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(vault_key(&vault, "primary").await, None, "the key is gone");
+}
+
+/// Absent still means "leave the vault alone" — the third state, and the one
+/// every ordinary field edit relies on.
+#[tokio::test]
+async fn an_absent_api_key_leaves_the_vault_untouched() {
+    let (router, _dir, _path, vault) = router_with_vault(seed_two_entries(), None).await;
+    let (status, _) = put_entry(&router, "primary", json!({ "api_key": "sk-live" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = put_entry(&router, "primary", json!({ "base_url": "https://p.test" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        vault_key(&vault, "primary").await.as_deref(),
+        Some("sk-live")
+    );
+}
+
+/// The vault write is staged BEFORE the pre-flight, because a dry run has to
+/// resolve the credential it is validating. That window is why the rollback
+/// exists: without it a rejected edit answers 400 with the config untouched
+/// and the secret already replaced — unrecoverable, since a clear is the only
+/// way to remove a key and the clear is what just destroyed it.
+#[tokio::test]
+async fn a_rejected_preflight_puts_the_previous_key_back() {
+    // Store through a healthy router, then rebuild one whose dry-run rejects,
+    // pointed at the SAME vault.
+    let (router, _dir, _path, vault) = router_with_vault(seed_two_entries(), None).await;
+    let (status, _) = put_entry(&router, "primary", json!({ "api_key": "sk-original" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rejecting = rebuild_router_sharing_vault(
+        seed_two_entries(),
+        vault.clone(),
+        Arc::new(baybo_gateway::test_support::RejectingDryRunReloader),
+    )
+    .await;
+
+    let (status, _) = put_entry(&rejecting, "primary", json!({ "api_key": "sk-rotated" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        vault_key(&vault, "primary").await.as_deref(),
+        Some("sk-original"),
+        "a refused rotation must not keep the new key"
+    );
+}
+
+/// The same window, for the clear: a rejected pre-flight must put the deleted
+/// key back rather than leave the entry credential-less.
+#[tokio::test]
+async fn a_rejected_preflight_undoes_a_clear() {
+    let (router, _dir, _path, vault) = router_with_vault(seed_two_entries(), None).await;
+    let (status, _) = put_entry(&router, "primary", json!({ "api_key": "sk-original" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rejecting = rebuild_router_sharing_vault(
+        seed_two_entries(),
+        vault.clone(),
+        Arc::new(baybo_gateway::test_support::RejectingDryRunReloader),
+    )
+    .await;
+
+    let (status, _) = put_entry(&rejecting, "primary", json!({ "api_key": "" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        vault_key(&vault, "primary").await.as_deref(),
+        Some("sk-original"),
+        "a refused clear must not destroy the key"
+    );
+}
+
+/// `api_key_configured` answers "does a key RESOLVE" (env included);
+/// `api_key_in_vault` answers "is one stored here". Only the second can be
+/// removed over HTTP, so a client that conflated them would offer a delete
+/// that reports success and changes nothing.
+#[tokio::test]
+async fn the_row_tells_a_stored_key_from_a_resolvable_one() {
+    let (router, _dir, _path, _vault) = router_with_vault(seed_two_entries(), None).await;
+
+    let req = auth(
+        Request::builder()
+            .method("GET")
+            .uri("/v1/llm/models")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let (_, before) = read_json(router.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(before["items"][0]["api_key_in_vault"], false);
+
+    let (status, _) = put_entry(&router, "primary", json!({ "api_key": "sk-live" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = auth(
+        Request::builder()
+            .method("GET")
+            .uri("/v1/llm/models")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let (_, after) = read_json(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(after["items"][0]["api_key_in_vault"], true);
+    assert_eq!(after["items"][0]["api_key_configured"], true);
+}
+
+// ── model + per-model facts may not travel together ──────────────────
+
+/// The transplant, made unrepresentable. `entry.model` is assigned before
+/// `default_spec_mut()` resolves, so a body carrying both moves the departing
+/// model's overrides onto its successor and answers 200. Nothing in the request
+/// says which model the numbers belong to, so the only honest answer is to
+/// refuse the pair.
+#[tokio::test]
+async fn changing_the_model_alongside_a_per_model_fact_is_refused() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+
+    for extra in [
+        json!({ "model": "o3", "context_window": 200_000 }),
+        json!({ "model": "o3", "supports_vision": true }),
+        json!({ "model": "o3", "pricing": { "input_per_1m_tokens": 1_000_000_i64 } }),
+    ] {
+        let (status, resp) = put_entry(&router, "primary", extra.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}");
+        assert!(
+            resp["error"].as_str().unwrap_or_default().contains("model"),
+            "the refusal says which pairing it refused: {resp}"
+        );
+    }
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    let primary = on_disk.llm_entry("primary").expect("primary");
+    assert_eq!(primary.model, "gpt-4o", "a refused write changes nothing");
+    assert!(primary.model_list.is_empty());
+}
+
+/// Each half on its own still works — the refusal is about the COMBINATION,
+/// and splitting the edit is the documented fix.
+#[tokio::test]
+async fn the_same_edit_split_into_two_requests_succeeds() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+
+    let (status, _) = put_entry(&router, "primary", json!({ "model": "o3" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = put_entry(&router, "primary", json!({ "context_window": 200_000 })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    let primary = on_disk.llm_entry("primary").expect("primary");
+    assert_eq!(primary.model, "o3");
+    // The window landed on o3, which is now the default — and nothing was
+    // carried over from gpt-4o, which never had a spec to carry.
+    assert_eq!(
+        primary.spec_for("o3").and_then(|s| s.context_window),
+        Some(200_000)
+    );
+    assert_eq!(primary.model_list.len(), 1);
 }

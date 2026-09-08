@@ -122,6 +122,24 @@ async fn update_model(
         )
     })?;
 
+    // `context_window` / `supports_vision` / `pricing` describe A MODEL, and
+    // this request has no way to say WHICH — they land wherever `model` leaves
+    // the default pointing. A client that renders the entry and posts the form
+    // back therefore moves the departing model's overrides onto its successor,
+    // and gets a 200 for it. Refusing the combination is what makes that
+    // unrepresentable; the caller changes the model, sees what the new one
+    // actually resolves to, and then decides whether to override it.
+    if req.model.is_some()
+        && (req.context_window.is_some() || req.supports_vision.is_some() || req.pricing.is_some())
+    {
+        return Err(GatewayError::BadRequest(
+            "`model` cannot be changed in the same request as `context_window`, \
+             `supports_vision` or `pricing`: those describe a model, and this request cannot say \
+             which one they belong to. Send the model change on its own first."
+                .into(),
+        ));
+    }
+
     let mut current = read_config_for_dashboard(&state).await?;
     let entry = current
         .llm
@@ -166,36 +184,29 @@ async fn update_model(
         .validate()
         .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
 
-    // Stage a rotated API key in the vault *before* the pre-flight build:
-    // every provider requires the key at client construction, so dry-run
-    // (and the rebuild) must resolve the new credential, not the old. Empty
-    // string = clear, a no-op here — there's no per-key delete on this
-    // path, so the prior secret stays until a fresh value is set.
-    if let Some(api_key) = req.api_key.as_deref() {
-        if api_key.is_empty() {
-            tracing::info!(
-                entry = %name,
-                "api_key clear requested; this path has no per-key vault delete, leaving the prior \
-                 secret in place (rotate by setting a fresh non-empty value)"
-            );
-        } else {
-            state
-                .secret_vault
-                .store_secret(&vault_api_key_name(&name), api_key.as_bytes())
-                .await
-                .map_err(|e| GatewayError::Internal(format!("vault write failed: {e}")))?;
-        }
-    }
+    // Stage the API-key change in the vault *before* the pre-flight build:
+    // every provider resolves its credential at client construction, so a dry
+    // run that still saw the old key would validate a build nobody asked for.
+    // An empty string is a CLEAR — the key is deleted, not left in place.
+    let staged = stage_api_key(&state, &name, req.api_key.as_deref()).await?;
 
     // Pre-flight before persisting, so an unbuildable edit is rejected
     // without dirtying the file (a later SIGHUP would otherwise re-read and
     // silently drop it). With the new key already staged, this validates
     // the real post-edit build.
-    state.config_reloader.dry_run(&current).await?;
-    current
-        .write_to_file(target)
-        .await
-        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+    //
+    // Both fallible steps below undo the vault first. Without that, a rejected
+    // pre-flight would answer 400 with the config untouched and the secret
+    // already gone — and since the clear IS the only way to remove a key,
+    // there would be nothing left to put back.
+    if let Err(e) = state.config_reloader.dry_run(&current).await {
+        staged.restore(&state).await;
+        return Err(e.into());
+    }
+    if let Err(e) = current.write_to_file(target).await {
+        staged.restore(&state).await;
+        return Err(GatewayError::Internal(e.to_string()));
+    }
 
     // Apply in-process. `reload` always rebuilds the LLM pool, so a vault
     // key rotation (invisible in the config diff) takes effect too. If a
@@ -622,6 +633,85 @@ async fn get_usage(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/// A vault edit made ahead of the pre-flight that can still reject it, plus
+/// what it takes to put the vault back.
+///
+/// The ordering is forced: providers resolve their credential when the client
+/// is constructed, so `dry_run` has to see the intended key. That leaves the
+/// window this type closes — a 400 after the secret already moved.
+struct StagedApiKey {
+    /// `None` when the request carried no `api_key` at all, i.e. nothing to
+    /// undo. Otherwise the vault name and whatever was there before.
+    undo: Option<(String, Option<Vec<u8>>)>,
+}
+
+impl StagedApiKey {
+    const NONE: Self = Self { undo: None };
+
+    /// Put the vault back the way it was. Best-effort and never fatal: the
+    /// caller is already returning an error, and a failed restore must not
+    /// replace that error's message with this one — but it does deserve a loud
+    /// log, because it is the one path that can strand a credential.
+    async fn restore(self, state: &AdminState) {
+        let Some((vault_name, previous)) = self.undo else {
+            return;
+        };
+        let result = match &previous {
+            Some(bytes) => state.secret_vault.store_secret(&vault_name, bytes).await,
+            None => state.secret_vault.delete_secret(&vault_name).await,
+        };
+        if let Err(e) = result {
+            tracing::error!(
+                error = %e,
+                secret = %vault_name,
+                restoring = if previous.is_some() { "previous key" } else { "absence" },
+                "failed to roll back a staged api key after a rejected edit; the vault may now \
+                 disagree with the config on disk"
+            );
+        }
+    }
+}
+
+/// Apply the request's `api_key` to the vault, returning the undo.
+///
+/// Three states, and they are the request's, not this function's invention:
+/// absent leaves the vault alone, `""` deletes the stored key, and a value
+/// replaces it.
+async fn stage_api_key(
+    state: &AdminState,
+    entry: &str,
+    api_key: Option<&str>,
+) -> GatewayResult<StagedApiKey> {
+    let Some(api_key) = api_key else {
+        return Ok(StagedApiKey::NONE);
+    };
+    let vault_name = vault_api_key_name(entry);
+    let previous = state
+        .secret_vault
+        .get_secret(&vault_name)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("vault read failed: {e}")))?
+        .map(|v| v.as_bytes().to_vec());
+
+    if api_key.is_empty() {
+        state
+            .secret_vault
+            .delete_secret(&vault_name)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("vault delete failed: {e}")))?;
+        tracing::info!(entry = %entry, "api key cleared from the vault");
+    } else {
+        state
+            .secret_vault
+            .store_secret(&vault_name, api_key.as_bytes())
+            .await
+            .map_err(|e| GatewayError::Internal(format!("vault write failed: {e}")))?;
+    }
+    Ok(StagedApiKey {
+        undo: Some((vault_name, previous)),
+    })
+}
+
 /// Read the on-disk config for dashboard reads/writes. Falls back to
 /// the cached `state.config` snapshot when no `config_path` was set
 /// (dev mode with implicit defaults) — mutation endpoints still gate
@@ -696,6 +786,16 @@ async fn build_model_entry(
     )
     .await
     .is_some();
+    // Separate from `configured`, which an env var also satisfies: only a
+    // stored key can be deleted over HTTP, so only a stored key may be
+    // offered for deletion.
+    let api_key_in_vault = state
+        .secret_vault
+        .get_secret(&vault_api_key_name(entry.name.as_str()))
+        .await
+        .ok()
+        .flatten()
+        .is_some();
 
     LlmModelEntry {
         name: entry.name.to_string(),
@@ -709,6 +809,7 @@ async fn build_model_entry(
         base_url: entry.base_url.clone(),
         api_key_env: entry.api_key_env.clone(),
         api_key_configured,
+        api_key_in_vault,
         reasoning_effort: entry.reasoning_effort.clone(),
         available_efforts: baybo_llm::providers::effort_wire_for_provider(&entry.provider)
             .levels()
