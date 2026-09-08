@@ -120,6 +120,17 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var sessionModelStallMs: Int = 0
     private var setModelError: Error?
     private var llmCatalog: LlmModelCatalog?
+    private var llmListError: Error?
+    private var llmWriteError: Error?
+    /// Holds a config write open so a test can log out while it is still in
+    /// flight — the epoch-straddle shape.
+    private var llmWriteStallMs: Int = 0
+    private var llmRequiresRestart = false
+    private var llmEdits: [LlmEditCall] = []
+    private var llmDefaultSets: [String] = []
+    private var llmProbes: [String] = []
+    private var llmProbeResult: LlmTestResult?
+    private var cleartextBinding = false
 
     /// The baseline answer to a sync: no rows, no cursor. Enough to unwind the
     /// webview's in-flight guard, and it confirms nothing in the outbox.
@@ -272,6 +283,25 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func stallSessionModel(ms: Int) { lock.withLock { sessionModelStallMs = ms } }
     func failSetModel(with error: Error) { lock.withLock { setModelError = error } }
     func answerModelCatalog(_ catalog: LlmModelCatalog) { lock.withLock { llmCatalog = catalog } }
+    func failListModels(with error: Error) { lock.withLock { llmListError = error } }
+    func failLlmWrite(with error: Error) { lock.withLock { llmWriteError = error } }
+    func stallLlmWrite(ms: Int) { lock.withLock { llmWriteStallMs = ms } }
+    /// Answer every config write "persisted, not live" — the state where the
+    /// editor must say staged and withdraw the probe.
+    func answerLlmWritesStaged() { lock.withLock { llmRequiresRestart = true } }
+    func answerProbe(_ result: LlmTestResult) { lock.withLock { llmProbeResult = result } }
+    func markBindingCleartext() { lock.withLock { cleartextBinding = true } }
+
+    /// One recorded `llmUpdateModel`. The EDIT is kept whole: the point of most
+    /// of these tests is which single key the screen chose to send.
+    struct LlmEditCall: Equatable {
+        let entry: String
+        let edit: LlmEntryEdit
+    }
+
+    var llmEditCalls: [LlmEditCall] { lock.withLock { llmEdits } }
+    var llmDefaultSetCalls: [String] { lock.withLock { llmDefaultSets } }
+    var llmProbeCalls: [String] { lock.withLock { llmProbes } }
 
     /// Push a frame into the session's live sink, exactly as the core's pump
     /// does. The sink hops to the main queue, so the caller must let the actor
@@ -441,9 +471,37 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatSetCronPinned(jobId: String, pinned: Bool) async throws { throw Self.unsupported }
 
     func llmListModels() async throws -> LlmModelCatalog {
+        if let failure = lock.withLock({ llmListError }) { throw failure }
         guard let catalog = lock.withLock({ llmCatalog }) else { throw Self.unsupported }
         return catalog
     }
+
+    func llmUpdateModel(name: String, edit: LlmEntryEdit) async throws -> LlmMutateResult {
+        let (failure, stall) = lock.withLock {
+            llmEdits.append(LlmEditCall(entry: name, edit: edit))
+            return (llmWriteError, llmWriteStallMs)
+        }
+        if stall > 0 { try? await Task.sleep(for: .milliseconds(stall)) }
+        if let failure { throw failure }
+        return LlmMutateResult(requiresRestart: lock.withLock { llmRequiresRestart })
+    }
+
+    func llmSetDefault(name: String) async throws -> LlmMutateResult {
+        let failure = lock.withLock {
+            llmDefaultSets.append(name)
+            return llmWriteError
+        }
+        if let failure { throw failure }
+        return LlmMutateResult(requiresRestart: lock.withLock { llmRequiresRestart })
+    }
+
+    func llmTestModel(name: String) async throws -> LlmTestResult {
+        lock.withLock { llmProbes.append(name) }
+        guard let result = lock.withLock({ llmProbeResult }) else { throw Self.unsupported }
+        return result
+    }
+
+    func activeBindingIsCleartext() throws -> Bool { lock.withLock { cleartextBinding } }
 
     func chatSessionModel(sessionId: String) async throws -> SessionModelPin {
         let stall = lock.withLock { sessionModelStallMs }
