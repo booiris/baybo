@@ -1,10 +1,19 @@
 //! `/v1/llm` — snapshot of the configured LLM provider plus the
 //! models-dashboard surface (`/v1/llm/models`, `/v1/llm/default`,
-//! `/v1/llm/usage`, `/v1/llm/models/{name}/test`).
+//! `/v1/llm/usage`, `/v1/llm/models/{name}/test`,
+//! `/v1/llm/models/{name}/model-list`, `/v1/llm/models/{name}/catalog`).
 //!
 //! `GET /v1/llm` returns the *currently active* provider/model (whatever
-//! the runtime loaded at startup). Edits land on disk and require a
-//! gateway restart to take effect — same contract as `PUT /v1/config`.
+//! the runtime loaded at startup). Edits land on disk and are hot-reloaded
+//! in-process; `requires_restart` in the answer means the write reached the
+//! file but not the running pool.
+//!
+//! **Which model an entry SERVES lives in two different places, on purpose.**
+//! `PUT /llm/models/{name}` sets `model` — the entry's default, and the only
+//! model whose overrides this API can edit. `PUT /llm/models/{name}/model-list`
+//! sets the whole served SET, preserving each surviving id's overrides. Before
+//! the latter existed, `model_list` could only grow (via `default_spec_mut`)
+//! and nothing over HTTP could shrink it.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -18,9 +27,10 @@ use utoipa_axum::routes;
 
 use crate::Result;
 use crate::api::dto::{
-    ErrorBody, LlmInfo, LlmModelEntry, LlmModelPricingDto, LlmModelTestResult, LlmModelUsage,
-    LlmModelsResponse, LlmPricingOverrideDto, LlmUsageQuery, LlmUsageResponse, MutateResponse,
-    SetDefaultLlmRequest, UpdateLlmModelRequest,
+    ErrorBody, LlmCatalogModel, LlmCatalogResponse, LlmInfo, LlmModelEntry, LlmModelPricingDto,
+    LlmModelTestResult, LlmModelUsage, LlmModelsResponse, LlmPricingOverrideDto, LlmUsageQuery,
+    LlmUsageResponse, MutateResponse, SetDefaultLlmRequest, SetLlmModelListRequest,
+    UpdateLlmModelRequest,
 };
 use crate::server::AdminState;
 use crate::{GatewayError, Result as GatewayResult};
@@ -35,6 +45,8 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_models))
         .routes(routes!(update_model))
         .routes(routes!(test_model))
+        .routes(routes!(set_model_list))
+        .routes(routes!(get_catalog))
         .routes(routes!(set_default))
         .routes(routes!(get_usage))
 }
@@ -292,6 +304,188 @@ async fn test_model(
             model: entry.model,
         })),
     }
+}
+
+#[utoipa::path(
+    put,
+    path = "/llm/models/{name}/model-list",
+    tag = "llm",
+    params(
+        ("name" = String, Path, description = "Entry name (matches `llm[*].name`)"),
+    ),
+    request_body = SetLlmModelListRequest,
+    responses(
+        (status = 200, description = "Model list replaced and hot-reloaded in-process.", body = MutateResponse),
+        (status = 400, description = "Empty id, duplicate, or the default model missing", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Entry not found", body = ErrorBody),
+        (status = 500, description = "Write failure", body = ErrorBody),
+    )
+)]
+async fn set_model_list(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetLlmModelListRequest>,
+) -> Result<Json<MutateResponse>> {
+    let target = state.config_path.as_ref().ok_or_else(|| {
+        GatewayError::BadRequest(
+            "gateway was started without a config file; set BAYBO_CONFIG_PATH or pass --config \
+             <path> so the mutation has a destination"
+                .into(),
+        )
+    })?;
+
+    let mut current = read_config_for_dashboard(&state).await?;
+    let entry = current
+        .llm
+        .iter_mut()
+        .find(|e| e.name == name)
+        .ok_or_else(|| GatewayError::NotFound(format!("llm entry {name:?}")))?;
+
+    let mut models: Vec<String> = Vec::with_capacity(req.models.len());
+    for raw in &req.models {
+        let model = raw.trim();
+        if model.is_empty() {
+            return Err(GatewayError::BadRequest(
+                "model ids must be non-empty".into(),
+            ));
+        }
+        // A duplicate would make `spec_for` ambiguous — it returns the first
+        // match, so the second copy's overrides would be silently inert.
+        if models.iter().any(|m| m == model) {
+            return Err(GatewayError::BadRequest(format!(
+                "model {model:?} is listed twice"
+            )));
+        }
+        models.push(model.to_string());
+    }
+
+    // The default model has to stay in its own entry's list. `LlmEntry::models`
+    // prepends it when absent, so omitting it would not actually remove it —
+    // the write would report a set the entry does not have.
+    if !models.iter().any(|m| m == entry.model.as_str()) {
+        return Err(GatewayError::BadRequest(format!(
+            "the entry's default model {:?} must stay in its model list; change `model` first if \
+             you meant to replace it",
+            entry.model
+        )));
+    }
+
+    // Carry each surviving id's overrides across. Only an id that was not
+    // there gets a bare spec, so a caller may send plain ids without having to
+    // know — or echo back — what the operator configured.
+    let previous = std::mem::take(&mut entry.model_list);
+    entry.model_list = models
+        .into_iter()
+        .map(|model| {
+            previous
+                .iter()
+                .find(|s| s.model == model)
+                .cloned()
+                .unwrap_or_else(|| baybo_config::LlmModelSpec::bare(model))
+        })
+        .collect();
+
+    // `lite_model` pointing outside the new list is caught here — the
+    // validator owns that rule and its message already says how to fix it.
+    current
+        .validate()
+        .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+    state.config_reloader.dry_run(&current).await?;
+    current
+        .write_to_file(target)
+        .await
+        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+
+    let requires_restart = super::config::apply_after_write(&state).await?;
+
+    Ok(Json(MutateResponse {
+        path: format!("llm[{name}].model_list"),
+        written_to: target.display().to_string(),
+        requires_restart,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/llm/models/{name}/catalog",
+    tag = "llm",
+    params(
+        ("name" = String, Path, description = "Entry name (matches `llm[*].name`)"),
+    ),
+    responses(
+        (status = 200, description = "The provider's live model catalog", body = LlmCatalogResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Entry not found", body = ErrorBody),
+        (status = 502, description = "The provider's catalog could not be read", body = ErrorBody),
+    )
+)]
+async fn get_catalog(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Result<Json<LlmCatalogResponse>> {
+    let cfg = read_config_for_dashboard(&state).await?;
+    let entry = cfg
+        .llm
+        .iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| GatewayError::NotFound(format!("llm entry {name:?}")))?
+        .clone();
+
+    let registry = LlmProviderRegistry::with_default_providers();
+    let provider_cfg = LlmProviderConfig {
+        provider: entry.provider.clone(),
+        api_key: resolve_api_key(
+            entry.name.as_str(),
+            &entry.provider,
+            entry.api_key_env.as_deref(),
+            Some(state.secret_vault.as_ref()),
+        )
+        .await,
+        base_url: entry.base_url.clone(),
+        // Listing a catalog names no model, and an entry mid-setup can have an
+        // empty one — the client still has to build.
+        model: if entry.model.is_empty() {
+            "unused".into()
+        } else {
+            entry.model.clone()
+        },
+        // Catalog listing only — no billing, no completion — so the entry's
+        // per-model overrides have nothing to say here.
+        supports_vision: None,
+        context_window: None,
+        pricing: None,
+        reasoning_effort: entry.reasoning_effort.clone(),
+        vault: Some(state.secret_vault.clone()),
+        proxy: cfg
+            .proxy
+            .as_ref()
+            .map(|p| baybo_security::http::ProxySettings {
+                url: p.url.clone(),
+                no_proxy: p.no_proxy.clone(),
+            }),
+    };
+
+    let live = registry
+        .list_live_models(&provider_cfg)
+        .await
+        // The failure is the provider's or the credential's, not this
+        // gateway's, and the operator's fix is on the entry.
+        .map_err(|e| GatewayError::BadRequest(format!("live model discovery: {e}")))?;
+
+    let configured = entry.models();
+    Ok(Json(LlmCatalogResponse {
+        items: live
+            .into_iter()
+            .map(|m| LlmCatalogModel {
+                configured: configured.iter().any(|s| s.model == m.id),
+                id: m.id,
+                display_name: m.display_name,
+                context_window: m.context_window,
+                supports_vision: m.supports_vision,
+            })
+            .collect(),
+    }))
 }
 
 #[utoipa::path(

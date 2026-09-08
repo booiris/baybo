@@ -559,3 +559,174 @@ async fn update_model_behind_pending_non_hot_field_reports_restart_not_400() {
         "must report restart-pending, with the LLM edit still persisted"
     );
 }
+
+// ── set_model_list ───────────────────────────────────────────────────
+
+/// Drive `PUT /v1/llm/models/{name}/model-list` and hand back the answer.
+async fn put_model_list(router: &axum::Router, entry: &str, models: Value) -> (StatusCode, Value) {
+    let req = auth(
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/llm/models/{entry}/model-list"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "models": models }).to_string()))
+            .unwrap(),
+    );
+    read_json(router.clone().oneshot(req).await.unwrap()).await
+}
+
+/// The hole this endpoint closes: before it, `model_list` could only grow —
+/// `default_spec_mut` materialises a spec and nothing over HTTP removed one.
+#[tokio::test]
+async fn set_model_list_adds_and_removes_members() {
+    let mut seed = seed_two_entries();
+    seed.llm[0].model_list = vec![
+        baybo_config::LlmModelSpec::bare("gpt-4o"),
+        baybo_config::LlmModelSpec::bare("o3-stale"),
+    ];
+    let (router, _dir, path) = router_with_seed_config(seed).await;
+
+    let (status, resp) = put_model_list(&router, "primary", json!(["gpt-4o", "o3"])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["path"], "llm[primary].model_list");
+    assert_eq!(resp["requires_restart"], false);
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    let primary = on_disk.llm_entry("primary").expect("primary present");
+    let ids: Vec<&str> = primary
+        .model_list
+        .iter()
+        .map(|s| s.model.as_str())
+        .collect();
+    assert_eq!(ids, ["gpt-4o", "o3"], "o3 added, o3-stale dropped");
+}
+
+/// A caller may send plain ids without knowing which overrides exist — so the
+/// handler has to carry a surviving id's spec across rather than replacing it
+/// with a bare one. Getting this wrong would silently wipe an operator's
+/// pricing/context/vision work on every list edit.
+#[tokio::test]
+async fn set_model_list_preserves_a_surviving_models_overrides() {
+    let mut seed = seed_two_entries();
+    let mut kept = baybo_config::LlmModelSpec::bare("gpt-4o");
+    kept.context_window = Some(64_000);
+    kept.supports_vision = Some(false);
+    seed.llm[0].model_list = vec![kept];
+    let (router, _dir, path) = router_with_seed_config(seed).await;
+
+    let (status, _) = put_model_list(&router, "primary", json!(["gpt-4o", "o3"])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    let primary = on_disk.llm_entry("primary").expect("primary present");
+    let spec = primary.spec_for("gpt-4o").expect("gpt-4o still listed");
+    assert_eq!(spec.context_window, Some(64_000));
+    assert_eq!(spec.supports_vision, Some(false));
+    // …and the newcomer arrives bare rather than inheriting anything.
+    let fresh = primary.spec_for("o3").expect("o3 listed");
+    assert_eq!(fresh.context_window, None);
+    assert_eq!(fresh.supports_vision, None);
+}
+
+/// `LlmEntry::models` PREPENDS the default when the list omits it, so a write
+/// that dropped it would not actually remove it — the endpoint would report a
+/// set the entry does not have. Refuse instead of silently re-adding.
+#[tokio::test]
+async fn set_model_list_refuses_to_drop_the_default_model() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+
+    let (status, resp) = put_model_list(&router, "primary", json!(["o3"])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("gpt-4o"),
+        "the refusal names the default it protected: {resp}"
+    );
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    assert!(
+        on_disk
+            .llm_entry("primary")
+            .expect("primary")
+            .model_list
+            .is_empty(),
+        "a refused write must not touch the file"
+    );
+}
+
+/// `spec_for` returns the FIRST match, so a duplicate id would leave the second
+/// copy's overrides permanently inert — invisible in every read-back.
+#[tokio::test]
+async fn set_model_list_rejects_duplicates_and_blank_ids() {
+    let (router, _dir, _path) = router_with_seed_config(seed_two_entries()).await;
+
+    let (status, _) = put_model_list(&router, "primary", json!(["gpt-4o", "gpt-4o"])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = put_model_list(&router, "primary", json!(["gpt-4o", "  "])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Sending the set the entry already has must be a clean no-op answer, not a
+/// conflict: the relay leg replays an idempotent request that went silent, and
+/// this shape is the reason the endpoint replaces a set instead of appending.
+#[tokio::test]
+async fn set_model_list_is_idempotent() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+
+    for _ in 0..2 {
+        let (status, _) = put_model_list(&router, "primary", json!(["gpt-4o", "o3"])).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    let ids: Vec<&str> = on_disk
+        .llm_entry("primary")
+        .expect("primary")
+        .model_list
+        .iter()
+        .map(|s| s.model.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["gpt-4o", "o3"],
+        "a replay converges, it does not double"
+    );
+}
+
+/// `lite_model` is checked by the config validator, and this endpoint is the
+/// one that can strand it. The validator owns the rule; this proves the
+/// endpoint actually runs it before writing.
+#[tokio::test]
+async fn set_model_list_refuses_to_strand_the_lite_model() {
+    let mut seed = seed_two_entries();
+    seed.llm[0].model_list = vec![
+        baybo_config::LlmModelSpec::bare("gpt-4o"),
+        baybo_config::LlmModelSpec::bare("gpt-4o-mini"),
+    ];
+    seed.llm[0].lite_model = Some("gpt-4o-mini".into());
+    let (router, _dir, path) = router_with_seed_config(seed).await;
+
+    let (status, _) = put_model_list(&router, "primary", json!(["gpt-4o"])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    assert_eq!(
+        on_disk
+            .llm_entry("primary")
+            .expect("primary")
+            .model_list
+            .len(),
+        2,
+        "a refused write must not touch the file"
+    );
+}
+
+#[tokio::test]
+async fn set_model_list_404s_for_an_unknown_entry() {
+    let (router, _dir, _path) = router_with_seed_config(seed_two_entries()).await;
+    let (status, _) = put_model_list(&router, "nope", json!(["gpt-4o"])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
