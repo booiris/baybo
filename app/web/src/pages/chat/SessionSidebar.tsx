@@ -53,8 +53,8 @@ import {
 import { SearchPanel } from './SearchPanel';
 
 // Chat zone 2: the session list sidebar (the global icon rail is zone 1, the
-// thread + floating composer is zone 3). A newest-first conversation list of
-// compact rows organised into a 2-level folder tree, plus lifted Pinned and
+// thread + floating composer is zone 3). A recency-ordered conversation list
+// of compact rows organised into a 2-level folder tree, plus lifted Pinned and
 // trailing Uncategorized buckets. Drag a chat onto a folder header to file it,
 // drag folders to reorder/nest; right-click for the full action set.
 //
@@ -149,8 +149,9 @@ function SessionRow({
   depth: number;
 } & RowCallbacks &
   RowRenameProps) {
-  // A chat is a plain draggable, NOT a sortable: chat order is server-driven
-  // (newest-first), so dragging one must not reflow the list — it only lifts
+  // A chat is a plain draggable, NOT a sortable: chat order is recency-driven
+  // (the conversation last spoken in leads), so dragging one must not reflow
+  // the list — it only lifts
   // out to drop onto a folder. The floating preview is the DragOverlay; the
   // source row just dims in place (no transform), so nothing slides around.
   //
@@ -653,8 +654,8 @@ export function SessionSidebar({
   // Pinned chats are lifted out of the tree entirely. Cron fires collapse into
   // their job's group (ignoring folder_id). Everything else is grouped by
   // folder_id; folder ids that no longer exist fall back to uncategorized so a
-  // stale folder_id never hides a chat. Incoming newest-first order is
-  // preserved within each bucket. Rules + precedence live in `sessionBuckets`.
+  // stale folder_id never hides a chat. Incoming order is preserved within
+  // each bucket. Rules + precedence live in `sessionBuckets`.
   const folderById = useMemo(() => {
     const m = new Map<string, Folder>();
     for (const f of folders) m.set(f.id, f);
@@ -814,7 +815,7 @@ export function SessionSidebar({
           onAssignFolder(src.id, overParsed.id);
         }
         // Dropping a chat over another chat is ignored — chat order is
-        // server-driven (newest-first), not user-sortable.
+        // recency-driven, not hand-arrangeable.
         return;
       }
 
