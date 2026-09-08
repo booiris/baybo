@@ -215,7 +215,9 @@ was tried and failed, and several name a bug that shipped once already.
   gateway's `llm` entries and the editor for one. The GLOBAL half of the model
   story (the picker above is the per-session half). Read it before touching
   `LlmEntryScreen` or any `llm_*` write: the one-key-per-PUT rule is what keeps
-  a live gateway defect unreachable, and the API-key row's three refusals
+  a latent gateway defect unreachable (no in-tree client triggers it today —
+  it bites the next one written the obvious way), and the API-key row's three
+  refusals
   (no clear, no cleartext binding, warn on an env shadow) each name a way the
   obvious design loses a real secret.
 - [`docs/approvals.md`](docs/approvals.md) — the native tool-approval card and

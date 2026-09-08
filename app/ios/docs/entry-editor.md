@@ -53,6 +53,17 @@ whole reason the editor commits per row rather than per form, and it is why the
 obvious `ProjectSettingsSheet` shape ("the PUT replaces the whole record, so
 every field must be sent") is exactly wrong here.
 
+To be precise about the severity: no in-tree client triggers this today.
+`app/web` dirty-tracks every field, so a `context_window` it sends was just
+typed and is meant for the new model; the CLI never goes through HTTP at all.
+It is a hazard in the API's shape, waiting for the next client written the
+obvious way — read the entry, render a form, PUT the form back. One observable
+consequence IS already live, though: `default_spec_mut()` permanently
+materialises the departing default into `model_list`, `UpdateLlmModelRequest`
+has no field for it, and `model_list` is what feeds `entry.models()` — so the
+picker's candidate list grows with every default-model switch that followed an
+override, on both clients, with no way to shrink it.
+
 It also dissolves a UniFFI limit for free. The endpoint is three-state per field
 — key absent = keep, `null` = clear, a value = set — which wants
 `Option<Option<T>>`, and UniFFI cannot express that. But a single-field edit **is
