@@ -419,7 +419,14 @@ pub struct LlmModelInfo {
     /// resolving from an environment variable. Only a stored key can be
     /// removed over HTTP, so this — not `api_key_configured` — is what decides
     /// whether the editor may offer a delete.
-    pub api_key_in_vault: bool,
+    ///
+    /// **`None` means the gateway never said**, which a gateway older than the
+    /// field cannot. It is deliberately not defaulted to `false`: every other
+    /// tolerated-absent field on this record has a zero value that means
+    /// *absence* (no base URL, no override), but `false` here is a CLAIM — "no
+    /// key is stored" — and asserting it while one is would tell the user the
+    /// opposite of the truth and hide the only control that could fix it.
+    pub api_key_in_vault: Option<bool>,
     /// The default model's `context_window` override; `None` = inherited.
     pub context_window_override: Option<u32>,
     /// What the override resolves to once the snapshot and factory defaults

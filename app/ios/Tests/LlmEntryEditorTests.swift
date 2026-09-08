@@ -184,6 +184,39 @@ struct LlmEntryEditorTests {
         #expect(cold.entry(named: "claude")?.apiKeyConfigured == true)
     }
 
+    /// `apiKeyInVault` is three-state, and the third state is the point.
+    ///
+    /// A gateway older than the field omits it. Defaulting that to `false`
+    /// would make the app assert "no key is stored" while one is — hiding the
+    /// only control that could remove it, and picking the hint that says so.
+    /// Every other tolerated-absent field on this record has a zero value that
+    /// means absence; this one's would be a claim.
+    @Test func anOlderGatewaySaysNothingAboutTheVaultRatherThanNo() async {
+        client.answerModelCatalog(
+            LlmModelCatalog(
+                defaultName: "claude",
+                items: [
+                    // The gateway that predates the field, as the FFI decodes it.
+                    LlmFixtures.entry("claude", model: "claude-sonnet-5", apiKeyInVault: nil),
+                    LlmFixtures.entry("gpt", model: "gpt-5.5", apiKeyInVault: false),
+                    LlmFixtures.entry("kimi", model: "k2", apiKeyInVault: true),
+                ]))
+        let catalog = ModelCatalog(client: client, directory: temp.url)
+        catalog.refreshIfNeeded()
+        _ = await waitUntil { !catalog.models.isEmpty }
+
+        #expect(catalog.entry(named: "claude")?.apiKeyInVault == nil, "unknown, not `no`")
+        #expect(catalog.entry(named: "gpt")?.apiKeyInVault == false)
+        #expect(catalog.entry(named: "kimi")?.apiKeyInVault == true)
+
+        // And the distinction survives the mirror — a cold offline start must
+        // not turn "never said" into "said no" either.
+        let cold = ModelCatalog(client: FakeBayboClient(), directory: temp.url)
+        #expect(cold.entry(named: "claude")?.apiKeyInVault == nil)
+        #expect(cold.entry(named: "gpt")?.apiKeyInVault == false)
+        #expect(cold.entry(named: "kimi")?.apiKeyInVault == true)
+    }
+
     /// A mirror written before the editor existed carries only the six original
     /// fields. It must still decode — painting the pre-editor subset until the
     /// next live fetch — rather than throwing the whole catalog away.
