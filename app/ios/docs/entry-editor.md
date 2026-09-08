@@ -28,12 +28,14 @@ Two more absences, each load-bearing:
   the entry from the pool, `dry_run` passes, the file is written, and
   `GET /v1/llm/models` keeps listing a row that no longer exists. A free-text
   field here would be a silent 200-OK deletion.
-- **No "clear key" affordance.** `api_key: ""` does **not** clear the vault —
-  the handler logs the request and returns, leaving the prior secret in place —
-  and no HTTP route deletes a vault key at all. The DTO's doc comment promises
-  the opposite and has already generated into the OpenAPI schema `app/web`
-  consumes; build from the handler, not the doc. The FFI refuses an empty key
-  before the wire rather than reporting success for a write that did nothing.
+- **Removal is offered on `api_key_in_vault`, not `api_key_configured`.**
+  `configured` means a key RESOLVES — env var included — and only what the
+  vault holds can be deleted. Offering removal on an env-provided key would be
+  a button that reports success and changes nothing. (`api_key: ""` used to be
+  exactly that: the handler logged the request and kept the secret, while the
+  DTO promised a delete and had already generated that promise into the TS
+  client. It now really deletes, and the rollback below is what makes staging
+  it before the pre-flight safe.)
 
 `lite_model` and pricing are read-only over HTTP and are not rendered — a row
 you cannot act on is noise. `lite_model` earns its keep only as the Model
@@ -80,11 +82,21 @@ a sum type**: `LlmEntryEdit` has one variant per row, `None` means `null`, and
 mapping lives, and **no `skip_serializing_if` may ever appear in it** — that
 would silently turn every clear into a keep.
 
-The same rule covers a second hazard: the vault write lands **before** the
-pre-flight that can reject it, so a request rotating a key alongside an
-unbuildable change returns 400 with the config untouched and the secret already
-replaced. Combined with the un-clearable key above, that is unrecoverable from
-the phone. A key that rides alone cannot be in such a request.
+The endpoint now also **refuses `model` in the same request as
+`context_window` / `supports_vision` / `pricing`** — the transplant made
+unrepresentable at the source rather than only avoided by this client. A caller
+that wants both sends two requests, and the second one's form is seeded from
+what the new model actually resolves to.
+
+A second hazard shares the shape: the vault write lands **before** the
+pre-flight that can reject it, because a dry run has to resolve the credential
+it is validating. That window is now closed by a rollback — the handler
+snapshots the previous secret, applies the change, and restores it if the
+pre-flight or the file write fails. Without that, a refused edit answered 400
+with the config untouched and the secret already gone, and since the clear is
+the only way to remove a key there was nothing left to put back. A key that
+rides alone in its own request is still the right habit, and this screen's
+one-key-per-PUT rule gives it for free.
 
 ## The model list
 
@@ -235,7 +247,10 @@ non-2xx into a bare status code, so the copy is generic on purpose; the probe's
 
 - `crates/gateway/tests/llm_endpoint.rs` — the list endpoint's add/remove, that
   a surviving id keeps its overrides, the three refusals, and that a replay
-  converges rather than doubling.
+  converges rather than doubling; the api-key store/clear/absent trio, both
+  rollback paths (a refused rotation and a refused clear), `api_key_in_vault`
+  vs `api_key_configured`, and that `model` beside a per-model fact is refused
+  while the same edit split in two succeeds.
 - `ffi/src/gateway_api.rs` — one key per body and explicit nulls, the empty-key
   refusal, `POST_ONCE` for the probe, `requires_restart` surviving the decode,
   path escaping, the widened narrow (both the override and effective columns,

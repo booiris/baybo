@@ -10650,6 +10650,7 @@
           "provider",
           "model",
           "api_key_configured",
+          "api_key_in_vault",
           "available_efforts",
           "is_default",
           "effective_context_window",
@@ -10666,6 +10667,10 @@
               "string",
               "null"
             ]
+          },
+          "api_key_in_vault": {
+            "type": "boolean",
+            "description": "`true` when a key is stored in THIS gateway's vault, as opposed to\nmerely resolving from an environment variable.\n\nThe two differ in what a client may offer: only a vault key can be\nremoved over HTTP (`api_key: \"\"`), and offering that on an entry whose\nkey comes from the environment would be a button that reports success\nand changes nothing."
           },
           "available_efforts": {
             "type": "array",
@@ -12284,7 +12289,7 @@
               "string",
               "null"
             ],
-            "description": "Set the literal API key in the vault (`llm.entry.<name>.api_key`).\nPass `\"\"` to remove the vault entry, or omit the field to leave\nthe vault untouched. Never echoed back."
+            "description": "Set the literal API key in the vault (`llm.entry.<name>.api_key`).\nPass `\"\"` to delete the stored key, or omit the field to leave the\nvault untouched. Never echoed back.\n\nA delete only removes what THIS vault holds; if `api_key_env` or the\nprovider's default env var still resolves, the entry keeps working and\n`api_key_configured` stays true."
           },
           "api_key_env": {
             "type": [

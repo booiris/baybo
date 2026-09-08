@@ -4257,13 +4257,30 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The key is never read back — leave this blank to keep the current one. It cannot be removed from here, only replaced."
+            "value": "The key is never read back — leave this blank to keep whatever is set."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "密钥不会被读回——留空就是保持当前密钥。这里只能替换，不能删除。"
+            "value": "密钥不会被读回——留空就是保持现状。"
+          }
+        }
+      }
+    },
+    "llm.keyHintStored": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The key is never read back — leave this blank to keep it. Removing it deletes only what this gateway stores; an environment variable would still apply."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "密钥不会被读回——留空就是保持不变。删除只会清掉这个网关里存的那份；环境变量里的仍然有效。"
           }
         }
       }
@@ -4570,6 +4587,74 @@
           "stringUnit": {
             "state": "translated",
             "value": "服务商默认（开）"
+          }
+        }
+      }
+    },
+    "llm.removeKey": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove the stored key"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除已存的密钥"
+          }
+        }
+      }
+    },
+    "llm.removeKeyCommit": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除"
+          }
+        }
+      }
+    },
+    "llm.removeKeyExplain": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "It cannot be read back or restored. This entry stops working until a new key is set, unless an environment variable supplies one."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "密钥无法读回，也无法恢复。除非有环境变量提供，否则这个条目会一直不可用，直到设置新密钥。"
+          }
+        }
+      }
+    },
+    "llm.removeKeyTitle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove the stored key?"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除已存的密钥？"
           }
         }
       }

@@ -234,6 +234,7 @@ final class ModelCatalog: ObservableObject {
             var baseUrl: String?
             var apiKeyEnv: String?
             var apiKeyConfigured: Bool?
+            var apiKeyInVault: Bool?
             var contextWindowOverride: UInt32?
             var effectiveContextWindow: UInt32?
             var supportsVisionOverride: Bool?
@@ -255,6 +256,7 @@ final class ModelCatalog: ObservableObject {
                 baseUrl: $0.baseUrl,
                 apiKeyEnv: $0.apiKeyEnv,
                 apiKeyConfigured: $0.apiKeyConfigured ?? false,
+                apiKeyInVault: $0.apiKeyInVault ?? false,
                 contextWindowOverride: $0.contextWindowOverride,
                 effectiveContextWindow: $0.effectiveContextWindow ?? 0,
                 supportsVisionOverride: $0.supportsVisionOverride,
@@ -274,6 +276,7 @@ final class ModelCatalog: ObservableObject {
                     baseUrl: $0.baseUrl,
                     apiKeyEnv: $0.apiKeyEnv,
                     apiKeyConfigured: $0.apiKeyConfigured,
+                    apiKeyInVault: $0.apiKeyInVault,
                     contextWindowOverride: $0.contextWindowOverride,
                     effectiveContextWindow: $0.effectiveContextWindow,
                     supportsVisionOverride: $0.supportsVisionOverride,
@@ -304,7 +307,7 @@ final class ModelCatalog: ObservableObject {
                     name: "claude", provider: "anthropic", model: "claude-sonnet-5",
                     modelCandidates: ["claude-opus-4-8"], reasoningEffort: nil,
                     availableEfforts: ["low", "medium", "high", "xhigh", "max"],
-                    liteModel: nil, baseUrl: nil, apiKeyEnv: nil, apiKeyConfigured: true,
+                    liteModel: nil, baseUrl: nil, apiKeyEnv: nil, apiKeyConfigured: true, apiKeyInVault: true,
                     contextWindowOverride: nil, effectiveContextWindow: 200_000,
                     supportsVisionOverride: nil, effectiveSupportsVision: true),
                 LlmModelInfo(
@@ -312,7 +315,7 @@ final class ModelCatalog: ObservableObject {
                     modelCandidates: ["gpt-5.5-mini", "o3"], reasoningEffort: "xhigh",
                     availableEfforts: ["low", "medium", "high", "xhigh", "max"],
                     liteModel: "gpt-5.5-mini", baseUrl: "https://proxy.test/v1",
-                    apiKeyEnv: "OPENAI_KEY", apiKeyConfigured: false,
+                    apiKeyEnv: "OPENAI_KEY", apiKeyConfigured: false, apiKeyInVault: false,
                     contextWindowOverride: 400_000, effectiveContextWindow: 400_000,
                     supportsVisionOverride: false, effectiveSupportsVision: false),
             ]

@@ -3092,6 +3092,16 @@ export interface components {
             api_key_configured: boolean;
             api_key_env?: string | null;
             /**
+             * @description `true` when a key is stored in THIS gateway's vault, as opposed to
+             *     merely resolving from an environment variable.
+             *
+             *     The two differ in what a client may offer: only a vault key can be
+             *     removed over HTTP (`api_key: ""`), and offering that on an entry whose
+             *     key comes from the environment would be a button that reports success
+             *     and changes nothing.
+             */
+            api_key_in_vault: boolean;
+            /**
              * @description The thinking levels this entry's provider can actually be told, in
              *     display order (cheapest first). Empty when baybo sends this provider
              *     no effort at all, which is a picker's cue to offer none rather than a
@@ -3895,8 +3905,12 @@ export interface components {
         UpdateLlmModelRequest: {
             /**
              * @description Set the literal API key in the vault (`llm.entry.<name>.api_key`).
-             *     Pass `""` to remove the vault entry, or omit the field to leave
-             *     the vault untouched. Never echoed back.
+             *     Pass `""` to delete the stored key, or omit the field to leave the
+             *     vault untouched. Never echoed back.
+             *
+             *     A delete only removes what THIS vault holds; if `api_key_env` or the
+             *     provider's default env var still resolves, the entry keeps working and
+             *     `api_key_configured` stays true.
              */
             api_key?: string | null;
             /** @description Environment variable name holding the API key, or `null` to clear. */
