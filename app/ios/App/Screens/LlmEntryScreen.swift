@@ -593,7 +593,12 @@ struct LlmEntryScreen: View {
         // also true when an env var supplies the key, and only what the vault
         // holds can be deleted over HTTP. A remove button on an env-provided
         // key would report success and change nothing.
-        if entry.apiKeyInVault && !cleartext {
+        //
+        // `== true` rather than a truthiness test, because the field is
+        // THREE-state: `nil` is a gateway too old to have the field, and on
+        // such a gateway the delete is a no-op anyway. Only an explicit `true`
+        // earns the button.
+        if entry.apiKeyInVault == true && !cleartext {
             Button {
                 Haptics.tap()
                 confirmingKeyRemoval = true
@@ -608,7 +613,10 @@ struct LlmEntryScreen: View {
             .accessibilityIdentifier("llm-remove-key")
         }
 
-        hint(lang.t(entry.apiKeyInVault ? "llm.keyHintStored" : "llm.keyHint"))
+        // The removal-explaining hint belongs only where removal is offered.
+        // `nil` and `false` share the plain one: neither can remove anything,
+        // and neither should claim to know that nothing is stored.
+        hint(lang.t(entry.apiKeyInVault == true ? "llm.keyHintStored" : "llm.keyHint"))
     }
 
     // MARK: - Row + control vocabulary

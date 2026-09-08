@@ -234,6 +234,9 @@ final class ModelCatalog: ObservableObject {
             var baseUrl: String?
             var apiKeyEnv: String?
             var apiKeyConfigured: Bool?
+            /// Three-state like the record it mirrors: absent in a mirror
+            /// written before the field, and absent from a gateway that has
+            /// none. Both mean "unknown", which is the same answer.
             var apiKeyInVault: Bool?
             var contextWindowOverride: UInt32?
             var effectiveContextWindow: UInt32?
@@ -256,7 +259,7 @@ final class ModelCatalog: ObservableObject {
                 baseUrl: $0.baseUrl,
                 apiKeyEnv: $0.apiKeyEnv,
                 apiKeyConfigured: $0.apiKeyConfigured ?? false,
-                apiKeyInVault: $0.apiKeyInVault ?? false,
+                apiKeyInVault: $0.apiKeyInVault,
                 contextWindowOverride: $0.contextWindowOverride,
                 effectiveContextWindow: $0.effectiveContextWindow ?? 0,
                 supportsVisionOverride: $0.supportsVisionOverride,

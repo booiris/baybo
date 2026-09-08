@@ -31,7 +31,17 @@ Two more absences, each load-bearing:
 - **Removal is offered on `api_key_in_vault`, not `api_key_configured`.**
   `configured` means a key RESOLVES — env var included — and only what the
   vault holds can be deleted. Offering removal on an env-provided key would be
-  a button that reports success and changes nothing. (`api_key: ""` used to be
+  a button that reports success and changes nothing.
+
+  The field is **three-state**, and the third state is load-bearing: `None` is
+  a gateway older than the field, which cannot answer. It is deliberately not
+  `#[serde(default)]`-ed to `false` like the rest of the row. Every other
+  tolerated-absent field here has a zero value that means *absence* — no base
+  URL, no override — but `false` here is a CLAIM, "no key is stored", and
+  asserting it against an old gateway would tell the user the opposite of the
+  truth while hiding the control that could fix it. **A default whose zero
+  value is a statement rather than an absence must be `Option`.** Only an
+  explicit `true` earns the button; `None` and `false` share the plain hint. (`api_key: ""` used to be
   exactly that: the handler logged the request and kept the secret, while the
   DTO promised a delete and had already generated that promise into the TS
   client. It now really deletes, and the rollback below is what makes staging

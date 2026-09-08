@@ -582,8 +582,10 @@ struct WireLlmModel {
     api_key_env: Option<String>,
     #[serde(default)]
     api_key_configured: bool,
+    /// Absent on a gateway older than the field, and that has to stay
+    /// distinguishable from `false` — see the record's own doc comment.
     #[serde(default)]
-    api_key_in_vault: bool,
+    api_key_in_vault: Option<bool>,
     #[serde(default)]
     context_window_override: Option<u32>,
     #[serde(default)]
@@ -3660,8 +3662,11 @@ mod tests {
         assert_eq!(bare.base_url, None);
         // Resolvable is not the same as stored: only a stored key can be
         // deleted over HTTP, so only a stored key may be offered for deletion.
-        assert!(!bare.api_key_in_vault, "this row's key comes from the env");
-        assert!(entry.api_key_in_vault);
+        assert_eq!(
+            bare.api_key_in_vault, None,
+            "this row omits the field, which is not the same as saying `false`"
+        );
+        assert_eq!(entry.api_key_in_vault, Some(true));
     }
 
     /// The pin read rides the session detail with `limit=1` — the smallest page

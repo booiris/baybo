@@ -25,7 +25,7 @@ enum LlmFixtures {
         baseUrl: String? = nil,
         apiKeyEnv: String? = nil,
         apiKeyConfigured: Bool = true,
-        apiKeyInVault: Bool = false,
+        apiKeyInVault: Bool? = false,
         contextWindowOverride: UInt32? = nil,
         effectiveContextWindow: UInt32 = 200_000,
         supportsVisionOverride: Bool? = nil,
