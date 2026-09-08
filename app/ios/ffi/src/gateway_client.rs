@@ -64,6 +64,13 @@ impl GatewayJsonClient for ActiveGatewayClient {
         forward!(self, c => c.put_empty(path, body))
     }
 
+    async fn put_json<'a, T>(&'a self, path: &'a str, body: Vec<u8>) -> Result<T, String>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        forward!(self, c => c.put_json::<T>(path, body))
+    }
+
     async fn delete_empty<'a>(&'a self, path: &'a str) -> Result<(), String> {
         forward!(self, c => c.delete_empty(path))
     }

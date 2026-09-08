@@ -360,10 +360,22 @@ pub struct SubagentCursor {
     pub session_id: String,
 }
 
-/// One selectable LLM entry for the chat header's model picker — a `baybo.json`
-/// entry, narrowed from the gateway's `LlmModelEntry`. `name` is the entry name
-/// (what a session pin references); the picker lists it by name and offers the
-/// models it can serve (`model` + `model_candidates`).
+/// One configured LLM entry — a `baybo.json` entry, narrowed from the gateway's
+/// `LlmModelEntry`. `name` is the entry name (what a session pin references);
+/// the picker lists it by name and offers the models it can serve
+/// (`model` + `model_candidates`).
+///
+/// Two surfaces read this record and they want different halves of it. The chat
+/// header's picker needs only the identity + the pick sets; the Settings entry
+/// EDITOR also needs the config the gateway will let a client change, plus the
+/// **effective** values those overrides resolve to. The effective columns are
+/// computed gateway-side by layering an override over the OpenRouter snapshot
+/// and the provider's factory defaults — tables the phone does not have — so
+/// they can only ever be read, never derived here.
+///
+/// There is deliberately no `is_default`: the catalog's `default_name` is the
+/// one home for that question, and a per-row copy would be a second spelling
+/// of it that can disagree.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct LlmModelInfo {
     pub name: String,
@@ -385,6 +397,113 @@ pub struct LlmModelInfo {
     /// effort from baybo at all, and the Thinking row is hidden rather than
     /// offering picks that would never reach the wire.
     pub available_efforts: Vec<String>,
+
+    /// The cheaper model this entry uses for lightweight auxiliary calls, when
+    /// one is configured. Read-only over HTTP (`UpdateLlmModelRequest` has no
+    /// field for it), so the editor never renders it as a row — it exists only
+    /// to warn that switching `model` away from it can be rejected.
+    pub lite_model: Option<String>,
+    /// Custom endpoint, or `None` for the provider's own. Nothing validates it
+    /// gateway-side: a wrong host builds a client fine (construction is local
+    /// and offline) and fails at the entry's first real turn.
+    pub base_url: Option<String>,
+    /// The env var name holding this entry's key. When set it OUTRANKS the
+    /// vault, so a key stored from the phone is inert until this is cleared.
+    pub api_key_env: Option<String>,
+    /// Whether a key currently RESOLVES for this entry — across the env var,
+    /// the vault, and the provider default. Not "a key is stored", and not an
+    /// error when false: `ollama` takes an optional key and `llamafile` none
+    /// at all, so a healthy local entry sits here permanently.
+    pub api_key_configured: bool,
+    /// The default model's `context_window` override; `None` = inherited.
+    pub context_window_override: Option<u32>,
+    /// What the override resolves to once the snapshot and factory defaults
+    /// are layered under it. Seeding an editor with THIS and saving it back
+    /// would manufacture an override out of an inherited value, pinning the
+    /// model to a number that used to track the snapshot.
+    pub effective_context_window: u32,
+    /// The default model's `supports_vision` override; `None` = inherited.
+    /// Three states, which is why the editor cannot use a two-state toggle.
+    pub supports_vision_override: Option<bool>,
+    pub effective_supports_vision: bool,
+}
+
+/// One field of one LLM entry, as `PUT /v1/llm/models/{name}` is told to change
+/// it — the write half of [`LlmModelInfo`].
+///
+/// **One variant per request, and that is the point.** The endpoint is
+/// three-state per field (key absent = keep, `null` = clear the override, a
+/// value = set it), and its handler assigns `entry.model` BEFORE it resolves
+/// the spec that `context_window` / `supports_vision` land on. A body carrying
+/// `model` alongside either of those therefore moves the departing model's
+/// overrides onto its successor, and answers 200. Sending exactly one key makes
+/// that state unreachable rather than a rule someone has to remember.
+///
+/// It also dissolves a UniFFI limit for free: the three-state contract wants
+/// `Option<Option<T>>`, which UniFFI cannot express — but a single-field edit
+/// IS a sum type, so `None` here means `null` on the wire and "keep" is simply
+/// a variant nobody sent.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum LlmEntryEdit {
+    /// The entry's default model. Must be one of `model_candidates` — nothing
+    /// gateway-side checks a model id against the vendor, so a typo would
+    /// build, list, and validate cleanly, then fail at the first completion.
+    Model {
+        model: String,
+    },
+    BaseUrl {
+        url: Option<String>,
+    },
+    /// Store a key in the gateway's vault. Never empty: an empty string does
+    /// NOT clear the key — the handler logs and returns, leaving the prior
+    /// secret in place — so sending one would report success for a write that
+    /// did nothing. No HTTP path can clear a vault key at all.
+    ApiKey {
+        key: String,
+    },
+    ApiKeyEnv {
+        env: Option<String>,
+    },
+    ReasoningEffort {
+        effort: Option<String>,
+    },
+    ContextWindow {
+        tokens: Option<u32>,
+    },
+    SupportsVision {
+        on: Option<bool>,
+    },
+}
+
+/// What a config mutation answers with.
+///
+/// `requires_restart` means **persisted to disk but not live**: the reloader
+/// stored the new baseline and returned before rebuilding the LLM pool, which
+/// happens when some other non-hot field was already pending on disk. It is
+/// load-bearing for the editor — in that state the running pool still holds the
+/// old client, while `POST /v1/llm/models/{name}/test` reads the config from
+/// DISK, so a probe would certify settings nobody is running.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LlmMutateResult {
+    pub requires_restart: bool,
+}
+
+/// One probe of an entry's default model (`POST /v1/llm/models/{name}/test`) —
+/// a real, billed completion against the provider.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LlmTestResult {
+    pub ok: bool,
+    /// The provider's own error, verbatim, when `ok` is false. Suitable for
+    /// display: it is the only place in this whole surface where a gateway-side
+    /// failure reaches the phone as prose rather than a bare status code.
+    pub error: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    /// What actually ran — echoed back because the entry may have been edited
+    /// between the screen painting and the probe firing.
+    pub provider: String,
+    pub model: String,
 }
 
 /// The gateway's configured LLM entries plus the current `default-llm` name

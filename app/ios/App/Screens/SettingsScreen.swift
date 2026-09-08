@@ -7,6 +7,9 @@ struct SettingsScreen: View {
     @Environment(\.openURL) private var openURL
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
+    /// Only for the Models row's trailing value — the `default-llm` name. The
+    /// mirror paints it cold, so a returning launch shows it before any fetch.
+    @ObservedObject private var catalog = ModelCatalog.shared
 
     /// Clearance for the overlaid header; the native tab bar's bottom inset is
     /// handled by the system, so the bottom is just a breathing gap.
@@ -29,6 +32,16 @@ struct SettingsScreen: View {
                 ) {
                     Haptics.tap()
                     lang.toggle()
+                }
+                divider
+                actionRow(
+                    icon: "cpu",
+                    title: lang.t("settings.models"),
+                    value: catalog.defaultName,
+                    identifier: "settings-models"
+                ) {
+                    Haptics.tap()
+                    appStore.openLlmEntries()
                 }
                 divider
                 actionRow(
@@ -59,6 +72,10 @@ struct SettingsScreen: View {
         }
         .padding(.top, Self.topInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // A first run that opened Settings before any chat has no catalog yet,
+        // and the Models row would read blank. Latched once per run, so this is
+        // free on every later visit.
+        .onAppear { catalog.refreshIfNeeded() }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
                 logoutButton
@@ -86,12 +103,18 @@ struct SettingsScreen: View {
     }
 
     private func actionRow(
-        icon: String, title: String, value: String? = nil, action: @escaping () -> Void
+        icon: String, title: String, value: String? = nil, identifier: String? = nil,
+        action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
             rowContent(icon: icon, title: title, value: value, chevron: true)
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier(identifier ?? "")
+        // The value is the row's state, not part of its name: a by-label query
+        // must keep matching while `default-llm` changes underneath it.
+        .accessibilityLabel(Text(verbatim: title))
+        .accessibilityValue(Text(verbatim: value ?? ""))
     }
 
     private func openExternalURL(_ value: String) {
