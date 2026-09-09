@@ -9,9 +9,10 @@ use crate::api::{
     ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary, ChatSubagentList,
     ChatSubagentStatus, ChatSubagentSummary, CronJobStatus, CronJobSummary, DeckCardInfo,
     DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, HiredBy, IssueAttachmentInfo,
-    IssueAttachmentInput, IssueInfo, IssuePriority, IssueRunInfo, IssueStatus, LlmModelCatalog,
-    LlmModelInfo, ProjectActivity, ProjectAttention, ProjectInfo, RunStatus, RunTrigger,
-    SessionModelPin, SubIssueProgress, SubagentCursor, TeamMemberInfo,
+    IssueAttachmentInput, IssueInfo, IssuePriority, IssueRunInfo, IssueStatus, LlmCatalogModel,
+    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, ProjectActivity,
+    ProjectAttention, ProjectInfo, RunStatus, RunTrigger, SessionModelPin, SubIssueProgress,
+    SubagentCursor, TeamMemberInfo,
 };
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
@@ -22,6 +23,10 @@ const PATH_CHAT_SUBAGENTS: &str = "/v1/chat/subagents";
 const PATH_CHAT_SEARCH: &str = "/v1/chat/search";
 const PATH_CRON: &str = "/v1/cron";
 const PATH_LLM_MODELS: &str = "/v1/llm/models";
+/// The gateway-wide `default-llm` — the entry every UNPINNED session resolves
+/// against. A SIBLING of `/v1/llm/models`, not a sub-path of it, so it cannot
+/// be derived from the const above.
+const PATH_LLM_DEFAULT: &str = "/v1/llm/default";
 const PATH_AGENTS: &str = "/v1/agents";
 const PATH_DECK: &str = "/v1/deck";
 /// The kanban boards. Every card, run, comment and approval on the phone
@@ -77,6 +82,19 @@ pub(crate) trait GatewayJsonClient {
         path: &'a str,
         body: Vec<u8>,
     ) -> impl Future<Output = Result<(), String>> + Send + 'a;
+
+    /// PUT that DECODES its response. The config-mutation routes answer with a
+    /// `MutateResponse` whose `requires_restart` is the only way to tell a
+    /// persisted-and-live edit from a persisted-but-staged one — and the two
+    /// need different copy and a different Test-connection affordance, so
+    /// discarding the body the way `put_empty` does is not an option there.
+    fn put_json<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static;
 
     fn delete_empty<'a>(
         &'a self,
@@ -529,8 +547,10 @@ pub(crate) struct ChatMessageLookupResponse {
     pub(crate) ordinal: Option<i64>,
 }
 
-/// `GET /v1/llm/models`, narrowed to the picker's fields. The gateway row
-/// carries a full dashboard's worth of config/pricing detail — serde drops it.
+/// `GET /v1/llm/models`, narrowed to what the picker and the entry editor
+/// between them read. The gateway row also carries pricing detail and an
+/// `is_default` flag — serde drops both: pricing has no editor over HTTP, and
+/// the default's one home is `default_name` on the envelope.
 #[derive(Deserialize)]
 struct LlmModelsList {
     default_name: String,
@@ -554,11 +574,88 @@ struct WireLlmModel {
     /// Thinking row rather than offering inert picks.
     #[serde(default)]
     available_efforts: Vec<String>,
+    #[serde(default)]
+    lite_model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    api_key_configured: bool,
+    /// Absent on a gateway older than the field, and that has to stay
+    /// distinguishable from `false` — see the record's own doc comment.
+    #[serde(default)]
+    api_key_in_vault: Option<bool>,
+    #[serde(default)]
+    context_window_override: Option<u32>,
+    #[serde(default)]
+    effective_context_window: u32,
+    #[serde(default)]
+    supports_vision_override: Option<bool>,
+    #[serde(default)]
+    effective_supports_vision: bool,
 }
 
 #[derive(Deserialize)]
 struct WireLlmModelSpec {
     model: String,
+}
+
+/// The config-mutation answer shared by `PUT /v1/llm/models/{name}` and
+/// `PUT /v1/llm/default`. `path` and `written_to` describe a file on the
+/// gateway's disk and mean nothing on a phone; only the restart flag is read.
+#[derive(Deserialize)]
+struct WireMutateResponse {
+    #[serde(default)]
+    requires_restart: bool,
+}
+
+/// `POST /v1/llm/models/{name}/test`. Every optional field is absent on the
+/// branch that does not produce it — a failed probe carries `error` and no
+/// timings, a green one the reverse.
+#[derive(Deserialize)]
+struct WireLlmTestResult {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    latency_ms: Option<u64>,
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+    provider: String,
+    model: String,
+}
+
+/// `PUT /v1/llm/default` body.
+#[derive(Serialize)]
+struct SetDefaultLlmRequest<'a> {
+    name: &'a str,
+}
+
+/// `PUT /v1/llm/models/{name}/model-list` body — the whole served SET.
+#[derive(Serialize)]
+struct SetLlmModelListRequest<'a> {
+    models: &'a [String],
+}
+
+/// `GET /v1/llm/models/{name}/catalog` response.
+#[derive(Deserialize)]
+struct WireLlmCatalog {
+    #[serde(default)]
+    items: Vec<WireLlmCatalogModel>,
+}
+
+#[derive(Deserialize)]
+struct WireLlmCatalogModel {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    configured: bool,
 }
 
 /// `GET /v1/chat/sessions/{id}?limit=1` read for the session meta only — the
@@ -1249,8 +1346,139 @@ pub(crate) async fn list_llm_models<C: GatewayJsonClient + Sync>(
                 model_candidates: m.model_list.into_iter().map(|s| s.model).collect(),
                 reasoning_effort: m.reasoning_effort,
                 available_efforts: m.available_efforts,
+                lite_model: m.lite_model,
+                base_url: m.base_url,
+                api_key_env: m.api_key_env,
+                api_key_configured: m.api_key_configured,
+                api_key_in_vault: m.api_key_in_vault,
+                context_window_override: m.context_window_override,
+                effective_context_window: m.effective_context_window,
+                supports_vision_override: m.supports_vision_override,
+                effective_supports_vision: m.effective_supports_vision,
             })
             .collect(),
+    })
+}
+
+/// The JSON body for ONE field edit — exactly one key, always present.
+///
+/// The absent/`null`/value contract lives entirely in this function: a key that
+/// is here with `null` clears the override, and every key that is NOT here is
+/// left alone. So `skip_serializing_if` must never appear on any of these —
+/// it would silently turn every "clear" into a "keep".
+fn entry_edit_body(edit: &LlmEntryEdit) -> serde_json::Value {
+    match edit {
+        LlmEntryEdit::Model { model } => serde_json::json!({ "model": model }),
+        LlmEntryEdit::BaseUrl { url } => serde_json::json!({ "base_url": url }),
+        LlmEntryEdit::ApiKey { key } => serde_json::json!({ "api_key": key }),
+        LlmEntryEdit::ApiKeyEnv { env } => serde_json::json!({ "api_key_env": env }),
+        LlmEntryEdit::ReasoningEffort { effort } => {
+            serde_json::json!({ "reasoning_effort": effort })
+        }
+        LlmEntryEdit::ContextWindow { tokens } => serde_json::json!({ "context_window": tokens }),
+        LlmEntryEdit::SupportsVision { on } => serde_json::json!({ "supports_vision": on }),
+    }
+}
+
+/// Change ONE field of one LLM entry. See [`LlmEntryEdit`] for why the request
+/// carries a single key and never a whole entry.
+pub(crate) async fn update_llm_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+    edit: LlmEntryEdit,
+) -> Result<LlmMutateResult, String> {
+    validate_path_segment(&name, "llm entry name")?;
+    let body = serde_json::to_vec(&entry_edit_body(&edit))
+        .map_err(|e| format!("encode llm entry edit: {e}"))?;
+    let path = format!("{PATH_LLM_MODELS}/{}", percent_encode(&name));
+    let wire: WireMutateResponse = client.put_json(&path, body).await?;
+    Ok(LlmMutateResult {
+        requires_restart: wire.requires_restart,
+    })
+}
+
+/// Probe an entry's default model with one real completion.
+///
+/// **`post_json_once`, never `post_json`.** The relay replays a pooled leg that
+/// went silent, and this probe routinely outlives that budget: the gateway
+/// allows 60s to connect and a 600s idle read with no total cap, against a
+/// 15s-to-first-byte pooled leg. A replay here is a second billed completion —
+/// and an invisible one, because the probe runs with cost hooks passed through,
+/// so it never lands on a `cost_records` row.
+pub(crate) async fn test_llm_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+) -> Result<LlmTestResult, String> {
+    validate_path_segment(&name, "llm entry name")?;
+    let path = format!("{PATH_LLM_MODELS}/{}/test", percent_encode(&name));
+    let wire: WireLlmTestResult = client.post_json_once(&path, Vec::new()).await?;
+    Ok(LlmTestResult {
+        ok: wire.ok,
+        error: wire.error,
+        latency_ms: wire.latency_ms,
+        input_tokens: wire.input_tokens,
+        output_tokens: wire.output_tokens,
+        provider: wire.provider,
+        model: wire.model,
+    })
+}
+
+/// Replace the models an entry serves.
+///
+/// A whole-set PUT, not add/remove, for two reasons: model ids routinely carry
+/// a slash (`meta-llama/Llama-3-70B`) and would be unsafe in a path segment,
+/// and replacing a set is idempotent — a relay leg that replays this converges
+/// instead of double-adding. The gateway carries each surviving id's overrides
+/// across, so sending plain ids never destroys the operator's work.
+pub(crate) async fn set_llm_model_list<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+    models: Vec<String>,
+) -> Result<LlmMutateResult, String> {
+    validate_path_segment(&name, "llm entry name")?;
+    let body = serde_json::to_vec(&SetLlmModelListRequest { models: &models })
+        .map_err(|e| format!("encode set model list request: {e}"))?;
+    let path = format!("{PATH_LLM_MODELS}/{}/model-list", percent_encode(&name));
+    let wire: WireMutateResponse = client.put_json(&path, body).await?;
+    Ok(LlmMutateResult {
+        requires_restart: wire.requires_restart,
+    })
+}
+
+/// The provider's LIVE model catalog for one entry — the pick list behind
+/// "add a model". A real call out to the vendor, so it is slow and it fails
+/// for an entry whose credentials are not good yet.
+pub(crate) async fn llm_catalog<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+) -> Result<Vec<LlmCatalogModel>, String> {
+    validate_path_segment(&name, "llm entry name")?;
+    let path = format!("{PATH_LLM_MODELS}/{}/catalog", percent_encode(&name));
+    let wire: WireLlmCatalog = client.get_json(&path).await?;
+    Ok(wire
+        .items
+        .into_iter()
+        .map(|m| LlmCatalogModel {
+            id: m.id,
+            display_name: m.display_name,
+            context_window: m.context_window,
+            configured: m.configured,
+        })
+        .collect())
+}
+
+/// Move the gateway's `default-llm` to `name` — the GLOBAL entry every unpinned
+/// session follows, not a per-session pin (`set_session_model` is that one).
+/// The name rides the BODY, so nothing about it touches the path.
+pub(crate) async fn set_default_llm<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+) -> Result<LlmMutateResult, String> {
+    let body = serde_json::to_vec(&SetDefaultLlmRequest { name: &name })
+        .map_err(|e| format!("encode set default llm request: {e}"))?;
+    let wire: WireMutateResponse = client.put_json(PATH_LLM_DEFAULT, body).await?;
+    Ok(LlmMutateResult {
+        requires_restart: wire.requires_restart,
     })
 }
 
@@ -2493,6 +2721,20 @@ mod tests {
             }
         }
 
+        fn put_json<'a, T>(
+            &'a self,
+            path: &'a str,
+            body: Vec<u8>,
+        ) -> impl Future<Output = Result<T, String>> + Send + 'a
+        where
+            T: DeserializeOwned + Send + 'static,
+        {
+            async move {
+                self.record("PUT", path, &body);
+                self.decode()
+            }
+        }
+
         fn delete_empty<'a>(
             &'a self,
             path: &'a str,
@@ -3355,14 +3597,16 @@ mod tests {
         assert!(client.calls.lock().is_empty());
     }
 
-    /// The picker reads three fields off a row that carries a dashboard's worth
-    /// of config/pricing detail — the extras must be dropped, not a decode error.
+    /// The catalog reads the picker's fields AND the entry editor's off a row
+    /// that also carries pricing and an `is_default` flag — those extras must be
+    /// dropped, not a decode error. `is_default` is dropped on purpose: the
+    /// envelope's `default_name` is the one home for that question.
     #[tokio::test]
     async fn list_llm_models_narrows_the_dashboard_rows() {
         let client = RecordingClient::new(
             r#"{"default_name":"fast","items":[
                 {"name":"fast","provider":"anthropic","model":"claude-haiku-4-5","api_key_configured":true,"is_default":true,"effective_context_window":200000,"effective_supports_vision":true,"effective_pricing":{}},
-                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","available_efforts":["low","medium","high","xhigh","max"],"api_key_configured":false,"is_default":false,"effective_context_window":400000,"effective_supports_vision":false,"effective_pricing":{}}
+                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","available_efforts":["low","medium","high","xhigh","max"],"lite_model":"gpt-5.5-mini","base_url":"https://proxy.test/v1","api_key_env":"OPENAI_KEY","api_key_configured":false,"api_key_in_vault":true,"is_default":false,"context_window_override":400000,"effective_context_window":400000,"supports_vision_override":false,"effective_supports_vision":false,"effective_pricing":{}}
             ]}"#,
         );
         let catalog = list_llm_models(&client).await.expect("models");
@@ -3391,6 +3635,38 @@ mod tests {
         // decodes to empty, and the panel hides the row rather than offering
         // picks that would never reach the wire.
         assert!(catalog.items[0].available_efforts.is_empty());
+
+        // The editor's half of the row. Every one of these was dropped before
+        // the entry editor existed, so their absence would look like an
+        // unconfigured entry rather than a decode gap.
+        let entry = &catalog.items[1];
+        assert_eq!(entry.lite_model.as_deref(), Some("gpt-5.5-mini"));
+        assert_eq!(entry.base_url.as_deref(), Some("https://proxy.test/v1"));
+        assert_eq!(entry.api_key_env.as_deref(), Some("OPENAI_KEY"));
+        assert!(!entry.api_key_configured);
+        assert_eq!(entry.context_window_override, Some(400_000));
+        assert_eq!(entry.effective_context_window, 400_000);
+        assert_eq!(entry.supports_vision_override, Some(false));
+        assert!(!entry.effective_supports_vision);
+
+        // A row with no overrides distinguishes "inherited" from "pinned": the
+        // override is None while the effective value still arrives. Conflating
+        // them is what would let an editor save an inherited value back as a
+        // pin that stops tracking the provider snapshot.
+        let bare = &catalog.items[0];
+        assert_eq!(bare.context_window_override, None);
+        assert_eq!(bare.effective_context_window, 200_000);
+        assert_eq!(bare.supports_vision_override, None);
+        assert!(bare.effective_supports_vision);
+        assert!(bare.api_key_configured);
+        assert_eq!(bare.base_url, None);
+        // Resolvable is not the same as stored: only a stored key can be
+        // deleted over HTTP, so only a stored key may be offered for deletion.
+        assert_eq!(
+            bare.api_key_in_vault, None,
+            "this row omits the field, which is not the same as saying `false`"
+        );
+        assert_eq!(entry.api_key_in_vault, Some(true));
     }
 
     /// The pin read rides the session detail with `limit=1` — the smallest page
@@ -3459,6 +3735,249 @@ mod tests {
             client.only_call().body,
             r#"{"llm":null,"model":null,"reasoning_effort":null}"#
         );
+    }
+
+    /// The global default is a SIBLING path of the catalog, and the entry name
+    /// rides the BODY — nothing about it ever reaches the path.
+    #[tokio::test]
+    async fn setting_the_default_llm_puts_the_name_in_the_body() {
+        let client = RecordingClient::new(r#"{"path":"default-llm","requires_restart":false}"#);
+        let result = set_default_llm(&client, "5.5-max".to_string())
+            .await
+            .expect("default");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/v1/llm/default");
+        assert_eq!(call.body, r#"{"name":"5.5-max"}"#);
+        assert!(!result.requires_restart);
+    }
+
+    /// `requires_restart` decides whether the editor says "saved" or "staged",
+    /// and whether it offers a probe at all — so it has to survive the decode
+    /// rather than being dropped with the rest of `MutateResponse`.
+    #[tokio::test]
+    async fn a_staged_write_reports_requires_restart() {
+        let client = RecordingClient::new(
+            r#"{"path":"llm[fast]","written_to":"/etc/baybo.json","requires_restart":true}"#,
+        );
+        let result = update_llm_model(
+            &client,
+            "fast".to_string(),
+            LlmEntryEdit::Model {
+                model: "claude-opus-4-8".to_string(),
+            },
+        )
+        .await
+        .expect("update");
+
+        assert!(result.requires_restart);
+        assert_eq!(client.only_call().body, r#"{"model":"claude-opus-4-8"}"#);
+    }
+
+    /// ONE key per body, and a cleared override must be an explicit `null`.
+    /// An absent key means "keep" to the gateway, so a `skip_serializing_if`
+    /// creeping onto any of these would turn every clear into a silent no-op.
+    #[tokio::test]
+    async fn each_entry_edit_sends_exactly_its_own_key() {
+        let cases = [
+            (
+                LlmEntryEdit::BaseUrl {
+                    url: Some("https://example.test/v1".to_string()),
+                },
+                r#"{"base_url":"https://example.test/v1"}"#,
+            ),
+            (LlmEntryEdit::BaseUrl { url: None }, r#"{"base_url":null}"#),
+            (
+                LlmEntryEdit::ApiKeyEnv { env: None },
+                r#"{"api_key_env":null}"#,
+            ),
+            (
+                LlmEntryEdit::ReasoningEffort {
+                    effort: Some("xhigh".to_string()),
+                },
+                r#"{"reasoning_effort":"xhigh"}"#,
+            ),
+            (
+                LlmEntryEdit::ContextWindow {
+                    tokens: Some(200_000),
+                },
+                r#"{"context_window":200000}"#,
+            ),
+            (
+                LlmEntryEdit::ContextWindow { tokens: None },
+                r#"{"context_window":null}"#,
+            ),
+            (
+                LlmEntryEdit::SupportsVision { on: Some(false) },
+                r#"{"supports_vision":false}"#,
+            ),
+            (
+                LlmEntryEdit::SupportsVision { on: None },
+                r#"{"supports_vision":null}"#,
+            ),
+            (
+                LlmEntryEdit::ApiKey {
+                    key: "sk-live".to_string(),
+                },
+                r#"{"api_key":"sk-live"}"#,
+            ),
+        ];
+
+        for (edit, expected) in cases {
+            let client = RecordingClient::new(r#"{"requires_restart":false}"#);
+            update_llm_model(&client, "fast".to_string(), edit.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{edit:?}: {e}"));
+            let call = client.only_call();
+            assert_eq!(call.path, "/v1/llm/models/fast", "{edit:?}");
+            assert_eq!(call.body, expected, "{edit:?}");
+        }
+    }
+
+    /// An empty key is the DELETE verb, not an accident — it has to reach the
+    /// wire verbatim. (The screen only sends it from an explicit remove
+    /// action; a blank field commits nothing.)
+    #[tokio::test]
+    async fn an_empty_api_key_is_the_delete_verb() {
+        let client = RecordingClient::new(r#"{"requires_restart":false}"#);
+        update_llm_model(
+            &client,
+            "fast".to_string(),
+            LlmEntryEdit::ApiKey { key: String::new() },
+        )
+        .await
+        .expect("clear");
+
+        assert_eq!(client.only_call().body, r#"{"api_key":""}"#);
+    }
+
+    /// The probe is a real billed completion, so it must never ride the leg the
+    /// relay auto-replays — a slow provider would otherwise be charged twice,
+    /// and invisibly, since the probe runs with cost hooks passed through.
+    #[tokio::test]
+    async fn the_probe_uses_the_never_replayed_verb() {
+        let client = RecordingClient::new(
+            r#"{"ok":true,"latency_ms":812,"input_tokens":9,"output_tokens":3,
+                "provider":"anthropic","model":"claude-haiku-4-5"}"#,
+        );
+        let result = test_llm_model(&client, "fast".to_string())
+            .await
+            .expect("probe");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "POST_ONCE");
+        assert_eq!(call.path, "/v1/llm/models/fast/test");
+        assert!(result.ok);
+        assert_eq!(result.latency_ms, Some(812));
+        assert_eq!(result.model, "claude-haiku-4-5");
+        assert_eq!(result.error, None);
+    }
+
+    /// A refused probe carries the provider's own prose and no timings — the
+    /// one place on this surface where a gateway-side failure reaches the phone
+    /// as something readable instead of a bare status code.
+    #[tokio::test]
+    async fn a_failed_probe_keeps_the_providers_prose() {
+        let client = RecordingClient::new(
+            r#"{"ok":false,"error":"401 invalid x-api-key","provider":"anthropic","model":"opus"}"#,
+        );
+        let result = test_llm_model(&client, "fast".to_string())
+            .await
+            .expect("probe answered");
+
+        assert!(!result.ok);
+        assert_eq!(result.error.as_deref(), Some("401 invalid x-api-key"));
+        assert_eq!(result.latency_ms, None);
+    }
+
+    /// A whole-set PUT, so a replay converges. The ids ride the BODY — model
+    /// ids routinely carry a slash, which a path segment could not hold.
+    #[tokio::test]
+    async fn the_model_list_is_replaced_as_a_whole_set() {
+        let client = RecordingClient::new(r#"{"requires_restart":false}"#);
+        set_llm_model_list(
+            &client,
+            "fast".to_string(),
+            vec![
+                "claude-haiku-4-5".to_string(),
+                "meta-llama/Llama-3-70B".to_string(),
+            ],
+        )
+        .await
+        .expect("set list");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/v1/llm/models/fast/model-list");
+        assert_eq!(
+            call.body,
+            r#"{"models":["claude-haiku-4-5","meta-llama/Llama-3-70B"]}"#
+        );
+    }
+
+    /// `configured` is what separates "already served" from "would be added" in
+    /// the add picker, and an absent one must read as NOT configured rather
+    /// than failing the decode.
+    #[tokio::test]
+    async fn the_catalog_marks_what_the_entry_already_serves() {
+        let client = RecordingClient::new(
+            r#"{"items":[
+                {"id":"gpt-5.5","display_name":"GPT-5.5","context_window":400000,"configured":true},
+                {"id":"o3","supports_vision":true},
+                {"id":"o4-mini","context_window":200000,"configured":false}
+            ]}"#,
+        );
+        let items = llm_catalog(&client, "gpt".to_string())
+            .await
+            .expect("catalog");
+
+        assert_eq!(client.only_call().path, "/v1/llm/models/gpt/catalog");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "gpt-5.5");
+        assert_eq!(items[0].display_name.as_deref(), Some("GPT-5.5"));
+        assert_eq!(items[0].context_window, Some(400_000));
+        assert!(items[0].configured);
+        // A row carrying only an id still decodes; the extra field the picker
+        // does not render is dropped rather than refused.
+        assert_eq!(items[1].id, "o3");
+        assert_eq!(items[1].context_window, None);
+        assert!(!items[1].configured);
+        assert!(!items[2].configured);
+    }
+
+    /// The entry name reaches the PATH here (unlike the default endpoint), so
+    /// it takes the same escaping guard every other path segment does.
+    #[tokio::test]
+    async fn entry_writes_reject_a_path_escaping_name() {
+        for bad in ["a/b", "a?b", "", "../../v1/config"] {
+            let client = RecordingClient::empty();
+            assert!(
+                update_llm_model(
+                    &client,
+                    bad.to_string(),
+                    LlmEntryEdit::BaseUrl { url: None },
+                )
+                .await
+                .is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                test_llm_model(&client, bad.to_string()).await.is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                set_llm_model_list(&client, bad.to_string(), Vec::new())
+                    .await
+                    .is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                llm_catalog(&client, bad.to_string()).await.is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(client.calls.lock().is_empty());
+        }
     }
 
     #[tokio::test]

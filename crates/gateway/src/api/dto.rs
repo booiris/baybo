@@ -274,6 +274,14 @@ pub struct LlmModelEntry {
     /// (vault entry, explicit `api_key_env`, or provider-default env
     /// var). The literal value never leaves the gateway.
     pub api_key_configured: bool,
+    /// `true` when a key is stored in THIS gateway's vault, as opposed to
+    /// merely resolving from an environment variable.
+    ///
+    /// The two differ in what a client may offer: only a vault key can be
+    /// removed over HTTP (`api_key: ""`), and offering that on an entry whose
+    /// key comes from the environment would be a button that reports success
+    /// and changes nothing.
+    pub api_key_in_vault: bool,
     pub reasoning_effort: Option<String>,
     /// The thinking levels this entry's provider can actually be told, in
     /// display order (cheapest first). Empty when baybo sends this provider
@@ -346,8 +354,12 @@ pub struct UpdateLlmModelRequest {
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub pricing: Option<Option<LlmPricingOverrideDto>>,
     /// Set the literal API key in the vault (`llm.entry.<name>.api_key`).
-    /// Pass `""` to remove the vault entry, or omit the field to leave
-    /// the vault untouched. Never echoed back.
+    /// Pass `""` to delete the stored key, or omit the field to leave the
+    /// vault untouched. Never echoed back.
+    ///
+    /// A delete only removes what THIS vault holds; if `api_key_env` or the
+    /// provider's default env var still resolves, the entry keeps working and
+    /// `api_key_configured` stays true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
@@ -367,6 +379,48 @@ where
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetDefaultLlmRequest {
     pub name: String,
+}
+
+/// `PUT /v1/llm/models/{name}/model-list` body — the models this entry
+/// serves, as a SET, in picker order.
+///
+/// Replace rather than add/remove, for two reasons. Model ids routinely
+/// contain a slash (`meta-llama/Llama-3-70B`), which makes them unsafe as a
+/// path segment; and a whole-set PUT is idempotent, so a client whose request
+/// is replayed converges instead of double-adding.
+///
+/// **Replacing the list never destroys an override.** The handler keeps each
+/// surviving id's existing `LlmModelSpec` and only mints a bare one for an id
+/// that was not there — so a caller may send plain ids without knowing which
+/// overrides exist. Dropping an id DOES drop its overrides, which is the point
+/// of dropping it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetLlmModelListRequest {
+    pub models: Vec<String>,
+}
+
+/// One model as the provider's own catalog reports it
+/// (`GET /v1/llm/models/{name}/catalog`). A LIVE read over the provider's API,
+/// not config — so it can be slow, and it can fail for an entry whose
+/// credentials are not yet valid.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmCatalogModel {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    /// Whether this id is already in the entry's `model_list`, so a picker can
+    /// tell what it would be adding from what is already served.
+    pub configured: bool,
+}
+
+/// `GET /v1/llm/models/{name}/catalog` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmCatalogResponse {
+    pub items: Vec<LlmCatalogModel>,
 }
 
 /// `POST /v1/llm/models/{name}/test` response. Carries the latency and
