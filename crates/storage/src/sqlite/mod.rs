@@ -477,6 +477,15 @@ pub(crate) fn in_placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
+/// `(?),(?),...,(?)` — the row list for a `VALUES` clause of `n` bound
+/// values, i.e. [`in_placeholders`]'s set as a one-column relation that can
+/// be joined against. Unlike `IN (...)`, `VALUES` keeps duplicates, so a
+/// caller that joins on this must hand over distinct values or accept
+/// duplicate output rows.
+pub(crate) fn values_placeholders(n: usize) -> String {
+    std::iter::repeat_n("(?)", n).collect::<Vec<_>>().join(",")
+}
+
 /// Whether a write failed because a **uniqueness** constraint refused it —
 /// the row is already there — rather than for any other reason.
 ///

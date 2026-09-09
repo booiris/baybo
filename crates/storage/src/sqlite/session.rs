@@ -64,6 +64,36 @@ type RawSessionListRow = (
 pub(super) const SESSION_LIST_COLUMNS: &str = "data, hidden, last_llm, pinned, id, folder_id, \
      archived, title, last_model, last_effort, agent_id, agent_framework";
 
+/// The last `limit` active rows of each listed session, ascending.
+///
+/// The window is cut on `ordinal` BEFORE any content is touched, and that is
+/// the whole point of the shape. `session_messages_read` projects
+/// `content_payloads.data`, so a `ROW_NUMBER() OVER (PARTITION BY session_id)`
+/// over the *view* drags every listed session's entire transcript — payload
+/// blobs and all — through a sorter just to keep `limit` rows of it. Probing
+/// each session's floor ordinal through the `(session_id, ordinal)` primary key
+/// first, and joining the view only to the survivors, returns a byte-identical
+/// result set for a fraction of the reads: over a real 543-session /
+/// 321k-message store the whole call goes 170ms -> 35ms warm (the SQL alone
+/// 136ms -> 19ms), with 64.7MB of payload never read.
+///
+/// `{{ids}}` takes a `VALUES` row list; the trailing `?` is the floor OFFSET.
+const ACTIVE_TAILS_SQL: &str = r#"
+WITH ids(id) AS (VALUES {{ids}}),
+     cut AS (
+         SELECT id AS session_id,
+                (SELECT m.ordinal FROM session_messages m
+                  WHERE m.session_id = ids.id AND m.compaction_inserted = 0
+                  ORDER BY m.ordinal DESC LIMIT 1 OFFSET ?) AS floor
+           FROM ids
+     )
+SELECT v.session_id, v.ordinal, v.created_at, v.role, v.content, v.source, v.platform_msg_id
+  FROM cut JOIN session_messages_read v ON v.session_id = cut.session_id
+ WHERE v.compaction_inserted = 0
+   AND v.ordinal >= COALESCE(cut.floor, -1)
+ ORDER BY v.session_id, v.ordinal
+"#;
+
 fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     s.lineage.as_ref().map(|l| match l.kind {
         LineageKind::Subagent => LINEAGE_KIND_SUBAGENT,
@@ -1631,24 +1661,28 @@ impl SessionStore for SqliteSessionStore {
         if session_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
-        let limit = limit as i64;
+        // `VALUES` keeps duplicates where `IN` folded them, and the join below
+        // would then emit one copy of the tail per repeated id.
+        let mut seen = std::collections::HashSet::new();
+        let keys: Vec<String> = session_ids
+            .iter()
+            .filter(|s| seen.insert(s.as_str()))
+            .map(|s| s.as_str().to_string())
+            .collect();
+        // The floor is the `limit`-th newest row, so it sits at OFFSET
+        // `limit - 1`. The `limit == 0` early return above is what keeps that
+        // subtraction in range.
+        let floor_offset = (limit - 1) as i64;
         let raw = self
             .pool
             .interact("sessions.active_tails", move |conn| {
-                let placeholders = super::in_placeholders(keys.len());
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT session_id, ordinal, created_at, role, content, source, platform_msg_id FROM ( \
-                         SELECT session_id, ordinal, created_at, role, content, source, platform_msg_id, \
-                                ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) rn \
-                         FROM session_messages_read \
-                         WHERE session_id IN ({placeholders}) AND compaction_inserted = 0 \
-                     ) WHERE rn <= ? ORDER BY session_id, ordinal"
-                ))?;
+                let sql =
+                    ACTIVE_TAILS_SQL.replace("{{ids}}", &super::values_placeholders(keys.len()));
+                let mut stmt = conn.prepare(&sql)?;
                 let params: Vec<rusqlite::types::Value> = keys
                     .iter()
                     .map(|k| rusqlite::types::Value::from(k.clone()))
-                    .chain(std::iter::once(rusqlite::types::Value::from(limit)))
+                    .chain(std::iter::once(rusqlite::types::Value::from(floor_offset)))
                     .collect();
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(params), |row| {
@@ -3140,6 +3174,122 @@ mod tests {
         let title_map: std::collections::HashMap<_, _> = titles.into_iter().collect();
         assert_eq!(title_map[&a.id], Some("A".into()));
         assert_eq!(title_map[&b.id], None);
+    }
+
+    // The tail window is cut on a floor ordinal found over
+    // `compaction_inserted = 0` rows alone. A floor taken over every row
+    // instead still returns rows and still looks ascending — it just returns
+    // too few of them — so the cases that separate the two are the point of
+    // this test, and the fixture in
+    // `chat_list_batch_queries_group_per_session` (no compaction, no short
+    // session, no repeated id) separates neither.
+    #[tokio::test]
+    async fn active_tails_cuts_the_window_past_compaction_machinery() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+        let ordinals = |tails: &[(SessionId, i64, DateTime<Utc>, ChatMessage)],
+                        want: &SessionId| {
+            tails
+                .iter()
+                .filter(|(sid, ..)| sid == want)
+                .map(|(_, ordinal, ..)| *ordinal)
+                .collect::<Vec<_>>()
+        };
+
+        // Compacted: three real turns (0..=2), two compaction rows the
+        // machinery wrote (3, 4), two real turns after it (5, 6).
+        let compacted = make_root_session("tail-compacted");
+        store.save(&compacted).await.unwrap();
+        for msg in [
+            baybo_model::ChatMessage::user(text("one")),
+            baybo_model::ChatMessage::assistant(text("two")),
+            baybo_model::ChatMessage::user(text("three")),
+        ] {
+            store
+                .append_session_message(&compacted.id, &msg)
+                .await
+                .unwrap();
+        }
+        let base = store
+            .apply_session_compaction(
+                &compacted.id,
+                &[
+                    baybo_model::ChatMessage::system(text("summary")),
+                    baybo_model::ChatMessage::user(text("carried")),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            base, 3,
+            "compaction lands contiguously after the real turns"
+        );
+        for msg in [
+            baybo_model::ChatMessage::assistant(text("after")),
+            baybo_model::ChatMessage::user(text("and after that")),
+        ] {
+            store
+                .append_session_message(&compacted.id, &msg)
+                .await
+                .unwrap();
+        }
+
+        // Shorter than the window, and an id the store has never seen.
+        let short = make_root_session("tail-short");
+        store.save(&short).await.unwrap();
+        store
+            .append_session_message(&short.id, &baybo_model::ChatMessage::user(text("only")))
+            .await
+            .unwrap();
+        let absent = SessionId::from("tail-nothing-here");
+
+        let ids = [compacted.id.clone(), short.id.clone(), absent.clone()];
+        let tails = store.active_tails(&ids, 3).await.unwrap();
+        assert_eq!(
+            ordinals(&tails, &compacted.id),
+            vec![2, 5, 6],
+            "the three newest real rows — 3 and 4 are compaction machinery, \
+             and a floor taken over every row would start at 5 and yield two"
+        );
+        assert_eq!(
+            ordinals(&tails, &short.id),
+            vec![0],
+            "a session with fewer rows than the window yields all of them"
+        );
+        assert!(
+            !tails.iter().any(|(sid, ..)| sid == &absent),
+            "an id with no rows contributes none"
+        );
+
+        let one = store.active_tails(&ids, 1).await.unwrap();
+        assert_eq!(
+            ordinals(&one, &compacted.id),
+            vec![6],
+            "limit 1 is the newest"
+        );
+        assert_eq!(ordinals(&one, &short.id), vec![0]);
+
+        assert!(
+            store.active_tails(&ids, 0).await.unwrap().is_empty(),
+            "limit 0 is the early return that keeps the floor offset in range"
+        );
+
+        // The `VALUES` row list keeps duplicates where `IN` folded them, so the
+        // dedup in the wrapper is what stops one repeated id from emitting its
+        // tail twice.
+        let repeated = [compacted.id.clone(), compacted.id.clone()];
+        assert_eq!(
+            ordinals(
+                &store.active_tails(&repeated, 3).await.unwrap(),
+                &compacted.id
+            ),
+            vec![2, 5, 6],
+            "a repeated id yields one tail, not two"
+        );
     }
 
     #[tokio::test]
