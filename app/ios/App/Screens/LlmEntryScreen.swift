@@ -103,6 +103,14 @@ struct LlmEntryScreen: View {
                     Spacer(minLength: 60)
                 }
                 .padding(.top, ChatHeaderView.barHeight + 16)
+                // The container has to claim the width itself. Without this a
+                // level whose content is all narrow — the catalog's loading and
+                // failure states are two short lines — sizes the VStack to its
+                // widest child and the ScrollView centres it, so that one level
+                // alone rendered centred while every other looked correct. The
+                // others were only ever left-aligned by accident: their
+                // full-width pill buttons were doing this job.
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .scrollDismissesKeyboard(.interactively)
             .scrollContentBackground(.hidden)
