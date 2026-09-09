@@ -190,7 +190,7 @@ The footer renders exactly one of two buttons, chosen by `busy && !hasContent` (
 - **Stop button** (red circle, `RiStopFill`) — shown only when `busy && !hasContent`: a turn is in flight *and* the composer has no draft/ready attachment. `onClick={handleStop}` issues `/stop`. Disabled while disconnected.
 - **Send button** (amber circle, `RiSendPlane2Line`, `type="submit"`) — shown otherwise. Disabled when there is no session, the WS is not `connected`, any attachment is still `uploading`, or `!hasContent`. Its tooltip flips between "Send (Enter)" and "Queue message (Enter)" depending on `busy || queue.pauseReason !== null`.
 
-`busy` is `currentView.awaitingReply || (currentView.turn?.active ?? false)` (~line 334) — true optimistically between send and the first response, and authoritatively per the server `TurnState`. `hasContent` is `composer.trim().length > 0 || attachments.some((a) => a.status === 'ready')` (~line 1468).
+`busy` is `currentView.awaitingReply || (currentView.turn?.active ?? false)` (~line 334) — true optimistically between send and the first response, and authoritatively per the server `TurnState`. `hasContent` is `composer.trim().length > 0 || attachments.some((a) => a.status === 'ready')`, where both `composer` and `attachments` are the **active conversation's** draft — so the Send/Stop matrix answers for the conversation on screen, and a draft parked in another one cannot suppress this one's stop button.
 
 Key invariant: because the stop button only appears when `!hasContent`, typing a draft *while a turn runs* swaps the red stop button back to the amber send button — so a mid-turn submit parks/queues the draft instead of cancelling the turn (cancel is then only reachable by typing `/stop` or clearing the draft). The two branches use distinct React `key`s (`composer-stop` / `composer-send`) and `handleStop` calls `e.preventDefault()`: clicking stop flips `busy` false synchronously mid-click, which would otherwise re-type the same DOM node into the submit button and let the browser run its default submit on it — sending the draft. The distinct keys plus the `preventDefault` both block that. The stop button is `type="button"`; only the send button is `type="submit"`.
 
@@ -203,9 +203,142 @@ Key invariant: because the stop button only appears when `!hasContent`, typing a
 - idle and not paused → `direct` (`sendText(composer, wire)` — sends immediately; the turn's completion auto-drains the queue, so a non-empty queue never stalls a direct send).
 - busy **or** paused (after a `/stop`/error) → `park` (`queue.enqueue(...)` into the interjection queue).
 
-`/stop` detection is `isStopCommand` (~line 3483): trimmed text starting with `/` whose first token (split on whitespace or `@`) lowercases to `stop`. The submitted line is recorded in the input ring via `inputHistory.commit` (send, park, or a typed `/stop` all count). After dispatch the composer is cleared, every attachment `previewUrl` is `URL.revokeObjectURL`'d, `attachments` is reset to `[]`, and the slash-hint popup is closed.
+`/stop` detection is `isStopCommand`: trimmed text starting with `/` whose first token (split on whitespace or `@`) lowercases to `stop`.
+
+**The dispatch has to succeed before the draft is ended.** `sendText` now returns a boolean and bails on no session, no socket, or a connection that is not up; `handleSend` returns early on `false`, before `inputHistory.commit` and before the discard. That gate is the only one on the keyboard path — `Enter` submits through `form.requestSubmit()`, which ignores the send button's `disabled` — so without it a press at `/chat`, or one during a reconnect, cleared the composer and sent nothing. Parking is local and always succeeds. Once the dispatch is through, the submitted line is recorded in the input ring (`inputHistory.commit` — send, park, or a typed `/stop` all count), the **active conversation's** draft is discarded through `draftApi.discard(draftKey)` (text, staged files, and their `previewUrl` object URLs, which the store revokes), and the slash-hint popup is closed. Other conversations' drafts are untouched: `draftKey` is the render's, the same conversation `sendText` posted to, never re-read from a live ref — a send racing a switch would otherwise wipe the *destination* conversation's untouched draft.
 
 `sendText` (~line 1394) routes non-stop sends through `sendToSession`, which appends an optimistic `pending: true` user row, sets `awaitingReply: true`, bumps the per-session turn token, and emits a WS message frame keyed by a fresh `clientMsgId` (same UUID dedups the frame and reconciles the optimistic row against the inbound echo). `/stop` is special-cased entirely client-side: it collapses the live work block to "Cancelled", keeps any partial reply as its own bubble, marks the session stopped (`stoppedSessionsRef`), pauses the interjection queue if items are parked, and sends the `/stop` frame — the server's later `TurnState`/notice frames reconcile idempotently. Both paths require `status.state === 'connected'`; a disconnected `sendToSession` returns false and leaves the item queued.
+
+### The draft belongs to the conversation
+
+What the composer is holding — the typed text **and** the staged file strip — is
+per conversation, one record per session id in
+`app/web/src/pages/chat/draftStore.tsx`. Switch conversations and you get back
+exactly what you left in this one; the conversation you came from keeps its own.
+Before this, a single tab-global `composer` string and a single `attachments`
+array served every conversation, so a half-written message followed you into the
+next chat and a staged screenshot could be posted into a thread it was never
+meant for.
+
+**Exactly two things end a draft: sending it, and the conversation being hidden.**
+Everything else is a checkpoint and the draft comes back — switching
+conversations, an LRU eviction of the transcript behind it (§ Bounded
+per-session view cache), archiving, and a trip to an admin route. That last one
+is why `DraftProvider` is mounted in `main.tsx` above `<HashRouter>`, next to
+`QueueProvider`, rather than living in `ChatPage` state: `/chat` and `/logs` are
+sibling routes, so the always-mounted icon rail unmounts `ChatPage` on every
+glance at the log, and component state would drop every draft in every
+conversation. Hiding discards through `draftApi.discard`, called at both hide
+sites (the local `DELETE` and the cross-tab `session_updated{hidden:true}`) and
+deliberately **not** inside `releaseSessionView` — the LRU calls that too, and
+evicting a transcript is not a decision to throw away unsent text.
+
+Text and files are **one record**, not two maps. A submit posts both into the
+conversation they were typed in, so a strip that could drift away from its text
+would post one conversation's screenshot under another's words.
+
+`patchDraft` is the whole map algebra and is unit-tested apart from React
+(`app/web/src/pages/chat/draftStore.test.ts`). Three rules it enforces:
+
+- **A draft that empties out is deleted**, so the map holds exactly the
+  conversations with unsent content and needs no cap. "Empty" is *not* trimmed —
+  the map is what the textarea renders, so treating whitespace as empty would
+  delete the bucket mid-keystroke and swallow the spaces as they were typed.
+  `hasContent` does the trimming instead.
+- **A late upload cannot resurrect a draft.** A settle landing on a key that is
+  gone (its draft sent, or its conversation hidden, while the blob was
+  uploading) returns the same map, rather than minting a bucket no screen can
+  reach.
+- **Every other conversation stays reference-identical**, which is the reported
+  bug expressed as data.
+
+**The conversation-less `/chat` surface gets its own bucket** (`NO_SESSION_DRAFT_KEY`,
+the empty string — a matched `/chat/:sessionId` segment can never be empty). That
+route is real and its composer is fully typeable, and the window is not a
+flicker: the rail's own Chat link lands there, so does hiding the last
+conversation, and the bootstrap is one-shot so nothing redirects back. On
+arriving in a conversation that has nothing typed of its own, that draft is
+**adopted** into it — the bootstrap redirect lands under the user's fingers. If
+the arriving conversation does have a draft, the adoption is refused and the
+no-session draft stays put, to be found again at `/chat`. Nothing is destroyed
+by adoption.
+
+**Staged files.** `uploadAttachment` takes the conversation as a *parameter*, not
+something read back when the upload lands: a switch during a big upload must
+still settle the chip it created, or that conversation is left with a pick stuck
+on `uploading`, which its send gate never clears — a permanently dead composer.
+
+The key is a *hint*, though, not the pick's identity — `holderOf` resolves the
+conversation that actually holds a `localId` (a uuid, so it cannot collide).
+Adoption is why: it re-keys a whole record, in-flight uploads included, so a pick
+staged at `/chat` and adopted into a conversation mid-upload would otherwise
+settle against a key nothing holds and hang on `uploading` forever — exactly the
+dead composer the parameter exists to prevent. A `localId` that is nowhere is
+genuinely gone (sent, or its conversation hidden) and is never resurrected.
+Preview object URLs are revoked by the store, in the two places a pick stops
+being reachable (`drop` and `discard`), outside the state updater so a
+double-invoked updater cannot kill a live `<img>`.
+
+**Persisted to `localStorage`** under `baybo.draft.<sessionId>`, one row per
+conversation, beside `baybo.queue.<sessionId>` and `baybo.outbox.<sessionId>` —
+so a reload, a crash, or taking the PWA's update offer gives the draft back.
+`loadDrafts()` runs in the `useState` initialiser, before the first render, so a
+restored conversation paints its draft instead of flashing an empty box.
+
+What crosses a reload is the text plus the picks that **already reached the blob
+store**. A `ready` pick is a `blobId` and the bytes are the gateway's, so the
+chip rebuilds and the send still works — this is the same bargain the
+interjection queue strikes for parked messages. A pick still `uploading` or in
+`error` is alive only as a local `File` and an object URL, both of which die with
+the document; those are dropped on load rather than restored as chips that can
+never finish, which would wedge the send gate on a permanently-`uploading`
+attachment. iOS keeps even those, by hard-linking the picks' bytes into the draft
+directory ([app/ios/docs/attachments.md](../app/ios/docs/attachments.md) §
+Leaving is not discarding); the browser has no equivalent.
+
+A restored pick has no `previewUrl` — an object URL belongs to the document that
+minted it — so the composer re-fetches the blob (bearer-gated, which is why an
+`<img src>` cannot) and hands a fresh URL back through `draftApi.restorePreview`,
+putting the strip back as it was rather than degrading a screenshot into a
+filename. Only the conversation on screen is rehydrated, so opening the tab does
+not pull down blobs for drafts nobody is looking at; a failed fetch leaves the
+chip under its filename and still sends.
+
+Writes are **debounced** (`DRAFT_PERSIST_DEBOUNCE_MS`, 400ms), because this is
+per-keystroke state where the queue's per-mutation precedent is not — a pasted
+wall of text would otherwise be re-serialised on every character. Every exit the
+tab can see coming flushes instead of waiting: `pagehide`, `visibilitychange` to
+hidden (on mobile the last callback before a discard), and unmount. An emptied or
+discarded draft **removes** its row rather than storing a husk.
+
+**Terminal events write through, they do not wait on the timer.** `discard` and
+`adopt` persist immediately, because the queue writes `baybo.queue.<id>`
+*synchronously* — so between Enter and the timer there was a window where the
+queue row and the draft row both held the same message, and an ungraceful exit
+inside it (a renderer OOM, a `kill -9`) restored a draft the user had already
+sent, to be sent a second time. The write-through lives inside `apply`, after its
+`next === draftsRef.current` early-out: `discardDraft` returns the same map when
+the key is absent, and removing a row on that would delete what a sibling tab
+wrote for a conversation this one never typed in.
+
+**The `/chat` bucket is the one draft that does not persist.** It exists to carry
+what you typed into the conversation you are about to land in — a hand-off inside
+one visit. A stored copy outlives the visit, and the next load's bootstrap
+redirect would hand a sentence typed days ago to whichever unrelated conversation
+resolved first and happened to be empty.
+
+The `storage` event is deliberately **not** listened to. A queue is shared intent
+and converges across tabs; a draft is what *this* tab's textarea is showing, and
+adopting a sibling tab's keystrokes would rewrite the box under someone's hands.
+Two tabs drafting the same conversation each keep their own, and the last one to
+write is what a later reload finds. One corrupt row costs only its own
+conversation — the JSON parse is per row, not around the sweep.
+
+One consequence worth knowing: a conversation switch driven by a **frame** (a
+sibling tab hiding the conversation you are in) now changes the textarea's
+`value` under a live IME composition, which a switch never did before. The
+user-driven path is safe — clicking a sidebar row blurs the box and ends the
+composition first.
 
 ### Enter to send, Shift+Enter newline, textarea auto-grow
 
@@ -231,11 +364,11 @@ Nothing else changes: `uploadAttachment` already derives the mime, the `previewU
 
 The two clients' caps differ legitimately — iOS bounds its strip at `ChatStore.maxStagedAttachments` (10, with a notice), web bounds nothing client-side, and the per-message cap (`MAX_MESSAGE_BATCH_ATTACHMENTS`) is the gateway's. The affordance differs on purpose too. iOS gets an explicit **Paste** row in the composer's `+` panel, which works for every clipboard shape, plus a responder-chain hook so long-press → Paste on the field works for an **image-only** clipboard — a SwiftUI `TextField` ignores an image paste outright, and once the board also carries text the field wins the paste and no ancestor can outrank it. See [app/ios/docs/attachments.md](../app/ios/docs/attachments.md) § Paste is a third source. Web has no such split: the browser hands the whole clipboard to one handler, which is why the text-wins rule above is a decision the web code gets to make and iOS's field makes for it. What the two owe each other is the produced `WireAttachment`, not the gesture.
 
-`uploadAttachment` (~line 1652) immediately pushes a `PendingAttachment` (`status: 'uploading'`) with a fresh `localId` (`crypto.randomUUID()`). For `image/*` mimes it sets `previewUrl = URL.createObjectURL(file)` for an instant local thumbnail (no upload round-trip). It then `POST`s the raw file body to `${baseUrl}/v1/blobs` with headers `Authorization: Bearer <adminToken>` and `content-type: <mime>` (the admin listener resolves the bearer to `AuthedClient::Web`, bypassing pairing). On success it stores the returned content-addressed `blob_id` and flips `status: 'ready'`; on any failure `status: 'error'`. Mime defaults to `application/octet-stream` when the file reports none.
+`uploadAttachment(key, file)` immediately stages a `PendingAttachment` (`status: 'uploading'`) into `key`'s draft with a fresh `localId` (`crypto.randomUUID()`). For `image/*` mimes it sets `previewUrl = URL.createObjectURL(file)` for an instant local thumbnail (no upload round-trip). It then `POST`s the raw file body to `${baseUrl}/v1/blobs` with headers `Authorization: Bearer <adminToken>` and `content-type: <mime>` (the admin listener resolves the bearer to `AuthedClient::Web`, bypassing pairing). On success it settles the chip to `{ status: 'ready', blobId }`; on any failure to `{ status: 'error' }` — both against the `key` it was handed, never the conversation that happens to be on screen when the upload lands. Mime defaults to `application/octet-stream` when the file reports none.
 
-`PendingAttachment` (~line 239) fields: `localId`, `filename`, `mime`, `size`, `status` (`'uploading' | 'ready' | 'error'`), `blobId?` (filled on upload), `previewUrl?` (images only). `attachmentKind(mime)` (~line 251) maps the mime to the wire `kind`: `image/*` → `image`, `audio/*` → `audio`, else `file`. On send, `handleSend` keeps only `ready` attachments with a `blobId` and builds `WireAttachment { kind, blob_id, mime_type, size, filename }` (shape in `app/web/src/api/chatWs.ts` ~line 20).
+`PendingAttachment` (`chat/draftStore.tsx`) fields: `localId`, `filename`, `mime`, `size`, `previewUrl?` (images only), plus a `status`/`blobId` **union** — `{ status: 'uploading' | 'error' }` or `{ status: 'ready'; blobId: string }`, so a ready pick without a blob has no spelling and `handleSend` needs no cast. `attachmentKind(mime)` (~line 251) maps the mime to the wire `kind`: `image/*` → `image`, `audio/*` → `audio`, else `file`. On send, `handleSend` keeps only `ready` attachments and builds `WireAttachment { kind, blob_id, mime_type, size, filename }` (shape in `app/web/src/api/chatWs.ts` ~line 20).
 
-Composer chip rendering (~line 2379): attachments with a `previewUrl` render as a 14×14 (`h-14 w-14`) `object-cover` image thumbnail (dimmed at 40% on `error`, with a spinner overlay while `uploading`); all others render as a named chip whose leading icon is a spinner (`uploading`), an X (`error`, error-tinted), or `RiAttachmentLine` (`ready`). Each carries a small remove button. `removeAttachment` (~line 1704) revokes the `previewUrl` if present and filters the item out by `localId`.
+Composer chip rendering (~line 2379): attachments with a `previewUrl` render as a 14×14 (`h-14 w-14`) `object-cover` image thumbnail (dimmed at 40% on `error`, with a spinner overlay while `uploading`); all others render as a named chip whose leading icon is a spinner (`uploading`), an X (`error`, error-tinted), or `RiAttachmentLine` (`ready`). Each carries a small remove button. `removeAttachment` delegates to `draftApi.drop(draftKey, localId)`, which filters the pick out of *this* conversation's draft and revokes its `previewUrl`.
 
 Note: in-thread attachment thumbnails are a *separate* concern from composer previews. Sent/received image attachments render via `AttachmentImage` (`app/web/src/pages/chat/AttachmentImage.tsx`), which fetches `GET /v1/blobs/<blobId>` with the admin bearer (an `<img>` tag can't send the auth header), turns the blob into an object URL, and shows a spinner while loading / a named placeholder chip on fetch failure. It re-fetches when `adminToken` lands and revokes the object URL on unmount. The thumbnail itself is a **button** — see the image viewer below.
 
@@ -253,7 +386,7 @@ The pinned model survives reloads because it is a flat session column: `currentV
 
 ## Slash commands & input history
 
-The chat composer (`app/web/src/pages/ChatPage.tsx`) carries two keyboard affordances ported from the TUI (`crates/tui/src/app.rs`): a `/`-prefixed slash-command autocomplete popup and a shell-style Up/Down input-history ring. Both are wired into the single `<textarea>` composer via `handleComposerKey` (`onKeyDown`) and `handleComposerChange` (`onChange`). The composer draft is tab-global — one `composer` string shared across every conversation, never reset on session switch — so the history ring is global too.
+The chat composer (`app/web/src/pages/ChatPage.tsx`) carries two keyboard affordances ported from the TUI (`crates/tui/src/app.rs`): a `/`-prefixed slash-command autocomplete popup and a shell-style Up/Down input-history ring. Both are wired into the single `<textarea>` composer via `handleComposerKey` (`onKeyDown`) and `handleComposerChange` (`onChange`). The **draft** that textarea shows is per conversation (see § The draft belongs to the conversation); the **ring** is deliberately not. It stays tab-global under one `baybo.inputHistory` key because it mirrors the single TUI ring: Up recalls the last thing you submitted in this browser whichever conversation you are in. What changed with per-conversation drafts is that the ring's *cursor* is reset on a session switch (`ChatPage.tsx`, the `[sessionId]` effect) — left mid-walk in one conversation, a Down in the next would otherwise write the first one's next entry into a draft that now sticks. And `recallPrev(composer.length === 0)` reads *this* conversation's draft, so a draft typed here blocks Up even if the one you came from was empty.
 
 ### Slash-command autocomplete popup
 
@@ -560,6 +693,8 @@ The "send all queued at once" path (`sendBatchToSession`) appends N optimistic r
 ### Bounded per-session view cache
 
 The tab keeps one `SessionView` per visited session in a `views` map (`SessionView` / `EMPTY_VIEW`, ~168-226): `transcript`, `pendingApproval`, history flags (`historyLoaded`/`historyLoading`/`olderLoading`), pagination cursors (`oldestOrdinal`/`hasMore`), `awaitingReply`, the per-session `model` pin, `tasks`, and the server-authoritative `turn`. Switching sessions does **not** drop the prior transcript. `VIEW_CACHE_LIMIT` = 20 caps the map: when exceeded, the LRU effect evicts the oldest non-active buckets (by frame recency in `recencyRef`), each via `releaseSessionView` (drops the WS subscription, frees the bucket, clears recency). The active session is never evicted. Only `views`-mutating frames bump recency — sidebar-only signals (`session_updated`) don't bias retention. Revisiting an evicted session re-subscribes and re-fetches via REST.
+
+**The composer draft is deliberately not a `SessionView` field.** It lives in its own uncapped map outside this cache (§ The draft belongs to the conversation), because REST cannot re-fetch text the server never saw: folding it in here for tidiness would make the 21st conversation you open silently delete the first one's unsent message, ordered by *transcript* recency rather than by anything the user did to the draft.
 
 ### Sync vs live frames (protocol v2)
 

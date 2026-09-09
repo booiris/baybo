@@ -1,14 +1,21 @@
 import { useCallback, useMemo, useRef } from 'react';
 
 // Web-chat composer input history — a faithful port of the TUI input ring
-// (`crates/tui/src/app.rs`). The composer is tab-global (one draft shared
-// across every conversation, never reset on switch), so the ring is global too
-// — Up recalls the last thing you submitted in this browser regardless of which
-// conversation you're in, exactly like the single TUI ring. It persists to
-// localStorage so it survives a reload the way the TUI ring survives a restart.
-// Up walks toward older entries; Down walks back toward the empty draft;
-// consecutive duplicates collapse and the ring is capped to the most recent
-// `HISTORY_CAP` entries.
+// (`crates/tui/src/app.rs`). The ring is tab-global on its own account, not as
+// a consequence of the composer: it holds lines you SUBMITTED, and Up recalls
+// the last thing you sent from this browser regardless of which conversation
+// you're in, exactly like the single TUI ring. The unsent DRAFT is a different
+// thing and is per conversation (`draftStore.tsx`) — do not "fix" the ring to
+// match it. It persists to localStorage so it survives a reload the way the TUI
+// ring survives a restart. Up walks toward older entries; Down walks back
+// toward the empty draft; consecutive duplicates collapse and the ring is
+// capped to the most recent `HISTORY_CAP` entries.
+//
+// Two consequences of the draft being per conversation, both handled by the
+// caller: `ChatPage` resets the navigation cursor on a session switch (a walk
+// left half-finished must not continue in the next conversation, where the
+// recalled line would now stick), and `recallPrev(composerEmpty)` is asked
+// about the conversation on screen.
 
 export const HISTORY_CAP = 500;
 export const HISTORY_KEY = 'baybo.inputHistory';

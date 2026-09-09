@@ -1,6 +1,6 @@
 # Web unit tests (`app/web`)
 
-The dashboard's vitest suite — **36 files, 597 tests** — and the conventions that
+The dashboard's vitest suite — **81 files, 1220 tests** — and the conventions that
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
@@ -156,6 +156,8 @@ says `pass`, not `skipping`, before trusting it.
 
 | Test file | Module / exports pinned | What it asserts |
 |---|---|---|
+| `pages/chat/draftStore.test.ts` (24) | `draftStore.tsx` — `patchDraft`, `discardDraft`, `adoptDraft`, `draftAt`, `draftKeyFor` | Per-conversation composer draft: patching one conversation leaves every other reference-identical (the reported bug as data), delete-on-empty without trimming (whitespace is still a draft the textarea shows), no bucket resurrection from an upload settling after its draft was sent or hidden, and the `/chat` draft being adopted into the conversation that resolves — never over one already typed in. |
+| `pages/chat/draftProvider.test.tsx` (18) · **render** | `draftStore.tsx` — `DraftProvider`, `useDrafts`, `useDraftApi` | `renderHook` over the provider: per-conversation isolation, same-tick mutation compose off the synchronous ref, debounced writes (not per keystroke), flush on unmount and on `visibilitychange`, a fresh provider reading back the last one's row, only `ready` picks persisted, the row removed on send / on empty / on adoption, the write-through on terminal events, a pick settling into the conversation its draft was adopted into, and object-URL revocation on drop / discard / a lost `restorePreview` race. |
 | `pages/chat/inputHistory.test.ts` (12) | `inputHistory.ts` — `appendHistory`, `historyPrev`, `historyNext`, `HISTORY_CAP` | Composer Up/Down history ring: trim, dedup-consecutive, cap, walk/clamp/drop-to-draft. Port of the TUI `remember`/`history_*`. |
 | `pages/chat/outboxStore.test.ts` (6) | `outboxStore.ts` — `OutboxStore`, `dueForBlindResend`, `resendExhausted` | Two-stage confirm (echo→sent→durable-release), blind-resend window + cap, rebase-unknown park/resume, sticky-failed + manual retry, reload persistence. |
 | `pages/chat/searchSnippet.test.ts` (12) | `searchSnippet.ts` — `queryChunks`, `snippet` | Transcript-search excerpt: AND-tokenize the query the way the server does, build the highlighted segment run. |
