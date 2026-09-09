@@ -72,6 +72,13 @@ import {
   type CursorState,
 } from './chat/syncCursor';
 import { useQueueStore, useSessionQueue, type QueuedItem } from './chat/queueStore';
+import {
+  draftAt,
+  draftKeyFor,
+  useDraftApi,
+  useDrafts,
+  NO_SESSION_DRAFT_KEY,
+} from './chat/draftStore';
 import { useFolderStore } from './chat/folderStore';
 import { useInputHistory } from './chat/inputHistory';
 import { normalizeMath } from './chat/mathDelimiters';
@@ -382,21 +389,6 @@ function parseJumpTarget(raw: string | null): number | null {
  *  the SubscribeState turn-identity staleness test. */
 const ENDED_TURN_MEMORY = 8;
 
-/** A file the user picked in the composer. Uploaded to the blob store as
- *  soon as it's selected; `blobId` is filled once the upload lands, at which
- *  point it can be attached to the next outgoing message. */
-interface PendingAttachment {
-  localId: string;
-  filename: string;
-  mime: string;
-  size: number;
-  status: 'uploading' | 'ready' | 'error';
-  blobId?: string;
-  /** Local object URL for an instant composer thumbnail (images only).
-   *  Revoked on remove / after send. */
-  previewUrl?: string;
-}
-
 function attachmentKind(mime: string): WireAttachment['kind'] {
   if (mime.startsWith('image/')) return 'image';
   if (mime.startsWith('audio/')) return 'audio';
@@ -582,9 +574,6 @@ export function ChatPage() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [defaultModelName, setDefaultModelName] = useState('');
 
-  // Files picked in the composer, uploaded to the blob store on select and
-  // attached to the next outgoing message once their upload lands.
-  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const anchorSessionIdRef = useRef<string | null>(null);
 
@@ -656,16 +645,46 @@ export function ChatPage() {
   // stale 'connecting' after a reconnect. Updated in the same `onStatus`
   // callback that calls `setStatus`.
   const statusRef = useRef<ConnectionStatus>({ state: 'connecting' });
-  const [composer, setComposer] = useState('');
-  const [showSlashHints, setShowSlashHints] = useState(false);
+  // The composer is per conversation: what was typed and what was staged live
+  // in `draftStore`, keyed by session id and mounted above the router, so a
+  // draft survives a switch, an LRU eviction of the transcript behind it, and a
+  // trip to an admin page. Only sending it, or hiding the conversation, ends
+  // one. `composer` / `attachments` are the ACTIVE conversation's projection —
+  // shadowing the old tab-global state, so every read site downstream is
+  // unchanged and the layout effects keyed on `composer` still fire on a
+  // switch, resizing the box to the restored draft.
+  const drafts = useDrafts();
+  const draftApi = useDraftApi();
+  const draftKey = draftKeyFor(sessionId);
+  const draft = draftAt(drafts, draftKey);
+  const composer = draft.text;
+  const attachments = draft.attachments;
+  const setComposer = useCallback(
+    (text: string) => draftApi.setText(draftKey, text),
+    [draftApi, draftKey],
+  );
+
+  // The conversation whose draft the slash popup is open over, or null. Keyed
+  // rather than a bare boolean so a switch closes it during the SAME render
+  // that swaps the draft in — a boolean reset in an effect would leave one
+  // frame where the popup refilters the arriving draft as a command query.
+  // Returning to a conversation whose draft still starts with `/` reopens it,
+  // which is the same popup over the same unchanged text.
+  const [slashHintsFor, setSlashHintsFor] = useState<string | null>(null);
+  const showSlashHints = slashHintsFor === draftKey;
   // Highlighted row in the slash-command popup; Up/Down move it, Tab/click accept.
   const [selectedSlash, setSelectedSlash] = useState(0);
   // Shell-style input ring (Up/Down recalls submitted messages), a port of the
   // TUI history. `pendingCaret` parks the caret at a target offset once React
   // has committed a programmatic composer replace (history recall → end of the
-  // recalled entry; slash completion → just after the inserted command).
+  // recalled entry; slash completion → just after the inserted command). It
+  // carries the conversation it was armed for: `composer` now changes on every
+  // switch, so the layout effect below runs then too, and an offset left over
+  // from the conversation you just left would jump the caret inside the
+  // restored draft — and steal focus into the composer, which no plain switch
+  // does today.
   const inputHistory = useInputHistory();
-  const pendingCaret = useRef<number | null>(null);
+  const pendingCaret = useRef<{ key: string; caret: number } | null>(null);
 
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
@@ -1462,6 +1481,11 @@ export function ChatPage() {
             // and its recency entry. Idempotent with the local
             // handleHideSession cleanup.
             releaseSessionView(frame.session_id);
+            // The conversation going away is the other thing that ends a
+            // draft. Deliberately NOT inside `releaseSessionView`: the LRU
+            // calls that too, and evicting a transcript is not a decision to
+            // throw away unsent text.
+            draftApi.discard(frame.session_id);
             if (currentSessionIdRef.current === frame.session_id) {
               navigateRef.current('/chat', { replace: true });
             }
@@ -1669,6 +1693,7 @@ export function ChatPage() {
     baseUrl,
     adminToken,
     releaseSessionView,
+    draftApi,
     enqueueDelta,
     cancelPacer,
     seedPacer,
@@ -1784,7 +1809,18 @@ export function ChatPage() {
     pinnedToBottomRef.current = true;
     setHasNewBelow(false);
     currentSessionIdRef.current = sessionId;
+    // A refiltered popup starts at the top, and the input ring's walk does not
+    // cross a switch: left mid-walk in one conversation, a Down here would
+    // write that conversation's next entry into the draft of this one, where it
+    // now sticks instead of evaporating.
+    setSelectedSlash(0);
+    inputHistory.reset();
     if (sessionId) {
+      // A draft typed at `/chat` follows the user into the conversation they
+      // land in — the bootstrap redirect lands there under their fingers — but
+      // only when that conversation has nothing typed of its own. A refusal
+      // leaves it where it is, to be found again at `/chat`.
+      draftApi.adopt(NO_SESSION_DRAFT_KEY, sessionId);
       recencyRef.current.set(sessionId, Date.now());
       setSessions((prev) => {
         const idx = prev.findIndex((s) => s.session_id === sessionId);
@@ -1798,7 +1834,7 @@ export function ChatPage() {
       // it read). Otherwise the badge would reappear on the next list refetch.
       markReadRef.current(sessionId);
     }
-  }, [sessionId]);
+  }, [sessionId, inputHistory, draftApi]);
 
   // LRU eviction. Active session is protected — yanking its bucket
   // mid-render would flash an empty transcript. Eviction drops the
@@ -2175,14 +2211,20 @@ export function ChatPage() {
   // mouse-driven slash pick lands the user back in the box ready to type args.
   useLayoutEffect(() => {
     if (pendingCaret.current === null) return;
-    const target = pendingCaret.current;
+    const armed = pendingCaret.current;
     pendingCaret.current = null;
+    // A switch changes `composer` too, so this runs then. An offset armed in
+    // the conversation the user just left is dropped rather than applied to the
+    // draft that arrived — placing it would also call `focus()` below and pull
+    // the caret out of the sidebar on a plain switch.
+    if (armed.key !== draftKey) return;
+    const target = armed.caret;
     const ta = composerRef.current;
     if (!ta) return;
     const pos = Math.min(target, ta.value.length);
     ta.focus();
     ta.setSelectionRange(pos, pos);
-  }, [composer]);
+  }, [composer, draftKey]);
 
   // Session-agnostic send used by the composer (active session), the queue
   // auto-fire pipeline, manual per-item fire, and resume — so a message can be
@@ -2354,16 +2396,20 @@ export function ChatPage() {
     [outbox],
   );
 
+  /** Returns true iff the message left the tab. The composer's draft is
+   *  discarded on that answer alone: a submit refused here (no session, no
+   *  socket, still connecting) must leave what the user typed where it is —
+   *  `Enter` reaches the submit handler through `form.requestSubmit()`, which
+   *  never consults the send button's `disabled`. */
   const sendText = useCallback(
-    (raw: string, wireAttachments: WireAttachment[] = []) => {
+    (raw: string, wireAttachments: WireAttachment[] = []): boolean => {
       const trimmed = raw.trim();
       if ((!trimmed && wireAttachments.length === 0) || !sessionId || !wsRef.current)
-        return;
-      if (status.state !== 'connected') return;
+        return false;
+      if (status.state !== 'connected') return false;
       // Non-stop sends go through the shared session-agnostic path.
       if (!isStopCommand(trimmed)) {
-        sendToSession(sessionId, raw, wireAttachments, { foreground: true });
-        return;
+        return sendToSession(sessionId, raw, wireAttachments, { foreground: true });
       }
       // `/stop` is the one command we can reflect without the backend: the
       // user's own action means "cancel", so collapse the live work block to
@@ -2422,6 +2468,7 @@ export function ChatPage() {
         clientMsgId,
         attachments: wireAttachments,
       });
+      return true;
     },
     [sessionId, status.state, sendToSession, flushPacerKeepStreaming],
   );
@@ -2441,10 +2488,10 @@ export function ChatPage() {
       if (attachments.some((a) => a.status === 'uploading')) return;
       const trimmed = composer.trim();
       const wire: WireAttachment[] = attachments
-        .filter((a) => a.status === 'ready' && a.blobId)
+        .filter((a) => a.status === 'ready')
         .map((a) => ({
           kind: attachmentKind(a.mime),
-          blob_id: a.blobId as string,
+          blob_id: a.blobId,
           mime_type: a.mime,
           size: a.size,
           filename: a.filename,
@@ -2456,24 +2503,27 @@ export function ChatPage() {
         paused: queue.pauseReason !== null,
       });
       if (action === 'noop') return;
+      // A refused send must not cost the user their draft. `sendText` bails on
+      // no session, no socket, or a connection that isn't up yet, and Enter
+      // reaches here through `form.requestSubmit()` — which ignores the send
+      // button's `disabled`, so this is the only gate on that path. Parking is
+      // local and always succeeds.
+      if (action === 'park') {
+        queue.enqueue({ id: uuid(), text: trimmed, attachments: wire });
+      } else if (!(action === 'stop' ? sendText('/stop') : sendText(composer, wire))) {
+        return;
+      }
       // Record the submitted line in the input ring (send, park, or a typed
       // `/stop` all count; `commit` trims, dedupes, and ignores empties).
       inputHistory.commit(composer);
-      if (action === 'stop') {
-        sendText('/stop');
-      } else if (action === 'direct') {
-        sendText(composer, wire);
-      } else {
-        queue.enqueue({ id: uuid(), text: trimmed, attachments: wire });
-      }
-      setComposer('');
-      attachments.forEach((a) => {
-        if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
-      });
-      setAttachments([]);
-      setShowSlashHints(false);
+      // Sending is one of exactly two things that end a draft. `draftKey` is
+      // this render's — the same conversation `sendText` posted to — never a
+      // live ref: a send racing a switch would otherwise wipe the destination
+      // conversation's untouched draft while leaving the sent one's in place.
+      draftApi.discard(draftKey);
+      setSlashHintsFor(null);
     },
-    [composer, busy, attachments, sendText, queue, inputHistory],
+    [composer, busy, attachments, sendText, queue, inputHistory, draftApi, draftKey],
   );
 
   const handleStop = useCallback(
@@ -2590,17 +2640,26 @@ export function ChatPage() {
     queueFrameRef.current = drainQueueOnFrame;
   }, [drainQueueOnFrame]);
 
+  /** Stage one pick into `key`'s draft and upload it. The conversation is a
+   *  PARAMETER, not something read back when the upload lands: a switch during
+   *  a big upload must still settle the chip it created, or that conversation
+   *  is left with a pick stuck on `uploading` — which its send gate never
+   *  clears, so its composer is dead for the rest of the tab's life. */
   const uploadAttachment = useCallback(
-    async (file: File) => {
+    async (key: string, file: File) => {
       const localId = uuid();
       const mime = file.type || 'application/octet-stream';
       // Instant composer thumbnail for images, straight from the local file
       // (no upload round-trip needed to preview it).
       const previewUrl = mime.startsWith('image/') ? URL.createObjectURL(file) : undefined;
-      setAttachments((prev) => [
-        ...prev,
-        { localId, filename: file.name, mime, size: file.size, status: 'uploading', previewUrl },
-      ]);
+      draftApi.stage(key, {
+        localId,
+        filename: file.name,
+        mime,
+        size: file.size,
+        status: 'uploading',
+        previewUrl,
+      });
       try {
         // The web operator's admin bearer authorises `/v1/blobs` and
         // resolves to `AuthedClient::Web`, which bypasses pairing; the
@@ -2616,30 +2675,28 @@ export function ChatPage() {
         });
         if (!res.ok) throw new Error(`upload failed: ${res.status}`);
         const data = (await res.json()) as { blob_id: string };
-        setAttachments((prev) =>
-          prev.map((a) =>
-            a.localId === localId ? { ...a, status: 'ready', blobId: data.blob_id } : a,
-          ),
-        );
+        draftApi.settle(key, localId, { status: 'ready', blobId: data.blob_id });
       } catch {
-        setAttachments((prev) =>
-          prev.map((a) => (a.localId === localId ? { ...a, status: 'error' } : a)),
-        );
+        draftApi.settle(key, localId, { status: 'error' });
       }
     },
-    [baseUrl, adminToken],
+    [baseUrl, adminToken, draftApi],
   );
 
   const handleFilePick = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
       const files = e.target.files;
+      // `draftKey` is this render's: the OS picker is window-modal, so no click
+      // can move the route while it is up, and the one thing that can — another
+      // tab hiding this conversation — has already discarded the draft the
+      // files would land in.
       if (files) {
-        for (const file of Array.from(files)) void uploadAttachment(file);
+        for (const file of Array.from(files)) void uploadAttachment(draftKey, file);
       }
       // Reset so picking the same file again still fires `change`.
       e.target.value = '';
     },
-    [uploadAttachment],
+    [uploadAttachment, draftKey],
   );
 
   /** Whether a file can be staged at all: the blob POST rides the operator's
@@ -2647,6 +2704,44 @@ export function ChatPage() {
    *  on afterwards) every upload would land in `error`. Shared by the attach
    *  button and the paste handler so the two cannot drift. */
   const canAttach = adminToken !== null && adminToken.length > 0 && status.state === 'connected';
+
+  // A draft restored from storage carries its picks as blob refs — the object
+  // URL that drew the thumbnail died with the document that minted it. Fetch the
+  // blob back (bearer-gated, so an `<img src>` can't do it) and hand the store a
+  // fresh URL, which puts the strip back exactly as it was left rather than
+  // degrading a screenshot into a filename. Only the conversation on screen is
+  // rehydrated, so opening the tab doesn't pull down blobs for drafts nobody is
+  // looking at.
+  const rehydratingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (adminToken === null || adminToken.length === 0) return;
+    const wanted = attachments.filter(
+      (a) =>
+        a.status === 'ready' &&
+        a.previewUrl === undefined &&
+        a.mime.startsWith('image/') &&
+        !rehydratingRef.current.has(a.localId),
+    );
+    for (const a of wanted) {
+      if (a.status !== 'ready') continue;
+      const { localId, blobId } = a;
+      rehydratingRef.current.add(localId);
+      void (async () => {
+        try {
+          const base = (baseUrl || '').replace(/\/+$/, '');
+          const res = await fetch(`${base}/v1/blobs/${encodeURIComponent(blobId)}`, {
+            headers: { Authorization: `Bearer ${adminToken}` },
+          });
+          if (!res.ok) throw new Error(`blob ${res.status}`);
+          draftApi.restorePreview(draftKey, localId, URL.createObjectURL(await res.blob()));
+        } catch {
+          // No thumbnail, so the chip renders under its filename — the pick is
+          // still a blob ref and still sends. Left in the in-flight set so a
+          // dead blob isn't re-fetched on every keystroke.
+        }
+      })();
+    }
+  }, [attachments, draftKey, baseUrl, adminToken, draftApi]);
 
   /** Paste-to-attach: a clipboard carrying files and no text stages them
    *  through the same `uploadAttachment` pipeline as the file picker, so the
@@ -2666,19 +2761,16 @@ export function ChatPage() {
           file.name.length > 0
             ? file
             : new File([file], pastedFilename(file.type, index), { type: file.type });
-        void uploadAttachment(named);
+        void uploadAttachment(draftKey, named);
       });
     },
-    [canAttach, uploadAttachment],
+    [canAttach, uploadAttachment, draftKey],
   );
 
-  const removeAttachment = useCallback((localId: string) => {
-    setAttachments((prev) => {
-      const target = prev.find((a) => a.localId === localId);
-      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
-      return prev.filter((a) => a.localId !== localId);
-    });
-  }, []);
+  const removeAttachment = useCallback(
+    (localId: string) => draftApi.drop(draftKey, localId),
+    [draftApi, draftKey],
+  );
 
   // Slash-command completion candidates: when the draft starts with `/`, the
   // commands whose name prefix-matches the typed token. Mirrors the TUI's
@@ -2699,14 +2791,14 @@ export function ChatPage() {
       const name = filteredSlash[index]?.command;
       if (name === undefined) return;
       const { text, caret } = applySlashCompletion(composer, name);
-      setShowSlashHints(false);
+      setSlashHintsFor(null);
       setSelectedSlash(0);
       // Guard the no-op replace so a bailed-out render can't strand pendingCaret.
       if (text === composer) return;
       setComposer(text);
-      pendingCaret.current = caret;
+      pendingCaret.current = { key: draftKey, caret };
     },
-    [composer, filteredSlash],
+    [composer, filteredSlash, setComposer, draftKey],
   );
 
   const handleComposerKey = useCallback(
@@ -2756,8 +2848,8 @@ export function ChatPage() {
         // would strand `pendingCaret`).
         if (text === composer) return;
         setComposer(text);
-        setShowSlashHints(false);
-        pendingCaret.current = text.length;
+        setSlashHintsFor(null);
+        pendingCaret.current = { key: draftKey, caret: text.length };
       };
       // Unmodified Up/Down walk the input ring like the TUI — but only when the
       // caret is on the composer's edge line, so multi-line drafts keep native
@@ -2794,7 +2886,16 @@ export function ChatPage() {
         inputHistory.reset();
       }
     },
-    [composer, attachments, inputHistory, filteredSlash, selectedSlash, completeSlash],
+    [
+      composer,
+      attachments,
+      inputHistory,
+      filteredSlash,
+      selectedSlash,
+      completeSlash,
+      setComposer,
+      draftKey,
+    ],
   );
 
   // Slash hints are open only while the draft is a `/command` AND the caret is
@@ -2803,9 +2904,11 @@ export function ChatPage() {
   // setState when the boolean is unchanged, so onSelect is cheap.
   const refreshSlashHints = useCallback(
     (value: string, caret: number) => {
-      setShowSlashHints(slashCommands.length > 0 && caretOnSlashToken(value, caret));
+      setSlashHintsFor(
+        slashCommands.length > 0 && caretOnSlashToken(value, caret) ? draftKey : null,
+      );
     },
-    [slashCommands.length],
+    [slashCommands.length, draftKey],
   );
 
   const handleComposerChange = useCallback(
@@ -2817,7 +2920,7 @@ export function ChatPage() {
       // Any edit leaves history-navigation mode, like the TUI.
       inputHistory.reset();
     },
-    [refreshSlashHints, inputHistory],
+    [refreshSlashHints, inputHistory, setComposer],
   );
 
   // ── Interjection queue: composer/panel callbacks ────────────────────
@@ -3118,6 +3221,7 @@ export function ChatPage() {
     }
     setSessions((prev) => prev.filter((s) => s.session_id !== id));
     releaseSessionView(id);
+    draftApi.discard(id);
     if (sessionId === id) {
       const fallback =
         visibleSessions.find((s) => s.session_id !== id)?.session_id ??
@@ -3132,7 +3236,7 @@ export function ChatPage() {
     }
     setHideSubmitting(false);
     setHidePrompt(null);
-  }, [client, hidePrompt, releaseSessionView, sessionId, visibleSessions]);
+  }, [client, hidePrompt, releaseSessionView, draftApi, sessionId, visibleSessions]);
 
   // Re-pin the active session's model. The PUT is authoritative — its
   // `last_llm` echo drives the local update, and a live actor (if any)
