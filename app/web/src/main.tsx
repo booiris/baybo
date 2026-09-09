@@ -5,6 +5,7 @@ import App from './App';
 import { AdminAuthProvider } from './api/auth';
 import { QueueProvider } from './pages/chat/queueStore';
 import { FolderProvider } from './pages/chat/folderStore';
+import { DraftProvider } from './pages/chat/draftStore';
 import { registerPwa } from './pwa/registerSW';
 import { PwaUpdateBanner } from './pwa/PwaUpdateBanner';
 // KaTeX math styling + its self-hosted math fonts. Vite emits the referenced
@@ -29,9 +30,13 @@ createRoot(root).render(
     <AdminAuthProvider>
       <QueueProvider>
         <FolderProvider>
-          <HashRouter>
-            <App />
-          </HashRouter>
+          {/* Above the router: the icon rail unmounts ChatPage on every trip to
+              an admin route, and an unsent draft has to outlive that. */}
+          <DraftProvider>
+            <HashRouter>
+              <App />
+            </HashRouter>
+          </DraftProvider>
           {/* Outside the router so the reload offer survives the login screen. */}
           <PwaUpdateBanner />
         </FolderProvider>

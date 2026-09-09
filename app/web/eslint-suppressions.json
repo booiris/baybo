@@ -42,7 +42,7 @@
       "count": 42
     },
     "@typescript-eslint/strict-boolean-expressions": {
-      "count": 113
+      "count": 110
     }
   },
   "src/pages/CronPage.tsx": {
