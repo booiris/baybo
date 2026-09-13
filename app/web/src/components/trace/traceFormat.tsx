@@ -344,9 +344,13 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
       return 'progress update';
     }
     case 'title_generation': {
-      const llm = spans.find((s) => s.kind.kind === 'llm_call');
-      const out = llm?.kind.kind === 'llm_call' ? llm.kind.result?.output_content : undefined;
-      if (out != null && out !== '') return out.slice(0, 80);
+      // A failed call with images is retried on the text alone in the same
+      // step, so the title is the LAST call that produced one.
+      const out = spans
+        .flatMap((s) => (s.kind.kind === 'llm_call' ? [s.kind.result?.output_content] : []))
+        .reverse()
+        .find((o) => o != null && o !== '');
+      if (out != null) return out.slice(0, 80);
       return 'conversation title';
     }
   }

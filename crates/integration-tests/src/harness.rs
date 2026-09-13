@@ -104,12 +104,19 @@ impl AgentTestHarness {
     /// observable through `harness.secret_store` regardless of which
     /// session owns the placeholder map.
     pub async fn send_text(&mut self, text: impl Into<String>) -> anyhow::Result<()> {
+        self.send_content(vec![ContentBlock::Text(text.into())])
+            .await
+    }
+
+    /// [`AgentTestHarness::send_text`] for arbitrary user content — an
+    /// uncaptioned image, a caption plus attachments.
+    pub async fn send_content(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
         let message = Message {
             id: format!("msg-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
             session_id: self.session.id.clone(),
             channel: self.session.channel.clone(),
             sender: self.session.user.clone(),
-            content: vec![ContentBlock::Text(text.into())],
+            content,
             timestamp: Utc::now(),
             reply_to: None,
             metadata: MessageMetadata::default(),
@@ -208,6 +215,13 @@ pub struct AgentTestHarnessBuilder {
     /// return-immediately contract doesn't fit.
     llm: Option<Arc<dyn LlmCompletion>>,
     chat_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    /// Whether the stub LLM reports `supports_vision`. Defaults to `false`,
+    /// the stub's own default.
+    model_supports_vision: bool,
+    /// Live title surface. Defaults to `None`, which keeps the title pass
+    /// off: with one stub serving every call, a title `chat()` would take
+    /// the reply a test queued for a compaction or a request count.
+    title_sink: Option<Arc<dyn baybo_agent::SessionTitleSink>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -227,6 +241,8 @@ impl Default for AgentTestHarnessBuilder {
             memory: None,
             llm: None,
             chat_gate: None,
+            model_supports_vision: false,
+            title_sink: None,
         }
     }
 }
@@ -307,6 +323,21 @@ impl AgentTestHarnessBuilder {
         self
     }
 
+    /// Make the stub LLM report `supports_vision`, so paths that gate image
+    /// delivery on the model's capability take their vision branch.
+    pub fn with_model_vision(mut self, supports_vision: bool) -> Self {
+        self.model_supports_vision = supports_vision;
+        self
+    }
+
+    /// Wire a live title surface, which turns the conversation-title pass
+    /// on. Its `chat()` is served by the harness's own stub, so queue a
+    /// `push_response` for it.
+    pub fn with_title_sink(mut self, sink: Arc<dyn baybo_agent::SessionTitleSink>) -> Self {
+        self.title_sink = Some(sink);
+        self
+    }
+
     /// Wire a [`baybo_memory::Memory`] impl into the loop so a test can assert
     /// the recall / `on_turn_complete` hooks fire. Defaults to `None` (inert).
     pub fn with_memory(mut self, memory: Arc<dyn baybo_memory::Memory>) -> Self {
@@ -323,10 +354,11 @@ impl AgentTestHarnessBuilder {
     }
 
     /// Park the FIRST non-streaming `chat` (the compaction summariser is the
-    /// only caller in these suites) until `release` is notified, signalling
-    /// `entered` first so the test can act while the call is in flight. Later
-    /// calls pass straight through, so a test can hold one compaction and then
-    /// let the next one run normally.
+    /// only caller in these suites — unless [`Self::with_title_sink`] turns
+    /// the title pass on, whose `chat` would take the gate) until `release`
+    /// is notified, signalling `entered` first so the test can act while the
+    /// call is in flight. Later calls pass straight through, so a test can
+    /// hold one compaction and then let the next one run normally.
     ///
     /// Wraps the harness's OWN stub rather than replacing it — `with_llm`
     /// swaps the client out entirely, which would silently orphan
@@ -387,6 +419,11 @@ impl AgentTestHarnessBuilder {
             if let Some(window) = self.model_context_window {
                 let mut info = stub.model_info().clone();
                 info.context_window = window;
+                stub = stub.with_model_info(info);
+            }
+            if self.model_supports_vision {
+                let mut info = stub.model_info().clone();
+                info.supports_vision = true;
                 stub = stub.with_model_info(info);
             }
             Arc::new(stub)
@@ -539,7 +576,7 @@ impl AgentTestHarnessBuilder {
             sessions: Some(Arc::clone(&session_manager)),
             memory: self.memory,
             task_store: task_store.clone(),
-            title_sink: None,
+            title_sink: self.title_sink,
         });
         let (mailbox_tx, mailbox_rx) = baybo_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
@@ -656,5 +693,9 @@ impl LlmCompletion for GatedChat {
 
     fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
         self.inner.effective_effort(requested)
+    }
+
+    fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
+        self.inner.delivers_image_block(block)
     }
 }
