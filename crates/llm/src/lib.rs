@@ -243,6 +243,31 @@ pub fn delivers_media(role: baybo_model::Role) -> bool {
     matches!(role, baybo_model::Role::User)
 }
 
+/// [`is_portable_image_type`] for a MIME string.
+pub(crate) fn is_portable_image_mime(mime: &str) -> bool {
+    parse_image_media_type(mime).is_some_and(|media_type| is_portable_image_type(&media_type))
+}
+
+/// The image formats delivered to the model: png, jpeg and webp, the ones
+/// every provider that takes an inline image at all accepts
+/// (`portable_image_mimes_are_the_ones_anthropic_and_gemini_both_accept`
+/// pins them against the two converters that refuse the rest).
+///
+/// The rest of what [`parse_image_media_type`] admits is stubbed for
+/// everyone rather than allowed per provider, because a refusal is never
+/// just the image: rig's Anthropic converter errors on a HEIC before the
+/// request leaves, Gemini's errors on a GIF, OpenAI answers a 400 — and
+/// either way the WHOLE request fails, as does every later turn of the
+/// session, since each one resends the history. A per-provider matrix would
+/// buy a HEIC on Gemini and a GIF on Anthropic at the price of tracking
+/// every vendor's format list, and one wrong entry costs a whole session.
+fn is_portable_image_type(media_type: &ImageMediaType) -> bool {
+    matches!(
+        media_type,
+        ImageMediaType::JPEG | ImageMediaType::PNG | ImageMediaType::WEBP
+    )
+}
+
 /// Wrapper the model is asked to read as a delimiter around an inlined
 /// attachment. Every slot is client-controlled — the filename and MIME
 /// come off the wire and the body is the file itself — so all three are
@@ -1417,6 +1442,14 @@ pub trait LlmCompletion: Send + Sync {
     /// a client that silently answers "not applicable" is how effort stopped
     /// reaching `cost_records` in the first place.
     fn effective_effort(&self, requested: Option<&str>) -> Option<String>;
+    /// Whether this client would hand `block` to the model as a picture
+    /// rather than a text stub — see [`LlmClient::delivers_image_block`].
+    /// Defaults to `false`: only a client that materialises media can say
+    /// yes, and a caller picking images for a side pass would rather send
+    /// none than a placeholder.
+    fn delivers_image_block(&self, _block: &baybo_model::ContentBlock) -> bool {
+        false
+    }
 }
 
 #[async_trait::async_trait]
@@ -1432,6 +1465,9 @@ impl LlmCompletion for LlmClient {
     }
     fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
         LlmClient::effective_effort(self, requested)
+    }
+    fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
+        LlmClient::delivers_image_block(self, block)
     }
 }
 
@@ -1502,6 +1538,34 @@ impl LlmClient {
     pub fn with_blob_fetcher(mut self, fetcher: std::sync::Arc<dyn BlobFetcher>) -> Self {
         self.blob_fetcher = Some(fetcher);
         self
+    }
+
+    /// Whether `block` is an image this client would deliver as a picture:
+    /// the gates [`Self::user_content_for_block`] applies, answered from the
+    /// block's metadata without a fetch — vision, a blob fetcher, a format
+    /// we deliver ([`is_portable_image_type`]) and dimensions the provider
+    /// prices under [`IMAGE_TOKEN_CEILING`]. Recorded
+    /// dimensions are required: ingest leaves them unset past
+    /// [`MAX_IMAGE_DOCUMENT_BYTES`] and for a header it can't read, both of
+    /// which delivery stubs. Only the fetch itself can still fail.
+    ///
+    /// For side passes that pick images out of the transcript (the
+    /// conversation title), so they leave out what the model would only
+    /// read as `[image: …]`.
+    pub fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
+        let baybo_model::ContentBlock::Image {
+            mime_type,
+            width: Some(width),
+            height: Some(height),
+            ..
+        } = block
+        else {
+            return false;
+        };
+        self.model_info.supports_vision
+            && self.blob_fetcher.is_some()
+            && is_portable_image_mime(mime_type)
+            && self.model.delivers_image(*width, *height)
     }
 
     /// Sends a chat request to the provider and returns a unified response.
@@ -1760,6 +1824,14 @@ impl LlmClient {
                 ) else {
                     return text_stub(block);
                 };
+                if !is_portable_image_type(&media_type) {
+                    tracing::warn!(
+                        blob_id = %blob.blob_id,
+                        mime_type = %mime_type,
+                        "image format is not one we deliver; falling back to text stub",
+                    );
+                    return text_stub(block);
+                }
                 let bytes = match fetcher.fetch(&blob.blob_id).await {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -2439,6 +2511,181 @@ mod multimodal_dispatch_tests {
         );
         assert_eq!(parse_image_media_type("image/x-fancy"), None);
     }
+
+    /// Runs the real rig converters — the two that refuse some formats — so
+    /// a rig bump that widens or narrows either one's image support shows up
+    /// here.
+    #[test]
+    fn portable_image_mimes_are_the_ones_anthropic_and_gemini_both_accept() {
+        use rig::providers::anthropic::completion::Message as AnthropicMessage;
+        use rig::providers::gemini::completion::gemini_api_types::Content as GeminiContent;
+
+        let converts_on_both = |media_type: ImageMediaType| {
+            let message = || Message::User {
+                content: OneOrMany::one(UserContent::Image(Image {
+                    data: DocumentSourceKind::Base64("AAAA".into()),
+                    media_type: Some(media_type.clone()),
+                    detail: Some(ImageDetail::Auto),
+                    additional_params: None,
+                })),
+            };
+            AnthropicMessage::try_from(message()).is_ok()
+                && GeminiContent::try_from(message()).is_ok()
+        };
+
+        for mime in ["image/png", "image/jpeg", "image/jpg", "IMAGE/WEBP; q=1"] {
+            assert!(is_portable_image_mime(mime), "{mime}");
+            let media_type = parse_image_media_type(mime).unwrap();
+            assert!(converts_on_both(media_type), "{mime}");
+        }
+        for mime in ["image/gif", "image/heic", "image/heif", "image/svg+xml"] {
+            assert!(!is_portable_image_mime(mime), "{mime}");
+            let media_type = parse_image_media_type(mime).unwrap();
+            assert!(
+                !converts_on_both(media_type),
+                "{mime} converts on both now — it belongs in is_portable_image_mime"
+            );
+        }
+        assert!(!is_portable_image_mime("image/bmp"));
+    }
+}
+
+#[cfg(test)]
+mod image_format_tests {
+    //! A format we don't deliver has to become a stub BEFORE the converter
+    //! or the API sees it: a refusal is never just the image, it fails the
+    //! whole request, and every turn resends the history.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use baybo_model::{BlobRef, ContentBlock};
+    use rig::message::UserContent;
+
+    use super::*;
+    use crate::registry::{LlmProviderConfig, LlmProviderRegistry};
+
+    /// Serves a readable header whatever the block claims to be, so only the
+    /// format gate can stop a delivery — and counts that it was asked.
+    #[derive(Default)]
+    struct CountingFetcher(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl BlobFetcher for CountingFetcher {
+        async fn fetch(&self, _blob_id: &str) -> Result<Vec<u8>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(media_probe::fixture::png(800, 600))
+        }
+    }
+
+    /// One per provider family that handles images differently: Anthropic's
+    /// converter refuses what it can't name, Gemini's takes a different set,
+    /// OpenAI's passes any MIME to the API.
+    const VISION_MODELS: &[(&str, &str)] = &[
+        ("anthropic", "claude-sonnet-4-20250514"),
+        ("gemini", "gemini-2.5-flash"),
+        ("openai", "gpt-4o"),
+    ];
+
+    fn client_for(provider: &str, model: &str) -> LlmClient {
+        let mut client = LlmProviderRegistry::with_default_providers()
+            .build_client(&LlmProviderConfig {
+                provider: provider.into(),
+                api_key: Some("test".into()),
+                base_url: None,
+                model: model.into(),
+                supports_vision: Some(true),
+                context_window: None,
+                pricing: None,
+                reasoning_effort: None,
+                vault: None,
+                proxy: None,
+            })
+            .unwrap();
+        client.model_info.supports_vision = true;
+        client
+    }
+
+    fn image(mime: &str) -> ContentBlock {
+        sized(mime, Some((800, 600)))
+    }
+
+    fn sized(mime: &str, dimensions: Option<(u32, u32)>) -> ContentBlock {
+        ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:photo.tok".into(),
+            },
+            mime_type: mime.into(),
+            filename: None,
+            width: dimensions.map(|(w, _)| w),
+            height: dimensions.map(|(_, h)| h),
+        }
+    }
+
+    async fn deliver(provider: &str, model: &str, mime: &str) -> (UserContent, usize) {
+        let fetcher = Arc::new(CountingFetcher::default());
+        let client = client_for(provider, model).with_blob_fetcher(fetcher.clone());
+        let out = client.user_content_for_block(&image(mime)).await;
+        (out, fetcher.0.load(Ordering::SeqCst))
+    }
+
+    /// An iPhone photo is a HEIC; before this gate one of them failed every
+    /// turn after it on an Anthropic session.
+    #[tokio::test]
+    async fn a_format_we_do_not_deliver_is_stubbed_before_the_fetch() {
+        for (provider, model) in VISION_MODELS {
+            for mime in ["image/heic", "image/heif", "image/gif", "image/svg+xml"] {
+                let (out, fetches) = deliver(provider, model, mime).await;
+                assert!(
+                    matches!(&out, UserContent::Text(t) if t.text.contains(mime)),
+                    "{provider} {mime}: {out:?}"
+                );
+                assert_eq!(fetches, 0, "{provider} {mime}: refused before the fetch");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_formats_we_deliver_reach_the_model() {
+        for (provider, model) in VISION_MODELS {
+            for mime in ["image/png", "image/jpeg", "image/webp"] {
+                let (out, fetches) = deliver(provider, model, mime).await;
+                assert!(
+                    matches!(out, UserContent::Image(_)),
+                    "{provider} {mime}: {out:?}"
+                );
+                assert_eq!(fetches, 1, "{provider} {mime}");
+            }
+        }
+    }
+
+    /// What a side pass picks images with: every gate delivery applies
+    /// before the fetch, answered from the block alone.
+    #[test]
+    fn delivers_image_block_answers_from_the_metadata() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        let anthropic =
+            client_for("anthropic", "claude-sonnet-4-20250514").with_blob_fetcher(fetcher.clone());
+        let gemini = client_for("gemini", "gemini-2.5-flash").with_blob_fetcher(fetcher.clone());
+
+        assert!(anthropic.delivers_image_block(&image("image/png")));
+        assert!(!anthropic.delivers_image_block(&image("image/heic")));
+        // No recorded size: past the byte cap, or a header ingest couldn't read.
+        assert!(!anthropic.delivers_image_block(&sized("image/png", None)));
+        // Priced per provider: a 24 MP photo fits Anthropic's ceiling, not Gemini's.
+        let photo = sized("image/jpeg", Some((5712, 4284)));
+        assert!(anthropic.delivers_image_block(&photo));
+        assert!(!gemini.delivers_image_block(&photo));
+
+        let unfetched = client_for("anthropic", "claude-sonnet-4-20250514");
+        assert!(!unfetched.delivers_image_block(&image("image/png")));
+        let mut blind =
+            client_for("anthropic", "claude-sonnet-4-20250514").with_blob_fetcher(fetcher.clone());
+        blind.model_info.supports_vision = false;
+        assert!(!blind.delivers_image_block(&image("image/png")));
+        assert!(!anthropic.delivers_image_block(&ContentBlock::Text("a photo".into())));
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 0, "metadata only");
+    }
 }
 
 #[cfg(test)]
@@ -3017,10 +3264,11 @@ mod document_dispatch_tests {
 
     /// Delivery is gated on what the CURRENT provider charges. Gating on
     /// the cross-provider maximum instead silently dropped every image in
-    /// this table — including the 24 MP photo the app's own picker
-    /// produces by default, which really costs Claude 2,352 tokens — and
-    /// nothing in the pipeline downscales, so the user got no signal and
-    /// no picture.
+    /// this table — including a 24 MP camera photo, which really costs
+    /// Claude 2,352 tokens — and the gateway never downscales (only the iOS
+    /// composer does, and only a HEIC; a JPEG camera roll, a Files pick or
+    /// another channel still send one full size), so the user got no signal
+    /// and no picture.
     #[tokio::test]
     async fn an_image_is_delivered_wherever_the_provider_billing_it_can_afford_it() {
         let mut delivered_somewhere = 0;

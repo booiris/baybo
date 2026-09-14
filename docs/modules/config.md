@@ -92,7 +92,9 @@ Resolution, most specific first (`LlmClientPool::resolve_lite`):
 
 Step 3 is not optional. The Bash risk judges are fail-closed, so a "no lite configured" answer of `None` would silently turn the default `permission = auto` from "judge every destructive command" into "prompt on every destructive command".
 
-Which calls are auxiliary is decided by one rule: **an auxiliary call may use the lite model only if its input is not the session transcript.** The Bash risk judges (a command line), WebFetch's page summary (a fetched page), and title generation (one user message) qualify. Context compression and the progress observer do not — their input is the exact prefix provider prompt-caching keeps warm, and that cache is per-model, so moving them would trade a cache hit for a cold full-transcript read and can cost *more* than the model it saves.
+Which calls are auxiliary is decided by one rule: **an auxiliary call may use the lite model only if its input is not the session transcript.** The Bash risk judges (a command line), WebFetch's page summary (a fetched page), and title generation (the user's opening message) qualify. Context compression and the progress observer do not — their input is the exact prefix provider prompt-caching keeps warm, and that cache is per-model, so moving them would trade a cache hit for a cold full-transcript read and can cost *more* than the model it saves.
+
+Title generation is also the one auxiliary call that reads images: it sends the images sent with or just before the user's first question only when the lite model would see them as pictures (`supports_vision`, a png / jpeg / webp image, and dimensions its provider prices under the image ceiling), so a text-only `lite_model` titles from the question alone (see [agent.md](agent.md) → *Conversation title*).
 
 `baybo setup` / `baybo llm add` seed `lite_model` on every entry they create, but what they seed it *to* depends on the provider:
 

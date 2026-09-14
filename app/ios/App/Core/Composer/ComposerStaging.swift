@@ -320,7 +320,7 @@ final class ComposerStaging: ObservableObject {
     }
 
     func acceptPhoto(id: UUID, data: Data, declaredMime: String?) async {
-        guard let byteCount = StagedAttachment.wireSize(data.count) else {
+        guard StagedAttachment.wireSize(data.count) != nil else {
             drop(id, notice: Lang.shared.t("attach.tooLarge"))
             return
         }
@@ -336,22 +336,24 @@ final class ComposerStaging: ObservableObject {
         update(id) {
             $0.preview = .image(spool.image)
             $0.source = .spooled(spool.file)
-            $0.mime = mime
-            $0.byteCount = byteCount
+            $0.mime = spool.mime
+            $0.byteCount = spool.byteCount
         }
         scheduleDraftSave()
         pumpUploads()
     }
 
+    /// Off the main actor: re-encoding a 48 MP HEIC is a full decode.
     private static func spoolPhoto(
         _ data: Data, id: UUID, mime: String
-    ) async -> (file: SpoolFile, image: UIImage)? {
+    ) async -> (file: SpoolFile, image: UIImage, mime: String, byteCount: UInt32)? {
         await Task.detached(priority: .userInitiated) {
-            guard let file = try? StagedAttachment.spool(data, id: id, mime: mime) else {
-                return nil
-            }
+            let upload = StagedAttachment.uploadablePhoto(data, mime: mime)
+            guard let byteCount = StagedAttachment.wireSize(upload.data.count),
+                let file = try? StagedAttachment.spool(upload.data, id: id, mime: upload.mime)
+            else { return nil }
             guard let image = StagedAttachment.thumbnail(at: file.url) else { return nil }
-            return (file, image)
+            return (file, image, upload.mime, byteCount)
         }.value
     }
 

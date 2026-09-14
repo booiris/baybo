@@ -108,6 +108,22 @@ describe('stepSummaryText — compression', () => {
   });
 });
 
+describe('stepSummaryText — title_generation', () => {
+  it('reads the title off the text-only retry when the call with images failed', () => {
+    const failed = llmSpan({ output_content: '' });
+    const retried = { ...llmSpan({ output_content: 'Login error dialog' }), id: 'span-2' };
+    expect(stepSummaryText(step({ kind: 'title_generation' }), [failed, retried])).toBe(
+      'Login error dialog',
+    );
+  });
+
+  it('falls back when no call produced a title', () => {
+    expect(
+      stepSummaryText(step({ kind: 'title_generation' }), [llmSpan({ output_content: '' })]),
+    ).toBe('conversation title');
+  });
+});
+
 describe('turnInputText / turnOutputText — meta steps riding the turn', () => {
   const TITLE_PROMPT =
     'You are titling a brand-new conversation from the user\'s first message.\n\nUser\'s first message:\n<user_message>\nwhat broke the build?\n</user_message>';

@@ -1,3 +1,4 @@
+import ImageIO
 import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
@@ -145,7 +146,7 @@ struct StagedAttachment: Identifiable {
 
     static func sniffMime(_ data: Data) -> String {
         let head = [UInt8](data.prefix(12))
-        if head.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
+        if head.starts(with: [0xFF, 0xD8, 0xFF]) { return jpegMime }
         if head.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
         if head.starts(with: [0x47, 0x49, 0x46]) { return "image/gif" }
         guard head.count == 12 else { return fallbackMime }
@@ -154,6 +155,69 @@ struct StagedAttachment: Identifiable {
         if brand == "WEBP" { return "image/webp" }
         if box == "ftyp", heifBrands.contains(brand) { return "image/heic" }
         return fallbackMime
+    }
+
+    static let jpegMime = "image/jpeg"
+
+    /// Photos re-encoded before they leave the phone. HEIC is what the camera
+    /// roll hands over, and the gateway delivers png / jpeg / webp only
+    /// (`is_portable_image_type` in `crates/llm`, because a format some
+    /// provider refuses fails the whole request), so a HEIC would reach the
+    /// model as a placeholder. It travels as JPEG instead; every other photo
+    /// keeps its original bytes.
+    private static let reencodedPhotoMimes: Set<String> = ["image/heic", "image/heif"]
+    /// Long edges tried in order; the first whose JPEG fits
+    /// `providerImageByteCap` is sent. 4096 px keeps a 12 MP photo at full
+    /// size and is the edge the gateway's `IMAGE_TOKEN_CEILING` is priced
+    /// from, so it reaches every provider; 2048 px is for a scene too
+    /// detailed to fit.
+    private static let reencodedPhotoEdges = [4096, 2048]
+    /// Mirrors `MAX_IMAGE_DOCUMENT_BYTES` in `crates/llm`: past it the model
+    /// gets a placeholder instead of the image.
+    private static let providerImageByteCap = 5 * 1024 * 1024
+    private static let reencodedPhotoQuality = 0.8
+
+    /// The bytes a staged photo uploads as, and their mime — see
+    /// `reencodedPhotoMimes`. Bytes ImageIO can't decode come back as they
+    /// went in, which only keeps this total: the thumbnail decode that
+    /// follows in `spoolPhoto` fails on them too and drops the pick.
+    static func uploadablePhoto(_ data: Data, mime: String) -> (data: Data, mime: String) {
+        guard reencodedPhotoMimes.contains(mime) else { return (data, mime) }
+        var rendition: Data?
+        for edge in reencodedPhotoEdges {
+            rendition = jpegRendition(of: data, maxEdge: edge)
+            guard let jpeg = rendition, jpeg.count > providerImageByteCap else { break }
+        }
+        guard let rendition else { return (data, mime) }
+        return (rendition, jpegMime)
+    }
+
+    /// `data` as a JPEG at most `maxEdge` pixels on its long side, with its
+    /// orientation drawn into the pixels. The metadata stays behind — the
+    /// location a camera-roll photo carries would otherwise ride along to the
+    /// provider. `nil` when ImageIO can't decode it.
+    static func jpegRendition(of data: Data, maxEdge: Int) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxEdge,
+        ]
+        guard
+            let image = CGImageSourceCreateThumbnailAtIndex(
+                source, CGImageSourceGetPrimaryImageIndex(source), options as CFDictionary)
+        else { return nil }
+        let output = NSMutableData()
+        guard
+            let destination = CGImageDestinationCreateWithData(
+                output as CFMutableData, UTType.jpeg.identifier as CFString, 1, nil)
+        else { return nil }
+        let properties: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: reencodedPhotoQuality
+        ]
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
     }
 
     static func glyph(forMime mime: String) -> String {

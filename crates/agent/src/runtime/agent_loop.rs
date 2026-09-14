@@ -1033,7 +1033,7 @@ impl AgentLoop {
         self.context_manager.set_progress_observation(None);
 
         // Fire-and-forget at turn start so the title derives concurrently with
-        // the answer (it needs only the question, already in context).
+        // the answer (it needs only the opening message, already in context).
         self.maybe_generate_title(session, span_recorder, turn_id, is_user_turn, &cancel_token)
             .await;
 
@@ -3289,13 +3289,15 @@ impl AgentLoop {
     /// `run_inner` (right after the system prompt is seeded, before the first
     /// LLM call), so the title pass runs **concurrently with this turn's
     /// answer** rather than after it — the title depends only on the user's
-    /// first question, which is already in context, not on the reply. It
-    /// `tokio::spawn`s a DETACHED pass that records a
-    /// [`StepKind::TitleGeneration`] step + its `LlmCall` span **under this
+    /// opening message ([`crate::runtime::title::TitleSeed`]), which is
+    /// already in context, not on the reply. It `tokio::spawn`s a DETACHED
+    /// pass that records a
+    /// [`StepKind::TitleGeneration`] step + its `LlmCall` span (two when the
+    /// text-only fallback fires) **under this
     /// turn's own turn** (`current_turn_id`) — so cost + trace attribute to the
     /// triggering turn, exactly like [`Self::maybe_run_progress_observer`],
     /// rather than spinning up a separate maintenance turn. It titles the
-    /// session, persists it via `SessionManager::set_title`, and notifies the
+    /// session, persists it via `SessionManager::set_title_if_absent`, and notifies the
     /// [`Self::title_sink`] to broadcast it. Fire-and-forget: the turn never
     /// blocks on it.
     ///
@@ -3307,13 +3309,18 @@ impl AgentLoop {
     ///
     /// **Gate (all must hold):** the turn is `UserChat`; a
     /// [`Self::title_sink`] is wired (the "a live title surface exists" signal
-    /// — present in the running gateway, absent in tests / headless, so
+    /// — present in the running gateway, absent headless and by default in
+    /// tests (the integration harness opts in with `with_title_sink`), so
     /// titles are only generated where something renders them); the session is
     /// a top-level user session (`TriggerSource::User`, no lineage — cron /
     /// subagent skipped); it has no title yet (`session.title.is_none()`);
     /// this actor hasn't already attempted one ([`Self::title_generation`]
-    /// present, the per-actor-lifetime guard); and the transcript has a
-    /// text-bearing first user question ([`first_user_question`]).
+    /// present, the per-actor-lifetime guard); and the transcript has an
+    /// seed ([`crate::runtime::title::TitleSeed::from_transcript`]) — a
+    /// text-bearing user row, joined only by the user's images the lite
+    /// client would deliver as pictures (`BillableLlm::delivers_image_block`).
+    /// A text-only lite model never gets an image: it would read a
+    /// `[image: … blob_id=…]` stub instead.
     ///
     /// The `session.title.is_none()` arm is only a cheap pre-filter. It reads
     /// the actor's long-lived `Session` snapshot, which a rename (a targeted
@@ -3344,7 +3351,11 @@ impl AgentLoop {
         let Some(sessions) = self.sessions.clone() else {
             return;
         };
-        let Some(question) = first_user_question(self.context_manager.messages()) else {
+        let lite = &self.lite_client;
+        let Some(seed) = crate::runtime::title::TitleSeed::from_transcript(
+            self.context_manager.messages(),
+            |image| lite.delivers_image_block(image),
+        ) else {
             return;
         };
 
@@ -3367,7 +3378,7 @@ impl AgentLoop {
                 model_info,
                 cancel_token,
             };
-            match runner.run(question).await {
+            match runner.run(seed).await {
                 // Conditional write, not a plain set: the gate below ran
                 // before this LLM call, so the user may have renamed the
                 // conversation in the meantime. Staying silent on `false`
@@ -3386,121 +3397,6 @@ impl AgentLoop {
             }
         });
         self.title_generation = Some(handle);
-    }
-}
-
-/// Cap on the opening message handed to title generation. Naming a
-/// conversation never needs more than its first couple of paragraphs, and
-/// the message is unbounded user input — a pasted log as the first turn
-/// would otherwise be sent verbatim, which a small lite model may not even
-/// have the window for.
-const TITLE_QUESTION_MAX_CHARS: usize = 2_000;
-
-/// Extract the session's first genuine user question from the transcript:
-/// the first `MessageSource::User` row that actually carries text (a
-/// media-only opener — an uncaptioned image with no `Text` block — is
-/// skipped, so a session that opens with media then a real question still
-/// titles from the question). `None` when there is no text-bearing user row.
-/// Truncated to [`TITLE_QUESTION_MAX_CHARS`].
-fn first_user_question(messages: &[ChatMessage]) -> Option<String> {
-    messages
-        .iter()
-        .filter(|m| matches!(m.source(), baybo_model::MessageSource::User))
-        .find_map(|m| {
-            let text = m
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let text = text.trim();
-            if text.is_empty() {
-                return None;
-            }
-            Some(match text.char_indices().nth(TITLE_QUESTION_MAX_CHARS) {
-                Some((cut, _)) => text[..cut].to_string(),
-                None => text.to_string(),
-            })
-        })
-}
-
-#[cfg(test)]
-mod first_user_question_tests {
-    use super::TITLE_QUESTION_MAX_CHARS;
-    use super::first_user_question;
-    use baybo_model::{ChatMessage, ContentBlock};
-
-    /// The opener is unbounded user input; a pasted log must not ride
-    /// into the title prompt verbatim.
-    #[test]
-    fn a_long_opener_is_truncated() {
-        let long = "x".repeat(TITLE_QUESTION_MAX_CHARS * 3);
-        let msgs = vec![ChatMessage::user(vec![ContentBlock::Text(long)])];
-        let q = first_user_question(&msgs).expect("text-bearing row");
-        assert_eq!(q.chars().count(), TITLE_QUESTION_MAX_CHARS);
-    }
-
-    /// Truncation slices on a char boundary, not a byte one.
-    #[test]
-    fn truncation_is_char_boundary_safe() {
-        let long = "\u{03b1}\u{03b2}\u{03b3}".repeat(TITLE_QUESTION_MAX_CHARS);
-        let msgs = vec![ChatMessage::user(vec![ContentBlock::Text(long)])];
-        let q = first_user_question(&msgs).expect("text-bearing row");
-        assert_eq!(q.chars().count(), TITLE_QUESTION_MAX_CHARS);
-    }
-
-    #[test]
-    fn picks_first_genuine_user_row_over_injected_and_assistant() {
-        let msgs = vec![
-            ChatMessage::system(vec![ContentBlock::Text("system prompt".into())]),
-            ChatMessage::user(vec![ContentBlock::Text(
-                "How do I reset my password?".into(),
-            )]),
-            ChatMessage::assistant(vec![ContentBlock::Text("Sure…".into())]),
-            ChatMessage::user(vec![ContentBlock::Text("second question".into())]),
-        ];
-        assert_eq!(
-            first_user_question(&msgs).as_deref(),
-            Some("How do I reset my password?")
-        );
-    }
-
-    #[test]
-    fn skips_agent_injected_role_user_rows() {
-        let msgs = vec![
-            ChatMessage::agent_context(vec![ContentBlock::Text("injected context".into())]),
-            ChatMessage::user(vec![ContentBlock::Text("the real question".into())]),
-        ];
-        assert_eq!(
-            first_user_question(&msgs).as_deref(),
-            Some("the real question")
-        );
-    }
-
-    #[test]
-    fn none_when_no_user_row_or_media_only() {
-        let no_user = vec![ChatMessage::system(vec![ContentBlock::Text("s".into())])];
-        assert_eq!(first_user_question(&no_user), None);
-
-        let media_only = vec![ChatMessage::user(vec![ContentBlock::Text(String::new())])];
-        assert_eq!(first_user_question(&media_only), None);
-    }
-
-    #[test]
-    fn advances_past_a_media_only_opener_to_the_first_text_question() {
-        let msgs = vec![
-            ChatMessage::user(vec![ContentBlock::Text(String::new())]),
-            ChatMessage::user(vec![ContentBlock::Text(
-                "How do I reset my password?".into(),
-            )]),
-        ];
-        assert_eq!(
-            first_user_question(&msgs).as_deref(),
-            Some("How do I reset my password?")
-        );
     }
 }
 

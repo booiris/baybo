@@ -243,8 +243,9 @@ final class TranscriptMedia {
                 let content = ViewedImage.Content(bytes: bytes, mimeType: mimeType)
             else { return }
             // The share sheet hands over the FILE, not the decoded image, so the
-            // original encoding and name reach Photos / Files / AirDrop. A write
-            // failure only costs the share button, never the viewer.
+            // encoding it was uploaded in and its name reach Photos / Files /
+            // AirDrop. A write failure only costs the share button, never the
+            // viewer.
             let url = try? Self.writePreviewFile(
                 bytes: bytes, blobId: blobId, filename: filename, mimeType: mimeType)
             onViewImage?(ViewedImage(id: blobId, content: content, url: url))

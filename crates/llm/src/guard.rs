@@ -112,6 +112,12 @@ impl BillableLlm {
         self.inner.effective_effort(requested)
     }
 
+    /// Whether the wrapped client would hand `block` to the model as a
+    /// picture — see [`crate::LlmClient::delivers_image_block`].
+    pub fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
+        self.inner.delivers_image_block(block)
+    }
+
     /// Issue a minimal chat request to verify provider connectivity
     /// and auth. Mirrors the previous `LlmClient::probe()` so the
     /// `baybo llm probe` / `baybo doctor` paths still have a cheap

@@ -5,8 +5,8 @@ import WebKit
 /// A chat image the user tapped, ready for the full-screen viewer. Carries the
 /// decoded content so the viewer needs no second fetch, plus the same bytes
 /// materialised on disk under their real name — the share sheet hands over the
-/// FILE, so Save-to-Photos / Files / AirDrop get the original encoding and name
-/// rather than a re-encoded bitmap. Identified by blob id so
+/// FILE, so Save-to-Photos / Files / AirDrop get the encoding it was uploaded
+/// in and its name, rather than a re-encoded bitmap. Identified by blob id so
 /// `.fullScreenCover(item:)` re-presents when a different image is tapped.
 struct ViewedImage: Identifiable {
     /// What the viewer has to show — the two are not the same medium.

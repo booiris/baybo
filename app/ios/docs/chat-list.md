@@ -253,10 +253,12 @@ superseded ORIGINAL still renders, so `ordinal` is always the address. See
 ## Renaming a conversation
 
 `PUT /v1/chat/sessions/{id}/title` (`chat_set_title` over the active leg). Titles
-are otherwise machine-written — the auto-titler generates one from the first user
-question — and a rename settles the conversation against it: the titler writes
-only where there is no title (`set_title_if_absent`), so a hand-written name is
-never overwritten.
+are otherwise machine-written — the auto-titler generates one from the opening
+message (the first question, plus its images when the lite model would see them
+as pictures — a camera-roll HEIC counts, since it uploads as JPEG; see
+`docs/modules/agent.md` → *Conversation title*) — and a rename settles the
+conversation against it: the titler writes only where there is no title
+(`set_title_if_absent`), so a hand-written name is never overwritten.
 
 **The rules live in `RenameTitle`**, the Swift mirror of the web's
 `renameTitle.ts` and, through both, of the gateway's `validate_session_title`:

@@ -707,6 +707,148 @@ async fn multimodal_tool_images_are_injected_as_a_followup_user_row() {
     harness.shutdown().await;
 }
 
+#[derive(Default)]
+struct RecordingTitleSink(parking_lot::Mutex<Vec<(SessionId, String)>>);
+
+impl baybo_agent::SessionTitleSink for RecordingTitleSink {
+    fn title_updated(&self, session_id: &SessionId, title: &str) {
+        self.0.lock().push((session_id.clone(), title.to_string()));
+    }
+}
+
+fn user_png() -> ContentBlock {
+    ContentBlock::Image {
+        blob: BlobRef {
+            blob_id: format!("{SHA256_PREFIX}{}.tok", "f".repeat(64)),
+        },
+        mime_type: "image/png".into(),
+        filename: Some("error.png".into()),
+        width: Some(1280),
+        height: Some(720),
+    }
+}
+
+fn title_reply(title: &str) -> LlmResponse {
+    LlmResponse {
+        content: title.into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    }
+}
+
+/// The title pass is spawned concurrently with the answer, so its request is
+/// picked out by its prompt rather than by position.
+fn title_requests(stub: &StubLlm) -> Vec<baybo_llm::ChatRequest> {
+    stub.captured_requests()
+        .into_iter()
+        .filter(|r| {
+            r.messages.iter().any(|m| {
+                m.content.iter().any(|b| {
+                    matches!(b, ContentBlock::Text(t) if t.starts_with("You are titling a brand-new conversation"))
+                })
+            })
+        })
+        .collect()
+}
+
+/// On a vision lite model an uncaptioned picture waits for the question that
+/// follows it — WeChat has no captions — and then rides the title request
+/// with it, after the prompt.
+#[tokio::test(start_paused = true)]
+async fn an_uncaptioned_image_titles_with_the_question_that_follows_it() {
+    let sink = Arc::new(RecordingTitleSink::default());
+    let mut harness = AgentTestHarness::builder()
+        .with_model_vision(true)
+        .with_title_sink(sink.clone())
+        .build();
+    harness.stub_llm.push_stream(vec![StreamEvent::Text(
+        "What would you like to know?".into(),
+    )]);
+    harness.send_content(vec![user_png()]).await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert!(
+        title_requests(&harness.stub_llm).is_empty(),
+        "a picture alone never titles"
+    );
+
+    harness
+        .stub_llm
+        .push_response(title_reply("Login error dialog"));
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("That's a login error".into())]);
+    harness.send_text("why does this fail?").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let requests = title_requests(&harness.stub_llm);
+    let [request] = requests.as_slice() else {
+        panic!("exactly one title request, got {requests:?}");
+    };
+    assert_eq!(request.messages.len(), 1);
+    let content = &request.messages[0].content;
+    assert!(
+        matches!(content.first(), Some(ContentBlock::Text(prompt)) if prompt.contains("why does this fail?"))
+    );
+    assert_eq!(content[1..], [user_png()]);
+    assert_eq!(
+        *sink.0.lock(),
+        [(harness.session.id.clone(), "Login error dialog".to_string())]
+    );
+
+    harness.shutdown().await;
+}
+
+/// A text-only lite model would read the image as a `[image: … blob_id=…]`
+/// stub, so the question titles the conversation without it.
+#[tokio::test(start_paused = true)]
+async fn a_text_only_model_titles_from_the_first_question_not_the_image() {
+    let sink = Arc::new(RecordingTitleSink::default());
+    let mut harness = AgentTestHarness::builder()
+        .with_title_sink(sink.clone())
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("Nice picture".into())]);
+    harness.send_content(vec![user_png()]).await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert!(
+        title_requests(&harness.stub_llm).is_empty(),
+        "no title pass for an image the model cannot see"
+    );
+
+    harness
+        .stub_llm
+        .push_response(title_reply("Password reset"));
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("Here's how".into())]);
+    harness
+        .send_content(vec![
+            ContentBlock::Text("How do I reset my password?".into()),
+            user_png(),
+        ])
+        .await
+        .unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let requests = title_requests(&harness.stub_llm);
+    let [request] = requests.as_slice() else {
+        panic!("exactly one title request, got {requests:?}");
+    };
+    let [ContentBlock::Text(prompt)] = request.messages[0].content.as_slice() else {
+        panic!("text only, got {:?}", request.messages[0].content);
+    };
+    assert!(prompt.contains("How do I reset my password?"));
+    assert_eq!(
+        *sink.0.lock(),
+        [(harness.session.id.clone(), "Password reset".to_string())]
+    );
+
+    harness.shutdown().await;
+}
+
 /// A turn whose answer is only the file — no prose — must still reach the
 /// user. `is_blank_reply` (crates/agent/src/actor/mod.rs) suppresses an
 /// all-blank-text reply behind a fallback notice; a media block survives it

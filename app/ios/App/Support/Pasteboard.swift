@@ -5,9 +5,11 @@ import UniformTypeIdentifiers
 /// plus whatever flavour the clipboard called them.
 ///
 /// Never a `UIImage`. The mime the gateway stores and the provider is handed is
-/// sniffed from these bytes (`StagedAttachment.photoMime`), so decoding and
-/// re-encoding would silently replace the user's HEIC or JPEG with a different
-/// format — bigger, and under a mime that no longer describes what they copied.
+/// sniffed from these bytes (`StagedAttachment.photoMime`), so decoding here
+/// would re-encode every paste into a format bigger than the HEIC or JPEG the
+/// user copied. Only two re-encodes happen: a TIFF-only item becomes PNG here
+/// (`SystemPasteboard.image(at:)`), and a HEIC becomes JPEG in staging
+/// (`StagedAttachment.uploadablePhoto`) — each naming the bytes it produced.
 struct PastedImage {
     let data: Data
     /// What the clipboard flavour claims. A HINT only: `photoMime` sniffs the
@@ -129,9 +131,9 @@ enum Pasteboards {
 
 struct SystemPasteboard: PasteboardReading {
     /// Flavours whose bytes `StagedAttachment.sniffMime` already names, best
-    /// first. Handing the ORIGINAL bytes over is the rule: it keeps the stored
-    /// mime equal to what the user copied, and it never inflates a 12 MP HEIC
-    /// into a far larger PNG.
+    /// first. Handing the ORIGINAL bytes over is the rule: staging decides what
+    /// leaves the phone (a HEIC goes as JPEG), and nothing here ever inflates a
+    /// 12 MP HEIC into a far larger PNG.
     private static let encoded: [(type: UTType, mime: String)] = [
         (.png, "image/png"),
         (.jpeg, "image/jpeg"),

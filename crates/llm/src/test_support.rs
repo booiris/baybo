@@ -175,6 +175,22 @@ impl LlmCompletion for StubLlm {
     fn effective_effort(&self, _requested: Option<&str>) -> Option<String> {
         self.effective_effort.clone()
     }
+
+    /// A generic vision model on an OpenAI-compatible provider: a
+    /// recorded-size png, jpeg or webp, and only when the stub reports
+    /// `supports_vision`.
+    fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
+        self.model_info.supports_vision
+            && matches!(
+                block,
+                baybo_model::ContentBlock::Image {
+                    mime_type,
+                    width: Some(_),
+                    height: Some(_),
+                    ..
+                } if crate::is_portable_image_mime(mime_type)
+            )
+    }
 }
 
 #[cfg(test)]

@@ -51,15 +51,25 @@ struct ComposerStagingTests {
 
     /// Real encoded bytes — the spool's thumbnail goes through ImageIO, which
     /// a magic-byte fixture can't satisfy.
-    private static func smallPNG() -> Data {
+    private static func smallPNG() -> Data { png(width: 8, height: 8) }
+
+    private static func png(width: CGFloat, height: CGFloat) -> Data {
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 1
-        return UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8), format: format)
+        return UIGraphicsImageRenderer(size: CGSize(width: width, height: height), format: format)
             .pngData { ctx in
                 UIColor(white: 0.5, alpha: 1).setFill()
-                ctx.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+                ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
             }
     }
+
+    /// A real 64x64 HEIC in the shape a camera-roll pick arrives in — 8-bit,
+    /// `heic` brand, no crop box — encoded by libheif's `heif-enc`, since the
+    /// re-encode needs bytes ImageIO can decode.
+    private static let heicPhoto = Data(
+        base64Encoded:
+            "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAAVZtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAAAAAAAA5waXRtAAAAAAABAAAAImlsb2MAAAAAREAAAQABAAAAAAF6AAEAAAAAAAAALgAAACNpaW5mAAAAAAABAAAAFWluZmUCAAAAAAEAAGh2YzEAAAAA1mlwcnAAAAC3aXBjbwAAAHhodmNDAQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNwAAADAJAAAAMAAAMAHroCQGEAAQArQgEBA3AAAAMAkAAAAwAAAwAeoCCBBZbqSSmubgIaDAgAAAMAyAAAAwAIQGIAAQAHRAHBcrAiQAAAABNjb2xybmNseAABAA0ABoAAAAAUaXNwZQAAAAAAAABAAAAAQAAAABBwaXhpAAAAAAMICAgAAAAXaXBtYQAAAAAAAAABAAEEgQIDBAAAADZtZGF0AAAAKigBr1i5PxS7g9mfwoYF4lk5QJLBsiOee5ByI2OVandgO63x5NajJMFPgA=="
+    )!
 
     // MARK: - kind derivation
 
@@ -169,6 +179,46 @@ struct ComposerStagingTests {
         #expect(StagedAttachment.sniffMime(Self.ftyp("qt  ")) == StagedAttachment.fallbackMime)
     }
 
+    // MARK: - a HEIC leaves as JPEG
+
+    /// Anthropic's and OpenAI's APIs refuse HEIC, so on those models the photo
+    /// would reach the agent as a placeholder. It leaves the phone as a JPEG of
+    /// the same pixels — small enough here that nothing is scaled.
+    @Test func aHEICIsReencodedAsJPEG() throws {
+        #expect(StagedAttachment.sniffMime(Self.heicPhoto) == "image/heic")
+        let upload = StagedAttachment.uploadablePhoto(Self.heicPhoto, mime: "image/heic")
+        #expect(upload.mime == StagedAttachment.jpegMime)
+        #expect(StagedAttachment.sniffMime(upload.data) == StagedAttachment.jpegMime)
+        let image = try #require(UIImage(data: upload.data))
+        #expect(image.size == CGSize(width: 64, height: 64))
+    }
+
+    /// Every other photo is sent exactly as picked.
+    @Test func otherPhotosKeepTheirOriginalBytes() {
+        let png = Self.smallPNG()
+        let kept = StagedAttachment.uploadablePhoto(png, mime: "image/png")
+        #expect(kept.data == png)
+        #expect(kept.mime == "image/png")
+    }
+
+    /// Bytes ImageIO can't decode come back as they went in: the re-encode
+    /// never fails a pick of its own accord — the thumbnail decode after it is
+    /// what turns an undecodable photo away.
+    @Test func anUndecodableHEICKeepsItsBytes() {
+        let kept = StagedAttachment.uploadablePhoto(Self.heicBytes, mime: "image/heic")
+        #expect(kept.data == Self.heicBytes)
+        #expect(kept.mime == "image/heic")
+    }
+
+    /// A 48 MP photo re-encoded at full size would land over the 5 MiB
+    /// delivery cap (and Gemini's pixel-price ceiling) — a placeholder again.
+    @Test func theRenditionCapsTheLongEdge() throws {
+        let wide = Self.png(width: 5000, height: 20)
+        let jpeg = try #require(StagedAttachment.jpegRendition(of: wide, maxEdge: 4096))
+        let image = try #require(UIImage(data: jpeg))
+        #expect(max(image.size.width, image.size.height) == 4096)
+    }
+
     // MARK: - paste
 
     /// The Paste row's whole implementation: a clipboard image becomes the same
@@ -194,6 +244,26 @@ struct ComposerStagingTests {
         // the gateway's `attachment.<ext>` fallback is what titles its card.
         #expect(ref.filename == nil)
         #expect(fixture.store.notice == nil)
+    }
+
+    /// The funnel every photo goes through re-encodes a HEIC before the spool,
+    /// so what streams to the gateway, the mime it is filed under and the size
+    /// the card reports are all the JPEG's — never the original's.
+    @Test func aHEICStagesAndUploadsAsJPEG() async throws {
+        let fixture = ComposerFixture(
+            pasteboard: FakePasteboard([.image(Self.heicPhoto, mime: "image/heic")]))
+
+        fixture.staging.stagePasteboard()
+
+        #expect(await waitUntil { fixture.client.blobUploadCalls.count == 1 })
+        let call = try #require(fixture.client.blobUploadCalls.first)
+        #expect(call.mimeType == StagedAttachment.jpegMime)
+        let uploaded = try Data(contentsOf: URL(fileURLWithPath: call.path))
+        #expect(StagedAttachment.sniffMime(uploaded) == StagedAttachment.jpegMime)
+        #expect(await waitUntil { StagedAttachment.blocker(fixture.staging.staged) == nil })
+        let ref = try #require(fixture.staging.staged.first?.attachmentRef)
+        #expect(ref.mimeType == StagedAttachment.jpegMime)
+        #expect(ref.size == UInt32(uploaded.count))
     }
 
     /// The clipboard's declared flavour is a HINT, not the answer. `acceptPhoto`
