@@ -249,7 +249,7 @@ zstd = "0.13"
 # authorization-code-with-PKCE flow, `open` to launch the user's browser
 # during `baybo mcp add` against an OAuth-protected HTTP server, base64 for
 # PKCE challenge encoding.
-rmcp = { version = "1.5", default-features = false, features = [
+rmcp = { version = "2.0", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
