@@ -42,7 +42,9 @@ Panel rows set `accessibilityLabel` = title and `accessibilityValue` = subtitle,
 
 ## The catalog
 
-The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to name/provider/model/**model_list**/reasoning_effort/**available_efforts**) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a server-scoped **`models.json` mirror** (the `deck.json` idiom, written on fetch + effort edits and retained across logout/rebind) for offline cold-paint.
+The catalog (`GET /v1/llm/models`, FFI `llm_list_models`) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a server-scoped **`models.json` mirror** (the `deck.json` idiom, written on every successful fetch and retained across logout/rebind) for offline cold-paint.
+
+It carries TWO surfaces' worth of fields. The picker reads name/provider/model/**model_list**/reasoning_effort/**available_efforts**; the Settings entry editor ([entry-editor.md](entry-editor.md)) also reads `base_url`, `api_key_env`, `api_key_configured`, `lite_model`, and both the **override** and the **effective** context-window / vision columns. The effective ones are computed gateway-side by layering an override over the OpenRouter snapshot, so nothing here can derive them — which is why every write re-reads instead of patching locally. The row's `is_default` is deliberately dropped: `default_name` on the envelope is the one home for that question.
 
 Because of the mirror, a cold offline start still paints the pill and the panel. The pill renders only once the catalog has entries, and the pill **NEVER shows a placeholder** — always the best-known model id.
 
@@ -52,7 +54,7 @@ Because of the mirror, a cold offline start still paints the pill and the panel.
 
 - the **entry** is `SessionState.last_llm`;
 - the **model** is a `model_list` id in `last_model` (`nil` ⇒ entry default);
-- the **effort** (thinking level) is **PER-SESSION**, not a global entry edit.
+- the **effort** (thinking level) is **PER-SESSION** — a pick from THIS panel never touches the entry's configured level. The entry's own default effort is a global config edit, and it lives in Settings ([entry-editor.md](entry-editor.md)).
 
 `ChatStore.selectEffort` pins (entry, its relevant model, effort); `selectModel` keeps the current effort; both funnel through `applySelection` → one PUT. The panel's Thinking checkmark/subtitle read `store.modelPinEffort ?? entry's default` (session value wins, applies whatever entry — effort is INDEPENDENT of the llm/model pin).
 
@@ -87,3 +89,4 @@ Root workspace, **NOT** covered by `app/ios` CI:
 - `AgentMessage::SetModel{llm, model, effort}` threads the triple through the spawner (`ActorSpawner`'s `initial_effort`) → `AgentLoop.initial_effort` → every turn's `ChatRequest`.
 - `validate_llm_model` rejects a model outside the entry's `entry_model_ids`; the pin's effort is parsed against the ladder (`ReasoningEffort::parse`) and **canonicalised** on the way in, so `none` and `off` never persist as two spellings of one rung.
 - `PUT /v1/chat/sessions/{id}/model` carries `{llm, model, reasoning_effort}`; the old global `llm_set_reasoning_effort` FFI was removed (superseded).
+- The GLOBAL writes are `PUT /v1/llm/models/{name}` (FFI `llm_update_model`) and `PUT /v1/llm/default` (FFI `llm_set_default`), both reached only from Settings — see [entry-editor.md](entry-editor.md). A session pin and a config edit are different scopes on the same nouns; do not add a second door to either.

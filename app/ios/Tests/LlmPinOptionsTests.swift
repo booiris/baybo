@@ -7,9 +7,8 @@ struct LlmPinOptionsTests {
     private func entry(
         _ name: String, model: String, candidates: [String] = [], efforts: [String] = []
     ) -> LlmModelInfo {
-        LlmModelInfo(
-            name: name, provider: "p", model: model, modelCandidates: candidates,
-            reasoningEffort: nil, availableEfforts: efforts)
+        LlmFixtures.entry(
+            name, provider: "p", model: model, candidates: candidates, efforts: efforts)
     }
 
     private var pool: [LlmModelInfo] {

@@ -3976,6 +3976,148 @@
         }
       }
     },
+    "/v1/llm/models/{name}/catalog": {
+      "get": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "get_catalog",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Entry name (matches `llm[*].name`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The provider's live model catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmCatalogResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The provider's catalog could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/models/{name}/model-list": {
+      "put": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "set_model_list",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Entry name (matches `llm[*].name`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLlmModelListRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Model list replaced and hot-reloaded in-process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty id, duplicate, or the default model missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Write failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/llm/models/{name}/test": {
       "post": {
         "tags": [
@@ -10433,6 +10575,57 @@
           }
         }
       },
+      "LlmCatalogModel": {
+        "type": "object",
+        "description": "One model as the provider's own catalog reports it\n(`GET /v1/llm/models/{name}/catalog`). A LIVE read over the provider's API,\nnot config — so it can be slow, and it can fail for an entry whose\ncredentials are not yet valid.",
+        "required": [
+          "id",
+          "configured"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "Whether this id is already in the entry's `model_list`, so a picker can\ntell what it would be adding from what is already served."
+          },
+          "context_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "supports_vision": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "LlmCatalogResponse": {
+        "type": "object",
+        "description": "`GET /v1/llm/models/{name}/catalog` response.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogModel"
+            }
+          }
+        }
+      },
       "LlmInfo": {
         "type": "object",
         "description": "Current LLM provider descriptor.",
@@ -10457,6 +10650,7 @@
           "provider",
           "model",
           "api_key_configured",
+          "api_key_in_vault",
           "available_efforts",
           "is_default",
           "effective_context_window",
@@ -10473,6 +10667,10 @@
               "string",
               "null"
             ]
+          },
+          "api_key_in_vault": {
+            "type": "boolean",
+            "description": "`true` when a key is stored in THIS gateway's vault, as opposed to\nmerely resolving from an environment variable.\n\nThe two differ in what a client may offer: only a vault key can be\nremoved over HTTP (`api_key: \"\"`), and offering that on an entry whose\nkey comes from the environment would be a button that reports success\nand changes nothing."
           },
           "available_efforts": {
             "type": "array",
@@ -11405,6 +11603,21 @@
           }
         }
       },
+      "SetLlmModelListRequest": {
+        "type": "object",
+        "description": "`PUT /v1/llm/models/{name}/model-list` body — the models this entry\nserves, as a SET, in picker order.\n\nReplace rather than add/remove, for two reasons. Model ids routinely\ncontain a slash (`meta-llama/Llama-3-70B`), which makes them unsafe as a\npath segment; and a whole-set PUT is idempotent, so a client whose request\nis replayed converges instead of double-adding.\n\n**Replacing the list never destroys an override.** The handler keeps each\nsurviving id's existing `LlmModelSpec` and only mints a bare one for an id\nthat was not there — so a caller may send plain ids without knowing which\noverrides exist. Dropping an id DOES drop its overrides, which is the point\nof dropping it.",
+        "required": [
+          "models"
+        ],
+        "properties": {
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "SetSessionArchiveRequest": {
         "type": "object",
         "description": "Request body for `PUT /v1/chat/sessions/{session_id}/archive`.",
@@ -12076,7 +12289,7 @@
               "string",
               "null"
             ],
-            "description": "Set the literal API key in the vault (`llm.entry.<name>.api_key`).\nPass `\"\"` to remove the vault entry, or omit the field to leave\nthe vault untouched. Never echoed back."
+            "description": "Set the literal API key in the vault (`llm.entry.<name>.api_key`).\nPass `\"\"` to delete the stored key, or omit the field to leave the\nvault untouched. Never echoed back.\n\nA delete only removes what THIS vault holds; if `api_key_env` or the\nprovider's default env var still resolves, the entry keeps working and\n`api_key_configured` stays true."
           },
           "api_key_env": {
             "type": [

@@ -278,6 +278,27 @@ impl GatewayJsonClient for DirectHttp {
         }
     }
 
+    fn put_json<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let resp = self
+                .client()
+                .put(self.url(path))
+                .header(reqwest::header::CONTENT_TYPE, MEDIA_TYPE_JSON)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Baybo: {e}"))?;
+            parse_json_response(resp).await
+        }
+    }
+
     fn delete_empty<'a>(
         &'a self,
         path: &'a str,

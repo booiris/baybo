@@ -68,6 +68,13 @@ final class AppStore: ObservableObject {
         /// The Deck's recycle bin: soft-deleted cards, each restorable. Pushed
         /// from the Deck header's ☰ menu, mirroring `archived` for Chats.
         case deckRecycle
+        /// The gateway's configured LLM entries. Pushed from Settings — the
+        /// first Settings row that pushes anything. No argument: the screen
+        /// reads `ModelCatalog.shared`.
+        case llmEntries
+        /// One entry's editor, keyed by entry name. Pushed OVER the list, so
+        /// the edge swipe goes back to the entry it came from.
+        case llmEntry(String)
         case projectBoard(String)
         /// One card on a board. Pushed over its board, so the edge swipe goes
         /// back to the column it came from.
@@ -925,6 +932,21 @@ final class AppStore: ObservableObject {
     func openCronJobs() {
         guard !chatPath.contains(.cronJobs) else { return }
         chatPath.append(.cronJobs)
+    }
+
+    /// The Settings row: push the gateway's configured LLM entries. Guarded
+    /// like `openArchived`.
+    func openLlmEntries() {
+        guard !chatPath.contains(.llmEntries) else { return }
+        chatPath.append(.llmEntries)
+    }
+
+    /// One entry's editor, over the list. Guarded per NAME rather than per
+    /// case, so two different entries can legitimately stack while a second
+    /// tap on the one already open cannot.
+    func openLlmEntry(_ name: String) {
+        guard chatPath.last != .llmEntry(name) else { return }
+        chatPath.append(.llmEntry(name))
     }
 
     /// The Deck header's ☰ menu entry: push the card recycle bin. Guarded like

@@ -16,7 +16,9 @@ bar on 18–25 — system chrome, degrades on its own) with five sections
 - `projects` (`ProjectsScreen` — one card per board, pushing a board and then a
   card, see [projects.md](projects.md)),
 - `chats` (`ChatListScreen`),
-- `settings` (`SettingsScreen` — language, version, log out) and
+- `settings` (`SettingsScreen` — language, **Models**, version, log out; the
+  Models row is the first Settings row that PUSHES, onto the outer stack —
+  see [entry-editor.md](entry-editor.md)) and
 - `search` (`SearchScreen` — full-text over every conversation, see
   [chat-list.md](chat-list.md#searching-conversations)).
 
