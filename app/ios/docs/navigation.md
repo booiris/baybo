@@ -67,6 +67,50 @@ trailing edge; without the role it would just be a fifth item inside the pill.
 as an ordinary tab, so nothing here branches on version. It is also the only tab
 whose screen skips the shared wordmark header: its search field IS its header.
 
+### Re-tapping the selected Chats tab
+
+Tapping the Chats item while Chats is already selected steps the chat list to the
+next row carrying unread (the behaviour is
+[chat-list.md](chat-list.md#stepping-to-the-next-unread); this is how the gesture is
+caught).
+
+**There is no reselection API.** 26.5 exposes none — but UIKit still runs
+`_setSelectedViewControllerAndNotify:` for a tap on the already-selected item, and
+SwiftUI's coordinator writes the selection binding from
+`tabBarController(_:didSelect:)` regardless of whether the value changed. So the
+existing `searchAwareSelection` setter IS the hook: a `next == store.homeTab` branch
+at the top of it. Measured on a simulator with an `NSLog` in that setter — exactly
+one call per physical tap, `current=chats next=chats`, three taps three calls. The
+setter runs as an enqueued action at the end of an update pass, which is why
+mutating state from it is legal; it is the same window the search-edge branch's
+`withTransaction` already uses.
+
+**That branch now returns EARLY instead of re-writing `homeTab`,** which is a small
+win on its own: `@Published` does not de-duplicate, so every re-tap used to republish
+the whole shell and both tab badges. Nothing read that write — every
+`onChange(of:)` is equality-gated, `homeTab`'s `willSet` already ignores re-entry,
+and `-baybo-demo-tabs` writes `homeTab` directly without going through the binding.
+
+**The shell reports the GESTURE, not the behaviour.** It bumps a `@State` epoch and
+hands it to `ChatListScreen` as a plain `let`. One producer, one consumer, parent and
+child — a new `@Published` on `AppStore` would widen the shell's surface for one tap
+and republish it on every one.
+
+If this ever silently regresses the degradation is benign — the re-tap does nothing,
+exactly as before the feature. `UnreadStepUITests` is the tripwire, and it is in the
+non-gating suite, so a green CI is not proof. The fallback, documented and NOT built:
+a `UITabBarControllerDelegate` proxy reached by walking the VC hierarchy from a
+`UIViewControllerRepresentable` (`PopGesture.swift` is the in-tree precedent for the
+walk). It must retain and forward BOTH `shouldSelect` and `didSelect` — SwiftUI's own
+coordinator implements both and its selection breaks otherwise — and `delegate` is
+`weak`, so it needs an owner with the right lifetime. Strictly more code for the same
+signal one frame earlier.
+
+A third a11y trap, beside the two above: the gesture is invisible, so the Chats tab
+carries an `.accessibilityHint` (`TabContent.accessibilityHint(_:isEnabled:)`, iOS
+18.0+). **Whether VoiceOver surfaces a hint on the tap-an-already-selected-tab path
+is unverified** — no tier here can read it.
+
 ### The NavigationStack wraps the WHOLE TabView
 
 An OUTER `NavigationStack(path: $chatPath)` in `RootView` WRAPS the whole

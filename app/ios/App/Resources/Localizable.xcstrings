@@ -3027,6 +3027,23 @@
         }
       }
     },
+    "home.tab.chatsStepHint": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Steps to the next unread conversation"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "跳到下一个未读对话"
+          }
+        }
+      }
+    },
     "home.tab.deck": {
       "extractionState": "stale",
       "localizations": {

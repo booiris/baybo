@@ -318,6 +318,105 @@ the badge across devices.
 Relay warms the leg via `relay_preconnect`; direct via `direct_preconnect` (both
 best-effort on launch/foreground) so the pings arrive while parked on the list.
 
+## Stepping to the next unread
+
+**Tapping the Chats tab when Chats is ALREADY selected scrolls the list to the next
+row carrying unread**, one row per tap, walking down the rendered order and wrapping
+back to the top. It does **not** open the conversation and does **not** mark anything
+read: the badges are exactly where they were when the walk started. It is the
+"one more, downward" gesture, not an inbox-zero machine.
+
+`HomeTabView` reports only the GESTURE — a `@State` epoch bumped in the tab
+selection binding (see [navigation.md](navigation.md#re-tapping-the-selected-chats-tab))
+and handed to `ChatListScreen` as a plain `let`. The list owns what it means.
+
+### The walk
+
+`ChatListBuckets.nextUnread(after:in:)` is the whole rule, pure and unit-tested
+(`Tests/NextUnreadStepTests.swift`): the first row with `unread > 0` strictly AFTER
+the cursor in the array the list renders, wrapping to the top.
+
+- **It wraps rather than stopping.** The gesture never consumes unread, so the walk
+  cannot end by exhaustion — a terminal tap would leave an invisible gesture
+  permanently dead.
+- **It is addressed by `ChatListItem.id`, never by index.** Rows arrive, re-sort
+  (any `SessionActivity` bumps recency) and leave between taps, so a position is not
+  a handle. A cursor whose row has left the list restarts the walk from the top,
+  which falls out of the rule rather than needing an invalidation listener.
+- **A cron GROUP is one stop,** carrying `CronGroup.unread` — the sum over the fires
+  drawn inside it, so an escaped pinned fire is counted at its own row and nowhere
+  else. The walk cannot step *into* a group; those fires are rows of
+  `CronGroupScreen`.
+- **The pinned block is the prefix of that order,** so a pinned unread row is visited
+  before any unpinned one. That is what pinning means.
+- **`items(from:)` had to become a TOTAL order** for any of this to hold.
+  `Array.sorted(by:)` is not documented stable and the group half is appended while
+  iterating a `Dictionary`, so two rows sharing `(pinned, lastActive)` had no defined
+  relative order between two calls — and a walk that visits each row exactly once
+  cannot rest on that. The `id` tiebreak is what makes "one row per tap" mean
+  anything.
+
+The cursor is `@State` on `ChatListScreen` and nothing else: `AppStore.init`
+early-returns under XCTest (so anything living there is unreachable from the unit
+tier), a field there would survive a rebind into someone else's list, and
+`SessionIndex.save()` carries a badge publish on every write — a reading position is
+not worth a disk write plus a badge publish per tap. It clears on `.background`
+(**not** `.inactive`: pulling the notification shade down must not wipe a walk in
+progress). It deliberately does NOT clear on a tab switch or on popping back from a
+conversation — continuing below the row you just read is the whole point, and a
+lifecycle-event reset on this screen is a known bug source.
+
+### The landing, and the trap under it
+
+`ScrollViewProxy.scrollTo(target, anchor: .top)`, and `.top` is the only anchor that
+works: measured on 26.5, `.center` and a hand-computed `UnitPoint` both degrade to
+"scroll the minimum that reveals the row", which leaves an already-visible target
+sitting exactly where it was.
+
+**That forced the header clearance to move from `.contentMargins(.top, …, for:
+.scrollContent)` to `.safeAreaPadding(.top, …)`** — same constant, same resting
+layout (measured: first row top 120pt either way), but a content margin is content
+PADDING and `scrollTo` aligns to the scroll view's INSET. Under the margin a step
+landed its row at 62pt — beneath the 46pt bar and the top safe area, headline behind
+the wordmark. As an inset the same number lands a stepped row exactly where row one
+rests. `UnreadStepUITests.testTheSteppedRowLandsClearOfTheHeader` pins it against the
+wordmark's own frame, because a row under the veil still reports `exists` and
+`isHittable`.
+
+The scroll is animated (`stepScroll`, 0.22s) because the gesture is directional and a
+cut says nothing about which way it went. This is not the list's "every reshuffle
+snaps" rule, which is about cells changing slot. If it janks on a long list on a real
+device, deleting the `withAnimation` is the one-line reversal.
+
+**A step is refused mid-drag** (`!dragging`) and leaves the cursor alone so the next
+tap resumes. A programmatic scroll would otherwise fight the finger and hand the
+hand-rolled pull its on-release check carrying a peak the user never released. With
+the guard the step cannot reach `triggerRefresh` at all — `dragging` is set only from
+`.tracking` / `.interacting`. Verified by instrumenting `triggerRefresh` on a
+simulator: a 400pt drag fires it, three re-taps fire nothing. **That claim is not
+testable at the UI tier** — `RefreshRing`'s `.accessibilityHidden(!isRefreshing)` does
+not take the element out of the accessibility tree, so its existence says nothing
+about whether a refresh is running.
+
+### The arrival mark
+
+An ink ring blooms around the landed row for ~960ms — the native port of the
+transcript's `.jump-ring`, so the app's two "you have arrived here" marks read as one
+beat. It is an EDGE rather than a ground because every monochrome wash this palette
+can reach sits within ~9/255 of `pinnedRowTint` and would vanish on exactly the rows
+a walk is most likely to visit; see [design-system.md](design-system.md#borders).
+
+It replays off the tap's EPOCH, not off the row id: landing again on the same row —
+the wrap onto the only unread row — is `Equatable`-identical, so without the epoch
+the ring would not remount and the tap would look dropped. Same reason the
+transcript's ring keys on a nonce.
+
+**Nothing unread means nothing happens** — no toast, no scroll-to-top, no negative
+haptic. It is the house pattern for a refused gesture, and it cannot surprise anyone:
+with zero unread the Chats tab carries no badge, and `BadgeCenter.total` applies the
+same archived filter `ChatListBuckets.items(from:)` does, so "the badge is empty" and
+"the walk has no stop" cannot disagree.
+
 ## Chat-list approval mark
 
 A conversation whose tool call is parked on the gateway's approval gate wears an
