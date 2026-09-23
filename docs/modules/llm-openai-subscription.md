@@ -152,6 +152,9 @@ Authorization: Bearer <access_token>
 ChatGPT-Account-Id: <account_id>     // when present
 OpenAI-Beta: responses=experimental
 originator: codex_cli_rs              // anti-bot allowlist; required
+session-id: <session id>              // cache affinity — see §"Prompt cache"
+thread-id: <session id>               // all three = the body prompt_cache_key; omitted
+x-client-request-id: <session id>     // without one, or when it can't be a header
 Content-Type: application/json
 // no User-Agent header is set on the Responses call; only the
 // auth.openai.com OAuth endpoints send `User-Agent: baybo/<version>`
@@ -172,7 +175,7 @@ Content-Type: application/json
 
 Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.delta`, `response.output_item.added` / `response.output_item.done`, `response.function_call_arguments.*`, `response.completed`, `response.error` events into `StreamEvent`s.
 
-`originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...` — the Responses call sends no User-Agent at all, and only the OAuth endpoints carry baybo's own UA. This is the minimum needed for the route, no more.
+`originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...` — the Responses call sends no User-Agent at all, and only the OAuth endpoints carry baybo's own UA. The affinity headers borrow Codex's header names but carry baybo's own session id. This is the minimum needed for the route, no more.
 
 ### Model catalog
 
@@ -186,10 +189,39 @@ One known gap: `LiveModelInfo.context_window` is used for the picker label but i
 
 ### Prompt cache
 
-`prompt_cache_key` routes the lookup; it does not set a lifetime. The endpoint
-rejects every field it doesn't know with `400 Unsupported parameter`, and it
-knows neither `prompt_cache_retention` nor `prompt_cache_options` — both were
-tried against the live route and both 400.
+The cache is a prefix cache sharded across nodes: a call reads cached tokens
+only when it lands on a node that already holds its prefix. Upstream Codex
+states that the node is chosen by the `session-id` request header, not by the
+body `prompt_cache_key` (openai/codex bc5957eac9: "ChatGPT derives Responses
+cache affinity from the `session-id` header"). Other clients of the route
+report that a body-only key is replaced by a fresh random bucket on every
+response, echoed back in the `response.completed` payload, so one
+conversation's calls scatter across nodes. Lost affinity shows in
+`cost_records` as calls seconds apart in one turn reading 0, or the whole
+prefix, or exactly the size of some request minutes earlier, or just the static
+tools+instructions head shared by every session.
+
+So the key travels twice, byte-identical: in the body as `prompt_cache_key`,
+and as the `session-id`, `thread-id` and `x-client-request-id` headers — the
+names Codex CLI sends, hyphenated because proxies reject `_` in header names.
+`affinity_headers` builds them from the same `ProviderCallExtras` key the body
+uses, and both the first send and the 401 retry carry them. A key that isn't
+printable ASCII of at most 64 bytes (other clients report a 400 past 64,
+hermes-agent #62063) sends no headers, only the body key: a scattered cache
+beats a failed call. Ids baybo mints (`<uuid>`, `cron-`/`issue-`/`subagent-`
++ uuid, `system:<component>`) are at most 45 ASCII characters; a
+client-supplied session id (`--session`, `POST /v1/chat/sessions`, a
+Subscribed channel) can fall outside that and loses affinity.
+
+With `RUST_LOG=baybo_llm=debug`, every call that reaches `response.completed`
+logs `prompt cache key echo` with `cache_key_echo`: `matched` (the server used
+our key), `mismatched` (it used another bucket — affinity was not honoured, or
+no headers went out), or `absent` (the payload named no bucket, which says
+nothing either way).
+
+The key sets no lifetime. The endpoint rejects every field it doesn't know with
+`400 Unsupported parameter`, and it knows neither `prompt_cache_retention` nor
+`prompt_cache_options` — both were tried against the live route and both 400.
 
 Usage arrives on `response.completed` as `input_tokens` with an
 `input_tokens_details` breakdown: `cached_tokens` read from the cache,
@@ -198,10 +230,13 @@ the split `compute_cost_usd` wants. The route has so far reported writes as 0 on
 calls that demonstrably populated the cache, so treat a zero there as "not
 reported", not as "nothing was written".
 
-Hits are best-effort even with a key: an identical prefix re-sent under the same
-key seconds later still misses often enough to see in a handful of calls, and a
-board run's cache ratio is far below what a provider with a declared cache
-contract gives. Budget for misses; don't model this route as reliably cached.
+Measure affinity with the share of warm calls (same session, under 60 s after
+the previous call, input grown) whose `cached_input_tokens` lands within a few
+hundred tokens of the previous call's `input_tokens` — i.e. that hit the entry
+the previous request just wrote. The daily `sum(cached)/sum(input)` ratio hides
+scatter: long sessions still score well off hits on older entries, and the
+ratio swings with session mix. The route declares no cache contract, so budget
+for some misses regardless.
 
 ### Conversion: rig `CompletionRequest` → Codex `ResponsesApiRequest`
 
@@ -218,7 +253,7 @@ contract gives. Budget for misses; don't model this route as reliably cached.
 | `temperature` / `max_tokens` | dropped | Codex Responses rejects `temperature` with 400 "Unsupported parameter: temperature" (regression-tested: `body_drops_temperature_for_codex_responses`); `max_tokens` is likewise not forwarded |
 | (none) | `parallel_tool_calls: true`, `stream: true`, `store: false` | hard-coded |
 | `ChatRequest::tool_choice` | `tool_choice` | `auto` / `none`; `BoundBilledLlm` leaves it as the caller set it |
-| `ChatRequest::prompt_cache_key` | `prompt_cache_key` | which cache bucket the lookup routes to. `BoundBilledLlm` fills it with the session id, so concurrent runs stop evicting each other; probes carry their own constant. Omitted when unset |
+| `ChatRequest::prompt_cache_key` | `prompt_cache_key` + `session-id` / `thread-id` / `x-client-request-id` headers | the cache bucket; the headers are what route to it (§"Prompt cache"). `BoundBilledLlm` fills it with the session id, so concurrent runs stop evicting each other; probes carry their own constant. Omitted when unset |
 
 Tool-call return path: Responses API emits `response.function_call_arguments.delta` events; we accumulate per `call_id` (registered from `response.output_item.added`), finalise on `response.function_call_arguments.done` or `response.output_item.done` (item type `function_call`), surface as `StreamEvent::ToolCall`. Same shape the OpenAI variant already produces.
 
@@ -263,7 +298,7 @@ On the non-streaming path (`completion`, which drains the stream internally — 
 - **HTTPS-only on the bearer transport** *(Codex R2-F2)*: the `base_url` validator rejects any non-HTTPS scheme **before** the host suffix check, so even an allowlisted host on `http://` is refused. Protects the bearer from on-path observers and TLS-decrypting proxies that the host allowlist alone wouldn't catch. The unsafe override env var doesn't relax this — it can only widen the host allowlist, never weaken the scheme requirement. Regression tested (`validate_base_url_rejects_http_with_allowlisted_host` + 3 sibling tests).
 - **Durable refresh persistence** *(Codex R2-F3)*: after a successful OAuth refresh, `save_with_retries()` writes the rotated bundle to vault with up to 3 attempts (100ms / 500ms / 2s backoff). If all attempts fail, the bundle is kept in memory but flagged `persisted: false` ("dirty"). The next refresh-path entry retries the save before doing anything else (self-heal); if it STILL can't persist, it refuses to rotate again — better to wait than chain unsaved bundles that all evaporate on process restart. Without this, a transient FS glitch during refresh would silently lose the rotated `refresh_token` and the next process to start would hit `refresh_token_reused` → forced re-login. Regression tested (`save_with_retries_recovers_within_budget`, `save_with_retries_gives_up_after_budget`, `single_flight_refresh_self_heals_dirty_save`, `single_flight_refresh_refuses_to_rotate_when_dirty_save_keeps_failing`).
 - **Cross-process logout invalidation** *(Codex R2-F1)*: every cache hit re-validates against the vault on a periodic interval (`CACHE_VAULT_REVALIDATE_INTERVAL_SECS = 60`). Within the window, repeat calls skip the vault read entirely (hot path stays cheap). Past the window, a missing vault entry drops the in-memory cached bundle so a `baybo llm remove` run by another process (which clears the vault entry as part of removal) is honoured within ~60s. Without this, a CLI removal would only delete the on-disk vault entry while a running gateway / TUI keeps using its cached bundle (and 401 reactive refresh would even write a new bundle back into vault, partially undoing the logout). Regression tested (`ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied`, `ensure_fresh_bundle_skips_vault_within_revalidate_interval`).
-- **Anti-impersonation**: baybo never spoofs a Codex User-Agent — the Responses call sets no UA at all, and the `auth.openai.com` OAuth endpoints send baybo's own `User-Agent: baybo/<version>`. Only `originator: codex_cli_rs` mimics Codex (mandatory header for the route). Rationale documented inline.
+- **Anti-impersonation**: baybo never spoofs a Codex User-Agent — the Responses call sets no UA at all, and the `auth.openai.com` OAuth endpoints send baybo's own `User-Agent: baybo/<version>`. Only `originator: codex_cli_rs` mimics Codex (mandatory header for the route); the `session-id` / `thread-id` / `x-client-request-id` affinity headers use Codex's names with baybo's own session id. Rationale documented inline.
 - **Token at rest**: encrypted with the same AES-256-GCM master key as every other vault entry — same blast radius as a stored API key.
 - **Token in memory**: cached in the credential's `RefreshCoordinator` for the process lifetime (`CachedBundle` wraps the bundle plus `persisted` / `last_vault_check` bookkeeping); on logout we drop it and delete the vault entry. Refilling that cache from the vault will not overwrite a **dirty** entry with an older bundle — a dirty entry is the only copy of a rotated token that failed to persist, and dropping it would also drop the flag the "refuse to rotate again" guard reads (`vault_hit_does_not_clobber_a_dirty_cached_rotation`).
 - **Audit log**: every refresh emits a tracing event with `event=openai_subscription_token_refresh`, `outcome=success|transient|permanent`, no token material in logs ever.
@@ -273,6 +308,7 @@ On the non-streaming path (`completion`, which drains the stream internally — 
 - Unit: PKCE codes well-formed; JWT exp parsing handles short/missing claims. The refresh-on-401 retry path is not yet covered by a test (it needs an HTTP mock).
 - Unit: `OAuthTokenBundle` round-trips through `SecretVault::store_typed` / `get_typed` (uses existing `MemorySecretStore` test_support).
 - Unit: rig→Codex request conversion produces the expected JSON for representative messages (text, tool call, tool result, URL/base64 image, URL/base64 PDF).
+- Unit: the affinity headers repeat the body `prompt_cache_key`, are absent without a sendable key, and reach the wire — `stream()` against a loopback stub that captures the request head (`stream_puts_the_cache_key_on_the_wire_as_affinity_headers`).
 - Behaviour (not asserted by a test): `send()` concatenates only `/codex/responses` onto `base_url` and never silently rewrites the host — with `base_url` unset the request URL is exactly `https://chatgpt.com/backend-api/codex/responses`.
 - Integration: a manual live smoke test (real PKCE login + a single chat, env-gated, out of CI) is planned, not yet implemented.
 - No mock for the OpenAI auth endpoints in CI — too fragile, the official endpoints are stable enough that contract tests are low-value here.
