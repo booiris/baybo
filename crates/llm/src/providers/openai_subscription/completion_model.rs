@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::stream::{self, Stream, StreamExt};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rig::OneOrMany;
 use rig::completion::message::{
     AssistantContent, Document, DocumentMediaType, DocumentSourceKind, Image, ImageDetail,
@@ -29,8 +30,18 @@ pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const RESPONSES_PATH: &str = "/codex/responses";
 // The endpoint 400s on any field it doesn't know, and it knows neither
 // `prompt_cache_retention` nor `prompt_cache_options`: cache lifetime is
-// not ours to set, only which bucket the lookup routes to.
+// not ours to set.
 const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
+// Cache affinity comes from these headers, not the body key (openai/codex
+// bc5957eac9: "ChatGPT derives Responses cache affinity from the `session-id`
+// header"). Without them one conversation's calls scatter across cache nodes
+// that never saw its prefix. Codex CLI sends the same three names; each here
+// carries the body `prompt_cache_key` byte for byte.
+const AFFINITY_HEADERS: [&str; 3] = ["session-id", "thread-id", "x-client-request-id"];
+// Other clients report a 400 on a longer id (hermes-agent #62063); a cache
+// miss is the cheaper failure.
+const MAX_AFFINITY_KEY_LEN: usize = 64;
+const RESPONSE_COMPLETED_EVENT: &str = "response.completed";
 const INPUT_TOKENS_DETAILS_FIELD: &str = "input_tokens_details";
 const CACHED_TOKENS_FIELD: &str = "cached_tokens";
 const CACHE_WRITE_TOKENS_FIELD: &str = "cache_write_tokens";
@@ -205,13 +216,14 @@ impl OpenAiSubscriptionCompletionModel {
             let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
             CompletionError::RequestError(err)
         })?;
+        let affinity = affinity_headers(extras.prompt_cache_key);
         let bundle = self
             .refresh
             .ensure_fresh_bundle()
             .await
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
         let response = self
-            .send(&bundle, &body)
+            .send(&bundle, &body, &affinity)
             .await
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
         let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -225,7 +237,7 @@ impl OpenAiSubscriptionCompletionModel {
                 .await
                 .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
             let retried = self
-                .send(&refreshed, &body)
+                .send(&refreshed, &body, &affinity)
                 .await
                 .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
             if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -239,7 +251,7 @@ impl OpenAiSubscriptionCompletionModel {
         } else {
             response
         };
-        Ok(self.adapt_response(response))
+        Ok(self.adapt_response(response, extras.prompt_cache_key))
     }
 
     /// Live model discovery against `<base>/codex/models`, widened by
@@ -305,19 +317,21 @@ impl OpenAiSubscriptionCompletionModel {
         &self,
         bundle: &OAuthTokenBundle,
         body: &Value,
+        affinity: &HeaderMap,
     ) -> crate::Result<reqwest::Response> {
         let url = format!("{}{}", self.base_url, RESPONSES_PATH);
         debug!(url = %url, "POST openai-subscription Responses");
         self.authed_request(reqwest::Method::POST, &url, bundle)
             .header("OpenAI-Beta", "responses=experimental")
             .header("Accept", "text/event-stream")
+            .headers(affinity.clone())
             .json(body)
             .send()
             .await
             .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: HTTP transport"))
     }
 
-    fn adapt_response(&self, response: reqwest::Response) -> LlmStream {
+    fn adapt_response(&self, response: reqwest::Response, cache_key: Option<&str>) -> LlmStream {
         let status = response.status();
         if !status.is_success() {
             // Surface as a single-element error stream so callers see the
@@ -335,8 +349,38 @@ impl OpenAiSubscriptionCompletionModel {
             });
             return LlmStream::from_inner(Box::pin(stream));
         }
-        LlmStream::from_inner(Box::pin(parse_sse_stream(response)))
+        LlmStream::from_inner(Box::pin(parse_sse_stream(
+            response,
+            cache_key.map(str::to_owned),
+        )))
     }
+}
+
+/// The affinity headers for `cache_key`. Empty when there is no key or the
+/// key isn't short printable ASCII; the body still carries it either way.
+/// `HeaderValue::from_str` alone would pass raw UTF-8 through as obs-text,
+/// which a proxy may reject outright.
+fn affinity_headers(cache_key: Option<&str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let Some(key) = cache_key else {
+        return headers;
+    };
+    let sendable = key.len() <= MAX_AFFINITY_KEY_LEN && key.bytes().all(|b| b.is_ascii_graphic());
+    let value = match HeaderValue::from_str(key) {
+        Ok(value) if sendable => value,
+        _ => {
+            debug!(
+                key_len = key.len(),
+                "openai-subscription: prompt cache key cannot be sent as an affinity header; \
+                 cache hits will be scattered"
+            );
+            return headers;
+        }
+    };
+    for name in AFFINITY_HEADERS {
+        headers.insert(HeaderName::from_static(name), value.clone());
+    }
+    headers
 }
 
 /// The plan's quota is spent, not a throttle to back off from. Codex sends
@@ -757,6 +801,7 @@ fn tool_result_to_text(tr: &completion::message::ToolResult) -> String {
 /// Codex frequently adds new ones and we'd rather skip them than fail.
 fn parse_sse_stream(
     response: reqwest::Response,
+    cache_key: Option<String>,
 ) -> impl Stream<Item = crate::Result<StreamEvent>> + Send {
     use bytes::BytesMut;
     let mut buffer = BytesMut::new();
@@ -789,6 +834,7 @@ fn parse_sse_stream(
                     }
                 };
                 let Some(event) = parse_sse_event(raw_str) else { continue };
+                log_cache_key_echo(cache_key.as_deref(), &event);
                 match translate_event(&mut function_calls, event) {
                     Some(events) => {
                         for ev in events {
@@ -800,6 +846,34 @@ fn parse_sse_stream(
             }
         }
     }
+}
+
+/// Other clients report the completed response names the bucket the server
+/// actually used, and a fresh random one when affinity was not honoured.
+fn log_cache_key_echo(sent: Option<&str>, event: &SseEvent) {
+    if event.event_type != RESPONSE_COMPLETED_EVENT || !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let echoed = serde_json::from_str::<Value>(&event.data)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("response")?
+                .get(PROMPT_CACHE_KEY_FIELD)?
+                .as_str()
+                .map(str::to_owned)
+        });
+    let cache_key_echo = match echoed.as_deref() {
+        None => "absent",
+        Some(echo) if Some(echo) == sent => "matched",
+        Some(_) => "mismatched",
+    };
+    debug!(
+        cache_key_echo,
+        echoed = ?echoed,
+        sent = ?sent,
+        "openai-subscription: prompt cache key echo"
+    );
 }
 
 fn find_event_boundary(buf: &[u8]) -> Option<usize> {
@@ -963,7 +1037,7 @@ fn translate_event(
             }
         }
         // Final event with usage totals.
-        "response.completed" => {
+        RESPONSE_COMPLETED_EVENT => {
             if let Some(usage) = payload.get("response").and_then(|r| r.get("usage")) {
                 let input = usage
                     .get("input_tokens")
@@ -1127,6 +1201,116 @@ mod tests {
         };
         let body = build_responses_body("gpt-5", extras, &empty_request()).unwrap();
         assert_eq!(body[PROMPT_CACHE_KEY_FIELD], "session-7");
+    }
+
+    #[test]
+    fn affinity_headers_repeat_the_body_cache_key() {
+        let extras = crate::ProviderCallExtras {
+            prompt_cache_key: Some("session-7"),
+            ..Default::default()
+        };
+        let body = build_responses_body("gpt-5", extras, &empty_request()).unwrap();
+        let headers = affinity_headers(extras.prompt_cache_key);
+        for name in AFFINITY_HEADERS {
+            assert_eq!(
+                headers[name],
+                body[PROMPT_CACHE_KEY_FIELD].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn no_affinity_headers_without_a_sendable_key() {
+        let too_long = "k".repeat(MAX_AFFINITY_KEY_LEN + 1);
+        for key in [
+            None,
+            Some("line\nbreak"),
+            Some("周报-重构"),
+            Some("has space"),
+            Some(too_long.as_str()),
+        ] {
+            assert!(affinity_headers(key).is_empty(), "{key:?}");
+        }
+    }
+
+    /// Serves one completed response and hands back the request head it got.
+    async fn spawn_capturing_responses_endpoint() -> (String, tokio::sync::oneshot::Receiver<String>)
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let _ = tx.send(String::from_utf8_lossy(&head).to_lowercase());
+            let sse = r#"event: response.completed
+data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
+
+"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (origin, rx)
+    }
+
+    #[tokio::test]
+    async fn stream_puts_the_cache_key_on_the_wire_as_affinity_headers() {
+        use baybo_security::test_support::MemorySecretStore;
+        use baybo_security::{EncryptionKey, SecretVault};
+
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let store = VaultTokenStore::new(Arc::new(SecretVault::new(
+            key,
+            Arc::new(MemorySecretStore::new()),
+        )));
+        let now = chrono::Utc::now().timestamp();
+        store
+            .save(&OAuthTokenBundle {
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                id_token: "id".into(),
+                account_id: None,
+                expires_at: now + 7200,
+                obtained_at: now,
+            })
+            .await
+            .unwrap();
+        let (origin, head) = spawn_capturing_responses_endpoint().await;
+        let model = OpenAiSubscriptionCompletionModel::new(
+            "gpt-5".into(),
+            Some(origin),
+            None,
+            store,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            BackgroundRefresh::Disabled,
+        );
+        let extras = crate::ProviderCallExtras {
+            prompt_cache_key: Some("session-7"),
+            ..Default::default()
+        };
+
+        let mut stream = model.stream(empty_request(), extras).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let head = head.await.unwrap();
+        for name in AFFINITY_HEADERS {
+            assert!(
+                head.contains(&format!("\r\n{name}: session-7\r\n")),
+                "{name} missing: {head}"
+            );
+        }
     }
 
     #[test]
