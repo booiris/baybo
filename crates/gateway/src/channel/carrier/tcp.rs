@@ -1,7 +1,8 @@
 //! The opt-in TCP carrier (`gateway.direct_tcp`): one listener per configured
-//! family, bound when the runtime starts and bound again [`TCP_REBIND_DELAY`]
-//! after a failed bind, or after an accept error that breaks the listener
-//! itself. Each connection is one carrier session.
+//! family, bound when the runtime starts and bound again
+//! [`REBIND_DELAY`](super::runtime::REBIND_DELAY) after a failed bind, or
+//! after an accept error that breaks the listener itself. Each connection is
+//! one carrier session.
 //!
 //! - Before its preface, a connection holds a pre-authentication permit,
 //!   taken without waiting: at most [`MAX_TCP_PREAUTH`] in all and
@@ -55,9 +56,6 @@ pub(crate) const MAX_TCP_PREAUTH_PER_SOURCE: usize = 4;
 pub(crate) const TCP_PREAUTH_RESERVED: usize = 24;
 /// Authenticated TCP sessions one device may hold.
 pub(crate) const MAX_TCP_SESSIONS_PER_DEVICE: usize = 32;
-/// The wait before a listener whose bind failed, or whose socket broke, is
-/// bound again, and the pause of a listener out of resources.
-pub(crate) const TCP_REBIND_DELAY: Duration = Duration::from_secs(2);
 /// Sources remembered as having authenticated in this runtime; the oldest
 /// is forgotten first. Only the paired device can add one: a session counts
 /// only once the initiator has confirmed the Noise handshake, which a replay
@@ -305,7 +303,7 @@ pub(crate) async fn serve(
     context: Arc<RuntimeContext>,
     cancel: CancellationToken,
 ) {
-    let delay = context.timing.tcp_rebind_delay;
+    let delay = context.timing.rebind_delay;
     let mut sessions = JoinSet::new();
     // A bound listener accepts from `resume_at` on; an unbound one is bound
     // again at `resume_at`.
@@ -736,7 +734,7 @@ mod tests {
     fn a_connection_error_keeps_accepting_a_resource_error_pauses_and_a_listener_error_rebinds() {
         use AcceptFailure::{Connection, Listener, Resources};
         let now = Instant::now();
-        let delay = TCP_REBIND_DELAY;
+        let delay = crate::channel::carrier::runtime::REBIND_DELAY;
         assert_eq!(
             Connection.recovery(now, delay),
             AcceptRecovery {

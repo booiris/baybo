@@ -36,12 +36,17 @@ use super::quic::{
     CARRIER_REVOKED, CARRIER_REVOKED_REASON, ConnectionSlots, FIRST_STREAM_DEADLINE, IncomingCounts,
 };
 use super::session::DIRECT_OPEN_DEADLINE;
-use super::tcp::{TCP_REBIND_DELAY, TcpAdmission, TcpFamily};
+use super::tcp::{TcpAdmission, TcpFamily};
 use super::udp::{BoundSocket, UdpFamily, supervise};
 use crate::channel::state::WsChannelState;
 use crate::config::RuntimeCarrierConfig;
 use crate::device::load_or_create_static_keypair;
 
+/// The wait before a family whose bind failed is bound again, UDP or TCP,
+/// and before a broken TCP listener is; also the spacing of retries after a
+/// UDP family's persistent receive errors (its first rebind is immediate)
+/// and the pause of a TCP listener out of resources.
+pub(crate) const REBIND_DELAY: Duration = Duration::from_secs(2);
 /// How long a stopping runtime waits for its closed QUIC endpoints to drain
 /// and for quinn to release their sockets. It covers the 3×PTO drain of a
 /// connection closed mid-handshake (about 3 s at quinn's 333 ms initial RTT),
@@ -59,14 +64,14 @@ const SOCKET_RELEASE_POLL: Duration = Duration::from_millis(10);
 pub(crate) struct CarrierTiming {
     pub(crate) direct_open_deadline: Duration,
     pub(crate) first_stream_deadline: Duration,
-    pub(crate) tcp_rebind_delay: Duration,
+    pub(crate) rebind_delay: Duration,
 }
 
 impl CarrierTiming {
     pub(crate) const PRODUCTION: Self = Self {
         direct_open_deadline: DIRECT_OPEN_DEADLINE,
         first_stream_deadline: FIRST_STREAM_DEADLINE,
-        tcp_rebind_delay: TCP_REBIND_DELAY,
+        rebind_delay: REBIND_DELAY,
     };
 }
 
@@ -164,8 +169,10 @@ pub(crate) struct RuntimeContext {
 }
 
 /// A binding's carrier runtime. It is inactive, with nothing bound and no
-/// capability, when the binding has no candidate keys, or when no socket
-/// binds and no TCP listener is configured.
+/// capability, when the binding has no candidate keys, nothing is configured
+/// or no QUIC certificate can be generated, or when the QUIC server
+/// configuration cannot be built and no TCP listener is configured. A
+/// configured family whose bind fails keeps it active.
 pub(crate) struct CarrierRuntime {
     active: Option<ActiveRuntime>,
 }
@@ -176,9 +183,9 @@ struct ActiveRuntime {
     cert_hash: CertHash,
     /// The process's, shared with every other runtime of it.
     gate: OfferGate,
+    /// Each UDP and TCP family is supervised for the runtime's life: one
+    /// whose bind fails is bound again, so it stays here unbound until then.
     udp: Vec<Arc<UdpFamily>>,
-    /// Supervised for the runtime's life: a family whose bind fails is bound
-    /// again, so it stays here unbound until then.
     tcp: Vec<Arc<TcpFamily>>,
     /// The `gateway.direct_tcp.advertised_addresses` A offers while a
     /// listener is bound ([`advertised_candidates`]).
@@ -229,10 +236,10 @@ impl CarrierRuntime {
     }
 
     /// Binds the configured UDP sockets, one QUIC endpoint on each, and the
-    /// configured TCP listeners, and starts serving them. A UDP family whose
-    /// bind fails stays unbound; a TCP family is bound again until it
-    /// succeeds. With nothing bound and no TCP family the runtime is
-    /// inactive. The certificate and the offer gate are the process's.
+    /// configured TCP listeners, and starts serving them. A family whose
+    /// first bind fails, UDP or TCP, is bound again every [`REBIND_DELAY`]
+    /// until it succeeds. With no family served, the runtime is inactive.
+    /// The certificate and the offer gate are the process's.
     pub(crate) fn bind(
         config: &RuntimeCarrierConfig,
         process: &mut CarrierProcess,
@@ -595,7 +602,8 @@ fn device_candidates(
 }
 
 /// Binds each UDP family, with one QUIC endpoint on its socket, and starts
-/// serving it. A family whose bind fails is logged and left unbound.
+/// serving it. A family whose bind fails is served unbound, and
+/// [`supervise`] binds it again after the rebind delay.
 fn bind_udp(
     binds: &[SocketAddr],
     identity: &ServerIdentity,
@@ -614,26 +622,19 @@ fn bind_udp(
             return Vec::new();
         }
     };
-    let mut udp = Vec::new();
-    for bind in binds {
-        match UdpFamily::bind(*bind, server.clone()) {
-            Ok((family, probes)) => {
-                tasks.spawn(supervise(
-                    Arc::clone(&family),
-                    probes,
-                    Arc::clone(context),
-                    cancel.clone(),
-                ));
-                udp.push(family);
-            }
-            Err(error) => tracing::warn!(
-                bind = %bind,
-                error = %error,
-                "carrier: UDP socket unavailable; this family is not offered"
-            ),
-        }
-    }
-    udp
+    binds
+        .iter()
+        .map(|bind| {
+            let (family, probes) = UdpFamily::bind(*bind, server.clone());
+            tasks.spawn(supervise(
+                Arc::clone(&family),
+                probes,
+                Arc::clone(context),
+                cancel.clone(),
+            ));
+            family
+        })
+        .collect()
 }
 
 /// Resolves once every connection has drained and quinn holds no reference to

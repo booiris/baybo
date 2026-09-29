@@ -53,7 +53,7 @@ const SHORT_DEADLINE: Duration = Duration::from_millis(400);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(1);
 const STALLED_PREFACE_DEADLINE: Duration = Duration::from_secs(30);
 const UDP_BUFFER_LEN: usize = 2048;
-const TEST_TCP_REBIND_DELAY: Duration = Duration::from_millis(50);
+const TEST_REBIND_DELAY: Duration = Duration::from_millis(50);
 const BLOB_BODY_LEN: u64 = 1024;
 
 fn udp_only(ipv4: Option<&str>, ipv6: Option<&str>) -> RuntimeCarrierConfig {
@@ -670,14 +670,55 @@ async fn a_binding_without_candidate_keys_stays_inactive() {
     assert!(runtime.active.is_none());
 }
 
-#[tokio::test]
-async fn a_family_that_fails_to_bind_stays_unbound() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_udp_family_that_fails_to_bind_is_bound_again_after_the_rebind_delay() {
     let pairing = Pairing::new().await;
     let occupied = StdUdpSocket::bind(LOOPBACK).unwrap();
-    let address = occupied.local_addr().unwrap().to_string();
-    let runtime = pairing.runtime(&udp_only(Some(&address), None)).await;
-    assert_eq!(runtime.capability(), None);
-    assert!(runtime.active.is_none());
+    let address = occupied.local_addr().unwrap();
+    let timing = CarrierTiming {
+        rebind_delay: TEST_REBIND_DELAY,
+        ..CarrierTiming::PRODUCTION
+    };
+    let mut runtime = pairing
+        .runtime_with(
+            &udp_only(Some(&address.to_string()), None),
+            &mut CarrierProcess::new(),
+            timing,
+        )
+        .await;
+    assert_eq!(
+        runtime.capability(),
+        Some(DirectCapability {
+            version: DIRECT_PROTOCOL_VERSION,
+            udp: true,
+        }),
+        "the first hello names the family it keeps binding, so C routes its offers once it binds"
+    );
+    let (sealed, _) = pairing.offer(Vec::new());
+    let punch_id = PunchId::generate();
+    assert_eq!(
+        runtime.handle_offer(punch_id, sealed, None),
+        ControlReport::DirectDeclined { punch_id },
+        "declined:unbound"
+    );
+
+    tokio::time::sleep(TEST_REBIND_DELAY * 3).await;
+    assert!(
+        active(&runtime).bound_addresses().is_empty(),
+        "every retry fails while the port is held, and the family keeps retrying"
+    );
+    drop(occupied);
+    until("the family is bound again", || {
+        active(&runtime).bound_addresses() == vec![address]
+    })
+    .await;
+    let phone = Phone::bind(socket(LOOPBACK));
+    let (answer, _, _) = pairing.answered(&mut runtime, vec![phone.address()], None);
+    let connection = phone.connect(answer.quic_cert_sha256, address).await;
+    pairing
+        .session(&connection, &answer.token, LegClass::Api)
+        .await;
+    runtime.stop().await;
 }
 
 #[tokio::test]
@@ -1807,7 +1848,7 @@ async fn a_tcp_listener_that_fails_to_bind_is_bound_again_after_the_rebind_delay
     let occupied = StdTcpListener::bind(LOOPBACK).unwrap();
     let address = occupied.local_addr().unwrap();
     let timing = CarrierTiming {
-        tcp_rebind_delay: TEST_TCP_REBIND_DELAY,
+        rebind_delay: TEST_REBIND_DELAY,
         ..CarrierTiming::PRODUCTION
     };
     let mut runtime = pairing
