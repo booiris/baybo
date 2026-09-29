@@ -8,7 +8,8 @@ doctest = false
 
 [dependencies]
 # Shared single source of truth for the push delegation domain-separation
-# contexts (C's verifier links the same crate; the bytes must agree exactly).
+# contexts (C's verifier links the same crate; the bytes must agree exactly),
+# and for the direct-carrier wire types a sealed candidate set carries.
 remote-host-protocol = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
@@ -22,5 +23,8 @@ rand = { workspace = true }
 zeroize = { workspace = true }
 chacha20poly1305 = { workspace = true }
 ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+hmac = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]

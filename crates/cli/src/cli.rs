@@ -585,6 +585,11 @@ pub enum DeviceCmd {
         #[arg(long)]
         approved: bool,
     },
+    /// Show each approved device's live legs, by class, with the carrier
+    /// each rides on, and how its last direct offer went. Asks the running
+    /// gateway (`GET /v1/mobile/links`, with the vault's admin token); when
+    /// it is not reachable, says so and prints the device rows alone.
+    Status,
     /// Revoke a device. The row + token slot are retained for audit (the
     /// token simply stops authenticating).
     Revoke {

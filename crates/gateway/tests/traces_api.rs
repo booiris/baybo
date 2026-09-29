@@ -72,6 +72,7 @@ async fn build_router_with_lifecycle() -> (
         deck_manager: std::sync::Arc::clone(&tg.deps.deck_manager),
         project_manager: std::sync::Arc::clone(&tg.deps.project_manager),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
+        device_links: tg.deps.device_links.clone(),
     };
     let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     let router = admin_router

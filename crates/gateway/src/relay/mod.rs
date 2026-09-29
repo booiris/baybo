@@ -4,9 +4,11 @@
 //! **persistent outbound control connection** to C. On open it names itself with a
 //! [`ControlHello`] (its `relay_node_id`); its `remote_api_key` rides the
 //! `x-remote-api-key` dial header (the shared admission pre-layer), not the hello.
-//! Thereafter C pushes [`ControlSignal`] signals — today only
-//! `OpenDataLeg`, meaning a phone is waiting at the relay and A should open a
-//! data leg to meet it.
+//! Thereafter C pushes [`ControlSignal`] signals: `OpenDataLeg`, meaning a phone
+//! is waiting at the relay and A should open a data leg to meet it, and
+//! `DirectOffer`, a phone's sealed direct-carrier offer. A writes a
+//! [`ControlReport`] back on the same connection for each offer, and sends
+//! nothing else after the hello.
 //!
 //! This module is the **protocol-over-WebSocket core**: it runs over an
 //! already-connected stream, so it is host-testable against a mock C. The
@@ -17,6 +19,7 @@ use std::time::Duration;
 
 use baybo_security::SecretVault;
 use futures::{SinkExt, StreamExt};
+use remote_host_protocol::relay::ControlReport;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc};
@@ -134,14 +137,15 @@ pub(crate) fn ws_error_detail(e: &tokio_tungstenite::tungstenite::Error) -> Stri
 /// Run the A-side control connection over an already-connected `stream` (the
 /// caller dials TCP + TLS for `wss://`; tests pass a plain `ws://` TcpStream):
 /// complete the WS handshake, send `hello`, then forward every parsed server
-/// signal to `signals` until the connection closes. Unparseable frames are
-/// logged and skipped (forward-compatible with future signal kinds).
+/// signal to `signals` and write every report from `reports` until the
+/// connection closes. Unparseable frames are logged and skipped
+/// (forward-compatible with future signal kinds).
 #[cfg(test)]
 pub(crate) async fn run_control_connection<S>(
     url: &str,
     stream: S,
     hello: &ControlHello,
-    signals: mpsc::Sender<ControlSignal>,
+    channels: ControlChannels,
     healthy_cycle: bool,
 ) -> Result<Option<ControlCloseFrame>, ControlError>
 where
@@ -151,7 +155,7 @@ where
         .into_client_request()
         .map_err(|e| ControlError::Codec(format!("bad url: {e}")))?;
     let (ws, _) = client_async(request, stream).await?;
-    pump_control(url, ws, hello, signals, healthy_cycle).await
+    pump_control(url, ws, hello, channels, healthy_cycle).await
 }
 
 /// Production dial: connect to C's control endpoint (`wss://…` TLS handled by
@@ -161,7 +165,7 @@ pub(crate) async fn connect_control(
     url: &str,
     remote_api_key: &str,
     hello: &ControlHello,
-    signals: mpsc::Sender<ControlSignal>,
+    channels: ControlChannels,
     healthy_cycle: bool,
 ) -> Result<Option<ControlCloseFrame>, ControlError> {
     let mut request = url
@@ -176,13 +180,25 @@ pub(crate) async fn connect_control(
         .headers_mut()
         .insert(remote_host_protocol::REMOTE_API_KEY_HEADER, value);
     let (ws, _) = connect_async(request).await?;
-    pump_control(url, ws, hello, signals, healthy_cycle).await
+    pump_control(url, ws, hello, channels, healthy_cycle).await
+}
+
+/// The two queues between one control connection and its consumer. Each
+/// connection gets its own pair, so a report reaches C only on the connection
+/// that delivered its offer; one queued when that connection ends is dropped
+/// with it.
+pub(crate) struct ControlChannels {
+    /// Every parsed signal from C.
+    pub(crate) signals: mpsc::Sender<ControlSignal>,
+    /// Reports to write to C, in order.
+    pub(crate) reports: mpsc::Receiver<ControlReport>,
 }
 
 /// The control protocol over an already-handshaken WS (shared by the
 /// stream-based [`run_control_connection`] and the production [`connect_control`]
 /// so both speak it identically): send `hello`, then forward every parsed server
-/// signal to `signals` until the connection closes. Unparseable frames are
+/// signal to `channels.signals` and write every report from `channels.reports`
+/// as a binary JSON frame until the connection closes. Unparseable frames are
 /// logged and skipped (forward-compatible with future signal kinds). `Ok`
 /// carries the server's Close frame when it sent one, so the caller can log the
 /// relay's stated disconnect reason. `healthy_cycle` reflects the caller's
@@ -193,12 +209,16 @@ async fn pump_control<T>(
     url: &str,
     mut ws: WebSocketStream<T>,
     hello: &ControlHello,
-    signals: mpsc::Sender<ControlSignal>,
+    channels: ControlChannels,
     healthy_cycle: bool,
 ) -> Result<Option<ControlCloseFrame>, ControlError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let ControlChannels {
+        signals,
+        mut reports,
+    } = channels;
     let hello_bytes = serde_json::to_vec(hello).map_err(|e| ControlError::Codec(e.to_string()))?;
     ws.send(Message::Binary(hello_bytes)).await?;
     if healthy_cycle {
@@ -228,6 +248,7 @@ where
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut awaiting_pong = false;
     let mut close: Option<ControlCloseFrame> = None;
+    let mut reports_open = true;
 
     loop {
         tokio::select! {
@@ -259,6 +280,17 @@ where
                     _ => awaiting_pong = false,
                 }
             }
+            report = reports.recv(), if reports_open => match report {
+                Some(report) => match serde_json::to_vec(&report) {
+                    Ok(bytes) => ws.send(Message::Binary(bytes)).await?,
+                    Err(e) => tracing::warn!(
+                        punch = %report.punch_id().tag(),
+                        error = %e,
+                        "relay: control report failed to encode; dropped"
+                    ),
+                },
+                None => reports_open = false,
+            },
             _ = keepalive.tick() => {
                 if awaiting_pong {
                     return Err(ControlError::Codec("control keepalive unanswered".into()));
@@ -329,12 +361,17 @@ mod tests {
         let url = format!("ws://127.0.0.1:{port}/control");
         let hello = ControlHello {
             relay_node_id: "node-1".into(),
+            direct: None,
         };
         let (tx, mut rx) = mpsc::channel(4);
-        let client =
-            tokio::spawn(
-                async move { run_control_connection(&url, stream, &hello, tx, true).await },
-            );
+        let (_reports_tx, reports) = mpsc::channel(4);
+        let channels = ControlChannels {
+            signals: tx,
+            reports,
+        };
+        let client = tokio::spawn(async move {
+            run_control_connection(&url, stream, &hello, channels, true).await
+        });
 
         // A receives the OpenDataLeg signal C pushed.
         let sig = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
@@ -354,8 +391,104 @@ mod tests {
             *mock.received_hello.lock(),
             Some(ControlHello {
                 relay_node_id: "node-1".into(),
+                direct: None,
             }),
         );
+
+        client.abort();
+        server.abort();
+    }
+
+    /// Next binary frame the gateway sent, skipping its keepalive traffic.
+    async fn next_binary(socket: &mut WebSocket) -> Vec<u8> {
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(3), socket.recv())
+                .await
+                .expect("frame timed out")
+                .expect("connection closed")
+                .expect("connection failed");
+            match message {
+                AxumMsg::Binary(bytes) => return bytes.to_vec(),
+                AxumMsg::Ping(_) | AxumMsg::Pong(_) => continue,
+                other => panic!("unexpected control frame: {other:?}"),
+            }
+        }
+    }
+
+    async fn send_signal(socket: &mut WebSocket, signal: &ControlSignal) {
+        socket
+            .send(AxumMsg::Binary(serde_json::to_vec(signal).unwrap().into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_report_goes_out_as_a_binary_json_frame_on_its_connection() {
+        let (sockets_tx, mut sockets) = mpsc::channel::<WebSocket>(1);
+        let app = Router::new().route(
+            "/control",
+            get(move |ws: WebSocketUpgrade| {
+                let sockets_tx = sockets_tx.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        let _ = sockets_tx.send(socket).await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let url = format!("ws://127.0.0.1:{port}/control");
+        let hello = ControlHello {
+            relay_node_id: "node-1".into(),
+            direct: None,
+        };
+        let (signals, mut signals_rx) = mpsc::channel(4);
+        let (reports_tx, reports) = mpsc::channel(4);
+        let channels = ControlChannels { signals, reports };
+        let client = tokio::spawn(async move {
+            run_control_connection(&url, stream, &hello, channels, true).await
+        });
+        let mut c = sockets.recv().await.expect("the gateway dials control");
+        let _hello = next_binary(&mut c).await;
+
+        let punch_id = remote_host_protocol::relay::PunchId::generate();
+        send_signal(
+            &mut c,
+            &ControlSignal::DirectOffer {
+                punch_id,
+                offer: remote_host_protocol::relay::SealedCandidates {
+                    n: "bm9uY2U=".into(),
+                    enc: "Y2lwaGVydGV4dA==".into(),
+                },
+                register: None,
+            },
+        )
+        .await;
+        let delivered = signals_rx.recv().await.expect("offer forwarded");
+        assert!(
+            matches!(delivered, ControlSignal::DirectOffer { punch_id: id, .. } if id == punch_id)
+        );
+
+        let report = ControlReport::DirectDeclined { punch_id };
+        reports_tx.send(report.clone()).await.unwrap();
+        let written: ControlReport = serde_json::from_slice(&next_binary(&mut c).await).unwrap();
+        assert_eq!(written, report);
+
+        // A consumer that stops reporting leaves the connection up.
+        drop(reports_tx);
+        let open = ControlSignal::OpenDataLeg {
+            relay_key: "leg-after".into(),
+            class: LegClass::Api,
+        };
+        send_signal(&mut c, &open).await;
+        assert_eq!(signals_rx.recv().await, Some(open));
+        assert!(!client.is_finished());
 
         client.abort();
         server.abort();

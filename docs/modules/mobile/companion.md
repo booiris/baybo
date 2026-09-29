@@ -100,20 +100,35 @@ out and must log in again.
     bindings + a 32-byte `push_key` + the confirmation code; `pairing` —
     `PairFrame` / `DeviceHello` / `GatewayWelcome`; `fixtures` — the
     pinned cross-language AEAD vector.
+  - `candidates` — the direct-carrier candidate sets sealed under keys derived
+    from the pairing statics (`DeviceSealer` for P, `GatewaySealer` for A), the
+    `DeviceOffer` / `GatewayAnswer` bodies, and P's punch tags.
+- `crates/carrier` — the QUIC direct carrier shared by A (now) and P (PR2):
+  `DemuxSocket` (the one UDP socket per family that QUIC, the rendezvous and the
+  punches share), the QUIC endpoint and TLS configs with A's per-process
+  certificate and P's pin, `DirectOpen` framing, `PunchBurst` pacing, the
+  rendezvous `Registration` / `PeerLatch`, and `CarrierKind`. See
+  [`direct-carriers.md`](direct-carriers.md).
 - `crates/pairing` — `DevicePairingService` (`mint` / `complete` / slot lookup +
   operator/device decisions).
 - `crates/gateway` — A-side: the pairing host leg + `drive()` orchestration
   (`channel/device_pair.rs`, `channel/relay_pair.rs`), the device store, the
   **content session** responder (`channel/device_content.rs`), the relay-content
-  control manager (`channel/relay_content.rs`), and the push dispatcher
-  (`push/mod.rs`).
+  control manager (`channel/relay_content.rs`), the direct-carrier runtime each
+  relay binding holds (`channel/carrier/`), the link table behind
+  `GET /v1/mobile/links` and `baybo device status` (`channel/links.rs`), and the
+  push dispatcher (`push/mod.rs`).
 - `remote-host/` (C, separate workspace):
   - `crates/protocol` — `remote-host-protocol`, the wire contract (route paths,
     the relay `x-remote-api-key` header, keyless `/notify` + `/register` requests,
-    `ControlHello` / `ControlSignal`, provider-tagged `PushTarget`, URL builders); path-depended
-    across the boundary.
+    `ControlHello` / `ControlSignal`, provider-tagged `PushTarget`, URL builders,
+    and the direct-carrier wire types in `relay`: `DirectOfferRequest` /
+    `DirectOfferResponse`, `ControlReport`, `SealedCandidates`, the probe
+    datagrams and `AddressPolicy`); path-depended across the boundary.
   - `crates/relay` — the blind byte-pipe `RelayBroker` + the WS rendezvous/content
-    server; `crates/admission` — the hot-reloaded `remote_api_key` allow-list;
+    server, and the direct-carrier signalling: `POST /direct/{relay_node_id}`,
+    the punch registry (`punch.rs`) and the UDP rendezvous (`udp.rs`);
+    `crates/admission` — the hot-reloaded `remote_api_key` allow-list;
     `crates/push` — APNs (HTTP/2 sender, ES256 `.p8` JWT, `/notify` + `/register`);
     `crates/server` — the single binary serving relay + push on one listener;
     `crates/edge` — the shared per-request / per-client-IP layer both roles mount
@@ -223,11 +238,24 @@ operator-configurable for direct mode. The
 trust model detailed in
 [`relay-push-security.md`](relay-push-security.md#direct-mode-push-web-identity).
 
-## Reaching a NAT'd gateway (the relay)
+## Reaching a NAT'd gateway (the relay and direct carriers)
 
-A NAT'd gateway can't be dialed, so both pairing and post-pairing content ride
-C's blind relay, which only matches two legs by key and copies opaque frames
-(`remote-host/crates/relay/src/broker.rs`). Pairing is **relay-only**.
+A NAT'd gateway can't be dialed, so pairing and every content leg's first dial
+ride C's blind relay, which only matches two legs by key and copies opaque frames
+(`remote-host/crates/relay/src/broker.rs`). Pairing is **relay-only**, and the
+relay stays the baseline that always works.
+
+Post-pairing content may bypass the relay on a **direct carrier**
+([`direct-carriers.md`](direct-carriers.md)): QUIC over UDP to a LAN, IPv6,
+public or hole-punched IPv4 address, or TCP when the gateway opts in. The phone
+finds one with a background probe: it posts a sealed candidate offer to C
+(`POST /direct/{relay_node_id}`), C forwards it over the gateway's control
+connection and, when it runs a UDP rendezvous, lets both sides learn each
+other's IPv4 NAT mapping; the sealed candidate sets stay opaque to C. New API and blob legs
+then dial the carrier, and the chat leg moves only while no turn is in flight.
+Every carrier session runs the same Noise IK handshake as a relay leg, so C's
+position for content is unchanged. The gateway and C sides are built; the app
+does not probe yet (PR2), so today every leg rides the relay.
 
 - **Content control plane** (`channel/relay_content.rs`): whenever an approved
   device exists the gateway holds a persistent outbound **control connection** to
@@ -237,16 +265,22 @@ C's blind relay, which only matches two legs by key and copies opaque frames
   splices it to the phone's `/content/join/{node}` leg. The manager self-gates on
   the approved device row (idle when none), reading the relay URL + admission key
   recorded on the row at pairing — there is **no `relay`/`push` config block**. It
-  keeps polling that row while connected: a re-pair that changes the relay URL or
-  admission key tears down the stale control leg and immediately reconnects from
-  the new row, while a transient store read failure leaves the healthy leg alone.
+  keeps polling that row while connected: a re-pair that changes the relay URL,
+  admission key, device identity or credentials tears down the stale control leg
+  and immediately reconnects from the new row, while a transient store read
+  failure leaves the healthy leg alone. Each resolved binding is one **binding
+  scope** that owns the binding's direct-carrier runtime
+  ([`direct-carriers.md`](direct-carriers.md#gateway-a)); control redials stay
+  inside the scope, so a control flap never restarts the runtime.
   It is spawned + tracked under the shared `ShutdownSignal`
   (`baybo_gateway::spawn_relay_content`), owns its child tasks (the control pump +
-  per-signal data legs), and drains on shutdown.
+  per-signal data legs + the carrier runtime), and drains on shutdown.
 - **Device dedup is gateway-only** (`channel/state.rs` `LegDedup`): the relay is
   **device-blind** — Noise runs *after* C splices the two legs, so C never learns
   `device_id` and cannot dedup. Instead, each content leg is handed its own
-  `AbortHandle`; once its handshake resolves the `device_id` it registers in
+  `AbortHandle`; once its handshake resolves the `device_id` and the leg proves
+  live (its first decrypted transport message on the relay, P's handshake
+  confirmation on a direct carrier) it registers in
   `WsChannelState.device_leg_registry` (`device_id → AbortHandle`) and **aborts the
   stale predecessor** for that device (e.g. a half-open leg from a prior foreground
   reconnect). `DashMap::insert` is atomic, so two legs racing for one `device_id`
@@ -287,7 +321,7 @@ shows a "remembered" view on launch. The chat survives a background round-trip,
 and the content session reconnects (then runs the sync loop —
 `docs/sync-protocol.md`) on every iOS foreground. It
 also reconnects on its own when a live leg drops mid-session: the Rust pump fires
-the sink's `onDisconnected` callback (`FrameSink`, `app/ios/ffi/src/transport.rs`)
+the sink's `onDisconnected` callback (`FrameSink`, `app/ios/ffi/src/api.rs`)
 on any unsolicited exit (socket close, the
 inbound-liveness lapse, a remote-host restart) — but not on a deliberate
 reconnect/disconnect, which aborts the task first — and the native chat store
@@ -407,9 +441,12 @@ end-to-end across the workspace boundary: `remote-host-relay` /
 real `remote-host` relay in-process to drive both paths through it:
 `real_relay_splices_gateway_responder_and_mock_app` (the real Noise IK content
 responder + a mock app) and `real_relay_pairs_gateway_and_mock_app` (the real
-XXpsk0 pairing entry + a mock app landing an approved row). The AEAD interop is
+XXpsk0 pairing entry + a mock app landing an approved row). Its direct-carrier
+cases run the gateway's real relay-content manager against that C and its UDP
+rendezvous, with a mock phone that offers, punches and connects over QUIC or
+TCP (see [direct-carriers.md](direct-carriers.md), *Testing*). The AEAD interop is
 pinned by `device_proto::fixtures` +
-`app/ios/NotificationExtension/NotificationServiceTests.swift`.
+`app/ios/Tests/NotificationServiceTests.swift`.
 
 ## Deploying C
 
@@ -421,7 +458,10 @@ then pair the gateway with independent endpoints:
 `baybo device pair --proxy-url <relay-host> --push-url <push-host>
 --remote-api-key <admitted key>`. The proxy endpoint + relay key are baked into
 the QR; both endpoints and the relay-only key are written to the device row. The
-defaults are `wss://proxy.baybo.space` and `https://push.baybo.space`.
+defaults are `wss://proxy.baybo.space` and `https://push.baybo.space`. Setting
+`UDP_PUBLIC_ADDR` in the `.env` (and opening its UDP port) turns on the UDP
+rendezvous for hole-punched direct carriers; without it, offers are still
+forwarded and every other direct carrier works.
 
 ## Related
 
@@ -431,6 +471,8 @@ defaults are `wss://proxy.baybo.space` and `https://push.baybo.space`.
   relay, and push security, including remote-host transparency and boundaries.
 - [`blob-transfer.md`](blob-transfer.md) — dedicated relay blob
   legs for mobile attachments.
+- [`direct-carriers.md`](direct-carriers.md) — direct carriers: content legs that
+  leave C's data path whenever the network allows.
 - [`pairing.md`](../pairing.md) — the **channel**-pairing gate (a *different*
   subsystem for sidecar-routed inbound; do not conflate with device pairing).
 - [`gateway.md`](../gateway.md) — the gateway crate that hosts the A-side routes,

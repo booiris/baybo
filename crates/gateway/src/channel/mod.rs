@@ -23,11 +23,13 @@ pub(crate) mod api_tunnel;
 pub(crate) mod blobs;
 pub mod boot;
 pub mod bot_reconciler;
+pub(crate) mod carrier;
 pub mod control;
 pub(crate) mod device_content;
 pub(crate) mod device_pair;
 pub(crate) mod handshake;
 pub(crate) mod history;
+pub mod links;
 pub(crate) mod relay_content;
 #[cfg(test)]
 mod relay_e2e;

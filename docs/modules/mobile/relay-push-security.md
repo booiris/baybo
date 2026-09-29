@@ -41,10 +41,17 @@ The design protects:
   device and nowhere else once pairing completes.
 - Push preview plaintext, meaning the `title` and `body` that the lock screen
   shows after NSE decryption.
+- The direct-carrier host candidates (P's and A's LAN addresses, ULAs, GUAs and
+  public IPv4 interface addresses) and the direct token, which cross C only
+  inside sealed candidate sets ([`direct-carriers.md`](direct-carriers.md)). A
+  host candidate that is also that side's relay connection source address (for
+  example the GUA P posts from, or the address of a gateway without NAT) is
+  visible to C as that source, as it is without direct carriers.
 
 C is allowed to see:
 
-- `remote_api_key`, because the relay WebSocket routes are admitted by C.
+- `remote_api_key`, because C admits the relay routes (the WebSocket routes and
+  `POST /direct`).
 - Relay route identifiers: pairing `rendezvous_id`, content `relay_node_id`, and
   C-minted `relay_key`.
 - Relay connection source address, connection time, close time, byte lengths,
@@ -55,6 +62,11 @@ C is allowed to see:
   `delegation`, `sig`, `counter`).
 - Push `/notify` metadata: `device_id`, `bid`, `collapse_key`, `enc`, `n`,
   the gateway `sig`, the replay `counter`, and ciphertext length.
+- Direct-carrier signalling: whether A's control hello carries the direct
+  capability, the sealed candidate sets of `POST /direct` and of A's
+  `DirectAnswer` (opaque, and of one fixed length per kind), the IPv4 UDP mapping
+  (ip:port) of P and of A that its UDP rendezvous observes during a punch, and the
+  time, frequency and C-side outcome of every direct attempt.
 
 `collapse_key` is an opaque short hash of `(device_id, session_id)`, **not** the
 raw `device_id:session_id`. So C learns neither the cleartext `session_id` (which
@@ -212,7 +224,7 @@ confirmation then authorizes the resulting device binding.
 
 ### 2. Relay admission and keyless push authorization at C
 
-Every relay WebSocket route uses the `x-remote-api-key` header, defined by
+Every relay route uses the `x-remote-api-key` header, defined by
 `remote-host-protocol` as `REMOTE_API_KEY_HEADER`:
 
 - `GET /pair/host/{rendezvous_id}`
@@ -220,6 +232,9 @@ Every relay WebSocket route uses the `x-remote-api-key` header, defined by
 - `GET /control`
 - `GET /content/join/{relay_node_id}`
 - `GET /content/host/{relay_key}`
+- `POST /direct/{relay_node_id}`, a plain HTTP request rather than a WebSocket,
+  which carries a sealed direct-carrier offer
+  ([`direct-carriers.md`](direct-carriers.md))
 
 C resolves the header through its admission layer. Unknown or expired keys get
 `401 Unauthorized`. Admitted keys are used for connection caps, bandwidth
@@ -243,7 +258,12 @@ authorization authenticates a device binding and each notify request to the
 delegated gateway key. Neither layer authenticates P to A, authenticates A to P,
 or encrypts content. A leaked `remote_api_key` lets an attacker burn relay quota
 or attempt relay joins, but does not reveal chat plaintext, does not enable
-pairing MITM, and does not authorize push binding or notification.
+pairing MITM, and does not authorize push binding or notification. With the
+node id of a gateway on that key, which is not secret, it also lets an attacker
+have C forward offers to that gateway. A declines each one after one AEAD open,
+with no punch and no registration, and C bounds them by
+`DIRECT_OFFERS_PER_SOURCE_PER_MINUTE` per (node, client IP) and
+`DIRECT_OFFERS_PER_NODE_PER_MINUTE` per node.
 
 ### 3. Pairing-derived endpoint identity
 
@@ -376,7 +396,7 @@ gateway's push signing key, which it never holds.
 
 Relevant code:
 
-- P transport: `app/ios/ffi/src/relay/chat.rs` (generic frame pump: `app/ios/ffi/src/transport.rs`)
+- P transport: `app/ios/ffi/src/relay/chat.rs` (generic frame pump: `app/ios/ffi/src/transport/pump.rs`)
 - P crypto/session core: `app/ios/ffi/src/core/content.rs`
 - A relay control manager: `crates/gateway/src/channel/relay_content.rs`
 - A Noise responder: `crates/gateway/src/channel/device_content.rs`
@@ -406,8 +426,10 @@ Control and data-leg setup:
 1. A's `relay_content` manager polls for an approved device row. When one exists
    and has relay settings, it dials C's `/control` endpoint using the row's
    `relay_url` and `remote_api_key`.
-2. A sends `ControlHello { relay_node_id }` as the first control WebSocket frame.
-   The `remote_api_key` stays in the dial header.
+2. A sends `ControlHello { relay_node_id, direct }` as the first control
+   WebSocket frame, where `direct` is the gateway's direct-carrier capability,
+   present while its carrier runtime is active. The `remote_api_key` stays in the
+   dial header.
 3. C registers that control connection under `relay_node_id`, scoped to the
    admitted `remote_api_key`.
 4. P opens chat by dialing `GET /content/join/{relay_node_id}` with the same
@@ -443,8 +465,44 @@ message and reassembled by `FrameReassembler`.
 
 Chat leg deduplication happens only on A. C cannot deduplicate by `device_id`
 because it never sees the Noise plaintext or the authenticated device identity.
-A installs a new chat leg in `WsChannelState.device_leg_registry` only after IK
-succeeds and the `device_id` is known; the new leg aborts the stale predecessor.
+A installs a new chat leg in `WsChannelState.device_leg_registry` only once IK
+has succeeded, the `device_id` is known and the leg has proven live: a relay
+chat leg when its first transport message from P decrypts, a direct-carrier chat
+leg when P's handshake confirmation does. The new leg aborts the stale
+predecessor. C sees every relay leg's msg1 and could replay it, but only the
+initiator that wrote it can produce a transport message after it, so a replay
+never displaces the live chat leg.
+
+## Direct Carriers
+
+[`direct-carriers.md`](direct-carriers.md) lets a relay binding's legs leave C's
+data path: while its legs ride the relay, P probes in the background for a direct
+carrier, QUIC over UDP or TCP straight to A. The gateway and C implement it; the app does
+not probe yet, so until it does every leg rides the relay.
+
+Relevant code:
+
+- A carrier runtime: `crates/gateway/src/channel/carrier/`
+- Candidate sealing and punch tags: `crates/device-proto/src/candidates.rs`
+- C offer route: `remote-host/crates/relay/src/serve.rs`; punch registry:
+  `remote-host/crates/relay/src/punch.rs`; UDP rendezvous:
+  `remote-host/crates/relay/src/udp.rs`
+
+C's role is signalling only:
+
+1. P posts a candidate offer, sealed under a key derived from the pairing
+   statics, to `POST /direct/{relay_node_id}`, admitted like the relay routes.
+2. C forwards it over A's control connection as `ControlSignal::DirectOffer`,
+   with a per-punch rendezvous ticket when it runs a UDP rendezvous, and returns
+   A's sealed `DirectAnswer` (or an opaque `404` when A declines) as the POST's
+   response.
+3. When a rendezvous applies, both sides register from the UDP socket their QUIC
+   uses, and C tells each the IPv4 mapping it observed for the other (`Peer`).
+
+Every carrier session then opens with a `DirectOpen` preface (a per-runtime token
+from the sealed answer) and runs the same Noise IK handshake as a relay leg, which
+P confirms with one empty transport message, before any application byte flows.
+The additions to C's powers, and Claim 5, are listed under the boundaries below.
 
 ## Push Communication Flow After Authentication
 
@@ -789,6 +847,9 @@ C performs:
 - Rendezvous matching by `rendezvous_id`, `relay_node_id`, and `relay_key`.
 - Resource controls: connection caps, per-IP throttles, per-rendezvous join
   limits, frame size caps, and bandwidth classes.
+- Direct-carrier signalling: forwarding a sealed offer and its sealed answer by
+  `relay_node_id` and a C-minted `PunchId`, the per-source and per-node offer
+  budgets, and the per-punch IPv4 UDP rendezvous.
 
 C does not perform:
 
@@ -798,6 +859,9 @@ C does not perform:
 - Device identity resolution.
 - Noise key derivation.
 - Gateway device-token validation.
+- Candidate-set decryption: it holds no sealing key, so the contents of the
+  sealed sets, direct-carrier host candidates and the direct token, stay opaque
+  to it.
 
 If C modifies a relay frame:
 
@@ -958,6 +1022,21 @@ binding store and notify rate limiter are keyed by the globally-unique
 `device_id`. End-to-end content security still comes from Noise and `push_key`,
 not from C admission.
 
+### Claim 5: a carrier session is exactly as trustworthy as a relay leg
+
+A [direct carrier](direct-carriers.md) session delivers no application byte
+before Noise IK completes between the pairing statics and P confirms it. A checks
+the initiator against its approved device rows (`lookup_approved_by_pubkey` in
+`responder_handshake`, `crates/gateway/src/channel/device_content.rs`), and P
+checks the pinned gateway static. The `DirectOpen` token, QUIC's TLS and A's
+allowed-IP set are availability gates only.
+
+Claim 2 therefore holds verbatim with "carrier session" in place of "relay leg".
+The sealed candidate sets and the `Public`-IPv4 checks add the guarantee that C
+cannot steer either side's direct traffic toward any private address. Toward
+public addresses, C can steer only what [C can do](#c-can-do) lists, per genuine
+offer.
+
 ## Security Boundaries
 
 ### In scope
@@ -972,6 +1051,9 @@ not from C admission.
   as the `guest` trial key — can try to spend that key's relay quota, guess device
   ids, call the push routes for another device id, or race public
   rendezvous joins.
+- With direct carriers: an on-path LAN attacker between P and A, network
+  observers on the direct path, and C forging, replaying or withholding
+  candidate advertisements and `Peer` messages.
 
 ### Out of scope
 
@@ -984,6 +1066,9 @@ not from C admission.
 - Ordinary APNs alert anti-forgery under `.p8` compromise. If C is malicious and
   holds the provider key, it can send arbitrary non-decrypted APNs alerts. It
   still cannot generate a valid encrypted Baybo preview.
+- Address privacy between the endpoints once a direct carrier is attempted: A
+  and P learn each other's addresses, and observers on either network see that P
+  talks to A.
 
 ### C can do
 
@@ -994,12 +1079,40 @@ not from C admission.
   this remains availability-only hardening.
 - Observe relay byte lengths, directions, timings, source addresses, and traffic
   class.
+- Replay a relay leg's Noise msg1, which carries no replay protection. A answers
+  with msg2, lists the leg for the device and bumps its `last_seen` until C
+  closes it, but the session never decrypts anything and never displaces the
+  device's live chat leg (see the chat leg deduplication above).
 - Store, drop, or prune provider tokens in its push token store.
 - Send the honest generic placeholder notification.
 - If malicious and holding `.p8`, send arbitrary ordinary APNs alerts outside the
   encrypted-preview path.
 - Leak metadata it sees, such as provider token, device id, relay
   `remote_api_key`, and `collapse_key` (an opaque hash).
+
+With direct carriers ([`direct-carriers.md`](direct-carriers.md#security)), C
+can in addition:
+
+- Observe new metadata: P's and A's IPv4 UDP mappings (ip:port), their NAT
+  behaviour as visible from one vantage point, and the time, frequency and C-side
+  outcome of every direct attempt.
+- Force the relay, by dropping, delaying or answering falsely to `POST /direct`,
+  `DirectOffer`, `DirectAnswer`, `Register` or `Peer`. The effect is availability
+  only: P stays on the relay.
+- Steer registrations, punches and one admission. For each offer P really
+  sealed, C chooses:
+  - one `Public` IPv4 rendezvous address, via a lookup of a name C picked, of
+    which only the IPv4 (A-record) results are used. A and P each send it at most
+    `PEER_WAIT / REGISTER_RETRY_INTERVAL` (20) datagrams of
+    `REGISTER_DATAGRAM_LEN` (64) bytes;
+  - one latched `Public` IPv4 srflx address per side. It receives `PUNCH_BURST`
+    punches from the other side and, from P, QUIC Initials for up to
+    `PROBE_BUDGET`;
+  - one `Public` IP in A's allowed set for `PUNCH_TTL`: the srflx it names for P.
+
+  That admission lets C reach A's pre-authentication QUIC surface and fetch A's
+  per-process certificate. It still ends at the `DirectOpen` token gate and
+  Noise.
 
 ### C cannot do, assuming endpoint keys stay secret
 
@@ -1014,6 +1127,34 @@ not from C admission.
   including from a caller with no admitted relay key — without the gateway's push
   signing key (the per-device delegation chain + replay counter gate it).
 
+With direct carriers, C also cannot:
+
+- Read host candidates from the sealed sets. The sets hide P's and A's LAN
+  addresses, ULAs, GUAs and public IPv4 interface addresses, and the direct
+  token. C learns a host candidate only when it is also that side's relay
+  connection source address, which it sees anyway: for example the GUA P posts
+  from, or the address of a gateway without NAT. It cannot learn how many
+  candidates either side has, or whether A offers TCP.
+- Tamper with candidate sets. It cannot inject, alter or drop an individual host
+  candidate: any tampering fails the AEAD, and the whole set is rejected.
+- Point either side at a private address. Both sides require the rendezvous and
+  `Peer` addresses to be `Public` IPv4, and private targets come only from
+  sealed, authenticated sets.
+- Admit any other source at A. An authenticated punch needs the punch key, so C
+  cannot forge one. An observer on the P→A path can race a copy from its own
+  address, which admits that address to the same pre-authentication surface, at
+  most `MAX_PRFLX_SOURCES_PER_PUNCH` per punch.
+- Replay an old answer to P: the `offer_id` echo prevents it.
+- Get a replayed offer accepted, with one exception: A's replay cache lives for
+  the gateway process, so it declines a repeat across Reconfigures, and a new
+  process declines any offer issued before it started by P's clock. An offer C
+  captured within P's clock lead over A (at most `OFFER_MAX_AGE`) before a
+  gateway process restart is accepted once by the new process, as one more
+  genuine offer.
+- Mint an offer that A accepts: doing so needs P's static secret.
+- Read, modify or misroute content on a direct carrier, or impersonate either
+  end (Claim 5).
+
 ## Operational Notes
 
 - `remote_api_key` leakage is a relay traffic/resource-abuse risk. The key is
@@ -1024,7 +1165,9 @@ not from C admission.
   previews.
 - When a device is revoked, A's relay-content manager observes the absence of an
   approved device row and tears down the control connection, so A stops
-  advertising the `relay_node_id`.
+  advertising the `relay_node_id`. The same poll ends the binding's scope, which
+  stops its carrier runtime: every direct-carrier session, QUIC or TCP, closes
+  and its in-flight requests are dropped.
 - `/register` is sent only by A (it holds the gateway push signing key the binding
   is authenticated with); P cannot register directly, and never holds push
   provider credentials. P keeps the binding current by sending its tagged target
@@ -1049,10 +1192,13 @@ not from C admission.
 - [`companion.md`](companion.md) - mobile companion architecture.
 - [`pairing-security.md`](pairing-security.md) - device pairing threat model and proof.
 - [`blob-transfer.md`](blob-transfer.md) - dedicated relay blob legs.
+- [`direct-carriers.md`](direct-carriers.md) - direct carriers for relay bindings and their security delta.
 - `crates/gateway/src/channel/relay_content.rs` - A-side relay control manager.
 - `crates/gateway/src/channel/device_content.rs` - A-side Noise IK responder.
 - `crates/gateway/src/push/mod.rs` - A-side push dispatcher.
 - `remote-host/crates/relay/src/broker.rs` - C blind relay broker.
-- `remote-host/crates/relay/src/serve.rs` - C relay WS routes and admission.
+- `remote-host/crates/relay/src/serve.rs` - C relay WS routes, `POST /direct` and admission.
+- `remote-host/crates/relay/src/udp.rs` - C per-punch UDP rendezvous.
+- `crates/gateway/src/channel/carrier/` - A-side direct-carrier runtime.
 - `remote-host/crates/push/src/notify.rs` - C push pipeline.
 - `app/ios/NotificationExtension/NotificationService.swift` - P-side NSE decrypt path.

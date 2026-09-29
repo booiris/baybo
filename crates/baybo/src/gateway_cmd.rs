@@ -599,6 +599,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         llm_pool: Arc::clone(&graph.llm_pool),
         supervisor: run_handle.supervisor.clone(),
         inbound_dedup: Arc::clone(&graph.inbound_dedup),
+        device_links: baybo_gateway::channel::links::DeviceLinks::new(),
         config_reloader: Arc::clone(&graph.config_reloader),
         admin_token: token.clone(),
         log_buffer: Arc::clone(&log_buffer),

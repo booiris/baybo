@@ -32,6 +32,7 @@ use std::time::Duration;
 use axum::body::{self, Body};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, header};
 use bytes::Bytes;
+use carrier::kind::CarrierKind;
 use device_proto::api_tunnel::{
     self, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest, TunnelResponse, TunnelReuse,
 };
@@ -132,8 +133,10 @@ pub(crate) async fn run_api_tunnel_over_relay(
     state: &WsChannelState,
 ) {
     let (sink, source) = ws.split();
-    if let Err(e) = run_tunnel_session(TungBinSink(sink), TungBinSource(source), class, state).await
-    {
+    let sink = state
+        .device_links
+        .tracked(TungBinSink(sink), class, Some(CarrierKind::Relay));
+    if let Err(e) = run_tunnel_session(sink, TungBinSource(source), class, state).await {
         log_relay_session_end(&e, "relay api tunnel aborted");
     }
 }
@@ -152,7 +155,10 @@ fn reuse_for(class: LegClass) -> Option<TunnelReuse> {
     }
 }
 
-async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
+/// The API tunnel responder for an `Api` or `Blob` leg, over the relay data leg
+/// or a carrier session: Noise IK device authentication, then the tunnel's
+/// request loop.
+pub(crate) async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
     mut sink: Si,
     mut source: So,
     class: LegClass,
@@ -428,36 +434,43 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
         }
     };
 
-    let router = super::tunnel_http::router(state.clone());
-    let response_task = tokio::spawn(async move {
-        router
-            .oneshot(req)
-            .await
-            .map_err(|e| format!("forward tunnel HTTP request: {e}"))
-    });
-    let drain = match stream_forward_body(
-        source,
-        transport,
-        reassembler,
-        pending,
-        tx,
-        request_id,
-        declared_len,
-    )
-    .await
-    {
+    // The router is polled inside this session, never spawned, so a session
+    // dropped mid-upload (a revoked binding) drops the handler with it before
+    // the handler can read the cut-off body as a complete one.
+    let routed = super::tunnel_http::router(state.clone()).oneshot(req);
+    tokio::pin!(routed);
+    let mut answered = None;
+    let drain = {
+        let body = stream_forward_body(
+            source,
+            transport,
+            reassembler,
+            pending,
+            tx,
+            request_id,
+            declared_len,
+        );
+        tokio::pin!(body);
+        loop {
+            tokio::select! {
+                drain = &mut body => break drain,
+                response = &mut routed, if answered.is_none() => answered = Some(response),
+            }
+        }
+    };
+    let drain = match drain {
         Ok(drain) => drain,
         Err((status, reason)) => {
-            response_task.abort();
-            let _ = response_task.await;
             send_error(sink, transport, request_id, status, &reason).await?;
             return Ok(LegState::MustClose);
         }
     };
 
-    let response = response_task
-        .await
-        .map_err(|e| format!("forward tunnel HTTP task failed: {e}"))??;
+    let response = match answered {
+        Some(response) => response,
+        None => routed.await,
+    }
+    .map_err(|e| format!("forward tunnel HTTP request: {e}"))?;
     let leg_state = match drain {
         BodyDrain::Drained => LegState::Reusable,
         // The router answered without reading the body (a 401 before any extractor
