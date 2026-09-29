@@ -1,7 +1,8 @@
 //! One address family's stable UDP socket: bound when the runtime starts,
-//! served for the runtime's life, and rebound only when receive errors
-//! persist. A receive error backs off inside the socket without reaching
-//! quinn, so a transient one never costs the family its connections.
+//! served for the runtime's life, and bound again when its first bind fails
+//! or when receive errors persist. A receive error backs off inside the
+//! socket without reaching quinn, so a transient one never costs the family
+//! its connections.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,8 +24,6 @@ use super::runtime::RuntimeContext;
 pub(crate) const REBIND_AFTER_RECV_ERRORS: u32 = 6;
 /// How often the family checks its socket's receive-error streak.
 const SOCKET_HEALTH_POLL: Duration = Duration::from_secs(1);
-/// The wait before a failed rebind is tried again.
-const SOCKET_REBIND_DELAY: Duration = Duration::from_secs(2);
 const SOCKET_REBOUND_REASON: &[u8] = b"socket rebound";
 
 /// A family's socket and the QUIC endpoint on it.
@@ -67,17 +66,29 @@ pub(crate) struct UdpFamily {
 }
 
 impl UdpFamily {
+    /// Binds the family's socket. A failed bind leaves the family unbound,
+    /// and [`supervise`] binds it again after the rebind delay.
     pub(crate) fn bind(
         bind: SocketAddr,
         server: quinn::ServerConfig,
-    ) -> Result<(Arc<Self>, ProbeReceiver), CarrierError> {
-        let (bound, probes) = BoundSocket::bind(bind, server.clone())?;
+    ) -> (Arc<Self>, Option<ProbeReceiver>) {
+        let (bound, probes) = match BoundSocket::bind(bind, server.clone()) {
+            Ok((bound, probes)) => (Some(bound), Some(probes)),
+            Err(error) => {
+                tracing::warn!(
+                    bind = %bind,
+                    %error,
+                    "carrier: UDP socket unavailable; retrying"
+                );
+                (None, None)
+            }
+        };
         let family = Self {
             bind,
             server,
-            bound: Mutex::new(Some(bound)),
+            bound: Mutex::new(bound),
         };
-        Ok((Arc::new(family), probes))
+        (Arc::new(family), probes)
     }
 
     /// Whether this is the IPv4 family.
@@ -98,14 +109,24 @@ impl UdpFamily {
 
 /// Serves `family` until `cancel` fires: its endpoint's connections and its
 /// probe datagrams, each in a task that sees a per-socket child of `cancel`
-/// and ends when it fires. Returns only after they have all ended. A
-/// persistent receive error closes the endpoint and binds the family again.
+/// and ends when it fires. Returns only after they have all ended. An
+/// unbound family (`probes` is `None`) is bound again after the rebind
+/// delay; a persistent receive error closes the endpoint and binds the
+/// family again at once.
 pub(crate) async fn supervise(
     family: Arc<UdpFamily>,
-    mut probes: ProbeReceiver,
+    probes: Option<ProbeReceiver>,
     context: Arc<RuntimeContext>,
     cancel: CancellationToken,
 ) {
+    let delay = context.timing.rebind_delay;
+    let mut probes = match probes {
+        Some(probes) => probes,
+        None => match rebind(&family, delay, delay, &cancel).await {
+            Some(probes) => probes,
+            None => return,
+        },
+    };
     while let Some(bound) = family.current() {
         let socket_cancel = cancel.child_token();
         let mut serving = JoinSet::new();
@@ -141,30 +162,37 @@ pub(crate) async fn supervise(
         bound.endpoint.close(CARRIER_REVOKED, SOCKET_REBOUND_REASON);
         *family.bound.lock() = None;
         drop(bound);
-        probes = match rebind(&family, &cancel).await {
+        probes = match rebind(&family, Duration::ZERO, delay, &cancel).await {
             Some(probes) => probes,
             None => return,
         };
     }
 }
 
-/// Binds `family` again, retrying every [`SOCKET_REBIND_DELAY`] until it
-/// succeeds or `cancel` fires.
-async fn rebind(family: &UdpFamily, cancel: &CancellationToken) -> Option<ProbeReceiver> {
+/// Binds `family` again once `first_wait` has passed, then every `delay`
+/// until it succeeds or `cancel` fires.
+async fn rebind(
+    family: &UdpFamily,
+    first_wait: Duration,
+    delay: Duration,
+    cancel: &CancellationToken,
+) -> Option<ProbeReceiver> {
+    let mut wait = first_wait;
     loop {
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = cancel.cancelled() => return None,
+        }
         match BoundSocket::bind(family.bind, family.server.clone()) {
             Ok((bound, probes)) => {
-                tracing::info!(bind = %family.bind, "carrier: UDP socket rebound");
-                tracing::debug!(local = %bound.local_addr, "carrier: rebound UDP socket address");
+                tracing::info!(bind = %family.bind, "carrier: UDP socket bound");
+                tracing::debug!(local = %bound.local_addr, "carrier: bound UDP socket address");
                 *family.bound.lock() = Some(bound);
                 return Some(probes);
             }
             Err(error) => {
-                tracing::warn!(%error, retry_in = ?SOCKET_REBIND_DELAY, "carrier: UDP rebind failed");
-                tokio::select! {
-                    () = tokio::time::sleep(SOCKET_REBIND_DELAY) => {}
-                    () = cancel.cancelled() => return None,
-                }
+                tracing::debug!(bind = %family.bind, %error, retry_in = ?delay, "carrier: UDP rebind failed; retrying");
+                wait = delay;
             }
         }
     }
