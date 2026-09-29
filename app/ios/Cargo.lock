@@ -504,10 +504,12 @@ dependencies = [
 name = "device-proto"
 version = "0.1.1"
 dependencies = [
+ "base64",
  "chacha20poly1305",
  "ed25519-dalek",
  "hex",
  "hkdf",
+ "hmac",
  "rand 0.10.2",
  "remote-host-protocol",
  "rmp-serde",
@@ -515,6 +517,7 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "snow",
+ "subtle",
  "thiserror 2.0.18",
  "zeroize",
 ]
@@ -1422,7 +1425,12 @@ dependencies = [
 name = "remote-host-protocol"
 version = "0.1.0"
 dependencies = [
+ "rand 0.9.4",
  "serde",
+ "subtle",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

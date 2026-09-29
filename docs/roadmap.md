@@ -94,8 +94,14 @@ Beyond those recorded gaps, planned work — all *todo*:
 
 ## Remote-host
 
-- **NAT hole punching** — *todo*. Direct client↔gateway connectivity across NATs,
-  so the relay drops out of the data path once a tunnel is established.
+- **NAT hole punching (direct carriers)** — *in progress*. A paired phone and its
+  gateway move their traffic off the relay onto a direct carrier (QUIC over UDP on
+  a LAN, IPv6, public or hole-punched IPv4 address, or opt-in TCP) whenever the
+  network allows, with the relay as the baseline that always works. The protocol,
+  the remote-host's `POST /direct` and per-punch UDP rendezvous, and the gateway's
+  carrier runtime are built; the app side (the prober, the carriers and idle chat
+  rotation) and the netns NAT matrix are not. Spec:
+  [`modules/mobile/direct-carriers.md`](modules/mobile/direct-carriers.md).
 
 ## Platform & infrastructure
 

@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use super::bot_reconciler::ChannelBotReconciler;
 use super::control::ChannelControlRegistry;
 use super::history::TuiHistoryStore;
+use super::links::DeviceLinks;
 use super::session_resolver::ChannelSessionResolver;
 use crate::auth::{AdminAuthState, ChannelTokenTable};
 use crate::log_buffer::LogBuffer;
@@ -95,6 +96,10 @@ pub struct WsChannelState {
     /// bounded by the relay's per-key connection cap), so they are not registered
     /// here.
     pub device_leg_registry: Arc<DashMap<String, tokio::task::AbortHandle>>,
+    /// The link table: each device's live legs and last direct offer. The
+    /// relay legs and the carrier runtime write it; every state built from
+    /// the same [`GatewayDeps`] shares one table.
+    pub device_links: DeviceLinks,
     /// Backing store for non-text media. Sidecars upload via
     /// `POST /v1/blobs`, the agent emits replies that reference blobs
     /// the gateway already has, and `GET /v1/blobs/{id}` lets sidecars
@@ -147,6 +152,7 @@ impl WsChannelState {
             pairing,
             device_store: deps.stores.device.clone(),
             device_leg_registry: Arc::new(DashMap::new()),
+            device_links: deps.device_links.clone(),
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
             turn_lifecycle: Arc::clone(&deps.turn_lifecycle),
@@ -160,12 +166,16 @@ impl WsChannelState {
     }
 }
 
-/// A relay content leg's handle into the [`WsChannelState::device_leg_registry`].
-/// The relay-content manager builds one from the leg's own `AbortHandle`; the
-/// content session calls [`install`](Self::install) once Noise resolves the
-/// `device_id`, registering this leg as the device's live one and aborting any
-/// stale predecessor. Only the relay path carries one — the device-blind relay
-/// can't dedup, so the gateway must.
+/// A chat leg's handle into the [`WsChannelState::device_leg_registry`]. The
+/// relay-content manager builds one from a relay leg's own `AbortHandle`, and
+/// the carrier runtime from a carrier chat session's; the content session
+/// calls [`install`](Self::install) once Noise has resolved the `device_id`
+/// and proven the initiator live (its handshake confirmation on a carrier,
+/// its first decrypted transport message on the relay), registering this leg
+/// as the device's live one and aborting any stale predecessor, on whichever
+/// carrier it runs. A does not rank carriers: the
+/// phone decides which chat leg is current, and the last to install wins. The
+/// device-blind relay can't dedup, so the gateway must.
 pub(crate) struct LegDedup {
     pub(crate) registry: Arc<DashMap<String, tokio::task::AbortHandle>>,
     pub(crate) abort: tokio::task::AbortHandle,

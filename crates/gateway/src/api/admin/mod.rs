@@ -11,6 +11,7 @@ pub mod cron;
 pub mod deck;
 pub mod llm;
 pub mod logs;
+pub mod mobile;
 pub mod project_team;
 pub mod projects;
 pub mod push;
@@ -149,6 +150,7 @@ fn effort_ladder() -> String {
         (name = "channels", description = "Registered channel plugins"),
         (name = "chat", description = "Web and device chat sessions"),
         (name = "push", description = "Direct-mode device push registration"),
+        (name = "mobile", description = "Paired devices' live legs and direct carriers"),
         (name = "llm", description = "Configured LLM provider"),
         (name = "logs", description = "Recent tracing events (in-memory ring buffer)"),
         (name = "agents", description = "User-managed agent profiles (chat personas)"),
@@ -176,6 +178,7 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(channels::routes())
         .merge(chat::routes())
         .merge(push::routes())
+        .merge(mobile::routes())
         .merge(llm::routes())
         .merge(logs::routes())
         .merge(agents::routes())

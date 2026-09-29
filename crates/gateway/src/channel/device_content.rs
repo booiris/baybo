@@ -26,10 +26,12 @@ use std::time::Duration;
 
 use baybo_channels::wire::{self, Frame};
 use baybo_model::ChannelType;
+use carrier::kind::CarrierKind;
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, write_chunked};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use remote_host_protocol::relay::LegClass;
 use snow::TransportState;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
@@ -117,9 +119,11 @@ pub(crate) async fn run_content_over_relay(
     dedup: Option<LegDedup>,
 ) {
     let (sink, source) = ws.split();
-    if let Err(e) =
-        run_content_session(TungBinSink(sink), TungBinSource(source), state, dedup).await
-    {
+    let sink =
+        state
+            .device_links
+            .tracked(TungBinSink(sink), LegClass::Chat, Some(CarrierKind::Relay));
+    if let Err(e) = run_content_session(sink, TungBinSource(source), state, dedup).await {
         log_relay_session_end(&e, "relay content session aborted");
     }
 }
@@ -127,8 +131,8 @@ pub(crate) async fn run_content_over_relay(
 /// The content responder: run the Noise IK responder handshake (authenticating
 /// the device by matching the initiator's static key to an approved device row),
 /// then Noise-wrap the shared channel frame loop over `sink`/`source`. Runs over
-/// the outbound relay data leg.
-async fn run_content_session<Si: BinarySink, So: BinarySource>(
+/// the outbound relay data leg and over a carrier session.
+pub(crate) async fn run_content_session<Si: BinarySink, So: BinarySource>(
     mut sink: Si,
     mut source: So,
     state: &WsChannelState,
@@ -140,14 +144,24 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     let device_id = device.device_id;
     let transport = Arc::new(Mutex::new(transport));
 
-    // Gateway-only device dedup: now that this leg has a viable Noise session, make
-    // it the live leg for `device_id` and abort any stale predecessor (e.g. a
-    // half-open leg left by a prior foreground reconnect). The relay can't do this —
-    // it never learns `device_id` — so it is enforced here. Done only after the
-    // handshake succeeds, so a failed dial never kills a working session.
-    if let Some(dedup) = dedup {
-        dedup.install(&device_id);
-    }
+    // Gateway-only device dedup: once this leg is proven live, make it the
+    // live leg for `device_id` and abort any stale predecessor (e.g. a
+    // half-open leg left by a prior foreground reconnect). The relay can't do
+    // this — it never learns `device_id` — so it is enforced here. A confirmed
+    // handshake proves the initiator live; a two-message one does not, since
+    // the relay sees every msg1 it carries and could replay one, so such a leg
+    // installs only once its first transport message decrypts.
+    let pending_dedup = match dedup {
+        Some(dedup) if Si::CONFIRMS_HANDSHAKE => {
+            dedup.install(&device_id);
+            None
+        }
+        Some(dedup) => Some(PendingDedup {
+            dedup,
+            device_id: device_id.clone(),
+        }),
+        None => None,
+    };
 
     tracing::info!(
         device = %super::short_hash(&device_id),
@@ -178,6 +192,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
             transport: Arc::clone(&transport),
             reassembler: FrameReassembler::new(),
             pending: std::collections::VecDeque::new(),
+            pending_dedup,
         },
         state,
         &channel_type,
@@ -191,7 +206,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
 }
 
 /// Read the next binary message (skipping ping/pong) with a timeout — for the
-/// two Noise handshake messages before the frame loop takes over.
+/// initiator's handshake messages before the frame loop takes over.
 async fn recv_handshake<So: BinarySource>(
     source: &mut So,
     timeout: Duration,
@@ -218,8 +233,8 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
         .await
         .map_err(|e| RelaySessionError::Infra(format!("gateway static key: {e}")))?;
 
-    // 2 messages: read the initiator's `msg1` (carrying its static key),
-    // authenticate it, then send `msg2` and enter transport mode.
+    // Read the initiator's `msg1` (carrying its static key), authenticate it,
+    // then send `msg2` and enter transport mode.
     let mut handshake = gateway_static
         .ik_responder()
         .map_err(|e| RelaySessionError::Infra(format!("build ik responder: {e}")))?;
@@ -253,9 +268,13 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
     sink.send_bytes(buf[..n].to_vec())
         .await
         .map_err(|()| RelaySessionError::Ended("send handshake msg2".to_string()))?;
-    let transport = handshake
+    let mut transport = handshake
         .into_transport_mode()
         .map_err(|e| RelaySessionError::Infra(format!("enter transport mode: {e}")))?;
+    if Si::CONFIRMS_HANDSHAKE {
+        read_confirmation(source, &mut transport, &mut buf).await?;
+    }
+    sink.authenticated(&device)?;
 
     // Best-effort liveness bump for the operator's device list.
     let now = chrono::Utc::now().timestamp();
@@ -270,14 +289,53 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
     Ok((transport, device))
 }
 
-/// A binary-message duplex the content responder runs over: the outbound relay
-/// data leg ([`TungBinSink`]/[`TungBinSource`]). Only opaque binary frames cross
-/// it (Noise ciphertext); ping/pong are skipped, anything else ends the stream.
+/// Reads the initiator's handshake confirmation, one transport message with
+/// an empty payload, within [`HANDSHAKE_TIMEOUT`]. It decrypts only under the
+/// ephemeral key of the initiator that wrote msg1, so a replayed msg1 ends
+/// here.
+async fn read_confirmation<So: BinarySource>(
+    source: &mut So,
+    transport: &mut TransportState,
+    buf: &mut [u8],
+) -> Result<(), RelaySessionError> {
+    let confirmation = recv_handshake(source, HANDSHAKE_TIMEOUT).await?;
+    let len = transport.read_message(&confirmation, buf).map_err(|e| {
+        RelaySessionError::AuthRejected(format!("read handshake confirmation: {e}"))
+    })?;
+    if len != 0 {
+        return Err(RelaySessionError::AuthRejected(
+            "the handshake confirmation carries a payload".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A binary-message duplex the content and tunnel responders run over: the
+/// outbound relay data leg ([`TungBinSink`]/[`TungBinSource`]) or a carrier
+/// session's framed stream. Only opaque binary frames cross it (Noise
+/// ciphertext); on the relay leg ping/pong are skipped, anything else ends the
+/// stream.
 #[async_trait::async_trait]
 pub(crate) trait BinarySink: Send + 'static {
+    /// Whether the initiator must confirm the handshake: right after it reads
+    /// msg2 it sends one transport message with an empty payload, and the
+    /// session is authenticated only once that decrypts. Noise IK's msg1
+    /// carries no replay protection, so wherever it can be observed, a
+    /// replay of it would otherwise authenticate as the device. Carrier
+    /// sessions require it; the relay leg does not.
+    const CONFIRMS_HANDSHAKE: bool = false;
+
     /// Send one binary message. `Err(())` means the wire is gone.
     async fn send_bytes(&mut self, bytes: Vec<u8>) -> Result<(), ()>;
     async fn close(&mut self);
+    /// Called once, when the responder handshake has authenticated `device`
+    /// (sent msg2 and, if [`CONFIRMS_HANDSHAKE`](Self::CONFIRMS_HANDSHAKE),
+    /// read the confirmation), before the session does anything as that
+    /// device. A carrier session's pre-authentication limits end here, and an
+    /// error refuses the session.
+    fn authenticated(&mut self, _device: &AuthenticatedDevice) -> Result<(), RelaySessionError> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -355,6 +413,15 @@ impl<S: BinarySink> FrameSink for NoiseFrameSink<S> {
     }
 }
 
+/// A chat leg's [`LegDedup`], held until the initiator proves it is live:
+/// its first transport message decrypts under keys only the initiator that
+/// wrote msg1 holds. A replayed msg1 gets msg2 but never produces one, so it
+/// never displaces the device's live chat leg.
+struct PendingDedup {
+    dedup: LegDedup,
+    device_id: String,
+}
+
 /// Inbound: Noise-decrypt each binary message into an encoded [`Frame`].
 pub(crate) struct NoiseFrameSource<R: BinarySource> {
     source: R,
@@ -363,6 +430,7 @@ pub(crate) struct NoiseFrameSource<R: BinarySource> {
     /// Frames reassembled from inbound messages but not yet handed out (the
     /// `FrameSource` returns them one at a time).
     pending: std::collections::VecDeque<Frame>,
+    pending_dedup: Option<PendingDedup>,
 }
 
 #[async_trait::async_trait]
@@ -385,6 +453,9 @@ impl<R: BinarySource> FrameSource for NoiseFrameSource<R> {
                     }
                 }
             };
+            if let Some(PendingDedup { dedup, device_id }) = self.pending_dedup.take() {
+                dedup.install(&device_id);
+            }
             for frame_bytes in reassembled {
                 match wire::decode(&frame_bytes) {
                     Ok(frame) => self.pending.push_back(frame),

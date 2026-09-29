@@ -6,8 +6,18 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+# `AddressPolicy::active()` returns `AddressPolicy::for_tests()`, which treats
+# loopback and the benchmarking ranges as reachable. Test builds only.
+test-support = []
+
 [dependencies]
 serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

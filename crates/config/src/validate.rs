@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::Path;
 
 use baybo_model::MicroUsd;
@@ -8,7 +9,7 @@ use crate::browser::BrowserConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
-use crate::gateway::GatewayConfig;
+use crate::gateway::{DirectTcpConfig, DirectUdpConfig, GatewayConfig};
 use crate::llm::LlmEntry;
 use crate::web_search::{MAX_RESULTS_CEILING, WebSearchConfig};
 use crate::workspace::WorkspaceConfig;
@@ -279,6 +280,64 @@ fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) 
                 "must be non-empty",
             ));
         }
+    }
+    validate_direct_udp(&gateway.direct_udp, errors);
+    if let Some(tcp) = &gateway.direct_tcp {
+        validate_direct_tcp(tcp, errors);
+    }
+}
+
+/// Shape rules only. Address classes belong to the protocol crate's
+/// `AddressPolicy`, which the gateway applies when it gathers candidates.
+fn validate_direct_udp(udp: &DirectUdpConfig, errors: &mut Vec<ValidationError>) {
+    validate_family_binds("gateway.direct_udp", udp.ipv4_bind, udp.ipv6_bind, errors);
+    if udp.enabled && udp.ipv4_bind.is_none() && udp.ipv6_bind.is_none() {
+        errors.push(ValidationError::new(
+            "gateway.direct_udp",
+            "needs ipv4_bind or ipv6_bind while enabled (set enabled=false to turn direct UDP off)",
+        ));
+    }
+}
+
+fn validate_direct_tcp(tcp: &DirectTcpConfig, errors: &mut Vec<ValidationError>) {
+    validate_family_binds("gateway.direct_tcp", tcp.ipv4_bind, tcp.ipv6_bind, errors);
+    if tcp.ipv4_bind.is_none() && tcp.ipv6_bind.is_none() {
+        errors.push(ValidationError::new(
+            "gateway.direct_tcp",
+            "needs ipv4_bind or ipv6_bind (omit the section to turn direct TCP off)",
+        ));
+    }
+    for (i, address) in tcp.advertised_addresses.iter().enumerate() {
+        let field = format!("gateway.direct_tcp.advertised_addresses[{i}]");
+        if address.port() == 0 {
+            errors.push(ValidationError::new(field, "port must be > 0"));
+        } else if address.ip().to_canonical().is_unspecified() {
+            errors.push(ValidationError::new(
+                field,
+                "must name a reachable address, not an unspecified one",
+            ));
+        }
+    }
+}
+
+fn validate_family_binds(
+    section: &str,
+    ipv4_bind: Option<SocketAddr>,
+    ipv6_bind: Option<SocketAddr>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if ipv4_bind.is_some_and(|bind| !bind.is_ipv4()) {
+        errors.push(ValidationError::new(
+            format!("{section}.ipv4_bind"),
+            "must be an IPv4 socket address",
+        ));
+    }
+    // The IPv6 socket sets IPV6_V6ONLY, which refuses to bind a mapped address.
+    if ipv6_bind.is_some_and(|bind| bind.ip().to_canonical().is_ipv4()) {
+        errors.push(ValidationError::new(
+            format!("{section}.ipv6_bind"),
+            "must be an IPv6 socket address, not an IPv4 or IPv4-mapped one",
+        ));
     }
 }
 

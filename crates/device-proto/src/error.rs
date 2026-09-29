@@ -47,4 +47,43 @@ pub enum ProtoError {
     /// constant in what it reveals.
     #[error("signature {stage} failed")]
     Signature { stage: &'static str },
+
+    /// The peer's X25519 static key is a low-order point: the static-static DH
+    /// output is all zero, so no candidate keys are derived.
+    #[error("x25519 peer key yields an all-zero shared secret")]
+    WeakPeerKey,
+
+    /// A sealed candidate set was refused whole, at seal or at open.
+    #[error("sealed candidates: {0}")]
+    Candidates(#[from] CandidateRejection),
+}
+
+/// Why a sealed candidate set was refused. No variant carries a candidate, the
+/// token or key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CandidateRejection {
+    #[error("sealed set exceeds the size cap")]
+    Oversized,
+    #[error("sealed set is not valid base64")]
+    Encoding,
+    #[error("nonce is {got} bytes, expected {expected}")]
+    NonceLength { expected: usize, got: usize },
+    #[error("ciphertext is {got} bytes, expected {expected}")]
+    CiphertextLength { expected: usize, got: usize },
+    #[error("body is {len} bytes, the plaintext holds {capacity}")]
+    BodyTooLarge { len: usize, capacity: usize },
+    #[error("declared body length does not frame exactly one body")]
+    BodyLength,
+    #[error("plaintext padding is not zero")]
+    Padding,
+    #[error("candidate set version {got} is not supported")]
+    Version { got: u8 },
+    #[error("{len} {list} candidates exceed the cap of {max}")]
+    Count {
+        list: &'static str,
+        len: usize,
+        max: usize,
+    },
+    #[error("answer does not echo the offer id")]
+    OfferIdMismatch,
 }

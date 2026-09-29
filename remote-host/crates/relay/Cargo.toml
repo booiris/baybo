@@ -36,3 +36,6 @@ remote-host-edge = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tokio-tungstenite = { workspace = true }
+# `AddressPolicy::for_tests`, so the UDP rendezvous tests can register from
+# loopback sources.
+remote-host-protocol = { workspace = true, features = ["test-support"] }
