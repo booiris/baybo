@@ -11,14 +11,20 @@
 //! WebSocket transport on top (the `remote-host-relay` binary), hosting the
 //! pairing rendezvous with admission so only an admitted gateway can occupy a
 //! rendezvous.
+//!
+//! Direct carriers add `POST /direct/{relay_node_id}` to [`serve`], the
+//! per-punch state behind it (`punch`), and the IPv4 UDP rendezvous
+//! ([`udp`]).
 
 pub mod bandwidth;
 pub mod broker;
 pub mod conns;
 pub mod control;
 pub mod error;
+mod punch;
 pub mod serve;
 pub mod traffic;
+pub mod udp;
 pub mod ws;
 
 pub use bandwidth::{BandwidthLimiter, BandwidthRegistry};

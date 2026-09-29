@@ -5,7 +5,10 @@
 //! `pair` is a live, terminal-only flow: it mints a code, waits for the phone to
 //! scan and reach the confirm step, shows the Bluetooth-style confirmation code,
 //! and asks the operator to approve — both sides confirm before any token
-//! activates. There is no separate `approve` step.
+//! activates. There is no separate `approve` step. `status` asks the running
+//! gateway for each device's live legs ([`status`]).
+
+mod status;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +41,7 @@ pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutpu
             remote_api_key,
         } => pair(ctx, proxy_url, push_url, remote_api_key).await,
         DeviceCmd::List { approved } => list(ctx, approved).await,
+        DeviceCmd::Status => status::status(ctx).await,
         DeviceCmd::Revoke { device_id, yes } => revoke(ctx, device_id, yes).await,
     }
 }

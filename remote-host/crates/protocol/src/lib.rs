@@ -1,8 +1,10 @@
-//! The remote-host ("C") wire contract: route paths, the admission header, and
-//! the serde types crossing the relay (WS) + push (HTTP) boundaries. Pure serde,
-//! no transport and no baybo deps, so the server, the gateway, and the app all
-//! depend on it instead of hand-mirroring the protocol.
+//! The remote-host ("C") wire contract: route paths, the admission header, the
+//! serde types crossing the relay (WS) + push (HTTP) boundaries, and the
+//! direct-carrier address policy and probe-datagram codec. No async transport
+//! and no baybo deps, so the server, the gateway, and the app all depend on it
+//! instead of hand-mirroring the protocol.
 
+pub mod error;
 pub mod push;
 pub mod relay;
 

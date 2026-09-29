@@ -170,6 +170,18 @@ fn device_pair_parses_separate_proxy_and_push_urls() {
 }
 
 #[test]
+fn device_status_takes_no_args() {
+    let cli = parse(&["device", "status"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Device {
+            cmd: DeviceCmd::Status
+        })
+    ));
+    assert!(Cli::try_parse_from(["baybo", "device", "status", "device-1"]).is_err());
+}
+
+#[test]
 fn setup_takes_no_args() {
     let cli = parse(&["setup"]);
     assert!(matches!(cli.command, Some(Commands::Setup)));

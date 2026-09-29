@@ -5,7 +5,7 @@ on one listener, reached by disjoint route paths.
 
 | Role | When it runs | Routes | What it does |
 |------|--------------|--------|--------------|
-| **relay** | always on | `/pair/host/{rendezvous_id}`, `/pair/join/{rendezvous_id}`, `/control`, `/content/join/{node}`, `/content/host/{key}` | Blind WebSocket rendezvous for pairing + content (NAT'd gateways). Stateless. |
+| **relay** | always on | `/pair/host/{rendezvous_id}`, `/pair/join/{rendezvous_id}`, `/control`, `/content/join/{node}`, `/content/host/{key}`, `POST /direct/{node}`; UDP rendezvous when `UDP_PUBLIC_ADDR` is set | Blind WebSocket rendezvous for pairing + content (NAT'd gateways), and the signalling for direct carriers. No durable state. |
 | **push** | auto, when an APNs `.p8` is configured (`APNS_P8_HOST_PATH`) | `POST /notify`, `POST /register` | Holds the APNs `.p8`; signs ES256 JWTs and POSTs the blind encrypted preview to Apple. |
 
 So a bare config runs relay only; fill the APNs section in `.env` to add push.
@@ -172,6 +172,32 @@ CLIENT_IP_HEADERS=cf-connecting-ip
 
 > **Trust a client-IP header ONLY when the origin is reachable solely via that proxy** — a [Cloudflare IP allowlist](https://www.cloudflare.com/ips/), a `cloudflared` Tunnel (no public origin), or Authenticated Origin Pulls (CF mTLS). Otherwise a direct-to-origin attacker can forge `cf-connecting-ip` to evade the limit or frame an arbitrary IP. For `x-forwarded-for` the **left-most** entry is taken as the original client, so it too is only safe behind a proxy that overwrites/anchors it.
 
+## Direct carriers (UDP rendezvous)
+
+A paired phone and its gateway move their traffic off the relay onto a **direct carrier** (QUIC over UDP, or TCP when the gateway opts in) whenever the network allows; the relay stays the path that always works. C only signals: it cannot read the addresses the two sides exchange, and never sees anything they send each other:
+
+- **`POST /direct/{node}`** carries the phone's sealed offer, which is opaque to C. C forwards it to that node's gateway over its control connection and holds the POST (up to **3 s**) for the gateway's sealed answer. The route is admitted like every relay route (the per-IP limiter, then `x-remote-api-key`). Its responses are never cacheable:
+  - `200` with the answer;
+  - `404 no direct route` when the gateway is not connected, is not direct-capable, belongs to another key, or declines. The reasons are deliberately indistinguishable;
+  - `504` when the gateway does not answer in time or its control connection ends;
+  - `429` + `Retry-After` past **6 offers/min per (node, client IP)** (the client IP resolves the same way as the per-IP limiter's, `CLIENT_IP_HEADERS`), **30/min per node**, or **2 in-flight punches per node**; `503` + `Retry-After` when the gateway's control channel is full or C holds **4096** punches. These limits are fixed constants; the `RELAY_IP_*` limits apply on top.
+- **The UDP rendezvous** (optional) lets the two sides hole-punch through IPv4 NATs. When `UDP_PUBLIC_ADDR` is set, each forwarded offer gets a per-punch rendezvous: both sides register from the UDP socket their QUIC uses, and C tells each one the IPv4 mapping it observed for the other. C keeps this state per punch for **20 s** only. It replies once per registration, only to the sender, with a datagram shorter than the request, and never for an unknown punch or a wrong ticket, so the port can neither reflect nor amplify. Without `UDP_PUBLIC_ADDR`, offers are still forwarded: LAN, IPv6, public-IPv4 and TCP carriers work, and only hole-punched IPv4 does not.
+
+To turn the rendezvous on:
+
+```bash
+# in .env
+UDP_PUBLIC_ADDR=rendezvous.example.com:7777   # or a public IPv4 literal plus port
+UDP_PORT=7777                                 # published as 0.0.0.0:7777:7777/udp
+```
+
+- **Name it for UDP.** Use an IPv4 literal plus port, or a hostname plus port whose A records point at C. Clients use only the name's IPv4 results, and every one of them must be a public address, so an AAAA record is ignored. The hostname must be **DNS-only** (not CDN-proxied: a proxy cannot carry UDP and would hide the mapping). It is separate from the relay hostname, which may stay behind a CDN. C does not resolve it; clients do.
+- **Open the UDP port inbound** in the host firewall and in any provider security group. C needs no IPv6 for this.
+- **Preserve the source address.** The compose file publishes the port through the kernel NAT path (the default iptables/nftables DNAT publishing). A userland proxy rewrites every source to a private bridge address; C then refuses every registration and logs `udp_source_not_public` (at most once a minute).
+- **On a multi-homed host running C with host networking** (`network_mode: host`), set `UDP_BIND_ADDR` in `.env` to the public-facing address plus `UDP_PORT`: replies must leave from the address the clients sent to, because clients drop a reply from any other source. The compose file passes `UDP_BIND_ADDR` through and defaults it to `0.0.0.0:${UDP_PORT}`; with the default published port, leave it unset, since the kernel NAT already answers from the address the client sent to and the container cannot bind a host address. `UDP_BIND_ADDR` must be IPv4, since the rendezvous observes IPv4 mappings only.
+- **Startup fails** on an invalid `UDP_PUBLIC_ADDR` (it must be a public IPv4 literal or an LDH hostname, plus a non-zero port), an invalid `UDP_BIND_ADDR`, or a UDP bind that fails.
+- **Logs.** Each offer logs its node, key tag, punch tag, status and elapsed time; each punch with a rendezvous logs, when it ends, whether each side registered and how long pairing took. Tickets, sealed blobs and observed addresses never appear at info level; addresses appear at `remote_host_relay=debug` only.
+
 ## Gateway wiring (pair against this host)
 
 The gateway holds **no** `.p8`, and there is **no `relay`/`push` block in `baybo.json`** — relay control + push are driven by the approved device row. Choose their endpoints independently when pairing (one-time per-device values recorded on the row):
@@ -183,6 +209,8 @@ baybo device pair --proxy-url wss://proxy.example.com \
 ```
 
 The gateway dials `--proxy-url` for pairing/control/content and POSTs keyless push to `--push-url`. Omit the flags to use `wss://proxy.baybo.space`, `https://push.baybo.space`, and the relay's default `guest` key (an ordinary admitted key on that proxy, not a special admission class). The `remote_api_key` must be admitted in the proxy's `remote_api_keys` table (see **Admission** above) and is sent only on relay legs. To change either endpoint for an already-paired device, re-pair with the new flags.
+
+Direct carriers need no pairing flag: the gateway advertises them on its control connection by itself (`gateway.direct_udp` in `baybo.json`, on by default; `gateway.direct_tcp`, opt-in), and C forwards offers only to a gateway that does. A gateway in a container needs host networking for direct UDP.
 
 ## Notes
 

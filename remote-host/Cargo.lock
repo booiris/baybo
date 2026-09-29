@@ -1500,8 +1500,13 @@ dependencies = [
 name = "remote-host-protocol"
 version = "0.1.0"
 dependencies = [
+ "rand 0.9.4",
  "serde",
  "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

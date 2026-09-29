@@ -1,0 +1,38 @@
+[package]
+name = "carrier"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# `DemuxSocket::inject_recv_errors`, for the gateway's rebind tests: a real
+# socket cannot be made to fail its receives.
+test-support = []
+
+# The config builders take the consumer's rustls `CryptoProvider`, so the
+# crate names none. quinn's `rustls-ring` is what brings
+# `quinn::crypto::rustls` into existence (ring is already in the gateway's and
+# the app's graphs), so the crate builds on its own.
+[dependencies]
+remote-host-protocol = { workspace = true }
+device-proto = { workspace = true }
+quinn = { workspace = true, features = ["rustls-ring"] }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+socket2 = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }
+rustls = { workspace = true, features = ["aws_lc_rs"] }
+quinn-proto = { workspace = true }
+# `test-util` backs `#[tokio::test(start_paused = true)]`; `full` omits it.
+tokio = { workspace = true, features = ["test-util"] }
+futures = { workspace = true }
