@@ -50,6 +50,7 @@ use super::device_pair::PairingHostDeps;
 use super::relay_pair::host_pairing_leg;
 use super::state::WsChannelState;
 use crate::device::load_or_create_static_keypair;
+use crate::relay::dial::RelayDialer;
 use crate::test_support::build_test_deps;
 
 /// A `tokio-tungstenite` client leg into the relay (plaintext `ws://` in-test).
@@ -223,7 +224,13 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
     let relay_key = signal["relay_key"].as_str().unwrap().to_owned();
 
     // The gateway opens its host leg and runs the real Noise IK responder over it.
-    let host_ws = dial(port, &format!("/content/host/{relay_key}")).await;
+    let host_ws = RelayDialer::direct()
+        .dial(
+            &format!("ws://127.0.0.1:{port}/content/host/{relay_key}"),
+            REMOTE_API_KEY,
+        )
+        .await
+        .expect("gateway content host leg via the production dialer");
     let responder_state = state.clone();
     tokio::spawn(async move {
         run_content_over_relay(host_ws, &responder_state, None).await;
@@ -328,6 +335,7 @@ async fn real_relay_pairs_gateway_and_mock_app() {
         relay_url: relay_url.clone(),
         push_url: "https://push.test".into(),
         remote_api_key: REMOTE_API_KEY.into(),
+        relay_dialer: RelayDialer::direct(),
     };
     let gateway = {
         let relay_url = relay_url.clone();

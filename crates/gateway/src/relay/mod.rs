@@ -10,8 +10,11 @@
 //!
 //! This module is the **protocol-over-WebSocket core**: it runs over an
 //! already-connected stream, so it is host-testable against a mock C. The
-//! production wrapper supplies the TCP/TLS dial of `relay.base_url` and a
-//! reconnect loop; data-leg establishment and the blind byte-pipe ride on top.
+//! production wrapper dials through [`dial::RelayDialer`] (the egress proxy and
+//! system trust roots apply) and runs a reconnect loop; data-leg establishment
+//! and the blind byte-pipe ride on top.
+
+pub mod dial;
 
 use std::time::Duration;
 
@@ -20,11 +23,10 @@ use futures::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc};
-#[cfg(test)]
-use tokio_tungstenite::client_async;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{WebSocketStream, connect_async};
+
+use dial::{RelayDialError, RelayDialer};
 
 /// `SecretVault` key holding A's stable, non-secret `relay_node_id` (a UUID).
 /// The app caches it at pairing to reach a NAT'd A via the relay, so it must not
@@ -88,6 +90,8 @@ pub use remote_host_protocol::relay::{ControlHello, ControlSignal, LegClass};
 pub enum ControlError {
     #[error("ws: {0}")]
     Ws(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("dial: {0}")]
+    Dial(#[from] RelayDialError),
     #[error("codec: {0}")]
     Codec(String),
 }
@@ -102,86 +106,22 @@ pub(crate) struct ControlCloseFrame {
     pub(crate) reason: String,
 }
 
-/// Log-friendly detail for a control error: WS upgrade rejects surface their
-/// HTTP status + response body (the relay's admission verdict — the only way to
-/// tell a 401/403 unadmitted-key reject from DNS/TLS/timeout noise); everything
-/// else renders via `Display`.
-pub(crate) fn control_error_detail(e: &ControlError) -> String {
-    match e {
-        ControlError::Ws(ws) => ws_error_detail(ws),
-        other => other.to_string(),
-    }
-}
-
-/// See [`control_error_detail`]; shared with the content data-leg dial, which
-/// handles raw tungstenite errors.
-pub(crate) fn ws_error_detail(e: &tokio_tungstenite::tungstenite::Error) -> String {
-    let tokio_tungstenite::tungstenite::Error::Http(resp) = e else {
-        return e.to_string();
-    };
-    let status = resp.status();
-    match resp
-        .body()
-        .as_deref()
-        .map(|b| crate::http_body_snippet(&String::from_utf8_lossy(b)))
-        .filter(|s| !s.is_empty())
-    {
-        Some(body) => format!("http {status}: {body}"),
-        None => format!("http {status}"),
-    }
-}
-
-/// Run the A-side control connection over an already-connected `stream` (the
-/// caller dials TCP + TLS for `wss://`; tests pass a plain `ws://` TcpStream):
-/// complete the WS handshake, send `hello`, then forward every parsed server
-/// signal to `signals` until the connection closes. Unparseable frames are
-/// logged and skipped (forward-compatible with future signal kinds).
-#[cfg(test)]
-pub(crate) async fn run_control_connection<S>(
-    url: &str,
-    stream: S,
-    hello: &ControlHello,
-    signals: mpsc::Sender<ControlSignal>,
-    healthy_cycle: bool,
-) -> Result<Option<ControlCloseFrame>, ControlError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let request = url
-        .into_client_request()
-        .map_err(|e| ControlError::Codec(format!("bad url: {e}")))?;
-    let (ws, _) = client_async(request, stream).await?;
-    pump_control(url, ws, hello, signals, healthy_cycle).await
-}
-
-/// Production dial: connect to C's control endpoint (`wss://…` TLS handled by
-/// `connect_async`) and run the control loop, returning when the connection
-/// closes or errors so the caller can reconnect.
+/// Production dial: connect to C's control endpoint through `dialer`, presenting
+/// `remote_api_key` as the admission header, and run the control loop, returning
+/// when the connection closes or errors so the caller can reconnect.
 pub(crate) async fn connect_control(
+    dialer: &RelayDialer,
     url: &str,
     remote_api_key: &str,
     hello: &ControlHello,
     signals: mpsc::Sender<ControlSignal>,
     healthy_cycle: bool,
 ) -> Result<Option<ControlCloseFrame>, ControlError> {
-    let mut request = url
-        .into_client_request()
-        .map_err(|e| ControlError::Codec(format!("bad url: {e}")))?;
-    // Admission rides the dial header now (the relay's shared pre-layer), so the
-    // hello carries only the relay_node_id.
-    let value = remote_api_key
-        .parse()
-        .map_err(|e| ControlError::Codec(format!("bad instance key header: {e}")))?;
-    request
-        .headers_mut()
-        .insert(remote_host_protocol::REMOTE_API_KEY_HEADER, value);
-    let (ws, _) = connect_async(request).await?;
+    let ws = dialer.dial(url, remote_api_key).await?;
     pump_control(url, ws, hello, signals, healthy_cycle).await
 }
 
-/// The control protocol over an already-handshaken WS (shared by the
-/// stream-based [`run_control_connection`] and the production [`connect_control`]
-/// so both speak it identically): send `hello`, then forward every parsed server
+/// The control protocol over an already-handshaken WS: send `hello`, then forward every parsed server
 /// signal to `signals` until the connection closes. Unparseable frames are
 /// logged and skipped (forward-compatible with future signal kinds). `Ok`
 /// carries the server's Close frame when it sent one, so the caller can log the
@@ -280,18 +220,23 @@ mod tests {
     use axum::routing::get;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use tokio::net::TcpStream;
 
     // The mock C records the hello it received and emits one OpenDataLeg.
     #[derive(Clone, Default)]
     struct MockC {
         received_hello: Arc<Mutex<Option<ControlHello>>>,
+        received_key: Arc<Mutex<Option<String>>>,
     }
 
     async fn mock_c_handler(
         ws: WebSocketUpgrade,
+        headers: axum::http::HeaderMap,
         axum::extract::State(state): axum::extract::State<MockC>,
     ) -> impl IntoResponse {
+        *state.received_key.lock() = headers
+            .get(remote_host_protocol::REMOTE_API_KEY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         ws.on_upgrade(move |socket| run_mock_c(socket, state))
     }
 
@@ -324,17 +269,16 @@ mod tests {
             let _ = axum::serve(listener, app.into_make_service()).await;
         });
 
-        // A dials the control WS (ws:// for the test; production wss:// adds TLS).
-        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // A dials the control WS through the production dialer (ws:// for the
+        // test; the dialer's TLS/proxy paths are covered in `dial::tests`).
         let url = format!("ws://127.0.0.1:{port}/control");
         let hello = ControlHello {
             relay_node_id: "node-1".into(),
         };
         let (tx, mut rx) = mpsc::channel(4);
-        let client =
-            tokio::spawn(
-                async move { run_control_connection(&url, stream, &hello, tx, true).await },
-            );
+        let client = tokio::spawn(async move {
+            connect_control(&RelayDialer::direct(), &url, "inst-A", &hello, tx, true).await
+        });
 
         // A receives the OpenDataLeg signal C pushed.
         let sig = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
@@ -349,7 +293,8 @@ mod tests {
             },
         );
 
-        // C received A's hello (relay_node_id + instance key).
+        // C received A's admission key on the dial and its hello after.
+        assert_eq!(mock.received_key.lock().as_deref(), Some("inst-A"));
         assert_eq!(
             *mock.received_hello.lock(),
             Some(ControlHello {

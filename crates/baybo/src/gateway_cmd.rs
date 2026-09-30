@@ -613,6 +613,9 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root().to_path_buf(),
         )),
+        relay_dialer: baybo_gateway::relay::dial::RelayDialer::new(boot::proxy_settings(
+            &graph.config,
+        )),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

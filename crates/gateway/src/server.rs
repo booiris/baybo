@@ -137,6 +137,9 @@ pub struct GatewayDeps {
     /// files (an agent's `SOUL.md`, its skills folder) through the same
     /// source of truth as the runtime.
     pub workspace_paths: Arc<baybo_workspace::WorkspacePaths>,
+    /// Dials the relay's control connection and data legs through the egress
+    /// proxy with system trust roots.
+    pub relay_dialer: crate::relay::dial::RelayDialer,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -313,9 +316,9 @@ impl GatewayServer {
 /// Holds an outbound A→C control link so a phone can reach this (possibly NAT'd)
 /// gateway for chat via the relay. The manager self-gates on the approved device
 /// row (idle until one is paired), reading the relay URL + admission key from it —
-/// there is no `relay` config block. It installs its own rustls CryptoProvider (it
-/// owns the wss dial). Spawned alongside the other gateway managers so it rides the
-/// same `ShutdownSignal` + task tracker and is drained on shutdown.
+/// there is no `relay` config block. It dials through [`GatewayDeps::relay_dialer`].
+/// Spawned alongside the other gateway managers so it rides the same
+/// `ShutdownSignal` + task tracker and is drained on shutdown.
 pub fn spawn_relay_content(
     deps: &GatewayDeps,
     shutdown: ShutdownSignal,

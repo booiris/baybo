@@ -22,19 +22,15 @@ use baybo_store::DeviceStatus;
 use rand::RngExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::api_tunnel::run_api_tunnel_over_relay;
 use super::device_content::run_content_over_relay;
 use super::state::{LegDedup, WsChannelState};
-use remote_host_protocol::REMOTE_API_KEY_HEADER;
 use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::LegClass;
 
 use crate::relay::{
-    ControlCloseFrame, ControlHello, ControlSignal, connect_control, control_error_detail,
-    load_or_create_relay_node_id, ws_error_detail,
+    ControlCloseFrame, ControlHello, ControlSignal, connect_control, load_or_create_relay_node_id,
 };
 
 /// Mean backoff between control-connection (re)dials. The actual wait is
@@ -216,12 +212,22 @@ async fn approved_relay_settings(
 /// paired; stops when `shutdown` fires, tearing down the live control connection
 /// and any in-flight content data legs (no detached, un-drained child tasks).
 pub(crate) fn spawn(state: WsChannelState, shutdown: ShutdownSignal) -> JoinHandle<()> {
-    // The control connection dials `wss://` via tokio-tungstenite, which uses
-    // rustls's process-default CryptoProvider. Our graph enables both aws-lc-rs
-    // and ring, so install aws-lc-rs explicitly before the first dial or
-    // connect_async panics. Idempotent — Err means one is already installed.
+    // Our graph enables both aws-lc-rs and ring, so rustls can't pick a
+    // process-default CryptoProvider on its own; pin aws-lc-rs for any code that
+    // builds a rustls config from the default. (reqwest, and so the relay dialer,
+    // picks its provider when its client is built and doesn't depend on this.)
+    // Idempotent — Err means one is already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    tracing::debug!("relay-content: control manager started");
+    tracing::info!(
+        egress = %state.relay_dialer.describe(),
+        "relay-content: control manager started"
+    );
+    if let Err(e) = state.relay_dialer.ready() {
+        tracing::error!(
+            error = %e,
+            "relay-content: relay dials will fail until the proxy / trust-store setting is fixed"
+        );
+    }
     tokio::spawn(run(state, shutdown))
 }
 
@@ -408,7 +414,18 @@ async fn run_once(
         };
         let control_url = control_url.to_owned();
         let remote_api_key = settings.remote_api_key.clone();
-        async move { connect_control(&control_url, &remote_api_key, &hello, tx, healthy_cycle).await }
+        let dialer = state.relay_dialer.clone();
+        async move {
+            connect_control(
+                &dialer,
+                &control_url,
+                &remote_api_key,
+                &hello,
+                tx,
+                healthy_cycle,
+            )
+            .await
+        }
     });
 
     // In-flight content data legs. Tracked (not detached) so they're aborted when
@@ -522,7 +539,7 @@ async fn run_once(
     }
     match outcome {
         Ok(Ok(close)) => Ok(ControlEnd::ClosedByRelay(close)),
-        Ok(Err(e)) => Err(control_error_detail(&e)),
+        Ok(Err(e)) => Err(e.to_string()),
         Err(e) => Err(format!("control task panicked: {e}")),
     }
 }
@@ -544,42 +561,14 @@ async fn open_data_leg(
 ) {
     let started = std::time::Instant::now();
     let url = remote_host_protocol::relay::content_host_url(relay_url, relay_key);
-    let mut req = match url.into_client_request() {
-        Ok(r) => r,
-        // The error stringifies the request URL, which embeds the raw relay_key;
-        // log the sanitized key_tag instead so the credential never reaches a log.
-        Err(_) => {
-            tracing::warn!(
-                class = ?class,
-                relay_key = %key_tag(relay_key),
-                relay = %relay_url,
-                "relay-content: bad data-leg url"
-            );
-            return;
-        }
-    };
-    match remote_api_key.parse() {
-        Ok(v) => {
-            req.headers_mut().insert(REMOTE_API_KEY_HEADER, v);
-        }
+    let ws = match state.relay_dialer.dial(&url, remote_api_key).await {
+        Ok(ws) => ws,
         Err(e) => {
             tracing::warn!(
                 class = ?class,
                 relay_key = %key_tag(relay_key),
+                relay = %relay_url,
                 error = %e,
-                "relay-content: bad remote_api_key header"
-            );
-            return;
-        }
-    }
-    let ws = match connect_async(req).await {
-        Ok((ws, _)) => ws,
-        Err(e) => {
-            tracing::warn!(
-                class = ?class,
-                relay_key = %key_tag(relay_key),
-                relay = %relay_url,
-                error = %ws_error_detail(&e),
                 "relay-content: data-leg connect failed; phone waiting at relay will not be served"
             );
             return;

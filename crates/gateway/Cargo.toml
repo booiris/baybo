@@ -83,20 +83,18 @@ sha2 = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
-# A holds an outbound control WS to the remote host (C); `handshake` is enough
-# (the caller dials TCP/TLS and hands us the stream). `connect` + rustls roots
-# add the outbound `wss://` client the relay-pairing host manager dials.
-tokio-tungstenite = { workspace = true, features = [
-    "connect",
-    "rustls-tls-webpki-roots",
-] }
-# Pin the process-wide rustls CryptoProvider before the relay wss client dials
-# (see GatewayServer::new) — the graph has both aws-lc-rs + ring, so rustls can't
-# auto-select and connect_async would panic.
+# Relay WebSockets are dialed through reqwest (see `relay/dial.rs`) so they
+# share its egress proxy and system trust roots; tungstenite only frames the
+# upgraded stream, so `handshake` is enough.
+tokio-tungstenite = { workspace = true }
+# Pin the process-wide rustls CryptoProvider (see `relay_content::spawn`): the
+# graph has both aws-lc-rs + ring, so rustls can't auto-select one.
 rustls = { workspace = true }
 libc = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { workspace = true }
+# `client-proxy`: the relay dialer asks reqwest's own proxy matcher which targets
+# are proxied (see `relay/dial.rs`).
+hyper-util = { workspace = true, features = ["client-proxy"] }
 http-body-util = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 tower = { workspace = true }
@@ -131,7 +129,10 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-tokio-tungstenite = { workspace = true }
+# `connect` for the e2e harness's mock-app legs (plain ws:// only — no TLS roots).
+tokio-tungstenite = { workspace = true, features = ["connect"] }
+# TLS relay stub for the dialer's trust-root tests.
+tokio-rustls = { workspace = true }
 # Boot a real remote-host relay (C) in-process for the relay-content e2e harness,
 # so the spliced A<->C<->P path is proven across the workspace boundary.
 remote-host-relay = { workspace = true }

@@ -21,6 +21,13 @@
 /// the local gateway and any loopback MCP / CDP endpoint.
 const ALWAYS_DIRECT: &str = "localhost,127.0.0.1,::1";
 
+/// Env vars naming the proxy for a TLS (`https` / `wss`) target, most specific
+/// group first, each group in the spellings curl and reqwest accept.
+const TLS_PROXY_ENV: [[&str; 2]; 2] = [["HTTPS_PROXY", "https_proxy"], ["ALL_PROXY", "all_proxy"]];
+
+/// Env vars carrying the operator's no-proxy list (comma-separated).
+const NO_PROXY_ENV: [&str; 2] = ["NO_PROXY", "no_proxy"];
+
 /// Runtime proxy configuration. Cheap to clone (two small strings). The
 /// `url` may embed `user:pass@` credentials, so `Debug` redacts them — never
 /// log the raw URL.
@@ -35,10 +42,44 @@ pub struct ProxySettings {
 }
 
 impl ProxySettings {
+    /// The ambient proxy for a TLS (`https` / `wss`) target, read through `get`
+    /// (production passes `std::env::var`): `HTTPS_PROXY`, else `ALL_PROXY`, with
+    /// `NO_PROXY` as the extra no-proxy list. For callers that need the proxy as
+    /// a value — to name the route in logs and errors, or to decide per target
+    /// whether it is proxied — instead of leaving reqwest to read the env
+    /// implicitly. The operator's `proxy` block, when set, takes precedence.
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        // Within a group the first variable that is SET wins, even when empty —
+        // the precedence reqwest (hyper-util) applies to every other client.
+        let first_set = |group: &[&str]| {
+            group
+                .iter()
+                .find_map(|k| get(k))
+                .filter(|v| !v.trim().is_empty())
+        };
+        let url = TLS_PROXY_ENV.iter().find_map(|group| first_set(group))?;
+        let no_proxy = first_set(&NO_PROXY_ENV).map(|list| {
+            list.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+        Some(Self {
+            url: url.trim().to_string(),
+            no_proxy,
+        })
+    }
+
+    /// The proxy URL with any `user:pass@` replaced by `[REDACTED]` — the only
+    /// form of the URL that may reach a log line or an error message.
+    pub fn display_url(&self) -> String {
+        redact_credentials(&self.url)
+    }
+
     /// Effective no-proxy list as the single comma-separated string reqwest's
     /// `NoProxy` and the `NO_PROXY` env var both expect: loopback first, then
     /// any operator additions (blank entries dropped).
-    fn no_proxy_list(&self) -> String {
+    pub fn no_proxy_list(&self) -> String {
         let extra: Vec<&str> = self
             .no_proxy
             .iter()
@@ -115,14 +156,12 @@ fn redact_credentials(url: &str) -> String {
         Some((s, r)) => (Some(s), r),
         None => (None, url),
     };
-    // Userinfo, if present, lives before the first '/' and ends at the last
-    // '@' in that segment.
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let redacted_rest = match authority.rsplit_once('@') {
-        Some((_creds, host)) => {
-            let tail = &rest[authority.len()..];
-            format!("[REDACTED]@{host}{tail}")
-        }
+    // Userinfo ends at the LAST '@' before any query/fragment, not at the first
+    // '/': a pasted token-style password may carry an unencoded '/', and a proxy
+    // URL has no meaningful path to protect.
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let redacted_rest = match rest[..end].rfind('@') {
+        Some(at) => format!("[REDACTED]@{}", &rest[at + 1..]),
         None => rest.to_string(),
     };
     match scheme {
@@ -214,6 +253,80 @@ mod tests {
         assert!(!shown.contains("alice"), "creds leaked: {shown}");
         assert!(shown.contains("[REDACTED]@proxy.host:1080"), "got: {shown}");
         assert!(shown.contains("socks5://"), "scheme dropped: {shown}");
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn from_env_is_none_without_a_tls_proxy_var() {
+        assert_eq!(ProxySettings::from_env(env_of(&[])), None);
+        // A plain-http-only proxy doesn't apply to a TLS target.
+        assert_eq!(
+            ProxySettings::from_env(env_of(&[("HTTP_PROXY", "http://p:3128")])),
+            None
+        );
+        assert_eq!(
+            ProxySettings::from_env(env_of(&[("HTTPS_PROXY", "  ")])),
+            None
+        );
+        // A set-but-empty upper-case spelling shadows the lower-case one.
+        assert_eq!(
+            ProxySettings::from_env(env_of(&[
+                ("HTTPS_PROXY", ""),
+                ("https_proxy", "http://p:3128")
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn from_env_prefers_https_proxy_over_all_proxy() {
+        let p = ProxySettings::from_env(env_of(&[
+            ("ALL_PROXY", "socks5h://s:1080"),
+            ("https_proxy", "http://h:3128"),
+        ]))
+        .expect("proxy");
+        assert_eq!(p.url, "http://h:3128");
+
+        let p =
+            ProxySettings::from_env(env_of(&[("all_proxy", "socks5h://s:1080")])).expect("proxy");
+        assert_eq!(p.url, "socks5h://s:1080");
+    }
+
+    #[test]
+    fn from_env_carries_no_proxy_and_keeps_loopback_direct() {
+        let p = ProxySettings::from_env(env_of(&[
+            ("HTTPS_PROXY", "http://h:3128"),
+            ("no_proxy", " .corp.example, ,10.0.0.0/8 "),
+        ]))
+        .expect("proxy");
+        assert_eq!(
+            p.no_proxy,
+            Some(vec![".corp.example".to_string(), "10.0.0.0/8".to_string()])
+        );
+        assert_eq!(
+            p.no_proxy_list(),
+            format!("{ALWAYS_DIRECT},.corp.example,10.0.0.0/8")
+        );
+    }
+
+    #[test]
+    fn display_url_redacts_credentials() {
+        let p = settings("http://alice:s3cret@proxy.host:3128", None);
+        assert_eq!(p.display_url(), "http://[REDACTED]@proxy.host:3128");
+        let p = settings("socks5h://proxy.host:1080", None);
+        assert_eq!(p.display_url(), "socks5h://proxy.host:1080");
+        // A '/' inside the password must not end the userinfo early.
+        let p = settings("http://alice:pa/ss@proxy.host:3128", None);
+        assert_eq!(p.display_url(), "http://[REDACTED]@proxy.host:3128");
+        let p = settings("alice:pa/ss@proxy.host:3128", None);
+        assert_eq!(p.display_url(), "[REDACTED]@proxy.host:3128");
     }
 
     #[test]
