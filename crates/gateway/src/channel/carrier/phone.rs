@@ -1,7 +1,7 @@
 //! The phone's end of a direct carrier, as the carrier runtime's tests and the
 //! relay E2E drive it: a probe socket with its QUIC client endpoint, and
 //! sessions opened with `DirectOpen`, Noise IK and its confirmation over a
-//! QUIC stream or a TCP connection. Also the bounded waits those tests share.
+//! QUIC stream. Also the bounded waits those tests share.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -18,8 +18,6 @@ use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, wr
 use remote_host_protocol::relay::{DirectOpen, DirectToken, LegClass};
 use snow::TransportState;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 
 /// How long one step of a carrier test may take before the test fails.
@@ -127,17 +125,6 @@ impl PhoneKeys<'_> {
         self.open_session(send, recv, token, class).await
     }
 
-    /// Opens a session of `class` on a new TCP connection to `address`.
-    pub(crate) async fn tcp_session(
-        self,
-        address: SocketAddr,
-        token: &DirectToken,
-        class: LegClass,
-    ) -> TcpSession {
-        let (read, write) = TcpStream::connect(address).await.unwrap().into_split();
-        self.open_session(write, read, token, class).await
-    }
-
     async fn open_session<W, R>(
         self,
         mut send: W,
@@ -201,7 +188,6 @@ pub(crate) struct PhoneSession<W, R> {
 }
 
 pub(crate) type QuicSession = PhoneSession<quinn::SendStream, quinn::RecvStream>;
-pub(crate) type TcpSession = PhoneSession<OwnedWriteHalf, OwnedReadHalf>;
 
 impl<W, R> PhoneSession<W, R>
 where

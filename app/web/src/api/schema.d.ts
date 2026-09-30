@@ -3039,7 +3039,7 @@ export interface components {
          * @description What a leg rides on: C's relay splice or one of the direct carriers.
          * @enum {string}
          */
-        LinkCarrier: "relay" | "lan" | "ipv6" | "ipv4" | "ipv4_punched" | "tcp";
+        LinkCarrier: "relay" | "lan" | "ipv6" | "ipv4" | "ipv4_punched";
         /**
          * @description A leg's class, as the leg announced it.
          * @enum {string}

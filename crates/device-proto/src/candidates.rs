@@ -15,8 +15,8 @@
 //!   associated data binds the relay node id, and for an answer also the punch
 //!   id.
 //! - The plaintext is `u16be(len) ‖ msgpack(body) ‖ zero padding` to one fixed
-//!   length per message kind, so the ciphertext length reveals neither the
-//!   candidate count nor whether A offers TCP.
+//!   length per message kind, so the ciphertext length does not reveal the
+//!   candidate count.
 //! - P's punch datagrams carry `HMAC-SHA256(k_punch, offer_id ‖ u16be(seq))`
 //!   truncated to [`PUNCH_TAG_LEN`]. P mints them and A only verifies them, so
 //!   A's own punches never carry a valid tag.
@@ -36,9 +36,8 @@ use hkdf::Hkdf;
 use hmac::digest::OutputSizeUser;
 use hmac::{Hmac, Mac};
 use remote_host_protocol::relay::{
-    DirectToken, MAX_SEALED_CANDIDATES_BYTES, MAX_TCP_CANDIDATES, MAX_UDP_HOST_CANDIDATES,
-    PUNCH_TAG_LEN, PunchId, PunchTag, SEALED_ANSWER_PLAINTEXT_LEN, SEALED_OFFER_PLAINTEXT_LEN,
-    SealedCandidates,
+    DirectToken, MAX_SEALED_CANDIDATES_BYTES, MAX_UDP_HOST_CANDIDATES, PUNCH_TAG_LEN, PunchId,
+    PunchTag, SEALED_ANSWER_PLAINTEXT_LEN, SEALED_OFFER_PLAINTEXT_LEN, SealedCandidates,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
@@ -69,7 +68,6 @@ const ANSWER_AAD_DOMAIN: &[u8] = b"baybo/direct/answer/v1";
 
 const BODY_LEN_PREFIX_LEN: usize = size_of::<u16>();
 const UDP_LIST: &str = "udp";
-const TCP_LIST: &str = "tcp";
 /// Whether [`BASE64`] pads, which [`sealed_wire_len`] must know at compile time.
 const BASE64_PADDED: bool = true;
 
@@ -176,16 +174,12 @@ pub struct GatewayAnswer {
     pub quic_cert_sha256: CertHash,
     /// A's host candidates on its stable sockets.
     pub udp: Vec<SocketAddr>,
-    /// Empty unless `gateway.direct_tcp` is configured.
-    #[serde(default)]
-    pub tcp: Vec<SocketAddr>,
 }
 
 impl GatewayAnswer {
     fn check(&self) -> Result<(), CandidateRejection> {
         check_version(self.v)?;
-        check_count(UDP_LIST, self.udp.len(), MAX_UDP_HOST_CANDIDATES)?;
-        check_count(TCP_LIST, self.tcp.len(), MAX_TCP_CANDIDATES)
+        check_count(UDP_LIST, self.udp.len(), MAX_UDP_HOST_CANDIDATES)
     }
 }
 
@@ -574,9 +568,9 @@ mod tests {
 
     const NODE: &str = "node-1";
     const WIDEST_OFFER_BODY_LEN: usize = 402;
-    const WIDEST_ANSWER_BODY_LEN: usize = 702;
+    const WIDEST_ANSWER_BODY_LEN: usize = 525;
     const SEALED_OFFER_WIRE_LEN: usize = 736;
-    const SEALED_ANSWER_WIRE_LEN: usize = 1420;
+    const SEALED_ANSWER_WIRE_LEN: usize = 908;
 
     struct Pair {
         device: DeviceSealer,
@@ -612,7 +606,7 @@ mod tests {
         vec![v6([0xff; 16], u16::MAX); count]
     }
 
-    fn answer(offer_id: OfferId, udp: Vec<SocketAddr>, tcp: Vec<SocketAddr>) -> GatewayAnswer {
+    fn answer(offer_id: OfferId, udp: Vec<SocketAddr>) -> GatewayAnswer {
         GatewayAnswer {
             v: CANDIDATE_SET_VERSION,
             issued_at_ms: 1_700_000_000_000,
@@ -620,7 +614,6 @@ mod tests {
             token: DirectToken::generate(),
             quic_cert_sha256: CertHash::of_certificate(b"certificate"),
             udp,
-            tcp,
         }
     }
 
@@ -640,7 +633,6 @@ mod tests {
             ..answer(
                 OfferId([0xff; OFFER_ID_LEN]),
                 widest(MAX_UDP_HOST_CANDIDATES),
-                widest(MAX_TCP_CANDIDATES),
             )
         }
     }
@@ -692,7 +684,6 @@ mod tests {
         let sent = answer(
             offer_id,
             vec![v4([10, 0, 1, 2], 5000), v6([0x20; 16], 5001)],
-            vec![v4([203, 0, 113, 7], 443)],
         );
         let sealed = gateway.seal_answer(NODE, &punch_id(1), &sent).unwrap();
         let opened = device
@@ -717,7 +708,7 @@ mod tests {
             Err(ProtoError::Aead { .. })
         ));
 
-        let sent = answer(offer.offer_id, vec![], vec![]);
+        let sent = answer(offer.offer_id, vec![]);
         let answer_under_p2a = seal_body(
             &device.keys.p2a,
             &answer_aad(NODE, &punch_id(1)),
@@ -741,7 +732,7 @@ mod tests {
             CandidateRejection::CiphertextLength { .. }
         ));
 
-        let sent = answer(offer.offer_id, vec![], vec![]);
+        let sent = answer(offer.offer_id, vec![]);
         let sealed_answer = gateway.seal_answer(NODE, &punch_id(1), &sent).unwrap();
         assert!(matches!(
             rejection(gateway.open_offer(NODE, &sealed_answer)),
@@ -759,7 +750,7 @@ mod tests {
             Err(ProtoError::Aead { .. })
         ));
 
-        let sent = answer(offer.offer_id, vec![], vec![]);
+        let sent = answer(offer.offer_id, vec![]);
         let sealed_answer = gateway.seal_answer(NODE, &punch_id(1), &sent).unwrap();
         assert!(matches!(
             device.open_answer("node-2", &punch_id(1), &offer.offer_id, &sealed_answer),
@@ -835,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_lengths_hide_the_candidate_count_and_tcp() {
+    fn sealed_lengths_hide_the_candidate_count() {
         let Pair { device, gateway } = pair();
         let empty = device
             .seal_offer(NODE, &DeviceOffer::new(0, vec![]))
@@ -844,23 +835,14 @@ mod tests {
         assert_eq!(empty.n.len(), full.n.len());
         assert_eq!(empty.enc.len(), full.enc.len());
 
-        let offer_id = OfferId::generate();
-        let without_tcp = gateway
-            .seal_answer(
-                NODE,
-                &punch_id(1),
-                &answer(offer_id, widest(MAX_UDP_HOST_CANDIDATES), vec![]),
-            )
-            .unwrap();
-        let with_tcp = gateway
+        let full = gateway
             .seal_answer(NODE, &punch_id(1), &widest_answer())
             .unwrap();
         let bare = gateway
-            .seal_answer(NODE, &punch_id(1), &answer(offer_id, vec![], vec![]))
+            .seal_answer(NODE, &punch_id(1), &answer(OfferId::generate(), vec![]))
             .unwrap();
-        assert_eq!(without_tcp.enc.len(), with_tcp.enc.len());
-        assert_eq!(bare.enc.len(), with_tcp.enc.len());
-        assert_eq!(bare.n.len(), with_tcp.n.len());
+        assert_eq!(bare.enc.len(), full.enc.len());
+        assert_eq!(bare.n.len(), full.n.len());
     }
 
     #[test]
@@ -955,13 +937,10 @@ mod tests {
             CandidateRejection::Count { list: UDP_LIST, .. }
         ));
 
-        let over = GatewayAnswer {
-            tcp: widest(MAX_TCP_CANDIDATES + 1),
-            ..answer(over.offer_id, vec![], vec![])
-        };
+        let over = answer(over.offer_id, widest(MAX_UDP_HOST_CANDIDATES + 1));
         assert!(matches!(
             rejection(gateway.seal_answer(NODE, &punch_id(1), &over)),
-            CandidateRejection::Count { list: TCP_LIST, .. }
+            CandidateRejection::Count { list: UDP_LIST, .. }
         ));
         let smuggled = seal_body(
             &gateway.keys.a2p,
@@ -972,7 +951,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             rejection(device.open_answer(NODE, &punch_id(1), &over.offer_id, &smuggled)),
-            CandidateRejection::Count { list: TCP_LIST, .. }
+            CandidateRejection::Count { list: UDP_LIST, .. }
         ));
     }
 
@@ -1080,7 +1059,7 @@ mod tests {
     #[test]
     fn an_answer_that_does_not_echo_the_offer_id_is_refused() {
         let Pair { device, gateway } = pair();
-        let sent = answer(OfferId::generate(), vec![], vec![]);
+        let sent = answer(OfferId::generate(), vec![]);
         let sealed = gateway.seal_answer(NODE, &punch_id(1), &sent).unwrap();
         assert_eq!(
             rejection(device.open_answer(NODE, &punch_id(1), &OfferId::generate(), &sealed)),

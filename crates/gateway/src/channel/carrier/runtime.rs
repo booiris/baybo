@@ -15,8 +15,8 @@ use device_proto::candidates::{
 use futures::future::join_all;
 use parking_lot::Mutex;
 use remote_host_protocol::relay::{
-    AddressPolicy, ControlReport, DIRECT_PROTOCOL_VERSION, DirectCapability, DirectToken,
-    MAX_TCP_CANDIDATES, PunchId, SealedCandidates, UdpRendezvous,
+    AddressPolicy, ControlReport, DIRECT_PROTOCOL_VERSION, DirectCapability, DirectToken, PunchId,
+    SealedCandidates, UdpRendezvous,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use super::error::CarrierBindingError;
-use super::gather::{Unoffered, advertised_candidates, gather, is_candidate, punch_pairs};
+use super::gather::{gather, is_candidate, punch_pairs};
 use super::interfaces;
 use super::offer::{ACCEPTED, Decline, OfferGate};
 use super::probe::{
@@ -36,16 +36,14 @@ use super::quic::{
     CARRIER_REVOKED, CARRIER_REVOKED_REASON, ConnectionSlots, FIRST_STREAM_DEADLINE, IncomingCounts,
 };
 use super::session::DIRECT_OPEN_DEADLINE;
-use super::tcp::{TcpAdmission, TcpFamily};
 use super::udp::{BoundSocket, UdpFamily, supervise};
 use crate::channel::state::WsChannelState;
 use crate::config::RuntimeCarrierConfig;
 use crate::device::load_or_create_static_keypair;
 
-/// The wait before a family whose bind failed is bound again, UDP or TCP,
-/// and before a broken TCP listener is; also the spacing of retries after a
-/// UDP family's persistent receive errors (its first rebind is immediate)
-/// and the pause of a TCP listener out of resources.
+/// The wait before a family whose bind failed is bound again; also the
+/// spacing of retries after a family's persistent receive errors (its first
+/// rebind is immediate).
 pub(crate) const REBIND_DELAY: Duration = Duration::from_secs(2);
 /// How long a stopping runtime waits for its closed QUIC endpoints to drain
 /// and for quinn to release their sockets. It covers the 3×PTO drain of a
@@ -165,14 +163,12 @@ pub(crate) struct RuntimeContext {
     pub(crate) punches: Mutex<PunchTable>,
     pub(crate) connections: Arc<ConnectionSlots>,
     pub(crate) incoming: IncomingCounts,
-    pub(crate) tcp: Arc<TcpAdmission>,
 }
 
 /// A binding's carrier runtime. It is inactive, with nothing bound and no
-/// capability, when the binding has no candidate keys, nothing is configured
-/// or no QUIC certificate can be generated, or when the QUIC server
-/// configuration cannot be built and no TCP listener is configured. A
-/// configured family whose bind fails keeps it active.
+/// capability, when the binding has no candidate keys, nothing is configured,
+/// or no QUIC certificate or server configuration can be built. A configured
+/// family whose bind fails keeps it active.
 pub(crate) struct CarrierRuntime {
     active: Option<ActiveRuntime>,
 }
@@ -183,17 +179,12 @@ struct ActiveRuntime {
     cert_hash: CertHash,
     /// The process's, shared with every other runtime of it.
     gate: OfferGate,
-    /// Each UDP and TCP family is supervised for the runtime's life: one
-    /// whose bind fails is bound again, so it stays here unbound until then.
+    /// Each family is supervised for the runtime's life: one whose bind
+    /// fails is bound again, so it stays here unbound until then.
     udp: Vec<Arc<UdpFamily>>,
-    tcp: Vec<Arc<TcpFamily>>,
-    /// The `gateway.direct_tcp.advertised_addresses` A offers while a
-    /// listener is bound ([`advertised_candidates`]).
-    advertised: Vec<SocketAddr>,
     /// Every task the runtime spawns. Each ends when `cancel` fires, a
-    /// family's task only after the connections, streams or TCP sessions
-    /// under it have ended, so stopping drops every session before any
-    /// endpoint closes.
+    /// family's task only after the connections and streams under it have
+    /// ended, so stopping drops every session before any endpoint closes.
     tasks: JoinSet<()>,
     cancel: CancellationToken,
 }
@@ -235,10 +226,10 @@ impl CarrierRuntime {
         }
     }
 
-    /// Binds the configured UDP sockets, one QUIC endpoint on each, and the
-    /// configured TCP listeners, and starts serving them. A family whose
-    /// first bind fails, UDP or TCP, is bound again every [`REBIND_DELAY`]
-    /// until it succeeds. With no family served, the runtime is inactive.
+    /// Binds the configured UDP sockets, one QUIC endpoint on each, and
+    /// starts serving them. A family whose first bind fails is bound again
+    /// every [`REBIND_DELAY`] until it succeeds. With no family served, the
+    /// runtime is inactive.
     /// The certificate and the offer gate are the process's.
     pub(crate) fn bind(
         config: &RuntimeCarrierConfig,
@@ -270,45 +261,12 @@ impl CarrierRuntime {
             punches: Mutex::new(PunchTable::default()),
             connections: Arc::new(ConnectionSlots::default()),
             incoming: IncomingCounts::default(),
-            tcp: Arc::new(TcpAdmission::default()),
         });
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
         let udp = bind_udp(&config.udp_binds(), identity, &context, &cancel, &mut tasks);
-        let tcp: Vec<Arc<TcpFamily>> = config
-            .tcp_binds()
-            .into_iter()
-            .map(|bind| {
-                let (family, listener) = TcpFamily::bind(bind);
-                tasks.spawn(super::tcp::serve(
-                    Arc::clone(&family),
-                    listener,
-                    Arc::clone(&context),
-                    cancel.clone(),
-                ));
-                family
-            })
-            .collect();
-        if udp.is_empty() && tcp.is_empty() {
+        if udp.is_empty() {
             return Self::inactive();
-        }
-        let configured = config
-            .tcp
-            .as_ref()
-            .map_or(&[][..], |tcp| &tcp.advertised_addresses[..]);
-        let (advertised, unoffered) = advertised_candidates(configured, &context.policy);
-        for (index, reason) in unoffered {
-            match reason {
-                Unoffered::NotACandidate => tracing::warn!(
-                    index,
-                    "carrier: a gateway.direct_tcp.advertised_addresses entry has no address class; it is never offered"
-                ),
-                Unoffered::OverCap => tracing::warn!(
-                    index,
-                    cap = MAX_TCP_CANDIDATES,
-                    "carrier: a gateway.direct_tcp.advertised_addresses entry comes after the cap; it is never offered"
-                ),
-            }
         }
         let runtime = ActiveRuntime {
             context,
@@ -316,16 +274,10 @@ impl CarrierRuntime {
             cert_hash: identity.cert_hash(),
             gate: process.offers.clone(),
             udp,
-            tcp,
-            advertised,
             tasks,
             cancel,
         };
-        tracing::debug!(
-            udp = ?runtime.bound_addresses(),
-            tcp = ?runtime.listening(),
-            "carrier: runtime started"
-        );
+        tracing::debug!(udp = ?runtime.bound_addresses(), "carrier: runtime started");
         Self {
             active: Some(runtime),
         }
@@ -390,8 +342,8 @@ impl CarrierRuntime {
     }
 
     /// Ends every task first, each QUIC session dropped before its
-    /// connection closes with `CARRIER_REVOKED` and each TCP session with its
-    /// listener, then closes each endpoint and waits, bounded by
+    /// connection closes with `CARRIER_REVOKED`, then closes each endpoint
+    /// and waits, bounded by
     /// [`CARRIER_DRAIN_GRACE`], until every UDP socket is closed.
     pub(crate) async fn stop(self) {
         let Some(runtime) = self.active else {
@@ -439,14 +391,6 @@ impl ActiveRuntime {
             .collect()
     }
 
-    /// The addresses the TCP listeners accept on, while bound.
-    fn listening(&self) -> Vec<SocketAddr> {
-        self.tcp
-            .iter()
-            .filter_map(|family| family.local_addr())
-            .collect()
-    }
-
     /// Spawns a task that ends when `cancel` fires, and reaps finished ones.
     fn spawn_cancellable(
         &mut self,
@@ -468,8 +412,7 @@ impl ActiveRuntime {
         register: Option<UdpRendezvous>,
     ) -> Result<SealedCandidates, Decline> {
         let bound = self.bound();
-        let listening = self.listening();
-        if bound.is_empty() && listening.is_empty() {
+        if bound.is_empty() {
             return Err(Decline::Unbound);
         }
         let context = Arc::clone(&self.context);
@@ -492,21 +435,14 @@ impl ActiveRuntime {
         })?;
 
         let local: Vec<SocketAddr> = bound.iter().map(|socket| socket.local_addr).collect();
-        let own = gather(
-            &local,
-            &listening,
-            &self.advertised,
-            &context.policy,
-            interfaces::enumerate,
-        );
+        let own = gather(&local, &context.policy, interfaces::enumerate);
         let answer = GatewayAnswer {
             v: CANDIDATE_SET_VERSION,
             issued_at_ms: now_ms,
             offer_id: offer.offer_id,
             token: context.token.clone(),
             quic_cert_sha256: self.cert_hash,
-            udp: own.udp.clone(),
-            tcp: own.tcp,
+            udp: own.clone(),
         };
         let sealed_answer = context
             .sealer
@@ -539,7 +475,7 @@ impl ActiveRuntime {
         );
 
         let punches: Vec<PunchTarget> =
-            punch_pairs(&own.udp, &targets, &context.policy, MAX_HOST_PUNCH_PAIRS)
+            punch_pairs(&own, &targets, &context.policy, MAX_HOST_PUNCH_PAIRS)
                 .into_iter()
                 .filter_map(|pair| {
                     let socket = bound

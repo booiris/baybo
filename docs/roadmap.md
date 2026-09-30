@@ -96,7 +96,7 @@ Beyond those recorded gaps, planned work — all *todo*:
 
 - **NAT hole punching (direct carriers)** — *in progress*. A paired phone and its
   gateway move their traffic off the relay onto a direct carrier (QUIC over UDP on
-  a LAN, IPv6, public or hole-punched IPv4 address, or opt-in TCP) whenever the
+  a LAN, IPv6, public or hole-punched IPv4 address) whenever the
   network allows, with the relay as the baseline that always works. The protocol,
   the remote-host's `POST /direct` and per-punch UDP rendezvous, and the gateway's
   carrier runtime are built; the app side (the prober, the carriers and idle chat

@@ -45,10 +45,6 @@ device-proto = { workspace = true }
 # gateway already uses.
 carrier = { workspace = true }
 quinn = { workspace = true }
-# The opt-in TCP carrier's IPv6 listener is IPv6-only, which tokio's
-# listener cannot set; `all` adds the keepalive probe count and
-# TCP_USER_TIMEOUT its sessions set.
-socket2 = { workspace = true, features = ["all"] }
 remote-host-protocol = { workspace = true }
 baybo-turn = { workspace = true }
 baybo-llm = { workspace = true }

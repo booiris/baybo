@@ -477,7 +477,7 @@ never displaces the live chat leg.
 
 [`direct-carriers.md`](direct-carriers.md) lets a relay binding's legs leave C's
 data path: while its legs ride the relay, P probes in the background for a direct
-carrier, QUIC over UDP or TCP straight to A. The gateway and C implement it; the app does
+carrier, QUIC over UDP straight to A. The gateway and C implement it; the app does
 not probe yet, so until it does every leg rides the relay.
 
 Relevant code:
@@ -1134,7 +1134,7 @@ With direct carriers, C also cannot:
   token. C learns a host candidate only when it is also that side's relay
   connection source address, which it sees anyway: for example the GUA P posts
   from, or the address of a gateway without NAT. It cannot learn how many
-  candidates either side has, or whether A offers TCP.
+  candidates either side has.
 - Tamper with candidate sets. It cannot inject, alter or drop an individual host
   candidate: any tampering fails the AEAD, and the whole set is rejected.
 - Point either side at a private address. Both sides require the rendezvous and
@@ -1166,7 +1166,7 @@ With direct carriers, C also cannot:
 - When a device is revoked, A's relay-content manager observes the absence of an
   approved device row and tears down the control connection, so A stops
   advertising the `relay_node_id`. The same poll ends the binding's scope, which
-  stops its carrier runtime: every direct-carrier session, QUIC or TCP, closes
+  stops its carrier runtime: every direct-carrier session closes
   and its in-flight requests are dropped.
 - `/register` is sent only by A (it holds the gateway push signing key the binding
   is authenticated with); P cannot register directly, and never holds push

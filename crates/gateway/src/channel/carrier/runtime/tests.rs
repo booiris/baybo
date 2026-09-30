@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
@@ -21,8 +21,7 @@ use remote_host_protocol::relay::{
     DirectOpen, LegClass, PUNCH_TAG_LEN, ProbeDatagram, PunchRole, PunchTag, RENDEZVOUS_TICKET_LEN,
     RendezvousTicket,
 };
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -30,17 +29,15 @@ use tokio::time::timeout;
 use super::*;
 use crate::channel::device_content::{BinarySink, BinarySource, run_content_session};
 use crate::channel::state::LegDedup;
-use crate::config::{FamilyBinds, RuntimeDirectTcpConfig};
+use crate::config::FamilyBinds;
 use crate::device::load_or_create_static_keypair;
 use crate::test_support::{TestGateway, build_test_deps};
 
 use super::super::offer::{MAX_REPLAY_ENTRIES, OFFER_MAX_AGE};
 use super::super::phone::{
-    Phone, PhoneKeys, QUIET, QuicSession, STEP, TcpSession, close_code, ipv6_loopback_available,
-    until,
+    Phone, PhoneKeys, QUIET, QuicSession, STEP, close_code, ipv6_loopback_available, until,
 };
 use super::super::quic::{CARRIER_UNAUTHENTICATED, MAX_QUIC_CONNECTIONS_PER_SOURCE};
-use super::super::tcp::MAX_TCP_PREAUTH_PER_SOURCE;
 use super::super::udp::REBIND_AFTER_RECV_ERRORS;
 
 const NODE_ID: &str = "node-1";
@@ -62,33 +59,11 @@ fn udp_only(ipv4: Option<&str>, ipv6: Option<&str>) -> RuntimeCarrierConfig {
             ipv4: ipv4.map(|bind| bind.parse().unwrap()),
             ipv6: ipv6.map(|bind| bind.parse().unwrap()),
         }),
-        tcp: None,
     }
 }
 
 fn loopback() -> RuntimeCarrierConfig {
     udp_only(Some(LOOPBACK), None)
-}
-
-/// A TCP listener on `bind` and, when given, a UDP socket on `udp`.
-fn with_tcp(udp: Option<&str>, bind: &str, advertised: Vec<SocketAddr>) -> RuntimeCarrierConfig {
-    RuntimeCarrierConfig {
-        udp: udp.map(|udp| FamilyBinds {
-            ipv4: Some(udp.parse().unwrap()),
-            ipv6: None,
-        }),
-        tcp: Some(RuntimeDirectTcpConfig {
-            binds: FamilyBinds {
-                ipv4: Some(bind.parse().unwrap()),
-                ipv6: None,
-            },
-            advertised_addresses: advertised,
-        }),
-    }
-}
-
-fn tcp_only() -> RuntimeCarrierConfig {
-    with_tcp(None, LOOPBACK, Vec::new())
 }
 
 fn socket(address: &str) -> SocketAddr {
@@ -107,14 +82,6 @@ fn port_is_held(address: SocketAddr) -> bool {
     }
 }
 
-fn tcp_port_is_held(address: SocketAddr) -> bool {
-    match StdTcpListener::bind(address) {
-        Ok(_) => false,
-        Err(error) if error.kind() == ErrorKind::AddrInUse => true,
-        Err(error) => panic!("probe listen on {address}: {error}"),
-    }
-}
-
 fn active(runtime: &CarrierRuntime) -> &ActiveRuntime {
     runtime.active.as_ref().expect("an active runtime")
 }
@@ -125,14 +92,6 @@ fn context(runtime: &CarrierRuntime) -> &RuntimeContext {
 
 fn udp_address(runtime: &CarrierRuntime) -> SocketAddr {
     active(runtime).bound_addresses()[0]
-}
-
-fn tcp_address(runtime: &CarrierRuntime) -> SocketAddr {
-    active(runtime).listening()[0]
-}
-
-fn tcp_admission(runtime: &CarrierRuntime) -> &TcpAdmission {
-    &context(runtime).tcp
 }
 
 fn bound_socket(runtime: &CarrierRuntime) -> BoundSocket {
@@ -289,18 +248,6 @@ impl Pairing {
         self.keys().session(connection, token, class).await
     }
 
-    async fn tcp_session(
-        &self,
-        address: SocketAddr,
-        token: &DirectToken,
-        class: LegClass,
-    ) -> TcpSession {
-        self.keys().tcp_session(address, token, class).await
-    }
-
-    /// What an observer of one carrier session's first frames holds: its
-    /// Noise msg1 and its handshake confirmation, made against the gateway's
-    /// static key in memory, so no session of the runtime authenticated.
     async fn observed_handshake(&self) -> (Vec<u8>, Vec<u8>) {
         let gateway = load_or_create_static_keypair(&self.state.secret_vault)
             .await
@@ -591,10 +538,7 @@ async fn one_certificate_serves_every_runtime_of_the_process() {
 #[tokio::test]
 async fn a_runtime_with_no_carrier_configured_binds_nothing_and_advertises_nothing() {
     let pairing = Pairing::new().await;
-    let nothing = RuntimeCarrierConfig {
-        udp: None,
-        tcp: None,
-    };
+    let nothing = RuntimeCarrierConfig { udp: None };
     for config in [nothing, udp_only(None, None)] {
         let mut process = CarrierProcess::new();
         let runtime = CarrierRuntime::start(
@@ -616,39 +560,6 @@ async fn a_runtime_with_no_carrier_configured_binds_nothing_and_advertises_nothi
             "no certificate with nothing to bind"
         );
     }
-}
-
-#[tokio::test]
-async fn a_tcp_only_runtime_listens_and_advertises_without_udp_until_stopped() {
-    let pairing = Pairing::new().await;
-    let mut process = CarrierProcess::new();
-    let mut runtime = pairing
-        .runtime_with(&tcp_only(), &mut process, CarrierTiming::PRODUCTION)
-        .await;
-    assert_eq!(
-        runtime.capability(),
-        Some(DirectCapability {
-            version: DIRECT_PROTOCOL_VERSION,
-            udp: false,
-        })
-    );
-    assert!(active(&runtime).bound_addresses().is_empty());
-    let listening = tcp_address(&runtime);
-    assert!(tcp_port_is_held(listening));
-
-    let (answer, _, _) = pairing.answered(&mut runtime, Vec::new(), None);
-    assert!(answer.udp.is_empty());
-    assert_eq!(answer.tcp, vec![listening]);
-    assert!(
-        Some(answer.quic_cert_sha256) == process.identity().map(ServerIdentity::cert_hash),
-        "every answer carries the process's certificate"
-    );
-
-    runtime.stop().await;
-    assert!(
-        !tcp_port_is_held(listening),
-        "stop returns once the listener is closed"
-    );
 }
 
 #[tokio::test]
@@ -767,24 +678,6 @@ async fn an_accepted_offer_is_answered_with_the_token_certificate_and_candidates
         "the loopback socket's own address: {:?}",
         answer.udp
     );
-    assert!(answer.tcp.is_empty(), "no TCP without direct_tcp");
-    runtime.stop().await;
-}
-
-#[tokio::test]
-async fn an_answer_offers_the_advertised_tcp_addresses_then_the_listener() {
-    let pairing = Pairing::new().await;
-    let advertised = vec![socket("198.18.0.5:443"), socket("[fe80::1]:443")];
-    let mut runtime = pairing
-        .runtime(&with_tcp(Some(LOOPBACK), LOOPBACK, advertised))
-        .await;
-    let (answer, _, _) = pairing.answered(&mut runtime, Vec::new(), None);
-    assert_eq!(
-        answer.tcp,
-        vec![socket("198.18.0.5:443"), tcp_address(&runtime)],
-        "an advertised address without a class is never offered"
-    );
-    assert!(answer.udp.contains(&udp_address(&runtime)));
     runtime.stop().await;
 }
 
@@ -1621,9 +1514,7 @@ fn listed(pairing: &Pairing) -> (Vec<ListedLeg>, Option<Result<(), Decline>>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_link_table_lists_each_carrier_leg_by_kind_and_each_offers_outcome() {
     let pairing = Pairing::new().await;
-    let mut runtime = pairing
-        .runtime(&with_tcp(Some(LOOPBACK), LOOPBACK, Vec::new()))
-        .await;
+    let mut runtime = pairing.runtime(&loopback()).await;
     let phone = Phone::bind(socket(LOOPBACK));
     let (sealed, offer_id) = pairing.offer(vec![phone.address()]);
     let punch_id = PunchId::generate();
@@ -1644,8 +1535,8 @@ async fn the_link_table_lists_each_carrier_leg_by_kind_and_each_offers_outcome()
     let quic_chat = pairing
         .session(&connection, &answer.token, LegClass::Chat)
         .await;
-    let tcp_api = pairing
-        .tcp_session(tcp_address(&runtime), &answer.token, LegClass::Api)
+    let quic_api = pairing
+        .session(&connection, &answer.token, LegClass::Api)
         .await;
     until("both carrier legs are listed", || {
         listed(&pairing).0.len() == 2
@@ -1656,7 +1547,7 @@ async fn the_link_table_lists_each_carrier_leg_by_kind_and_each_offers_outcome()
     assert_eq!(
         legs,
         [
-            (LegClass::Api, Some(CarrierKind::Tcp)),
+            (LegClass::Api, Some(CarrierKind::Ipv4)),
             (LegClass::Chat, Some(CarrierKind::Ipv4)),
         ],
         "a loopback QUIC pair is public IPv4 on both ends under the test policy"
@@ -1669,7 +1560,7 @@ async fn the_link_table_lists_each_carrier_leg_by_kind_and_each_offers_outcome()
     );
     assert_eq!(listed(&pairing).1, Some(Err(Decline::Replayed)));
 
-    drop((quic_chat, tcp_api));
+    drop((quic_chat, quic_api));
     until("ended legs leave the table", || {
         listed(&pairing).0.is_empty()
     })
@@ -1709,24 +1600,75 @@ async fn a_quic_leg_on_a_wildcard_socket_takes_its_kind_from_the_address_the_pho
     runtime.stop().await;
 }
 
-/// Whether the gateway closes `stream`, without sending anything, within
-/// [`STEP`].
-async fn closed_by_gateway(stream: &mut TcpStream) -> bool {
-    let mut byte = [0u8; 1];
-    match timeout(STEP, stream.read(&mut byte)).await {
-        Ok(Ok(0)) => true,
-        Ok(Err(error)) => error.kind() == ErrorKind::ConnectionReset,
-        Ok(Ok(_)) | Err(_) => false,
-    }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_carrier_handshake_never_displaces_the_live_chat_leg() {
+    let pairing = Pairing::new().await;
+    let mut runtime = pairing.runtime(&loopback()).await;
+    let phone = Phone::bind(socket(LOOPBACK));
+    let (answer, _, _) = pairing.answered(&mut runtime, vec![phone.address()], None);
+    let connection = phone
+        .connect(answer.quic_cert_sha256, udp_address(&runtime))
+        .await;
+    // An authenticated stream first, so the replay's failure does not close
+    // the connection the genuine chat leg then opens on.
+    let _api = pairing
+        .session(&connection, &answer.token, LegClass::Api)
+        .await;
+    let (mut live, _live_writer) = relay_chat_leg(&pairing).await;
+    let (msg1, confirmation) = pairing.observed_handshake().await;
+
+    let (mut send, recv) = connection.open_bi().await.unwrap();
+    let mut frames = FrameReader::new(recv);
+    write_direct_open(
+        &mut send,
+        &DirectOpen {
+            token: answer.token.clone(),
+            class: LegClass::Chat,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(&mut send, &msg1).await.unwrap();
+    timeout(STEP, frames.next_frame())
+        .await
+        .expect("the gateway answers a replayed msg1")
+        .unwrap()
+        .expect("handshake message 2");
+    write_frame(&mut send, &confirmation).await.unwrap();
+    let after_confirmation = timeout(STEP, frames.next_frame())
+        .await
+        .expect("the gateway ends the replay");
+    assert!(
+        !matches!(after_confirmation, Ok(Some(_))),
+        "the replay is closed without another frame"
+    );
+    assert!(
+        timeout(QUIET, &mut live).await.is_err(),
+        "the live chat leg is not displaced"
+    );
+
+    let _chat = pairing
+        .session(&connection, &answer.token, LegClass::Chat)
+        .await;
+    let displaced = timeout(STEP, live).await.expect("the relay leg ends");
+    assert!(
+        displaced.unwrap_err().is_cancelled(),
+        "a confirmed carrier chat leg does displace it"
+    );
+    runtime.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tcp_session_runs_the_tunnel_on_its_devices_permit_once_noise_completes() {
+async fn a_quic_api_session_runs_the_tunnel() {
     let pairing = Pairing::new().await;
-    let mut runtime = pairing.runtime(&tcp_only()).await;
-    let (answer, _, _) = pairing.answered(&mut runtime, Vec::new(), None);
+    let mut runtime = pairing.runtime(&loopback()).await;
+    let phone = Phone::bind(socket(LOOPBACK));
+    let (answer, _, _) = pairing.answered(&mut runtime, vec![phone.address()], None);
+    let connection = phone
+        .connect(answer.quic_cert_sha256, udp_address(&runtime))
+        .await;
     let mut session = pairing
-        .tcp_session(tcp_address(&runtime), &answer.token, LegClass::Api)
+        .session(&connection, &answer.token, LegClass::Api)
         .await;
     session
         .send_tunnel(&TunnelRequest::Head {
@@ -1743,247 +1685,5 @@ async fn a_tcp_session_runs_the_tunnel_on_its_devices_permit_once_noise_complete
         } => assert_eq!((request_id, status), (1, 200)),
         other => panic!("expected a response head, got {other:?}"),
     }
-    let admission = tcp_admission(&runtime);
-    assert_eq!(
-        admission.preauth_held(),
-        0,
-        "Noise released the pre-authentication permit"
-    );
-    assert_eq!(admission.sessions_held(&pairing.device_id), 1);
-
-    drop(session);
-    until("the ended session releases its device permit", || {
-        tcp_admission(&runtime).sessions_held(&pairing.device_id) == 0
-    })
-    .await;
     runtime.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wrong_token_or_a_silent_preface_closes_a_tcp_connection_and_frees_its_permit() {
-    let pairing = Pairing::new().await;
-    let timing = CarrierTiming {
-        direct_open_deadline: SHORT_DEADLINE,
-        ..CarrierTiming::PRODUCTION
-    };
-    let runtime = pairing
-        .runtime_with(&tcp_only(), &mut CarrierProcess::new(), timing)
-        .await;
-    let address = tcp_address(&runtime);
-
-    let mut wrong = TcpStream::connect(address).await.unwrap();
-    write_direct_open(
-        &mut wrong,
-        &DirectOpen {
-            token: DirectToken::generate(),
-            class: LegClass::Chat,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        closed_by_gateway(&mut wrong).await,
-        "a wrong token is refused before Noise"
-    );
-    let mut silent = TcpStream::connect(address).await.unwrap();
-    assert!(
-        closed_by_gateway(&mut silent).await,
-        "a silent connection is closed at the preface deadline"
-    );
-    until("both permits are released", || {
-        tcp_admission(&runtime).preauth_held() == 0
-    })
-    .await;
-    runtime.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unknown_tcp_source_is_capped_until_a_punch_makes_it_known() {
-    let pairing = Pairing::new().await;
-    let timing = CarrierTiming {
-        direct_open_deadline: STALLED_PREFACE_DEADLINE,
-        ..CarrierTiming::PRODUCTION
-    };
-    let mut runtime = pairing
-        .runtime_with(&tcp_only(), &mut CarrierProcess::new(), timing)
-        .await;
-    let address = tcp_address(&runtime);
-    let mut idle = Vec::new();
-    for held in 1..=MAX_TCP_PREAUTH_PER_SOURCE {
-        idle.push(TcpStream::connect(address).await.unwrap());
-        until("the connection holds a permit", || {
-            tcp_admission(&runtime).preauth_held() == held
-        })
-        .await;
-    }
-    let mut refused = TcpStream::connect(address).await.unwrap();
-    assert!(
-        closed_by_gateway(&mut refused).await,
-        "an unknown source past its cap is closed unread"
-    );
-    assert_eq!(
-        tcp_admission(&runtime).preauth_held(),
-        MAX_TCP_PREAUTH_PER_SOURCE
-    );
-
-    pairing.answered(&mut runtime, vec![socket("127.0.0.1:40000")], None);
-    idle.push(TcpStream::connect(address).await.unwrap());
-    until(
-        "a source in the allowed set passes the per-source cap",
-        || tcp_admission(&runtime).preauth_held() == MAX_TCP_PREAUTH_PER_SOURCE + 1,
-    )
-    .await;
-    runtime.stop().await;
-    for mut stream in idle {
-        assert!(
-            closed_by_gateway(&mut stream).await,
-            "stop closes connections still before their preface"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tcp_listener_that_fails_to_bind_is_bound_again_after_the_rebind_delay() {
-    let pairing = Pairing::new().await;
-    let occupied = StdTcpListener::bind(LOOPBACK).unwrap();
-    let address = occupied.local_addr().unwrap();
-    let timing = CarrierTiming {
-        rebind_delay: TEST_REBIND_DELAY,
-        ..CarrierTiming::PRODUCTION
-    };
-    let mut runtime = pairing
-        .runtime_with(
-            &with_tcp(None, &address.to_string(), Vec::new()),
-            &mut CarrierProcess::new(),
-            timing,
-        )
-        .await;
-    assert_eq!(
-        runtime.capability(),
-        Some(DirectCapability {
-            version: DIRECT_PROTOCOL_VERSION,
-            udp: false,
-        }),
-        "the first hello names the family it keeps binding, so C routes its offers once it binds"
-    );
-    let (sealed, _) = pairing.offer(Vec::new());
-    let punch_id = PunchId::generate();
-    assert_eq!(
-        runtime.handle_offer(punch_id, sealed, None),
-        ControlReport::DirectDeclined { punch_id },
-        "declined:unbound"
-    );
-
-    drop(occupied);
-    until("the listener is bound again", || {
-        active(&runtime).listening() == vec![address]
-    })
-    .await;
-    let (answer, _, _) = pairing.answered(&mut runtime, Vec::new(), None);
-    assert_eq!(answer.tcp, vec![address]);
-    runtime.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_replayed_tcp_handshake_never_authenticates_or_displaces_the_live_chat_leg() {
-    let pairing = Pairing::new().await;
-    let mut runtime = pairing.runtime(&tcp_only()).await;
-    let (answer, _, _) = pairing.answered(&mut runtime, Vec::new(), None);
-    let listening = tcp_address(&runtime);
-    let (mut live, _live_writer) = relay_chat_leg(&pairing).await;
-    let (msg1, confirmation) = pairing.observed_handshake().await;
-
-    let (read, mut write) = TcpStream::connect(listening).await.unwrap().into_split();
-    let mut frames = FrameReader::new(read);
-    write_direct_open(
-        &mut write,
-        &DirectOpen {
-            token: answer.token.clone(),
-            class: LegClass::Chat,
-        },
-    )
-    .await
-    .unwrap();
-    write_frame(&mut write, &msg1).await.unwrap();
-    timeout(STEP, frames.next_frame())
-        .await
-        .expect("the gateway answers a replayed msg1")
-        .unwrap()
-        .expect("handshake message 2");
-    write_frame(&mut write, &confirmation).await.unwrap();
-    let after_confirmation = timeout(STEP, frames.next_frame())
-        .await
-        .expect("the gateway ends the replay");
-    assert!(
-        !matches!(after_confirmation, Ok(Some(_))),
-        "the replay is closed without another frame"
-    );
-
-    let admission = tcp_admission(&runtime);
-    until("the replay's permit is released", || {
-        admission.preauth_held() == 0
-    })
-    .await;
-    assert_eq!(
-        admission.sessions_held(&pairing.device_id),
-        0,
-        "no device permit"
-    );
-    assert!(
-        !admission.knows(listening.ip()),
-        "the replay's source is not remembered"
-    );
-    assert!(
-        timeout(QUIET, &mut live).await.is_err(),
-        "the live chat leg is not displaced"
-    );
-
-    let _chat = pairing
-        .tcp_session(listening, &answer.token, LegClass::Chat)
-        .await;
-    let displaced = timeout(STEP, live).await.expect("the relay leg ends");
-    assert!(
-        displaced.unwrap_err().is_cancelled(),
-        "a confirmed TCP chat leg does displace it"
-    );
-    assert!(tcp_admission(&runtime).knows(listening.ip()));
-    runtime.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stopping_a_binding_closes_its_active_tcp_sessions_even_mid_request() {
-    let uploads = Arc::new(WatchedUploads::default());
-    let pairing = Pairing::new()
-        .await
-        .storing_blobs_in(Arc::clone(&uploads) as Arc<dyn BlobStore>);
-    let mut runtime = pairing.runtime(&tcp_only()).await;
-    let (answer, _, _) = pairing.answered(&mut runtime, Vec::new(), None);
-    let listening = tcp_address(&runtime);
-    let mut chat = pairing
-        .tcp_session(listening, &answer.token, LegClass::Chat)
-        .await;
-    let mut upload = pairing
-        .tcp_session(listening, &answer.token, LegClass::Api)
-        .await;
-    upload.send_tunnel(&parked_upload()).await;
-    until("the upload handler reads the body", || {
-        uploads.entered.load(Ordering::SeqCst)
-    })
-    .await;
-
-    timeout(STEP, runtime.stop())
-        .await
-        .expect("stop does not wait for the parked request");
-    assert!(
-        uploads.ended.load(Ordering::SeqCst),
-        "the handler is gone when stop returns"
-    );
-    assert!(
-        !uploads.body_ended.load(Ordering::SeqCst),
-        "the handler never reads the cut-off body as a complete one"
-    );
-    assert!(uploads.blobs.is_empty());
-    assert!(!tcp_port_is_held(listening), "the listener is closed");
-    chat.ended().await;
-    upload.ended().await;
 }

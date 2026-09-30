@@ -247,7 +247,7 @@ relay stays the baseline that always works.
 
 Post-pairing content may bypass the relay on a **direct carrier**
 ([`direct-carriers.md`](direct-carriers.md)): QUIC over UDP to a LAN, IPv6,
-public or hole-punched IPv4 address, or TCP when the gateway opts in. The phone
+public or hole-punched IPv4 address. The phone
 finds one with a background probe: it posts a sealed candidate offer to C
 (`POST /direct/{relay_node_id}`), C forwards it over the gateway's control
 connection and, when it runs a UDP rendezvous, lets both sides learn each
@@ -443,8 +443,8 @@ real `remote-host` relay in-process to drive both paths through it:
 responder + a mock app) and `real_relay_pairs_gateway_and_mock_app` (the real
 XXpsk0 pairing entry + a mock app landing an approved row). Its direct-carrier
 cases run the gateway's real relay-content manager against that C and its UDP
-rendezvous, with a mock phone that offers, punches and connects over QUIC or
-TCP (see [direct-carriers.md](direct-carriers.md), *Testing*). The AEAD interop is
+rendezvous, with a mock phone that offers, punches and connects over QUIC (see
+[direct-carriers.md](direct-carriers.md), *Testing*). The AEAD interop is
 pinned by `device_proto::fixtures` +
 `app/ios/Tests/NotificationServiceTests.swift`.
 

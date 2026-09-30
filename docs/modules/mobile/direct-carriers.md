@@ -14,10 +14,7 @@
 
 Paths cited with a line number point into this tree. PR1 changes nothing under `app/ios` but its lockfile, so every `app/ios` citation describes the app as PR2 finds it. Everything about P is planned: a statement marked (PR2), a constant whose *Where* is P, and an `app/ios` path that does not exist yet all describe PR2. A statement marked (PR1) describes code PR1 changed or added. The *Delivery plan* lists both PRs.
 
-A paired phone (P) reaches its gateway (A) through the operator's blind WSS relay (C), even when both sit on the same Wi-Fi. This design keeps that relay as the baseline that always works, and adds **direct carriers**:
-
-- QUIC over UDP, on a LAN address, an IPv6 address, a public IPv4 address or a hole-punched IPv4 mapping;
-- TCP, opt-in on the gateway.
+A paired phone (P) reaches its gateway (A) through the operator's blind WSS relay (C), even when both sit on the same Wi-Fi. This design keeps that relay as the baseline that always works, and adds **direct carriers**: QUIC over UDP, on a LAN address, an IPv6 address, a public IPv4 address or a hole-punched IPv4 mapping.
 
 P and A find a direct carrier through an ICE-lite candidate exchange signalled through C. The candidate lists are sealed end to end, with keys derived from the static keys the two endpoints learned at pairing. Every leg dials the relay first. A background probe then moves new API and blob legs onto a direct carrier once one is found, and the chat leg follows only when no turn is in flight. Every carrier session opens with a `DirectOpen` preface and then runs the same Noise IK handshake as a relay leg, so C's position for content is unchanged. The change is in metadata: C now observes IPv4 NAT mappings and learns that a direct attempt happened.
 
@@ -34,7 +31,7 @@ P and A find a direct carrier through an ICE-lite candidate exchange signalled t
 
 Everything this document calls *direct* belongs to a **relay binding**, meaning a device paired through C:
 
-- The wire and config names keep the `direct` prefix: `/direct/{relay_node_id}`, `ControlSignal::DirectOffer`, `gateway.direct_udp`, `gateway.direct_tcp`.
+- The wire and config names keep the `direct` prefix: `/direct/{relay_node_id}`, `ControlSignal::DirectOffer`, `gateway.direct_udp`.
 - The code lives under `carrier` names (`crates/carrier`, `crates/gateway/src/channel/carrier/`, and in PR2 `app/ios/ffi/src/relay/carrier/`), so it never sits next to `app/ios/ffi/src/direct/`.
 - In prose, a leg on a direct carrier is a **carrier leg**, and its authenticated stream or connection is a **carrier session**.
 
@@ -60,10 +57,10 @@ Everything this document calls *direct* belongs to a **relay binding**, meaning 
 | Term | Meaning |
 |---|---|
 | **A / C / P** | The gateway / the operator's remote host / the phone, as in [`companion.md`](companion.md#roles). |
-| **Carrier** | The transport that legs ride on. The **relay carrier** is C's WSS splice (`/content/join` ↔ `/content/host`). A **direct carrier** is one QUIC connection between P and A, or one proven TCP address. |
+| **Carrier** | The transport that legs ride on. The **relay carrier** is C's WSS splice (`/content/join` ↔ `/content/host`). A **direct carrier** is one QUIC connection between P and A. |
 | **Candidate** | An address at which a side can be reached. A **host candidate** is an interface address that the side reports about itself: private IPv4, IPv6 ULA, IPv6 GUA, or a public IPv4 address on an interface (a host with no NAT). A **server-reflexive (srflx) candidate** is a side's public IPv4 mapping as observed by C's UDP rendezvous. |
-| **Carrier session** | One authenticated leg on a direct carrier: a QUIC bidirectional stream, or a TCP connection, opened with `DirectOpen` and then Noise IK, which P confirms. It runs exactly the relay leg's content responder (Chat) or API tunnel (Api/Blob). |
-| **Probe** | One background attempt by P to find a direct carrier. It consists of one `POST /direct`, a candidate exchange, an optional punch, concurrent QUIC connects, a TCP fallback, and a proof leg. |
+| **Carrier session** | One authenticated leg on a direct carrier: a QUIC bidirectional stream opened with `DirectOpen` and then Noise IK, which P confirms. It runs exactly the relay leg's content responder (Chat) or API tunnel (Api/Blob). |
+| **Probe** | One background attempt by P to find a direct carrier. It consists of one `POST /direct`, a candidate exchange, an optional punch, concurrent QUIC connects, and a proof leg. |
 | **Punch** | The per-probe state at C and A, named by a `PunchId` that C mints. It covers UDP registration, the `Peer` exchange and the punch datagrams. P's punch datagrams carry a tag only P and A can compute (**authenticated punches**). |
 | **Upgrade** | New Api/Blob legs dial on the live direct carrier instead of the relay. |
 | **Rotation** | The supervisor moves the live chat leg onto the direct carrier. This happens **only when the chat leg is idle.** |
@@ -83,7 +80,6 @@ Everything this document calls *direct* belongs to a **relay binding**, meaning 
                  │ P  phone        │ ═══ QUIC / UDP ═══════════════ │ A  gateway      │
                  │ one UDP socket  │   LAN v4 · ULA · v6 GUA ·      │ one UDP socket  │
                  │ per family      │   public v4 · v4 srflx         │ per family      │
-                 │                 │ ─── TCP (only if A opts in) ── │ TCP listeners   │
                  └─────────────────┘                                └─────────────────┘
   every carrier session:  DirectOpen{token, class} ▸ Noise IK (pairing statics) + P's confirmation ▸
                           run_content_session (Chat) | run_tunnel_session (Api, Blob)
@@ -97,7 +93,6 @@ The ranking below has two uses. It sets the order in which a probe prefers finis
 | 2 | `Ipv6` | QUIC to a GUA host candidate; both stateful firewalls are opened by outbound traffic | no |
 | 3 | `Ipv4` | QUIC to a public IPv4 host candidate | no |
 | 4 | `Ipv4Punched` | QUIC to A's srflx mapping after a punch | yes |
-| 5 | `Tcp` | TCP to a host candidate or to one of A's `advertised_addresses` | no |
 | — | `Relay` | WSS via C | — |
 
 **What C sees**, relative to [`relay-push-security.md`](relay-push-security.md#protected-assets):
@@ -109,7 +104,7 @@ The ranking below has two uses. It sets the order in which a probe prefers finis
 | That a direct attempt happened, and its timing and outcome at C | no | **yes** |
 | Host candidates and the direct token | — | **no**: they are sealed. A host candidate that is also that side's HTTPS/WSS source address (for example the GUA P posts from, or the address of a gateway without NAT) is visible only as that source, as it was without direct carriers |
 | A's QUIC certificate | — | not sent to C; C can fetch it by naming its own address as P's srflx (see *Security*), which grants nothing |
-| How many candidates each side has, and whether A offers TCP | — | **no**: each sealed message kind has one fixed plaintext length |
+| How many candidates each side has | — | **no**: each sealed message kind has one fixed plaintext length |
 | Lengths and timing of traffic on a direct carrier | — | **no**: the carrier bypasses C |
 
 ## Candidates
@@ -157,15 +152,13 @@ Neither side needs a port-forward rule, and a stateful firewall on either side i
 
 ### Gathering
 
-**A** enumerates its interface addresses once per accepted offer. It does so only while at least one direct socket or listener is bound, so a gateway with direct carriers disabled never walks its interfaces.
+**A** enumerates its interface addresses once per accepted offer. It does so only while at least one direct socket is bound, so a gateway with direct carriers disabled never walks its interfaces.
 
 - It reads addresses and interface flags through `getifaddrs`, and each IPv6 address's own flags from `/proc/net/if_inet6` on Linux and through `SIOCGIFAFLAG_IN6` on macOS. It skips IPv6 addresses flagged temporary, deprecated, tentative or duplicate (DAD failed), and an IPv6 address whose flags it cannot read. A failed enumeration reads as no address, so the answer carries no host candidate.
 - It keeps addresses on UP+RUNNING interfaces whose class is `Lan` or `Public`.
 - It skips interfaces whose names start with one of `VIRTUAL_INTERFACE_PREFIXES`: container bridges and veths (`docker`, `br-`, `veth`, `virbr`, `cni`, `lxc`) and VPN tunnels (`tailscale`, `wg`, `tun`, `utun`, `zt`).
 - It keeps at most one GUA per /64 and at most `MAX_GATEWAY_GUAS` GUAs, `MAX_GATEWAY_ULAS` ULAs and `MAX_GATEWAY_IPV4_HOSTS` IPv4 addresses, ranked ULA/private < GUA < public IPv4.
 - Each address is paired with the port of that family's stable socket.
-- TCP candidates, present only with `gateway.direct_tcp` and only while a listener is bound, are the configured `advertised_addresses` that have a class, then the addresses a bound listener covers, ranked and capped like the UDP ones, with the listener's port. They are capped at `MAX_TCP_CANDIDATES` in all; the operator named the advertised ones, so the cap never drops one of them for a host address. An advertised address without a class, or one after `MAX_TCP_CANDIDATES` distinct advertised addresses, is never offered, and the runtime warns about it, by index, when it starts. `advertised_candidates` in `gather.rs` is the one home of that rule.
-- One enumeration per offer serves both lists.
 
 **P** gathers from the primary interface of the currently satisfied `NWPath`:
 
@@ -206,7 +199,7 @@ Each side has its own sealer type in `crates/device-proto/src/candidates.rs` (PR
 
 **Plaintext.** The plaintext is `u16be(len) ‖ msgpack(body) ‖ zero padding` to **one fixed length per message kind**: `SEALED_OFFER_PLAINTEXT_LEN` for offers and `SEALED_ANSWER_PLAINTEXT_LEN` for answers.
 
-- Each length holds the largest body the caps allow (every candidate IPv6, and a full `tcp` list), so the ciphertext length reveals neither the candidate count nor whether A offers TCP. At their longest encodings those bodies are 402 and 702 bytes. Once base64-encoded, the two sealed kinds are 736 and 1420 bytes. A test pins all four figures. Compile-time asserts, which count the base64 length with `base64::encoded_len`, keep both kinds within `MAX_SEALED_CANDIDATES_BYTES`.
+- Each length holds the largest body the caps allow (every candidate IPv6), so the ciphertext length does not reveal the candidate count. At their longest encodings those bodies are 402 and 525 bytes. Once base64-encoded, the two sealed kinds are 736 and 908 bytes. A test pins all four figures. Compile-time asserts, which count the base64 length with `base64::encoded_len`, keep both kinds within `MAX_SEALED_CANDIDATES_BYTES`.
 - The body is msgpack with named fields. It is sized first and then encoded straight into the zeroed fixed-length buffer, so no growable copy of it exists.
 - `seal` checks the version and the caps, and fails if a body does not fit. `open` rejects a ciphertext of any other length before the AEAD. After the AEAD it rejects a declared length that overruns the plaintext, padding that is not zero, and a body whose msgpack value does not end exactly at the declared length.
 - Fixed-size byte fields are encoded with `serde_bytes`, so their encoded length does not depend on their values.
@@ -248,8 +241,6 @@ pub struct GatewayAnswer {
     pub token: DirectToken,          // DirectOpen gate; minted per binding runtime
     pub quic_cert_sha256: CertHash,  // 32 bytes (serde_bytes): P pins A's per-process QUIC certificate
     pub udp: Vec<SocketAddr>,        // A's host candidates on its stable sockets
-    #[serde(default)]
-    pub tcp: Vec<SocketAddr>,        // empty unless gateway.direct_tcp
 }
 ```
 
@@ -277,7 +268,7 @@ An *authenticated* entry whose address class is excluded is dropped individually
 
 ### Capability gating
 
-- **A's hello.** (PR1) `ControlHello` carries `direct: Option<DirectCapability>`. A sends it whenever its carrier runtime is active, that is, serves at least one family: a configured UDP family, or a configured TCP family, whether or not its first bind succeeded. The capability names the families the runtime serves, not what is bound at that instant, so it is the same in every hello of a binding scope and never goes stale while a family is being bound again (a family still retrying its first bind, or a UDP rebind after persistent receive errors): an offer that arrives meanwhile is declined as `unbound`, or answered without that family's candidates. `udp: true` means A serves an IPv4 UDP family and will register on demand.
+- **A's hello.** (PR1) `ControlHello` carries `direct: Option<DirectCapability>`. A sends it whenever its carrier runtime is active, that is, serves at least one configured UDP family, whether or not its first bind succeeded. The capability names the families the runtime serves, not what is bound at that instant, so it is the same in every hello of a binding scope and never goes stale while a family is being bound again (a family still retrying its first bind, or a rebind after persistent receive errors): an offer that arrives meanwhile is declined as `unbound`, or answered without that family's candidates. `udp: true` means A serves an IPv4 UDP family and will register on demand.
 - **How C decodes it.** C closes control on an unparseable hello (`remote-host/crates/relay/src/serve.rs:759-772`), so the capability field is decoded **leniently**: any decode failure yields `None` and is logged once. A malformed capability must not cost the gateway its relay.
 - **Unknown versions.** An unknown `version` is treated as not direct-capable, and control stays up. `ControlHello::supported_direct()` is that predicate: the capability, when it is present and of `DIRECT_PROTOCOL_VERSION`.
 - **What C sends.** C sends `DirectOffer` only to a control connection whose hello carried a supported capability. A gateway without direct carriers therefore never receives it. If one ever did, it would warn and skip the frame, as every gateway does with a control signal it cannot parse (`crates/gateway/src/relay/mod.rs:260-268`).
@@ -311,7 +302,7 @@ An *authenticated* entry whose address class is excluded is dropped individually
    - `Peer{punch_id, srflx}`, carrying the other role's latched mapping, once both roles are observed;
    - `Registered{punch_id}` before that.
 10. **Both sides check `Peer` and punch.** Each side accepts `Peer` only when it comes from the resolved rendezvous address, carries its own `punch_id`, and names a `Public` IPv4 address. Each side **latches the first valid `Peer` per punch**: an identical later one is ignored, and one naming a different address is dropped and logged (`peer_conflict`). A adds the srflx IP to the allowed set for the rest of `PUNCH_TTL`. Both sides then punch the srflx (`PUNCH_BURST` at `PUNCH_INTERVAL`), and P starts a QUIC connect to A's srflx. P's own punches and retransmitted Initials open P's NAT, and A's punches open A's NAT.
-11. **P picks a winner.** When the first QUIC handshake completes, P waits up to `TIER_GRACE` for a better-ranked attempt still in flight. It keeps the best one and closes the rest. If no QUIC handshake has completed within `QUIC_PHASE_BUDGET`, or every QUIC attempt has already errored, and the answer carries `tcp` candidates, P dials them concurrently (LAN before IPv6 before IPv4), each connect bounded by `DIRECT_LEG_DIAL_TIMEOUT`. QUIC attempts still in flight keep running, and the ranking still applies. The probe ends at `PROBE_BUDGET`.
+11. **P picks a winner.** When the first QUIC handshake completes, P waits up to `TIER_GRACE` for a better-ranked attempt still in flight. It keeps the best one and closes the rest. The probe ends on the relay when no QUIC handshake has completed within `PROBE_BUDGET`, or every QUIC attempt has already errored.
 12. **P proves the carrier.** P opens one session on the winning carrier (`DirectOpen{token, class: Api}`, then Noise IK and its confirmation). A successful handshake proves the carrier, and the resulting API leg is parked in the leg pool. Only then does the carrier become live on P.
 
 ```
@@ -337,7 +328,7 @@ P                                    C                                    A
 
 - **Configuration.** `crates/carrier` builds both sides' configuration: `server_config(&ServerIdentity, provider)` for A and `client_config(pinned: CertHash, provider)` for P. Each side passes in its own rustls `CryptoProvider`; the crate names none.
 - **ALPN.** Both sides set `DIRECT_QUIC_ALPN`.
-- **Certificate.** A's certificate is a per-process `rcgen` self-signed certificate for `DIRECT_QUIC_SERVER_NAME` (`ServerIdentity::generate`, run when the first binding runtime has a socket or listener to bind and kept for the life of the process in its `CarrierProcess`, beside the offer replay cache; A seals `ServerIdentity::cert_hash` into every answer, a TCP-only runtime's included, since `GatewayAnswer` always carries one). P's `ServerCertVerifier`:
+- **Certificate.** A's certificate is a per-process `rcgen` self-signed certificate for `DIRECT_QUIC_SERVER_NAME` (`ServerIdentity::generate`, run when the first binding runtime has a socket to bind and kept for the life of the process in its `CarrierProcess`, beside the offer replay cache; A seals `ServerIdentity::cert_hash` into every answer). P's `ServerCertVerifier`:
   - compares the SHA-256 of the end-entity certificate with `quic_cert_sha256` in constant time (`CertHash::of_certificate` and `CertHash` equality);
   - rejects any intermediates;
   - keeps rustls's `verify_tls13_signature` against the presented certificate;
@@ -345,9 +336,8 @@ P                                    C                                    A
 
   Neither side resumes a TLS session: A sends no session tickets and P disables resumption, so every handshake checks the pin. QUIC's TLS is therefore authenticated and hides the `DirectOpen` token even from an active LAN attacker, but it still grants nothing: **Noise IK is the authentication for every session.**
 - **Transport.** Both sides refuse unidirectional streams and datagrams, and share the keep-alive and idle timeout. A additionally pins its limits (see *Gateway (A)*). P grants A no bidirectional stream either, since A never opens one.
-- **Framing.** A `DirectOpen` is a u32-BE-length-prefixed JSON record capped at `MAX_DIRECT_FRAME_BYTES`, and it is the first thing on every stream or TCP connection. The Noise frames that follow use the same framing. `crates/carrier` owns it: `write_frame` and `write_direct_open`, and a `FrameReader` whose `next_frame` never reads past the frame it assembles and is cancel safe, so a pump can read inside a `select!`. A stream that ends between frames reads as a clean end, and one that ends inside a frame is a truncation. A declared length over the cap is refused before anything is allocated for it, and a malformed preface is refused without echoing its bytes. An error ends the stream: the reader has lost its place, so every later `next_frame` fails with `FrameError::Poisoned`. The frame being assembled may be the preface, so the reader keeps it in `Zeroizing` and its `Debug` prints only lengths.
+- **Framing.** A `DirectOpen` is a u32-BE-length-prefixed JSON record capped at `MAX_DIRECT_FRAME_BYTES`, and it is the first thing on every stream. The Noise frames that follow use the same framing. `crates/carrier` owns it: `write_frame` and `write_direct_open`, and a `FrameReader` whose `next_frame` never reads past the frame it assembles and is cancel safe, so a pump can read inside a `select!`. A stream that ends between frames reads as a clean end, and one that ends inside a frame is a truncation. A declared length over the cap is refused before anything is allocated for it, and a malformed preface is refused without echoing its bytes. An error ends the stream: the reader has lost its place, so every later `next_frame` fails with `FrameError::Poisoned`. The frame being assembled may be the preface, so the reader keeps it in `Zeroizing` and its `Debug` prints only lengths.
 - **Handshake confirmation.** Every carrier session's Noise IK handshake is confirmed: right after P reads msg2, before anything else, it sends one transport message with an empty payload. A counts the session as authenticated (the `authenticated` hook, `LegDedup`, the device's `last_seen`) only once that message decrypts, within the responder's `HANDSHAKE_TIMEOUT` (10 s, `crates/gateway/src/channel/device_content.rs`); a confirmation that does not decrypt, or carries a payload, refuses the session. Noise IK's msg1 carries no replay protection, and the confirmation is encrypted under keys that only the initiator that wrote msg1 holds, so a replayed msg1 gets A's msg2 and nothing more. The seam declares it: carrier sinks set `BinarySink::CONFIRMS_HANDSHAKE`, and the relay leg, whose msg1 crosses only TLS to C, keeps the two-message handshake. C can still replay a relay leg's msg1, so a relay chat leg installs its `LegDedup` only once its first transport message from P decrypts, which a replayed msg1 never produces (see *Dedup*).
-- **TCP.** On TCP the preface and msg1 travel in plaintext, and the token stays valid for the runtime's lifetime. An on-path attacker who reads them can replay both: the token passes the gate and A answers msg1, but without P's confirmation the session never authenticates. A replay therefore holds only a pre-authentication permit, for at most `DIRECT_OPEN_DEADLINE` plus two `HANDSHAKE_TIMEOUT`s and bounded by the pre-authentication caps; it never makes its source known, takes no device permit and displaces no chat leg.
 
 ### Wire types (PR1, `remote-host/crates/protocol/src/relay.rs`)
 
@@ -427,7 +417,7 @@ pub struct DirectOfferResponse {
     pub rendezvous: Option<UdpRendezvous>,
 }
 
-/// First framed record on every direct stream / TCP connection.
+/// First framed record on every direct QUIC stream.
 #[derive(Serialize, Deserialize)]
 pub struct DirectOpen { pub token: DirectToken, pub class: LegClass }
 ```
@@ -460,7 +450,7 @@ The protocol, C, A and carrier values are in the code (PR1), at the place the *W
 
 | Value | Where | Buys | Costs |
 |---|---|---|---|
-| `MAX_UDP_HOST_CANDIDATES = 8`, `MAX_TCP_CANDIDATES = 4` | protocol | Decode caps for either side's sets | P hosts with many GUAs lose the lowest-ranked ones |
+| `MAX_UDP_HOST_CANDIDATES = 8` | protocol | Decode cap for either side's sets | P hosts with many GUAs lose the lowest-ranked ones |
 | `MAX_GATEWAY_GUAS = 2`, `MAX_GATEWAY_ULAS = 1`, `MAX_GATEWAY_IPV4_HOSTS = 2` | A | One stable GUA per /64; room for a private and a public IPv4 address | Hosts with more addresses lose the lowest-ranked ones |
 | `VIRTUAL_INTERFACE_PREFIXES` | A | Container and VPN interfaces are never offered | A carrier over a VPN overlay is not attempted |
 | `SEALED_OFFER_PLAINTEXT_LEN = 512`, `SEALED_ANSWER_PLAINTEXT_LEN = 1024` | protocol | Ciphertext length is constant per kind; each holds the full-cap all-IPv6 body (402 and 702 bytes at worst), pinned by a test | 1.5 KiB of sealed data per probe |
@@ -475,7 +465,7 @@ The protocol, C, A and carrier values are in the code (PR1), at the place the *W
 | `PUNCH_BURST = 5`, `PUNCH_INTERVAL = 200ms` | carrier (`PunchBurst`), used by A and P | Covers the skew between the two `Peer` deliveries; later bursts pass the NAT opened by the earlier ones | See the caps below |
 | `MAX_PUNCH_DATAGRAMS_PER_OFFER = 256`, `MAX_PRFLX_SOURCES_PER_PUNCH = 4` | A | Bounds A's fan-out and what authenticated punches can admit | Lowest-ranked pairs are not punched |
 | `MAX_PUNCH_DATAGRAMS_PER_PROBE = 64` | P | Bounds P's fan-out; one QUIC attempt per remote candidate | — |
-| `PROBE_BUDGET = 10s`, `QUIC_PHASE_BUDGET = 5s`, `TIER_GRACE = 300ms` | P | The whole probe runs in the background; TCP gets the second half; a later LAN success beats an earlier srflx one | None user-visible |
+| `PROBE_BUDGET = 10s`, `TIER_GRACE = 300ms` | P | The whole probe runs in the background; a later LAN success beats an earlier srflx one | None user-visible |
 | `DIRECT_QUIC_KEEP_ALIVE = 10s`, `DIRECT_QUIC_IDLE_TIMEOUT = 45s` | carrier | Keepalive under common UDP NAT timeouts; the idle timeout equals the pump's `INBOUND_LIVENESS_TIMEOUT` (`app/ios/ffi/src/transport/pump.rs:28`), pinned by an ffi test | One small packet every 10 s |
 | `DIRECT_QUIC_ALPN = "baybo-direct/1"`, `DIRECT_QUIC_SERVER_NAME = "baybo-direct"` | carrier | A fixed identity for the self-signed certificate | — |
 | `MAX_DIRECT_FRAME_BYTES = 65535` | carrier | One frame carries one Noise message, whose maximum this is | — |
@@ -483,12 +473,9 @@ The protocol, C, A and carrier values are in the code (PR1), at the place the *W
 | `PROBE_QUEUE_CAPACITY = 256` | carrier | Received probe datagrams wait for their owner in bounded memory | A burst beyond it is dropped, as UDP loss would drop it |
 | `DIRECT_OPEN_DEADLINE = 1s`, `FIRST_STREAM_DEADLINE = 3s` | A | A silent stream or connection cannot hold a slot; the first-stream deadline starts at `Incoming::accept()` and covers the handshake | — |
 | `MAX_QUIC_CONNECTIONS = 8`, `MAX_QUIC_CONNECTIONS_PER_SOURCE = 4`, `MAX_STREAMS_PER_CONNECTION = 32` | A; `MAX_STREAMS_PER_CONNECTION` is in carrier, which pins it in A's `TransportConfig` | One carrier plus the losing probe attempts (≤ 3 per P source); streams cover the app's fan-out | — |
-| `MAX_TCP_PREAUTH = 48`, `MAX_TCP_PREAUTH_PER_SOURCE = 4`, `TCP_PREAUTH_RESERVED = 24`, `MAX_TCP_SESSIONS_PER_DEVICE = 32` | A | Known sources keep 24 pre-auth slots, above the app's burst of 1 chat + 12 concurrent API dials + 3 pooled legs + blob | Unknown sources share 24 slots, 4 per IPv4 address or IPv6 /64 |
-| `MAX_KNOWN_TCP_SOURCES = 8` | A | A carrier's TCP legs stay known after its punch expires; bounded memory, and only the paired device adds entries | A device that authenticated from more than 8 networks in one runtime is unknown on the oldest until it authenticates there again |
 | `REBIND_AFTER_RECV_ERRORS = 6` | A | A receive-error streak this long (about 8 s of backed-off failures, checked every second) is persistent and rebinds the family's socket | The family's QUIC connections close on a rebind |
 | `INCOMING_LOG_INTERVAL = 60s` | A | `quic_incoming` is a counter line, not one line per packet | — |
-| `TCP_KEEPALIVE_INTERVAL = 5s`, `TCP_KEEPALIVE_PROBES = 7` | A | With `DIRECT_QUIC_KEEP_ALIVE`, a TCP session whose peer vanished ends after `DIRECT_QUIC_IDLE_TIMEOUT`, as a QUIC one does (on Linux, `TCP_USER_TIMEOUT` bounds unacknowledged data the same way) | One keepalive probe every 10 s on an idle session |
-| `REBIND_DELAY = 2s`, `CARRIER_DRAIN_GRACE = 4s` | A | A family whose bind failed, UDP or TCP, and a broken listener retry, and a listener out of resources pauses; a stopping runtime waits for its connections to drain and its sockets to close, which covers the 3×PTO drain of a connection closed mid-handshake (about 3 s at quinn's 333 ms initial RTT) | A Reconfigure or shutdown waits up to 4 s while connections drain |
+| `REBIND_DELAY = 2s`, `CARRIER_DRAIN_GRACE = 4s` | A | A family whose bind failed retries; a stopping runtime waits for its connections to drain and its sockets to close, which covers the 3×PTO drain of a connection closed mid-handshake (about 3 s at quinn's 333 ms initial RTT) | A Reconfigure or shutdown waits up to 4 s while connections drain |
 | `SOCKET_RECV_BACKOFF = 250ms · 2ⁿ, max 4s` | protocol (`socket_recv_backoff`), used by C and by carrier's `DemuxSocket` (A and P) | A receive error never tears down the runtime or C's HTTP/WSS | — |
 | `UDP_SOURCE_WARN_INTERVAL = 60s` | C | Source-rewriting deployments stay visible without log floods | — |
 | `DEFAULT_UDP_BIND_ADDR = 0.0.0.0:7777` | C | IPv4 rendezvous by default | — |
@@ -505,7 +492,6 @@ The protocol, C, A and carrier values are in the code (PR1), at the place the *W
 - `RelayDialer::establish` (`app/ios/ffi/src/relay/chat.rs:47`) never consults a carrier. A chat dial always goes to the relay.
 - (PR2) `dial_tunnel_leg` (`app/ios/ffi/src/relay/tunnel.rs:304`, relay-only today) dials on the live direct carrier when it is usable (not suspended, not cooling off), and on the relay otherwise. If a carrier dial fails before Noise completes, or exceeds `DIRECT_LEG_DIAL_TIMEOUT`, P **immediately re-dials that leg on the relay**, then judges the carrier:
   - **QUIC.** P retires the carrier only on connection-level evidence: `Connection::close_reason()` is `Some`, or the connection received no datagram while the dial ran (`Connection::stats().udp_rx`). Any other failure belongs to the stream (A's caps, a slow device lookup): new legs go to the relay for `CARRIER_DIAL_COOLOFF`, and the carrier and a chat leg on it stay up.
-  - **TCP.** Each leg is its own connection, so a connect failure or timeout retires the carrier, and a failure after connect starts the cool-off.
 
 **The prober** lives in `app/ios/ffi/src/relay/carrier/` (PR2). It runs at most one probe per binding at a time, and **nothing waits on it**.
 
@@ -577,12 +563,12 @@ Before the commit point, the rotation is **abandoned** when the carrier dies, th
 
 - **Binding scope (PR1).** `relay_content::run` (`crates/gateway/src/channel/relay_content.rs:278`) resolves `approved_relay_settings` and enters a **binding scope** (`BindingScope`) once per distinct `Ready(settings)`; the scope is left on Reconfigure, TearDown or shutdown. The scope owns the carrier runtime, started before its first control connection. Inside it, `run_binding` is the control redial loop: each iteration runs one control connection (`run_once`) and, after the backoff, re-resolves the settings, so a control redial does not restart the runtime and a control flap keeps carrier sessions up.
 - **Settings identity (PR1).** `RelaySettings` (`relay_content.rs:165`) holds the approved `DeviceRow`'s `device_id`, `device_pubkey`, `auth_token_sha256` and `approved_at` beside `relay_url` and `remote_api_key`. Its equality covers the device identity and credentials, so a re-pair or credential change is a Reconfigure, just like a relay URL change.
-- **Task tree.** Every QUIC stream task, before and after authentication, runs in its connection's `JoinSet`. Every connection task runs in its endpoint's `JoinSet`, under the UDP family's task in the runtime's `JoinSet`, where the punches and the registrations also run. Every TCP session task, before and after authentication, runs in its listener's `JoinSet`, under the TCP family's task in the runtime's `JoinSet`. Each of them ends when the runtime's cancellation token fires.
+- **Task tree.** Every QUIC stream task, before and after authentication, runs in its connection's `JoinSet`. Every connection task runs in its endpoint's `JoinSet`, under the UDP family's task in the runtime's `JoinSet`, where the punches and the registrations also run. Each of them ends when the runtime's cancellation token fires.
 - **Stopping.** A Reconfigure, a TearDown (revoke) or a shutdown stops the runtime:
-  1. It fires the runtime's cancellation token and waits for every task to end. Each connection shuts its stream `JoinSet` down, which drops in-flight router futures the way `legs.shutdown()` hard-aborts relay legs (`relay_content.rs:644`), and then closes itself with `CARRIER_REVOKED`. Each TCP family closes its listener and shuts its session `JoinSet` down the same way, which closes every TCP connection. The API tunnel polls a forwarded request's router inside its session, never as a task of its own, so dropping the session drops the handler too, including one still reading an upload's body. A request from a revoked device does not run to completion, and a handler never reads a cut-off body as a complete one.
+  1. It fires the runtime's cancellation token and waits for every task to end. Each connection shuts its stream `JoinSet` down, which drops in-flight router futures the way `legs.shutdown()` hard-aborts relay legs (`relay_content.rs:644`), and then closes itself with `CARRIER_REVOKED`. The API tunnel polls a forwarded request's router inside its session, never as a task of its own, so dropping the session drops the handler too, including one still reading an upload's body. A request from a revoked device does not run to completion, and a handler never reads a cut-off body as a complete one.
   2. It then closes the endpoints with `endpoint.close(CARRIER_REVOKED)` (QUIC application error code 1) and waits, bounded by `CARRIER_DRAIN_GRACE`, until the connections have drained (`wait_idle`) and quinn holds no reference to either socket. The runtime's own reference is then the last one, so every socket is closed when `stop` returns, and the next runtime can bind a fixed-port family again. A socket still held at the grace closes when its last connection's drain ends.
 - Revocation is noticed on the 5 s `DEVICE_POLL_INTERVAL` (`relay_content.rs:64`). That is the same bound as the relay control connection. Between control connections it is noticed when the next redial re-resolves the row; a store read that fails there keeps the scope and redials with its settings.
-- The runtime is started, and its UDP sockets bound, **before** control connects, so the capability in the first hello already names the families the runtime serves. Starting it derives the binding's candidate keys. When the gateway's static key cannot be read from the vault, the scope is not entered yet: the manager retries on its next `DEVICE_POLL_INTERVAL` tick, as it does for the relay node id, and connects control only once the runtime has started. Every relay leg's handshake reads the same key, so control could serve nothing meanwhile, and waiting keeps the capability in the scope's first hello. A binding whose device public key is malformed or low-order gets an inactive runtime: nothing is bound, the hellos carry no capability, and every offer is declined. So does a binding with nothing configured or whose QUIC certificate cannot be generated, and one whose QUIC server configuration cannot be built while no TCP family is configured. A configured family whose first bind fails keeps the runtime active and is bound again every `REBIND_DELAY`.
+- The runtime is started, and its UDP sockets bound, **before** control connects, so the capability in the first hello already names the families the runtime serves. Starting it derives the binding's candidate keys. When the gateway's static key cannot be read from the vault, the scope is not entered yet: the manager retries on its next `DEVICE_POLL_INTERVAL` tick, as it does for the relay node id, and connects control only once the runtime has started. Every relay leg's handshake reads the same key, so control could serve nothing meanwhile, and waiting keeps the capability in the scope's first hello. A binding whose device public key is malformed or low-order gets an inactive runtime: nothing is bound, the hellos carry no capability, and every offer is declined. So does a binding with nothing configured, or whose QUIC certificate or server configuration cannot be built. A configured family whose first bind fails keeps the runtime active and is bound again every `REBIND_DELAY`.
 
 **Offers.**
 
@@ -608,7 +594,7 @@ Before the commit point, the rotation is **abandoned** when the carrier dies, th
   A never reads uni streams or datagrams, so it accepts none, and nothing can be buffered for them.
 - **Streams.** `accept_bi` **spawns** each stream's `DirectOpen` + Noise IK authentication into the connection's `JoinSet`, bounded by a per-connection semaphore of `MAX_STREAMS_PER_CONNECTION`. Authentication never runs inline in the accept loop, so one stalled preface cannot block the next stream. A stream is authenticated when A's side of Noise IK completes: the responder handshake calls `BinarySink::authenticated` once it has matched the device, sent msg2 and read P's handshake confirmation, and the carrier's sink reports that to its connection. A stream that ends first, whatever ends it, reports a failure.
 - **First-stream deadline.** `FIRST_STREAM_DEADLINE` starts at `Incoming::accept()`, so it covers the handshake. A connection with no authenticated stream by then is closed with `CARRIER_UNAUTHENTICATED` (QUIC application error code 2) and releases its permit; one whose handshake has not completed is dropped. So is a connection whose first stream to report fails. Once a stream has authenticated, a later failure leaves the connection up.
-- **Hand-off (PR1).** TCP connections and QUIC streams share the `DirectOpen` gate (`read_open`), one routing function, `handle_authenticated_transport` in `crates/gateway/src/channel/carrier/`, and one framed `BinarySource`. Chat goes to `run_content_session` with a `LegDedup`; Api and Blob go to `run_tunnel_session`. Both are `pub(crate)` and run over the `BinarySink`/`BinarySource` seam (`crates/gateway/src/channel/device_content.rs:319-345`) that the relay leg also runs over. The seam carries `CONFIRMS_HANDSHAKE` (see *Handshake confirmation*) and the `authenticated` hook; on the relay leg the hook only lists the leg in the link table. The hook receives the device Noise authenticated and may refuse the session; it runs before the session does anything as that device, so a refused chat leg never displaces the live one through `LegDedup`.
+- **Hand-off (PR1).** Every QUIC stream passes the `DirectOpen` gate (`read_open`) and one routing function, `handle_authenticated_transport` in `crates/gateway/src/channel/carrier/`, over one framed `BinarySource`. Chat goes to `run_content_session` with a `LegDedup`; Api and Blob go to `run_tunnel_session`. Both are `pub(crate)` and run over the `BinarySink`/`BinarySource` seam (`crates/gateway/src/channel/device_content.rs:319-345`) that the relay leg also runs over. The seam carries `CONFIRMS_HANDSHAKE` (see *Handshake confirmation*) and the `authenticated` hook; on the relay leg the hook only lists the leg in the link table. The hook receives the device Noise authenticated and may refuse the session; it runs before the session does anything as that device, so a refused chat leg never displaces the live one through `LegDedup`.
 - **Receive errors.** A socket receive error backs off (`SOCKET_RECV_BACKOFF`, inside `DemuxSocket`) without tearing down the runtime. Only a persistent error rebinds the socket: the family checks its socket's `consecutive_recv_errors` every second, and a streak of `REBIND_AFTER_RECV_ERRORS` closes the endpoint's connections with `CARRIER_REVOKED`, closes the endpoint and binds the family again at once, retrying every `REBIND_DELAY` until it succeeds or the runtime stops. A family whose first bind fails is bound again the same way, after `REBIND_DELAY`; the failed bind logs at warn, and each failed retry at debug.
 
 **Punching.** A sends punches only to two kinds of address:
@@ -617,20 +603,6 @@ Before the commit point, the rotation is **abandoned** when the carrier dies, th
 - (b) the latched `Peer` address of a punch that A itself answered, and only when it is `Public` IPv4 and comes from the resolved rendezvous address.
 
 A never punches a source learned from an authenticated punch. C cannot choose any other target.
-
-**TCP (opt-in).** TCP runs only when `gateway.direct_tcp` is present (`crates/gateway/src/channel/carrier/tcp.rs`).
-
-- The listeners bind at runtime start, and a failed bind rebinds after `REBIND_DELAY`, until the runtime stops. As with a UDP family, a runtime with a TCP family configured stays active while nothing is bound yet; the capability names the family from the first hello, and an unbound listener is left out of the answer.
-- An accept error is classified by what it says about the listener. One that belongs to the connection being accepted (`ECONNABORTED`, `ECONNRESET`, `ECONNREFUSED`, `EINTR`, `EAGAIN`, `EPERM`, `ETIMEDOUT`, and the network errors Linux passes on from that connection: `EPROTO`, `ENOPROTOOPT`, `EOPNOTSUPP`, `ENETDOWN`, `ENETUNREACH`, `EHOSTDOWN`, `EHOSTUNREACH`) is logged at trace, and the listener takes the next connection at once, since any peer can cause one by resetting a queued connection. Running out of descriptors or memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) pauses accepting for `REBIND_DELAY` and keeps the port. Any other error means the listening socket itself is broken: the listener is dropped and bound again after `REBIND_DELAY`. The IPv6 listener sets `IPV6_V6ONLY`, so both families can listen on one port, and both set `SO_REUSEADDR`, so the next runtime can listen on a fixed port again.
-- **Before the preface,** the accept loop takes a pre-authentication permit, never waiting for one, and closes a connection it cannot admit unread:
-  - global `MAX_TCP_PREAUTH`, and `MAX_TCP_PREAUTH_PER_SOURCE` per `source_key`, so an IPv6 client rotating through its /64 is one source;
-  - a **known** source is exempt from the per-source cap and may use `TCP_PREAUTH_RESERVED` permits that no other source can take: its IP is in a live punch's allowed set, or its `source_key` has authenticated in this runtime. The runtime remembers the last `MAX_KNOWN_TCP_SOURCES` sources that authenticated, so a carrier's later legs stay known after its punch expires. Only the paired device can add one, since a session authenticates only once P's handshake confirmation decrypts.
-
-  The permit is released when Noise completes, P's confirmation included, through the `authenticated` hook, or with the session when it fails, so a flood of unknown sources cannot starve P's legs.
-- An authenticated session holds a per-device permit (`MAX_TCP_SESSIONS_PER_DEVICE`), keyed by the device Noise authenticated and taken in the same hook. A device that holds them all has its new session refused there.
-- Each accepted connection sets `TCP_NODELAY`. `DirectOpen` must arrive within `DIRECT_OPEN_DEADLINE`, and the token is compared in constant time.
-- A session whose phone vanishes without a FIN ends after `DIRECT_QUIC_IDLE_TIMEOUT`, as a QUIC carrier does. Each accepted connection enables TCP keepalive, probing after `DIRECT_QUIC_KEEP_ALIVE` of silence and then every `TCP_KEEPALIVE_INTERVAL`, `TCP_KEEPALIVE_PROBES` times, which covers a silent session such as a parked API leg. On Linux it also sets `TCP_USER_TIMEOUT` to `DIRECT_QUIC_IDLE_TIMEOUT`, which covers a session whose data goes unacknowledged, such as a chat leg's keepalive pings or a blob download. macOS has no such option, so there a session with unacknowledged data waits for the kernel's retransmission timeout. Until the session ends it holds its device permit and its link-table entry.
-- Each leg is its own TCP connection, and its `carrier_session` line names the kind `tcp`.
 
 **Dedup.** `LegDedup` (`crates/gateway/src/channel/state.rs`) spans carriers: whichever chat leg installs last wins, and A does not rank carriers against each other. P's supervisor is the only party that decides which chat leg is current, and it never has two chat dials out at once. A late relay handshake cannot occur, because P dials a relay chat leg only when it has no live chat leg. A chat leg installs once it is proven live: a carrier chat leg when P's handshake confirmation decrypts, a relay chat leg when its first transport message from P does (P's `Subscribe`, or at the latest its `Pong` to A's keepalive `Ping`). C opens every relay data leg and can replay a relay leg's msg1, and A answers it with msg2, but only the initiator that wrote that msg1 can produce a transport message after it, so a replay never displaces the device's live chat leg, a carrier one included.
 
@@ -660,19 +632,14 @@ A's local address is the destination of the datagrams the connection receives, w
 ```jsonc
 "gateway": {
   // On by default whenever a binding exists; absent ⇒ defaults.
-  "direct_udp": { "enabled": true, "ipv4_bind": "0.0.0.0:0", "ipv6_bind": "[::]:0" },
-  // Opt-in: absent ⇒ no TCP listeners (the Option-section convention of config.md).
-  // No default ports: the operator picks them and forwards or advertises them.
-  "direct_tcp": { "ipv4_bind": "0.0.0.0:<port>", "ipv6_bind": "[::]:<port>",
-                  "advertised_addresses": ["<public-ip>:<forwarded-port>"] }
+  "direct_udp": { "enabled": true, "ipv4_bind": "0.0.0.0:0", "ipv6_bind": "[::]:0" }
 }
 ```
 
-The fields are typed `Option<SocketAddr>` or `Vec<SocketAddr>`, so an unparseable address fails deserialisation. `validate_gateway` (`crates/config/src/validate.rs:260`) adds these rules:
+The binds are typed `Option<SocketAddr>`, so an unparseable address fails deserialisation. `validate_gateway` (`crates/config/src/validate.rs:260`) adds these rules:
 
 - **Family:** each `*_bind` must match its family, also while `direct_udp` is disabled. An `ipv6_bind` must not be IPv4-mapped (`[::ffff:a.b.c.d]`), because the IPv6 socket sets `IPV6_V6ONLY` and could not bind it.
-- **At least one family:** `direct_udp.enabled` requires at least one bind, and a present `direct_tcp` needs at least one bind.
-- **Advertised addresses:** they must have a non-zero port and must not be unspecified, in IPv4-mapped form either.
+- **At least one family:** `direct_udp.enabled` requires at least one bind.
 
 `direct_udp.enabled: false` is the off switch, and a `null` bind leaves that family unbound. An absent `direct_udp` field takes its default, so an explicit `null` is the only way to turn one family off, and it survives a rewrite of the file.
 
@@ -717,8 +684,8 @@ A gateway in a container needs host networking for direct UDP. On a bridge netwo
 | old | new | new | No capability in the hello ⇒ `404`. P stays on the relay and backs off. |
 | new | old | new | The route does not exist ⇒ `404`, same as above. The old C ignores the extra hello field (serde ignores unknown fields). |
 | new | old | old | A binds its sockets and advertises; nothing ever arrives. |
-| new, `direct_udp.enabled: false`, no TCP | new | new | No capability ⇒ `404`. |
-| new | new, no `UDP_PUBLIC_ADDR` | new | Offers flow without `register`: LAN, IPv6, public-IPv4 host candidates (admitted by authenticated punches, which a stateful host firewall on A drops unless it accepts inbound UDP on a fixed `direct_udp` port; see *Sockets*) and TCP work; `Ipv4Punched` does not. |
+| new, `direct_udp.enabled: false` | new | new | No capability ⇒ `404`. |
+| new | new, no `UDP_PUBLIC_ADDR` | new | Offers flow without `register`: LAN, IPv6, public-IPv4 host candidates (admitted by authenticated punches, which a stateful host firewall on A drops unless it accepts inbound UDP on a fixed `direct_udp` port; see *Sockets*) work; `Ipv4Punched` does not. |
 | new | new | new | Full design. |
 
 The built-in public proxy (`proxy.baybo.space`) is to run with the UDP rendezvous enabled once C is deployed after PR1 merges (planned). A self-hosted C opts in by setting `UDP_PUBLIC_ADDR`.
@@ -749,7 +716,7 @@ This section records the delta against [`relay-push-security.md`](relay-push-sec
 
 **C cannot, assuming endpoint keys stay secret:**
 
-- **Read host candidates from the sealed sets.** The sets hide P's and A's LAN addresses, ULAs, GUAs and public IPv4 interface addresses, and the direct token. C learns a host candidate only when it is also that side's HTTPS/WSS source address, which it sees anyway: for example the GUA P posts from, or the address of a gateway without NAT. It cannot learn how many candidates either side has, or whether A offers TCP.
+- **Read host candidates from the sealed sets.** The sets hide P's and A's LAN addresses, ULAs, GUAs and public IPv4 interface addresses, and the direct token. C learns a host candidate only when it is also that side's HTTPS/WSS source address, which it sees anyway: for example the GUA P posts from, or the address of a gateway without NAT. It cannot learn how many candidates either side has.
 - **Tamper with sets.** C cannot inject, alter or drop an individual host candidate. Any tampering fails the AEAD, and the whole set is rejected.
 - **Point either side at a private address.** C cannot make A or P send to a `Lan` or excluded address. Both sides require the rendezvous and `Peer` addresses to be `Public` IPv4, and private targets come only from sealed, authenticated sets.
 - **Admit any other source at A.** An authenticated punch needs `k_punch`, so C cannot forge one. An observer on the P→A path can race a copy from its own address, which admits that address to the same pre-authentication surface, at most `MAX_PRFLX_SOURCES_PER_PUNCH` per punch.
@@ -765,14 +732,13 @@ This section records the delta against [`relay-push-security.md`](relay-push-sec
 - **C's UDP** replies at most once per `Register`, only to its sender, never with more bytes than it received, and only for live punches with the correct role ticket. It cannot reflect or amplify.
 - **`POST /direct`** is bounded by the per-IP bucket, the per-(node, source) rate, the per-node ceiling and the in-flight cap.
 - **A** does no handshake work for sources outside its allowed set, sends a Retry to unvalidated ones, and pins its QUIC transport limits so that an admitted, unauthenticated peer cannot make it buffer data it never reads. QUIC's 3× anti-amplification limit applies to the admitted sources.
-- **A's TCP listener** takes pre-authentication permits without waiting, keyed by `source_key`, and keeps a reserved share for known sources.
 - **P** sends at most `MAX_PUNCH_DATAGRAMS_PER_PROBE` punches and one QUIC attempt per remote candidate per probe, only toward sealed candidates it may dial and the one latched srflx.
 
 **LAN probing.**
 
 - A's private targets are exactly the addresses the legitimate P sealed about itself. P omits cellular private addresses.
 - A may still punch a P LAN address that coincides with an unrelated host on A's own LAN, for example when P is on a different Wi-Fi that uses the same subnet. That costs `PUNCH_BURST` small, inert datagrams per address per genuine probe.
-- P dials A's `Lan` candidates only from a Wi-Fi or wired interface that has a `Lan` address of that family: at most `PUNCH_BURST` punches and one QUIC attempt per candidate per probe. With `direct_tcp`, a TCP dial on a foreign Wi-Fi that reuses A's subnet can hand an unrelated host the `DirectOpen` token and a msg1. The token passes only the gate, and a replayed msg1 never gets past P's handshake confirmation, so every session still needs Noise IK.
+- P dials A's `Lan` candidates only from a Wi-Fi or wired interface that has a `Lan` address of that family: at most `PUNCH_BURST` punches and one QUIC attempt per candidate per probe.
 
 **Privacy delta.**
 
@@ -784,18 +750,18 @@ Browser remote access is out of scope and is not affected.
 
 ## Observability
 
-- **Carrier model.** `CarrierKind { Relay, Lan, Ipv6, Ipv4, Ipv4Punched, Tcp }` is shared by A's link table and P's state. A probe has one tier per direct kind (`lan`, `ipv6`, `ipv4`, `ipv4_punched`, `tcp`), and records an outcome for each:
+- **Carrier model.** `CarrierKind { Relay, Lan, Ipv6, Ipv4, Ipv4Punched }` is shared by A's link table and P's state. A probe has one tier per direct kind (`lan`, `ipv6`, `ipv4`, `ipv4_punched`), and records an outcome for each:
   - `ok`, `failed` or `timeout`;
   - `not_offered`: no candidates of that tier, no rendezvous, or a path that may not dial it;
   - `denied`: the iOS Local Network permission is refused or pending (see *The prober*);
   - `skipped`.
-- **iOS.** (PR2) `SettingsScreen` (`app/ios/App/Screens/SettingsScreen.swift`) gets a **Connection** row showing "Relay", "Direct · LAN", "Direct · IPv6", "Direct · IPv4", "Direct · IPv4 (punched)" or "Direct · TCP". A **Last probe** detail shows the time, the network kind and the per-tier outcomes. State reaches Swift through a new `CarrierSink` callback interface, registered like the existing sinks (`app/ios/ffi/src/lib.rs:149-171`). **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
+- **iOS.** (PR2) `SettingsScreen` (`app/ios/App/Screens/SettingsScreen.swift`) gets a **Connection** row showing "Relay", "Direct · LAN", "Direct · IPv6", "Direct · IPv4" or "Direct · IPv4 (punched)". A **Last probe** detail shows the time, the network kind and the per-tier outcomes. State reaches Swift through a new `CarrierSink` callback interface, registered like the existing sinks (`app/ios/ffi/src/lib.rs:149-171`). **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
 - **Gateway.** `baybo device status` (PR1) lists, for each approved device, its approval and last-seen times, its live legs by class with their carrier and start time, and its last offer's outcome and time.
   - It reads the running gateway's admin route `GET /v1/mobile/links`, authenticated with the vault's admin token, at the address `baybo_gateway::config::admin_dial_addr` derives from `gateway.bind_address` and `gateway.port` (a wildcard bind is dialed on loopback, as `baybo tui` does). It is the first `baybo device` command that queries the running gateway instead of the stores. When no link table comes back, it says why in one line (nothing answered, the gateway refused the token, or the vault holds none) and prints the device rows alone. With `--json`, `gateway.error` carries that line and each device's `legs` is `null`, not empty, while unknown.
   - It is shell-only, like the rest of the `device` family, which `crates/cli/src/slash.rs` already rejects as a whole.
 - **Structured logs,** as key=value fields. Addresses appear only at debug level.
-  - **P:** `direct_probe probe trigger network=<tag> outcome elapsed_ms tiers="lan=… ipv6=… ipv4=… ipv4_punched=… tcp=…"`, `direct_attempt tier family candidate_class outcome elapsed_ms`, `peer_conflict punch`, `carrier_up kind`, `carrier_down kind reason lifetime_ms`, `carrier_cooloff reason`, `chat_rotation outcome waited_ms`.
-  - **A:** `direct_offer punch=<tag> device outcome=accepted|declined:<auth|stale|replayed|over_cap|unbound>` (plus `superseded=<tag>` when it replaced a punch; `unbound` when no socket or listener is bound, which includes a binding without candidate keys), `udp_register punch outcome=peer|no_peer|no_reply|unresolved`, `peer_conflict punch`, `punch punch targets datagrams`, `punch_admit punch sources`, `quic_incoming` (counters of `accepted`, `retried`, `ignored_not_in_punch` and `ignored_cap`, counted per runtime and logged at most once per `INCOMING_LOG_INTERVAL` across its families and rebinds), `carrier_session class kind device`.
+  - **P:** `direct_probe probe trigger network=<tag> outcome elapsed_ms tiers="lan=… ipv6=… ipv4=… ipv4_punched=…"`, `direct_attempt tier family candidate_class outcome elapsed_ms`, `peer_conflict punch`, `carrier_up kind`, `carrier_down kind reason lifetime_ms`, `carrier_cooloff reason`, `chat_rotation outcome waited_ms`.
+  - **A:** `direct_offer punch=<tag> device outcome=accepted|declined:<auth|stale|replayed|over_cap|unbound>` (plus `superseded=<tag>` when it replaced a punch; `unbound` when no socket is bound, which includes a binding without candidate keys), `udp_register punch outcome=peer|no_peer|no_reply|unresolved`, `peer_conflict punch`, `punch punch targets datagrams`, `punch_admit punch sources`, `quic_incoming` (counters of `accepted`, `retried`, `ignored_not_in_punch` and `ignored_cap`, counted per runtime and logged at most once per `INCOMING_LOG_INTERVAL` across its families and rebinds), `carrier_session class kind device`.
   - **C:** as listed under *C (remote-host)*.
 
 ## Failure modes
@@ -803,7 +769,7 @@ Browser remote access is out of scope and is not affected.
 | # | Scenario | Detection | Behaviour | User cost |
 |---|---|---|---|---|
 | 1 | C, A or P lacks support | `404` | Stay on the relay; back off | none |
-| 2 | A's side is symmetric NAT, P is symmetric and A port-restricted, or UDP is blocked | No QUIC handshake within `QUIC_PHASE_BUDGET` | Try TCP if offered, else relay; back off per network | none |
+| 2 | A's side is symmetric NAT, P is symmetric and A port-restricted, or UDP is blocked | No QUIC handshake within `PROBE_BUDGET` | Stay on the relay; back off per network | none |
 | 3 | Carrier dies (gateway restart or crash, NAT rebind) | `CONNECTION_CLOSE` on a graceful stop; otherwise the QUIC idle timeout or the pump's liveness | Legs end; chat reconnects over the relay; re-probe | One reconnect. After a crash, a chat leg on the carrier stays dead for up to `DIRECT_QUIC_IDLE_TIMEOUT`, where the relay notices within an RTT |
 | 4 | Carrier blackholed (mapping expired silently) | A carrier dial times out with no datagram received | That leg falls back to the relay; carrier retired | ≤ 3 s on one API call |
 | 5 | Stream-level failure on a live QUIC carrier | A carrier dial fails while datagrams still arrive | That leg falls back to the relay; carrier cools off; the chat leg is untouched | ≤ 3 s on one API call |
@@ -815,7 +781,7 @@ Browser remote access is out of scope and is not affected.
 | 11 | A turn starts after the rotation's commit point | Re-subscribe returns `SubscribeState{active}` | State re-seeded; deltas between A's abort and the re-subscribe are lost, as on any reconnect | A rare, short gap, identical to a relay reconnect |
 | 12 | Rotation dial fails | The dial fails | Leg-dial rule; if A already switched, chat reconnects over the relay | At most one reconnect |
 | 13 | C at capacity | `429` / `503` | Retry after `Retry-After`; failure cache untouched | none |
-| 14 | IPv6-only path without CLAT | No IPv4 route | IPv4 tiers `not_offered`; IPv6 and TCP still run | Relay if A has no GUA and no TCP |
+| 14 | IPv6-only path without CLAT | No IPv4 route | IPv4 tiers `not_offered`; IPv6 still runs | Relay if A has no GUA |
 | 15 | Device revoked | 5 s poll → TearDown | Runtime stops; carrier sessions and their in-flight requests dropped; relay Noise lookup fails too | By design |
 
 ## Testing
@@ -829,7 +795,7 @@ Browser remote access is out of scope and is not affected.
 - **device-proto:**
   - seal/open round trips; directional separation (a set sealed under the other direction's key does not open, even at the right length and associated data; a set reflected to its sender is refused by its length); AAD binding (a wrong node id or punch id fails);
   - low-order peer keys (u = 0, u = 1 and an order-8 point) are rejected; tampering with the ciphertext or the nonce fails; every seal draws a fresh nonce;
-  - an empty set and a full-cap all-IPv6 set seal to the same length, as do an answer with an empty `tcp` and one with a full `tcp`; the pinned plaintext lengths hold the widest full-cap bodies, whose body and sealed wire lengths are pinned exactly; fixed-size byte fields encode at a fixed length;
+  - an empty set and a full-cap all-IPv6 set seal to the same length, as do an empty answer and a full-cap one; the pinned plaintext lengths hold the widest full-cap bodies, whose body and sealed wire lengths are pinned exactly; fixed-size byte fields encode at a fixed length;
   - an oversized or over-cap body fails to seal; a wrong-length plaintext, non-zero padding, an overrunning declared length, bytes after the body inside the declared length, a malformed body, a version mismatch and an over-cap count fail to open; an oversized, non-base64 or short-nonce set is refused before the AEAD;
   - an answer that does not echo the offer id is refused; punch tags verify and reject; `CertHash` pins one certificate.
 - **carrier:**
@@ -856,21 +822,21 @@ Browser remote access is out of scope and is not affected.
   - `Peer` is latched (a conflicting one is logged and dropped), and a lost first `Peer` is recovered by the next `Register`;
   - a valid authenticated punch admits its source and a bad tag does not; an `Incoming` outside the allowed set is ignored; an unvalidated one gets a Retry, unless its source is at its cap;
   - a stalled preface on stream 1 does not block stream 2; the first-stream deadline holds, and a handshake that never completes releases its permit at `FIRST_STREAM_DEADLINE`;
-  - stopping a binding closes its active sessions even mid-request, on QUIC (`stopping_a_binding_closes_its_active_quic_sessions_even_mid_request`) and on TCP (`…_tcp_sessions_even_mid_request`): an Api upload parked in its handler on each has its future dropped, never seeing its body end, by the time `stop` returns;
+  - stopping a binding closes its active sessions even mid-request (`stopping_a_binding_closes_its_active_quic_sessions_even_mid_request`): an Api upload parked in its handler has its future dropped, never seeing its body end, by the time `stop` returns;
   - interfaces are not enumerated when nothing is bound, and once per offer otherwise; an excluded or port-less device candidate is dropped and never admitted; a declined offer is never punched and never registers; a private `Peer` is ignored and registration goes on; a binding without candidate keys stays inactive;
   - a UDP family whose first bind fails (its fixed port still held) is named in the first hello, declines offers as `unbound`, and is bound again after the rebind delay, then serves;
   - a persistent receive error rebinds the family, whose connections close with `CARRIER_REVOKED`, and the new socket serves; the test feeds the real socket's receive-error streak through `DemuxSocket::inject_recv_errors` (carrier `test-support`), so the family's own health poll decides;
-  - TCP: the per-source cap keys an IPv6 /64 as one source, and a pre-auth flood leaves known sources their reserved permits; an unknown source past its cap is closed unread, and a source in a live punch's allowed set passes it; a source that authenticated stays known until it is the oldest of too many; a device holds at most its session permits; a TCP session runs the tunnel once Noise has traded its pre-auth permit for a device permit; a replayed `DirectOpen`, msg1 and confirmation never authenticate: the source is not remembered, no device permit is taken and the live chat leg is not displaced, while a confirmed TCP chat leg does displace it; an accept error of one connection keeps the listener, running out of resources pauses it and only a broken listener rebinds, both as the error's class and as the step the accept loop takes; an accepted connection carries the keepalive and user timeout that bound a vanished peer; a wrong token or a silent preface closes the connection and frees its permit; a listener that fails to bind is bound again after the rebind delay; an answer offers the advertised addresses, then the listener's, and never one without a class or past the cap; a TCP-only runtime advertises without `udp`, from its first hello even while its listener is still retrying its bind, and its listener is closed when `stop` returns;
+  - a QUIC Api session runs the tunnel; a replayed `DirectOpen`, msg1 and confirmation on a carrier stream never authenticate and never displace the live chat leg, while a confirmed carrier chat leg does displace it;
   - `LegDedup` works across carriers, and a relay chat leg installs only at its first decrypted transport message, so a relay msg1 C replays never displaces a live carrier chat leg; the `CarrierKind` classification, including a mixed ULA/GUA IPv6 pair in both directions, which takes the class of A's address; the config validation table.
-  - the link table: a leg is listed, under the device Noise authenticated, from its `authenticated` hook until its sink drops, and never when the wrapped sink refuses the device; a QUIC chat leg is listed with its path's kind, on a socket bound to a specific address and on a wildcard-bound one, whose kind comes from the datagrams' destination, and a TCP leg as `tcp`, over real loopback carriers, and a relay chat leg as `relay` in the relay E2E; each offer's outcome replaces the last and outlives the legs; the wire labels equal `CarrierKind::as_str`, `LegClass` and the `direct_offer` outcomes; `GET /v1/mobile/links` refuses a missing or wrong bearer and serves what the writers recorded; `baybo device status` against a stand-in gateway joins the table to the approved rows, and prints the rows alone, saying why, when nothing answers, the gateway refuses the token, or the vault holds none.
+  - the link table: a leg is listed, under the device Noise authenticated, from its `authenticated` hook until its sink drops, and never when the wrapped sink refuses the device; a QUIC chat leg is listed with its path's kind, on a socket bound to a specific address and on a wildcard-bound one, whose kind comes from the datagrams' destination, over real loopback carriers, and a relay chat leg as `relay` in the relay E2E; each offer's outcome replaces the last and outlives the legs; the wire labels equal `CarrierKind::as_str`, `LegClass` and the `direct_offer` outcomes; `GET /v1/mobile/links` refuses a missing or wrong bearer and serves what the writers recorded; `baybo device status` against a stand-in gateway joins the table to the approved rows, and prints the rows alone, saying why, when nothing answers, the gateway refuses the token, or the vault holds none.
   - the binding scope: a control flap stays inside it and never restarts the runtime; a static key the vault cannot read yet delays control until the runtime starts, so the first hello carries the capability; the runtime holds its sockets from the first hello until a revoke ends the scope, and releases them after; a stopped runtime's sockets are closed when `stop` returns, also with a connection draining, so the next runtime binds the same fixed port; a hello carries no capability when the runtime is inactive; a report goes back only on the connection that delivered its offer; stopping drops every task before any endpoint closes; a re-pair or credential change is a Reconfigure.
 
-**E2E (PR1)** lives in `crates/gateway/src/channel/relay_e2e.rs`, which boots a real in-process C; for the direct cases C also runs its UDP rendezvous on loopback. The gateway side is the real relay-content manager (`relay_content::run` with millisecond polls), so the binding scope, its carrier runtime, the hello's capability and the report path run as shipped. The crate builds with `test-support`, so `AddressPolicy::for_tests()` treats 127/8 as `Public` and `::1` as `Lan`. A mock device, driving the phone's end of a carrier that `crates/gateway/src/channel/carrier/phone.rs` (test-only) shares with the runtime's tests, seals an offer, posts it, gets A to admit it the ways P's tiers do (a `Peer` from C's rendezvous, an authenticated punch alone, or a host candidate in its offer) and connects over QUIC or TCP:
+**E2E (PR1)** lives in `crates/gateway/src/channel/relay_e2e.rs`, which boots a real in-process C; for the direct cases C also runs its UDP rendezvous on loopback. The gateway side is the real relay-content manager (`relay_content::run` with millisecond polls), so the binding scope, its carrier runtime, the hello's capability and the report path run as shipped. The crate builds with `test-support`, so `AddressPolicy::for_tests()` treats 127/8 as `Public` and `::1` as `Lan`. A mock device, driving the phone's end of a carrier that `crates/gateway/src/channel/carrier/phone.rs` (test-only) shares with the runtime's tests, seals an offer, posts it, gets A to admit it the ways P's tiers do (a `Peer` from C's rendezvous, an authenticated punch alone, or a host candidate in its offer) and connects over QUIC:
 
 - the rendezvous path of P's `ipv4_punched` tier runs over 127.0.0.1. The phone registers, learns A's mapping from `Peer`, waits for A's punch and dials the mapping. Its offer carries no host candidate, and since loopback has no NAT to open it sends no punch of its own, so C's `Peer` is the only thing that can admit it: A allows the mapping it latches before it punches it. The mapping is A's host address, which the test policy classes `Public`, so A lists the leg as `ipv4`; A labels a leg `ipv4_punched` only behind a NAT, as in the netns matrix;
 - the `Lan` carrier runs over `[::1]`, where A, serving no IPv4 UDP family, gets no rendezvous. The offer carries no host candidate either, so the phone's authenticated punch alone admits it; an Initial A judges before the punch is ignored, and quinn's retransmit gets in. On a host that cannot bind `::1` the case skips itself, as the runtime's IPv6 test does;
-- each completes a chat frame round trip, and so does a TCP leg when TCP is configured;
-- revoking mid-session closes both carrier sessions: a QUIC leg, admitted by the host candidate the phone offers, closes with `CARRIER_REVOKED`, and a TCP leg ends. The legs leave the link table, and C, whose control connection has closed, answers the next offer `404`;
+- each completes a chat frame round trip;
+- revoking mid-session closes the carrier: its QUIC connection, admitted by the host candidate the phone offers, closes with `CARRIER_REVOKED`, ending its chat and API sessions. The legs leave the link table, and C, whose control connection has closed, answers the next offer `404`;
 - a tampered offer is declined by A, C answers it with its opaque `404`, and the device's last offer in the link table reads `declined:auth`.
 
 **Unit tests (PR2):**
@@ -928,7 +894,7 @@ Additional rows and variants:
 
 - same LAN → `Lan`;
 - both sides `v6-firewall` with GUAs → `Ipv6`, whatever the IPv4 profile;
-- `udp-blocked` on either side, with A `open` and `direct_tcp` set → `Tcp` (after `QUIC_PHASE_BUDGET`), otherwise `Relay`;
+- `udp-blocked` on either side → `Relay`;
 - C without `UDP_PUBLIC_ADDR` → A `open` gives `Ipv4`, and every other IPv4 cell gives `Relay`;
 - P IPv6-only behind `nat64` → `Ipv6` when A has a GUA, otherwise `Relay`;
 - P reaching C's HTTPS over IPv6 → the IPv4 table unchanged, because admission never depends on the HTTPS client IP;
@@ -968,24 +934,25 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 1. **The relay is never gated.** No dial waits on a probe, and the chat dial path never uses a carrier. Rotation is the only way a chat leg reaches a direct carrier, and it starts only when the chat is idle.
 2. **Every carrier session runs `DirectOpen`, then Noise IK between the pairing statics, confirmed by P, then the same responder as a relay leg.** A resolves the device only by its static key, and counts the session as that device's only once the confirmation decrypts.
 3. **Pairing is relay-only.**
-4. **A's carrier runtime lives in the binding scope**, which exists only while the binding resolves to one `Ready(settings)`; a control redial does not restart it. Stopping it drops every carrier session's task, pre- and post-authentication, for TCP and QUIC, before it closes the endpoints.
+4. **A's carrier runtime lives in the binding scope**, which exists only while the binding resolves to one `Ready(settings)`; a control redial does not restart it. Stopping it drops every carrier session's task, pre- and post-authentication, before it closes the endpoints.
 5. **One stable UDP socket per family per side.** Registration, punches and QUIC share it. A's lives for the runtime and is bound again only after a failed bind or a persistent socket error; P's lives for a probe and its carrier. Receive errors back off and do not tear down the runtime.
 6. **Every endpoint sets `grease_quic_bit(false)`**, so its peer never clears the fixed bit toward it, and every probe datagram's first byte has `0x80|0x40` clear. The demux splits GRO buffers into segments and is built on `quinn_udp`, so replies keep the targeted source address.
 7. **A admits an `Incoming` only when its source IP is in a live punch's allowed set,** retries an unvalidated address, and pins its QUIC transport limits. Everything else is `ignore()`d, and the demux keeps from quinn the packets it would answer before admission (a version other than v1, an Initial with a short destination connection ID).
 8. **Stream authentication is spawned, never inline in `accept_bi`.** A connection gets `FIRST_STREAM_DEADLINE`, counted from `Incoming::accept()`, to authenticate a stream.
-9. **Caps are named by what they count and keyed by `source_key`.** The known-source TCP permits and the per-connection stream limit are sized above the app's leg fan-out.
+9. **Caps are named by what they count and keyed by `source_key`.** The per-connection stream limit is sized above the app's leg fan-out.
 10. **A and P send probe and QUIC datagrams only to sealed host candidates, a `Public` IPv4 rendezvous address from `resolve_public_v4`, and a latched `Public` IPv4 `Peer` address.** The `Peer` must come from the resolved rendezvous address and belong to a punch the side took part in. Each side latches the first valid `Peer` per punch. An authenticated punch admits a source at A but never makes it a target.
 11. **Sealing:** an all-zero DH output is rejected; the keys are directional and `Zeroizing`; every seal uses a fresh random 24-byte nonce; the AAD binds the node id, plus the punch id for answers; each message kind has one fixed plaintext length; any AEAD, length, version or cap failure rejects the whole set; P requires the `offer_id` echo; A enforces `OFFER_MAX_AGE`, the process's `started_at_ms` and the process's replay cache.
-12. **Secrets:** the direct token is minted from a CSPRNG per binding runtime and travels inside sealed answers and, on TCP, in the plaintext `DirectOpen` preface. It is zeroized on drop, never printed, and compared in constant time. Punch ids and tickets are minted from a CSPRNG at C, per punch and per role, and the device's ticket can never register the gateway's role. `offer_id` is minted from a CSPRNG at P.
+12. **Secrets:** the direct token is minted from a CSPRNG per binding runtime and travels inside sealed answers and, under QUIC's TLS, in the `DirectOpen` preface. It is zeroized on drop, never printed, and compared in constant time. Punch ids and tickets are minted from a CSPRNG at C, per punch and per role, and the device's ticket can never register the gateway's role. `offer_id` is minted from a CSPRNG at P.
 13. **C:** a malformed capability or report never closes control; direct state is per punch and has a TTL; (PR1) `MAX_RELAY_NODE_ID_BYTES` is enforced wherever a node id becomes a map key; the direct path never causes a control redial.
 14. **C's UDP:** at most one reply per `Register`, only to its sender, never longer than it; only for a live punch, a valid ticket and the role's latched source; IPv4 sources only. `UDP_PUBLIC_ADDR` is configured separately from the relay hostname.
 15. **P's probe state:** probes are single-flight per binding; the failure cache is per `(binding, network)` and counts only failed probes and unsolicited early carrier deaths; `network_changed` ignores duplicates and secondary-interface changes and otherwise retires the carrier synchronously; the background barrier suspends the carrier and `.active` re-proves it; a result with a stale epoch is discarded; pair and forget clear carrier state infallibly; a carrier is evicted by closing its connection (`stable_id`), never the endpoint.
 16. **P's legs:** every carrier transition invalidates the API leg pool; a failed carrier leg dial falls back to the relay for that leg at once, and only connection-level evidence retires the carrier; while a rotation is in flight, sends are held and the relay leg's `PumpEnded` waits for the rotation's outcome.
-17. **Config rules live only in `validate.rs`, and address classes only in `AddressPolicy`.** A never enumerates interfaces when no direct socket or listener is bound.
+17. **Config rules live only in `validate.rs`, and address classes only in `AddressPolicy`.** A never enumerates interfaces when no direct socket is bound.
 
 ## Rejected
 
 - **Direct-first dialing with a per-leg budget.** Every leg would pay up to the budget on any network where direct fails, and the relay would stop being the baseline. Relay-first costs nothing when direct fails and one background probe when it works.
+- **A TCP carrier.** TCP cannot be hole-punched, so it reaches A only on a LAN, through an inbound-open IPv6 firewall, or through a port the operator forwards and advertises. Its one gain is a network that blocks UDP, where the relay already works. It would cost a plaintext `DirectOpen` token and Noise msg1 that an on-path host can replay, a pre-authentication permit scheme for a listener every source can reach, and a second carrier model on P. A future TCP carrier comes with a `DIRECT_PROTOCOL_VERSION` bump, since it changes `GatewayAnswer`.
 - **Migrating the chat leg mid-turn.** The Ephemeral plane is never replayed, so the user would see a hole in the answer.
 - **Closing the carrier at `.background`.** A relay chat leg survives a short app switch. Closing the carrier would cut a rotated chat leg mid-reply on every switch and force a new probe on every foreground.
 - **Candidates in `ControlHello`.** They go stale. Refreshing them forces control redials, which must never touch live relay legs. They also cannot carry a per-punch freshness proof. Gathering per offer is fresh and costs one interface enumeration.
@@ -1008,7 +975,7 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 - **C:** `POST /direct` with the per-source and per-node budgets; the punch registry and its in-flight rules; control-report parsing; the `ControlRegistry::register` node-id check; the UDP rendezvous (`UDP_PUBLIC_ADDR`, `UDP_BIND_ADDR`, `DEFAULT_UDP_BIND_ADDR`); the edge label; `docker-compose.yml` and `.env.example` (`UDP_PUBLIC_ADDR`, `UDP_PORT`, the optional `UDP_BIND_ADDR`); `DEPLOY.md`.
 - **Gateway:**
   - the binding scope in `relay_content::run` and the `RelaySettings` identity fields;
-  - the carrier runtime: stable sockets, QUIC endpoint, admission, authenticated-punch verification, punching, opt-in TCP (the gateway gains `socket2` for its IPv6-only listener);
+  - the carrier runtime: stable sockets, QUIC endpoint, admission, authenticated-punch verification, punching;
   - the outbound `ControlReport` path in `pump_control`, and the capability in the hello;
   - on the responder seam, the handshake confirmation (`BinarySink::CONFIRMS_HANDSHAKE`) and the `authenticated` hook; the API tunnel polls a forwarded request's router inside its session, so a dropped session drops the handler;
   - `DeviceLinks`, `GET /v1/mobile/links` and `baybo device status`. The route is registered in the OpenAPI doc under a `mobile` tag; `docs/openapi.json` is regenerated with `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync`, and `app/web/src/api/schema.d.ts` from it with `pnpm --filter baybo-web gen:api`. The rule for dialing the admin listener from the same host moves from `crates/baybo/src/gateway_client.rs` to `baybo_gateway::config::admin_dial_addr`, which `baybo tui`, `baybo prompt` and `baybo device status` share;
@@ -1030,7 +997,7 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 
 - **ffi:**
   - Generalise `WsStream` to a binary transport in `app/ios/ffi/src/transport/{mod,pump}.rs`, `app/ios/ffi/src/relay/tunnel.rs` and `app/ios/ffi/src/relay/chat.rs` (the chat leg's Noise handshake over a carrier stream). On a carrier session every handshake ends with P's confirmation, one empty transport message sent right after msg2; the relay leg's handshake is unchanged. `app/ios/ffi/src/relay/dial.rs` stays WS-only.
-  - Add `app/ios/ffi/src/relay/carrier/`: the prober, the QUIC and TCP carriers, the network fingerprint and key, and the failure cache. Add `carrier = { path = "../../crates/carrier" }` to `app/ios/Cargo.toml` `[workspace.dependencies]`, and refresh `app/ios/Cargo.lock` in the same commit. The same commit widens `.github/workflows/ci.yml`'s `IOS_DEPS` and `ios_native` filters to `crates/(wire|device-proto|model|carrier)/`, and adds `crates/carrier/**` to the `ios-sim` job's ffi cache key, since from then on a carrier change can break the iOS build.
+  - Add `app/ios/ffi/src/relay/carrier/`: the prober, the QUIC carrier, the network fingerprint and key, and the failure cache. Add `carrier = { path = "../../crates/carrier" }` to `app/ios/Cargo.toml` `[workspace.dependencies]`, and refresh `app/ios/Cargo.lock` in the same commit. The same commit widens `.github/workflows/ci.yml`'s `IOS_DEPS` and `ios_native` filters to `crates/(wire|device-proto|model|carrier)/`, and adds `crates/carrier/**` to the `ios-sim` job's ffi cache key, since from then on a carrier change can break the iOS build.
   - In the supervisor: the active-turn set and the rotation transition, with its commit point and held sends. Invalidate the pool on transitions.
   - In `app/ios/ffi/src/lib.rs`: `network_changed` and `CarrierSink`. The `.background` barrier suspends the carrier and `.active` re-proves it; pair and forget clear carrier state.
   - An in-memory keychain backend for non-iOS builds, behind a `test-support` feature, so the netns client can be seeded with a `PairedRecord`. Today's non-iOS keychain (`app/ios/ffi/src/keychain.rs:336-357`) discards writes.

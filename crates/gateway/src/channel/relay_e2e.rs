@@ -23,11 +23,11 @@
 //!   a C that also runs its UDP rendezvous. A mock phone seals an offer,
 //!   posts it to C and gets A to admit it the ways P's tiers do: a `Peer`
 //!   from C's rendezvous, an authenticated punch alone, or a host candidate
-//!   in its offer. It then connects over QUIC or TCP with the pinned
-//!   certificate, `DirectOpen` and Noise IK; a chat frame round-trips, and a
-//!   revoke closes the carrier sessions. The crate builds with the
-//!   protocol's `test-support`, so `AddressPolicy::for_tests` makes 127/8
-//!   `Public` and `::1` `Lan`.
+//!   in its offer. It then connects over QUIC with the pinned certificate,
+//!   `DirectOpen` and Noise IK; a chat frame round-trips, and a revoke closes
+//!   the carrier sessions. The crate builds with the protocol's
+//!   `test-support`, so `AddressPolicy::for_tests` makes 127/8 `Public` and
+//!   `::1` `Lan`.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -81,7 +81,7 @@ use super::device_pair::PairingHostDeps;
 use super::relay_content::{ControlTiming, run};
 use super::relay_pair::host_pairing_leg;
 use super::state::WsChannelState;
-use crate::config::{FamilyBinds, RuntimeCarrierConfig, RuntimeDirectTcpConfig};
+use crate::config::{FamilyBinds, RuntimeCarrierConfig};
 use crate::device::load_or_create_static_keypair;
 use crate::relay::load_or_create_relay_node_id;
 use crate::test_support::{TestGateway, build_test_deps};
@@ -735,24 +735,6 @@ fn udp_carriers(ipv4: Option<&str>, ipv6: Option<&str>) -> RuntimeCarrierConfig 
             ipv4: ipv4.map(|bind| bind.parse().unwrap()),
             ipv6: ipv6.map(|bind| bind.parse().unwrap()),
         }),
-        tcp: None,
-    }
-}
-
-/// A TCP listener on loopback and, when `udp`, an IPv4 UDP socket too.
-fn tcp_carriers(udp: bool) -> RuntimeCarrierConfig {
-    RuntimeCarrierConfig {
-        udp: udp.then(|| FamilyBinds {
-            ipv4: Some(LOOPBACK_V4.parse().unwrap()),
-            ipv6: None,
-        }),
-        tcp: Some(RuntimeDirectTcpConfig {
-            binds: FamilyBinds {
-                ipv4: Some(LOOPBACK_V4.parse().unwrap()),
-                ipv6: None,
-            },
-            advertised_addresses: Vec::new(),
-        }),
     }
 }
 
@@ -888,31 +870,13 @@ async fn real_relay_offer_opens_a_lan_carrier_over_ipv6_loopback() {
     rig.stop().await;
 }
 
-/// With `direct_tcp` configured, A's answer carries its listener, and a chat
-/// frame round-trips over a TCP leg.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_relay_offer_opens_a_tcp_carrier_when_tcp_is_configured() {
-    let mut rig = DirectRig::start(tcp_carriers(false)).await;
-
-    let answered = rig.offer(Vec::new()).await;
-    let [listener] = answered.answer.tcp[..] else {
-        panic!("one TCP candidate: {:?}", answered.answer.tcp);
-    };
-    let mut chat = rig
-        .keys()
-        .tcp_session(listener, &answered.answer.token, LegClass::Chat)
-        .await;
-    rig.chat_round_trip(&mut chat, "over a tcp carrier").await;
-    assert_eq!(rig.listed().0, [(LegClass::Chat, Some(CarrierKind::Tcp))]);
-    rig.stop().await;
-}
-
 /// Revoking the device mid-session ends the binding scope: its QUIC
-/// connection closes with `CARRIER_REVOKED`, its TCP session ends, the legs
-/// leave the link table, and C no longer routes the phone's offers.
+/// connection closes with `CARRIER_REVOKED`, ending its chat and API
+/// sessions, the legs leave the link table, and C no longer routes the
+/// phone's offers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoking_the_device_closes_its_live_carrier_sessions() {
-    let mut rig = DirectRig::start(tcp_carriers(true)).await;
+    let mut rig = DirectRig::start(udp_carriers(Some(LOOPBACK_V4), None)).await;
     let phone = Phone::bind(LOOPBACK_V4.parse().unwrap());
     let answered = rig.offer(vec![phone.address()]).await;
     let token = &answered.answer.token;
@@ -922,10 +886,7 @@ async fn revoking_the_device_closes_its_live_carrier_sessions() {
         .await;
     let mut chat = rig.keys().session(&connection, token, LegClass::Chat).await;
     rig.chat_round_trip(&mut chat, "before the revoke").await;
-    let mut tunnel = rig
-        .keys()
-        .tcp_session(answered.answer.tcp[0], token, LegClass::Api)
-        .await;
+    let mut tunnel = rig.keys().session(&connection, token, LegClass::Api).await;
     until("both carrier legs are listed", || rig.listed().0.len() == 2).await;
 
     rig.gateway

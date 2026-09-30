@@ -1,7 +1,6 @@
 //! A carrier session from its first frame on: the `DirectOpen` token gate,
-//! then the same Noise IK responder a relay leg runs. TCP connections and
-//! QUIC streams share [`read_open`], [`handle_authenticated_transport`] and
-//! [`FramedSource`].
+//! then the same Noise IK responder a relay leg runs: [`read_open`],
+//! [`handle_authenticated_transport`] and [`FramedSource`].
 
 use std::time::Duration;
 
@@ -19,8 +18,7 @@ use crate::channel::device_content::{
 };
 use crate::channel::state::{LegDedup, WsChannelState};
 
-/// How long a new stream or TCP connection may take to deliver its
-/// `DirectOpen` preface.
+/// How long a new stream may take to deliver its `DirectOpen` preface.
 pub(crate) const DIRECT_OPEN_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Reads a session's `DirectOpen` preface within `deadline` and checks its
@@ -150,8 +148,8 @@ pub(crate) struct QuicBinarySink {
     pub(crate) report: AuthReport,
 }
 
-/// The receive half of one carrier session, a QUIC stream or a TCP
-/// connection, past its `DirectOpen` preface.
+/// The receive half of one carrier session's QUIC stream, past its
+/// `DirectOpen` preface.
 pub(crate) struct FramedSource<R>(pub(crate) FrameReader<R>);
 
 #[async_trait::async_trait]

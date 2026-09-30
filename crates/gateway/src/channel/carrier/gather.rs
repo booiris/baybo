@@ -4,9 +4,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 
-use remote_host_protocol::relay::{
-    AddressClass, AddressPolicy, MAX_TCP_CANDIDATES, MAX_UDP_HOST_CANDIDATES,
-};
+use remote_host_protocol::relay::{AddressClass, AddressPolicy, MAX_UDP_HOST_CANDIDATES};
 
 use super::interfaces::InterfaceAddress;
 
@@ -62,107 +60,28 @@ pub(crate) fn is_candidate(candidate: SocketAddr, policy: &AddressPolicy) -> boo
     candidate.port() != 0 && HostTier::of(candidate.ip(), policy).is_some()
 }
 
-/// A's candidates for one answer.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Gathered {
-    pub(crate) udp: Vec<SocketAddr>,
-    pub(crate) tcp: Vec<SocketAddr>,
-}
-
-/// A's candidates for one answer, from the bound UDP sockets and TCP
-/// listeners and the `advertised` TCP candidates (see
-/// [`advertised_candidates`]). `enumerate` runs once, and only when a socket
-/// or listener is bound, so a gateway with nothing bound never walks its
-/// interfaces.
+/// A's candidates for one answer, from the bound UDP sockets. `enumerate`
+/// runs only when a socket is bound, so a gateway with nothing bound never
+/// walks its interfaces.
 pub(crate) fn gather(
-    udp: &[SocketAddr],
-    tcp: &[SocketAddr],
-    advertised: &[SocketAddr],
+    bound: &[SocketAddr],
     policy: &AddressPolicy,
     enumerate: impl FnOnce() -> Vec<InterfaceAddress>,
-) -> Gathered {
-    if udp.is_empty() && tcp.is_empty() {
-        return Gathered::default();
-    }
-    let interfaces = enumerate();
-    Gathered {
-        udp: host_candidates(udp, policy, &interfaces),
-        tcp: tcp_candidates(tcp, advertised, policy, &interfaces),
-    }
-}
-
-/// Why A never offers a configured advertised TCP address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unoffered {
-    /// Its address has no class.
-    NotACandidate,
-    /// [`MAX_TCP_CANDIDATES`] other advertised addresses come before it.
-    OverCap,
-}
-
-/// The configured advertised TCP addresses A offers, canonical and without
-/// repeats, at most [`MAX_TCP_CANDIDATES`] in configuration order, and the
-/// index of each one it never offers, with the reason. A repeat of an
-/// offered address is neither.
-pub(crate) fn advertised_candidates(
-    configured: &[SocketAddr],
-    policy: &AddressPolicy,
-) -> (Vec<SocketAddr>, Vec<(usize, Unoffered)>) {
-    let mut offered: Vec<SocketAddr> = Vec::new();
-    let mut unoffered = Vec::new();
-    for (index, address) in configured.iter().enumerate() {
-        let address = AddressPolicy::canonical_socket_addr(*address);
-        if !is_candidate(address, policy) {
-            unoffered.push((index, Unoffered::NotACandidate));
-        } else if !offered.contains(&address) {
-            if offered.len() == MAX_TCP_CANDIDATES {
-                unoffered.push((index, Unoffered::OverCap));
-            } else {
-                offered.push(address);
-            }
-        }
-    }
-    (offered, unoffered)
-}
-
-/// A's TCP candidates while a listener is bound: the `advertised`
-/// candidates, then the addresses the bound listeners cover, ranked, at most
-/// [`MAX_TCP_CANDIDATES`] in all. The operator named the advertised ones,
-/// so the cap never drops them for a host address.
-fn tcp_candidates(
-    listening: &[SocketAddr],
-    advertised: &[SocketAddr],
-    policy: &AddressPolicy,
-    interfaces: &[InterfaceAddress],
 ) -> Vec<SocketAddr> {
-    if listening.is_empty() {
+    if bound.is_empty() {
         return Vec::new();
     }
-    let mut candidates: Vec<SocketAddr> = Vec::new();
-    for candidate in advertised
-        .iter()
-        .copied()
-        .chain(host_candidates(listening, policy, interfaces))
-    {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    candidates.truncate(MAX_TCP_CANDIDATES);
-    candidates
+    host_candidates(bound, policy, &enumerate())
 }
 
-/// The candidates of the sockets or listeners `bound` to: each usable
-/// interface address paired with the port of the bound address of its family
-/// that covers it, ranked best first and capped per kind.
+/// The candidates of the sockets `bound` to: each usable interface address
+/// paired with the port of the bound address of its family that covers it,
+/// ranked best first and capped per kind.
 fn host_candidates(
     bound: &[SocketAddr],
     policy: &AddressPolicy,
     interfaces: &[InterfaceAddress],
 ) -> Vec<SocketAddr> {
-    if bound.is_empty() {
-        return Vec::new();
-    }
     let mut ranked: Vec<(HostTier, SocketAddr)> = interfaces
         .iter()
         .filter(|address| {
@@ -258,7 +177,6 @@ mod tests {
 
     const V4_PORT: u16 = 40_004;
     const V6_PORT: u16 = 40_006;
-    const TCP_PORT: u16 = 40_010;
 
     fn address(interface: &str, ip: &str) -> InterfaceAddress {
         InterfaceAddress {
@@ -293,103 +211,12 @@ mod tests {
     #[test]
     fn nothing_bound_never_walks_the_interfaces() {
         let walked = std::cell::Cell::new(false);
-        let gathered = gather(&[], &[], &[socket("8.8.8.8", 443)], &policy(), || {
+        let gathered = gather(&[], &policy(), || {
             walked.set(true);
             vec![address("eth0", "192.168.1.2")]
         });
-        assert_eq!(gathered, Gathered::default());
+        assert!(gathered.is_empty());
         assert!(!walked.get());
-    }
-
-    #[test]
-    fn one_walk_serves_both_carriers() {
-        let walks = std::cell::Cell::new(0);
-        let listener = socket("0.0.0.0", TCP_PORT);
-        let gathered = gather(&sockets(), &[listener], &[], &policy(), || {
-            walks.set(walks.get() + 1);
-            vec![address("eth0", "192.168.1.2")]
-        });
-        assert_eq!(walks.get(), 1);
-        assert_eq!(
-            gathered,
-            Gathered {
-                udp: vec![socket("192.168.1.2", V4_PORT)],
-                tcp: vec![socket("192.168.1.2", TCP_PORT)],
-            }
-        );
-    }
-
-    #[test]
-    fn advertised_addresses_are_offered_canonical_once_and_up_to_the_cap() {
-        let configured = [
-            socket("8.8.8.8", 443),
-            parsed("[::ffff:8.8.4.4]:443"),
-            parsed("[fe80::1]:443"),
-            socket("8.8.8.8", 443),
-            socket("1.1.1.1", 443),
-            socket("1.0.0.1", 443),
-            socket("9.9.9.9", 443),
-            socket("8.8.4.4", 443),
-        ];
-        let (offered, unoffered) = advertised_candidates(&configured, &policy());
-        assert_eq!(
-            offered,
-            vec![
-                socket("8.8.8.8", 443),
-                socket("8.8.4.4", 443),
-                socket("1.1.1.1", 443),
-                socket("1.0.0.1", 443),
-            ]
-        );
-        assert_eq!(offered.len(), MAX_TCP_CANDIDATES);
-        assert_eq!(
-            unoffered,
-            vec![(2, Unoffered::NotACandidate), (6, Unoffered::OverCap)],
-            "a repeat of an offered address is neither offered again nor reported"
-        );
-    }
-
-    #[test]
-    fn tcp_candidates_need_a_bound_listener_and_advertised_ones_come_first() {
-        let interfaces = vec![
-            address("eth0", "192.168.1.2"),
-            address("eth0", "10.0.0.2"),
-            address("eth0", "2606:4700:1::1"),
-            address("eth0", "2606:4700:2::1"),
-        ];
-        let (advertised, _) = advertised_candidates(
-            &[socket("8.8.8.8", 443), socket("::ffff:10.0.0.2", TCP_PORT)],
-            &policy(),
-        );
-        assert!(
-            gather(&sockets(), &[], &advertised, &policy(), || interfaces
-                .clone())
-            .tcp
-            .is_empty(),
-            "no listener, no TCP candidate"
-        );
-
-        let listeners = [socket("0.0.0.0", TCP_PORT), socket("::", TCP_PORT)];
-        let tcp = gather(&[], &listeners, &advertised, &policy(), || interfaces).tcp;
-        assert_eq!(
-            tcp,
-            vec![
-                socket("8.8.8.8", 443),
-                socket("10.0.0.2", TCP_PORT),
-                socket("192.168.1.2", TCP_PORT),
-                socket("2606:4700:1::1", TCP_PORT),
-            ],
-            "advertised first, then the covered host addresses by rank, without repeats, capped"
-        );
-        assert_eq!(tcp.len(), MAX_TCP_CANDIDATES);
-    }
-
-    #[test]
-    fn a_specific_listener_covers_only_its_own_address() {
-        let interfaces = vec![address("eth0", "192.168.1.2"), address("eth1", "10.0.0.2")];
-        let listener = socket("192.168.1.2", TCP_PORT);
-        let tcp = gather(&[], &[listener], &[], &policy(), || interfaces).tcp;
-        assert_eq!(tcp, vec![listener]);
     }
 
     #[test]

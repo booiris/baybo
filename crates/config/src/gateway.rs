@@ -24,19 +24,6 @@ impl Default for DirectUdpConfig {
     }
 }
 
-/// `gateway.direct_tcp`: opt-in TCP listeners for direct carriers. The section
-/// has no default ports: the operator picks them, and forwards or advertises
-/// them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct DirectTcpConfig {
-    pub ipv4_bind: Option<SocketAddr>,
-    pub ipv6_bind: Option<SocketAddr>,
-    /// Addresses the gateway is reachable at from outside (a forwarded public
-    /// port), offered to the phone alongside its interface addresses.
-    pub advertised_addresses: Vec<SocketAddr>,
-}
-
 /// HTTP gateway configuration.
 ///
 /// The gateway runs two listeners:
@@ -72,9 +59,6 @@ pub struct GatewayConfig {
     /// force-exit watchdog kicks in.
     pub shutdown_grace_secs: u64,
     pub direct_udp: DirectUdpConfig,
-    /// Absent means no direct TCP listeners.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub direct_tcp: Option<DirectTcpConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -86,7 +70,6 @@ impl Default for GatewayConfig {
             cors_allowed_origins: Vec::new(),
             shutdown_grace_secs: 30,
             direct_udp: DirectUdpConfig::default(),
-            direct_tcp: None,
         }
     }
 }

@@ -322,7 +322,7 @@ impl GatewayServer {
 /// gateway for chat via the relay. The manager self-gates on the approved device
 /// row (idle until one is paired), reading the relay URL + admission key from it —
 /// there is no `relay` config block. While a binding exists it also runs the
-/// binding's direct carriers (`gateway.direct_udp` / `gateway.direct_tcp`). It
+/// binding's direct carriers (`gateway.direct_udp`). It
 /// installs its own rustls CryptoProvider (it owns the wss dial). Spawned alongside
 /// the other gateway managers so it rides the same `ShutdownSignal` + task tracker
 /// and is drained on shutdown.

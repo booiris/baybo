@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use baybo_config::{
-    BayboConfig, ConfigError, DirectTcpConfig, DirectUdpConfig, DiscordChannelConfig, LlmEntry,
-    LlmEntryName, LlmModelSpec, PermissionPolicy, ProxyConfig, TelegramChannelConfig,
+    BayboConfig, ConfigError, DirectUdpConfig, DiscordChannelConfig, LlmEntry, LlmEntryName,
+    LlmModelSpec, PermissionPolicy, ProxyConfig, TelegramChannelConfig,
 };
 use baybo_model::{ExternalAgentKind, ModelTier};
 
@@ -67,28 +67,10 @@ fn a_null_direct_udp_bind_leaves_that_family_off_across_a_rewrite() {
 }
 
 #[test]
-fn direct_tcp_is_opt_in_and_typed() {
-    assert_eq!(BayboConfig::default().gateway.direct_tcp, None);
-    let config = with_gateway(
-        r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:42124", "advertised_addresses": ["203.0.113.7:42124"] } }"#,
-    )
-    .unwrap();
-    assert_eq!(
-        config.gateway.direct_tcp,
-        Some(DirectTcpConfig {
-            ipv4_bind: Some(socket("0.0.0.0:42124")),
-            ipv6_bind: None,
-            advertised_addresses: vec![socket("203.0.113.7:42124")],
-        })
-    );
-}
-
-#[test]
 fn an_unparseable_direct_address_fails_to_load() {
     for gateway in [
         r#"{ "direct_udp": { "ipv4_bind": "0.0.0.0" } }"#,
-        r#"{ "direct_tcp": { "ipv4_bind": "localhost:42124" } }"#,
-        r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:1", "advertised_addresses": ["gw.example:1"] } }"#,
+        r#"{ "direct_udp": { "ipv4_bind": "localhost:42124" } }"#,
     ] {
         match with_gateway(gateway) {
             Err(ConfigError::Parse(_)) => {}
@@ -135,45 +117,6 @@ fn direct_carrier_validation_table() {
         (
             r#"{ "direct_udp": { "ipv6_bind": "[::ffff:0.0.0.0]:0" } }"#,
             Some("gateway.direct_udp.ipv6_bind"),
-        ),
-        (r#"{ "direct_tcp": {} }"#, Some("gateway.direct_tcp")),
-        (
-            r#"{ "direct_tcp": { "ipv4_bind": null, "ipv6_bind": null } }"#,
-            Some("gateway.direct_tcp"),
-        ),
-        (r#"{ "direct_tcp": { "ipv6_bind": "[::]:42123" } }"#, None),
-        (r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:0" } }"#, None),
-        (
-            r#"{ "direct_tcp": { "ipv6_bind": "0.0.0.0:42123" } }"#,
-            Some("gateway.direct_tcp.ipv6_bind"),
-        ),
-        (
-            r#"{ "direct_tcp": { "ipv6_bind": "[::ffff:192.168.1.2]:42123" } }"#,
-            Some("gateway.direct_tcp.ipv6_bind"),
-        ),
-        (
-            r#"{ "direct_tcp": { "ipv4_bind": "[::]:42124" } }"#,
-            Some("gateway.direct_tcp.ipv4_bind"),
-        ),
-        (
-            r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:42124", "advertised_addresses": ["203.0.113.7:42124", "[2001:db8::7]:42123", "192.168.1.10:42124"] } }"#,
-            None,
-        ),
-        (
-            r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:42124", "advertised_addresses": ["203.0.113.7:0"] } }"#,
-            Some("gateway.direct_tcp.advertised_addresses[0]"),
-        ),
-        (
-            r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:42124", "advertised_addresses": ["203.0.113.7:1", "0.0.0.0:42124"] } }"#,
-            Some("gateway.direct_tcp.advertised_addresses[1]"),
-        ),
-        (
-            r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:42124", "advertised_addresses": ["[::]:42124"] } }"#,
-            Some("gateway.direct_tcp.advertised_addresses[0]"),
-        ),
-        (
-            r#"{ "direct_tcp": { "ipv4_bind": "0.0.0.0:42124", "advertised_addresses": ["[::ffff:0.0.0.0]:42124"] } }"#,
-            Some("gateway.direct_tcp.advertised_addresses[0]"),
         ),
     ];
     for (gateway, rejected_field) in cases {

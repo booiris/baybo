@@ -78,7 +78,6 @@ pub enum LinkCarrier {
     Ipv6,
     Ipv4,
     Ipv4Punched,
-    Tcp,
 }
 
 /// How the carrier runtime answered an offer, spelled as the `direct_offer`
@@ -135,7 +134,6 @@ impl LinkCarrier {
             Self::Ipv6 => CarrierKind::Ipv6,
             Self::Ipv4 => CarrierKind::Ipv4,
             Self::Ipv4Punched => CarrierKind::Ipv4Punched,
-            Self::Tcp => CarrierKind::Tcp,
         }
     }
 }
@@ -148,7 +146,6 @@ impl From<CarrierKind> for LinkCarrier {
             CarrierKind::Ipv6 => Self::Ipv6,
             CarrierKind::Ipv4 => Self::Ipv4,
             CarrierKind::Ipv4Punched => Self::Ipv4Punched,
-            CarrierKind::Tcp => Self::Tcp,
         }
     }
 }
@@ -323,7 +320,6 @@ mod tests {
             CarrierKind::Ipv6,
             CarrierKind::Ipv4,
             CarrierKind::Ipv4Punched,
-            CarrierKind::Tcp,
         ] {
             let carrier = LinkCarrier::from(kind);
             assert_eq!(carrier.as_str(), kind.as_str());
