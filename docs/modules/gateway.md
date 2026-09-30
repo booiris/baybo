@@ -1131,7 +1131,8 @@ crates/gateway/
 │   │   ├── mod.rs           #   push dispatch fan-out
 │   │   └── web.rs           #   direct-mode device push bindings (/v1/push/*)
 │   ├── relay/               # the gateway's outbound A↔C relay control connection
-│   │   └── mod.rs
+│   │   ├── mod.rs
+│   │   └── dial.rs          #   RelayDialer — the only relay WS dial path (egress proxy + system trust roots)
 │   ├── channel/             # /v1/channel-ws WS server + /v1/blobs for sidecars, TUI, and web chat
 │   │   ├── mod.rs           #   module glue + re-exports; notes every SessionEvent is sent live 1:1 (no coalescing)
 │   │   ├── adapter.rs       #   Sidecar — SessionEvent→Frame translator + outbound pump; attaches to Channel

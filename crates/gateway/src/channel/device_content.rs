@@ -34,8 +34,7 @@ use snow::TransportState;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
 /// An outbound relay data leg (the gateway dialed C's `/content/host/{key}`).
-pub(crate) type RelayWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+pub(crate) use crate::relay::dial::RelayWs;
 
 use super::adapter::{FrameSink, FrameSource, Sidecar};
 use super::state::{LegDedup, WsChannelState};

@@ -22,6 +22,7 @@ use super::history::TuiHistoryStore;
 use super::session_resolver::ChannelSessionResolver;
 use crate::auth::{AdminAuthState, ChannelTokenTable};
 use crate::log_buffer::LogBuffer;
+use crate::relay::dial::RelayDialer;
 use crate::server::GatewayDeps;
 use baybo_channels::InboundDedup;
 use dashmap::DashMap;
@@ -118,6 +119,8 @@ pub struct WsChannelState {
     /// agent sees each upstream event exactly once. Sidecars that omit
     /// `platform_msg_id` opt out — every frame is admitted.
     pub inbound_dedup: Arc<InboundDedup>,
+    /// Dials the relay control connection and its data legs.
+    pub relay_dialer: RelayDialer,
 }
 
 impl WsChannelState {
@@ -156,6 +159,7 @@ impl WsChannelState {
                     .with_device_store(deps.stores.device.clone()),
             },
             inbound_dedup: Arc::clone(&deps.inbound_dedup),
+            relay_dialer: deps.relay_dialer.clone(),
         }
     }
 }

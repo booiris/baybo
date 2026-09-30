@@ -20,16 +20,10 @@ use std::time::Duration;
 
 use device_proto::pairing::{self, PairFrame};
 use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-use remote_host_protocol::REMOTE_API_KEY_HEADER;
 
 use super::device_pair::{PairTransport, PairingHostDeps, drive};
-
-type RelayWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+use crate::relay::dial::RelayWs;
 
 /// A relay host leg as a [`PairTransport`], so [`drive`] runs over it unchanged.
 struct RelayLegTransport(RelayWs);
@@ -84,18 +78,8 @@ async fn host_leg_once(
     rendezvous_id: &str,
 ) -> LegEnd {
     let url = remote_host_protocol::relay::pair_host_url(relay_url, rendezvous_id);
-    let req = match url.into_client_request() {
-        Ok(mut req) => match remote_api_key.parse() {
-            Ok(value) => {
-                req.headers_mut().insert(REMOTE_API_KEY_HEADER, value);
-                req
-            }
-            Err(e) => return LegEnd::Connect(format!("bad instance key header: {e}")),
-        },
-        Err(e) => return LegEnd::Connect(format!("bad relay url: {e}")),
-    };
-    let ws = match connect_async(req).await {
-        Ok((ws, _)) => ws,
+    let ws = match deps.relay_dialer.dial(&url, remote_api_key).await {
+        Ok(ws) => ws,
         Err(e) => return LegEnd::Connect(format!("host leg connect failed: {e}")),
     };
     let mut transport = RelayLegTransport(ws);
@@ -129,12 +113,9 @@ pub async fn host_pairing_leg(
     remote_api_key: &str,
     rendezvous_id: &str,
 ) -> Result<(), String> {
-    // `baybo device pair` calls this from the CLI process — outside the gateway
-    // daemon (whose own dialer installs the provider in `relay_content::spawn`) —
-    // and our graph enables both aws-lc-rs and ring, so install one before the wss
-    // dial below or connect_async panics. Idempotent: Err means one is already
-    // installed.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // Connect failures in a row; only the first of a streak is surfaced so a
+    // relay that stays unreachable doesn't flood the operator's terminal.
+    let mut connect_failures: u32 = 0;
     loop {
         // Keep whether this was a handshake abort (re-park now) or a connect
         // failure (back off) alongside the reason, so there is one source of truth.
@@ -142,8 +123,23 @@ pub async fn host_pairing_leg(
             match host_leg_once(deps, relay_url, remote_api_key, rendezvous_id).await {
                 LegEnd::Done => return Ok(()),
                 LegEnd::Handshake(reason) => (reason, true),
-                LegEnd::Connect(reason) => (reason, false),
+                LegEnd::Connect(reason) => {
+                    if connect_failures == 0 {
+                        tracing::warn!(
+                            egress = %deps.relay_dialer.describe(),
+                            error = %reason,
+                            "device pair: can't reach the relay; retrying"
+                        );
+                    } else {
+                        tracing::debug!(error = %reason, "device pair: relay still unreachable");
+                    }
+                    connect_failures = connect_failures.saturating_add(1);
+                    (reason, false)
+                }
             };
+        if handshake_abort {
+            connect_failures = 0;
+        }
 
         // Stop re-hosting once there's a terminal outcome: the slot is gone (a
         // successful pair consumed it, or it aged out) or either side has declined
