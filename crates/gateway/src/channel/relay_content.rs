@@ -870,10 +870,7 @@ mod tests {
     }
 
     fn no_carriers() -> RuntimeCarrierConfig {
-        RuntimeCarrierConfig {
-            udp: None,
-            tcp: None,
-        }
+        RuntimeCarrierConfig { udp: None }
     }
 
     /// A stand-in for C's `/control` route that hands each accepted connection
@@ -1059,7 +1056,6 @@ mod tests {
                     ipv4: Some("127.0.0.1:0".parse().unwrap()),
                     ipv6: None,
                 }),
-                tcp: None,
             };
             let mut runtime = CarrierRuntime::start(
                 &carrier,
@@ -1117,7 +1113,6 @@ mod tests {
                 ipv4: Some(udp),
                 ipv6: None,
             }),
-            tcp: None,
         };
         let (tg, shutdown, manager) = start_manager(&c, carrier).await;
 
@@ -1250,7 +1245,6 @@ mod tests {
                 ipv4: Some("127.0.0.1:0".parse().unwrap()),
                 ipv6: None,
             }),
-            tcp: None,
         };
         let shutdown = ShutdownSignal::new();
         let manager = tokio::spawn(run(state, carrier, shutdown.clone(), ControlTiming::FAST));

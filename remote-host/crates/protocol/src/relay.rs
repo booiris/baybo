@@ -94,13 +94,11 @@ pub const DIRECT_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_RELAY_NODE_ID_BYTES: usize = 128;
 /// Decode cap on the UDP host candidates of either side's sealed set.
 pub const MAX_UDP_HOST_CANDIDATES: usize = 8;
-/// Decode cap on the TCP candidates of a sealed answer.
-pub const MAX_TCP_CANDIDATES: usize = 4;
 /// Fixed plaintext length of every sealed offer, so its ciphertext length
 /// reveals nothing about the candidates.
 pub const SEALED_OFFER_PLAINTEXT_LEN: usize = 512;
 /// Fixed plaintext length of every sealed answer.
-pub const SEALED_ANSWER_PLAINTEXT_LEN: usize = 1024;
+pub const SEALED_ANSWER_PLAINTEXT_LEN: usize = 640;
 /// Cap on the combined length of a [`SealedCandidates`]' `n` and `enc`.
 pub const MAX_SEALED_CANDIDATES_BYTES: usize = 2048;
 /// Cap on a `POST /direct` request body, and on the response body P reads.
@@ -245,8 +243,8 @@ pub struct DirectOfferResponse {
     pub rendezvous: Option<UdpRendezvous>,
 }
 
-/// First framed record on every direct stream or TCP connection. The token is
-/// an availability gate; the Noise IK handshake that follows authenticates.
+/// First framed record on every direct QUIC stream. The token is an
+/// availability gate; the Noise IK handshake that follows authenticates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectOpen {
     pub token: DirectToken,

@@ -13,8 +13,6 @@
 //! - [`udp`]: each family's stable socket, rebound only on a persistent
 //!   receive error.
 //! - [`quic`]: QUIC admission and the connections and streams it admits.
-//! - [`tcp`]: the opt-in TCP listeners, their pre-authentication permits and
-//!   the sessions they accept.
 //! - [`session`]: the `DirectOpen` gate and the hand-off to the relay leg's
 //!   responders.
 //! - `phone` (tests only): the phone's end of a carrier, shared by the
@@ -31,5 +29,4 @@ pub(crate) mod punches;
 pub(crate) mod quic;
 pub(crate) mod runtime;
 pub(crate) mod session;
-pub(crate) mod tcp;
 pub(crate) mod udp;

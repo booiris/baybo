@@ -292,7 +292,7 @@ mod tests {
         let mut refused = links.tracked(
             NullSink { refuse: true },
             LegClass::Chat,
-            Some(CarrierKind::Tcp),
+            Some(CarrierKind::Ipv4),
         );
         assert!(refused.authenticated(&device(DEVICE)).is_err());
         assert!(links.snapshot().is_empty());
@@ -302,7 +302,8 @@ mod tests {
     fn legs_are_listed_under_the_device_noise_authenticated() {
         let links = DeviceLinks::new();
         let mut first = links.tracked(NullSink::default(), LegClass::Chat, Some(CarrierKind::Lan));
-        let mut second = links.tracked(NullSink::default(), LegClass::Chat, Some(CarrierKind::Tcp));
+        let mut second =
+            links.tracked(NullSink::default(), LegClass::Chat, Some(CarrierKind::Ipv4));
         first.authenticated(&device(OTHER)).unwrap();
         second.authenticated(&device(DEVICE)).unwrap();
         let ids: Vec<String> = links
@@ -317,7 +318,7 @@ mod tests {
         );
         assert_eq!(
             legs(&links, DEVICE),
-            [(LegClass::Chat, Some(CarrierKind::Tcp))]
+            [(LegClass::Chat, Some(CarrierKind::Ipv4))]
         );
     }
 

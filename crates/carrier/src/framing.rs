@@ -1,7 +1,7 @@
-//! Carrier-session framing. Every record on a direct QUIC stream or TCP
-//! connection is `u32be(len) ‖ bytes` with `len ≤ MAX_DIRECT_FRAME_BYTES`. The
-//! first record is the JSON [`DirectOpen`] preface; the Noise frames that
-//! follow use the same framing.
+//! Carrier-session framing. Every record on a direct QUIC stream is
+//! `u32be(len) ‖ bytes` with `len ≤ MAX_DIRECT_FRAME_BYTES`. The first record
+//! is the JSON [`DirectOpen`] preface; the Noise frames that follow use the
+//! same framing.
 
 use std::fmt;
 

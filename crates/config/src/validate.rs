@@ -9,7 +9,7 @@ use crate::browser::BrowserConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
-use crate::gateway::{DirectTcpConfig, DirectUdpConfig, GatewayConfig};
+use crate::gateway::{DirectUdpConfig, GatewayConfig};
 use crate::llm::LlmEntry;
 use crate::web_search::{MAX_RESULTS_CEILING, WebSearchConfig};
 use crate::workspace::WorkspaceConfig;
@@ -282,9 +282,6 @@ fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) 
         }
     }
     validate_direct_udp(&gateway.direct_udp, errors);
-    if let Some(tcp) = &gateway.direct_tcp {
-        validate_direct_tcp(tcp, errors);
-    }
 }
 
 /// Shape rules only. Address classes belong to the protocol crate's
@@ -296,27 +293,6 @@ fn validate_direct_udp(udp: &DirectUdpConfig, errors: &mut Vec<ValidationError>)
             "gateway.direct_udp",
             "needs ipv4_bind or ipv6_bind while enabled (set enabled=false to turn direct UDP off)",
         ));
-    }
-}
-
-fn validate_direct_tcp(tcp: &DirectTcpConfig, errors: &mut Vec<ValidationError>) {
-    validate_family_binds("gateway.direct_tcp", tcp.ipv4_bind, tcp.ipv6_bind, errors);
-    if tcp.ipv4_bind.is_none() && tcp.ipv6_bind.is_none() {
-        errors.push(ValidationError::new(
-            "gateway.direct_tcp",
-            "needs ipv4_bind or ipv6_bind (omit the section to turn direct TCP off)",
-        ));
-    }
-    for (i, address) in tcp.advertised_addresses.iter().enumerate() {
-        let field = format!("gateway.direct_tcp.advertised_addresses[{i}]");
-        if address.port() == 0 {
-            errors.push(ValidationError::new(field, "port must be > 0"));
-        } else if address.ip().to_canonical().is_unspecified() {
-            errors.push(ValidationError::new(
-                field,
-                "must name a reachable address, not an unspecified one",
-            ));
-        }
     }
 }
 

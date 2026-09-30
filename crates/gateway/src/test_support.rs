@@ -208,10 +208,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         admin_bind,
         cors_allowed_origins: Vec::new(),
         shutdown_grace: Duration::from_millis(250),
-        carrier: RuntimeCarrierConfig {
-            udp: None,
-            tcp: None,
-        },
+        carrier: RuntimeCarrierConfig { udp: None },
     };
 
     // Tests that need to observe router intake (e.g. the WS channel

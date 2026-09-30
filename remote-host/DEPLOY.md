@@ -174,14 +174,14 @@ CLIENT_IP_HEADERS=cf-connecting-ip
 
 ## Direct carriers (UDP rendezvous)
 
-A paired phone and its gateway move their traffic off the relay onto a **direct carrier** (QUIC over UDP, or TCP when the gateway opts in) whenever the network allows; the relay stays the path that always works. C only signals: it cannot read the addresses the two sides exchange, and never sees anything they send each other:
+A paired phone and its gateway move their traffic off the relay onto a **direct carrier** (QUIC over UDP) whenever the network allows; the relay stays the path that always works. C only signals: it cannot read the addresses the two sides exchange, and never sees anything they send each other:
 
 - **`POST /direct/{node}`** carries the phone's sealed offer, which is opaque to C. C forwards it to that node's gateway over its control connection and holds the POST (up to **3 s**) for the gateway's sealed answer. The route is admitted like every relay route (the per-IP limiter, then `x-remote-api-key`). Its responses are never cacheable:
   - `200` with the answer;
   - `404 no direct route` when the gateway is not connected, is not direct-capable, belongs to another key, or declines. The reasons are deliberately indistinguishable;
   - `504` when the gateway does not answer in time or its control connection ends;
   - `429` + `Retry-After` past **6 offers/min per (node, client IP)** (the client IP resolves the same way as the per-IP limiter's, `CLIENT_IP_HEADERS`), **30/min per node**, or **2 in-flight punches per node**; `503` + `Retry-After` when the gateway's control channel is full or C holds **4096** punches. These limits are fixed constants; the `RELAY_IP_*` limits apply on top.
-- **The UDP rendezvous** (optional) lets the two sides hole-punch through IPv4 NATs. When `UDP_PUBLIC_ADDR` is set, each forwarded offer gets a per-punch rendezvous: both sides register from the UDP socket their QUIC uses, and C tells each one the IPv4 mapping it observed for the other. C keeps this state per punch for **20 s** only. It replies once per registration, only to the sender, with a datagram shorter than the request, and never for an unknown punch or a wrong ticket, so the port can neither reflect nor amplify. Without `UDP_PUBLIC_ADDR`, offers are still forwarded: LAN, IPv6, public-IPv4 and TCP carriers work, and only hole-punched IPv4 does not.
+- **The UDP rendezvous** (optional) lets the two sides hole-punch through IPv4 NATs. When `UDP_PUBLIC_ADDR` is set, each forwarded offer gets a per-punch rendezvous: both sides register from the UDP socket their QUIC uses, and C tells each one the IPv4 mapping it observed for the other. C keeps this state per punch for **20 s** only. It replies once per registration, only to the sender, with a datagram shorter than the request, and never for an unknown punch or a wrong ticket, so the port can neither reflect nor amplify. Without `UDP_PUBLIC_ADDR`, offers are still forwarded: LAN, IPv6 and public-IPv4 carriers work, and only hole-punched IPv4 does not.
 
 To turn the rendezvous on:
 
@@ -210,7 +210,7 @@ baybo device pair --proxy-url wss://proxy.example.com \
 
 The gateway dials `--proxy-url` for pairing/control/content and POSTs keyless push to `--push-url`. Omit the flags to use `wss://proxy.baybo.space`, `https://push.baybo.space`, and the relay's default `guest` key (an ordinary admitted key on that proxy, not a special admission class). The `remote_api_key` must be admitted in the proxy's `remote_api_keys` table (see **Admission** above) and is sent only on relay legs. To change either endpoint for an already-paired device, re-pair with the new flags.
 
-Direct carriers need no pairing flag: the gateway advertises them on its control connection by itself (`gateway.direct_udp` in `baybo.json`, on by default; `gateway.direct_tcp`, opt-in), and C forwards offers only to a gateway that does. A gateway in a container needs host networking for direct UDP.
+Direct carriers need no pairing flag: the gateway advertises them on its control connection by itself (`gateway.direct_udp` in `baybo.json`, on by default), and C forwards offers only to a gateway that does. A gateway in a container needs host networking for direct UDP.
 
 ## Notes
 

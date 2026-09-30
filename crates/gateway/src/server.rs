@@ -325,10 +325,9 @@ impl GatewayServer {
 /// gateway for chat via the relay. The manager self-gates on the approved device
 /// row (idle until one is paired), reading the relay URL + admission key from it —
 /// there is no `relay` config block. While a binding exists it also runs the
-/// binding's direct carriers (`gateway.direct_udp` / `gateway.direct_tcp`). It
-/// dials through [`GatewayDeps::relay_dialer`]. Spawned alongside the other
-/// gateway managers so it rides the same `ShutdownSignal` + task tracker and is
-/// drained on shutdown.
+/// binding's direct carriers (`gateway.direct_udp`). It dials through
+/// [`GatewayDeps::relay_dialer`]. Spawned alongside the other gateway managers so
+/// it rides the same `ShutdownSignal` + task tracker and is drained on shutdown.
 pub fn spawn_relay_content(
     deps: &GatewayDeps,
     shutdown: ShutdownSignal,

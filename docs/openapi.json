@@ -10485,8 +10485,7 @@
           "lan",
           "ipv6",
           "ipv4",
-          "ipv4_punched",
-          "tcp"
+          "ipv4_punched"
         ]
       },
       "LinkClass": {

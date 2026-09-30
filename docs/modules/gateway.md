@@ -1203,7 +1203,7 @@ crates/gateway/
 ├── src/
 │   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, ConfigReloader, Sidecar*, …
 │   ├── config.rs            # RuntimeGatewayConfig (admin bind + shutdown grace + CORS + RuntimeCarrierConfig:
-│   │                        #   the direct carriers' binds, copied from gateway.direct_udp / direct_tcp);
+│   │                        #   the direct carriers' binds, copied from gateway.direct_udp);
 │   │                        #   admin_dial_addr (where a same-host client dials the admin listener)
 │   ├── server.rs            # GatewayDeps, AdminState, ChannelState, GatewayServer; build_admin_router
 │   │                        #   (admin TCP + co-hosted /v1/channel-ws + /v1/blobs subrouter)
@@ -1232,8 +1232,8 @@ crates/gateway/
 │   │   │                    #   offer (freshness + the process's replay cache), punches (allowed-IP sets,
 │   │   │                    #   authenticated punches), gather + interfaces (host candidates), probe (punching,
 │   │   │                    #   registration, probe routing), udp (per-family socket + rebind), quic (admission,
-│   │   │                    #   connections, streams), tcp (opt-in listeners, pre-auth + per-device permits),
-│   │   │                    #   session (DirectOpen gate + responder hand-off), phone (tests only: the
+│   │   │                    #   connections, streams), session (DirectOpen gate + responder hand-off),
+│   │   │                    #   phone (tests only: the
 │   │   │                    #   phone's end of a carrier, shared by the runtime tests and relay_e2e)
 │   │   ├── control.rs       #   ChannelControlRegistry (push control frames from outside the route task)
 │   │   ├── device_content.rs #  gateway side of a paired device's content (chat) session over the relay
@@ -1243,7 +1243,7 @@ crates/gateway/
 │   │   ├── links.rs         #   DeviceLinks, the link table: live legs by class + carrier, last direct offer
 │   │   ├── relay_content.rs #   the gateway's relay-content control side
 │   │   ├── relay_e2e.rs     #   cross-workspace E2E tests through a real C: the spliced relay path (pair +
-│   │   │                    #   content) and the direct carriers (offer, rendezvous, QUIC/TCP, revoke)
+│   │   │                    #   content) and the direct carriers (offer, rendezvous, QUIC, revoke)
 │   │   ├── relay_pair.rs    #   the relay host leg `baybo device pair` opens
 │   │   ├── route.rs         #   ws_handler + inbound loop (Subscribe/Message/ResolveApproval/…)
 │   │   ├── session_pulse.rs #   owner-channel dispatch observer → throttled Frame::SessionActivity

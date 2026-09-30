@@ -16,8 +16,6 @@ pub enum CarrierKind {
     Ipv4,
     /// QUIC through A's IPv4 NAT mapping, opened by a punch.
     Ipv4Punched,
-    /// A proven TCP address.
-    Tcp,
 }
 
 impl CarrierKind {
@@ -28,7 +26,6 @@ impl CarrierKind {
             Self::Ipv6 => "ipv6",
             Self::Ipv4 => "ipv4",
             Self::Ipv4Punched => "ipv4_punched",
-            Self::Tcp => "tcp",
         }
     }
 
@@ -116,12 +113,8 @@ mod tests {
             CarrierKind::Ipv6,
             CarrierKind::Ipv4,
             CarrierKind::Ipv4Punched,
-            CarrierKind::Tcp,
         ]
         .map(CarrierKind::as_str);
-        assert_eq!(
-            labels,
-            ["relay", "lan", "ipv6", "ipv4", "ipv4_punched", "tcp"]
-        );
+        assert_eq!(labels, ["relay", "lan", "ipv6", "ipv4", "ipv4_punched"]);
     }
 }
