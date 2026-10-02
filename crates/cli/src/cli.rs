@@ -946,6 +946,11 @@ pub enum GatewayCmd {
     },
     /// Print installation and runtime status of the service.
     Status,
+    /// Check that this binary can reach everything `start` needs, from
+    /// wherever it runs. `install` runs it under the service manager — which
+    /// may deny access the installing shell has — before writing a unit.
+    #[command(hide = true)]
+    Preflight,
     /// Inspect or rotate the auth token.
     Token {
         #[command(subcommand)]

@@ -16,13 +16,17 @@
 //! Sidecars register themselves with the channel registry from the WS
 //! route task when they connect.
 
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
 use baybo_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use baybo_config::BayboConfig;
-use baybo_gateway::installer::{self, InstallContext, ServiceInstaller};
+use baybo_gateway::installer::{
+    self, InstallContext, InstallerError, ServiceInstaller, ServiceStatus,
+};
 use baybo_gateway::{
     AdminToken, ChannelServer, ChannelSpawner, ChannelTokenTable, ClientIdentity, GatewayDeps,
     GatewayServer, RuntimeGatewayConfig, SidecarSupervisor, TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY,
@@ -56,8 +60,28 @@ impl baybo_janitor::BuildArtifactSource for BoardBuildArtifacts {
     }
 }
 
+/// How long the first probe may take with someone at the keyboard. macOS
+/// parks a background process inside `open()` while its permission dialog is
+/// up, and killing the probe early takes the dialog down with it — so this is
+/// time to read and answer it, not a performance budget.
+const PREFLIGHT_PROMPT_WAIT: Duration = Duration::from_secs(120);
+/// With nobody to answer a dialog, a probe that has not finished by now is
+/// not going to.
+const PREFLIGHT_UNATTENDED_WAIT: Duration = Duration::from_secs(30);
+/// How long `install` keeps re-checking after opening System Settings.
+const ACCESS_WAIT: Duration = Duration::from_secs(300);
+const ACCESS_POLL: Duration = Duration::from_secs(3);
+const ACCESS_POLL_WAIT: Duration = Duration::from_secs(10);
+/// Created and removed again in the workspace root to prove it is writable.
+const PREFLIGHT_PROBE_FILE: &str = ".baybo-preflight";
+
 /// Entry point — routes the parsed subcommand to the right handler.
 pub async fn run(cmd: GatewayCmd) -> anyhow::Result<()> {
+    // Before `load_config`, whose `exists()` check reads a permission denial
+    // as "no such file" — and would then say so.
+    if matches!(cmd, GatewayCmd::Preflight) {
+        return preflight().await;
+    }
     let config = boot::load_config().await?;
     let config = Arc::new(config);
 
@@ -73,6 +97,7 @@ pub async fn run(cmd: GatewayCmd) -> anyhow::Result<()> {
         GatewayCmd::Disable => disable(&config),
         GatewayCmd::Uninstall { yes: _ } => uninstall(&config).await,
         GatewayCmd::Status => status(&config),
+        GatewayCmd::Preflight => preflight().await,
         GatewayCmd::Token { cmd } => match cmd {
             GatewayTokenCmd::Show => token_show(&config).await,
             GatewayTokenCmd::Rotate { yes: _ } => token_rotate(&config).await,
@@ -87,7 +112,12 @@ fn make_installer(user_mode: bool) -> anyhow::Result<Box<dyn ServiceInstaller>> 
         .map_err(|e| anyhow::anyhow!("no installer for this platform: {e}"))
 }
 
+fn workspace_logs_dir(config: &BayboConfig) -> PathBuf {
+    baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).logs_dir()
+}
+
 fn install_context(
+    installer: &dyn ServiceInstaller,
     config: &BayboConfig,
     explicit_exec: Option<PathBuf>,
     run_as: Option<installer::ServiceUser>,
@@ -95,8 +125,7 @@ fn install_context(
     let exec_start = installer::resolve_exec_start(explicit_exec.as_deref())
         .map_err(|e| anyhow::anyhow!("cannot resolve executable path: {e}"))?;
     let config_path = resolve_install_config_path()?;
-    let log_dir =
-        baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).logs_dir();
+    let log_dir = installer.log_dir(&workspace_logs_dir(config));
     Ok(InstallContext {
         exec_start,
         config_path,
@@ -177,7 +206,8 @@ fn install_service(
         None
     };
     let installer = make_installer(!system)?;
-    let ctx = install_context(config, explicit_exec, run_as)?;
+    let ctx = install_context(installer.as_ref(), config, explicit_exec, run_as)?;
+    ensure_service_can_run(installer.as_ref(), &ctx)?;
     let path = installer
         .install(&ctx)
         .map_err(|e| anyhow::anyhow!("install failed: {e}"))?;
@@ -191,11 +221,109 @@ fn install_service(
     Ok(())
 }
 
-fn restart(_config: &BayboConfig) -> anyhow::Result<()> {
+/// Refuse to write a unit for a service that cannot start, and — where the
+/// platform can say why and what fixes it — walk the operator through it.
+///
+/// A unit installed anyway fails later and quietly: the service manager
+/// keeps respawning it, the install and enable both report success, and the
+/// first symptom is a paired phone that cannot send a message.
+fn ensure_service_can_run(
+    installer: &dyn ServiceInstaller,
+    ctx: &InstallContext,
+) -> anyhow::Result<()> {
+    let attended = std::io::stdin().is_terminal();
+    if attended && let Some(notice) = installer.preflight_notice() {
+        eprintln!("install: {notice}");
+    }
+    let wait = if attended {
+        PREFLIGHT_PROMPT_WAIT
+    } else {
+        PREFLIGHT_UNATTENDED_WAIT
+    };
+    let Err(err) = installer.preflight(ctx, wait) else {
+        return Ok(());
+    };
+    let InstallerError::Preflight { detail, remedy } = err else {
+        anyhow::bail!("install: preflight could not run: {err}");
+    };
+    eprintln!("install: {detail}");
+    let Some(remedy) = remedy else {
+        anyhow::bail!("not installed: the service would not be able to start");
+    };
+    eprintln!("\n{remedy}");
+    if !attended || !installer.open_access_settings(ctx) {
+        anyhow::bail!("not installed: fix the access above, then re-run `baybo gateway install`");
+    }
+    eprintln!(
+        "\nOpened System Settings and selected {} in Finder. Waiting for the grant \
+         (up to {} min; Ctrl-C to stop)…",
+        ctx.exec_start.display(),
+        ACCESS_WAIT.as_secs() / 60
+    );
+    let deadline = Instant::now() + ACCESS_WAIT;
+    while Instant::now() < deadline {
+        std::thread::sleep(ACCESS_POLL);
+        match installer.preflight(ctx, ACCESS_POLL_WAIT) {
+            Ok(()) => {
+                eprintln!("install: access granted");
+                return Ok(());
+            }
+            Err(InstallerError::Preflight { .. }) => continue,
+            Err(e) => anyhow::bail!("install: preflight could not run: {e}"),
+        }
+    }
+    anyhow::bail!("not installed: access was not granted in time; re-run `baybo gateway install`")
+}
+
+/// Turn "the manager accepted the start" into "the gateway is up", or an
+/// error that says where to look.
+fn confirm_started(installer: &dyn ServiceInstaller, config: &BayboConfig) -> anyhow::Result<()> {
+    installer.confirm_started().map_err(|e| {
+        let logs = installer.logs_hint(&installer.log_dir(&workspace_logs_dir(config)));
+        anyhow::anyhow!("{e}\nlogs: {logs}")
+    })
+}
+
+/// The service manager's view of the gateway, checked from where it runs.
+/// Exits non-zero with the OS's own error text, which `install` relays.
+async fn preflight() -> anyhow::Result<()> {
+    use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+
+    let explicit = std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from);
+    let path = explicit.clone().unwrap_or_else(default_config_file);
+    // Read it outright: `exists()` folds a privacy denial into "absent".
+    let config = match std::fs::read(&path) {
+        Ok(_) => BayboConfig::load_from_file(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("config {}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => {
+            BayboConfig::default()
+        }
+        Err(e) => anyhow::bail!("open {}: {e}", path.display()),
+    };
+    let root = PathBuf::from(&config.workspace.path);
+    probe_writable(&root)?;
+    println!(
+        "preflight ok: config {}, workspace {}",
+        path.display(),
+        root.display()
+    );
+    Ok(())
+}
+
+fn probe_writable(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+    let probe = dir.join(PREFLIGHT_PROBE_FILE);
+    std::fs::write(&probe, b"").map_err(|e| anyhow::anyhow!("write {}: {e}", probe.display()))?;
+    std::fs::remove_file(&probe).map_err(|e| anyhow::anyhow!("remove {}: {e}", probe.display()))
+}
+
+fn restart(config: &BayboConfig) -> anyhow::Result<()> {
     let installer = make_installer(true)?;
     installer
         .restart()
         .map_err(|e| anyhow::anyhow!("restart failed: {e}"))?;
+    confirm_started(installer.as_ref(), config)?;
     println!("gateway restarted");
     Ok(())
 }
@@ -209,12 +337,16 @@ fn disable(_config: &BayboConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn status(_config: &BayboConfig) -> anyhow::Result<()> {
+fn status(config: &BayboConfig) -> anyhow::Result<()> {
     let installer = make_installer(true)?;
     let status = installer
         .status()
         .map_err(|e| anyhow::anyhow!("status lookup failed: {e}"))?;
-    println!("{status:?}");
+    println!("{status}");
+    if matches!(status, ServiceStatus::Crashing { .. }) {
+        let logs = installer.logs_hint(&installer.log_dir(&workspace_logs_dir(config)));
+        println!("logs: {logs}");
+    }
     Ok(())
 }
 
@@ -238,6 +370,7 @@ async fn enable(config: &BayboConfig) -> anyhow::Result<()> {
     installer
         .enable()
         .map_err(|e| anyhow::anyhow!("enable failed: {e}"))?;
+    confirm_started(installer.as_ref(), config)?;
 
     println!("gateway enabled and started; token: {token}");
     Ok(())
