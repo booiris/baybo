@@ -42,6 +42,15 @@ pub enum InstallerError {
     #[error("systemd install requires a HOME directory; $HOME is not set")]
     NoHome,
 
+    /// The service manager could not run `baybo gateway preflight` to
+    /// completion — so the gateway it would supervise cannot start either.
+    #[error("{detail}")]
+    Preflight {
+        detail: String,
+        /// What the operator can do about it, when the installer can tell.
+        remedy: Option<String>,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -140,7 +149,7 @@ pub fn resolve_service_user(explicit: Option<&str>) -> Result<ServiceUser> {
 }
 
 /// Runtime status of the installed service.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceStatus {
     /// Unit file not present.
     NotInstalled,
@@ -150,8 +159,36 @@ pub enum ServiceStatus {
     Enabled,
     /// Enabled and currently running.
     Running,
+    /// Loaded and kept alive by the service manager, but every start exits.
+    ///
+    /// Distinct from `Running` on purpose: a supervised process in a restart
+    /// loop is still *registered* with its manager, and reading registration
+    /// as liveness is how a gateway that had exited 68 times in a row was
+    /// reported as running.
+    Crashing { last_exit: i32 },
     /// Something went wrong inspecting status.
     Unknown(String),
+}
+
+impl std::fmt::Display for ServiceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInstalled => {
+                write!(f, "not installed — run `baybo gateway install`")
+            }
+            Self::Installed => {
+                write!(f, "installed but not enabled — run `baybo gateway enable`")
+            }
+            Self::Enabled => write!(f, "enabled, not running"),
+            Self::Running => write!(f, "running"),
+            Self::Crashing { last_exit } => write!(
+                f,
+                "NOT running — the service manager keeps restarting it and it exits \
+                 every time (last exit code {last_exit})"
+            ),
+            Self::Unknown(reason) => write!(f, "unknown ({reason})"),
+        }
+    }
 }
 
 pub trait ServiceInstaller {
@@ -163,7 +200,64 @@ pub trait ServiceInstaller {
     fn disable(&self) -> Result<()>;
     fn uninstall(&self) -> Result<()>;
     fn status(&self) -> Result<ServiceStatus>;
+
+    /// Where the service's stdout/stderr land. The workspace's own log dir
+    /// unless the platform cannot reach it from the service manager.
+    fn log_dir(&self, workspace_logs: &Path) -> PathBuf {
+        workspace_logs.to_path_buf()
+    }
+
+    /// Where to tell the operator to look when the service will not start.
+    fn logs_hint(&self, log_dir: &Path) -> String {
+        log_dir.display().to_string()
+    }
+
+    /// Run `baybo gateway preflight` **as the service manager would run the
+    /// gateway** — same binary, same environment, same sandboxing — giving
+    /// it up to `wait` to finish.
+    ///
+    /// Probing from the installing shell proves nothing: that process
+    /// inherits the terminal's privileges, which are exactly the ones the
+    /// service will not have. The default is a no-op for managers that do
+    /// not narrow a process's access the way launchd's TCC attribution does.
+    fn preflight(&self, ctx: &InstallContext, wait: std::time::Duration) -> Result<()> {
+        let _ = (ctx, wait);
+        Ok(())
+    }
+
+    /// Said before `preflight` runs, when running it may put something on
+    /// the operator's screen they need to answer.
+    fn preflight_notice(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Open whatever OS settings grant the access `preflight` found missing.
+    /// Returns whether anything was opened — if not, there is nothing for
+    /// the operator to do in a UI and no point waiting on one.
+    fn open_access_settings(&self, ctx: &InstallContext) -> bool {
+        let _ = ctx;
+        false
+    }
+
+    /// After `enable` / `restart`: block until the service is demonstrably
+    /// up, or say why it is not. A manager accepting the start request is
+    /// not evidence the process stayed up.
+    fn confirm_started(&self) -> Result<()> {
+        std::thread::sleep(START_SETTLE);
+        match self.status()? {
+            ServiceStatus::Running => Ok(()),
+            other => Err(InstallerError::Other(format!(
+                "the service did not stay up: {other}"
+            ))),
+        }
+    }
 }
+
+/// How long a freshly started service must survive before it counts as up.
+/// Longer than both managers' restart delay (`RestartSec=2s` /
+/// `ThrottleInterval=2`), so a process that exits on boot has had time to be
+/// restarted at least once and show it.
+pub const START_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Return the installer for the current target OS, or
 /// [`InstallerError::Unsupported`] if no installer is compiled-in.

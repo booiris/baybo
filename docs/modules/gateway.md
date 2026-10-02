@@ -513,6 +513,13 @@ trait ServiceInstaller {
     fn disable(&self) -> Result<()>;
     fn uninstall(&self) -> Result<()>;
     fn status(&self) -> Result<ServiceStatus>;
+    // Defaulted — only launchd overrides the first four.
+    fn log_dir(&self, workspace_logs: &Path) -> PathBuf;
+    fn logs_hint(&self, log_dir: &Path) -> String;
+    fn preflight(&self, ctx: &InstallContext, wait: Duration) -> Result<()>;
+    fn preflight_notice(&self) -> Option<&'static str>;
+    fn open_access_settings(&self, ctx: &InstallContext) -> bool;
+    fn confirm_started(&self) -> Result<()>;
 }
 ```
 
@@ -596,6 +603,73 @@ stays reachable, just never by accident: `--run-as root`.
 Note `--system` is a no-op shape on macOS — `for_current_platform`
 returns the `LaunchdInstaller` either way, and a LaunchAgent already
 runs as the user. `run_as` is ignored there.
+
+### A service that cannot start is never reported as installed
+
+Every step of the old flow reported success for a gateway that had never
+run: `install` wrote the unit, `enable` loaded it, and `status` printed
+`Running` — while launchd had respawned it 68 times, each exiting
+`EX_CONFIG`. The first symptom was a paired phone that could not send a
+message. Four things close that gap, and the shell-vs-service distinction
+underlies all of them: **the installing shell has privileges the service
+does not**, so nothing checked from that shell says anything about the
+service.
+
+- **`status` reads liveness, not registration.** launchd's `status` parses
+  `launchctl print gui/<uid>/com.baybo.gateway`: a `pid` means `Running`;
+  no pid with a non-zero `last exit code` is `ServiceStatus::Crashing`.
+  `launchctl list` containing the label only proves the job is loaded, and
+  a job in a restart loop is loaded. Only fields one tab deep are read —
+  nested dicts repeat keys like `state` and `pid`. `status` prints a
+  sentence (and the log path when crashing), not the enum's `Debug`.
+- **`enable` / `restart` confirm the start** (`confirm_started`). launchd
+  compares its `runs` counter across a `START_SETTLE` window rather than
+  sampling a pid once: a crash-looping job HAS a pid on every respawn, so a
+  single sample can say yes to a gateway that never stays up. systemd's
+  default sleeps the same window and requires `is-active`.
+- **Service logs live in `~/Library/Logs/baybo`** on macOS
+  (`LaunchdInstaller::log_dir`), never the workspace. launchd opens
+  `StandardOutPath` / `StandardErrorPath` itself, before exec'ing baybo,
+  and a background job may not touch an external volume (or `~/Documents`,
+  `~/Desktop`, iCloud, a network share) without a TCC grant. With the
+  workspace there the job died `EX_CONFIG` before baybo ran and left no log
+  line anywhere — and granting baybo Full Disk Access does not fix it,
+  because it is launchd opening the file.
+- **`install` runs `baybo gateway preflight` under launchd first** and
+  refuses to write the unit if it fails. The probe is a one-shot job with
+  its own label (`com.baybo.gateway.preflight`), the gateway's exact
+  binary and environment, and logs in a temp dir; it reads the config
+  outright (`Path::exists` folds a privacy denial into "no such file", so
+  `load_config` would report a missing file) and creates and removes a file
+  in the workspace root. `preflight` is a hidden subcommand and is
+  dispatched before `load_config` for the same reason.
+
+The probe sees three TCC outcomes, and they need different handling:
+
+| What the probe does | Meaning | `install` says |
+|---|---|---|
+| exits 0 | allowed (or nothing protected) | proceeds |
+| exits with `Operation not permitted` | a decision exists and it is no | the Settings route (Files & Folders, or Full Disk Access), or move the workspace |
+| **hangs inside `open()`** | nobody has decided yet — macOS is showing a dialog and holds the call until it is answered | look for the dialog and click Allow; Settings as the fallback |
+
+The hang is why the first probe's wait is long when someone is at the
+keyboard (`PREFLIGHT_PROMPT_WAIT`, 120s): killing the probe takes the
+dialog down with it, and a short timeout would re-pop it on every retry.
+Clicking **Allow** on that dialog is enough — Full Disk Access is not
+required. Unattended (stdin not a TTY) the wait is 30s and a failure just
+exits with the remedy. Attended, after a denial `install` opens the Full
+Disk Access pane, reveals the binary in Finder so it can be dragged in,
+and re-probes until the grant lands. There is **no programmatic grant**:
+the TCC database is SIP-protected, `tccutil` can only reset, and only an
+MDM profile can pre-approve — so guiding the operator is the most an
+installer can do.
+
+A binary *itself* on an external volume hangs too, earlier — dyld is the
+one parked in `open()` — and surfaces the same way.
+
+Any TCC grant is attributed to the binary's code signature. Release
+binaries are currently ad-hoc signed, so an upgrade is a new identity and
+the grant may need repeating; a Developer ID signature would carry it.
 
 ### Service unit hardening — no restart-loop footgun
 
