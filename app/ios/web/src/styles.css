@@ -349,6 +349,17 @@ button {
   height: 1px;
   background: var(--color-line);
 }
+/* The paging affordance's slot: the pill and the in-flight ring swap inside
+   one fixed-height box, so starting a fetch never moves the rows under a
+   reader who is scrolling up into it (only the prepend commit, which the
+   anchor accounts for, changes the log's height). */
+.older-slot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 2rem;
+}
 /* Older-page paging: a small monochrome ring centered at the top of the log
    while the fetch is in flight — the send/work-spinner idiom, not a stray
    assistant bubble with a static ellipsis. */
@@ -451,11 +462,25 @@ html.retargeting #root { visibility: hidden; }
 /* Offscreen rows skip layout/paint and release their raster memory — the
    bulk of the ~1000x source-to-resident amplification that killed heavy
    threads. `auto` intrinsic-size locks to the real height once a row has
-   been measured, so scrollHeight only estimates on the first pass; the
-   follow pin's drift re-pin and the prepend/replace anchors absorb that. */
+   been laid out, but a row that has NEVER been laid out sits at the 160px
+   guess — and WebKit has no scroll anchoring, so when it scrolls in at the
+   top edge it snaps to its real height and shoves everything under the
+   reader by the difference (one jolt per row, -100..+3000px: the scroll-up
+   "whole page shakes"). Nothing written after the fact can hide that — the
+   snap is painted before any ResizeObserver/scroll handler sees it.
+
+   So no row is skippable before it has been laid out once: a row mounts
+   fully rendered (no `data-cv`), which also lets the prepend anchor read real
+   heights, and Transcript.tsx (`FRESH_ROW_SELECTOR`) stamps it `data-cv="done"`
+   two frames later, once WebKit has remembered its real size. The attribute
+   is set imperatively and React never renders it, so a re-render can't strip
+   it; a remounted node starts fresh again, which is exactly right. */
 .msg-group, .work-ladder {
   content-visibility: auto;
   contain-intrinsic-size: auto 160px;
+}
+.msg-group:not([data-cv="done"]), .work-ladder:not([data-cv="done"]) {
+  content-visibility: visible;
 }
 /* PAINT containment rides along with `content-visibility: auto` even while the
    row is on screen, and it clips to the row's box — so the two marks a row

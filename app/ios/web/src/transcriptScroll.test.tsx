@@ -772,3 +772,239 @@ describe("jump to a search hit's ordinal", () => {
     expect(ringedRowId()).toBeNull();
   });
 });
+
+/// The scroll-up "whole page shakes" fix, pinned at the seams jsdom can see.
+///
+/// The jolt itself is WebKit's: a row that has never been laid out sits at its
+/// `contain-intrinsic-size` guess and snaps to its real height as it crosses the
+/// top edge, and WebKit has no scroll anchoring to absorb it. None of that
+/// paints here. What CAN be held is the contract around it — a row mounts with
+/// no `data-cv` (so styles.css renders it fully) and is handed to
+/// `content-visibility: auto` only two frames later; one page per scroll-up
+/// gesture; a band a whole viewport tall; and an affordance whose box does not
+/// change size when a fetch starts.
+describe("scroll-up paging without the jolt", () => {
+  /// A frame clock the test advances by hand, so "two frames after mount" is a
+  /// statement rather than a race against `settle()`'s timers.
+  let frames = new Map<number, FrameRequestCallback>();
+  let nextFrameId = 1;
+  let realRaf: typeof window.requestAnimationFrame;
+  let realCancel: typeof window.cancelAnimationFrame;
+
+  function frame(): void {
+    act(() => {
+      const due = [...frames.values()];
+      frames = new Map();
+      for (const cb of due) cb(performance.now());
+    });
+  }
+
+  function cv(id: string): string | null {
+    return document.querySelector(`[data-row-id="${id}"]`)?.getAttribute("data-cv") ?? null;
+  }
+
+  function fetches(): number {
+    return posts().filter((p) => p.type === "fetchHistory").length;
+  }
+
+  describe("content-visibility hand-off", () => {
+    beforeEach(() => {
+      frames = new Map();
+      nextFrameId = 1;
+      realRaf = window.requestAnimationFrame;
+      realCancel = window.cancelAnimationFrame;
+      window.requestAnimationFrame = (cb: FrameRequestCallback): number => {
+        const id = nextFrameId++;
+        frames.set(id, cb);
+        return id;
+      };
+      window.cancelAnimationFrame = (id: number): void => {
+        frames.delete(id);
+      };
+    });
+
+    afterEach(() => {
+      window.requestAnimationFrame = realRaf;
+      window.cancelAnimationFrame = realCancel;
+    });
+
+    it("mounts rows fully rendered and retires them after two frames", async () => {
+      await open(60, 999);
+      const mounted = rowIds();
+      expect(mounted.length).toBeGreaterThan(0);
+      expect(mounted.every((id) => cv(id) === null)).toBe(true);
+
+      frame();
+      // One frame is not enough: WebKit has laid the row out but the pass that
+      // stamps it is still queued behind the frame that did.
+      expect(mounted.every((id) => cv(id) === null)).toBe(true);
+
+      frame();
+      expect(mounted.every((id) => cv(id) === "done")).toBe(true);
+    });
+
+    it("gives a prepended page its own two frames", async () => {
+      await open(60, 999);
+      frame();
+      frame();
+      const settled = rowIds();
+
+      await scrollTo(0);
+      const paged = rowIds().filter((id) => !settled.includes(id));
+      expect(paged.length).toBeGreaterThan(0);
+      expect(paged.every((id) => cv(id) === null)).toBe(true);
+      // Re-rendering never strips the stamp — React does not own the attribute.
+      expect(settled.every((id) => cv(id) === "done")).toBe(true);
+
+      frame();
+      expect(paged.every((id) => cv(id) === null)).toBe(true);
+      frame();
+      expect(paged.every((id) => cv(id) === "done")).toBe(true);
+    });
+
+    // A streaming reply commits every frame. Were a pass cancelled by the next
+    // commit, rows would never be retired while one streams; were a later pass
+    // to sweep up rows mounted after it was scheduled, those rows would skip
+    // their own layout frame.
+    it("lets an earlier pass finish across a later commit, without stamping the later rows", async () => {
+      await open(60, 999);
+      const first = rowIds();
+      frame();
+
+      await act(async () => {
+        window.baybo.userSent({ msgId: "pm-cv", text: "hi", attachments: [] });
+      });
+      expect(rowIds()).toContain("pm-cv");
+
+      frame();
+      expect(first.every((id) => cv(id) === "done")).toBe(true);
+      expect(cv("pm-cv")).toBeNull();
+
+      frame();
+      expect(cv("pm-cv")).toBe("done");
+    });
+  });
+
+  describe("one page per gesture", () => {
+    // A reservoir pop is synchronous, but its rows only reach the DOM on the
+    // next commit — and every scroll event in the band before then saw the same
+    // top-of-log position and popped another page. On device a fling's burst of
+    // events stacked page on page under the reader.
+    it("refuses a second trigger while a reservoir page is uncommitted", async () => {
+      await open(200, 999);
+      expect(rowIds()).toHaveLength(40);
+
+      act(() => {
+        window.dispatchEvent(new Event("touchstart"));
+        document.documentElement.scrollTop = 0;
+        // Same position, before React has committed the first page.
+        window.dispatchEvent(new Event("scroll"));
+        window.dispatchEvent(new Event("scroll"));
+        window.dispatchEvent(new Event("touchend"));
+      });
+      await settle();
+
+      expect(rowIds()).toHaveLength(90);
+      expect(fetches()).toBe(0);
+    });
+
+    it("pages again once the first page has committed", async () => {
+      await open(200, 999);
+      await scrollTo(0);
+      expect(rowIds()).toHaveLength(90);
+      await scrollTo(0);
+      expect(rowIds()).toHaveLength(140);
+    });
+  });
+
+  describe("the paging band", () => {
+    // A page asked for at the very top landed its scrollTop write while a fling
+    // was still running into the 0 clamp; a viewport of runway lands it on rows
+    // nobody is looking at yet.
+    it("is a whole viewport tall", async () => {
+      await open(200, 999);
+      expect(rowIds()).toHaveLength(40);
+
+      await scrollTo(VIEW + 10);
+      expect(rowIds()).toHaveLength(40);
+
+      await scrollTo(VIEW - 10);
+      expect(rowIds()).toHaveLength(90);
+    });
+
+    it("keeps its floor when the viewport is too short to measure", async () => {
+      Object.defineProperty(document.documentElement, "clientHeight", {
+        configurable: true,
+        get: () => 0,
+      });
+      await open(200, 999);
+
+      await scrollTo(100);
+      expect(rowIds()).toHaveLength(40);
+
+      await scrollTo(50);
+      expect(rowIds()).toHaveLength(90);
+    });
+  });
+
+  describe("the older-page affordance", () => {
+    function slot(): Element | null {
+      return document.querySelector(".chat-log > .older-slot");
+    }
+
+    // The pill and the in-flight ring swap inside one box, so starting a fetch
+    // never changes the log's height under a reader scrolling into it.
+    it("swaps the button and the spinner inside one slot", async () => {
+      await open(40, 999);
+      expect(slot()?.querySelector(".load-older")).not.toBeNull();
+      expect(document.querySelectorAll(".load-older")).toHaveLength(1);
+
+      await scrollTo(0);
+      expect(fetches()).toBe(1);
+      expect(slot()?.querySelector(".older-spinner")).not.toBeNull();
+      expect(slot()?.querySelector(".load-older")).toBeNull();
+      expect(document.querySelectorAll(".older-spinner")).toHaveLength(1);
+
+      await pushFrame({
+        kind: "history_page",
+        rows: items(910, 959),
+        oldest_ordinal: 910,
+        has_more: false,
+      });
+      expect(slot()).toBeNull();
+    });
+
+    it("leaves a reader at the newest edge alone, however short the thread", async () => {
+      // Pinned at the bottom of 12 rows, the viewport already sits inside the
+      // band — but nobody has asked for history yet.
+      await open(12, 999);
+      // jsdom fires no scroll event for the pin's own write; WebKit does.
+      await act(async () => {
+        window.dispatchEvent(new Event("scroll"));
+      });
+      await settle();
+      expect(document.documentElement.scrollTop).toBeLessThan(VIEW);
+      expect(fetches()).toBe(0);
+
+      await scrollTo(0);
+      expect(fetches()).toBe(1);
+    });
+
+    it("stops scroll-driven retries after a failed page; the pill still retries", async () => {
+      await open(40, 999);
+      await scrollTo(0);
+      expect(fetches()).toBe(1);
+
+      await pushFrame({ kind: "history_failed", error: "offline" });
+      await scrollTo(30);
+      await scrollTo(10);
+      expect(fetches()).toBe(1);
+
+      await act(async () => {
+        document.querySelector<HTMLButtonElement>(".load-older")?.click();
+      });
+      await settle();
+      expect(fetches()).toBe(2);
+    });
+  });
+});

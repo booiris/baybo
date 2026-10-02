@@ -470,6 +470,49 @@ in, so either side carrying it cancels the card. A reloaded notice keeps its
 step with no `tool_status` stays NEUTRAL — the old "ok" default painted every
 result-less call green.
 
+### Scroll-up paging and row containment
+
+Every `.msg-group` / `.work-ladder` is `content-visibility: auto` so offscreen
+rows release their rendering (the memory story above). The cost is that a row
+which has NEVER been laid out sits at its `contain-intrinsic-size` guess (160px)
+and, as it scrolls in, takes its real height in one frame. WebKit has no scroll
+anchoring, so everything under the reader moves by the difference — one jolt per
+row, from -100px to several thousand, alternating in sign as short and long rows
+come in. That is what a scroll up through history felt like once both the
+bounded mount and containment landed: the whole page shaking. Correcting it
+after the fact does not work. WebKit paints the snap before any ResizeObserver
+or scroll handler runs, so a JS anchor only adds a bounce back on the next
+frame (measured: more bad frames, not fewer).
+
+So a row is never skippable before it has been measured once. Rows mount with no
+`data-cv` and render fully (`:not([data-cv="done"])` → `visible`). That also
+gives the prepend anchor real heights to do its arithmetic on. Two frames after
+`document.fonts.ready`, Transcript stamps them `data-cv="done"`, and from then
+on `contain-intrinsic-size: auto` remembers their real size. The attribute is
+written imperatively and never by React, so a re-render keeps it and a remount
+(a compaction divider re-keys its row) starts the row fresh again. In a macOS
+WKWebView probe, the old CSS made 335 uncommanded shifts over a cold mount plus six 50-row pages,
+up to 2377px each; the new CSS made 0. Memory on the paging path stayed at the
+old level.
+
+The rest of paging is built not to move rows either:
+
+- **The band is a viewport tall** (`max(SCROLL_TOP_THRESHOLD_PX, clientHeight)`).
+  Paging at the very top made the prepend's scrollTop write land while a fling
+  was running into the 0 clamp or the rubber-band. A screen of runway lands the
+  page on rows nobody is looking at yet.
+- **Only a reader who has left the newest edge pages** (`!followRef`). Without
+  that, a thread under two screens tall would fetch a page on every open.
+- **A failed page latches scroll-driven paging off** (`pagingFailedRef`) until a
+  page lands or the connection turns over. Otherwise a fling through a
+  screen-tall band stacks one notice per scroll event. The pill still retries
+  on a tap.
+- **One page per gesture.** A reservoir pop is synchronous, so `loadOlder`
+  refuses while `prependAnchor` is armed (an uncommitted page).
+- **The pill and the in-flight ring share one fixed `.older-slot`**, so starting
+  a fetch changes no heights. An empty FINAL page still arms the anchor, because
+  retiring the slot moves the rows below it.
+
 ### Timestamps
 
 Every message row carries a **timestamp under its last bubble** (`.msg-time`), sided by
