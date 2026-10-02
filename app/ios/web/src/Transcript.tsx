@@ -203,10 +203,18 @@ const SAFETY_TICK_MS = 180_000;
 /// genuinely lost turn hold the composer hostage for twice as long.
 const AWAITING_MAX_MS = 30_000;
 
-/// How close to the top of the chat log (px) triggers a scroll-up fetch of the
-/// next older page. A small band so the load fires just before the user hits the
-/// very top, hiding the round-trip.
+/// Floor of the scroll-up paging band (px from the top). The band is really one
+/// viewport tall (see onScroll): paging at the very top meant the prepend's
+/// scrollTop write landed while a fling was running into the 0 clamp or the
+/// rubber-band, and threw the reader back by whatever the scroller travelled
+/// in between. A screen of runway lands it on rows nobody is looking at yet.
+/// This floor only matters for a viewport too short to measure.
 const SCROLL_TOP_THRESHOLD_PX = 64;
+
+/// Rows whose real height WebKit has not yet remembered — see the
+/// `content-visibility` block in styles.css for why a row must be laid out
+/// once before it may be skipped.
+const FRESH_ROW_SELECTOR = ".msg-group:not([data-cv]), .work-ladder:not([data-cv])";
 
 /// How close to the bottom of the chat log (px) still counts as "following" the
 /// newest edge. Within this band incoming rows / stream deltas keep the log
@@ -2031,6 +2039,9 @@ export function Transcript({
   // fetch. `loadingOlder` (state) drives the spinner; this ref is the race-free
   // gate.
   const pagingRef = useRef(false);
+  // The last backward page failed; scroll-driven paging holds off until a
+  // page lands or the connection turns over (see onScroll).
+  const pagingFailedRef = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
   // Set just before a scroll-up PREPEND so the layout effect can re-anchor the
   // viewport (prepending above the top would otherwise jump the scroll
@@ -2271,6 +2282,29 @@ export function Transcript({
       window.removeEventListener("touchcancel", up);
     };
   }, []);
+
+  // Hand every newly mounted row over to `content-visibility: auto` two frames
+  // after it was laid out at its real height (styles.css). Snapshot the rows
+  // NOW: one mounting after this pass was scheduled must still get its own two
+  // frames, or it would be skipped before its size was remembered. Passes are
+  // never cancelled on the next commit — a streaming reply commits every frame
+  // and would starve them.
+  // Waits for webfonts first: a row measured in the fallback face would
+  // remember the wrong height and snap again when it scrolls in. Keyed on
+  // `compactionPoints` too — a divider landing re-keys (remounts) its row.
+  useEffect(() => {
+    const fresh = logRef.current?.querySelectorAll<HTMLElement>(FRESH_ROW_SELECTOR);
+    if (!fresh || fresh.length === 0) return;
+    // `fonts` is absent outside a real browser engine (jsdom).
+    const fontsReady: Promise<unknown> = "fonts" in document ? document.fonts.ready : Promise.resolve();
+    void fontsReady.then(() =>
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          for (const row of fresh) row.dataset.cv = "done";
+        }),
+      ),
+    );
+  }, [messages, compactionPoints]);
 
   // After a scroll-up PREPEND, restore the viewport so the content the user was
   // looking at stays put (the log is `flex-direction: column`, so inserting
@@ -2707,7 +2741,9 @@ export function Transcript({
   const prependOlder = useCallback((older: Row[], newOldest: number | null, more: boolean) => {
     flushRowOps();
     const anchorEl = scrollEl();
-    if (older.length > 0 && anchorEl) {
+    // An empty FINAL page still moves the rows: it retires the paging slot
+    // above them.
+    if ((older.length > 0 || !more) && anchorEl) {
       prependAnchor.current = {
         prevScrollHeight: anchorEl.scrollHeight,
         prevScrollTop: anchorEl.scrollTop,
@@ -2778,7 +2814,10 @@ export function Transcript({
   // `history_page` reply prepends in the frame switch (and clears the guards
   // there). `pagingRef` gates re-entry.
   const loadOlder = useCallback(() => {
-    if (pagingRef.current || !hasMoreOlder) return;
+    // An armed anchor is a page not yet committed: a reservoir pop is
+    // synchronous, so every scroll event in the band until React commits it
+    // would otherwise pop another.
+    if (pagingRef.current || prependAnchor.current || !hasMoreOlder) return;
     // Rows we already hold beat a round trip — and this is the safety net for a
     // reservoir the post-paint frame never drained (rAF is throttled while the
     // webview is hidden), which would otherwise re-fetch what is on disk and
@@ -2800,6 +2839,7 @@ export function Transcript({
         setLoadingOlder(false);
       }
     } catch (e) {
+      pagingFailedRef.current = true;
       pagingRef.current = false;
       setLoadingOlder(false);
       log("warn", `history page failed: ${String(e)}`);
@@ -3313,6 +3353,7 @@ export function Transcript({
         if (pending === null || pending.epoch !== connEpochRef.current) break;
         const rows = frame.rows.map(transcriptItemToRow).filter((r): r is Row => r !== null);
         prependOlder(rows, frame.oldest_ordinal ?? null, frame.has_more);
+        pagingFailedRef.current = false;
         pagingRef.current = false;
         setLoadingOlder(false);
         break;
@@ -3323,6 +3364,7 @@ export function Transcript({
         const pending = relayHistory.current;
         relayHistory.current = null;
         if (pending === null || pending.epoch !== connEpochRef.current) break;
+        pagingFailedRef.current = true;
         pagingRef.current = false;
         setLoadingOlder(false);
         log("warn", `history fetch failed: ${frame.error}`);
@@ -3422,6 +3464,7 @@ export function Transcript({
   const handleConnEpoch = (epoch: number) => {
     connEpochRef.current = epoch;
     relayHistory.current = null;
+    pagingFailedRef.current = false;
     pagingRef.current = false;
     setLoadingOlder(false);
     setConnEpoch(epoch);
@@ -3536,7 +3579,18 @@ export function Transcript({
         // never scroll the reader away — only fingers and explicit jumps do.
         el.scrollTop = el.scrollHeight;
       }
-      if (el.scrollTop <= SCROLL_TOP_THRESHOLD_PX) loadOlder();
+      // Only a reader who has left the newest edge is asking for history —
+      // under a pin the band would page a short thread at every open. And
+      // after a failed fetch, scrolling alone doesn't retry: the band is a
+      // screen tall, so one fling would stack a notice per scroll event. The
+      // pill still retries on tap; a new connection clears the latch.
+      if (
+        !followRef.current &&
+        !pagingFailedRef.current &&
+        el.scrollTop <= Math.max(SCROLL_TOP_THRESHOLD_PX, el.clientHeight)
+      ) {
+        loadOlder();
+      }
     };
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
@@ -3851,13 +3905,18 @@ export function Transcript({
   return (
     <ImageDimsContext.Provider value={imageDimsStore}>
       <div className="chat-log" ref={logRef}>
-        {loadingOlder && <div className="older-spinner" aria-hidden="true" />}
-        {hasMoreOlder && !loadingOlder && (
-          // Affordance for short threads that don't scroll (the onScroll path
-          // covers the rest). Tapping pages the next older slice.
-          <button className="load-older" onClick={() => loadOlder()}>
-            {t("chat.loadOlder")}
-          </button>
+        {(loadingOlder || hasMoreOlder) && (
+          <div className="older-slot">
+            {loadingOlder ? (
+              <div className="older-spinner" aria-hidden="true" />
+            ) : (
+              // Affordance for short threads that don't scroll (the onScroll
+              // path covers the rest). Tapping pages the next older slice.
+              <button className="load-older" onClick={() => loadOlder()}>
+                {t("chat.loadOlder")}
+              </button>
+            )}
+          </div>
         )}
         {renderRows.map((m) => {
           const row =
