@@ -6,6 +6,11 @@ import SwiftUI
 /// foreground, and by pull. Rows push a `ChatScreen`; the header's compose
 /// button (top-right) mints a session and enters it.
 struct ChatListScreen: View {
+    /// Bumped by `HomeTabView` on each tap of the ALREADY-selected Chats tab.
+    /// Every change steps the list down to the next row carrying unread — without
+    /// opening it and without marking anything read (`docs/chat-list.md`).
+    let reselectEpoch: Int
+
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var index = SessionIndex.shared
     @ObservedObject private var lang = Lang.shared
@@ -23,10 +28,24 @@ struct ChatListScreen: View {
     @State private var isRefreshing = false
     @State private var pullPeak: CGFloat = 0
     @State private var dragging = false
+    /// Where the unread walk last landed, keyed by `ChatListItem.id` — the only
+    /// stable handle over a list whose rows arrive, re-sort and leave between taps.
+    @State private var stepCursor: ChatListItem.ID?
+    /// The row wearing the arrival ring, and which tap put it there.
+    @State private var arrival: Arrival?
+
+    private struct Arrival: Equatable {
+        let id: ChatListItem.ID
+        let epoch: Int
+    }
 
     /// Clearance for the overlaid header: bar height + a breath. (The native tab
     /// bar's bottom inset is handled by the system, so no bottom margin here.)
     /// Shared with `ArchivedScreen`, whose header reuses this chrome.
+    ///
+    /// This screen spends it as a safe-area INSET rather than a content margin —
+    /// the two rest identically, but only an inset is visible to `scrollTo`. See
+    /// the call site, and `docs/chat-list.md`.
     static let topContentMargin: CGFloat = 58
     /// Top-overscroll (points) that, once released past it, fires a refresh.
     private static let pullThreshold: CGFloat = 72
@@ -62,6 +81,11 @@ struct ChatListScreen: View {
     ///
     /// Anything under ~300ms lands mid-teardown and is within noise of 0.
     private static let swipeDismissal: Duration = .milliseconds(660)
+    /// How long one unread step's scroll takes. Animated, because the gesture is
+    /// directional — "one more, downward" — and a cut says nothing about which way
+    /// it went. This is not the list's "every reshuffle snaps" rule above: that one
+    /// is about cells changing SLOT, not about the scroll view moving.
+    private static let stepScroll: Double = 0.22
 
     /// What the list renders: ordinary conversations plus one row per **cron
     /// group** (each scheduled job's fires, collapsed — `docs/cron-groups.md`).
@@ -104,6 +128,11 @@ struct ChatListScreen: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 Task { await refresh() }
+            } else if phase == .background {
+                // `.background`, not `.inactive`: pulling the notification shade
+                // down must not wipe a walk in progress. After real time away
+                // every new unread sorts above the cursor anyway.
+                resetWalk()
             }
         }
         // Popping back from a conversation to the list root: `.task` doesn't
@@ -134,6 +163,27 @@ struct ChatListScreen: View {
     }
 
     private func sessionList(_ items: [ChatListItem]) -> some View {
+        // The reader is only ever driven by the unread step; `ForEach` over
+        // `Identifiable` already registers `ChatListItem.id` with it, so no row
+        // needs an `.id()` of its own.
+        ScrollViewReader { proxy in
+            list(items)
+                .onChange(of: reselectEpoch) { _, epoch in
+                    stepToNextUnread(proxy: proxy, epoch: epoch)
+                }
+                .task(id: arrival) {
+                    guard arrival != nil else { return }
+                    // A CANCELLED sleep must not fall through to the clear:
+                    // `.task(id:)` cancels the outgoing mark's timer as the next
+                    // one arrives, and clearing there would retire its successor
+                    // on sight.
+                    do { try await Task.sleep(for: ArrivalRing.lifetime) } catch { return }
+                    arrival = nil
+                }
+        }
+    }
+
+    private func list(_ items: [ChatListItem]) -> some View {
         List {
             ForEach(items) { item in
                 switch item {
@@ -148,7 +198,14 @@ struct ChatListScreen: View {
         // glided anyway (UIKit holds the cell; see `swipeDismissal`), so the
         // animation only ever dressed up the programmatic `-baybo-demo-pin` path.
         .scrollContentBackground(.hidden)
-        .contentMargins(.top, Self.topContentMargin, for: .scrollContent)
+        // The header clearance is a safe-area INSET, not `.contentMargins(.top, …,
+        // for: .scrollContent)`. Both rest identically (measured: first row top
+        // 120pt either way), but a content margin is content PADDING and
+        // `scrollTo(anchor: .top)` aligns to the INSET — so under the margin an
+        // unread step landed its row at 62pt, under the 46pt bar and the top safe
+        // area. As an inset the same number puts a stepped row exactly where row
+        // one rests.
+        .safeAreaPadding(.top, Self.topContentMargin)
         .scrollBounceBehavior(.always)
         .onScrollGeometryChange(for: CGFloat.self) { geo in
             max(0, -(geo.contentOffset.y + geo.contentInsets.top))
@@ -179,6 +236,7 @@ struct ChatListScreen: View {
         } label: {
             SessionRowView(row: row, langCode: lang.current.lproj).equatable()
         }
+        .background { arrivalRing(for: row.id) }
         // CONSTANT background — the pinned tint lives in the row content
         // (see SessionRowView), so a pin flip is a pure move, not a
         // background-config swap that would blank the sliding row.
@@ -246,6 +304,7 @@ struct ChatListScreen: View {
         } label: {
             CronGroupRowView(group: group, langCode: lang.current.lproj).equatable()
         }
+        .background { arrivalRing(for: ChatListItem.cronGroup(group).id) }
         .listRowBackground(Theme.paper)
         .listRowSeparatorTint(Theme.line)
         .listRowInsets(
@@ -349,6 +408,47 @@ struct ChatListScreen: View {
         }
     }
 
+    /// One step of the unread walk, off a re-tap of the already-selected Chats tab.
+    ///
+    /// Refused mid-drag: a programmatic scroll would fight the finger, and it would
+    /// hand the hand-rolled pull its on-release check carrying a peak the user never
+    /// released. The cursor is left untouched so the next tap resumes rather than
+    /// skipping a row.
+    ///
+    /// `listItems` is re-derived here rather than captured from the body pass, so
+    /// publish/body ordering cannot hand the walk a stale array.
+    private func stepToNextUnread(proxy: ScrollViewProxy, epoch: Int) {
+        guard !dragging,
+            let target = ChatListBuckets.nextUnread(after: stepCursor, in: listItems)
+        else { return }
+        stepCursor = target
+        arrival = Arrival(id: target, epoch: epoch)
+        Haptics.tap()
+        // `.top` is the ONLY anchor `List` honours: measured on 26.5, `.center` and
+        // a hand-computed `UnitPoint` both degrade to "scroll the minimum that
+        // reveals the row", which leaves an already-visible target sitting exactly
+        // where it was. The clearance comes from the safe area instead — see
+        // `safeAreaPadding` on the list.
+        withAnimation(.easeOut(duration: Self.stepScroll)) {
+            proxy.scrollTo(target, anchor: .top)
+        }
+    }
+
+    private func resetWalk() {
+        stepCursor = nil
+        arrival = nil
+    }
+
+    @ViewBuilder private func arrivalRing(for id: ChatListItem.ID) -> some View {
+        if let arrival, arrival.id == id {
+            // The epoch is the REPLAY key: a repeat landing on the same row (the
+            // wrap onto the only unread row) is `Equatable`-identical, so without
+            // it the ring would not remount and the tap would look dropped. Same
+            // reason the transcript's jump ring replays off a nonce.
+            ArrivalRing().id(arrival.epoch)
+        }
+    }
+
     /// (Re-)start the toast's auto-dismiss — consecutive archives keep one
     /// toast alive and restart its clock.
     private func armUndoDismiss() {
@@ -404,6 +504,59 @@ struct ChatListScreen: View {
         } catch {
             NSLog("baybo: session list refresh: %@", bayboErrorText(error))
         }
+    }
+}
+
+/// The arrival mark: a transient ink ring around the row a Chats-tab re-tap just
+/// stepped to — the native port of the transcript's `.jump-ring`, so the app's two
+/// "you have arrived here" marks read as one beat.
+///
+/// An EDGE, not a ground. Every monochrome wash this palette can reach sits within
+/// ~9/255 of `pinnedRowTint`, so a tinted ground would disappear on exactly the rows
+/// a walk is most likely to visit, and anything darker reads as a SELECTED cell. No
+/// hue either: red is the destructive token, and a filled ink capsule in this row
+/// already means a COUNT.
+///
+/// A cell recycled and returned inside the mark's lifetime re-blooms. Accepted: the
+/// ringed row is the one just scrolled to, so it is on screen.
+private struct ArrivalRing: View {
+    @State private var lit = false
+    @State private var bloomed = false
+
+    private static let lineWidth: CGFloat = 1.5
+    /// How far the ring stays off the screen edge. It bleeds back out past the row's
+    /// content gutter, the way `pinnedRowTint` does.
+    private static let edgeInset: CGFloat = 10
+    /// Paper channel inside the row's own vertical padding.
+    private static let verticalInset: CGFloat = 4
+    private static let bloomScale: CGFloat = 1.03
+    private static let bloom: Double = 0.14
+    private static let hold: Duration = .milliseconds(560)
+    private static let fade: Double = 0.26
+
+    /// How long one mark lives, so the screen can release its state after it.
+    static let lifetime: Duration = hold + .milliseconds(Int(fade * 1000))
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+            .strokeBorder(Theme.ink, lineWidth: Self.lineWidth)
+            .padding(.horizontal, -(ChatListScreen.rowHInset - Self.edgeInset))
+            .padding(.vertical, Self.verticalInset)
+            .opacity(lit ? 1 : 0)
+            .scaleEffect(bloomed ? 1 : Self.bloomScale)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            // Driven from state on appear rather than a `.transition`: a transition
+            // inside a `List` row's background is not something to bet on.
+            .task {
+                withAnimation(.easeOut(duration: Self.bloom)) {
+                    lit = true
+                    bloomed = true
+                }
+                try? await Task.sleep(for: Self.hold)
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeIn(duration: Self.fade)) { lit = false }
+            }
     }
 }
 

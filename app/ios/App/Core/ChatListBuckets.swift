@@ -45,6 +45,16 @@ enum ChatListItem: Identifiable, Equatable {
         case .cronGroup(let group): group.pinned
         }
     }
+
+    /// What the row's badge shows — the conversation's own count, or the group's
+    /// sum over the fires drawn INSIDE it. One home for "does this row still want
+    /// the user", so the unread WALK and the drawn badge cannot answer it apart.
+    var unread: Int {
+        switch self {
+        case .chat(let row): row.unread
+        case .cronGroup(let group): group.unread
+        }
+    }
 }
 
 /// One scheduled job's fires, collapsed. Derived per render from the rows — it
@@ -156,9 +166,37 @@ enum ChatListBuckets {
         // The list's existing grain: pinned block first, then most recent. A
         // group sorts among the chats, not above or below them — it *is* a
         // conversation stream.
+        //
+        // The `id` tiebreak makes the order TOTAL. `Array.sorted(by:)` is not
+        // documented stable and the group half is appended while iterating a
+        // `Dictionary`, so two rows sharing `(pinned, lastActive)` had no defined
+        // relative order between two calls — and `nextUnread` walks each row
+        // exactly once, which an undefined order cannot support.
         return items.sorted {
             if $0.pinned != $1.pinned { return $0.pinned }
-            return $0.lastActive > $1.lastActive
+            if $0.lastActive != $1.lastActive { return $0.lastActive > $1.lastActive }
+            return $0.id < $1.id
         }
+    }
+
+    /// The row a re-tap of the Chats tab steps to: the first row carrying unread
+    /// STRICTLY AFTER `cursor` in the rendered order, wrapping back to the top.
+    ///
+    /// It WRAPS rather than stopping because the gesture deliberately does not
+    /// consume unread (`docs/chat-list.md`), so the walk can never end by
+    /// exhaustion — a terminal tap would leave an invisible gesture permanently
+    /// dead. And it is addressed by `id`, never by index: rows arrive, re-sort and
+    /// leave between taps, so a position is not a handle. A cursor whose row has
+    /// left the list restarts the walk from the top rather than guessing a slot.
+    static func nextUnread(after cursor: ChatListItem.ID?, in items: [ChatListItem])
+        -> ChatListItem.ID?
+    {
+        guard !items.isEmpty else { return nil }
+        let resume = cursor.flatMap { id in items.firstIndex { $0.id == id } }.map { $0 + 1 } ?? 0
+        for step in 0..<items.count {
+            let item = items[(resume + step) % items.count]
+            if item.unread > 0 { return item.id }
+        }
+        return nil
     }
 }

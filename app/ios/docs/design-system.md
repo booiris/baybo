@@ -192,6 +192,15 @@ deliberate line elements (the wordmark rule, focus). `--color-line-strong` also 
 neutral rule that needs more weight than a hairline (quote edges, dividers). **Never
 heavier than 1px** for the incidental case.
 
+**A 1.5px ink ring is the ARRIVAL mark.** `ChatListScreen`'s `ArrivalRing` (and the
+transcript's `.jump-ring`) — deliberate line elements, not incidental hairlines, which
+is why they sit above the 1px ceiling. It has to be an edge: a monochrome WASH is
+unavailable for a row-level transient state, because every one this palette can reach
+(`ink` at 0.035–0.05, `surface` #FAFAFA) is within ~9/255 of `pinnedRowTint` #F1F1F1
+and would vanish on a pinned row, while anything darker reads as a SELECTED cell.
+Hue is not an option either: red is the destructive token, and a filled ink capsule in
+a chat row already means a COUNT.
+
 ### Corners
 
 Always rounded — `--radius` / `Theme.radius` for cards/inputs, `--radius-pill` (SwiftUI:

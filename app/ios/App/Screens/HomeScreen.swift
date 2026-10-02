@@ -22,6 +22,9 @@ struct HomeTabView: View {
     /// Only for the Chats badge — the same rows the app icon counts.
     @ObservedObject private var index = SessionIndex.shared
     @State private var projectsWaiting = 0
+    /// Bumped once per tap on the ALREADY-selected Chats item. The shell reports
+    /// the GESTURE; `ChatListScreen` owns what it means (`docs/chat-list.md`).
+    @State private var chatsReselectEpoch = 0
 
     var body: some View {
         TabView(selection: searchAwareSelection) {
@@ -35,6 +38,13 @@ struct HomeTabView: View {
                     content(for: tab)
                 }
                 .badge(badge(for: tab))
+                // The step gesture's only disclosure — nothing on screen says
+                // "tap me again". Whether VoiceOver surfaces a hint on the
+                // tap-an-already-selected-tab path is unverified; see
+                // `docs/navigation.md`.
+                .accessibilityHint(
+                    Text(verbatim: lang.t("home.tab.chatsStepHint")),
+                    isEnabled: tab == .chats)
             }
         }
         .tint(Theme.ink)
@@ -68,10 +78,24 @@ struct HomeTabView: View {
     ///
     /// Scoped to the search edges, so every other tab switch keeps the system's
     /// Liquid Glass selection morph.
+    ///
+    /// The same setter is also the only hook for a **re-tap of the selected
+    /// item**: 26.5 ships no reselection API, but UIKit still runs
+    /// `_setSelectedViewControllerAndNotify:` for a tap on the already-selected
+    /// tab and SwiftUI's coordinator writes the binding from
+    /// `tabBarController(_:didSelect:)` regardless of change. Writing the
+    /// unchanged value back would only republish the shell (and both tab
+    /// badges) — `@Published` does not de-duplicate — and nothing reads it:
+    /// every `onChange(of:)` is equality-gated and `homeTab`'s `willSet` already
+    /// ignores re-entry.
     private var searchAwareSelection: Binding<AppStore.HomeTab> {
         Binding(
             get: { store.homeTab },
             set: { next in
+                guard next != store.homeTab else {
+                    if next == .chats { chatsReselectEpoch += 1 }
+                    return
+                }
                 guard next == .search || store.homeTab == .search else {
                     store.homeTab = next
                     return
@@ -91,7 +115,7 @@ struct HomeTabView: View {
             // reveal together on pop. Hiding the bar via `.toolbar(.hidden, for:
             // .tabBar)` from an inner stack instead pops it back in abruptly
             // AFTER the transition (the "bar missing then appears" glitch).
-            ChatListScreen()
+            ChatListScreen(reselectEpoch: chatsReselectEpoch)
         case .settings:
             section { SettingsScreen() }
         case .deck:
