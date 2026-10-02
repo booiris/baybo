@@ -65,6 +65,8 @@ pub struct PairingHostDeps {
     /// Persisted on the device row so the gateway's later relay control and data
     /// legs reuse it without a config block. Push does not carry this key.
     pub remote_api_key: String,
+    /// Dials the host leg (egress proxy + system trust roots).
+    pub relay_dialer: crate::relay::dial::RelayDialer,
 }
 
 /// Per-step receive timeout — a stalled peer must not pin a connection.
@@ -471,6 +473,7 @@ mod tests {
             relay_url: String::new(),
             push_url: "https://push.test".into(),
             remote_api_key: String::new(),
+            relay_dialer: crate::relay::dial::RelayDialer::direct(),
         };
         (deps, device_pairing)
     }

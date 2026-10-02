@@ -160,6 +160,12 @@ async fn pair(
         Some(url) => normalize_push_url(&url)?,
         None => remote_host_protocol::DEFAULT_PUSH_URL.to_string(),
     };
+    // Fail before showing a QR the phone can't complete: a malformed proxy
+    // setting or an unreadable trust store means no relay dial can succeed.
+    let relay_dialer = baybo_gateway::relay::dial::RelayDialer::new(ctx.proxy_settings());
+    relay_dialer
+        .ready()
+        .map_err(|e| CliError::Config(e.to_string()))?;
     let k = qr_encode(&remote_api_key);
     // `s=` is the 256-bit secret, hex-encoded; it is bearer credential material.
     // The whole payload is rendered as a QR only — never echoed to the terminal
@@ -199,6 +205,7 @@ async fn pair(
         relay_url: endpoint.clone(),
         push_url,
         remote_api_key: remote_api_key.clone(),
+        relay_dialer,
     };
     let mut host = {
         let (relay_url, key, rid) = (

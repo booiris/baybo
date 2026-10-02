@@ -19,6 +19,23 @@ Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `
 > working; add more bypass entries via `no_proxy`. The boot layer maps
 > `ProxyConfig` into the runtime `baybo_security::http::ProxySettings`. `proxy` is
 > **not** hot-reloadable — changing it rejects the reload (restart required).
+>
+> **Relay WebSockets.** The gateway's relay dials — the control connection, the
+> content / API / blob data legs, and the `baybo device pair` host leg — go
+> through `baybo_gateway::relay::dial::RelayDialer`, which performs the
+> WebSocket upgrade over a reqwest client. They therefore use the same proxy
+> handling (HTTP `CONNECT`, SOCKS) and the same system trust store as the HTTP
+> calls above. Without a `proxy` block, the dialer falls back to the ambient
+> `HTTPS_PROXY`, then `ALL_PROXY`, honouring `NO_PROXY`; loopback always stays
+> direct. A plain `ws://` relay is refused when an `http(s)` proxy would carry
+> it, because the proxy would see the leg key and admission key in the clear.
+> It still works through a SOCKS proxy or when its host is in `no_proxy`.
+> With `socks5h://`, the proxy resolves the relay host; with plain
+> `socks5://`, the gateway resolves it locally. Once a proxy applies, a failed
+> dial is reported as an error — it never retries directly — and credentials
+> are redacted from logs and errors. A malformed proxy URL disables relay dials,
+> and `baybo device pair` refuses to show a QR code, instead of connecting
+> directly. The proxy's own host must be resolvable, or given as an IP.
 
 > **MCP status note.** MCP server records do **not** live in `baybo.json`.
 > They live in `<workspace>/config/.mcp.json`, owned by `baybo-tools::mcp`
