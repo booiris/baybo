@@ -72,6 +72,9 @@ struct ProjectIssueScreen: View {
         }
         .sheet(item: $openRun) { route in
             ProjectRunSheet(route: route) { confirmingStop = true }
+                // Its transcript webview is its own; rebuilt with the others
+                // on a resume recycle (`recycleWebHostsIfStale`).
+                .id(appStore.webHostGeneration)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.hidden)
                 .presentationBackground(Theme.paper)

@@ -10,6 +10,7 @@ export const en = {
       compacting: "Compacting context…",
       compacted: "Context compacted",
       loadingThread: "Loading conversation…",
+      loadThreadFailed: "Couldn't load this conversation. Tap to retry.",
       htmlPreview: "HTML preview",
       loadingHtmlPreview: "Loading preview…",
       invalidHtmlPreview: "Invalid HTML preview blob id",

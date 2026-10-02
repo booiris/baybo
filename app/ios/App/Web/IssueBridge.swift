@@ -56,8 +56,9 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         switch type {
         case "issueReady", "ready":
             // No crash-budget re-arm here: surviving is proven by time between
-            // deaths (see the window reset in `contentProcessDied`), not by a
-            // load that may still re-explode.
+            // deaths (`CrashReloadBudget`), not by a load that may still
+            // re-explode.
+            WebLifecycleLog.note(.issue, "ready")
             ready = true
             let hadPending = !pending.isEmpty
             for js in pending { webView?.evaluateJavaScript(js) }
@@ -133,12 +134,12 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
 
     // MARK: - native → web
 
-    private static let maxConsecutiveDeaths = 3
-    private static let deathWindowSeconds: TimeInterval = 30
-    private var consecutiveDeaths = 0
-    private var lastDeathAt = Date.distantPast
+    /// See `CrashReloadBudget`: past the cap the page parks until a card opens
+    /// on it again or the app returns to the foreground.
+    private var crashBudget = CrashReloadBudget()
 
     func retarget(to next: IssueStore, targetId: String) {
+        reviveIfParked()
         if self.targetId == targetId, store === next { return }
         let previous = store
         store?.detach(self)
@@ -186,24 +187,28 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     }
 
     func contentProcessDied() {
-        // A visible card can recover by replaying its target after reload, but
-        // cap the loop when WebKit repeatedly crashes on the same content.
-        let now = Date()
-        if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds { consecutiveDeaths = 0 }
-        lastDeathAt = now
-        consecutiveDeaths += 1
-        guard consecutiveDeaths <= Self.maxConsecutiveDeaths else {
-            NSLog("baybo: issue web content process died again; giving up on reloads")
-            return
+        // A visible card recovers by replaying its target after the reload.
+        switch crashBudget.recordDeath() {
+        case .reload:
+            NSLog("baybo: issue web content process died; reloading")
+            WebLifecycleLog.note(.issue, "content process died; reloading")
+            rebuild()
+        case .park:
+            NSLog("baybo: issue web content process died again; parking until revived")
+            WebLifecycleLog.note(.issue, "content process died again; parked")
+            ready = false
+            pending.removeAll()
         }
-        guard let webView, let url = IssueHost.issueURL else { return }
-        NSLog("baybo: issue web content process died; reloading")
-        ready = false
-        pending.removeAll()
-        webView.load(URLRequest(url: url))
+    }
+
+    func reviveIfParked() {
+        guard crashBudget.revive() else { return }
+        WebLifecycleLog.note(.issue, "revived parked page")
+        rebuild()
     }
 
     private func eval(_ target: String, _ fn: String, _ jsonPayload: String) {
+        guard !crashBudget.parked else { return }
         let js = "window.\(target).\(fn)(\(jsonPayload));"
         if ready {
             webView?.evaluateJavaScript(js)

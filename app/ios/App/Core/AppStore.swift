@@ -276,6 +276,14 @@ final class AppStore: ObservableObject {
     static let maxResidentStores = 12
     private var transcriptHost: TranscriptHost?
     private var prewarmedDraftId: String?
+    /// When the scene last reached `.background`; consumed by the next
+    /// `didBecomeActive` to decide whether the warm webviews are recycled.
+    private var backgroundedAt: Date?
+    /// Bumped each time the warm webviews are replaced
+    /// (`recycleWebHostsIfStale`). Screens that hold a host for their whole
+    /// life key on it, so a screen showing the old webview is rebuilt around
+    /// the new one instead of keeping a torn-down view on screen.
+    @Published private(set) var webHostGeneration = 0
     /// The Deck tab's engine + its kept-warm shell webview, prewarmed once a
     /// binding reaches home and torn down with that binding.
     @Published private(set) var deckStore = DeckStore()
@@ -624,6 +632,8 @@ final class AppStore: ObservableObject {
     /// and re-subscribe cached chat stores so catch-up does not wait for a
     /// screen to reappear.
     func didBecomeActive() {
+        recycleWebHostsIfStale()
+        reviveParkedWebHosts()
         SessionIndex.shared.reconcileAppBadge()
         if !AppDelegate.hasToken {
             AppDelegate.registerForPush()
@@ -656,6 +666,101 @@ final class AppStore: ObservableObject {
             prewarmDeckHost()
             prewarmIssueHosts()
         }
+    }
+
+    /// The scene reached `.background` — the start of the suspension window
+    /// `recycleWebHostsIfStale` measures.
+    func didEnterBackground() {
+        backgroundedAt = Date()
+        WebLifecycleLog.note(.app, "background")
+    }
+
+    /// A suspension at least this long replaces every warm webview on return.
+    static let webHostRecycleInterval: TimeInterval = 5 * 60
+
+    /// `webHostRecycleInterval`, unless a DEBUG launch passes
+    /// `-baybo-web-recycle-after <seconds>` so the recycle can be driven on a
+    /// simulator without waiting out the real interval.
+    private static var effectiveWebHostRecycleInterval: TimeInterval {
+        #if DEBUG
+            let args = ProcessInfo.processInfo.arguments
+            if let flag = args.firstIndex(of: "-baybo-web-recycle-after"), flag + 1 < args.count,
+                let seconds = TimeInterval(args[flag + 1])
+            {
+                return seconds
+            }
+        #endif
+        return webHostRecycleInterval
+    }
+
+    /// After a long suspension, rebuild the transcript, deck and issue
+    /// webviews from scratch — what killing and relaunching the app does.
+    ///
+    /// iOS reclaims a suspended app's WebKit GPU and Networking processes under
+    /// memory pressure while leaving its WebContent processes alive. The page
+    /// never dies, so no termination callback fires and nothing reloads; WebKit
+    /// relaunches the GPU process on resume, but on device the surviving view
+    /// kept trying to reach the reclaimed one (`BERenderingVisibilitySink …
+    /// does not exist` on every attach) and every conversation the one shared
+    /// transcript webview was pointed at stayed white until the process was
+    /// killed. There is no public signal that those helpers died, so the
+    /// length of the suspension stands in for it. A fresh `WKWebView` brings
+    /// fresh process bindings; a reload of the old one would not.
+    ///
+    /// The rebuilt pages restore from the mirror / store exactly as a cold
+    /// launch would, so the cost is a document load per host.
+    private func recycleWebHostsIfStale() {
+        guard let since = backgroundedAt else { return }
+        backgroundedAt = nil
+        let suspended = Date().timeIntervalSince(since)
+        WebLifecycleLog.note(.app, "foreground after \(Int(suspended))s")
+        guard suspended >= Self.effectiveWebHostRecycleInterval, route == .home else { return }
+        WebLifecycleLog.note(.app, "recycling warm webviews")
+        recycleTranscriptHost()
+        if let old = _deckHost {
+            old.teardown()
+            _deckHost = DeckHost(store: deckStore)
+        }
+        issueHostPool.recycle()
+        webHostGeneration += 1
+    }
+
+    /// The pushed conversation (if any) gets a host aimed at its own store, so
+    /// the rebuilt ChatScreen's `retarget` is a same-store re-attach; otherwise
+    /// the new host is prewarmed on a fresh draft, as at launch.
+    private func recycleTranscriptHost() {
+        guard let old = transcriptHost else { return }
+        transcriptHost = nil
+        if case .session(let sessionId) = chatPath.last {
+            let fresh = transcriptHost(for: sessionId)
+            // A reader parked up in the history would otherwise land on the
+            // newest edge. The new page queues the call until its `init`.
+            old.bridge.captureReadingPosition { [weak fresh] position in
+                WebLifecycleLog.note(
+                    .transcript, position == nil ? "no reading position" : "reading position captured")
+                guard let position else { return }
+                fresh?.bridge.restoreReadingPosition(position)
+            }
+        } else {
+            prewarmTranscriptHost()
+        }
+        // The outgoing ChatScreen's `onDisappear` flushes the old page's
+        // debounced `persist` through the old bridge; keep its message handler
+        // installed long enough for that write to land in the mirror.
+        Task { @MainActor in
+            try? await Task.sleep(for: Self.recycledHostGrace)
+            old.teardown()
+        }
+    }
+
+    private static let recycledHostGrace: Duration = .seconds(2)
+
+    /// A parked crash-looping webview (`CrashReloadBudget`) gets one more
+    /// reload on every return to the foreground.
+    private func reviveParkedWebHosts() {
+        transcriptHost?.bridge.reviveIfParked()
+        _deckHost?.bridge.reviveIfParked()
+        issueHostPool.reviveParked()
     }
 
     /// The app is leaving the foreground. Every resident conversation's unsent

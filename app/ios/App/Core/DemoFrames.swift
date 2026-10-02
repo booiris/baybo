@@ -200,6 +200,10 @@
             // session's mirror, so pointing this at a real conversation
             // (`-baybo-open-session`) would overwrite one.
             guard sessionId == AppStore.debugSessionId else { return }
+            // Once per process: a screen rebuilt around a recycled webview
+            // re-appears, and a second canned REPLACE would land on top of
+            // whatever the rebuilt page just restored.
+            guard Self.demoIndexSeeded.insert(sessionId).inserted else { return }
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
                 let rows = Self.demoIndexRows()
@@ -603,6 +607,7 @@
             }
         }
         @MainActor private static var demoSwitchSeeded = Set<String>()
+        @MainActor private static var demoIndexSeeded = Set<String>()
 
         func startDemoFramesIfRequested() {
             guard ProcessInfo.processInfo.arguments.contains(Self.demoFramesArg) else { return }

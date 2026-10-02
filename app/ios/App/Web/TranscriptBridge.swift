@@ -96,6 +96,8 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     }
 
     func retarget(to newStore: any TranscriptTarget) {
+        reviveIfParked()
+        WebLifecycleLog.note(.transcript, store === newStore ? "reattach (ready=\(ready))" : "retarget (ready=\(ready))")
         if store === newStore {
             newStore.attachBridge(self)
         } else {
@@ -175,44 +177,85 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
         reloadDocument()
     }
 
-    /// How many back-to-back deaths `contentProcessDied` will answer with a
-    /// reload before giving up. The kill is memory pressure, and the reload
-    /// rebuilds the same footprint — with no cap, a page that dies on every
-    /// load flickers forever while hammering the gateway with mount-edge
-    /// syncs. Past the cap the transcript stays blank until the user backs
-    /// out or resyncs. The budget re-arms on TIME ONLY (a death landing more
-    /// than the window after the previous one resets the count) — never on a
-    /// paint. It originally re-armed on `shown`, and the white-flash flicker
-    /// loop sailed straight through the cap: each reload PAINTED (re-arming
-    /// the budget) and then re-exploded to the per-process jetsam limit within
-    /// ~1s, six kills in five seconds with the guard never firing.
-    private static let maxConsecutiveDeaths = 3
-    private static let deathWindowSeconds: TimeInterval = 30
-    private var consecutiveDeaths = 0
-    private var lastDeathAt = Date.distantPast
+    /// Back-to-back WebContent deaths, capped (see `CrashReloadBudget`). Past
+    /// the cap the page PARKS; `reviveIfParked` buys it one more reload on the
+    /// next user-driven edge.
+    private var crashBudget = CrashReloadBudget()
 
-    /// The WebContent process died under a VISIBLE webview — the one case
-    /// WebKit does NOT auto-reload (an offscreen kill heals itself on
-    /// re-attach: the reload's fresh `ready` re-inits and re-seeds). Without
-    /// this, `ready` stays latched true and every call() silently no-ops
-    /// against a blank page — the transcript is bricked until a resync or an
-    /// app restart. Same recovery as `rebuildIfShowing` minus the mirror drop:
-    /// the mirror is intact and IS what the fresh `ready`'s init restores
-    /// (which is also why `discardPersist` stays false here — a late persist
-    /// from the dead process carries the freshest pre-crash state, exactly
-    /// what the mirror should hold).
+    /// The WebContent process died. WebKit will not reload it for us — not
+    /// visible, and not offscreen either: implementing the delegate method that
+    /// lands here opts the view out of WebKit's automatic recovery (a probe
+    /// kept a killed offscreen view's pid at 0 through re-attach and window
+    /// toggles until it was reloaded by hand). Without this, `ready` stays
+    /// latched true and every call() silently no-ops against a blank page.
+    /// Same recovery as `rebuildIfShowing` minus the mirror drop: the mirror
+    /// is intact and IS what the fresh `ready`'s init restores (which is also
+    /// why `discardPersist` stays false here — a late persist from the dead
+    /// process carries the freshest pre-crash state, exactly what the mirror
+    /// should hold).
     func contentProcessDied() {
-        let now = Date()
-        if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds {
-            consecutiveDeaths = 0
+        switch crashBudget.recordDeath() {
+        case .reload:
+            NSLog("baybo: transcript web content process died; reloading")
+            WebLifecycleLog.note(.transcript, "content process died; reloading")
+            reloadDocument()
+        case .park:
+            NSLog("baybo: transcript web content process died again; parking until revived")
+            WebLifecycleLog.note(.transcript, "content process died again; parked")
+            park()
         }
-        lastDeathAt = now
-        consecutiveDeaths += 1
-        guard consecutiveDeaths <= Self.maxConsecutiveDeaths else {
-            NSLog("baybo: transcript web content process died again; giving up on reloads")
+    }
+
+    /// A parked page has no live document to talk to, so `call()` drops
+    /// instead of buffering: nothing would ever flush `pending`, and the reload
+    /// that ends the park re-inits from the store and mirror and re-runs the
+    /// mount sync, which re-derives everything a dropped call carried.
+    private func park() {
+        ready = false
+        pending.removeAll()
+        htmlPreviewMaximized = false
+    }
+
+    /// Where the reader is parked in this page's history, as the page's JSON
+    /// `ReadingPosition` — nil while they follow the newest edge, or when there
+    /// is no live page to ask. Read off a page about to be replaced
+    /// (`AppStore.recycleWebHostsIfStale`); its JS still runs even when its
+    /// paint is what broke.
+    func captureReadingPosition(_ done: @escaping (String?) -> Void) {
+        guard ready, !crashBudget.parked, let webView else {
+            done(nil)
             return
         }
-        NSLog("baybo: transcript web content process died; reloading")
+        webView.evaluateJavaScript(
+            "window.baybo && window.baybo.readingPosition ? window.baybo.readingPosition() : null"
+        ) { result, error in
+            if let error {
+                NSLog("baybo: reading position eval failed: %@", error.localizedDescription)
+                WebLifecycleLog.note(.transcript, "reading position eval failed")
+            }
+            done(result as? String)
+        }
+    }
+
+    /// Park the reader where a replaced page left them. The JSON is re-encoded
+    /// rather than spliced in as received, so only an object reaches the call.
+    func restoreReadingPosition(_ positionJson: String) {
+        guard let data = positionJson.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data),
+            object is [String: Any],
+            let clean = try? JSONSerialization.data(withJSONObject: object),
+            let literal = String(data: clean, encoding: .utf8)
+        else { return }
+        WebLifecycleLog.note(.transcript, "restoring reading position")
+        call("restoreReadingPosition", literal)
+    }
+
+    /// A user-driven edge (opening a conversation, returning to the
+    /// foreground): a parked page gets one more reload.
+    func reviveIfParked() {
+        guard crashBudget.revive() else { return }
+        NSLog("baybo: transcript reviving parked page")
+        WebLifecycleLog.note(.transcript, "revived parked page")
         reloadDocument()
     }
 
@@ -502,6 +545,7 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     }
 
     private func call(_ method: String, _ argumentLiteral: String) {
+        guard !crashBudget.parked else { return }
         let js = "window.baybo && window.baybo.\(method)(\(argumentLiteral));"
         guard ready, webView != nil else {
             pending.append(js)
@@ -586,6 +630,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
         switch type {
         case "ready":
             NSLog("baybo: transcript bridge ready (session=%@)", store?.sessionId ?? "?")
+            WebLifecycleLog.note(.transcript, "ready")
             ready = true
             deliverInit()
             flushPending()
@@ -611,6 +656,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // Deliberately NOT a crash-reload budget re-arm: a page can paint
             // and still re-explode moments later (the white-flash loop), so
             // surviving is proven by time between deaths, not by a paint.
+            if !contentVisible { WebLifecycleLog.note(.transcript, "shown") }
             contentVisible = true
         case "sync":
             // The one forward-recovery pull: the webview posts its cursor

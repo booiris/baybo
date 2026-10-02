@@ -57,6 +57,7 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
     private func handle(type: String, body: [String: Any]) {
         switch type {
         case "ready":
+            WebLifecycleLog.note(.deck, "ready")
             ready = true
             store?.bridgeBecameReady()
             for js in pending {
@@ -120,37 +121,42 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
     // MARK: native → web
 
     /// The transcript webview's crash-recovery twin (see
-    /// `TranscriptBridge.contentProcessDied`): a WebContent death under a
-    /// VISIBLE deck leaves `ready` latched and every eval a silent no-op —
-    /// bricked until app restart. Reload and let the fresh `ready` replay.
-    /// The 30s window bounds a crash storm: three reloads, then quiet until
-    /// the window lapses. Time-only re-arm — a load that reaches `ready` (or
-    /// paints) can still re-explode, which is exactly the loop the cap exists
-    /// for (see TranscriptBridge's budget note).
-    private static let maxConsecutiveDeaths = 3
-    private static let deathWindowSeconds: TimeInterval = 30
-    private var consecutiveDeaths = 0
-    private var lastDeathAt = Date.distantPast
+    /// `TranscriptBridge.contentProcessDied` and `CrashReloadBudget`): a
+    /// WebContent death leaves `ready` latched and every eval a silent no-op.
+    /// Reload and let the fresh `ready` replay; past the cap, park until a
+    /// user-driven edge revives it.
+    private var crashBudget = CrashReloadBudget()
 
     func contentProcessDied() {
-        let now = Date()
-        if now.timeIntervalSince(lastDeathAt) > Self.deathWindowSeconds {
-            consecutiveDeaths = 0
+        switch crashBudget.recordDeath() {
+        case .reload:
+            NSLog("baybo: deck web content process died; reloading")
+            WebLifecycleLog.note(.deck, "content process died; reloading")
+            reloadShell()
+        case .park:
+            NSLog("baybo: deck web content process died again; parking until revived")
+            WebLifecycleLog.note(.deck, "content process died again; parked")
+            ready = false
+            pending.removeAll()
         }
-        lastDeathAt = now
-        consecutiveDeaths += 1
-        guard consecutiveDeaths <= Self.maxConsecutiveDeaths else {
-            NSLog("baybo: deck web content process died again; giving up on reloads")
-            return
-        }
+    }
+
+    /// The deck tab appeared, or the app returned to the foreground.
+    func reviveIfParked() {
+        guard crashBudget.revive() else { return }
+        WebLifecycleLog.note(.deck, "revived parked page")
+        reloadShell()
+    }
+
+    private func reloadShell() {
         guard let webView, let url = DeckHost.deckURL else { return }
-        NSLog("baybo: deck web content process died; reloading")
         ready = false
         pending.removeAll()
         webView.load(URLRequest(url: url))
     }
 
     private func eval(_ fn: String, _ jsonPayload: String) {
+        guard !crashBudget.parked else { return }
         let js = "window.deckShell.\(fn)(\(jsonPayload));"
         if ready {
             webView?.evaluateJavaScript(js)

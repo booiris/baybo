@@ -403,6 +403,20 @@ button {
   border-top-color: transparent;
   animation: send-spin 0.7s linear infinite;
 }
+/* The empty thread's first page failed — `.thread-loading`'s slot and type,
+   but tappable: the retry it advertises also runs on its own backoff. */
+.thread-load-failed {
+  align-self: center;
+  margin-top: 1.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 0;
+  background: none;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-ink-soft);
+  cursor: pointer;
+  animation: delayed-in 160ms ease-out both;
+}
 /* Shared "appear only if you're still here" ramp — each caller sets its own
    delay (thread-loading 400ms, the send spinner 900ms): `both` holds opacity 0
    through the delay, so anything that unmounts inside it was never seen. */

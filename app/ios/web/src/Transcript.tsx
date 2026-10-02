@@ -26,6 +26,7 @@ import {
   revealAfterRetarget,
   subscribeTranscript,
   type OutlinePost,
+  type ReadingPosition,
   type UserSentPayload,
 } from "./bridge";
 import {
@@ -190,6 +191,13 @@ const SYNC_MERGE_LIMIT = 200;
 /// every 3 minutes, skipped when any frame arrived within the interval.
 /// Backstops a lost `gap` nudge and suspended-app windows.
 const SAFETY_TICK_MS = 180_000;
+
+/// Backoff for re-running a sync that FAILED while the thread has nothing to
+/// show (a conversation this device never rendered, opened offline or on a
+/// dead leg). Without it the empty thread waited for the safety tick — and the
+/// failure itself reset that tick's clock. The last step repeats until a page
+/// lands.
+const SYNC_RETRY_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000];
 
 /// Hard ceiling on the optimistic post-send run-state window (`awaitingReply`).
 /// A real turn clears it far sooner — via its first output or its terminal frame
@@ -2003,6 +2011,14 @@ export function Transcript({
     syncInFlight.current = inFlight;
     setSyncing(inFlight);
   }, []);
+  // The last sync failed and the thread had nothing to show — the empty state
+  // says so (with a retry) instead of leaving blank paper. Cleared by the next
+  // page; `syncRetry` holds the backoff timer that keeps trying meanwhile.
+  const [syncFailed, setSyncFailed] = useState(false);
+  const syncRetry = useRef<{ attempt: number; timer: number | undefined }>({
+    attempt: 0,
+    timer: undefined,
+  });
   // Highest ordinal already reported to native as read — dedupes the
   // fire-and-forget `mark_read` posts (the cursor advances on every sync and
   // every live reply while the transcript is on screen).
@@ -2116,7 +2132,13 @@ export function Transcript({
   // A search hit whose row is not loaded yet: the ordinal to reach and how many
   // more pages may be spent reaching it. A ref, not state — the loop is driven
   // by frames landing, and re-rendering on each step would buy nothing.
-  const pendingJump = useRef<{ ordinal: number; pagesLeft: number } | null>(null);
+  // `restoreOffset` marks a reading-position restore rather than a search jump:
+  // it parks the row at that offset, quietly, and gives up without a notice.
+  const pendingJump = useRef<{
+    ordinal: number;
+    pagesLeft: number;
+    restoreOffset?: number;
+  } | null>(null);
   const jumpSettleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(jumpSettleTimer.current), []);
 
@@ -2879,6 +2901,26 @@ export function Transcript({
     }
   }, [setSyncInFlight]);
 
+  const clearSyncRetry = useCallback(() => {
+    window.clearTimeout(syncRetry.current.timer);
+    syncRetry.current = { attempt: 0, timer: undefined };
+    setSyncFailed(false);
+  }, []);
+
+  const scheduleSyncRetry = useCallback(() => {
+    const retry = syncRetry.current;
+    window.clearTimeout(retry.timer);
+    const delay =
+      SYNC_RETRY_BACKOFF_MS[Math.min(retry.attempt, SYNC_RETRY_BACKOFF_MS.length - 1)];
+    retry.attempt += 1;
+    retry.timer = window.setTimeout(() => {
+      retry.timer = undefined;
+      runSync();
+    }, delay);
+  }, [runSync]);
+
+  useEffect(() => () => window.clearTimeout(syncRetry.current.timer), []);
+
   const advanceCursorFromSync = useCallback((nextCursor: number | null, rebased: boolean) => {
     cursorRef.current = advanceFromSync(cursorRef.current, nextCursor, rebased);
   }, []);
@@ -3087,7 +3129,11 @@ export function Transcript({
       log("warn", `unparseable frame: ${String(e)}`);
       return;
     }
-    lastFrameAt.current = Date.now();
+    // The synthesized failure replies prove nothing about the stream — counting
+    // them as traffic pushed the safety tick a whole interval further out.
+    if (frame.kind !== "sync_failed" && frame.kind !== "history_failed") {
+      lastFrameAt.current = Date.now();
+    }
     switch (frame.kind) {
       case "message": {
         const ordinal = typeof frame.ordinal === "number" ? frame.ordinal : null;
@@ -3335,6 +3381,7 @@ export function Transcript({
         }
         break;
       case "sync_page":
+        clearSyncRetry();
         applySyncPage(frame);
         break;
       case "sync_failed":
@@ -3342,6 +3389,12 @@ export function Transcript({
         // guard so the next trigger retries; the durable record is intact.
         setSyncInFlight(false);
         log("warn", `sync fetch failed: ${frame.error}`);
+        // A thread with rows keeps showing them and waits for the next edge;
+        // an empty one has nothing on screen, so say so and keep retrying.
+        if (messagesRef.current.length === 0) {
+          setSyncFailed(true);
+          scheduleSyncRetry();
+        }
         break;
       case "history_page": {
         // Backward paging (scroll-up) only — the reset-rebuild REPLACE is gone
@@ -3519,9 +3572,10 @@ export function Transcript({
     postOutlineHere(here);
   }, []);
 
-  // The one client loop's OPEN edge: run sync on mount (a resident re-entry —
-  // hydration-matrix cell E in the retired scheme — that fires no connEpoch
-  // edge still hydrates here). Safe to double with the connEpoch edge:
+  // The one client loop's OPEN edge: run sync on mount. Only a CROSS-session
+  // open mounts — the shared webview keeps the keyed tree across a same-session
+  // re-entry, whose catch-up rides the connEpoch native owes it instead
+  // (`ChatStore.connEpochOwed`). Safe to double with the connEpoch edge:
   // `syncInFlight` coalesces, and an empty difference is a no-op.
   useEffect(() => {
     runSync();
@@ -3612,6 +3666,8 @@ export function Transcript({
     handleOutlineLoadOlder,
     handleOutlineHereRequested,
     handleSyncRequested,
+    captureReadingPosition,
+    restoreReadingPosition,
   });
   handlersRef.current = {
     handleFrame,
@@ -3626,6 +3682,8 @@ export function Transcript({
     handleOutlineLoadOlder,
     handleOutlineHereRequested,
     handleSyncRequested,
+    captureReadingPosition,
+    restoreReadingPosition,
   };
   useEffect(
     () =>
@@ -3653,6 +3711,9 @@ export function Transcript({
         outlineLoadOlder: () => handlersRef.current.handleOutlineLoadOlder(),
         outlineHereRequested: () => handlersRef.current.handleOutlineHereRequested(),
         syncRequested: () => handlersRef.current.handleSyncRequested(),
+        readingPosition: () => handlersRef.current.captureReadingPosition(),
+        restoreReadingPosition: (position) =>
+          handlersRef.current.restoreReadingPosition(position),
       }),
     [],
   );
@@ -3700,7 +3761,8 @@ export function Transcript({
     const target = messagesRef.current.find((r) => rowCoverageOrdinal(r) === pending.ordinal);
     if (target !== undefined) {
       pendingJump.current = null;
-      jumpToMessage(target.id);
+      if (pending.restoreOffset !== undefined) parkRow(target.id, pending.restoreOffset);
+      else jumpToMessage(target.id);
       return;
     }
 
@@ -3734,8 +3796,69 @@ export function Transcript({
   }
 
   function giveUpPendingJump() {
+    const restoring = pendingJump.current?.restoreOffset !== undefined;
     pendingJump.current = null;
-    appendNotice(t("chat.jumpNotFound"));
+    // A restore that cannot find its row simply stays at the newest edge — the
+    // reader asked for nothing, so there is nothing to apologise for.
+    if (!restoring) appendNotice(t("chat.jumpNotFound"));
+  }
+
+  /// The reader's place, for a page about to be replaced: the first row whose
+  /// bottom is below the viewport's top edge, and where its top sits. Null
+  /// while following — the replacement lands on the newest edge by itself.
+  function captureReadingPosition(): ReadingPosition | null {
+    if (followRef.current) return null;
+    for (const el of document.querySelectorAll("[data-row-id]")) {
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom <= 0) continue;
+      const rowId = el.getAttribute("data-row-id") ?? "";
+      const row = messagesRef.current.find((r) => r.id === rowId);
+      return { rowId, ordinal: row ? rowCoverageOrdinal(row) : null, offset: rect.top };
+    }
+    return null;
+  }
+
+  function restoreReadingPosition(position: ReadingPosition) {
+    const present = messagesRef.current.some((r) => r.id === position.rowId);
+    if (present) {
+      parkRow(position.rowId, position.offset);
+      return;
+    }
+    if (position.ordinal === null) return;
+    pendingJump.current = {
+      ordinal: position.ordinal,
+      pagesLeft: JUMP_PAGE_BUDGET,
+      restoreOffset: position.offset,
+    };
+    advancePendingJump();
+  }
+
+  /// `jumpToMessage` without the ring, to an exact offset: put the row's top
+  /// `offset` px below the viewport's top edge. Deferred two frames so the
+  /// mount's own pin and the deferred head drain have run first, and re-seated
+  /// once after late layout (images, KaTeX) settles.
+  function parkRow(rowId: string, offset: number) {
+    clearTimeout(glideTimer.current);
+    glidingRef.current = false;
+    followRef.current = false;
+    const place = () => {
+      if (userTouchingRef.current) return;
+      const node = document.querySelector(`[data-row-id="${CSS.escape(rowId)}"]`);
+      const el = scrollEl();
+      if (node === null || el === null) return;
+      // Again, at the write: the mount's pin keeps landing in the follow band
+      // during the two frames this waited, and onScroll re-arms following
+      // there — the write would then read as drift and be pinned straight back.
+      followRef.current = false;
+      el.scrollTop += node.getBoundingClientRect().top - offset;
+    };
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        place();
+        clearTimeout(jumpSettleTimer.current);
+        jumpSettleTimer.current = setTimeout(place, JUMP_SETTLE_MS);
+      }),
+    );
   }
 
   function jumpToMessage(rowId: string) {
@@ -3974,6 +4097,19 @@ export function Transcript({
           <div className="thread-loading" aria-live="polite">
             {t("chat.loadingThread")}
           </div>
+        )}
+        {renderRows.length === 0 && !streaming && !turnActive && !syncing && syncFailed && (
+          // The first page failed (offline, or a leg that died under it) and a
+          // backoff retry is armed. Tapping retries now.
+          <button
+            className="thread-load-failed"
+            onClick={() => {
+              window.clearTimeout(syncRetry.current.timer);
+              runSync();
+            }}
+          >
+            {t("chat.loadThreadFailed")}
+          </button>
         )}
       </div>
     </ImageDimsContext.Provider>

@@ -113,13 +113,21 @@ has no `work_ended_at`) now costs one round trip per open and nothing on screen.
 (`ChatStore.requestSync`) fetches `GET …/sync` over the active leg and pushes a
 synthesized `sync_page` frame back.
 
-Clock edges — there are five:
+Clock edges — there are six:
 
-- mount (resident re-entry),
-- the `connEpoch` bump (`handleConnEpoch` — reconnect),
+- mount (a CROSS-session open remounts the keyed tree; a same-session re-entry
+  of the shared webview does not, and gets no mount edge),
+- the `connEpoch` bump (`handleConnEpoch` — reconnect). A reconnect claimed
+  while no page was attached is owed to the next `attachBridge`
+  (`ChatStore.connEpochOwed`) — that is the same-session re-entry's only way to
+  hear it,
 - a `gap` frame,
 - the offscreen-buffer-overflow re-attach (native `bridge.requestSync()`),
-- the 3-minute safety tick.
+- the 3-minute safety tick, which the synthesized `sync_failed` /
+  `history_failed` replies do not reset (they prove nothing about the stream),
+- the failed-empty retry: a `sync_failed` on a thread with no rows shows a
+  tap-to-retry line and re-runs the pull on `SYNC_RETRY_BACKOFF_MS`
+  (2s, 5s, 15s, then every 30s) until a page lands.
 
 `syncInFlight` coalesces a burst to one pull.
 

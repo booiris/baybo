@@ -37,8 +37,12 @@ struct RootView: View {
                                         store: store.chatStore(for: sessionId)
                                     )
                                     // The cross-session remount contract of the
-                                    // shared webview depends on this keying.
-                                    .id(sessionId)
+                                    // shared webview depends on this keying; the
+                                    // generation rebuilds the screen around a
+                                    // recycled host (`recycleWebHostsIfStale`).
+                                    .id(ChatScreenIdentity(
+                                        sessionId: sessionId,
+                                        webHostGeneration: store.webHostGeneration))
                                 case .archived:
                                     ArchivedScreen()
                                 case .cronGroup(let jobId):
@@ -218,4 +222,11 @@ struct RootView: View {
             store.confirmDeleteCronGroup = nil
         }
     }
+}
+
+/// What a pushed `ChatScreen` is keyed on: its conversation, and the warm
+/// transcript host it was built around.
+private struct ChatScreenIdentity: Hashable {
+    let sessionId: String
+    let webHostGeneration: Int
 }

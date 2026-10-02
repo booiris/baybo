@@ -9,6 +9,7 @@ export const zh: typeof en = {
       compacting: "正在压缩上下文…",
       compacted: "上下文已压缩",
       loadingThread: "对话加载中…",
+      loadThreadFailed: "对话加载失败，点按重试",
       htmlPreview: "HTML 预览",
       loadingHtmlPreview: "正在加载预览…",
       invalidHtmlPreview: "HTML 预览的 blob id 无效",

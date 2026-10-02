@@ -21,6 +21,19 @@ export type InitPayload = {
   expandUnansweredTail: boolean;
 };
 
+/// Where a reader parked up in the history is: the row at the top of the
+/// viewport and how far below the viewport's top edge it starts (negative once
+/// it has scrolled partly off). Carried from a page being replaced to its
+/// replacement (`AppStore.recycleWebHostsIfStale`).
+export type ReadingPosition = {
+  rowId: string;
+  /// The row's coverage ordinal, so the new page can page back for a row its
+  /// mirror window does not reach. Null for a row with none (an optimistic
+  /// bubble, a notice).
+  ordinal: number | null;
+  offset: number;
+};
+
 export type UserSentPayload = {
   msgId: string;
   text: string;
@@ -101,6 +114,13 @@ type BayboGlobal = {
   /// silently miss every user-authored hit. The thread pages backward on its own
   /// if the row is not loaded yet (see `JUMP_PAGE_BUDGET`).
   jumpToOrdinal(ordinal: number): void;
+  /// The reader's place, as a JSON `ReadingPosition`, or null while following
+  /// the newest edge (or before a tree is mounted). Read synchronously by
+  /// native through `evaluateJavaScript`'s result.
+  readingPosition(): string | null;
+  /// Park the reader where a replaced page left them. Quiet — no landing ring,
+  /// no notice when the row cannot be found.
+  restoreReadingPosition(position: ReadingPosition): void;
   /// The sheet's "load earlier" row — runs the transcript's own backward
   /// paging, which grows the outline when the prepend lands.
   outlineLoadOlder(): void;
@@ -646,6 +666,9 @@ export type TranscriptEvents = {
   outlineLoadOlder(): void;
   /// The index sheet is opening — answer with the reader's current position.
   outlineHereRequested(): void;
+  /// The reader's place right now (see `window.baybo.readingPosition`).
+  readingPosition(): ReadingPosition | null;
+  restoreReadingPosition(position: ReadingPosition): void;
 };
 
 type Buffered =
@@ -659,6 +682,7 @@ type Buffered =
   | { kind: "syncRequested" }
   | { kind: "jumpToMessage"; rowId: string }
   | { kind: "jumpToOrdinal"; ordinal: number }
+  | { kind: "restoreReadingPosition"; position: ReadingPosition }
   | { kind: "outlineLoadOlder" }
   | { kind: "outlineHereRequested" };
 
@@ -709,6 +733,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   // it. `bridge.test.ts` pins this.
   else if (item.kind === "jumpToMessage") e.jumpToMessage(item.rowId);
   else if (item.kind === "jumpToOrdinal") e.jumpToOrdinal(item.ordinal);
+  else if (item.kind === "restoreReadingPosition") e.restoreReadingPosition(item.position);
   else if (item.kind === "outlineLoadOlder") e.outlineLoadOlder();
   else if (item.kind === "outlineHereRequested") e.outlineHereRequested();
   else e.jumpToLatest();
@@ -820,6 +845,13 @@ window.baybo = {
   },
   jumpToOrdinal(ordinal) {
     dispatch({ kind: "jumpToOrdinal", ordinal });
+  },
+  readingPosition() {
+    const position = events?.readingPosition() ?? null;
+    return position === null ? null : JSON.stringify(position);
+  },
+  restoreReadingPosition(position) {
+    dispatch({ kind: "restoreReadingPosition", position });
   },
   outlineLoadOlder() {
     dispatch({ kind: "outlineLoadOlder" });

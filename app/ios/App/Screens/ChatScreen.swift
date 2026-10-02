@@ -252,7 +252,14 @@ struct ChatScreen: View {
             #endif
         }
         .onDisappear {
+            // Read BEFORE the detach clears it. A screen that no longer owns the
+            // conversation's bridge has been replaced by a screen for the SAME
+            // session (the resume recycle re-keys it) whose `onAppear` may
+            // already have run — leaving here would clear the foreground marker
+            // and the paste target the replacement just set.
+            let owned = store.isAttached(to: host.bridge)
             host.bridge.detachCurrent(store)
+            guard owned else { return }
             SessionIndex.shared.leaveSession(store.sessionId)
             ComposerPasteTarget.shared.detach(store.staging)
         }

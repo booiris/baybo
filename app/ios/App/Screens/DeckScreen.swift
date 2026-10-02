@@ -10,6 +10,9 @@ struct DeckScreen: View {
 
     var body: some View {
         DeckContent(deck: store.deckStore, host: store.deckHost())
+            // Rebuilt around a recycled shell (`recycleWebHostsIfStale`).
+            .id(store.webHostGeneration)
+            .onAppear { store.deckHost().bridge.reviveIfParked() }
     }
 }
 

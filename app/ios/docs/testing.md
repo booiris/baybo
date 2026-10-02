@@ -402,6 +402,16 @@ without touching `app/ios` at all.
   headlessly. A `sync_page` rather than live `message` frames on purpose: the
   wire's `Frame::Message` has no time field, so the sheet's clock and day key
   only exist on the reconstructed-row path.
+  Seeds once per process, so a screen rebuilt by the resume recycle does not
+  REPLACE the thread a second time on top of what it just restored.
+
+- **`-baybo-web-recycle-after <seconds>`** (DEBUG) shrinks the resume recycle's
+  five-minute threshold (`AppStore.webHostRecycleInterval`) so a home-button
+  round trip replaces the warm webviews. `WebHostRecycleUITests` drives it with
+  `-baybo-open-chat -baybo-demo-index`: it parks the reader in the history,
+  suspends, and asserts the rebuilt transcript both PAINTS (pixel sample) and
+  puts the reader back on the same row. Each run's lifecycle trail lands in the
+  container's `Library/Application Support/baybo/diagnostics/web-lifecycle.log`.
 
 - **`-baybo-demo-compose`** (DEBUG, with `-baybo-open-chat`) seeds the composer's
   staged strip with one pick of each state — a ready image thumbnail, a ready

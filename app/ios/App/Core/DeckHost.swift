@@ -51,9 +51,9 @@ final class DeckHost {
     }
 }
 
-/// The deck's whole navigation-delegate reason to exist: a visible-time
-/// WebContent death is the host's to recover (WebKit auto-reloads only
-/// offscreen views) — see `DeckBridge.contentProcessDied`.
+/// The deck's whole navigation-delegate reason to exist: a WebContent death is
+/// the host's to recover — implementing this method opts the view out of
+/// WebKit's own reload, visible or not. See `DeckBridge.contentProcessDied`.
 @MainActor
 private final class DeckNavigationPolicy: NSObject, WKNavigationDelegate {
     weak var bridge: DeckBridge?
