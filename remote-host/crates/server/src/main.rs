@@ -489,15 +489,11 @@ fn dashboard_token() -> Option<remote_host_dashboard::DashboardToken> {
 }
 
 /// Parse an env override, accepting only values `is_valid` passes. `None` (the
-/// caller's default applies) when the var is unset or blank — Compose passes
-/// `${VAR:-}` as the empty string — and, with a **warn**, when it is set to
-/// something unparseable or rejected, so a typo'd knob is self-diagnosing
-/// instead of silently falling back.
+/// caller's default applies) when the var is unset or blank ([`env_nonblank`]),
+/// and, with a **warn**, when it is set to something unparseable or rejected,
+/// so a typo'd knob is self-diagnosing instead of silently falling back.
 fn env_override<T: std::str::FromStr>(key: &str, is_valid: impl Fn(&T) -> bool) -> Option<T> {
-    let raw = std::env::var(key).ok()?;
-    if raw.trim().is_empty() {
-        return None;
-    }
+    let raw = env_nonblank(key)?;
     match raw.parse::<T>() {
         Ok(v) if is_valid(&v) => Some(v),
         _ => {
