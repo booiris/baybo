@@ -218,11 +218,20 @@ the line (`ChatStore.notice`'s setter clears the flag), and the visit retracts i
 `AppStore.recycleWebHostsIfStale`: a return to the foreground after at least
 `webHostRecycleInterval` (5 minutes) in the background replaces the shared
 transcript, deck and issue webviews with brand-new `WKWebView`s, and bumps
-`webHostGeneration`. Everything that shows a webview it does not get from those
-three is keyed on the generation instead, so it is rebuilt with its own: the
-pushed `ChatScreen` (`ChatScreenIdentity` — which also closes the subagent
-sheet presented over it, and that sheet's child transcript with it), the deck
-content, and the project-run sheet.
+`webHostGeneration`, which the deck content and the project-run sheet are keyed
+on so they are rebuilt with their own webview.
+
+A conversation ON SCREEN is double-buffered instead of torn down under the
+reader. The replacement is inserted BEHIND the old webview in the same
+container, loads there, has the reader's place restored, and only once it has
+both painted (`shown`) and settled the restore (`readingPositionSettled`) — or
+`transcriptSwapTimeout` passes — does `transcriptHostGeneration` bump. The
+pushed `ChatScreen` is keyed on that (`ChatScreenIdentity` — which also closes
+the subagent sheet presented over it, and that sheet's child transcript with
+it), so the reader sees one swap. The first device build swapped at once and
+read as heavy flicker: a blank, a newest-edge paint and a jump in quick
+succession. What remains is one frame where the reparented webview hides its
+tiles until its next commit.
 
 Re-keying the `ChatScreen` replaces it with a screen for the SAME session, and
 SwiftUI may run the new screen's `onAppear` before the old one's
@@ -235,7 +244,7 @@ page is torn down, native asks it for the row at the top of the viewport and
 its offset (`readingPosition`, null while following the newest edge) and hands
 that to the new page (`restoreReadingPosition`), which parks the row quietly —
 paging back for it if the mirror's window does not reach it, and staying at the
-newest edge if it cannot be found.
+newest edge if it cannot be found — then posts `readingPositionSettled`.
 
 Why: while an app is suspended, iOS reclaims its WebKit **GPU and Networking**
 processes and leaves the WebContent processes alive. Nothing terminates, so

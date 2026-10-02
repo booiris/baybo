@@ -68,6 +68,10 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     /// the webview can fade in rather than pop its content in as the chat
     /// screen slides on. Re-armed on every fresh page load (`ready`).
     @Published private(set) var contentVisible = false
+    /// A `restoreReadingPosition` on this page has finished (parked, or the
+    /// row could not be found). What a staged replacement waits for before it
+    /// is swapped in front of the reader.
+    @Published private(set) var readingPositionSettled = false
     /// An agent-authored HTML iframe is expanded over the transcript. Native
     /// hides its header/composer while true; the close control lives in the
     /// trusted parent document, never inside the untrusted iframe.
@@ -651,6 +655,9 @@ extension TranscriptBridge: WKScriptMessageHandler {
             store?.replayUnconfirmedSends(to: self)
             discardPersist = false
             htmlPreviewMaximized = false
+        case "readingPositionSettled":
+            WebLifecycleLog.note(.transcript, "reading position settled")
+            readingPositionSettled = true
         case "shown":
             // The transcript painted its first frame — fade the webview in.
             // Deliberately NOT a crash-reload budget re-arm: a page can paint

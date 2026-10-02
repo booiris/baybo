@@ -42,7 +42,7 @@ struct RootView: View {
                                     // recycled host (`recycleWebHostsIfStale`).
                                     .id(ChatScreenIdentity(
                                         sessionId: sessionId,
-                                        webHostGeneration: store.webHostGeneration))
+                                        transcriptHostGeneration: store.transcriptHostGeneration))
                                 case .archived:
                                     ArchivedScreen()
                                 case .cronGroup(let jobId):
@@ -228,5 +228,5 @@ struct RootView: View {
 /// transcript host it was built around.
 private struct ChatScreenIdentity: Hashable {
     let sessionId: String
-    let webHostGeneration: Int
+    let transcriptHostGeneration: Int
 }

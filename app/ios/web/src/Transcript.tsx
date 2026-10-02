@@ -25,6 +25,7 @@ import {
   retrySend,
   revealAfterRetarget,
   subscribeTranscript,
+  postReadingPositionSettled,
   type OutlinePost,
   type ReadingPosition,
   type UserSentPayload,
@@ -3800,7 +3801,8 @@ export function Transcript({
     pendingJump.current = null;
     // A restore that cannot find its row simply stays at the newest edge — the
     // reader asked for nothing, so there is nothing to apologise for.
-    if (!restoring) appendNotice(t("chat.jumpNotFound"));
+    if (restoring) postReadingPositionSettled();
+    else appendNotice(t("chat.jumpNotFound"));
   }
 
   /// The reader's place, for a page about to be replaced: the first row whose
@@ -3824,7 +3826,10 @@ export function Transcript({
       parkRow(position.rowId, position.offset);
       return;
     }
-    if (position.ordinal === null) return;
+    if (position.ordinal === null) {
+      postReadingPositionSettled();
+      return;
+    }
     pendingJump.current = {
       ordinal: position.ordinal,
       pagesLeft: JUMP_PAGE_BUDGET,
@@ -3856,7 +3861,10 @@ export function Transcript({
       requestAnimationFrame(() => {
         place();
         clearTimeout(jumpSettleTimer.current);
-        jumpSettleTimer.current = setTimeout(place, JUMP_SETTLE_MS);
+        jumpSettleTimer.current = setTimeout(() => {
+          place();
+          postReadingPositionSettled();
+        }, JUMP_SETTLE_MS);
       }),
     );
   }

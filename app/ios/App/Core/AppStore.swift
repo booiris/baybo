@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// The root state machine: unbound (landing / direct login / scan / pair
@@ -284,6 +285,13 @@ final class AppStore: ObservableObject {
     /// life key on it, so a screen showing the old webview is rebuilt around
     /// the new one instead of keeping a torn-down view on screen.
     @Published private(set) var webHostGeneration = 0
+    /// The transcript's own generation, which the pushed `ChatScreen` is keyed
+    /// on (`ChatScreenIdentity`). Separate from `webHostGeneration` because a
+    /// conversation on screen swaps only once its replacement is ready
+    /// (`swapTranscriptHostWhenSettled`), not at the moment of the recycle.
+    @Published private(set) var transcriptHostGeneration = 0
+    /// The staged replacement's wait, while one is in flight.
+    private var transcriptSwap: AnyCancellable?
     /// The Deck tab's engine + its kept-warm shell webview, prewarmed once a
     /// binding reaches home and torn down with that binding.
     @Published private(set) var deckStore = DeckStore()
@@ -725,28 +733,64 @@ final class AppStore: ObservableObject {
         webHostGeneration += 1
     }
 
-    /// The pushed conversation (if any) gets a host aimed at its own store, so
-    /// the rebuilt ChatScreen's `retarget` is a same-store re-attach; otherwise
-    /// the new host is prewarmed on a fresh draft, as at launch.
+    /// A conversation on screen is double-buffered: the replacement loads
+    /// BEHIND the old webview, is put back where the reader was, and only then
+    /// takes its place — one swap instead of a blank, a newest-edge paint and a
+    /// jump. With nothing on screen the new host is simply prewarmed on a fresh
+    /// draft, as at launch.
     private func recycleTranscriptHost() {
         guard let old = transcriptHost else { return }
-        transcriptHost = nil
-        if case .session(let sessionId) = chatPath.last {
-            let fresh = transcriptHost(for: sessionId)
-            // A reader parked up in the history would otherwise land on the
-            // newest edge. The new page queues the call until its `init`.
-            old.bridge.captureReadingPosition { [weak fresh] position in
-                WebLifecycleLog.note(
-                    .transcript, position == nil ? "no reading position" : "reading position captured")
-                guard let position else { return }
-                fresh?.bridge.restoreReadingPosition(position)
-            }
-        } else {
+        guard case .session(let sessionId) = chatPath.last, let stage = old.webView.superview
+        else {
+            transcriptHost = nil
             prewarmTranscriptHost()
+            transcriptHostGeneration += 1
+            retire(old)
+            return
         }
-        // The outgoing ChatScreen's `onDisappear` flushes the old page's
-        // debounced `persist` through the old bridge; keep its message handler
-        // installed long enough for that write to land in the mirror.
+        transcriptSwap?.cancel()
+        let fresh = TranscriptHost(store: chatStore(for: sessionId))
+        fresh.webView.frame = old.webView.frame
+        fresh.webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        stage.insertSubview(fresh.webView, belowSubview: old.webView)
+
+        // Nil until the old page answers: whether there is a place to restore
+        // at all decides what "settled" means.
+        let restoring = CurrentValueSubject<Bool?, Never>(nil)
+        old.bridge.captureReadingPosition { [weak fresh] position in
+            WebLifecycleLog.note(
+                .transcript, position == nil ? "no reading position" : "reading position captured")
+            if let position { fresh?.bridge.restoreReadingPosition(position) }
+            restoring.send(position != nil)
+        }
+        let settled = Publishers.CombineLatest3(
+            fresh.bridge.$contentVisible, fresh.bridge.$readingPositionSettled, restoring
+        )
+        .filter { visible, positioned, restoring in
+            guard visible, let restoring else { return false }
+            return !restoring || positioned
+        }
+        .map { _ in "settled" }
+        let timeout = Just("timed out").delay(
+            for: .seconds(Self.transcriptSwapTimeout), scheduler: DispatchQueue.main)
+        transcriptSwap = settled.merge(with: timeout).first()
+            .sink { [weak self] outcome in
+                WebLifecycleLog.note(.transcript, "swapped in rebuilt page (\(outcome))")
+                self?.transcriptHost = fresh
+                self?.transcriptHostGeneration += 1
+                self?.transcriptSwap = nil
+                self?.retire(old)
+            }
+    }
+
+    /// The longest a staged transcript may take to load and settle before it is
+    /// swapped in anyway.
+    private static let transcriptSwapTimeout: TimeInterval = 2
+
+    /// The outgoing ChatScreen's `onDisappear` flushes the old page's debounced
+    /// `persist` through the old bridge; keep its message handler installed long
+    /// enough for that write to land in the mirror.
+    private func retire(_ old: TranscriptHost) {
         Task { @MainActor in
             try? await Task.sleep(for: Self.recycledHostGrace)
             old.teardown()

@@ -253,6 +253,13 @@ export function postContentReady(): void {
   postSafe({ type: "shown" });
 }
 
+/// A `restoreReadingPosition` has finished — the row is parked and re-seated,
+/// or could not be found. Native holds a rebuilt page out of sight until this
+/// lands, so the reader sees one swap instead of a jump.
+export function postReadingPositionSettled(): void {
+  postSafe({ type: "readingPositionSettled" });
+}
+
 /// Run the one forward-recovery pull: native fetches
 /// `GET /v1/chat/sessions/{id}/sync?since_ordinal=…&limit=…` over the active
 /// leg and pushes the result back as a local `sync_page` frame (or
