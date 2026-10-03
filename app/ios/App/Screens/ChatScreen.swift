@@ -208,6 +208,7 @@ struct ChatScreen: View {
             ModelCatalog.shared.refreshIfNeeded()
             store.refreshModelPin()
             SessionIndex.shared.enterSession(store.sessionId)
+            store.markReadOnOpen()
             // The header entry's second source: the web side can only see the
             // rows it has loaded, and a spawn older than the current window is
             // invisible to it. One bounded request per open covers that; the

@@ -1133,10 +1133,11 @@ final class AppStore: ObservableObject {
     /// clears itself where it lives.
     func requestMarkGroupRead(_ sessionIds: [String]) {
         guard !sessionIds.isEmpty else { return }
-        SessionIndex.shared.clearUnread(sessionIds)
         Task {
             do {
-                try await Baybo.client.chatMarkManyRead(sessionIds: sessionIds)
+                try await SessionIndex.shared.markingRead(sessionIds) {
+                    try await Baybo.client.chatMarkManyRead(sessionIds: sessionIds)
+                }
             } catch {
                 // The optimistic clear stands: the next list merge reconciles the
                 // badge to server truth either way, so a failure costs one stale

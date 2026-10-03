@@ -84,7 +84,7 @@ struct SessionIndexMirrorTests {
         for i in 0..<30 {
             remote.append(summary(id: "other-\(i)", lastActive: "2026-07-1\(i % 10)T00:00:00Z"))
         }
-        index.merge(remote: remote, fetchEpoch: index.mutationEpoch)
+        index.merge(remote: remote, fetch: index.beginListFetch())
 
         #expect(index.rows.count == 31)
         #expect(mirror(Self.sessionId) == #"{"messages":[{"id":"m1"}],"lastOrdinal":7}"#)
@@ -101,7 +101,7 @@ struct SessionIndexMirrorTests {
         for i in 0..<12 {
             remote.append(summary(id: "loud-\(i)", lastActive: "2026-07-14T0\(i % 10):00:00Z"))
         }
-        index.merge(remote: remote, fetchEpoch: index.mutationEpoch)
+        index.merge(remote: remote, fetch: index.beginListFetch())
 
         for i in 0..<50 {
             index.noteActivity(
@@ -122,7 +122,7 @@ struct SessionIndexMirrorTests {
         for i in 0..<20 {
             remote.append(summary(id: "cron-fire-\(i)", lastActive: "2026-07-14T0\(i % 10):00:00Z"))
         }
-        index.merge(remote: remote, fetchEpoch: index.mutationEpoch)
+        index.merge(remote: remote, fetch: index.beginListFetch())
 
         #expect(mirror(Self.sessionId) != nil)
         for i in 0..<20 {
@@ -173,13 +173,13 @@ struct SessionIndexMirrorTests {
                 summary(id: Self.sessionId, lastActive: "2026-07-14T00:00:00Z"),
                 summary(id: "s-kept", lastActive: "2026-07-14T00:00:00Z"),
             ],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(mirror(Self.sessionId) != nil)
 
         // The next pull no longer carries it — deleted elsewhere.
         index.merge(
             remote: [summary(id: "s-kept", lastActive: "2026-07-14T00:00:00Z")],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
 
         #expect(index.rows.map(\.id) == ["s-kept"])
         #expect(mirror(Self.sessionId) == nil)
@@ -205,7 +205,7 @@ struct SessionIndexMirrorTests {
                 summary(id: "s-pending", lastActive: "2026-07-14T00:00:00Z"),
                 summary(id: Self.sessionId, lastActive: "2026-07-14T00:00:00Z"),
             ],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
 
         #expect(!index.rows.contains { $0.id == "s-pending" })
         #expect(mirror(Self.sessionId) != nil)

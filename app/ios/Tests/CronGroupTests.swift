@@ -215,7 +215,7 @@ struct CronGroupPersistenceTests {
                     cronJobTitle: "Morning brief",
                     cronGroupPinned: false)
             ],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
 
         let file = temp.url.appendingPathComponent("sessions.json")
         let latestReachedDisk = await waitUntil {

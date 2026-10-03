@@ -143,6 +143,13 @@ struct ChatStoreOutboxTests {
         #expect(client.readOrdinals == [42], "the transcript callback must be deduplicated")
     }
 
+    /// Opening marks the whole session read at once, with the gateway resolving
+    /// the tail — no wait for the first sync to report a cursor.
+    @Test func openingMarksTheSessionReadToItsTail() async {
+        store.markReadOnOpen()
+        #expect(await waitUntil { client.batchReadCalls == [[Self.sessionId]] })
+    }
+
     /// A rebased page hides the floor, so each unconfirmed entry resolves by
     /// point lookup instead — found → released, no transmission consumed.
     @Test func rebasedSyncResolvesEachEntryByPointLookup() async {

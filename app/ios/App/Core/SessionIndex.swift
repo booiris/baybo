@@ -191,6 +191,14 @@ struct SessionRow: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+/// When a list snapshot was requested, as `SessionIndex.merge` needs to judge
+/// it: `mutationEpoch` for in-flight archive/pin/hide, `readClock` for read
+/// PUTs that may have landed after the server answered.
+struct ListFetch {
+    let mutationEpoch: Int
+    let readClock: UInt64
+}
+
 /// The device-local session registry backing the chat list on BOTH legs. Remote
 /// refreshes from direct REST or the relay API tunnel merge into this same
 /// rendering source. Rows persist as one small JSON file in Application Support;
@@ -331,6 +339,15 @@ final class SessionIndex: ObservableObject {
     /// before a mutation resolved is a stale snapshot even after the pending
     /// entry is gone — `merge` compares epochs and drops it.
     private(set) var mutationEpoch = 0
+    /// Sessions with a read-cursor PUT on the wire, counted because two marks
+    /// can overlap. Until it lands, the server's `unreadCount` for them is a
+    /// number the user has already cleared — see `markingRead`.
+    private var readsInFlight: [String: Int] = [:]
+    /// Ticks once per settled read PUT. A list fetch records it at start
+    /// (`ListFetch.readClock`): a session whose read settled after that may
+    /// have been counted by the server before its cursor moved.
+    private var readClock: UInt64 = 0
+    private var readSettledAt: [String: UInt64] = [:]
 
     /// Whether this instance drives the app-icon badge. True only for
     /// [`shared`]: the suites run in parallel and construct their own indexes
@@ -479,7 +496,7 @@ final class SessionIndex: ObservableObject {
             rows[idx].lastActive = at
             changed = true
         }
-        if sessionId != foregroundSessionId {
+        if sessionId != foregroundSessionId && readsInFlight[sessionId] == nil {
             rows[idx].unread += 1
             changed = true
         }
@@ -521,6 +538,40 @@ final class SessionIndex: ObservableObject {
         else { return }
         rows[idx].unread = 0
         save()
+    }
+
+    /// Run one read-cursor PUT for `sessionIds` with the badge cleared now and
+    /// held there: until the server's cursor has moved, its `unreadCount` is a
+    /// count of what the user just read, and `merge` would paint it back. Every
+    /// read PUT goes through here — a bare one reopens that race.
+    func markingRead(_ sessionIds: [String], _ put: () async throws -> Void) async throws {
+        clearUnread(sessionIds)
+        for id in sessionIds { readsInFlight[id, default: 0] += 1 }
+        defer { settleRead(sessionIds) }
+        try await put()
+    }
+
+    private func settleRead(_ sessionIds: [String]) {
+        readClock += 1
+        for id in sessionIds {
+            if let n = readsInFlight[id], n > 1 {
+                readsInFlight[id] = n - 1
+            } else {
+                readsInFlight[id] = nil
+            }
+            readSettledAt[id] = readClock
+        }
+    }
+
+    /// Whether a snapshot taken at `fetch` may predate a read of `sessionId`
+    /// reaching the server — its `unreadCount` for that row is not to be trusted.
+    private func readUnsettled(_ sessionId: String, at fetch: ListFetch) -> Bool {
+        readsInFlight[sessionId] != nil || (readSettledAt[sessionId] ?? 0) > fetch.readClock
+    }
+
+    /// Capture BEFORE fetching the list; hand the result to `merge`.
+    func beginListFetch() -> ListFetch {
+        ListFetch(mutationEpoch: mutationEpoch, readClock: readClock)
     }
 
     /// Optimistic clear behind a cron group's "mark all read" — one save, one
@@ -840,9 +891,9 @@ final class SessionIndex: ObservableObject {
     /// `mutationEpoch` BEFORE fetching: a snapshot older than the last mutation
     /// stage/resolve is dropped whole (it could rewind a flip whose pending
     /// entry has already cleared, or resurrect a just-deleted row); the next
-    /// refresh re-merges.
-    func merge(remote: [ChatSessionSummary], fetchEpoch: Int) {
-        guard fetchEpoch == mutationEpoch else { return }
+    /// refresh re-merges. `fetch` comes from `beginListFetch`.
+    func merge(remote: [ChatSessionSummary], fetch: ListFetch) {
+        guard fetch.mutationEpoch == mutationEpoch else { return }
         reconcileDurableMutations(remote: remote)
         var merged: [SessionRow] = []
         let local = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
@@ -886,8 +937,18 @@ final class SessionIndex: ObservableObject {
             // reconciles the badge to the truth — accurate across a cold
             // restart / a device that missed the live `SessionActivity` pings.
             // The live ping (`noteActivity`) still bumps it between pulls as a
-            // cheap accelerator.
-            let unread = Int(summary.unreadCount)
+            // cheap accelerator. Two exceptions, both a count of what the user
+            // has already read: the open chat (the list stays mounted under it,
+            // so its pulls keep landing), and a row whose read PUT may not have
+            // reached the server before this snapshot was taken.
+            let unread: Int
+            if summary.sessionId == foregroundSessionId {
+                unread = 0
+            } else if readUnsettled(summary.sessionId, at: fetch) {
+                unread = mine?.unread ?? 0
+            } else {
+                unread = Int(summary.unreadCount)
+            }
             // Server data is authoritative — adopt the snapshot's preview / user
             // text / recency wholesale. A local row NEVER overrides a server
             // value; it only fills a field the server left nil. (The old
@@ -938,6 +999,9 @@ final class SessionIndex: ObservableObject {
             dropped.insert(row.id)
         }
         if !dropped.isEmpty { onSessionsRemoved?(dropped) }
+        // A read that settled before this fetch began is in every later
+        // snapshot too, so its stamp has done its job.
+        readSettledAt = readSettledAt.filter { $0.value > fetch.readClock }
         guard merged != rows else { return }
         rows = merged
         save()

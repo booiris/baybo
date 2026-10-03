@@ -620,7 +620,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             store?.requestSync(sinceOrdinal: since, limit: limit)
         case "mark_read":
             // The viewer has read up to `ordinal` — advance the server chat-list
-            // read cursor so the unread badge clears on the next list pull.
+            // read cursor (`ChatStore.markRead`).
             if let ordinal = (body["ordinal"] as? NSNumber)?.int64Value {
                 store?.markRead(ordinal: ordinal)
             }
