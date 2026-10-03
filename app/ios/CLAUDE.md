@@ -51,7 +51,8 @@ of it. Its CI is its own three jobs — `ios-web` and `ios-core` (ubuntu) and
 `ios-sim` (macos-26) — all three ON, each behind the `changes` filter matching
 the change it answers for. The repo is public, so all three runners are free;
 the filters buy wall-clock and macOS queue slots, not minutes. What they do
-**not** reach is a device, and the UI smokes they run are non-gating; see
+**not** reach is a device, and the UI smokes are non-gating — a fourth job,
+`ios-ui-smokes`, chained after `ios-sim` on its build; see
 [`docs/testing.md`](docs/testing.md).
 
 ## Continuity contract (do not change — existing installs depend on it)

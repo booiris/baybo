@@ -10,8 +10,9 @@ name: CI
 # constraint here and the old 10x macOS multiplier is not a bill any more.
 #
 # Three things still are, and they are what the comments below now defend:
-#   - WALL-CLOCK. A cold `ios-sim` is ~25-40 min; a cold `test` is ~15. Nobody
-#     waits less because the minutes are free.
+#   - WALL-CLOCK. A cold `ios-sim` is ~20 min (warm ~8), then the non-gating
+#     `ios-ui-smokes` ~35 more; a cold `test` is ~15. Nobody waits less
+#     because the minutes are free.
 #   - macOS CONCURRENCY. The free plan allows 20 concurrent jobs but only 5
 #     concurrent macOS ones, shared across the account. That, not minutes, is
 #     what a fleet of iOS PRs actually contends for.
@@ -19,8 +20,8 @@ name: CI
 #     It is the whole reason for the cache design described next.
 #
 # Also worth knowing now that the repo is public: workflow logs and uploaded
-# artifacts need only READ access, which everyone now has. `ios-sim` uploads
-# `ios-xcresult` on every run, and an xcresult carries UI-test screenshots — of
+# artifacts need only READ access, which everyone now has. `ios-ui-smokes`
+# uploads `ios-xcresult` on every run, and an xcresult carries UI-test screenshots — of
 # demo fixtures today, so nothing sensitive, but check that again before
 # pointing a test at real data.
 #
@@ -181,9 +182,10 @@ jobs:
 
   # Detects which expensive, path-scoped stacks this PR touches, so the jobs
   # below can be skipped entirely. Runner minutes are free on this public repo,
-  # so what a skip buys is TIME and a macOS queue slot: `ios-sim` is the slow
-  # one (~25-40 min cold) and the free plan runs only 5 concurrent macOS jobs
-  # account-wide, so a PR that needs no Mac should not hold one.
+  # so what a skip buys is TIME and a macOS queue slot: `ios-sim` + its chained
+  # `ios-ui-smokes` are the slow pair (~45-55 min end to end, cold) and the
+  # free plan runs only 5 concurrent macOS jobs account-wide, so a PR that
+  # needs no Mac should not hold one.
   changes:
     name: detect changes
     runs-on: ubuntu-latest
@@ -373,10 +375,11 @@ jobs:
   # narrowly each is gated: the transcript bundle needs neither Rust nor a Mac
   # (`ios-web`, ~2 min), the app's own cargo workspace needs Rust but no Mac
   # (`ios-core`, slow), and only the Swift/Xcode half needs a Mac (`ios-sim`,
-  # slowest, and the only one that takes one of the 5 macOS slots). All three
-  # are ON, each behind its matching `changes` filter: `ios` for the two Linux
-  # jobs, `ios_native` for the Mac one, so a docs-only change under app/ios
-  # never queues for a Mac.
+  # slowest, and the only one that takes one of the 5 macOS slots — its
+  # non-gating `ios-ui-smokes` runs after it on the same build, never beside
+  # it). All three are ON, each behind its matching `changes` filter: `ios` for
+  # the two Linux jobs, `ios_native` for the Mac one, so a docs-only change
+  # under app/ios never queues for a Mac.
   # ---------------------------------------------------------------------------
 
   # The fastest third of the iOS suite: no Rust toolchain, no Mac, ~2 min. It
@@ -460,7 +463,7 @@ jobs:
         working-directory: app/ios
 
   ios-sim:
-    name: iOS app (build + unit tests; UI smokes non-gating)
+    name: iOS app (build + unit tests)
     needs: changes
     # NOT macos-latest — that label still maps to macos-15, whose simulator set
     # is iOS 18.x + a churning 26.0/26.1; the deployment target is 18.0 now, but
@@ -474,23 +477,17 @@ jobs:
     runs-on: macos-26
     # The slow one, and the only job here that needs a Mac. Standard macOS
     # runners are free on a public repo, so the old 10x multiplier is no longer
-    # a bill — what it costs now is ~25-40 min cold and one of the 5 concurrent
+    # a bill — what it costs now is wall-clock and one of the 5 concurrent
     # macOS slots the free plan allows account-wide. `ios_native` fires on any
     # change under crates/{wire,device-proto,model}/ or remote-host/ too, so a
     # PR with nothing iOS-shaped about it can still queue for a Mac. That is the
     # price of the gate having no hole where the wire contract lives; narrow the
     # filter before narrowing this.
     if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
-    # Sized from what the job actually does, because "non-gating" was not true:
-    # the UI smokes take ~30 min on their own (29m22s on the last green master
-    # run) and the gating half — xcframework, bundle, build-for-testing,
-    # BayboTests — plus the post steps is ~11 more. That left ~3 minutes of head
-    # room under a 40 cap, so the next test anyone added anywhere went over, the
-    # JOB hit its timeout mid-smoke, and a job timeout CANCELS rather than fails
-    # — which `continue-on-error` on the step does not absorb. The gating half
-    # had already passed and reported red anyway.
-    # So the step below carries its own cap and this one only has to clear it.
-    timeout-minutes: 50
+    # The GATING half only — the UI smokes are `ios-ui-smokes` below. Warm, this
+    # is ~8 min (xcframework cache hit, ~75s build-for-testing, ~2.5 min of
+    # BayboTests); a cold Rust core adds ~8-12.
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: app/ios
@@ -499,6 +496,10 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: 1
     steps:
       - uses: actions/checkout@v4
+      # First, so the ~2.5 min cold boot runs under the Rust/web/Xcode build
+      # instead of opening the unit-test step. Sets SIM_UDID for every xcodebuild
+      # below; see the script for why a UDID and not `name=…,OS=latest`.
+      - run: scripts/ci-boot-sim.sh
       - run: brew install xcodegen
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -552,15 +553,16 @@ jobs:
       # CODE_SIGN_ENTITLEMENTS="" and DEVELOPMENT_TEAM="" are the two that
       # actually defuse this project; the rest are the standard unsigned set.
       #
-      # OS=latest, never a pinned version: iOS 26.0/26.1 ship an SDK but NO
-      # runtime on this image, and GitHub rotates the runtime set monthly.
+      # Against the device ci-boot-sim.sh picked (the newest installed iOS
+      # runtime — never a pinned version: iOS 26.0/26.1 ship an SDK but NO
+      # runtime on this image, and GitHub rotates the runtime set monthly).
       - name: Build for testing
         run: |
           set -o pipefail
           xcodebuild build-for-testing \
             -project Baybo.xcodeproj -scheme Baybo -configuration Debug \
             -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
+            -destination "id=$SIM_UDID" \
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" \
@@ -569,66 +571,106 @@ jobs:
       # GATING. This is also the only thing in the repo that catches UniFFI seam
       # drift: Generated/BayboCore.swift is regenerated from the Rust on every
       # build, so a renamed ffi method breaks the Swift compile and nothing else
-      # anywhere would notice.
+      # anywhere would notice. `bootstatus -b` waits out the background boot (or
+      # boots the device itself if that one died).
       - name: Unit tests (BayboTests)
         run: |
           set -o pipefail
+          xcrun simctl bootstatus "$SIM_UDID" -b
           xcodebuild test-without-building \
             -project Baybo.xcodeproj -scheme Baybo \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
+            -destination "id=$SIM_UDID" \
             -derivedDataPath build/DerivedData \
             -only-testing:BayboTests \
             -resultBundlePath build/TestResults/unit.xcresult | xcbeautify
 
-      # NON-GATING, same call the repo already makes for the tmux render tests:
-      # these drive real gestures against a simulator and are timing-sensitive
-      # under load. A regression surfaces without wedging merges. Promote to
-      # gating once they have proven stable over a few weeks of real runs.
-      #
-      # A step-level continue-on-error rather than a second job: a separate macOS
-      # job would re-pay runner boot + toolchain setup, and take a second one of
-      # the 5 macOS slots, to run 4 minutes of tests it already has the built
-      # products for.
-      - name: UI smokes (non-gating)
-        # What makes the label true. A STEP that overruns fails the step, which
-        # `continue-on-error` swallows; only a JOB overrun cancels, and a
-        # cancelled job reports red no matter what already passed inside it. Set
-        # below the job's cap so the smokes can never take the gating result with
-        # them. If this fires, the smokes are the thing to make cheaper — raising
-        # it just moves the same wall.
-        timeout-minutes: 35
-        continue-on-error: true
-        id: ui_smokes
+      # Handed to `ios-ui-smokes` so it runs the SAME build instead of paying
+      # Rust + web + build-for-testing again. A tarball, not the directory:
+      # upload-artifact drops file modes, and an app bundle whose executables
+      # lost +x does not launch. The .xctestrun inside addresses everything
+      # relative to itself (__TESTROOT__), so it survives the move.
+      - name: Pack build products for the UI smokes
+        run: tar -czf "$RUNNER_TEMP/ios-build-products.tgz" -C build/DerivedData/Build Products
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-products
+          path: ${{ runner.temp }}/ios-build-products.tgz
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-unit-xcresult
+          path: app/ios/build/TestResults/
+
+  # NON-GATING, same call the repo already makes for the tmux render tests:
+  # these drive real gestures against a simulator and are timing-sensitive
+  # under load. A regression surfaces without wedging merges. Promote to gating
+  # once they have proven stable over a few weeks of real runs.
+  #
+  # Its own job, chained after `ios-sim`, rather than steps at the end of it.
+  # Inside that job the smokes held the gating check open: unit tests were done
+  # at ~8 min, but the check only reported when the JOB ended, ~35 min of smokes
+  # later. Chained with `needs`, the two never run at the same time, so this
+  # still holds ONE of the 5 macOS slots at a time — the price is a second
+  # runner boot (~1-2 min), not a second slot. It runs the build `ios-sim`
+  # uploaded (no Rust, no web, no xcodebuild build), and only after that build
+  # passed its unit tests, as the steps used to.
+  #
+  # `continue-on-error` at the job level, like `render-tests`: a failure shows
+  # red on the PR without failing the run. scripts/dev-merge-sync.sh waits on
+  # its REQUIRED_CHECKS only, so this never holds a merge.
+  ios-ui-smokes:
+    name: iOS UI smokes (non-gating)
+    needs: ios-sim
+    runs-on: macos-26
+    continue-on-error: true
+    # The smokes alone took 29m22s on the last green master run and have since
+    # hit the old 35-min step cap (no xcresult survives a cap kill). The step cap
+    # sits under the job's so a slow run still reports and uploads.
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app/ios
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: app/ios/scripts
+      - run: scripts/ci-boot-sim.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-build-products
+          path: ${{ runner.temp }}
+      - run: |
+          mkdir -p build/DerivedData/Build
+          tar -xzf "$RUNNER_TEMP/ios-build-products.tgz" -C build/DerivedData/Build
+
+      - name: UI smokes
+        timeout-minutes: 50
         run: |
           set -o pipefail
+          xcrun simctl bootstatus "$SIM_UDID" -b
+          xctestrun="$(ls build/DerivedData/Build/Products/*.xctestrun | head -1)"
           xcodebuild test-without-building \
-            -project Baybo.xcodeproj -scheme Baybo \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
-            -derivedDataPath build/DerivedData \
+            -xctestrun "$xctestrun" \
+            -destination "id=$SIM_UDID" \
             -only-testing:BayboUITests \
             -parallel-testing-enabled NO \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
             -resultBundlePath build/TestResults/ui.xcresult | xcbeautify
 
-      # `continue-on-error` reports a FAILED step as `success`, and a step killed
-      # by its own timeout as `success` too — so the step's conclusion says
-      # nothing, and a smoke run cut off two thirds through is indistinguishable
-      # from one that passed. That is a skipped-check-reads-as-green in another
-      # costume, which this repo has been bitten by twice. Non-gating means "does
-      # not block the merge", not "is never reported".
-      - name: UI smoke outcome (reported, still non-gating)
+      # A step that hit its timeout and one that failed both end the job red;
+      # this says which, and how far it got. Non-gating means "does not block
+      # the merge", not "is never reported".
+      - name: UI smoke summary
         if: always()
         run: |
-          echo "### iOS UI smokes: ${{ steps.ui_smokes.outcome }} (non-gating)" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.ui_smokes.outcome }}" != "success" ]; then
-            echo "Tests failed, or the 35-minute step cap cut the run short." >> "$GITHUB_STEP_SUMMARY"
-            echo "Details are in the ios-xcresult artifact." >> "$GITHUB_STEP_SUMMARY"
-          fi
           if [ -d build/TestResults/ui.xcresult ]; then
             xcrun xcresulttool get test-results summary --path build/TestResults/ui.xcresult \
               | tee -a "$GITHUB_STEP_SUMMARY" || true
           else
-            echo "no xcresult was produced" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "no xcresult was produced (the 50-minute step cap cut the run short?)" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - uses: actions/upload-artifact@v4

@@ -38,8 +38,8 @@ set -euo pipefail
 # not a flag this script carries.)
 #
 # Deliberately not required: "detect changes" (a path-filter helper for the
-# other jobs) and "tmux render tests (non-gating)" (named non-gating; flaky
-# under load, and conditional).
+# other jobs), "tmux render tests (non-gating)" and "iOS UI smokes
+# (non-gating)" (both named non-gating; flaky under load, and conditional).
 #
 # The three iOS jobs and the install.sh job ARE required, but only when this PR
 # should have run them — see the path filters below.
@@ -107,7 +107,7 @@ if printf '%s\n' "$CHANGED" | grep -qE "$IOS_DEPS_PATTERN"; then
   echo "==> diff touches iOS deps: requiring the two Linux iOS checks"
 fi
 if printf '%s\n' "$CHANGED" | grep -qE "$IOS_NATIVE_PATTERN"; then
-  REQUIRED_CHECKS+=("iOS app (build + unit tests; UI smokes non-gating)")
+  REQUIRED_CHECKS+=("iOS app (build + unit tests)")
   echo "==> diff touches the Swift/ffi half: requiring the macOS iOS check"
 fi
 if printf '%s\n' "$CHANGED" | grep -qE "$INSTALL_PATTERN"; then
@@ -139,14 +139,43 @@ fi
 [ "$(gh pr view "$PR" --json isDraft -q .isDraft)" = "false" ] ||
   die "PR #$PR is a draft: CI does not run on drafts. The owner marks it ready ('gh pr ready $PR'), then re-run this."
 
-echo "==> waiting for checks on PR #$PR ..."
-gh pr checks "$PR" --watch --fail-fast || die "checks failed/cancelled on PR #$PR — not merging"
+# Wait on REQUIRED_CHECKS only, not `gh pr checks --watch`: that waits for every
+# check, so the ~35 min of non-gating UI smokes held the merge, and
+# `--fail-fast` let a red NON-gating job abort it. A required check that has not
+# reported yet counts as pending; one that never will (renamed in ci.yml) runs
+# into the cap below, and the verification after this loop names it.
+echo "==> waiting for the gating checks on PR #$PR ..."
+WAIT_CAP_SECS=$((90 * 60))
+waited=0
+while :; do
+  rc=0
+  CHECKS="$(gh pr checks "$PR" --json name,bucket --jq '.[] | "\(.bucket)\t\(.name)"')" || rc=$?
+  pending=0
+  # The exit code cannot tell a failed read from a read that worked: gh exits 8
+  # while anything is pending and 1 once anything has failed — a NON-gating job
+  # included. Only empty output is a failed read (the GraphQL endpoint drops the
+  # odd request with a bare EOF); retry that rather than abort a 10-minute wait.
+  if [ -z "$CHECKS" ]; then
+    echo "    (could not read the checks, exit $rc; retrying)"
+    pending=1
+  fi
+  for name in "${REQUIRED_CHECKS[@]}"; do
+    buckets="$(printf '%s\n' "$CHECKS" | awk -F'\t' -v n="$name" '$2 == n { print $1 }')"
+    if [ -z "$buckets" ] || printf '%s\n' "$buckets" | grep -qx 'pending'; then
+      pending=1
+    elif printf '%s\n' "$buckets" | grep -qxE 'fail|cancel'; then
+      die "required check '$name' is '$(printf '%s' "$buckets" | tr '\n' ',')' on PR #$PR — not merging"
+    fi
+  done
+  [ "$pending" -eq 1 ] || break
+  [ "$waited" -lt "$WAIT_CAP_SECS" ] || break
+  sleep 30
+  waited=$((waited + 30))
+done
 
-# Trust the results, not the wait: see REQUIRED_CHECKS above for why exiting 0
-# proves nothing on its own.
+# Trust the results, not the wait: the loop above only stops waiting, and a
+# `skipping` check stops it as surely as a `pass` (see REQUIRED_CHECKS).
 echo "==> verifying the gating checks reported a real pass ..."
-CHECKS="$(gh pr checks "$PR" --json name,bucket --jq '.[] | "\(.bucket)\t\(.name)"')" ||
-  die "could not read the checks for PR #$PR"
 for name in "${REQUIRED_CHECKS[@]}"; do
   buckets="$(printf '%s\n' "$CHECKS" | awk -F'\t' -v n="$name" '$2 == n { print $1 }')"
   if [ -z "$buckets" ]; then
