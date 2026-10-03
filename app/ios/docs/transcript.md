@@ -168,29 +168,33 @@ Three things the hatch must NOT break, and how:
 ### The crash reload (the hatch's involuntary twin)
 
 `webViewWebContentProcessDidTerminate` → `TranscriptBridge.contentProcessDied`
-runs the SAME document reload for a WebContent process that died under a
-**visible** webview — the one case WebKit does not auto-reload (an offscreen
-kill heals itself on re-attach). Without it, `ready` stays latched true and
-every `call()` silently no-ops against a blank page: bricked until a resync or
-an app restart. Two deliberate differences from `rebuildIfShowing`, both
-load-bearing:
+runs the SAME document reload for a WebContent process that died. WebKit
+reloads nothing for us here, visible or offscreen: implementing that delegate
+method opts the view out of WebKit's automatic recovery (a probe kept a killed
+offscreen view's pid at 0 through re-attach and window toggles until it was
+reloaded by hand). Without it, `ready` stays latched true and every `call()`
+silently no-ops against a blank page. Two deliberate differences from
+`rebuildIfShowing`, both load-bearing:
 
 - **The mirror is NOT dropped and `discardPersist` stays false.** A late
   `persist` from the dead process carries the freshest pre-crash state —
   exactly what the mirror should hold and what the fresh `ready`'s init
   restores. The resync hatch inverts this because *it* deleted the mirror
   first.
-- **A crash-loop budget.** The kill is memory pressure and the reload rebuilds
-  the same footprint, so an uncapped handler would flicker forever while
-  hammering the gateway with mount-edge syncs. Three reloads per 30s window,
-  re-armed by TIME ONLY — a death landing more than the window after the
-  previous one resets the count. It must never re-arm on a paint: the
-  white-flash loop that motivated this painted on every reload (re-arming the
-  then-`shown`-based budget) and re-exploded to the 2.2GB per-process jetsam
-  limit within ~1s, six kills in five seconds with the cap never firing. Past
-  the cap the transcript stays blank until the user backs out or resyncs.
-  (`DeckBridge.contentProcessDied` is the deck webview's twin, budget
-  included, same time-only re-arm.)
+- **A crash-loop budget** (`CrashReloadBudget`, shared with the deck and issue
+  bridges). The kill is memory pressure and the reload rebuilds the same
+  footprint, so an uncapped handler would flicker forever while hammering the
+  gateway with mount-edge syncs. Three reloads per 30s window, re-armed by TIME
+  ONLY — a death landing more than the window after the previous one resets the
+  count. It must never re-arm on a paint: the white-flash loop that motivated
+  this painted on every reload (re-arming the then-`shown`-based budget) and
+  re-exploded to the 2.2GB per-process jetsam limit within ~1s, six kills in
+  five seconds with the cap never firing. Past the cap the page **parks**:
+  `call()` drops (nothing would flush `pending`), and the next user-driven edge
+  — `retarget` (opening any conversation) or returning to the foreground —
+  revives it with ONE more reload; a death within the window of that reload
+  parks it again. The cap used to be permanent, which left the one shared
+  webview blank for every conversation until the app was killed.
 
 The LEG is untouched — no unsubscribe, no redial. An in-flight turn keeps running
 and its frames keep arriving through the reload (they buffer in the bridge's
@@ -208,6 +212,61 @@ already left refuses the write (`chatOpen`) and gets no banner, having rebuilt i
 page immediately instead. It cannot strand: any later writer takes ownership of
 the line (`ChatStore.notice`'s setter clears the flag), and the visit retracts it
 (`leaveChat`).
+
+### The resume recycle
+
+`AppStore.recycleWebHostsIfStale`: a return to the foreground after at least
+`webHostRecycleInterval` (5 minutes) in the background replaces the shared
+transcript, deck and issue webviews with brand-new `WKWebView`s, and bumps
+`webHostGeneration`, which the deck content and the project-run sheet are keyed
+on so they are rebuilt with their own webview.
+
+A conversation ON SCREEN is double-buffered instead of torn down under the
+reader. The replacement is inserted BEHIND the old webview in the same
+container, loads there, has the reader's place restored, and only once it has
+both painted (`shown`) and settled the restore (`readingPositionSettled`) — or
+`transcriptSwapTimeout` passes — does `transcriptHostGeneration` bump. The
+pushed `ChatScreen` is keyed on that (`ChatScreenIdentity` — which also closes
+the subagent sheet presented over it, and that sheet's child transcript with
+it), so the reader sees one swap. The first device build swapped at once and
+read as heavy flicker: a blank, a newest-edge paint and a jump in quick
+succession. What remains is one frame where the reparented webview hides its
+tiles until its next commit.
+
+Re-keying the `ChatScreen` replaces it with a screen for the SAME session, and
+SwiftUI may run the new screen's `onAppear` before the old one's
+`onDisappear`. The old screen therefore leaves the session (foreground marker,
+paste target) only while it still owns the store's bridge — the new host
+attached the store to ITS bridge when it was built.
+
+A reader parked up in the history is put back where they were: before the old
+page is torn down, native asks it for the row at the top of the viewport and
+its offset (`readingPosition`, null while following the newest edge — measured
+against `previewParking` while a full-screen HTML preview has the scroller
+locked, since the lock can clamp the live offset) and hands
+that to the new page (`restoreReadingPosition`), which parks the row quietly —
+paging back for it if the mirror's window does not reach it, and staying at the
+newest edge if it cannot be found — then posts `readingPositionSettled`.
+
+Why: while an app is suspended, iOS reclaims its WebKit **GPU and Networking**
+processes and leaves the WebContent processes alive. Nothing terminates, so
+`contentProcessDied` never runs. On device the surviving view then kept
+addressing the reclaimed GPU process on every attach (`BERenderingVisibilitySink
+… does not exist`), and every conversation the shared transcript webview showed
+stayed white — JS still ran and WebKit still un-hid the layer tree — until the
+process was killed. No public API reports those helpers' deaths, so suspension
+length stands in for it, and a reload of the same view is not enough: the stale
+bindings belong to the view, not the document.
+
+The rebuilt pages restore from the mirror and the stores exactly as a cold
+launch would. The outgoing transcript host is torn down after a short grace so
+the old `ChatScreen`'s `onDisappear` flush can still land its `persist`.
+
+Every `ready`, first paint, retarget, death, park, revive and recycle is appended to
+`Application Support/baybo/diagnostics/web-lifecycle.log` (`WebLifecycleLog`) —
+on a device NSLog's dynamic arguments are `<private>` for a home-screen launch,
+so this file is the only witness a field report has. It holds lifecycle facts
+only, never content.
 
 ### Reparenting, prewarm, detach
 

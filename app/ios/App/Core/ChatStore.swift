@@ -352,6 +352,12 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// durable cursor) rather than flushing a hole-punched stream. Frames
     /// arriving meanwhile are dropped, not re-buffered.
     private var needsSyncOnAttach = false
+    /// `claimConnected` bumped `connEpoch` while no bridge was attached; the
+    /// next `attachBridge` delivers it (see there).
+    private var connEpochOwed = false
+    /// A sync failed while no page was attached; the next `attachBridge`
+    /// re-runs the pull in its place.
+    private var syncReplyOwed = false
 
     convenience init(sessionId: String, client: any BayboClientProtocol = Baybo.client) {
         self.init(
@@ -462,7 +468,11 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         generation = gen
         connEpoch += 1
         connState = .connected
-        bridge?.setConnEpoch(connEpoch)
+        if let bridge {
+            bridge.setConnEpoch(connEpoch)
+        } else {
+            connEpochOwed = true
+        }
         // Reconcile the outbox against the reconnect: entries still
         // lacking durability confirmation resend (sync-v2 send path).
         reconcileOutboxOnConnect(justSent: justSent)
@@ -734,6 +744,15 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         if bridge.ready {
             flushPendingSendConfirms(to: bridge)
         }
+        // A reconnect claimed while no page was attached. A page that mounts
+        // from here learns the epoch from its `init`, but a same-session
+        // re-entry does not remount — without this its sync loop never sees
+        // the reconnect edge and a thread whose first pull failed offline
+        // stays empty after the network is back.
+        let owedEpoch = connEpochOwed
+        connEpochOwed = false
+        let owedSync = syncReplyOwed
+        syncReplyOwed = false
         if needsSyncOnAttach {
             needsSyncOnAttach = false
             bufferedFrames.removeAll()
@@ -741,10 +760,23 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             // running its sync loop from its own durable cursor (which the
             // dropped live frames never advanced) rather than flushing a
             // hole-punched stream.
-            bridge.requestSync()
+            if owedEpoch {
+                bridge.setConnEpoch(connEpoch)
+            } else {
+                bridge.requestSync()
+            }
             return
         }
         flushBufferedFrames(to: bridge)
+        if owedEpoch {
+            bridge.setConnEpoch(connEpoch)
+        } else if owedSync {
+            bridge.requestSync()
+        }
+    }
+
+    func isAttached(to bridge: TranscriptBridge) -> Bool {
+        self.bridge === bridge
     }
 
     func detachBridge(_ bridge: TranscriptBridge) {
@@ -1241,8 +1273,15 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             } catch {
                 NSLog("baybo: sync: %@", bayboErrorText(error))
                 // Unwind the webview's in-flight sync guard so the next trigger
-                // retries; the durable record is intact server-side.
-                pushSynthesizedFrame(["kind": "sync_failed", "error": bayboErrorText(error)])
+                // retries; the durable record is intact server-side. With no
+                // page attached, a buffered failure would reach whichever tree
+                // mounts next and unwind ITS in-flight pull instead — so owe the
+                // attach a fresh pull (which also releases a reused tree's guard).
+                if bridge == nil {
+                    syncReplyOwed = true
+                } else {
+                    pushSynthesizedFrame(["kind": "sync_failed", "error": bayboErrorText(error)])
+                }
             }
         }
     }

@@ -9,6 +9,7 @@ import {
   HTML_PREVIEW_DRAG_MOVE_EVENT,
   HTML_PREVIEW_MAXIMIZED_CLASS,
   htmlPreviewUrl,
+  previewParking,
 } from "./htmlPreviewProtocol";
 
 type Rect = { left: number; top: number; width: number; height: number };
@@ -249,18 +250,19 @@ export function HtmlPreview({ blobId }: { blobId: string }) {
     root.style.cssText = "";
   }, []);
 
-  /// Where the thread was parked when the box took the screen. Locking the
-  /// document's scroller can clamp its offset, and the reader has to come back
-  /// to exactly the row they left — not to wherever the clamp put them.
-  const parkedScrollY = useRef(0);
-
+  // The reader has to come back to exactly the row they left — not to wherever
+  // the scroll lock's clamp put them (`previewParking`).
   const applyMaximized = useCallback((next: boolean) => {
     maximizedRef.current = next;
     setMaximizedState(next);
-    if (next) parkedScrollY.current = window.scrollY;
+    if (next) previewParking.scrollY = window.scrollY;
     document.documentElement.classList.toggle(HTML_PREVIEW_MAXIMIZED_CLASS, next);
-    if (!next && window.scrollY !== parkedScrollY.current) {
-      window.scrollTo({ top: parkedScrollY.current, behavior: "instant" });
+    if (!next) {
+      const parked = previewParking.scrollY;
+      previewParking.scrollY = null;
+      if (parked !== null && window.scrollY !== parked) {
+        window.scrollTo({ top: parked, behavior: "instant" });
+      }
     }
   }, []);
 

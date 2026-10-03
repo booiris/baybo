@@ -55,12 +55,14 @@ final class IssueHostPool {
         fileprivate let id: UUID
         fileprivate let slot: Int
         fileprivate weak var pool: IssueHostPool?
-        let host: IssueHost
 
-        fileprivate init(id: UUID, slot: Int, host: IssueHost, pool: IssueHostPool) {
+        /// Resolved through the pool, never captured: `recycle` swaps the
+        /// renderer behind a slot while its visit is still on screen.
+        @MainActor var host: IssueHost? { pool?.host(at: slot) }
+
+        fileprivate init(id: UUID, slot: Int, pool: IssueHostPool) {
             self.id = id
             self.slot = slot
-            self.host = host
             self.pool = pool
         }
 
@@ -96,12 +98,16 @@ final class IssueHostPool {
         }
     }
 
+    fileprivate func host(at slot: Int) -> IssueHost? {
+        slot < hosts.count ? hosts[slot] : nil
+    }
+
     func open(id: UUID, store: IssueStore) -> Lease {
         prewarm()
         let slot = plan.open(id)
         registrations[id] = Registration(store: store, slot: slot)
         assign(slot: slot, to: id)
-        return Lease(id: id, slot: slot, host: hosts[slot], pool: self)
+        return Lease(id: id, slot: slot, pool: self)
     }
 
     func didAppear(_ lease: Lease) {
@@ -130,6 +136,25 @@ final class IssueHostPool {
         teardown()
     }
 
+    /// Replace every warm renderer with a fresh one (`AppStore
+    /// .recycleWebHostsIfStale`), re-aiming each slot at the visit it was
+    /// serving and handing the new webview to that visit's container. Leases
+    /// resolve their host by slot, so a visit on screen keeps working across
+    /// the swap.
+    func recycle() {
+        guard !hosts.isEmpty else { return }
+        let old = hosts
+        hosts = old.map { _ in IssueHost() }
+        for (slot, id) in plan.slots.enumerated() {
+            if let id { assign(slot: slot, to: id) }
+        }
+        for host in old { host.teardown() }
+    }
+
+    func reviveParked() {
+        for host in hosts { host.bridge.reviveIfParked() }
+    }
+
     private func assign(slot: Int, to id: UUID) {
         guard slot < hosts.count, let registration = registrations[id],
             registration.slot == slot, let store = registration.store
@@ -142,12 +167,12 @@ final class IssueHostPool {
     }
 
     private func attach(_ container: IssueWebViewContainer, to lease: Lease) {
-        guard let registration = registrations[lease.id], registration.slot == lease.slot else {
-            return
-        }
+        guard let registration = registrations[lease.id], registration.slot == lease.slot,
+            let host = host(at: lease.slot)
+        else { return }
         registration.container = container
         guard plan.slots[lease.slot] == lease.id else { return }
-        container.adopt(lease.host.webView)
+        container.adopt(host.webView)
     }
 
     private func detach(_ container: IssueWebViewContainer, from lease: Lease) {
@@ -155,7 +180,7 @@ final class IssueHostPool {
             registration.container === container
         else { return }
         registration.container = nil
-        container.relinquish(lease.host.webView)
+        container.relinquishAll()
     }
 }
 
@@ -217,6 +242,10 @@ final class IssueWebViewContainer: UIView {
             next.bottomAnchor.constraint(equalTo: bottomAnchor),
         ]
         NSLayoutConstraint.activate(webConstraints)
+    }
+
+    func relinquishAll() {
+        if let webView { relinquish(webView) }
     }
 
     func relinquish(_ candidate: WKWebView) {

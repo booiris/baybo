@@ -70,6 +70,8 @@ function recorder(): { log: string[]; events: TranscriptEvents } {
       jumpToOrdinal: (ordinal) => log.push(`jumpToOrdinal:${ordinal}`),
       outlineLoadOlder: () => log.push("outlineLoadOlder"),
       outlineHereRequested: () => log.push("outlineHere"),
+      readingPosition: () => ({ rowId: "m7", ordinal: 7, offset: -12 }),
+      restoreReadingPosition: (position) => log.push(`restore:${position.rowId}`),
     },
   };
 }
@@ -449,6 +451,7 @@ describe("the pre-subscribe buffer", () => {
     window.baybo.jumpToOrdinal(42);
     window.baybo.outlineLoadOlder();
     window.baybo.requestOutlineHere();
+    window.baybo.restoreReadingPosition({ rowId: "m9", ordinal: 9, offset: 40 });
 
     const { log, events } = recorder();
     bridge.subscribeTranscript(events);
@@ -457,8 +460,24 @@ describe("the pre-subscribe buffer", () => {
       "jumpToOrdinal:42",
       "outlineLoadOlder",
       "outlineHere",
+      "restore:m9",
     ]);
     expect(log).not.toContain("jump");
+  });
+
+  // Native reads the answer off `evaluateJavaScript`'s result, so it has to be
+  // a plain JSON string — and null, not a throw, before any tree subscribed.
+  it("answers readingPosition synchronously as JSON, null with no tree", async () => {
+    const bridge = await loadBridge();
+    expect(window.baybo.readingPosition()).toBeNull();
+
+    bridge.subscribeTranscript(recorder().events);
+
+    expect(JSON.parse(window.baybo.readingPosition() ?? "null")).toEqual({
+      rowId: "m7",
+      ordinal: 7,
+      offset: -12,
+    });
   });
 
   it("re-buffers after unsubscribe, so a detached window loses nothing", async () => {

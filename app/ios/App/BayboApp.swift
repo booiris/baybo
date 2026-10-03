@@ -40,6 +40,7 @@ struct BayboApp: App {
             // suspend is about to kill.
             if phase == .background {
                 Baybo.client.relayInvalidateApiLegs()
+                store.didEnterBackground()
             }
         }
     }

@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render } from "@testing-library/react";
+import { act, cleanup, render } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
 
 import i18n from "./i18n";
 import { Transcript } from "./Transcript";
+import type { ReadingPosition } from "./bridge";
+import { HTML_PREVIEW_MAXIMIZED_CLASS, previewParking } from "./htmlPreviewProtocol";
 import type { PersistedState, Row, TranscriptRowItem } from "./types";
 
 /// The scroll model, under a fake layout.
@@ -1006,5 +1008,144 @@ describe("scroll-up paging without the jolt", () => {
       await settle();
       expect(fetches()).toBe(2);
     });
+  });
+});
+
+/// The resume recycle replaces the whole webview under a reader, and the new
+/// page would otherwise open on the newest edge. Native reads the old page's
+/// place (`readingPosition`) and hands it to the new one
+/// (`restoreReadingPosition`), which parks the row quietly — no ring, and no
+/// notice when the row cannot be found.
+describe("a replaced page puts the reader back", () => {
+  function fetches(): number[] {
+    return posts()
+      .filter((p) => p.type === "fetchHistory")
+      .map((p) => p.beforeOrdinal as number);
+  }
+
+  function capture(): ReadingPosition | null {
+    return JSON.parse(window.baybo.readingPosition() ?? "null") as ReadingPosition | null;
+  }
+
+  async function restore(position: ReadingPosition): Promise<void> {
+    await act(async () => {
+      window.baybo.restoreReadingPosition(position);
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 500));
+    });
+    await settle();
+  }
+
+  function topOf(rowId: string): number | null {
+    const el = document.querySelector(`[data-row-id="${CSS.escape(rowId)}"]`);
+    return el === null ? null : el.getBoundingClientRect().top;
+  }
+
+  it("has no place to carry while the reader follows the newest edge", async () => {
+    await open(60, 999);
+    expect(capture()).toBeNull();
+  });
+
+  it("carries the row at the top of the viewport and its offset", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+
+    const position = capture();
+
+    expect(position?.rowId).toBe(rowAtViewportTop());
+    expect(position?.ordinal).toBe(Number(position?.rowId.slice(1)));
+    expect(position?.offset).toBe(topOf(position?.rowId ?? ""));
+  });
+
+  // A full-screen preview locks the scroller, which can clamp its offset. The
+  // reader is still where they left the thread, so that is what is carried.
+  it("measures from where a full-screen preview parked the thread", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const expected = capture();
+
+    const parkedAt = document.documentElement.scrollTop;
+    previewParking.scrollY = parkedAt;
+    document.documentElement.classList.add(HTML_PREVIEW_MAXIMIZED_CLASS);
+    try {
+      // Clamped short of the top: reaching it would page older rows in and
+      // move the thread under the measurement.
+      await act(async () => {
+        document.documentElement.scrollTop = parkedAt - 5 * ROW_H;
+      });
+
+      expect(capture()).toEqual(expected);
+    } finally {
+      document.documentElement.classList.remove(HTML_PREVIEW_MAXIMIZED_CLASS);
+      previewParking.scrollY = null;
+    }
+  });
+
+  it("parks a loaded row at the same offset, without the landing ring", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const position = capture() as ReadingPosition;
+    cleanup();
+
+    await open(60, 999);
+    await restore(position);
+
+    expect(rowAtViewportTop()).toBe(position.rowId);
+    expect(topOf(position.rowId)).toBe(position.offset);
+    expect(document.querySelector(".jump-ring")).toBeNull();
+    expect(fetches()).toEqual([]);
+  });
+
+  // On device the mount's own pin keeps landing in the follow band while the
+  // restore waits out its two frames, and onScroll re-arms following there —
+  // a park that disarmed following only up front then read as drift and was
+  // pinned straight back to the newest edge.
+  it("holds the park when following re-arms while it waits", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const position = capture() as ReadingPosition;
+    cleanup();
+
+    await open(60, 999);
+    await act(async () => {
+      window.baybo.restoreReadingPosition(position);
+      window.dispatchEvent(new Event("scroll"));
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 500));
+    });
+    await settle();
+
+    expect(rowAtViewportTop()).toBe(position.rowId);
+  });
+
+  it("pages back for a row the new page's window does not reach", async () => {
+    await open(60, 999);
+    await restore({ rowId: "m900", ordinal: 900, offset: 0 });
+    expect(fetches()).toEqual([940]);
+
+    await pushFrame({
+      kind: "history_page",
+      rows: items(890, 939),
+      oldest_ordinal: 890,
+      has_more: true,
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 500));
+    });
+
+    expect(rowAtViewportTop()).toBe("m900");
+    expect(document.querySelector(".jump-ring")).toBeNull();
+  });
+
+  it("stays on the newest edge, silently, when the row is gone", async () => {
+    await open(60, 999);
+    const atNewest = document.documentElement.scrollTop;
+
+    await restore({ rowId: "pm-vanished", ordinal: null, offset: 0 });
+
+    expect(document.documentElement.scrollTop).toBe(atNewest);
+    expect(document.querySelector(".bubble.notice")).toBeNull();
   });
 });
