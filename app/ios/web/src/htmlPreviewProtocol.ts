@@ -9,6 +9,11 @@ export const HTML_PREVIEW_DRAG_END_EVENT = "baybo:html-preview-drag-end";
 /// Set on <html> while a preview owns the screen — locks the thread's scroll
 /// and lifts the `.md` clip that would otherwise cut a fixed child.
 export const HTML_PREVIEW_MAXIMIZED_CLASS = "html-preview-maximized";
+/// Where the thread was scrolled when a preview took the screen; null while
+/// none is up. Locking the scroller can clamp its offset, so this — not the
+/// live offset — is where the reader actually is: the preview restores it on
+/// close, and a reading position captured meanwhile is measured against it.
+export const previewParking: { scrollY: number | null } = { scrollY: null };
 export const HTML_PREVIEW_URL_PREFIX =
   "baybo-transcript://localhost/html-preview/";
 

@@ -5,6 +5,7 @@ import { I18nextProvider } from "react-i18next";
 import i18n from "./i18n";
 import { Transcript } from "./Transcript";
 import type { ReadingPosition } from "./bridge";
+import { HTML_PREVIEW_MAXIMIZED_CLASS, previewParking } from "./htmlPreviewProtocol";
 import type { PersistedState, Row, TranscriptRowItem } from "./types";
 
 /// The scroll model, under a fake layout.
@@ -1055,6 +1056,30 @@ describe("a replaced page puts the reader back", () => {
     expect(position?.rowId).toBe(rowAtViewportTop());
     expect(position?.ordinal).toBe(Number(position?.rowId.slice(1)));
     expect(position?.offset).toBe(topOf(position?.rowId ?? ""));
+  });
+
+  // A full-screen preview locks the scroller, which can clamp its offset. The
+  // reader is still where they left the thread, so that is what is carried.
+  it("measures from where a full-screen preview parked the thread", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const expected = capture();
+
+    const parkedAt = document.documentElement.scrollTop;
+    previewParking.scrollY = parkedAt;
+    document.documentElement.classList.add(HTML_PREVIEW_MAXIMIZED_CLASS);
+    try {
+      // Clamped short of the top: reaching it would page older rows in and
+      // move the thread under the measurement.
+      await act(async () => {
+        document.documentElement.scrollTop = parkedAt - 5 * ROW_H;
+      });
+
+      expect(capture()).toEqual(expected);
+    } finally {
+      document.documentElement.classList.remove(HTML_PREVIEW_MAXIMIZED_CLASS);
+      previewParking.scrollY = null;
+    }
   });
 
   it("parks a loaded row at the same offset, without the landing ring", async () => {

@@ -241,7 +241,9 @@ attached the store to ITS bridge when it was built.
 
 A reader parked up in the history is put back where they were: before the old
 page is torn down, native asks it for the row at the top of the viewport and
-its offset (`readingPosition`, null while following the newest edge) and hands
+its offset (`readingPosition`, null while following the newest edge — measured
+against `previewParking` while a full-screen HTML preview has the scroller
+locked, since the lock can clamp the live offset) and hands
 that to the new page (`restoreReadingPosition`), which parks the row quietly —
 paging back for it if the mirror's window does not reach it, and staying at the
 newest edge if it cannot be found — then posts `readingPositionSettled`.

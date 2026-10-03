@@ -30,6 +30,7 @@ import {
   type ReadingPosition,
   type UserSentPayload,
 } from "./bridge";
+import { HTML_PREVIEW_MAXIMIZED_CLASS, previewParking } from "./htmlPreviewProtocol";
 import {
   AttachmentBubble,
   ImageDimsContext,
@@ -3810,12 +3811,18 @@ export function Transcript({
   /// while following — the replacement lands on the newest edge by itself.
   function captureReadingPosition(): ReadingPosition | null {
     if (followRef.current) return null;
+    // Under a full-screen preview the scroller is locked and may have clamped
+    // its offset; measure as if it were still where the reader left it.
+    const parked = document.documentElement.classList.contains(HTML_PREVIEW_MAXIMIZED_CLASS)
+      ? previewParking.scrollY
+      : null;
+    const shift = parked === null ? 0 : (scrollEl()?.scrollTop ?? 0) - parked;
     for (const el of document.querySelectorAll("[data-row-id]")) {
       const rect = el.getBoundingClientRect();
-      if (rect.bottom <= 0) continue;
+      if (rect.bottom + shift <= 0) continue;
       const rowId = el.getAttribute("data-row-id") ?? "";
       const row = messagesRef.current.find((r) => r.id === rowId);
-      return { rowId, ordinal: row ? rowCoverageOrdinal(row) : null, offset: rect.top };
+      return { rowId, ordinal: row ? rowCoverageOrdinal(row) : null, offset: rect.top + shift };
     }
     return null;
   }
