@@ -244,7 +244,7 @@ export function postSyncRequest(sinceOrdinal: number | null, limit: number): voi
 
 /// Advance the server chat-list read cursor to `ordinal` — the viewer (looking
 /// at this transcript) has read up to here. Native forwards it to
-/// `chat_mark_read`; the unread badge clears on the next list pull. Best-effort
+/// `chat_mark_read` (`ChatStore.markRead`). Best-effort
 /// (max-wins server-side), so a stale/duplicate marker is harmless.
 export function postMarkRead(ordinal: number): void {
   postSafe({ type: "mark_read", ordinal });

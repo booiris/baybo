@@ -247,6 +247,9 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// The device-local chat-list registry this store records sends/replies into.
     private let index: SessionIndex
     private var remoteSessionEnsured: Bool
+    /// The gateway has a row for this session — a draft has nothing to read,
+    /// fetch, or mark.
+    var hasRemoteSession: Bool { listed || remoteSessionEnsured }
     private var ensureRemoteSessionTask: Task<Void, Error>?
     /// The persisted send outbox (survives relaunch alongside the transcript
     /// mirror). Confirmation is two-stage: the echo proves transport, an
@@ -1063,7 +1066,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// the only sync point. A draft has no remote row to read; its pin starts
     /// nil (authoritative) and any choice rides `pendingModelPin` instead.
     func refreshModelPin() {
-        guard listed || remoteSessionEnsured, !modelPinFetchInFlight else { return }
+        guard hasRemoteSession, !modelPinFetchInFlight else { return }
         modelPinFetchInFlight = true
         let epoch = modelPinEpoch
         Task {
@@ -1115,7 +1118,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         modelPinModel = model
         modelPinEffort = effort
         modelPinResolved = true
-        guard listed || remoteSessionEnsured else {
+        guard hasRemoteSession else {
             pendingModelPin = (entry: entry, model: model, effort: effort, epoch: epoch)
             return
         }
@@ -1191,7 +1194,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// active leg, reconciles the outbox against the returned rows, then pushes
     /// the `sync_page` frame back for the webview to apply.
     func requestSync(sinceOrdinal: Int64?, limit: UInt32) {
-        guard listed || remoteSessionEnsured else {
+        guard hasRemoteSession else {
             #if DEBUG
                 // A demo fixture pushes a canned turn into this very draft, and
                 // the empty baseline page below would REPLACE it away (see
@@ -1245,19 +1248,37 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     }
 
     /// Advance the server chat-list read cursor (max-wins) to `ordinal` — the
-    /// viewer has read up to here. Fire-and-forget: the badge clears on the next
-    /// list pull; a draft (no remote session yet) has nothing to mark.
+    /// viewer has read up to here. Fire-and-forget; the list row's badge is held
+    /// at zero until it lands (`SessionIndex.markingRead`).
     func markRead(ordinal: Int64) {
-        guard listed || remoteSessionEnsured else { return }
+        guard hasRemoteSession else { return }
         if let markedReadOrdinal, ordinal <= markedReadOrdinal { return }
         let previous = markedReadOrdinal
         markedReadOrdinal = ordinal
         Task {
             do {
-                try await client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
+                try await index.markingRead([sessionId]) {
+                    try await client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
+                }
             } catch {
                 if markedReadOrdinal == ordinal { markedReadOrdinal = previous }
                 NSLog("baybo: mark read: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    /// Opening the chat reads all of it: move the cursor to the session's tail
+    /// now, resolved by the gateway, rather than one sync round trip later when
+    /// the transcript first reports a cursor of its own.
+    func markReadOnOpen() {
+        guard hasRemoteSession else { return }
+        Task {
+            do {
+                try await index.markingRead([sessionId]) {
+                    try await client.chatMarkManyRead(sessionIds: [sessionId])
+                }
+            } catch {
+                NSLog("baybo: mark read on open: %@", bayboErrorText(error))
             }
         }
     }

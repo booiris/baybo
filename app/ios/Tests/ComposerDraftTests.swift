@@ -326,7 +326,7 @@ struct ComposerDraftTests {
         var dropped: Set<String> = []
         index.onSessionsRemoved = { dropped.formUnion($0) }
 
-        index.merge(remote: [], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [], fetch: index.beginListFetch())
 
         #expect(dropped == ["s-elsewhere"])
         #expect(DraftStore.read(key: .chat("s-elsewhere"), in: temp.url) == nil)

@@ -313,7 +313,25 @@ to the page's `next_cursor`; the webview's `mark_read` keeps advancing it for
 live replies. The store deduplicates the two paths, and `chat_mark_read` clears
 the badge across devices.
 
-`ChatScreen` enter/leave marks the foreground session and clears its badge.
+`ChatScreen` enter/leave marks the foreground session and clears its badge, and
+entering also moves the server cursor straight to the session's tail
+(`ChatStore.markReadOnOpen` → `chatMarkManyRead`, resolved by the gateway) instead
+of waiting a sync round trip for the transcript's first cursor.
+
+**A list pull must not paint back a count the user has already read.** The list
+stays mounted under the open chat, so its pulls (app back to active, a stale-list
+nudge, the pop from the previous chat) keep landing while the user reads, and the
+read PUT is fire-and-forget. `merge` therefore takes the server's `unreadCount`
+for every row except two: the foreground session (always 0), and a row whose read
+PUT may not have reached the server before that snapshot was taken (its local
+value stands). The second is why `merge` takes a `ListFetch` from
+`beginListFetch()` rather than a bare epoch: every read PUT runs through
+`SessionIndex.markingRead`, which clears the badge, holds it while the PUT is in
+flight (`noteActivity` does not bump it either), and stamps the settle on a
+`readClock` the fetch recorded at start — so a pull requested before the PUT
+landed is distrusted for that row even when it arrives after. A bare
+`chatMarkRead` outside `markingRead` reopens the race. Before this, the badge
+cleared only one list round trip after the user had left the chat.
 
 Relay warms the leg via `relay_preconnect`; direct via `direct_preconnect` (both
 best-effort on launch/foreground) so the pings arrive while parked on the list.

@@ -53,7 +53,7 @@ struct SessionIndexRenameTests {
     /// under the user seconds after they renamed it.
     @Test func aMergeCarryingTheOldTitleLosesToAStagedRename() {
         index.beginRename(Self.sessionId, title: "Trip planning")
-        index.merge(remote: [summary(title: "Weekend logistics")], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary(title: "Weekend logistics")], fetch: index.beginListFetch())
         #expect(index.rows.first?.title == "Trip planning")
     }
 
@@ -61,7 +61,7 @@ struct SessionIndexRenameTests {
     @Test func aMergeAfterTheAckAdoptsServerTruth() {
         index.beginRename(Self.sessionId, title: "Trip planning")
         index.finishRename(Self.sessionId)
-        index.merge(remote: [summary(title: "Weekend logistics")], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary(title: "Weekend logistics")], fetch: index.beginListFetch())
         #expect(index.rows.first?.title == "Weekend logistics")
     }
 

@@ -3,7 +3,7 @@ import Testing
 
 @testable import Baybo
 
-/// `merge(remote:fetchEpoch:)` — the REST list folded over the device-local
+/// `merge(remote:fetch:)` — the REST list folded over the device-local
 /// registry. The headline guard here is a regression this app demonstrably
 /// shipped: the old merge kept the local row when `mine.lastActive > remote
 /// lastActive`, comparing the DEVICE clock (stamped by `recordUserSend`) against
@@ -68,7 +68,7 @@ struct SessionIndexMergeTests {
                     lastUserText: "what is the answer",
                     lastMessageText: "the answer is 42")
             ],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.preview == "the answer is 42")
         #expect(index.rows.first?.userText == "what is the answer")
     }
@@ -79,7 +79,9 @@ struct SessionIndexMergeTests {
     @Test func staleFetchEpochDropsTheWholeSnapshot() {
         index.recordUserSend(sessionId: Self.sessionId, text: "local")
         let staleEpoch = index.mutationEpoch - 1
-        index.merge(remote: [summary(lastMessageText: "remote")], fetchEpoch: staleEpoch)
+        index.merge(
+            remote: [summary(lastMessageText: "remote")],
+            fetch: ListFetch(mutationEpoch: staleEpoch, readClock: 0))
         #expect(index.rows.first?.preview == "local")
     }
 
@@ -89,7 +91,7 @@ struct SessionIndexMergeTests {
         index.recordUserSend(sessionId: Self.sessionId, text: "local")
         index.beginHide(Self.sessionId)
         #expect(index.rows.isEmpty)
-        index.merge(remote: [summary(lastMessageText: "still there")], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary(lastMessageText: "still there")], fetch: index.beginListFetch())
         #expect(index.rows.isEmpty)
     }
 
@@ -97,18 +99,18 @@ struct SessionIndexMergeTests {
     /// draft (compose opened elsewhere, a cron session): it stays out of the
     /// list until it has something to show.
     @Test func emptyUnknownRemoteRowIsSuppressedAsADraft() {
-        index.merge(remote: [summary()], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary()], fetch: index.beginListFetch())
         #expect(index.rows.isEmpty)
     }
 
     @Test func emptyRemoteRowSurvivesWhenPinned() {
-        index.merge(remote: [summary(pinned: true)], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary(pinned: true)], fetch: index.beginListFetch())
         #expect(index.rows.map(\.id) == [Self.sessionId])
     }
 
     @Test func emptyRemoteRowSurvivesWhenThisDeviceAlreadyListedIt() {
         index.touch(sessionId: Self.sessionId)
-        index.merge(remote: [summary()], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary()], fetch: index.beginListFetch())
         #expect(index.rows.map(\.id) == [Self.sessionId])
     }
 
@@ -117,7 +119,7 @@ struct SessionIndexMergeTests {
     @Test func titlelessSnapshotKeepsTheLiveTitle() {
         index.recordUserSend(sessionId: Self.sessionId, text: "hello")
         index.applyTitle(sessionId: Self.sessionId, title: "Live title")
-        index.merge(remote: [summary(lastUserText: "hello")], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary(lastUserText: "hello")], fetch: index.beginListFetch())
         #expect(index.rows.first?.title == "Live title")
     }
 
@@ -126,7 +128,7 @@ struct SessionIndexMergeTests {
         index.applyTitle(sessionId: Self.sessionId, title: "Old")
         index.merge(
             remote: [summary(lastUserText: "hello", title: "Server")],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.title == "Server")
     }
 
@@ -135,7 +137,7 @@ struct SessionIndexMergeTests {
     @Test func previewFallsBackToTheUserTextOnAnOlderGateway() {
         index.merge(
             remote: [summary(lastUserText: "only the question")],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.preview == "only the question")
     }
 
@@ -144,7 +146,7 @@ struct SessionIndexMergeTests {
         index.beginArchive(Self.sessionId, archived: true)
         index.merge(
             remote: [summary(lastUserText: "hello", archived: false)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.archived == true)
     }
 
@@ -154,7 +156,7 @@ struct SessionIndexMergeTests {
 
         index.merge(
             remote: [summary(lastUserText: "hello", archived: true)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
 
         #expect(index.rows.first?.archived == true)
         #expect(index.pendingMutation(for: Self.sessionId) == nil)
@@ -166,7 +168,7 @@ struct SessionIndexMergeTests {
 
         index.merge(
             remote: [summary(lastUserText: "hello", archived: false)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
 
         #expect(index.rows.first?.archived == true)
         #expect(index.pendingMutation(for: Self.sessionId) == .archived(true))
@@ -176,7 +178,7 @@ struct SessionIndexMergeTests {
         index.recordUserSend(sessionId: Self.sessionId, text: "hello")
         index.beginHide(Self.sessionId)
 
-        index.merge(remote: [], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [], fetch: index.beginListFetch())
 
         #expect(index.rows.isEmpty)
         #expect(index.pendingMutation(for: Self.sessionId) == nil)
@@ -187,7 +189,7 @@ struct SessionIndexMergeTests {
         index.beginPin(Self.sessionId, pinned: true)
         index.merge(
             remote: [summary(lastUserText: "hello", pinned: false)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.pinned == true)
     }
 
@@ -196,7 +198,7 @@ struct SessionIndexMergeTests {
     @Test func unreadCountIsAdoptedFromTheServer() {
         index.merge(
             remote: [summary(lastMessageText: "reply", unreadCount: 7)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.unread == 7)
     }
 
@@ -207,7 +209,7 @@ struct SessionIndexMergeTests {
                     lastActive: "2026-07-10T12:00:00.123456789Z",
                     lastMessageText: "reply")
             ],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
 
         let parsed = index.rows.first?.lastActive.timeIntervalSince1970 ?? 0
         #expect(abs(parsed - 1_783_684_800.123_456_7) < 0.000_001)
@@ -220,17 +222,17 @@ struct SessionIndexMergeTests {
         index.recordUserSend(sessionId: "s-2", text: "second")
         index.merge(
             remote: [summary(id: "s-2", lastMessageText: "second")],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.map(\.id) == ["s-2"])
     }
 
     @Test func anIdenticalSnapshotDoesNotRepublishTheList() {
         let remote = [summary(lastMessageText: "answer")]
-        index.merge(remote: remote, fetchEpoch: index.mutationEpoch)
+        index.merge(remote: remote, fetch: index.beginListFetch())
         var publishes = 0
         let subscription = index.objectWillChange.sink { _ in publishes += 1 }
 
-        index.merge(remote: remote, fetchEpoch: index.mutationEpoch)
+        index.merge(remote: remote, fetch: index.beginListFetch())
 
         #expect(publishes == 0)
         withExtendedLifetime(subscription) {}

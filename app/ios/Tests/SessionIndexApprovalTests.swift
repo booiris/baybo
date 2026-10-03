@@ -45,7 +45,7 @@ struct SessionIndexApprovalTests {
     }
 
     @Test func liveEdgeRaisesAndClearsAKnownRow() {
-        index.merge(remote: [summary(id: "s1")], fetchEpoch: index.mutationEpoch)
+        index.merge(remote: [summary(id: "s1")], fetch: index.beginListFetch())
         #expect(index.rows.first?.approvalPending == false)
 
         index.noteApprovalPending(sessionId: "s1", pending: true)
@@ -76,14 +76,14 @@ struct SessionIndexApprovalTests {
     @Test func mergeAdoptsServerTruthInBothDirections() {
         index.merge(
             remote: [summary(id: "s1", approvalPending: true)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.approvalPending == true)
 
         // Unlike pin / archive / hide this is never a local intent, so the
         // server wins outright — no `pendingMutations` shielding.
         index.merge(
             remote: [summary(id: "s1", approvalPending: false)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.approvalPending == false)
     }
 
@@ -93,7 +93,7 @@ struct SessionIndexApprovalTests {
         // it as an empty draft — losing precisely the row the user must open.
         index.merge(
             remote: [summary(id: "s1", lastMessageText: nil, approvalPending: true)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.count == 1)
         #expect(index.rows.first?.approvalPending == true)
     }
@@ -101,7 +101,7 @@ struct SessionIndexApprovalTests {
     @Test func anEmptyUnblockedSessionIsStillFilteredOut() {
         index.merge(
             remote: [summary(id: "s1", lastMessageText: nil)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.isEmpty)
     }
 
@@ -113,7 +113,7 @@ struct SessionIndexApprovalTests {
         // "waiting for you".
         index.merge(
             remote: [summary(id: "s1", approvalPending: true)],
-            fetchEpoch: index.mutationEpoch)
+            fetch: index.beginListFetch())
         #expect(index.rows.first?.approvalPending == true)
 
         let reloaded = temp.makeIndex()

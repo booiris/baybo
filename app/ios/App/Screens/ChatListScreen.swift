@@ -497,10 +497,10 @@ struct ChatListScreen: View {
     /// Merge the gateway's list over the local registry. Failures stay quiet:
     /// the local rows keep rendering, which is the whole point of local-first.
     private func refresh() async {
-        let fetchEpoch = SessionIndex.shared.mutationEpoch
+        let fetch = SessionIndex.shared.beginListFetch()
         do {
             let items = try await Baybo.client.chatListSessions()
-            SessionIndex.shared.merge(remote: items, fetchEpoch: fetchEpoch)
+            SessionIndex.shared.merge(remote: items, fetch: fetch)
         } catch {
             NSLog("baybo: session list refresh: %@", bayboErrorText(error))
         }
