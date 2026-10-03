@@ -29,6 +29,37 @@ xcodebuild test-without-building -project Baybo.xcodeproj -scheme Baybo \
   -derivedDataPath build/DerivedData -only-testing:BayboTests    # or :BayboUITests
 ```
 
+### Fast local loop
+
+The block above is the full run. Iterating on one area, most of its cost is
+avoidable:
+
+```bash
+# Once: keep ONE dedicated test simulator booted and address it by UDID. A
+# `name=…,OS=latest` destination re-resolves (and may cold-boot) every run.
+# Keep it separate from any simulator you have paired to a gateway: the UI
+# smokes drive the app's own state, and on a paired one they break the pairing
+# and their demo rows get merged away by the real list.
+xcrun simctl create baybo-unit "iPhone 17 Pro"          # prints the UDID
+xcrun simctl boot <UDID>
+
+# Per change: an incremental build, then only the suite you are working on.
+xcodebuild build-for-testing -project Baybo.xcodeproj -scheme Baybo \
+  -sdk iphonesimulator -destination id=<UDID> -derivedDataPath build/DerivedData -quiet
+xcodebuild test-without-building -project Baybo.xcodeproj -scheme Baybo \
+  -destination id=<UDID> -derivedDataPath build/DerivedData \
+  -only-testing:BayboTests/SessionIndexReadTests                 # suite, or …/Suite/test()
+```
+
+- Re-running without touching code is the second command alone.
+- Don't re-run `scripts/build-app.sh` for a Swift-only change: it rebuilds the
+  Rust core and, by default, overwrites a signed device xcframework with the
+  simulator one ([build.md](build.md)).
+- `xcodegen generate` is only needed after a file is added, removed or moved —
+  the `.xcodeproj` is generated, so a new test file is invisible until then.
+- The whole unit bundle is ~2.5 min once the simulator is up; a single suite is
+  seconds.
+
 ### `app/ios/ffi/`
 
 Inline `#[cfg(test)] mod tests`. The load-bearing ones pin things no other check
@@ -255,12 +286,21 @@ job is filtered to the change it actually answers for.
 - `ios-core` (ubuntu, gated on `ios`, ~15-25 min cold) — `cargo fmt` / `clippy` /
   `nextest` over the ffi workspace. It shares no cache with the root workspace,
   so a cold run pays a full ~286-crate build.
-- `ios-sim` (macos-26, gated on `ios_native`, ~25-40 min cold) — the build +
-  unit tests, with the UI smokes **non-gating**. The slow one, and the only one
-  that takes a macOS slot. `ios_native` deliberately fires on
-  `crates/{wire,device-proto,model}` and `remote-host/` too, so a PR with
-  nothing iOS-shaped about it can still queue for a Mac — that is the cost of
-  the gate having no hole where the wire contract lives.
+- `ios-sim` (macos-26, gated on `ios_native`, ~8 min warm, ~20 cold) — the
+  build + `BayboTests`. The slow one, and the only one that takes a macOS slot.
+  `ios_native` deliberately fires on `crates/{wire,device-proto,model}` and
+  `remote-host/` too, so a PR with nothing iOS-shaped about it can still queue
+  for a Mac — that is the cost of the gate having no hole where the wire
+  contract lives. Its first step, `scripts/ci-boot-sim.sh`, starts the
+  simulator booting in the background so the ~2.5 min cold boot overlaps the
+  build, and pins every xcodebuild to that device's UDID.
+- `ios-ui-smokes` (macos-26, after `ios-sim`, ~35 min) — `BayboUITests`,
+  **non-gating** (job-level `continue-on-error`, so a failure shows red without
+  failing the run). It runs the build products `ios-sim` uploaded
+  (`ios-build-products`, a tarball because artifacts drop file modes), so it
+  pays no Rust or Xcode build. It used to be the tail of `ios-sim`, which kept
+  the gating check open for the whole ~35 min; chained with `needs`, the two
+  never overlap, so it still holds one macOS slot at a time.
 
 Two things a green CI does **not** mean:
 
@@ -270,10 +310,11 @@ Two things a green CI does **not** mean:
   `draft == false`, so `gh pr checks --watch` on a draft is indistinguishable
   from green. `scripts/dev-merge-sync.sh` refuses to merge on that, and now
   requires the three iOS checks whenever the PR's own diff says they should
-  have run.
+  have run. It waits on those required checks only, so the UI smokes never hold
+  a merge.
 
-Because the repo is public, workflow logs and the `ios-xcresult` artifact are
-readable by anyone. The xcresult carries UI-test screenshots — of demo fixtures
+Because the repo is public, workflow logs and the `ios-xcresult` (UI) and
+`ios-unit-xcresult` artifacts are readable by anyone. The xcresult carries UI-test screenshots — of demo fixtures
 today, so nothing sensitive, but that is a fact to re-check before pointing a
 test at real data.
 
