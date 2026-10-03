@@ -35,17 +35,27 @@ pub use api::{
     ChatSubagentList, ChatSubagentStatus, ChatSubagentSummary, ClientConfig, CronJobStatus,
     CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
     FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput,
-    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog,
-    LlmModelInfo, MessageLookup, NewIssue, NewProject, PairAbortListener, PairChallenge,
-    PairTarget, PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings,
-    ProjectSink, PushToken, RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch,
-    SubIssueProgress, SubagentCursor, TeamMemberInfo,
+    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmCatalogModel,
+    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, MessageLookup,
+    NewIssue, NewProject, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
+    ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings, ProjectSink, PushToken,
+    RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch, SubIssueProgress,
+    SubagentCursor, TeamMemberInfo,
 };
 use binding::{ActiveLeg, active_leg};
 use gateway_client::ActiveGatewayClient;
 use push::PushState;
 
 uniffi::setup_scaffolding!();
+
+/// How long the app waits on an LLM probe before calling it dead.
+///
+/// Neither leg bounds it for us. The gateway sets no total budget on the
+/// provider call — 60s to connect and a 600s *idle* read that resets on every
+/// byte — and the direct leg's JSON client applies no whole-request timeout at
+/// all, so an unanswered probe would hang until the provider gave up. 45s is
+/// past a slow-but-real first token and well short of that.
+const LLM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Parse a scanned QR payload (`baybo://pair?...`) into a pairing target.
 /// `None` = not a pairing QR — keep scanning. A payload without an explicit
@@ -181,6 +191,24 @@ impl BayboClient {
     /// login form.
     pub fn direct_status(&self) -> Result<Option<String>, BayboError> {
         direct::status().map_err(BayboError::from_msg)
+    }
+
+    /// Whether the ACTIVE binding would carry a request body in clear text.
+    ///
+    /// True only for a direct binding whose base URL is an explicit `http://` —
+    /// `normalize_base` preserves that scheme on purpose, so a local gateway can
+    /// be reached without TLS. A relay binding is never cleartext: the whole
+    /// request, path and headers included, is sealed inside Noise before it
+    /// reaches the socket.
+    ///
+    /// This lives here rather than as a `hasPrefix` in Swift because it is a
+    /// fact about the transport, and the transport is the one place that gets to
+    /// answer it. Its only caller is the API-key editor: a secret is the one
+    /// payload whose exposure re-sending cannot undo.
+    pub fn active_binding_is_cleartext(&self) -> Result<bool, BayboError> {
+        Ok(direct::status()
+            .map_err(BayboError::from_msg)?
+            .is_some_and(|base| base.starts_with("http://")))
     }
 
     /// Scan-to-connect: dial the gateway, run the XXpsk0 handshake through
@@ -1302,6 +1330,104 @@ impl BayboClient {
         runtime::run(async move {
             let client = self.gateway_client()?;
             gateway_api::list_llm_models(&client).await
+        })
+        .await
+    }
+
+    /// Change ONE field of the configured LLM entry `name` — the Settings entry
+    /// editor's only write. Global config, not a session pin: it applies to
+    /// every device and, for an unpinned session, from its next turn.
+    ///
+    /// One field per call is a contract, not a convenience — see
+    /// [`LlmEntryEdit`]. The answer's `requires_restart` says the edit reached
+    /// disk but not the running pool.
+    pub async fn llm_update_model(
+        self: Arc<Self>,
+        name: String,
+        edit: LlmEntryEdit,
+    ) -> Result<LlmMutateResult, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::update_llm_model(&client, name, edit).await
+        })
+        .await
+    }
+
+    /// Probe an entry's default model — one REAL, billed completion against the
+    /// provider, and the only vendor-touching pre-flight the system has.
+    ///
+    /// Capped at [`LLM_PROBE_TIMEOUT`] because neither leg can be relied on to
+    /// end it: the gateway sets no total budget (60s to connect, a 600s idle
+    /// read), and the direct leg applies no whole-request timeout at all, so an
+    /// unbounded probe would otherwise be a spinner with no exit.
+    pub async fn llm_test_model(
+        self: Arc<Self>,
+        name: String,
+    ) -> Result<LlmTestResult, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            match tokio::time::timeout(
+                LLM_PROBE_TIMEOUT,
+                gateway_api::test_llm_model(&client, name),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("the model did not answer in time".to_string()),
+            }
+        })
+        .await
+    }
+
+    /// Replace the models an LLM entry serves — the entry's own candidate set,
+    /// which is what the model pickers offer and what a session pin may name.
+    ///
+    /// A whole-set write, and idempotent: see [`LlmEntryEdit`] for why this
+    /// surface avoids read-modify-write, and note the gateway carries each
+    /// surviving id's overrides across, so plain ids are safe to send.
+    pub async fn llm_set_model_list(
+        self: Arc<Self>,
+        name: String,
+        models: Vec<String>,
+    ) -> Result<LlmMutateResult, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_llm_model_list(&client, name, models).await
+        })
+        .await
+    }
+
+    /// The provider's LIVE model catalog for one entry — what "add a model"
+    /// picks from, so an id is chosen rather than typed.
+    ///
+    /// Capped by [`LLM_PROBE_TIMEOUT`] for the same reason the probe is: this
+    /// calls out to the vendor, and neither leg bounds a slow provider.
+    pub async fn llm_catalog(
+        self: Arc<Self>,
+        name: String,
+    ) -> Result<Vec<LlmCatalogModel>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            match tokio::time::timeout(LLM_PROBE_TIMEOUT, gateway_api::llm_catalog(&client, name))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("the provider did not answer in time".to_string()),
+            }
+        })
+        .await
+    }
+
+    /// Move the gateway's `default-llm` — which entry an UNPINNED session runs
+    /// on, everywhere. Not [`Self::chat_set_session_model`], which pins one
+    /// conversation.
+    pub async fn llm_set_default(
+        self: Arc<Self>,
+        name: String,
+    ) -> Result<LlmMutateResult, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_default_llm(&client, name).await
         })
         .await
     }
