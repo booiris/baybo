@@ -74,9 +74,10 @@ jobs but only 5 macOS), so widening `IOS_DEPS` is a latency decision, not a
 billing one.
 
 Coverage stops at the simulator: no job touches a device, and the UI smokes are
-non-gating. And because the repo is public, workflow logs and uploaded artifacts
-are readable by anyone — `ios-sim` publishes an xcresult with UI-test
-screenshots on every run.
+non-gating — their own job, `ios-ui-smokes`, chained after `ios-sim` on its
+build, so they never hold the gating check open. And because the repo is public,
+workflow logs and uploaded artifacts are readable by anyone — `ios-ui-smokes`
+publishes an xcresult with UI-test screenshots on every run.
 
 ## Releases
 
