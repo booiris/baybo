@@ -49,7 +49,7 @@ pub use crate::guard::{BillableLlm, LlmCallGuard};
 pub use crate::json_extract::extract_json_object;
 pub use crate::providers::{FactoryDefaults, factory_defaults_for};
 pub use crate::registry::{
-    LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,
+    LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry, ProviderAuth,
 };
 /// Re-exported next to [`Attribution`] (which carries it) so call sites
 /// binding an attribution don't need a separate `baybo_model` import.
@@ -85,6 +85,15 @@ pub fn default_api_key_env_for_provider(provider: &str) -> Option<&'static str> 
     default_registry()
         .factory_for(provider)?
         .default_api_key_env()
+}
+
+/// How a registered provider is credentialed; `None` for an unknown name.
+///
+/// The one home for "can a client that only carries an API key create an entry
+/// for this provider". Before it, that question was answered by comparing
+/// against `openai_subscription::PROVIDER_NAME` at each site that cared.
+pub fn auth_for_provider(provider: &str) -> Option<ProviderAuth> {
+    Some(default_registry().factory_for(provider)?.auth())
 }
 
 /// Strip `; charset=…` and lowercase, then map common MIME strings to
@@ -4215,6 +4224,59 @@ mod provider_metadata_helpers_tests {
         // their deployment needs one).
         assert!(default_api_key_env_for_provider("llamafile").is_none());
         assert!(default_api_key_env_for_provider("ollama").is_none());
+    }
+
+    /// The auth mode is what a client with no interactive wizard asks instead
+    /// of matching on provider names. It is NOT derivable from the env-var
+    /// helper: that is `None` for the OAuth provider and the keyless ones
+    /// alike, which is exactly the conflation this exists to break.
+    #[test]
+    fn auth_mode_separates_oauth_from_merely_keyless() {
+        use crate::ProviderAuth;
+
+        assert_eq!(
+            auth_for_provider("openai-subscription"),
+            Some(ProviderAuth::OAuth)
+        );
+        assert_eq!(auth_for_provider("llamafile"), Some(ProviderAuth::Keyless));
+        assert_eq!(
+            auth_for_provider("ollama"),
+            Some(ProviderAuth::OptionalApiKey)
+        );
+        assert_eq!(auth_for_provider("openai"), Some(ProviderAuth::ApiKey));
+        assert_eq!(auth_for_provider("anthropic"), Some(ProviderAuth::ApiKey));
+        assert_eq!(auth_for_provider("not-a-real-provider"), None);
+
+        // All four report no env var, so the helper that used to stand in for
+        // this question cannot tell them apart.
+        for p in ["openai-subscription", "llamafile", "ollama"] {
+            assert!(default_api_key_env_for_provider(p).is_none(), "{p}");
+        }
+
+        // Only the OAuth one is out of reach for an api-key-only client.
+        assert!(
+            !auth_for_provider("openai-subscription")
+                .expect("known")
+                .is_api_key_shaped()
+        );
+        for p in ["llamafile", "ollama", "openai", "anthropic"] {
+            assert!(
+                auth_for_provider(p).expect("known").is_api_key_shaped(),
+                "{p}"
+            );
+        }
+    }
+
+    /// Every registered provider answers the question — a factory added without
+    /// thinking about auth gets the `ApiKey` default, which is right for the
+    /// overwhelming majority and wrong loudly (a create that fails to build)
+    /// rather than quietly if it is not.
+    #[test]
+    fn every_registered_provider_declares_an_auth_mode() {
+        let registry = LlmProviderRegistry::with_default_providers();
+        for name in registry.provider_names() {
+            assert!(auth_for_provider(name).is_some(), "{name} has no auth mode");
+        }
     }
 
     #[test]

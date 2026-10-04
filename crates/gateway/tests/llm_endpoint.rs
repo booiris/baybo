@@ -973,3 +973,278 @@ async fn the_same_edit_split_into_two_requests_succeeds() {
     );
     assert_eq!(primary.model_list.len(), 1);
 }
+
+// ── providers / create / delete ──────────────────────────────────────
+
+async fn get_json_at(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    let req = auth(
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap(),
+    );
+    read_json(router.clone().oneshot(req).await.unwrap()).await
+}
+
+async fn post_entry(router: &axum::Router, body: Value) -> (StatusCode, Value) {
+    let req = auth(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/llm/models")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    );
+    read_json(router.clone().oneshot(req).await.unwrap()).await
+}
+
+async fn delete_entry(router: &axum::Router, name: &str) -> (StatusCode, Value) {
+    let req = auth(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/llm/models/{name}"))
+            .body(Body::empty())
+            .unwrap(),
+    );
+    read_json(router.clone().oneshot(req).await.unwrap()).await
+}
+
+/// The compiled-in registry is the only source of legal provider ids, so this
+/// route is what lets a client offer a picker instead of a free-text field.
+/// It must also say HOW each is credentialed — a client that can only carry an
+/// API key has to be able to exclude the OAuth one by asking, not by knowing
+/// its name.
+#[tokio::test]
+async fn list_providers_reports_each_auth_mode() {
+    let (router, _dir, _path) = router_with_seed_config(seed_two_entries()).await;
+
+    let (status, body) = get_json_at(&router, "/v1/llm/providers").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let items = body["items"].as_array().expect("items");
+    assert!(
+        items.len() >= 15,
+        "the whole registry, not a subset: {}",
+        items.len()
+    );
+
+    let by_name = |n: &str| {
+        items
+            .iter()
+            .find(|p| p["name"] == n)
+            .unwrap_or_else(|| panic!("{n} missing from the provider list"))
+            .clone()
+    };
+    assert_eq!(by_name("openai")["auth"], "api_key");
+    assert_eq!(by_name("ollama")["auth"], "optional_api_key");
+    assert_eq!(by_name("llamafile")["auth"], "keyless");
+    assert_eq!(by_name("openai-subscription")["auth"], "oauth");
+    // The prefill a create form needs, where the provider has one.
+    assert_eq!(
+        by_name("anthropic")["default_api_key_env"],
+        "ANTHROPIC_API_KEY"
+    );
+}
+
+#[tokio::test]
+async fn create_persists_the_entry_and_stores_its_key() {
+    let (router, _dir, path, vault) = router_with_vault(seed_two_entries(), None).await;
+
+    let (status, resp) = post_entry(
+        &router,
+        json!({
+            "name": "kimi",
+            "provider": "moonshot",
+            "model": "kimi-k2",
+            "api_key": "sk-moonshot",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["path"], "llm[kimi]");
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    let created = on_disk.llm_entry("kimi").expect("kimi present");
+    assert_eq!(created.provider, "moonshot");
+    assert_eq!(created.model, "kimi-k2");
+    // Created bare: per-model overrides and the model list are edits made
+    // afterwards against the entry's own routes.
+    assert!(created.model_list.is_empty());
+    assert_eq!(created.lite_model, None);
+    // The existing entries and the default are untouched.
+    assert_eq!(on_disk.llm.len(), 3);
+    assert_eq!(on_disk.default_llm.as_str(), "primary");
+
+    assert_eq!(
+        vault_key(&vault, "kimi").await.as_deref(),
+        Some("sk-moonshot")
+    );
+}
+
+/// An OAuth provider's credential is a device-code login writing a token
+/// bundle — neither of which this route can perform. Creating the row anyway
+/// would list an entry that can never build.
+#[tokio::test]
+async fn create_refuses_an_oauth_provider() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+
+    let (status, resp) = post_entry(
+        &router,
+        json!({ "name": "codex", "provider": "openai-subscription", "model": "gpt-5" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("baybo llm add"),
+        "the refusal points at the flow that CAN do it: {resp}"
+    );
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    assert_eq!(on_disk.llm.len(), 2, "a refused create writes nothing");
+}
+
+#[tokio::test]
+async fn create_refuses_an_unknown_provider() {
+    let (router, _dir, _path) = router_with_seed_config(seed_two_entries()).await;
+    let (status, resp) = post_entry(
+        &router,
+        json!({ "name": "x", "provider": "nope", "model": "m" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/v1/llm/providers")
+    );
+}
+
+#[tokio::test]
+async fn create_refuses_a_duplicate_name() {
+    let (router, _dir, _path) = router_with_seed_config(seed_two_entries()).await;
+    let (status, _) = post_entry(
+        &router,
+        json!({ "name": "primary", "provider": "openai", "model": "gpt-4o" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// The name rides in the URL of every other route for this entry and becomes
+/// its vault-key suffix. `validate()` only requires non-empty, so a name that
+/// cannot survive a path segment would produce an entry nothing can address.
+#[tokio::test]
+async fn create_refuses_a_name_that_cannot_ride_a_url() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+
+    for bad in ["has/slash", "has space", "has?query", "..", "", "a%2Fb"] {
+        let (status, _) = post_entry(
+            &router,
+            json!({ "name": bad, "provider": "openai", "model": "gpt-4o" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} must be refused");
+    }
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    assert_eq!(on_disk.llm.len(), 2);
+}
+
+/// Same window as the other key writes: the pre-flight builds a client, which
+/// resolves the credential, so the key is staged before it — and must be put
+/// back when the pre-flight then rejects the entry. Otherwise a refused create
+/// leaves a secret behind for a name that does not exist.
+#[tokio::test]
+async fn a_refused_create_leaves_no_orphan_key() {
+    let (_router, _dir, _path, vault) = router_with_vault(seed_two_entries(), None).await;
+    let rejecting = rebuild_router_sharing_vault(
+        seed_two_entries(),
+        vault.clone(),
+        Arc::new(baybo_gateway::test_support::RejectingDryRunReloader),
+    )
+    .await;
+
+    let (status, _) = post_entry(
+        &rejecting,
+        json!({ "name": "ghost", "provider": "openai", "model": "gpt-4o", "api_key": "sk-x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        vault_key(&vault, "ghost").await,
+        None,
+        "a refused create must not strand a key under a name that does not exist"
+    );
+}
+
+#[tokio::test]
+async fn delete_removes_the_entry_and_its_key() {
+    let (router, _dir, path, vault) = router_with_vault(seed_two_entries(), None).await;
+    let (status, _) = put_entry(&router, "secondary", json!({ "api_key": "sk-secondary" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(vault_key(&vault, "secondary").await.is_some());
+
+    let (status, resp) = delete_entry(&router, "secondary").await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    assert!(on_disk.llm_entry("secondary").is_none());
+    assert_eq!(on_disk.llm.len(), 1);
+    assert_eq!(
+        vault_key(&vault, "secondary").await,
+        None,
+        "the key goes with it"
+    );
+}
+
+/// Removing what `default-llm` points at would leave the config referencing a
+/// missing entry — `validate()` would reject it, but a targeted refusal names
+/// the fix instead of surfacing a validation dump.
+#[tokio::test]
+async fn delete_refuses_the_default_entry() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+
+    let (status, resp) = delete_entry(&router, "primary").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("default-llm")
+    );
+
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
+    assert_eq!(on_disk.llm.len(), 2, "a refused delete writes nothing");
+}
+
+#[tokio::test]
+async fn delete_404s_for_an_unknown_entry() {
+    let (router, _dir, _path) = router_with_seed_config(seed_two_entries()).await;
+    let (status, _) = delete_entry(&router, "nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Create then delete, through the real routes, leaves the config exactly where
+/// it started — the round trip a client actually performs.
+#[tokio::test]
+async fn create_then_delete_round_trips() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+    let before = tokio::fs::read_to_string(&path).await.expect("seed");
+
+    let (status, _) = post_entry(
+        &router,
+        json!({ "name": "tmp", "provider": "groq", "model": "llama-3.3-70b" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = delete_entry(&router, "tmp").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after = tokio::fs::read_to_string(&path).await.expect("after");
+    assert_eq!(before, after, "create+delete is a no-op on disk");
+}

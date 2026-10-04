@@ -135,6 +135,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var llmCatalogCalls: [String] = []
     private var llmCatalogItems: [LlmCatalogModel] = []
     private var llmCatalogError: Error?
+    private var llmProviders: [LlmProviderInfo] = []
+    private var llmProvidersError: Error?
+    private var llmProviderFetches = 0
+    private var llmCreates: [NewLlmEntry] = []
+    private var llmDeletes: [String] = []
 
     /// The baseline answer to a sync: no rows, no cursor. Enough to unwind the
     /// webview's in-flight guard, and it confirms nothing in the outbox.
@@ -319,6 +324,12 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var llmCatalogFetches: [String] { lock.withLock { llmCatalogCalls } }
     func answerCatalog(_ items: [LlmCatalogModel]) { lock.withLock { llmCatalogItems = items } }
     func failCatalog(with error: Error) { lock.withLock { llmCatalogError = error } }
+    func answerProviders(_ items: [LlmProviderInfo]) { lock.withLock { llmProviders = items } }
+    func failProviders(with error: Error) { lock.withLock { llmProvidersError = error } }
+
+    var llmProviderFetchCount: Int { lock.withLock { llmProviderFetches } }
+    var llmCreateCalls: [NewLlmEntry] { lock.withLock { llmCreates } }
+    var llmDeleteCalls: [String] { lock.withLock { llmDeletes } }
 
     /// Push a frame into the session's live sink, exactly as the core's pump
     /// does. The sink hops to the main queue, so the caller must let the actor
@@ -534,6 +545,32 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         }
         if let failure { throw failure }
         return items
+    }
+
+    func llmListProviders() async throws -> [LlmProviderInfo] {
+        let (failure, items) = lock.withLock {
+            llmProviderFetches += 1
+            return (llmProvidersError, llmProviders)
+        }
+        if let failure { throw failure }
+        return items
+    }
+
+    func llmCreateModel(entry: NewLlmEntry) async throws -> LlmMutateResult {
+        let failure = lock.withLock {
+            llmCreates.append(entry)
+            return llmWriteError
+        }
+        if let failure { throw failure }
+        return LlmMutateResult(requiresRestart: lock.withLock { llmRequiresRestart })
+    }
+
+    func llmDeleteModel(name: String) async throws {
+        let failure = lock.withLock {
+            llmDeletes.append(name)
+            return llmWriteError
+        }
+        if let failure { throw failure }
     }
 
     func activeBindingIsCleartext() throws -> Bool { lock.withLock { cleartextBinding } }

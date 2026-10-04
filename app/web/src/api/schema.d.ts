@@ -865,7 +865,7 @@ export interface paths {
         };
         get: operations["list_models"];
         put?: never;
-        post?: never;
+        post: operations["create_model"];
         delete?: never;
         options?: never;
         head?: never;
@@ -882,7 +882,7 @@ export interface paths {
         get?: never;
         put: operations["update_model"];
         post?: never;
-        delete?: never;
+        delete: operations["delete_model"];
         options?: never;
         head?: never;
         patch?: never;
@@ -930,6 +930,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["test_model"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_providers"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2435,6 +2451,28 @@ export interface components {
             status?: null | components["schemas"]["IssueStatusDto"];
             title: string;
         };
+        /**
+         * @description `POST /v1/llm/models` body — create an entry.
+         *
+         *     Deliberately smaller than the entry it creates: per-model overrides,
+         *     `lite_model` and `model_list` are edits made afterwards against the entry's
+         *     own routes, so this carries only what an entry cannot exist without.
+         */
+        CreateLlmModelRequest: {
+            /** @description Stored in the vault under this entry's name. Never echoed back. */
+            api_key?: string | null;
+            api_key_env?: string | null;
+            base_url?: string | null;
+            model: string;
+            /**
+             * @description Unique entry name. It is also a URL path segment on every other
+             *     `/v1/llm/models/{name}` route and the suffix of this entry's vault key,
+             *     so the handler constrains it beyond `validate()`'s non-empty rule.
+             */
+            name: string;
+            /** @description Must be one of `GET /v1/llm/providers`, and not an OAuth one. */
+            provider: string;
+        };
         CreateProjectRequest: {
             /**
              * Format: int64
@@ -3238,6 +3276,40 @@ export interface components {
             input_per_1m_tokens?: number | null;
             /** Format: int64 */
             output_per_1m_tokens?: number | null;
+        };
+        /**
+         * @description How a provider is credentialed (`GET /v1/llm/providers`). Mirrors
+         *     `baybo_llm::ProviderAuth`; the DTO exists separately so the wire shape
+         *     can't drift when that enum grows a variant.
+         * @enum {string}
+         */
+        LlmProviderAuthDto: "api_key" | "optional_api_key" | "keyless" | "oauth";
+        /**
+         * @description One provider this build can serve, in registration order.
+         *
+         *     The registry is compiled in, so this list is the ONLY way a client learns
+         *     which provider ids are legal. Without it a create form has to free-text the
+         *     field, and a wrong provider is not an error: `prepare` warns and drops the
+         *     entry from the pool, `dry_run` passes, the file is written, and
+         *     `GET /v1/llm/models` keeps listing a row that no longer exists.
+         */
+        LlmProviderInfo: {
+            auth: components["schemas"]["LlmProviderAuthDto"];
+            /**
+             * @description The env var this provider conventionally reads its key from, when it
+             *     has one. A client can offer it as the alternative to storing a key.
+             */
+            default_api_key_env?: string | null;
+            /**
+             * @description Prefill for the base-URL field; `None` means the provider's own client
+             *     supplies one and the operator need not.
+             */
+            default_base_url?: string | null;
+            name: string;
+        };
+        /** @description `GET /v1/llm/providers` response. */
+        LlmProvidersResponse: {
+            items: components["schemas"]["LlmProviderInfo"][];
         };
         /** @description `GET /v1/llm/usage` response. */
         LlmUsageResponse: {
@@ -7114,6 +7186,66 @@ export interface operations {
             };
         };
     };
+    create_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateLlmModelRequest"];
+            };
+        };
+        responses: {
+            /** @description Entry created and hot-reloaded in-process. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MutateResponse"];
+                };
+            };
+            /** @description Bad name, unknown or OAuth provider, or an unbuildable entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description An entry with that name already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Write failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     update_model: {
         parameters: {
             query?: never;
@@ -7140,6 +7272,65 @@ export interface operations {
                 };
             };
             /** @description Invalid update */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Write failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Entry name (matches `llm[*].name`) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Entry removed and hot-reloaded in-process. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MutateResponse"];
+                };
+            };
+            /** @description The entry is `default-llm`, or signs in interactively */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -7322,6 +7513,35 @@ export interface operations {
             };
             /** @description Entry not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Providers this build can serve, in registration order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LlmProvidersResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

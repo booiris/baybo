@@ -25,7 +25,7 @@ struct LlmEntriesScreen: View {
         ZStack(alignment: .top) {
             Group {
                 if catalog.models.isEmpty {
-                    message(lang.t("llm.empty"))
+                    message(lang.t("llm.emptyWithAdd"))
                 } else {
                     entryList
                 }
@@ -60,6 +60,19 @@ struct LlmEntriesScreen: View {
                 .accessibilityLabel(Text(verbatim: lang.t("chat.back")))
 
                 Spacer()
+
+                Button {
+                    Haptics.tap()
+                    appStore.openNewLlmEntry()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Theme.ink)
+                        .frame(width: 42, height: 42)
+                }
+                .glassSurface(interactive: true, in: .circle)
+                .accessibilityIdentifier("llm-new-entry")
+                .accessibilityLabel(Text(verbatim: lang.t("llm.newTitle")))
             }
         }
         .padding(.horizontal, 24)

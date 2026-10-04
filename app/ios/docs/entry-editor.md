@@ -12,19 +12,18 @@ device, and — for a session with no pin — from its next turn.
 
 ## Scope, and what is deliberately absent
 
-There is **no create and no delete for an ENTRY**: the gateway exposes no POST
-or DELETE for one. Adding an entry is `baybo llm add` or a config-file edit. The
-editor is for entries that already exist, and the screen says nothing that
-implies otherwise.
+Entries are **created and removed here**, with one exclusion: a provider that
+signs in interactively. See [Creating an entry](#creating-an-entry).
 
 The models an entry SERVES are a different question, and that one is managed
-here — see [The model list](#the-model-list).
+here too — see [The model list](#the-model-list).
 
 Two more absences, each load-bearing:
 
-- **Provider is read-only.** The valid set is `LlmProviderRegistry`'s 19
-  factories, which is enumerable in Rust and on **no HTTP route** — the phone
-  cannot obtain it. And a bad provider is not a 400: `prepare` warns and DROPS
+- **Provider is read-only on an EXISTING entry.** Changing it would rebuild the
+  entry against a different vendor while its model, key and overrides stayed —
+  a combination nothing validates. It is chosen once, at creation, from
+  `GET /v1/llm/providers`. And a bad provider is not a 400: `prepare` warns and DROPS
   the entry from the pool, `dry_run` passes, the file is written, and
   `GET /v1/llm/models` keeps listing a row that no longer exists. A free-text
   field here would be a silent 200-OK deletion.
@@ -107,6 +106,50 @@ with the config untouched and the secret already gone, and since the clear is
 the only way to remove a key there was nothing left to put back. A key that
 rides alone in its own request is still the right habit, and this screen's
 one-key-per-PUT rule gives it for free.
+
+## Creating an entry
+
+`POST /v1/llm/models` takes only what an entry cannot exist without — name,
+provider, model, and optionally a base URL and a key. Everything else
+(`model_list`, per-model overrides, the thinking level) is an edit made
+afterwards against the entry's own routes, so the create form does not collect
+it and the handler does not accept it.
+
+**The provider is a PICK, from `GET /v1/llm/providers`.** The registry is
+compiled into the gateway binary, so that route is the only way a client learns
+which ids are legal — and a wrong one is not an error anywhere: `prepare` warns
+and drops the entry from the pool, `dry_run` passes, the file is written, and
+`GET /v1/llm/models` keeps listing a row the pool no longer has. A free-text
+provider field would be a silent 200-OK deletion.
+
+That route also carries **how each provider is credentialed**, which is not
+derivable from `default_api_key_env` — that is `None` for the OAuth provider and
+for the keyless ones alike. `ProviderAuth` (`crates/llm/src/registry.rs`) is the
+one home for the distinction; before it, telling them apart meant knowing that
+`openai-subscription` is the OAuth one by name, which only the setup wizard did.
+
+**OAuth providers are excluded, and filtered OUT of the picker rather than shown
+disabled.** Their credential is a device-code login writing a token bundle, and
+neither the route nor the phone can perform it; an entry created without it
+would be listed and unbuildable. `POST` refuses them, `DELETE` refuses them too
+— that bundle wants a server-side revoke, and whether it may be cleared at all
+depends on the other subscription entries, which is `baybo llm remove`'s job.
+
+Two rules the create handler owns that `validate()` does not:
+
+- **The name must survive a URL path segment.** It rides in the URL of every
+  other route for this entry and is its vault-key suffix; `validate()` requires
+  only non-empty, so a name with a slash would produce an entry nothing can
+  address afterwards.
+- **The first entry on a fresh install becomes `default-llm`.** `validate()`
+  rejects an empty default once entries exist, so the handler sets it rather
+  than writing a config it just made invalid.
+
+Deletion refuses the current `default-llm` — removing it would leave the config
+pointing at a row that is gone. The vault key is dropped **after** the config
+write, which is the opposite of every other key write here and for the opposite
+reason: the pre-flight on those must see the new key, while a key dropped before
+a failed delete would leave a live entry with no credential.
 
 ## The model list
 

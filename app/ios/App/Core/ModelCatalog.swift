@@ -208,6 +208,33 @@ final class ModelCatalog: ObservableObject {
         try await client.llmCatalog(name: entry)
     }
 
+    /// The providers this gateway can serve. Not cached either, and for a
+    /// sharper reason than the model catalog: the set is compiled into the
+    /// gateway binary, so it changes exactly when the gateway is upgraded —
+    /// which is the moment a cache would be wrong.
+    func providers() async throws -> [LlmProviderInfo] {
+        try await client.llmListProviders()
+    }
+
+    /// Create an entry, then re-read. The new row's `effective*` columns are
+    /// computed gateway-side, and it may also have become `default-llm` (the
+    /// first entry on a fresh install does), so nothing here can be guessed.
+    @discardableResult
+    func create(_ entry: NewLlmEntry) async throws -> LlmMutateResult {
+        let epoch = epoch
+        let result = try await client.llmCreateModel(entry: entry)
+        try await reload(expecting: epoch)
+        return result
+    }
+
+    /// Remove an entry and the key the gateway holds for it. Refused by the
+    /// gateway for the current `default-llm` and for an OAuth entry.
+    func delete(_ name: String) async throws {
+        let epoch = epoch
+        try await client.llmDeleteModel(name: name)
+        try await reload(expecting: epoch)
+    }
+
     // MARK: - Mirror (`models.json` — a pure cache, never a source of truth)
 
     /// Codable twin of the uniffi records (which aren't Codable themselves).

@@ -36,11 +36,11 @@ pub use api::{
     CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
     FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput,
     IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmCatalogModel,
-    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, MessageLookup,
-    NewIssue, NewProject, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
-    ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings, ProjectSink, PushToken,
-    RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch, SubIssueProgress,
-    SubagentCursor, TeamMemberInfo,
+    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmProviderAuth, LlmProviderInfo,
+    LlmTestResult, MessageLookup, NewIssue, NewLlmEntry, NewProject, PairAbortListener,
+    PairChallenge, PairTarget, PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo,
+    ProjectSettings, ProjectSink, PushToken, RunStatus, RunTrigger, SessionListSink,
+    SessionModelPin, StringPatch, SubIssueProgress, SubagentCursor, TeamMemberInfo,
 };
 use binding::{ActiveLeg, active_leg};
 use gateway_client::ActiveGatewayClient;
@@ -1375,6 +1375,44 @@ impl BayboClient {
                 Ok(result) => result,
                 Err(_) => Err("the model did not answer in time".to_string()),
             }
+        })
+        .await
+    }
+
+    /// The providers this gateway build can serve — the create form's picker.
+    ///
+    /// The registry is compiled into the gateway, so this is the only way the
+    /// app learns which provider ids are legal. A provider typed by hand is not
+    /// an error anywhere: the entry is written, dropped from the pool with a
+    /// warn, and still listed by `GET /v1/llm/models`.
+    pub async fn llm_list_providers(self: Arc<Self>) -> Result<Vec<LlmProviderInfo>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_llm_providers(&client).await
+        })
+        .await
+    }
+
+    /// Create an LLM entry. The gateway refuses an OAuth provider — its
+    /// device-code login is `baybo llm add`'s, and an entry created without it
+    /// could never build.
+    pub async fn llm_create_model(
+        self: Arc<Self>,
+        entry: NewLlmEntry,
+    ) -> Result<LlmMutateResult, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::create_llm_model(&client, entry).await
+        })
+        .await
+    }
+
+    /// Remove an LLM entry and the key the gateway stores for it. Refused for
+    /// the current `default-llm` and for an OAuth entry.
+    pub async fn llm_delete_model(self: Arc<Self>, name: String) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::delete_llm_model(&client, name).await
         })
         .await
     }

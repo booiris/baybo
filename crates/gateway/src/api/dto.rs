@@ -381,6 +381,86 @@ pub struct SetDefaultLlmRequest {
     pub name: String,
 }
 
+/// How a provider is credentialed (`GET /v1/llm/providers`). Mirrors
+/// `baybo_llm::ProviderAuth`; the DTO exists separately so the wire shape
+/// can't drift when that enum grows a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProviderAuthDto {
+    /// A key is required; the entry cannot be built without one.
+    ApiKey,
+    /// A key is accepted but optional (a local Ollama behind no auth).
+    OptionalApiKey,
+    /// Takes no key at all.
+    Keyless,
+    /// Signed in interactively. `POST /v1/llm/models` refuses these: the
+    /// device-code flow and the token bundle it writes are the CLI's
+    /// (`baybo llm add`), and an entry created here would have no way to
+    /// acquire a credential.
+    Oauth,
+}
+
+impl From<baybo_llm::ProviderAuth> for LlmProviderAuthDto {
+    fn from(v: baybo_llm::ProviderAuth) -> Self {
+        match v {
+            baybo_llm::ProviderAuth::ApiKey => Self::ApiKey,
+            baybo_llm::ProviderAuth::OptionalApiKey => Self::OptionalApiKey,
+            baybo_llm::ProviderAuth::Keyless => Self::Keyless,
+            baybo_llm::ProviderAuth::OAuth => Self::Oauth,
+        }
+    }
+}
+
+/// One provider this build can serve, in registration order.
+///
+/// The registry is compiled in, so this list is the ONLY way a client learns
+/// which provider ids are legal. Without it a create form has to free-text the
+/// field, and a wrong provider is not an error: `prepare` warns and drops the
+/// entry from the pool, `dry_run` passes, the file is written, and
+/// `GET /v1/llm/models` keeps listing a row that no longer exists.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmProviderInfo {
+    pub name: String,
+    pub auth: LlmProviderAuthDto,
+    /// Prefill for the base-URL field; `None` means the provider's own client
+    /// supplies one and the operator need not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_base_url: Option<String>,
+    /// The env var this provider conventionally reads its key from, when it
+    /// has one. A client can offer it as the alternative to storing a key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_api_key_env: Option<String>,
+}
+
+/// `GET /v1/llm/providers` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmProvidersResponse {
+    pub items: Vec<LlmProviderInfo>,
+}
+
+/// `POST /v1/llm/models` body — create an entry.
+///
+/// Deliberately smaller than the entry it creates: per-model overrides,
+/// `lite_model` and `model_list` are edits made afterwards against the entry's
+/// own routes, so this carries only what an entry cannot exist without.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateLlmModelRequest {
+    /// Unique entry name. It is also a URL path segment on every other
+    /// `/v1/llm/models/{name}` route and the suffix of this entry's vault key,
+    /// so the handler constrains it beyond `validate()`'s non-empty rule.
+    pub name: String,
+    /// Must be one of `GET /v1/llm/providers`, and not an OAuth one.
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Stored in the vault under this entry's name. Never echoed back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
 /// `PUT /v1/llm/models/{name}/model-list` body — the models this entry
 /// serves, as a SET, in picker order.
 ///

@@ -82,11 +82,47 @@ impl std::fmt::Debug for LlmProviderConfig {
     }
 }
 
+/// What a caller must collect before an entry for this provider can be built.
+///
+/// This is NOT derivable from [`LlmProviderFactory::default_api_key_env`],
+/// which is `None` for the OAuth provider and for the keyless ones alike — it
+/// answers "is there a conventional env var", not "is a credential needed".
+/// Telling those apart used to require knowing that `openai-subscription` is
+/// the OAuth one by name, which only the setup wizard did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuth {
+    /// A key is required; the client cannot be constructed without one.
+    ApiKey,
+    /// A key is accepted but optional — a local Ollama that may or may not
+    /// sit behind auth.
+    OptionalApiKey,
+    /// Takes no key at all (`llamafile`).
+    Keyless,
+    /// Signed in interactively, and no API key can stand in for it. A caller
+    /// that cannot run that flow must refuse the provider rather than create
+    /// an entry it has no way to credential.
+    OAuth,
+}
+
+impl ProviderAuth {
+    /// Whether an entry for this provider can be created by a client that can
+    /// only carry an API key — which is every client but the setup wizard.
+    pub fn is_api_key_shaped(self) -> bool {
+        !matches!(self, Self::OAuth)
+    }
+}
+
 /// A factory that knows how to create an `LlmClient` for a specific provider.
 #[async_trait::async_trait]
 pub trait LlmProviderFactory: Send + Sync {
     /// Returns the provider name this factory handles (e.g. `"openai"`, `"anthropic"`).
     fn provider_name(&self) -> &str;
+
+    /// How this provider is credentialed. Defaults to [`ProviderAuth::ApiKey`]
+    /// because that is what every factory but three is.
+    fn auth(&self) -> ProviderAuth {
+        ProviderAuth::ApiKey
+    }
 
     /// Creates an `LlmClient` from the given configuration.
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient>;

@@ -3893,6 +3893,74 @@
             }
           }
         }
+      },
+      "post": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "create_model",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLlmModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Entry created and hot-reloaded in-process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad name, unknown or OAuth provider, or an unbuildable entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "An entry with that name already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Write failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/llm/models/{name}": {
@@ -3935,6 +4003,75 @@
           },
           "400": {
             "description": "Invalid update",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Write failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "delete_model",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Entry name (matches `llm[*].name`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Entry removed and hot-reloaded in-process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The entry is `default-llm`, or signs in interactively",
             "content": {
               "application/json": {
                 "schema": {
@@ -4158,6 +4295,36 @@
           },
           "404": {
             "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/providers": {
+      "get": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "list_providers",
+        "responses": {
+          "200": {
+            "description": "Providers this build can serve, in registration order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmProvidersResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
             "content": {
               "application/json": {
                 "schema": {
@@ -9073,6 +9240,47 @@
           }
         }
       },
+      "CreateLlmModelRequest": {
+        "type": "object",
+        "description": "`POST /v1/llm/models` body — create an entry.\n\nDeliberately smaller than the entry it creates: per-model overrides,\n`lite_model` and `model_list` are edits made afterwards against the entry's\nown routes, so this carries only what an entry cannot exist without.",
+        "required": [
+          "name",
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "api_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stored in the vault under this entry's name. Never echoed back."
+          },
+          "api_key_env": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique entry name. It is also a URL path segment on every other\n`/v1/llm/models/{name}` route and the suffix of this entry's vault key,\nso the handler constrains it beyond `validate()`'s non-empty rule."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Must be one of `GET /v1/llm/providers`, and not an OAuth one."
+          }
+        }
+      },
       "CreateProjectRequest": {
         "type": "object",
         "required": [
@@ -10974,6 +11182,61 @@
               "null"
             ],
             "format": "int64"
+          }
+        }
+      },
+      "LlmProviderAuthDto": {
+        "type": "string",
+        "description": "How a provider is credentialed (`GET /v1/llm/providers`). Mirrors\n`baybo_llm::ProviderAuth`; the DTO exists separately so the wire shape\ncan't drift when that enum grows a variant.",
+        "enum": [
+          "api_key",
+          "optional_api_key",
+          "keyless",
+          "oauth"
+        ]
+      },
+      "LlmProviderInfo": {
+        "type": "object",
+        "description": "One provider this build can serve, in registration order.\n\nThe registry is compiled in, so this list is the ONLY way a client learns\nwhich provider ids are legal. Without it a create form has to free-text the\nfield, and a wrong provider is not an error: `prepare` warns and drops the\nentry from the pool, `dry_run` passes, the file is written, and\n`GET /v1/llm/models` keeps listing a row that no longer exists.",
+        "required": [
+          "name",
+          "auth"
+        ],
+        "properties": {
+          "auth": {
+            "$ref": "#/components/schemas/LlmProviderAuthDto"
+          },
+          "default_api_key_env": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The env var this provider conventionally reads its key from, when it\nhas one. A client can offer it as the alternative to storing a key."
+          },
+          "default_base_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Prefill for the base-URL field; `None` means the provider's own client\nsupplies one and the operator need not."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "LlmProvidersResponse": {
+        "type": "object",
+        "description": "`GET /v1/llm/providers` response.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LlmProviderInfo"
+            }
           }
         }
       },

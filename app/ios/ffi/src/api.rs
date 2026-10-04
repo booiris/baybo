@@ -509,6 +509,59 @@ pub struct LlmCatalogModel {
     pub configured: bool,
 }
 
+/// How a provider is credentialed — what the create form must collect before
+/// an entry for it can exist.
+///
+/// The phone cannot derive this: the registry is compiled into the gateway and
+/// `default_api_key_env` is absent for the OAuth provider and the keyless ones
+/// alike. Asking is the only way to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LlmProviderAuth {
+    /// A key is required.
+    ApiKey,
+    /// A key is accepted but optional (a local Ollama behind no auth).
+    OptionalApiKey,
+    /// Takes no key at all.
+    Keyless,
+    /// Signed in interactively. The create route refuses these, so the picker
+    /// does too rather than offering a choice that always 400s.
+    OAuth,
+    /// A mode this build does not name. Both ends carry the arm on purpose: a
+    /// gateway that grows an auth mode must cost one row its label, not blank
+    /// the whole provider list with a decode error.
+    Unknown,
+}
+
+/// One provider the gateway can serve — the create form's picker.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LlmProviderInfo {
+    pub name: String,
+    pub auth: LlmProviderAuth,
+    /// Prefill for the base-URL field; `None` means the provider supplies its
+    /// own and the operator need not.
+    pub default_base_url: Option<String>,
+    /// The env var this provider conventionally reads its key from, when it
+    /// has one — the alternative to storing a key in the vault.
+    pub default_api_key_env: Option<String>,
+}
+
+/// A new LLM entry, as the create form collects it.
+///
+/// Smaller than the entry it makes: `model_list`, per-model overrides and the
+/// thinking level are edits made afterwards against the entry's own routes.
+/// `name` rides in the URL of every one of those, so the gateway constrains it
+/// to what a path segment can carry.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NewLlmEntry {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    /// Stored in the gateway's vault. Never read back.
+    pub api_key: Option<String>,
+}
+
 /// What a config mutation answers with.
 ///
 /// `requires_restart` means **persisted to disk but not live**: the reloader

@@ -221,6 +221,69 @@ final class LlmEntryUITests: BayboUITestCase {
         attachScreenshot(app, name: "llm-add-model")
     }
 
+    /// The provider is a PICK, never free text. Nothing gateway-side checks a
+    /// provider id against the registry: a wrong one is written, dropped from
+    /// the pool with a warn, and still listed — a silent 200-OK deletion. With
+    /// no gateway behind the demo catalog the fetch fails, so the level has to
+    /// SAY so rather than render an empty picker that looks like "none exist".
+    func testCreatingAnEntryPicksTheProviderRatherThanTypingIt() {
+        let app = openModels()
+        let add = app.buttons["llm-new-entry"]
+        XCTAssertTrue(add.waitForExistence(timeout: 5), "the entries list needs an add affordance")
+        add.tap()
+
+        XCTAssertTrue(
+            app.buttons["llm-new-provider"].waitForExistence(timeout: 5),
+            "the create form never appeared")
+        // Name is free text; provider is not.
+        XCTAssertTrue(app.textFields["llm-new-name"].exists)
+        XCTAssertFalse(
+            app.textFields["llm-new-provider"].exists,
+            "the provider must never be a text field")
+
+        // Create stays disabled until a provider is chosen.
+        XCTAssertFalse(app.buttons["llm-new-create"].isEnabled)
+        attachScreenshot(app, name: "llm-new-form")
+
+        app.buttons["llm-new-provider"].tap()
+        let failure = app.staticTexts["llm-new-providers-failure"]
+        let anyProvider = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "llm-provider-")).firstMatch
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline && !failure.exists && !anyProvider.exists {
+            _ = failure.waitForExistence(timeout: 1)
+        }
+        XCTAssertTrue(
+            failure.exists || anyProvider.exists,
+            "the provider level must resolve to a list or a stated failure, not stay blank")
+        attachScreenshot(app, name: "llm-new-entry")
+    }
+
+    /// Removal is offered only on a NON-default entry: the gateway refuses to
+    /// delete what `default-llm` points at, and the fix for that lives on a
+    /// different screen.
+    func testOnlyANonDefaultEntryOffersRemoval() {
+        let app = openModels()
+
+        app.buttons["llm-entry-claude"].tap()
+        XCTAssertTrue(app.buttons["llm-field-model"].waitForExistence(timeout: 5))
+        XCTAssertFalse(
+            app.buttons["llm-delete-entry"].exists,
+            "the default entry must not offer removal")
+
+        app.buttons["llm-entry-back"].tap()
+        app.buttons["llm-entry-gpt"].tap()
+        let remove = app.buttons["llm-delete-entry"]
+        XCTAssertTrue(remove.waitForExistence(timeout: 5), "a non-default entry is removable")
+
+        remove.tap()
+        XCTAssertTrue(
+            app.buttons["Remove"].waitForExistence(timeout: 5),
+            "removing an entry must confirm first")
+        attachScreenshot(app, name: "llm-delete-entry-confirm")
+        app.buttons["Cancel"].tap()
+    }
+
     /// A pick commits immediately — there is no Save button on the fields
     /// level — and with no gateway behind the demo catalog the write fails.
     /// What matters is that the failure SURFACES: a silent no-op here would

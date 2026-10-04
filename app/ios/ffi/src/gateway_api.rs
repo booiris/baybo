@@ -10,9 +10,9 @@ use crate::api::{
     ChatSubagentStatus, ChatSubagentSummary, CronJobStatus, CronJobSummary, DeckCardInfo,
     DeckLayoutEntryInput, DeckSnapshotInfo, DeckView, HiredBy, IssueAttachmentInfo,
     IssueAttachmentInput, IssueInfo, IssuePriority, IssueRunInfo, IssueStatus, LlmCatalogModel,
-    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmTestResult, ProjectActivity,
-    ProjectAttention, ProjectInfo, RunStatus, RunTrigger, SessionModelPin, SubIssueProgress,
-    SubagentCursor, TeamMemberInfo,
+    LlmEntryEdit, LlmModelCatalog, LlmModelInfo, LlmMutateResult, LlmProviderAuth, LlmProviderInfo,
+    LlmTestResult, NewLlmEntry, ProjectActivity, ProjectAttention, ProjectInfo, RunStatus,
+    RunTrigger, SessionModelPin, SubIssueProgress, SubagentCursor, TeamMemberInfo,
 };
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
@@ -27,6 +27,9 @@ const PATH_LLM_MODELS: &str = "/v1/llm/models";
 /// against. A SIBLING of `/v1/llm/models`, not a sub-path of it, so it cannot
 /// be derived from the const above.
 const PATH_LLM_DEFAULT: &str = "/v1/llm/default";
+/// The providers this gateway build can serve. A SIBLING of the entry paths:
+/// it describes what could be created, not what is configured.
+const PATH_LLM_PROVIDERS: &str = "/v1/llm/providers";
 const PATH_AGENTS: &str = "/v1/agents";
 const PATH_DECK: &str = "/v1/deck";
 /// The kanban boards. Every card, run, comment and approval on the phone
@@ -632,6 +635,42 @@ struct WireLlmTestResult {
 #[derive(Serialize)]
 struct SetDefaultLlmRequest<'a> {
     name: &'a str,
+}
+
+/// `GET /v1/llm/providers` response.
+#[derive(Deserialize)]
+struct WireLlmProviders {
+    #[serde(default)]
+    items: Vec<WireLlmProvider>,
+}
+
+#[derive(Deserialize)]
+struct WireLlmProvider {
+    name: String,
+    /// An auth mode this build does not name decodes to `Unknown` rather than
+    /// failing — one unusable row beats blanking the whole picker.
+    #[serde(default)]
+    auth: Option<String>,
+    #[serde(default)]
+    default_base_url: Option<String>,
+    #[serde(default)]
+    default_api_key_env: Option<String>,
+}
+
+/// `POST /v1/llm/models` body. Every optional field is omitted when absent:
+/// unlike the field editor, nothing here means "clear", so an explicit null
+/// would say something this request has no way to mean.
+#[derive(Serialize)]
+struct CreateLlmModelRequest<'a> {
+    name: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_env: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<&'a str>,
 }
 
 /// `PUT /v1/llm/models/{name}/model-list` body — the whole served SET.
@@ -1465,6 +1504,79 @@ pub(crate) async fn llm_catalog<C: GatewayJsonClient + Sync>(
             configured: m.configured,
         })
         .collect())
+}
+
+/// The providers this gateway build can serve, in registration order.
+///
+/// The registry is compiled into the gateway, so this is the ONLY way the app
+/// learns which provider ids are legal. Without it a create form has to free-
+/// text the field, and a wrong provider is not an error — the entry is written,
+/// then dropped from the pool with a warn while the API keeps listing it.
+pub(crate) async fn list_llm_providers<C: GatewayJsonClient + Sync>(
+    client: &C,
+) -> Result<Vec<LlmProviderInfo>, String> {
+    let wire: WireLlmProviders = client.get_json(PATH_LLM_PROVIDERS).await?;
+    Ok(wire
+        .items
+        .into_iter()
+        .map(|p| LlmProviderInfo {
+            name: p.name,
+            auth: match p.auth.as_deref() {
+                Some("api_key") => LlmProviderAuth::ApiKey,
+                Some("optional_api_key") => LlmProviderAuth::OptionalApiKey,
+                Some("keyless") => LlmProviderAuth::Keyless,
+                Some("oauth") => LlmProviderAuth::OAuth,
+                _ => LlmProviderAuth::Unknown,
+            },
+            default_base_url: p.default_base_url,
+            default_api_key_env: p.default_api_key_env,
+        })
+        .collect())
+}
+
+/// Create an LLM entry. The gateway refuses an OAuth provider, a duplicate
+/// name, and a name that could not ride the URL of this entry's other routes.
+pub(crate) async fn create_llm_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    entry: NewLlmEntry,
+) -> Result<LlmMutateResult, String> {
+    let trimmed = |s: &Option<String>| -> Option<String> {
+        s.as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let base_url = trimmed(&entry.base_url);
+    let api_key_env = trimmed(&entry.api_key_env);
+    let api_key = trimmed(&entry.api_key);
+
+    let body = serde_json::to_vec(&CreateLlmModelRequest {
+        name: entry.name.trim(),
+        provider: entry.provider.trim(),
+        model: entry.model.trim(),
+        base_url: base_url.as_deref(),
+        api_key_env: api_key_env.as_deref(),
+        api_key: api_key.as_deref(),
+    })
+    .map_err(|e| format!("encode create llm entry request: {e}"))?;
+
+    let wire: WireMutateResponse = client.post_json(PATH_LLM_MODELS, body).await?;
+    Ok(LlmMutateResult {
+        requires_restart: wire.requires_restart,
+    })
+}
+
+/// Remove an LLM entry and the key the gateway holds for it.
+///
+/// Refused for the entry that is currently `default-llm`, and for an OAuth one
+/// — that credential wants a server-side revoke the CLI owns, and dropping the
+/// config row here would strand a live token.
+pub(crate) async fn delete_llm_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    name: String,
+) -> Result<(), String> {
+    validate_path_segment(&name, "llm entry name")?;
+    let path = format!("{PATH_LLM_MODELS}/{}", percent_encode(&name));
+    client.delete_empty(&path).await
 }
 
 /// Move the gateway's `default-llm` to `name` — the GLOBAL entry every unpinned
@@ -3946,6 +4058,104 @@ mod tests {
         assert!(!items[2].configured);
     }
 
+    /// The picker's whole point is that the app never types a provider id. An
+    /// auth mode this build does not name must cost that ONE row its label, not
+    /// blank the list — which is what a hard decode error would do.
+    #[tokio::test]
+    async fn the_provider_list_tolerates_an_unknown_auth_mode() {
+        let client = RecordingClient::new(
+            r#"{"items":[
+                {"name":"openai","auth":"api_key","default_api_key_env":"OPENAI_API_KEY"},
+                {"name":"ollama","auth":"optional_api_key","default_base_url":"http://localhost:11434"},
+                {"name":"llamafile","auth":"keyless"},
+                {"name":"openai-subscription","auth":"oauth","default_base_url":"https://chatgpt.com/backend-api"},
+                {"name":"from-the-future","auth":"passkey"},
+                {"name":"no-auth-field"}
+            ]}"#,
+        );
+        let items = list_llm_providers(&client).await.expect("providers");
+
+        assert_eq!(client.only_call().path, "/v1/llm/providers");
+        assert_eq!(items.len(), 6);
+        assert_eq!(items[0].auth, LlmProviderAuth::ApiKey);
+        assert_eq!(
+            items[0].default_api_key_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(items[1].auth, LlmProviderAuth::OptionalApiKey);
+        assert_eq!(items[2].auth, LlmProviderAuth::Keyless);
+        assert_eq!(items[3].auth, LlmProviderAuth::OAuth);
+        // Neither an unrecognised mode nor a missing field blanks the list.
+        assert_eq!(items[4].auth, LlmProviderAuth::Unknown);
+        assert_eq!(items[5].auth, LlmProviderAuth::Unknown);
+    }
+
+    /// Nothing on the create body means "clear", so an absent field is OMITTED
+    /// rather than sent as an explicit null — the opposite of the field editor,
+    /// where a null is the clear verb.
+    #[tokio::test]
+    async fn creating_an_entry_omits_what_it_was_not_given() {
+        let client = RecordingClient::new(r#"{"requires_restart":false}"#);
+        create_llm_model(
+            &client,
+            NewLlmEntry {
+                name: "  kimi  ".to_string(),
+                provider: " moonshot ".to_string(),
+                model: " kimi-k2 ".to_string(),
+                base_url: None,
+                api_key_env: Some("   ".to_string()),
+                api_key: None,
+            },
+        )
+        .await
+        .expect("create");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.path, "/v1/llm/models");
+        // Trimmed, and a whitespace-only optional is absent rather than "".
+        assert_eq!(
+            call.body,
+            r#"{"name":"kimi","provider":"moonshot","model":"kimi-k2"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_an_entry_sends_what_it_was_given() {
+        let client = RecordingClient::new(r#"{"requires_restart":true}"#);
+        let result = create_llm_model(
+            &client,
+            NewLlmEntry {
+                name: "local".to_string(),
+                provider: "ollama".to_string(),
+                model: "qwen3".to_string(),
+                base_url: Some("http://localhost:11434".to_string()),
+                api_key_env: None,
+                api_key: Some("sk-live".to_string()),
+            },
+        )
+        .await
+        .expect("create");
+
+        assert!(result.requires_restart);
+        assert_eq!(
+            client.only_call().body,
+            r#"{"name":"local","provider":"ollama","model":"qwen3","base_url":"http://localhost:11434","api_key":"sk-live"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_entry_addresses_it_by_path() {
+        let client = RecordingClient::empty();
+        delete_llm_model(&client, "kimi".to_string())
+            .await
+            .expect("delete");
+
+        let call = client.only_call();
+        assert_eq!(call.method, "DELETE");
+        assert_eq!(call.path, "/v1/llm/models/kimi");
+    }
+
     /// The entry name reaches the PATH here (unlike the default endpoint), so
     /// it takes the same escaping guard every other path segment does.
     #[tokio::test]
@@ -3974,6 +4184,10 @@ mod tests {
             );
             assert!(
                 llm_catalog(&client, bad.to_string()).await.is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                delete_llm_model(&client, bad.to_string()).await.is_err(),
                 "{bad:?} must be rejected"
             );
             assert!(client.calls.lock().is_empty());

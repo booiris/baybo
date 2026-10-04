@@ -310,6 +310,83 @@ struct LlmEntryEditorTests {
         #expect(client.llmCatalogFetches == ["claude", "claude"], "never cached")
     }
 
+    // MARK: - Create and delete
+
+    /// Creation re-reads like every other write, and for one reason the others
+    /// do not have: on a fresh install the FIRST entry also becomes
+    /// `default-llm`, which the client never asked for and cannot derive.
+    @Test func creatingAnEntryRepaintsFromTheServer() async throws {
+        client.answerModelCatalog(LlmModelCatalog(defaultName: "", items: []))
+        let catalog = ModelCatalog(client: client, directory: temp.url)
+        catalog.refreshIfNeeded()
+        _ = await waitUntil { catalog.defaultName != nil }
+
+        client.answerModelCatalog(
+            LlmModelCatalog(
+                defaultName: "kimi",
+                items: [LlmFixtures.entry("kimi", provider: "moonshot", model: "kimi-k2")]))
+        _ = try await catalog.create(
+            NewLlmEntry(
+                name: "kimi", provider: "moonshot", model: "kimi-k2",
+                baseUrl: nil, apiKeyEnv: nil, apiKey: "sk-x"))
+
+        #expect(catalog.entry(named: "kimi")?.provider == "moonshot")
+        #expect(catalog.defaultName == "kimi", "the first entry became the default server-side")
+        #expect(client.llmCreateCalls.map(\.name) == ["kimi"])
+        #expect(client.llmCreateCalls.first?.apiKey == "sk-x")
+    }
+
+    @Test func deletingAnEntryDropsItFromTheCatalog() async throws {
+        let catalog = await makeCatalog()
+
+        client.answerModelCatalog(
+            LlmModelCatalog(
+                defaultName: "claude",
+                items: [LlmFixtures.entry("claude", model: "claude-sonnet-5")]))
+        try await catalog.delete("gpt")
+
+        #expect(client.llmDeleteCalls == ["gpt"])
+        #expect(catalog.entry(named: "gpt") == nil)
+        #expect(catalog.models.count == 1)
+    }
+
+    /// A refused delete must leave the catalog exactly as it was — the gateway
+    /// refuses the current `default-llm` and an OAuth entry, and both arrive as
+    /// an ordinary error.
+    @Test func aRefusedDeleteKeepsTheEntry() async throws {
+        let catalog = await makeCatalog()
+        client.failLlmWrite(with: BayboError.Other(message: "HTTP 400"))
+
+        await #expect(throws: (any Error).self) {
+            try await catalog.delete("claude")
+        }
+
+        #expect(catalog.entry(named: "claude") != nil)
+        #expect(catalog.models.count == 2)
+    }
+
+    /// The provider set is compiled into the gateway, so it changes exactly
+    /// when the gateway is upgraded — the moment a cache would be wrong.
+    @Test func theProviderListIsFetchedLive() async throws {
+        let catalog = await makeCatalog()
+        client.answerProviders([
+            LlmProviderInfo(
+                name: "openai", auth: .apiKey, defaultBaseUrl: nil,
+                defaultApiKeyEnv: "OPENAI_API_KEY"),
+            LlmProviderInfo(
+                name: "openai-subscription", auth: .oAuth,
+                defaultBaseUrl: "https://chatgpt.com/backend-api", defaultApiKeyEnv: nil),
+        ])
+
+        let first = try await catalog.providers()
+        _ = try await catalog.providers()
+
+        #expect(first.count == 2)
+        #expect(first[0].auth == .apiKey)
+        #expect(first[1].auth == .oAuth)
+        #expect(client.llmProviderFetchCount == 2, "never cached")
+    }
+
     // MARK: - The probe
 
     @Test func theProbeReachesTheCoreAndCarriesTheProvidersProse() async throws {

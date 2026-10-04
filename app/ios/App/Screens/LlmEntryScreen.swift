@@ -49,6 +49,9 @@ struct LlmEntryScreen: View {
     /// to restore from, and the entry stops working for every device until a
     /// new one is set. The one action on this screen that earns a confirm.
     @State private var confirmingKeyRemoval = false
+    /// Deleting the entry takes its stored key with it and cannot be undone
+    /// from here — the same reason the key removal confirms.
+    @State private var confirmingDelete = false
 
     private enum Level: Equatable {
         case fields
@@ -129,6 +132,12 @@ struct LlmEntryScreen: View {
             }
         } message: {
             Text(verbatim: lang.t("llm.removeKeyExplain"))
+        }
+        .alert(lang.t("llm.deleteEntryTitle", entryName), isPresented: $confirmingDelete) {
+            Button(lang.t("common.cancel"), role: .cancel) {}
+            Button(lang.t("llm.deleteEntryCommit"), role: .destructive) { deleteEntry() }
+        } message: {
+            Text(verbatim: lang.t("llm.deleteEntryExplain"))
         }
     }
 
@@ -316,6 +325,25 @@ struct LlmEntryScreen: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 20)
                 .padding(.top, 20)
+        }
+
+        // Offered only for a non-default entry, because the gateway refuses the
+        // default one — it would leave `default-llm` pointing at a row that is
+        // gone. Hiding it beats surfacing that 400: the fix (point the default
+        // elsewhere first) is a different screen's action.
+        if entry.name != catalog.defaultName {
+            Button {
+                Haptics.tap()
+                confirmingDelete = true
+            } label: {
+                Text(verbatim: lang.t("llm.deleteEntry"))
+            }
+            .buttonStyle(OutlinePillButtonStyle(color: Theme.err))
+            .disabled(saving)
+            .opacity(saving ? 0.5 : 1)
+            .padding(.horizontal, 20)
+            .padding(.top, 24)
+            .accessibilityIdentifier("llm-delete-entry")
         }
     }
 
@@ -976,6 +1004,25 @@ struct LlmEntryScreen: View {
             } catch {
                 outcome = .failed(lang.t("llm.saveFailed", field))
                 NSLog("baybo: llm model list: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    private func deleteEntry() {
+        saving = true
+        outcome = nil
+        Task {
+            defer { saving = false }
+            do {
+                try await catalog.delete(entryName)
+                Haptics.success()
+                // The entry this screen is about no longer exists; staying
+                // would render the "no longer configured" state over a screen
+                // the user just acted on.
+                dismiss()
+            } catch {
+                outcome = .failed(lang.t("llm.deleteEntryFailed"))
+                NSLog("baybo: llm delete entry: %@", bayboErrorText(error))
             }
         }
     }

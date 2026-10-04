@@ -76,6 +76,9 @@ final class AppStore: ObservableObject {
         /// One entry's editor, keyed by entry name. Pushed OVER the list, so
         /// the edge swipe goes back to the entry it came from.
         case llmEntry(String)
+        /// The create form. Pushed over the list; it pops itself on success and
+        /// the list repaints from the catalog's post-create re-read.
+        case newLlmEntry
         case projectBoard(String)
         /// One card on a board. Pushed over its board, so the edge swipe goes
         /// back to the column it came from.
@@ -1096,6 +1099,11 @@ final class AppStore: ObservableObject {
     func openLlmEntry(_ name: String) {
         guard chatPath.last != .llmEntry(name) else { return }
         chatPath.append(.llmEntry(name))
+    }
+
+    func openNewLlmEntry() {
+        guard !chatPath.contains(.newLlmEntry) else { return }
+        chatPath.append(.newLlmEntry)
     }
 
     /// The Deck header's ☰ menu entry: push the card recycle bin. Guarded like

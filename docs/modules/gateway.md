@@ -765,7 +765,11 @@ PUT    /v1/agents/:agent_id/avatar      set the profile's avatar
 DELETE /v1/agents/:agent_id
 
 GET    /v1/llm                          currently active provider/model
+GET    /v1/llm/providers                providers this build can serve + how each authenticates
 GET    /v1/llm/models                   configured LLM entries + effective settings
+POST   /v1/llm/models                   create an entry (refuses OAuth providers)
+DELETE /v1/llm/models/:name             remove an entry + its vault key
+                                        (refuses default-llm and OAuth entries)
 PUT    /v1/llm/models/:name             edit an entry (hot-reloaded in-process)
                                         `model` may not travel with a per-model
                                         fact; `api_key: ""` deletes the key

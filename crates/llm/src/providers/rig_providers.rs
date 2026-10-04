@@ -66,6 +66,7 @@ pub(crate) fn rig_model_info(name: &str, model_id: &str, pricing: ModelPricing) 
 macro_rules! rig_provider_factory {
     // --- shared skeleton: $build yields the configured rig client ---
     (@factory $factory:ident, $name:literal, $variant:ident, $build:expr
+        $(, auth = $auth:expr)?
         $(, pricing = $pricing:expr)?
         $(, live_models = $live:path)?
         $(, api_key_env = $env:expr)?
@@ -79,6 +80,7 @@ macro_rules! rig_provider_factory {
                 $name
             }
 
+            $(fn auth(&self) -> $crate::ProviderAuth { $auth })?
             $(fn flat_default_pricing(&self) -> ModelPricing { $pricing })?
             $(fn default_api_key_env(&self) -> Option<&'static str> { Some($env) })?
             $(fn default_base_url(&self) -> Option<&'static str> { Some($url) })?
@@ -168,7 +170,8 @@ macro_rules! rig_provider_factory {
                 b.http_client(crate::proxied_client(config.proxy.as_ref())?)
                     .build()
                     .map_err(|e| crate::LlmError::Config(format!("failed to create {} client: {e}", $name)))
-            }
+            },
+            auth = $crate::ProviderAuth::OptionalApiKey
             $(, live_models = $live)?
             $(, api_key_env = $env)?
             $(, base_url = $url)?);
@@ -187,7 +190,8 @@ macro_rules! rig_provider_factory {
                 b.http_client(crate::proxied_client(config.proxy.as_ref())?)
                     .build()
                     .map_err(|e| crate::LlmError::Config(format!("failed to create {} client: {e}", $name)))
-            }
+            },
+            auth = $crate::ProviderAuth::Keyless
             $(, live_models = $live)?
             $(, api_key_env = $env)?
             $(, base_url = $url)?);
