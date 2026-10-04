@@ -36,6 +36,12 @@ Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `
 > are redacted from logs and errors. A malformed proxy URL disables relay dials,
 > and `baybo device pair` refuses to show a QR code, instead of connecting
 > directly. The proxy's own host must be resolvable, or given as an IP.
+>
+> **Direct carriers are not proxied.** The proxy governs HTTP(S) and WebSocket
+> traffic only. A paired device's direct carriers
+> ([`mobile/direct-carriers.md`](mobile/direct-carriers.md)) send UDP — the
+> rendezvous `Register`, punches and QUIC — straight from the host whether or not
+> a proxy is configured; `gateway.direct_udp.enabled: false` turns them off.
 
 > **MCP status note.** MCP server records do **not** live in `baybo.json`.
 > They live in `<workspace>/config/.mcp.json`, owned by `baybo-tools::mcp`
