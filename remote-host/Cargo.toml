@@ -39,8 +39,9 @@ remote-host-push = { path = "crates/push" }
 remote-host-relay = { path = "crates/relay" }
 remote-host-admission = { path = "crates/admission" }
 remote-host-dashboard = { path = "crates/dashboard" }
-# The shared wire contract (routes + serde types) the gateway + app also depend
-# on. Pure serde, no transport/baybo deps.
+# The shared wire contract (routes, serde types, the address policy and the
+# probe-datagram codec) the gateway + app also depend on. No async transport,
+# no baybo deps.
 remote-host-protocol = { path = "crates/protocol" }
 # The shared per-request / per-client-IP layer: the token-bucket primitive (push
 # frequency control + relay bandwidth throttle), the per-source-IP request throttle
@@ -73,6 +74,12 @@ jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_r
 tower = { version = "0.5", features = ["util"] }
 parking_lot = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
+# Constant-time comparison of the direct-carrier secrets (role tickets, the
+# `DirectOpen` token) in the protocol crate.
+subtle = "2"
+# The `DirectOpen` token is wiped from memory on drop.
+zeroize = "1"
 hex = "0.4"
 base64 = "0.22"
 rand = "0.9"

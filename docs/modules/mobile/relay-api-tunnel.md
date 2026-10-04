@@ -274,8 +274,10 @@ async fn handle_http_body_forward(..) -> Result<LegState, String>;     // Abando
 async fn handle_http_forward(..) -> Result<LegState, String>;
 ```
 
-`Abandoned` must still await `response_task` and send the response — the client
-needs that 401 — and only *then* close.
+`Abandoned` must still await the router's response and send it — the client
+needs that 401 — and only *then* close. The router is polled inside the session
+alongside the body drain, never spawned, so a session that is dropped mid-upload
+(a revoked binding) drops the handler with it.
 
 `reuse` is injected at `send_http_response`'s three `TunnelResponse::Head`
 construction sites (`:424`), as `Some(TunnelReuse { idle_ms: … })` **only when

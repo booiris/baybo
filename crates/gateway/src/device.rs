@@ -11,7 +11,7 @@ use baybo_security::SecretVault;
 use device_proto::noise::StaticKeypair;
 
 /// `SecretVault` key holding A's static Noise keypair as `public ‖ secret`.
-const NOISE_STATIC_VAULT_KEY: &str = "device.noise_static";
+pub(crate) const NOISE_STATIC_VAULT_KEY: &str = "device.noise_static";
 
 /// Persisted layout: 32-byte public key followed by 32-byte secret key.
 const KEYPAIR_BYTES: usize = 64;

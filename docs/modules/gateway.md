@@ -342,7 +342,8 @@ families (status, config, llm, cron, channels, turns, traces, logs,
 analytics, tools); the handler modules define their own endpoint DTOs the same
 way, next to the routes that serve them (`admin/chat.rs`,
 `admin/projects.rs`, `admin/agents.rs`, `admin/deck.rs`,
-`admin/push.rs`, `admin/project_team.rs`, `admin/skills.rs`). Mirror
+`admin/push.rs`, `admin/mobile.rs`, `admin/project_team.rs`,
+`admin/skills.rs`). Mirror
 types keep their bare name (`Turn`, `CronJob`, `ChannelType`, …) so the
 generated OpenAPI schemas — and the TypeScript types downstream — are stable
 across the refactor. Adding a field to a domain type now requires an
@@ -680,6 +681,15 @@ fires before the previous process has unwound; without the delay a
 restart loop can thrash the lock. The systemd unit also sets
 `TimeoutStopSec=30s` to match `GatewayConfig::shutdown_grace_secs`.
 
+### Direct carriers need host networking in a container
+
+A relay binding's carrier runtime (`channel/carrier/`,
+[`direct-carriers.md`](mobile/direct-carriers.md#gateway-a)) binds one UDP
+socket per family and punches the phone's candidates from it. A gateway in a
+container needs host networking for direct UDP: on a bridge network the host's
+NAT can confirm conntrack state for the phone's early inbound punch before the
+gateway's own first outbound one, and it then remaps the gateway's port.
+
 ## CLI Surface
 
 All commands live under `baybo gateway` and are shell-only by policy —
@@ -801,6 +811,7 @@ DELETE /v1/chat/folders/:id             delete (dissolves; member sessions ⇒ U
 GET    /v1/push/params                  the gateway's Ed25519 push verifying key (hex) to delegate over
 POST   /v1/push/register                register a direct-mode device push binding (device id + provider-tagged target + push_key + delegation)
 POST   /v1/mobile/push-token            store a paired device's provider-tagged push target
+GET    /v1/mobile/links                 the link table: each paired device's live legs by class and carrier, and its last direct offer
 
 GET    /v1/deck                         live cards + latest snapshot per card (the deck paint source)
 PUT    /v1/deck/layout                  apply the full layout ({ card_id, position, size } entries); 204
@@ -1191,7 +1202,9 @@ crates/gateway/
 │                            #   esbuild+node for sidecars/tool/*). All assets zstd-compressed + include_bytes!.
 ├── src/
 │   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, ConfigReloader, Sidecar*, …
-│   ├── config.rs            # RuntimeGatewayConfig (admin bind + shutdown grace + CORS)
+│   ├── config.rs            # RuntimeGatewayConfig (admin bind + shutdown grace + CORS + RuntimeCarrierConfig:
+│   │                        #   the direct carriers' binds, copied from gateway.direct_udp);
+│   │                        #   admin_dial_addr (where a same-host client dials the admin listener)
 │   ├── server.rs            # GatewayDeps, AdminState, ChannelState, GatewayServer; build_admin_router
 │   │                        #   (admin TCP + co-hosted /v1/channel-ws + /v1/blobs subrouter)
 │   ├── channel_listener.rs  # ChannelServer (loopback TCP + channel.port discovery + accept loop)
@@ -1214,13 +1227,23 @@ crates/gateway/
 │   │   ├── blobs.rs         #   POST /v1/blobs + GET /v1/blobs/{id}
 │   │   ├── boot.rs          #   install_channels / build_channel; APPROVAL_TIMEOUT=300s; per-channel gate
 │   │   ├── bot_reconciler.rs#   reconciles StartBot/StopBot rosters to Multiplexed sidecars
+│   │   ├── carrier/         #   a relay binding's direct carriers (the binding scope's CarrierRuntime):
+│   │   │                    #   runtime (offers, stop, the per-process certificate + offer gate),
+│   │   │                    #   offer (freshness + the process's replay cache), punches (allowed-IP sets,
+│   │   │                    #   authenticated punches), gather + interfaces (host candidates), probe (punching,
+│   │   │                    #   registration, probe routing), udp (per-family socket + rebind), quic (admission,
+│   │   │                    #   connections, streams), session (DirectOpen gate + responder hand-off),
+│   │   │                    #   phone (tests only: the
+│   │   │                    #   phone's end of a carrier, shared by the runtime tests and relay_e2e)
 │   │   ├── control.rs       #   ChannelControlRegistry (push control frames from outside the route task)
 │   │   ├── device_content.rs #  gateway side of a paired device's content (chat) session over the relay
 │   │   ├── device_pair.rs   #   XXpsk0 device-pairing handshake + mutual confirm (PairingHostDeps)
 │   │   ├── handshake.rs     #   validate_register (Tui/Tool/Subprocess/Web/Device gating via AuthedClient)
 │   │   ├── history.rs       #   TuiHistoryStore (vault-backed TUI input-history ring)
+│   │   ├── links.rs         #   DeviceLinks, the link table: live legs by class + carrier, last direct offer
 │   │   ├── relay_content.rs #   the gateway's relay-content control side
-│   │   ├── relay_e2e.rs     #   cross-workspace E2E tests for the spliced relay path (pair + content)
+│   │   ├── relay_e2e.rs     #   cross-workspace E2E tests through a real C: the spliced relay path (pair +
+│   │   │                    #   content) and the direct carriers (offer, rendezvous, QUIC, revoke)
 │   │   ├── relay_pair.rs    #   the relay host leg `baybo device pair` opens
 │   │   ├── route.rs         #   ws_handler + inbound loop (Subscribe/Message/ResolveApproval/…)
 │   │   ├── session_pulse.rs #   owner-channel dispatch observer → throttled Frame::SessionActivity

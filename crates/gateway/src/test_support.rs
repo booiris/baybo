@@ -26,7 +26,7 @@ use baybo_turn::TurnLifecycle;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use crate::config::RuntimeGatewayConfig;
+use crate::config::{RuntimeCarrierConfig, RuntimeGatewayConfig};
 use crate::log_buffer::LogBuffer;
 use crate::server::GatewayDeps;
 
@@ -208,6 +208,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         admin_bind,
         cors_allowed_origins: Vec::new(),
         shutdown_grace: Duration::from_millis(250),
+        carrier: RuntimeCarrierConfig { udp: None },
     };
 
     // Tests that need to observe router intake (e.g. the WS channel
@@ -254,6 +255,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         config_path: None,
         inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),
         relay_dialer: crate::relay::dial::RelayDialer::direct(),
+        device_links: crate::channel::links::DeviceLinks::new(),
         workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
             tempdir.path().to_path_buf(),
         )),

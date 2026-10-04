@@ -36,6 +36,12 @@ Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `
 > are redacted from logs and errors. A malformed proxy URL disables relay dials,
 > and `baybo device pair` refuses to show a QR code, instead of connecting
 > directly. The proxy's own host must be resolvable, or given as an IP.
+>
+> **Direct carriers are not proxied.** The proxy governs HTTP(S) and WebSocket
+> traffic only. A paired device's direct carriers
+> ([`mobile/direct-carriers.md`](mobile/direct-carriers.md)) send UDP — the
+> rendezvous `Register`, punches and QUIC — straight from the host whether or not
+> a proxy is configured; `gateway.direct_udp.enabled: false` turns them off.
 
 > **MCP status note.** MCP server records do **not** live in `baybo.json`.
 > They live in `<workspace>/config/.mcp.json`, owned by `baybo-tools::mcp`
@@ -145,7 +151,7 @@ Sections mirror Baybo's real runtime concerns, not a 1:1 copy of any external re
 | `skills`   | `baybo_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
 | `cost`     | `SpendingLimits` + `baybo_agent::router::LiveRateLimit` (via `RouterConfig.rate_limit`; hot-swapped on reload) |                                                                                                                                                                            |
 | `workspace`| `WorkspacePaths` + storage path composition                 | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/state/storage.db`).                                                                |
-| `gateway`  | `baybo_gateway::RuntimeGatewayConfig`                        | Admin bind address + port, CORS allowlist, shutdown grace. See [`gateway.md`](gateway.md).                                                                                                          |
+| `gateway`  | `baybo_gateway::RuntimeGatewayConfig`                        | Admin bind address + port, CORS allowlist, shutdown grace, and the paired phone's direct carriers: `direct_udp` (`{ enabled, ipv4_bind, ipv6_bind }`, on by default on ephemeral ports of both families; a `null` bind turns that family off). The binds are typed `SocketAddr`s. See [`gateway.md`](gateway.md) and [`mobile/direct-carriers.md`](mobile/direct-carriers.md#config). |
 | `browser`  | `baybo_tools::browser` configuration                         | Browser sidecar launch settings (docker mode, profile path).                                                                                                                                         |
 | `external_agents` | `baybo_agent::external_agent` registry                | Per-kind switch for the host-execution external agents — `claude`, `codex` (each `{ enabled, binary_path? }`). `enabled` defaults to **`true`**: boot probes `PATH` and registers whichever binary is actually installed, so having the CLI on the host is the opt-in. Set `false` to withhold an installed backend — worth knowing that these run their own tool loops with approvals bypassed. `binary_path` records the resolved absolute path `setup` probed, so the gateway (different cwd, narrower `PATH`) pins the same binary. |
 | `memory`   | `baybo-memory` backend selection                             | `{ enabled (default false), provider: noop\|mem0\|openviking, llm?, extra? }` — `llm` names the entry used for salience/extraction (unset ⇒ `default-llm`); `extra` is an opaque per-plugin bag (a documented exception to the typed-over-`Value` rule). Not hot-reloadable. See [`memory.md`](memory.md). |
@@ -222,6 +228,8 @@ Principle: a module earns a config section when operators need to tune it in pro
 | `gateway.port`                        | > 0                                                  |
 | `gateway.shutdown_grace_secs`         | ≥ 1                                                  |
 | `gateway.cors_allowed_origins[i]`     | non-empty                                            |
+| `gateway.direct_udp.ipv4_bind` / `.ipv6_bind` | if set, an IPv4 / IPv6 socket address respectively; an `ipv6_bind` is not IPv4-mapped |
+| `gateway.direct_udp`                  | `enabled: true` needs at least one bind (`enabled: false` is the off switch) |
 | `proxy.url`                           | when `proxy` is set: non-empty; scheme one of `http`/`https`/`socks5`/`socks5h`/`socks4`/`socks4a` |
 | `web_search.base_url`                 | HTTP(S); required for enabled SearXNG. Provider construction also rejects credentials, query strings, and fragments. |
 | `web_search.max_results`              | in `1..=20` (`MAX_RESULTS_CEILING` — every supported provider caps one page there) |

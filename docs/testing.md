@@ -57,6 +57,9 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 | domain crates      | `MemoryTurnStore` (`baybo-turn`), `MemoryTraceStore` (`baybo-trace`), `MemoryCostStore` (`baybo-cost`), `RecordingMemory` (`baybo-memory` — records `recall` / `on_turn_complete` calls), `MemorySessionStore` + `MemorySessionFolderStore` (`baybo-session`) | In-memory backends for the `*Store` traits (the trait contracts live in `baybo-store`; each fake sits in its domain crate's `test_support.rs`). Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage lookups (`list_lineage_children` returns empty); tests that need that surface should use the real sqlite store via `Store::open` against a tempfile. |
 | `baybo-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
 | `baybo-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
+| `remote-host-protocol` | `AddressPolicy::for_tests`                                          | With `test-support`, `AddressPolicy::active()` returns it: 127/8, 198.18/15 and 2001:2::/48 are `Public` and `::1` is `Lan`, so direct-carrier tests run over loopback. `remote-host-relay`'s and `baybo-gateway`'s tests enable it. Features unify per build, so any crate tested in the same `cargo`/`nextest` invocation as those sees the test policy too: tests that classify addresses use data that reads the same under either policy. |
+| `remote-host-relay` | `ControlRegistry::with_direct_answer_timeout`, `ConnectionRegistry::register_for_test` | Shortens how long `POST /direct` waits for the gateway's report, so the no-answer path does not sleep 3 s; registers a live connection to drive a revoke kick. |
+| `carrier`          | `DemuxSocket::inject_recv_errors`                                       | Records failed receives on a real socket, backing off as real ones do, so the gateway's rebind test drives the receive-error streak its supervisor polls. |
 | `baybo-workspace`   | `back_date`, `back_date_tree`, `back_date_symlink`                      | mtime back-dating for tests that drive the `walk::tree_stats` staleness gates (janitor sweeps). `back_date_symlink` sets the link's *own* lstat mtime via `utimensat(AT_SYMLINK_NOFOLLOW)`. |
 
 The integration-tests crate composes these into higher-level builders:
@@ -247,3 +250,17 @@ The real-terminal suites need `tmux` on `PATH`; without it they self-skip
 
 CI runs `cargo clippy --all --benches --tests --examples --all-features`
 with zero-warnings; new tests must clear that gate.
+
+The direct-carrier tests that run over IPv6 loopback self-skip, through
+`carrier::phone::ipv6_loopback_available`, on a host that cannot bind `::1`
+(a container with IPv6 disabled). The carrier's IPv6 interface flags have a
+macOS-only reader; CI's `gateway-macos` job runs its tests on macOS whenever
+`crates/gateway/src/channel/carrier/` changes.
+
+`remote-host/` is its own cargo workspace, excluded from the root one, so the
+commands above never run its tests. Run them from inside it
+(`cd remote-host && cargo nextest run --workspace`). nextest reads that
+workspace's own `remote-host/.config/nextest.toml`, which carries the same
+hang guard as the root config (`slow-timeout` terminating after 4 × 30 s). In
+CI, the `remote-host` job runs fmt, clippy and nextest there on every PR that
+touches `remote-host/` or `rust-toolchain.toml`.

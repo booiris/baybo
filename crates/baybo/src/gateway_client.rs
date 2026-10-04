@@ -13,28 +13,17 @@
 //! failure earns which operator-facing message — see
 //! [`dial_failure_error`], the one place that decides.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use baybo_channels::ChannelError;
 use baybo_config::BayboConfig;
 use baybo_gateway::TUI_TOKEN_VAULT_KEY;
 use baybo_tui::client::WsTransport;
 
-/// Resolve the admin listener address from the loaded config. When the
-/// gateway is bound to a wildcard interface (`0.0.0.0` / `::`), a
-/// same-host client rewrites it to loopback — the wildcard is a server-
-/// side bind directive, not a dialable target.
+/// Resolve the admin listener address from the loaded config
+/// ([`baybo_gateway::config::admin_dial_addr`]).
 pub fn admin_addr_from_config(config: &BayboConfig) -> anyhow::Result<SocketAddr> {
-    let host = config.gateway.bind_address.as_str();
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid gateway.bind_address {host:?}: {e}"))?;
-    let dial_ip = match ip {
-        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        other => other,
-    };
-    Ok(SocketAddr::new(dial_ip, config.gateway.port))
+    Ok(baybo_gateway::config::admin_dial_addr(&config.gateway)?)
 }
 
 /// Best-effort read of the per-start TUI token from the secret vault.

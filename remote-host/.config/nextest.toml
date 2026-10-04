@@ -1,0 +1,10 @@
+# cargo-nextest configuration for the remote-host workspace, which nextest
+# roots here rather than at the repository root. Run the suite with
+# `cargo nextest run --workspace` from remote-host/.
+# https://nexte.st/docs/configuration/
+
+[profile.default]
+# A hung test must FAIL the run, not wedge it: nextest's default is to wait
+# forever. The whole suite finishes in seconds, so terminating at 4 x 30s only
+# ever fires on a genuine hang.
+slow-timeout = { period = "30s", terminate-after = 4 }

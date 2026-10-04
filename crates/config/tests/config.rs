@@ -1,6 +1,8 @@
+use std::net::SocketAddr;
+
 use baybo_config::{
-    BayboConfig, ConfigError, DiscordChannelConfig, LlmEntry, LlmEntryName, LlmModelSpec,
-    PermissionPolicy, ProxyConfig, TelegramChannelConfig,
+    BayboConfig, ConfigError, DirectUdpConfig, DiscordChannelConfig, LlmEntry, LlmEntryName,
+    LlmModelSpec, PermissionPolicy, ProxyConfig, TelegramChannelConfig,
 };
 use baybo_model::{ExternalAgentKind, ModelTier};
 
@@ -25,6 +27,113 @@ fn default_config_is_valid() {
 fn empty_json_uses_defaults() {
     let config = BayboConfig::load_from_str("{}").expect("empty object should parse");
     assert_eq!(config, BayboConfig::default());
+}
+
+fn with_gateway(gateway: &str) -> Result<BayboConfig, ConfigError> {
+    BayboConfig::load_from_str(&format!(r#"{{ "gateway": {gateway} }}"#))
+}
+
+fn socket(address: &str) -> SocketAddr {
+    address.parse().unwrap()
+}
+
+#[test]
+fn direct_udp_is_on_by_default_on_ephemeral_ports_of_both_families() {
+    let expected = DirectUdpConfig {
+        enabled: true,
+        ipv4_bind: Some(socket("0.0.0.0:0")),
+        ipv6_bind: Some(socket("[::]:0")),
+    };
+    assert_eq!(BayboConfig::default().gateway.direct_udp, expected);
+    assert_eq!(with_gateway("{}").unwrap().gateway.direct_udp, expected);
+    assert_eq!(
+        with_gateway(r#"{ "direct_udp": {} }"#)
+            .unwrap()
+            .gateway
+            .direct_udp,
+        expected
+    );
+}
+
+#[test]
+fn a_null_direct_udp_bind_leaves_that_family_off_across_a_rewrite() {
+    let config = with_gateway(r#"{ "direct_udp": { "ipv6_bind": null } }"#).unwrap();
+    assert_eq!(config.gateway.direct_udp.ipv6_bind, None);
+    // `baybo config set` rewrites the whole file: the disabled family must not
+    // come back as the default bind.
+    let rewritten = serde_json::to_string(&config).unwrap();
+    let reloaded = BayboConfig::load_from_str(&rewritten).unwrap();
+    assert_eq!(reloaded.gateway.direct_udp, config.gateway.direct_udp);
+}
+
+#[test]
+fn an_unparseable_direct_address_fails_to_load() {
+    for gateway in [
+        r#"{ "direct_udp": { "ipv4_bind": "0.0.0.0" } }"#,
+        r#"{ "direct_udp": { "ipv4_bind": "localhost:42124" } }"#,
+    ] {
+        match with_gateway(gateway) {
+            Err(ConfigError::Parse(_)) => {}
+            other => panic!("{gateway}: expected a parse error, got {other:?}"),
+        }
+    }
+}
+
+/// Each case is the `gateway` object and the one field it must be rejected
+/// under, or `None` when it is valid.
+#[test]
+fn direct_carrier_validation_table() {
+    let cases: &[(&str, Option<&str>)] = &[
+        (r#"{ "direct_udp": { "enabled": false } }"#, None),
+        (
+            r#"{ "direct_udp": { "enabled": false, "ipv4_bind": null, "ipv6_bind": null } }"#,
+            None,
+        ),
+        (r#"{ "direct_udp": { "ipv4_bind": null } }"#, None),
+        (
+            r#"{ "direct_udp": { "ipv4_bind": "192.168.1.2:4433", "ipv6_bind": "[fd00::2]:4433" } }"#,
+            None,
+        ),
+        (
+            r#"{ "direct_udp": { "ipv4_bind": null, "ipv6_bind": null } }"#,
+            Some("gateway.direct_udp"),
+        ),
+        (
+            r#"{ "direct_udp": { "ipv4_bind": "[::]:0" } }"#,
+            Some("gateway.direct_udp.ipv4_bind"),
+        ),
+        (
+            r#"{ "direct_udp": { "ipv6_bind": "0.0.0.0:0" } }"#,
+            Some("gateway.direct_udp.ipv6_bind"),
+        ),
+        (
+            r#"{ "direct_udp": { "enabled": false, "ipv6_bind": "0.0.0.0:0" } }"#,
+            Some("gateway.direct_udp.ipv6_bind"),
+        ),
+        (
+            r#"{ "direct_udp": { "ipv6_bind": "[::ffff:10.0.0.1]:0" } }"#,
+            Some("gateway.direct_udp.ipv6_bind"),
+        ),
+        (
+            r#"{ "direct_udp": { "ipv6_bind": "[::ffff:0.0.0.0]:0" } }"#,
+            Some("gateway.direct_udp.ipv6_bind"),
+        ),
+    ];
+    for (gateway, rejected_field) in cases {
+        match (with_gateway(gateway), rejected_field) {
+            (Ok(_), None) => {}
+            (Err(error), Some(field)) => {
+                let errors = unwrap_validation(error);
+                assert!(
+                    has_field(&errors, field),
+                    "{gateway}: expected a rejection under {field}, got {errors:?}"
+                );
+                assert_eq!(errors.len(), 1, "{gateway}: {errors:?}");
+            }
+            (Ok(_), Some(field)) => panic!("{gateway}: expected a rejection under {field}"),
+            (Err(error), None) => panic!("{gateway}: expected valid, got {error:?}"),
+        }
+    }
 }
 
 #[test]

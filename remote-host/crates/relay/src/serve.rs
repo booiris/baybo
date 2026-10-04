@@ -25,21 +25,26 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::Router;
+use axum::body::Bytes;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, Request, State};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, Path, Request, State,
+};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use remote_host_admission::{Admission, AdmissionEntry, Admit};
 use remote_host_edge::ip_limit::{self, resolve_client_ip_from};
 use remote_host_edge::ip_traffic::{ClientIp, EP_CONTENT_HOST, EP_CONTENT_JOIN};
 use remote_host_protocol::REMOTE_API_KEY_HEADER;
 use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::{
-    CONTENT_HOST, CONTENT_JOIN, CONTROL, LegClass, PAIR_HOST, PAIR_JOIN, RELAY_LEG_CLASS_HEADER,
+    AddressPolicy, CONTENT_HOST, CONTENT_JOIN, CONTROL, ControlReport, DIRECT_OFFER,
+    DirectOfferRequest, LegClass, MAX_DIRECT_OFFER_BODY_BYTES, PAIR_HOST, PAIR_JOIN,
+    RELAY_LEG_CLASS_HEADER, SourceKey,
 };
 // `build_router` (pub) takes an `IpLimitConfig` and a `RelayServices` carrying an
 // `IpTrafficRegistry`, so downstream callers must be able to name both without
@@ -50,7 +55,11 @@ pub use remote_host_edge::ip_limit::IpLimitConfig;
 use crate::bandwidth::{BandwidthRegistry, LegClass as BwClass};
 use crate::broker::{ParkOutcome, RelayBroker};
 use crate::conns::ConnectionRegistry;
-use crate::control::{ControlHello, ControlRegisterError, ControlRegistry, SignalOpenError};
+use crate::control::{
+    ControlHello, ControlRegisterError, ControlRegistry, OfferRefusal, OfferSource,
+    SignalOpenError, node_id_within_bound,
+};
+use crate::punch::{OfferOutcome, ReportOutcome};
 use crate::traffic::{Direction, LegMetering, TrafficRegistry};
 use crate::ws::pump_ws;
 
@@ -303,28 +312,38 @@ pub struct RelayServices {
 /// [`IpLimitConfig`] trust caveat. The content handlers reuse those same trusted
 /// headers to resolve each leg's client IP for the per-IP byte accounting.
 pub fn build_router(services: RelayServices, ip_limit: IpLimitConfig) -> Router {
-    let RelayServices {
-        admission,
-        conns,
-        bandwidth,
-        traffic,
-        ip_traffic,
-        control,
-        broker,
-    } = services;
-    let state = RelayState {
-        broker,
-        admitted: admission,
-        control,
-        conns,
-        bandwidth,
-        traffic,
-        ip_traffic,
-        trusted_headers: Arc::new(ip_limit.trusted_headers.clone()),
-        pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        join_limiter: Arc::new(JoinRateLimiter::default()),
-        refusal_debounce: Arc::new(RefusalDebounce::default()),
-    };
+    let state = RelayState::from_services(services, &ip_limit);
+    relay_routes(state, ip_limit)
+}
+
+impl RelayState {
+    fn from_services(services: RelayServices, ip_limit: &IpLimitConfig) -> Self {
+        let RelayServices {
+            admission,
+            conns,
+            bandwidth,
+            traffic,
+            ip_traffic,
+            control,
+            broker,
+        } = services;
+        Self {
+            broker,
+            admitted: admission,
+            control,
+            conns,
+            bandwidth,
+            traffic,
+            ip_traffic,
+            trusted_headers: Arc::new(ip_limit.trusted_headers.clone()),
+            pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            join_limiter: Arc::new(JoinRateLimiter::default()),
+            refusal_debounce: Arc::new(RefusalDebounce::default()),
+        }
+    }
+}
+
+fn relay_routes(state: RelayState, ip_limit: IpLimitConfig) -> Router {
     // Every route admits via the shared `x-remote-api-key` pre-layer — including
     // `/control`, whose key now rides the dial header too (its hello carries only
     // the relay_node_id).
@@ -334,6 +353,12 @@ pub fn build_router(services: RelayServices, ip_limit: IpLimitConfig) -> Router 
         // Content relay (phase 2): the gateway holds a control connection; a
         // phone names the gateway by relay_node_id and C splices a data leg.
         .route(CONTROL, get(control_handler))
+        // Direct carriers: P's sealed offer, forwarded to the gateway over its
+        // control connection; the POST waits for the gateway's report.
+        .route(
+            DIRECT_OFFER,
+            post(direct_offer_handler).layer(DefaultBodyLimit::max(MAX_DIRECT_OFFER_BODY_BYTES)),
+        )
         .route(CONTENT_JOIN, get(content_join_handler))
         .route(CONTENT_HOST, get(content_host_handler))
         .route_layer(middleware::from_fn_with_state(
@@ -341,10 +366,25 @@ pub fn build_router(services: RelayServices, ip_limit: IpLimitConfig) -> Router 
             require_admitted,
         ))
         .with_state(state);
-    // The shared per-IP limiter is added *after* admission so it wraps it as the
-    // outermost layer (tower runs outer→inner), shedding a flood by client IP
-    // before the admission check and any upgrade work.
-    ip_limit::apply(router, ip_limit)
+    // The shared per-IP limiter is added *after* admission so it wraps it
+    // (tower runs outer→inner), shedding a flood by client IP before the
+    // admission check and any upgrade work. The offer route's `no-store` wraps
+    // both, so the responses they produce carry it too.
+    ip_limit::apply(router, ip_limit).layer(middleware::from_fn(no_store_on_direct_offers))
+}
+
+/// Marks every response on the [`DIRECT_OFFER`] route uncacheable, whatever
+/// produced it: the per-IP limiter, admission, an extractor's rejection or the
+/// handler.
+async fn no_store_on_direct_offers(req: Request, next: Next) -> Response {
+    let direct = req.uri().path().starts_with(direct_offer_path_prefix());
+    let mut response = next.run(req).await;
+    if direct {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 /// `401 Unauthorized` for a missing or unadmitted `remote_api_key`.
@@ -374,6 +414,12 @@ fn at_capacity() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "relay at capacity").into_response()
 }
 
+/// `503 Service Unavailable` when a content join names a node with no live
+/// control connection; the phone retries.
+fn gateway_not_connected() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response()
+}
+
 fn new_content_relay_key() -> String {
     format!("dl-{}", hex::encode(rand::random::<[u8; 16]>()))
 }
@@ -398,7 +444,19 @@ struct Admitted {
 /// Scanner-noise gate: internet scanners probing random paths must not produce a
 /// warn per probe, so admission refusals are logged only for real relay routes.
 fn is_relay_route(path: &str) -> bool {
-    path.starts_with("/pair/") || path.starts_with("/content/") || path == CONTROL
+    path.starts_with("/pair/")
+        || path.starts_with("/content/")
+        || path.starts_with(direct_offer_path_prefix())
+        || path == CONTROL
+}
+
+/// The static leading portion of the [`DIRECT_OFFER`] route, before its
+/// `{relay_node_id}` parameter.
+fn direct_offer_path_prefix() -> &'static str {
+    match DIRECT_OFFER.find('{') {
+        Some(i) => &DIRECT_OFFER[..i],
+        None => DIRECT_OFFER,
+    }
 }
 
 /// The static leading portion of the [`CONTENT_HOST`] route — everything before
@@ -692,12 +750,21 @@ async fn control_handler(
         remote_api_key: key,
         ..
     }): Extension<Admitted>,
+    headers: HeaderMap,
+    OptPeer(peer): OptPeer,
     ws: WebSocketUpgrade,
 ) -> Response {
-    capped(ws).on_upgrade(move |socket| run_control(socket, state, key))
+    let client = resolve_client_ip_from(&headers, peer.map(|p| p.ip()), &state.trusted_headers)
+        .map(AddressPolicy::client_key);
+    capped(ws).on_upgrade(move |socket| run_control(socket, state, key, client))
 }
 
-async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
+async fn run_control(
+    mut socket: WebSocket,
+    state: RelayState,
+    key: String,
+    client: Option<SourceKey>,
+) {
     let hello = match socket.recv().await {
         Some(Ok(AxumMessage::Binary(b))) => match serde_json::from_slice::<ControlHello>(&b) {
             Ok(h) => h,
@@ -738,11 +805,6 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
             return;
         }
     };
-    tracing::info!(
-        node = %hello.relay_node_id,
-        key_tag = %key_tag(&key),
-        "control: gateway connected"
-    );
     // The control connection is exempt from the per-key cap (essential, ~one per
     // gateway) so a gateway at its leg limit can still (re)establish control.
     let (_kick_guard, mut kick) = state.conns.register_unchecked(&key);
@@ -750,14 +812,19 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
     // key, but a concurrent revoke's kick may have run before we registered.
     if !still_admitted(state.admitted.as_ref(), &key) {
         tracing::warn!(
-            node = %hello.relay_node_id,
+            node_id_bytes = hello.relay_node_id.len(),
             key_tag = %key_tag(&key),
             "control: remote_api_key revoked during connect; closing"
         );
         return;
     }
-    let (mut rx, control_token) = match state.control.register(&hello.relay_node_id, &key) {
-        Ok(registered) => registered,
+    // An unknown capability version reads as not direct-capable; control stays up.
+    let offered = hello.supported_direct().copied();
+    let registered = state
+        .control
+        .register_from(&hello.relay_node_id, &key, offered, client);
+    let (mut rx, control_token, direct) = match registered {
+        Ok(registered) => (registered.signals, registered.token, registered.direct),
         Err(ControlRegisterError::OwnerMismatch { owner }) => {
             tracing::warn!(
                 node = %hello.relay_node_id,
@@ -767,7 +834,31 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
             );
             return;
         }
+        Err(ControlRegisterError::NodeIdTooLong { len }) => {
+            tracing::warn!(
+                node_id_bytes = len,
+                key_tag = %key_tag(&key),
+                "control: relay_node_id refused — longer than the protocol bound"
+            );
+            return;
+        }
     };
+    tracing::info!(
+        node = %hello.relay_node_id,
+        key_tag = %key_tag(&key),
+        direct = direct.is_some(),
+        direct_udp = direct.is_some_and(|capability| capability.udp),
+        direct_refused_client_cap = offered.is_some() && direct.is_none(),
+        unsupported_direct_version = ?hello
+            .direct
+            .filter(|_| direct.is_none())
+            .map(|capability| capability.version),
+        "control: gateway connected"
+    );
+    // Only inbound frames prove the gateway alive: C's own signals must not
+    // hold a half-open connection open.
+    let idle = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     let reason = loop {
         tokio::select! {
             // The gateway's remote_api_key was revoked (admission hot-reload).
@@ -798,17 +889,25 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
                 // no-op against the new owner, so just exit.
                 None => break "superseded",
             },
-            inbound = socket.recv() => match inbound {
-                // The gateway speaks only the hello; anything else (its keepalive
-                // Pings, auto-Ponged by axum) just proves liveness.
-                Some(Ok(_)) => {}
-                Some(Err(_)) => break "recv_error",
-                None => break "peer_closed",
-            },
+            inbound = socket.recv() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + CONTROL_IDLE_TIMEOUT);
+                match inbound {
+                    // After the hello the gateway sends only direct-carrier
+                    // reports; a frame that is not one is ignored and never
+                    // closes control.
+                    Some(Ok(AxumMessage::Binary(frame))) => {
+                        handle_control_report(&state.control, &hello.relay_node_id, control_token, &frame);
+                    }
+                    // Its keepalive Pings (auto-Ponged by axum) just prove liveness.
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break "recv_error",
+                    None => break "peer_closed",
+                }
+            }
             // The gateway pings well within this window; silence past it means a
             // half-open connection, so drop it (and unregister) rather than pin a
             // dead slot until the OS TCP timeout.
-            _ = tokio::time::sleep(CONTROL_IDLE_TIMEOUT) => {
+            () = &mut idle => {
                 tracing::info!(
                     node = %hello.relay_node_id,
                     idle_secs = CONTROL_IDLE_TIMEOUT.as_secs(),
@@ -829,6 +928,220 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
     );
 }
 
+/// Route one binary control frame from the gateway as a [`ControlReport`]. A
+/// malformed frame or a report C cannot honour is logged at debug and ignored.
+fn handle_control_report(
+    control: &ControlRegistry,
+    relay_node_id: &str,
+    control_token: u64,
+    frame: &[u8],
+) {
+    let report = match serde_json::from_slice::<ControlReport>(frame) {
+        Ok(report) => report,
+        Err(error) => {
+            // The category and position only: serde's message can quote the
+            // frame, which may carry a sealed answer.
+            tracing::debug!(
+                node = %relay_node_id,
+                len = frame.len(),
+                category = ?error.classify(),
+                line = error.line(),
+                column = error.column(),
+                "control: malformed frame from the gateway ignored"
+            );
+            return;
+        }
+    };
+    let punch = report.punch_id().tag();
+    let outcome = control.report_direct(relay_node_id, control_token, report);
+    match outcome {
+        ReportOutcome::Delivered => tracing::debug!(
+            node = %relay_node_id,
+            %punch,
+            "control: direct report delivered"
+        ),
+        _ => tracing::debug!(
+            node = %relay_node_id,
+            %punch,
+            outcome = outcome.as_str(),
+            "control: direct report ignored"
+        ),
+    }
+}
+
+/// The body of every `404` on the offer route: C never says which check failed.
+const NO_DIRECT_ROUTE: &str = "no direct route";
+/// The body of a `504` on the offer route.
+const NO_GATEWAY_ANSWER: &str = "gateway did not answer";
+/// `Retry-After` on a `503` for a gateway whose control channel is full.
+const CONTROL_BUSY_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// A refusal carrying `Retry-After` in whole seconds, rounded up, at least 1.
+fn retry_later(status: StatusCode, body: &'static str, wait: Duration) -> Response {
+    let seconds = (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1);
+    let mut response = (status, body).into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    response
+}
+
+fn offer_refusal_response(refusal: OfferRefusal) -> Response {
+    match refusal {
+        OfferRefusal::NoRoute(_) => (StatusCode::NOT_FOUND, NO_DIRECT_ROUTE).into_response(),
+        OfferRefusal::Limited { retry_after, .. } => retry_later(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many direct offers",
+            retry_after,
+        ),
+        OfferRefusal::AtCapacity { retry_after } => retry_later(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "direct offers at capacity",
+            retry_after,
+        ),
+        OfferRefusal::ControlBusy => retry_later(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway control busy",
+            CONTROL_BUSY_RETRY_AFTER,
+        ),
+        OfferRefusal::ControlGone => {
+            (StatusCode::GATEWAY_TIMEOUT, NO_GATEWAY_ANSWER).into_response()
+        }
+    }
+}
+
+/// Logs a refused offer. A missing route is routine (every gateway without the
+/// capability) and logs at debug; the rest log at their level at most once per
+/// [`REFUSAL_LOG_INTERVAL`] per (reason, node), so an offer flood cannot flood
+/// the log.
+fn log_offer_refusal(
+    state: &RelayState,
+    relay_node_id: &str,
+    key: &str,
+    refusal: OfferRefusal,
+    status: StatusCode,
+    started: Instant,
+) {
+    let status = status.as_u16();
+    let elapsed_ms = elapsed_ms(started);
+    let reason = refusal.reason();
+    if let OfferRefusal::NoRoute(_) = refusal {
+        tracing::debug!(
+            node_id_bytes = relay_node_id.len(),
+            key_tag = %key_tag(key),
+            reason,
+            status,
+            elapsed_ms,
+            "direct: offer refused — no direct route"
+        );
+        return;
+    }
+    let debounce_key = format!("direct-{reason}:{relay_node_id}");
+    match (state.refusal_debounce.should_emit(&debounce_key), refusal) {
+        (Some(suppressed), OfferRefusal::Limited { .. }) => tracing::info!(
+            node = %relay_node_id,
+            key_tag = %key_tag(key),
+            reason,
+            status,
+            elapsed_ms,
+            suppressed,
+            "direct: offer refused — over its budget"
+        ),
+        (Some(suppressed), _) => tracing::warn!(
+            node = %relay_node_id,
+            key_tag = %key_tag(key),
+            reason,
+            status,
+            elapsed_ms,
+            suppressed,
+            "direct: offer refused"
+        ),
+        (None, _) => tracing::debug!(
+            node = %relay_node_id,
+            key_tag = %key_tag(key),
+            reason,
+            status,
+            elapsed_ms,
+            "direct: offer refused"
+        ),
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `POST /direct/{relay_node_id}`: P's sealed offer. C checks only its size,
+/// forwards it to the node's direct-capable gateway as a new punch, and holds
+/// the POST for the gateway's report (`200` answer, `404` declined, `504` no
+/// answer). C does not authenticate the device here: the gateway does, through
+/// the seal.
+async fn direct_offer_handler(
+    Path(relay_node_id): Path<String>,
+    State(state): State<RelayState>,
+    Extension(Admitted {
+        remote_api_key: key,
+        ..
+    }): Extension<Admitted>,
+    headers: HeaderMap,
+    OptPeer(peer): OptPeer,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let offer = match serde_json::from_slice::<DirectOfferRequest>(&body) {
+        Ok(request) if request.offer.is_within_bounds() => request.offer,
+        Ok(_) | Err(_) => {
+            tracing::debug!(
+                node_id_bytes = relay_node_id.len(),
+                key_tag = %key_tag(&key),
+                len = body.len(),
+                "direct: offer refused — malformed or oversized body"
+            );
+            return (StatusCode::BAD_REQUEST, "malformed direct offer").into_response();
+        }
+    };
+    let client = resolve_client_ip_from(&headers, peer.map(|p| p.ip()), &state.trusted_headers)
+        .map(AddressPolicy::client_key);
+    let offered = state.control.offer_direct(
+        OfferSource {
+            relay_node_id: &relay_node_id,
+            remote_api_key: &key,
+            client,
+        },
+        offer,
+    );
+    let pending = match offered {
+        Ok(pending) => pending,
+        Err(refusal) => {
+            let response = offer_refusal_response(refusal);
+            log_offer_refusal(
+                &state,
+                &relay_node_id,
+                &key,
+                refusal,
+                response.status(),
+                started,
+            );
+            return response;
+        }
+    };
+    let punch = pending.punch_id();
+    let response = match pending.outcome().await {
+        OfferOutcome::Answered(answer) => Json(answer).into_response(),
+        OfferOutcome::Declined => (StatusCode::NOT_FOUND, NO_DIRECT_ROUTE).into_response(),
+        OfferOutcome::NoAnswer => (StatusCode::GATEWAY_TIMEOUT, NO_GATEWAY_ANSWER).into_response(),
+    };
+    tracing::info!(
+        node = %relay_node_id,
+        key_tag = %key_tag(&key),
+        punch = %punch.tag(),
+        status = response.status().as_u16(),
+        elapsed_ms = elapsed_ms(started),
+        "direct: offer"
+    );
+    response
+}
+
 /// App side of a content session: the phone names the gateway by `relay_node_id`.
 /// C signals that gateway (over its control connection) to open a data leg under
 /// a fresh `relay_key`, then joins the phone's leg to it — blind. Refused fast
@@ -844,6 +1157,14 @@ async fn content_join_handler(
     OptPeer(peer): OptPeer,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if !node_id_within_bound(&relay_node_id) {
+        tracing::debug!(
+            node_id_bytes = relay_node_id.len(),
+            key_tag = %key_tag(&phone_key),
+            "relay: content-join refused — relay_node_id longer than any gateway can register"
+        );
+        return gateway_not_connected();
+    }
     // The phone authors the leg class on its own join (the relay copies it, never
     // authors it). Absent/unparseable ⇒ Chat — a bad hint must never fail a join.
     let class = headers
@@ -914,7 +1235,7 @@ async fn content_join_handler(
                     "relay: content-join refused — no gateway control connection for this relay_node_id"
                 ),
             }
-            return (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response();
+            return gateway_not_connected();
         }
         Err(SignalOpenError::OwnerMismatch) => {
             state.pending_content_legs.lock().remove(&relay_key);
@@ -1187,6 +1508,14 @@ mod tests {
     use tokio_tungstenite::tungstenite::http::StatusCode as WsStatus;
     use tokio_tungstenite::tungstenite::{Error as WsError, Message};
     use tokio_tungstenite::{WebSocketStream, client_async};
+
+    use remote_host_protocol::relay::{
+        DIRECT_PROTOCOL_VERSION, DirectCapability, DirectOfferResponse, MAX_RELAY_NODE_ID_BYTES,
+        MAX_SEALED_CANDIDATES_BYTES, PunchId, SealedCandidates, UdpRendezvous,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::udp::RendezvousAddress;
 
     async fn serve() -> u16 {
         let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
@@ -1742,6 +2071,50 @@ mod tests {
         }
     }
 
+    /// A content join naming a node id longer than any gateway can register is
+    /// refused before the id reaches a map. A plausible absent node, as a
+    /// control, does leave its refusal-debounce key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_content_join_past_the_node_id_bound_never_becomes_a_key() {
+        let ip_limit = IpLimitConfig::socket_peer();
+        let state = RelayState::from_services(
+            RelayServices {
+                admission: Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
+                    "inst-A",
+                ])),
+                conns: Arc::new(ConnectionRegistry::new()),
+                bandwidth: Arc::new(BandwidthRegistry::new()),
+                traffic: Arc::new(TrafficRegistry::new()),
+                ip_traffic: Arc::new(IpTrafficRegistry::new()),
+                control: Arc::new(ControlRegistry::new()),
+                broker: Arc::new(RelayBroker::new()),
+            },
+            &ip_limit,
+        );
+        let debounce = Arc::clone(&state.refusal_debounce);
+        let pending = Arc::clone(&state.pending_content_legs);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = relay_routes(state, ip_limit);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let too_long = "n".repeat(MAX_RELAY_NODE_ID_BYTES + 1);
+        match connect_content_join(port, &too_long, Some("inst-A")).await {
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::SERVICE_UNAVAILABLE),
+            other => panic!("expected 503, got {other:?}"),
+        }
+        assert!(debounce.entries.lock().is_empty());
+        assert!(pending.lock().is_empty());
+
+        match connect_content_join(port, "ghost-node", Some("inst-A")).await {
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::SERVICE_UNAVAILABLE),
+            other => panic!("expected 503, got {other:?}"),
+        }
+        assert_eq!(debounce.entries.lock().len(), 1);
+    }
+
     /// A gateway content-host leg must claim a C-issued pending relay key.
     /// Unknown keys are rejected instead of parking a broker half that a future
     /// phone leg could be spliced into.
@@ -1840,6 +2213,510 @@ mod tests {
             closed,
             "control connection closed after its key was revoked"
         );
+    }
+
+    const RENDEZVOUS: &str = "rendezvous.example.com:7777";
+    const CF_CONNECTING_IP: &str = "cf-connecting-ip";
+
+    /// Serve the relay with connect info, two admitted keys (`inst-A` owns the
+    /// gateways, `inst-B` is another tenant), and the given control registry.
+    async fn serve_direct(
+        control: ControlRegistry,
+        ip_limit: IpLimitConfig,
+    ) -> (u16, Arc<ControlRegistry>) {
+        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
+            "inst-A", "inst-B",
+        ]));
+        let control = Arc::new(control);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = build_router(
+            RelayServices {
+                admission,
+                conns: Arc::new(ConnectionRegistry::new()),
+                bandwidth: Arc::new(BandwidthRegistry::new()),
+                traffic: Arc::new(TrafficRegistry::new()),
+                ip_traffic: Arc::new(IpTrafficRegistry::new()),
+                control: Arc::clone(&control),
+                broker: Arc::new(RelayBroker::new()),
+            },
+            ip_limit,
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        (port, control)
+    }
+
+    fn capable() -> serde_json::Value {
+        serde_json::json!({ "version": DIRECT_PROTOCOL_VERSION, "udp": true })
+    }
+
+    fn sealed(tag: &str) -> SealedCandidates {
+        SealedCandidates {
+            n: format!("nonce-{tag}"),
+            enc: format!("ciphertext-{tag}"),
+        }
+    }
+
+    fn offer_body() -> String {
+        serde_json::to_string(&DirectOfferRequest {
+            offer: sealed("offer"),
+        })
+        .unwrap()
+    }
+
+    struct HttpReply {
+        status: u16,
+        head: String,
+        body: String,
+    }
+
+    impl HttpReply {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.head.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then_some(value.trim())
+            })
+        }
+    }
+
+    /// One raw HTTP/1.1 `POST /direct/{node}`, optionally carrying the admitted
+    /// key and a `cf-connecting-ip`.
+    async fn post_offer(
+        port: u16,
+        node: &str,
+        key: Option<&str>,
+        body: &str,
+        client_ip: Option<&str>,
+    ) -> HttpReply {
+        let mut request = format!(
+            "POST /direct/{node} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if let Some(key) = key {
+            request.push_str(&format!("{REMOTE_API_KEY_HEADER}: {key}\r\n"));
+        }
+        if let Some(ip) = client_ip {
+            request.push_str(&format!("{CF_CONNECTING_IP}: {ip}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        HttpReply {
+            status: head.split(' ').nth(1).unwrap().parse().unwrap(),
+            head: head.to_owned(),
+            body: body.to_owned(),
+        }
+    }
+
+    /// A gateway's control connection whose hello carries `direct`; returns
+    /// once C has registered it.
+    async fn gateway(
+        port: u16,
+        control: &ControlRegistry,
+        node: &str,
+        direct: Option<serde_json::Value>,
+    ) -> WebSocketStream<TcpStream> {
+        let registered = control.connected();
+        let mut ws = connect_control(port, Some("inst-A")).await.unwrap();
+        let mut hello = serde_json::json!({ "relay_node_id": node });
+        if let Some(direct) = direct {
+            hello["direct"] = direct;
+        }
+        ws.send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if control.connected() > registered {
+                return ws;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the gateway's control connection never registered");
+    }
+
+    async fn next_direct_offer(
+        ws: &mut WebSocketStream<TcpStream>,
+    ) -> (PunchId, SealedCandidates, Option<UdpRendezvous>) {
+        let signal = recv_control_json(ws).await;
+        match serde_json::from_value(signal).unwrap() {
+            crate::ControlSignal::DirectOffer {
+                punch_id,
+                offer,
+                register,
+            } => (punch_id, offer, register),
+            other => panic!("expected a DirectOffer, got {other:?}"),
+        }
+    }
+
+    async fn send_report(ws: &mut WebSocketStream<TcpStream>, report: &ControlReport) {
+        ws.send(Message::Binary(serde_json::to_vec(report).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    fn assert_no_direct_route(reply: &HttpReply) {
+        assert_eq!(reply.status, 404);
+        assert_eq!(reply.body, NO_DIRECT_ROUTE, "every 404 is the same");
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+    }
+
+    #[test]
+    fn the_offer_route_is_a_relay_route() {
+        assert!(is_relay_route("/direct/node-1"));
+        assert!(!is_relay_route("/directory"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_direct_offer_is_answered_over_the_gateways_control_connection() {
+        let (port, control) = serve_direct(
+            ControlRegistry::new()
+                .with_udp_rendezvous(RendezvousAddress::parse(RENDEZVOUS).unwrap()),
+            IpLimitConfig::socket_peer(),
+        )
+        .await;
+        let mut gw = gateway(port, &control, "node-1", Some(capable())).await;
+
+        let body = offer_body();
+        let post =
+            tokio::spawn(
+                async move { post_offer(port, "node-1", Some("inst-A"), &body, None).await },
+            );
+        let (punch_id, offer, register) = next_direct_offer(&mut gw).await;
+        assert_eq!(
+            offer,
+            sealed("offer"),
+            "C forwards the sealed offer untouched"
+        );
+        let gateway_rendezvous = register.expect("a rendezvous for a udp-capable gateway");
+        assert_eq!(gateway_rendezvous.address, RENDEZVOUS);
+        send_report(
+            &mut gw,
+            &ControlReport::DirectAnswer {
+                punch_id,
+                answer: sealed("answer"),
+            },
+        )
+        .await;
+
+        let reply = post.await.unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        let response: DirectOfferResponse = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(response.punch_id, punch_id);
+        assert_eq!(response.answer, sealed("answer"));
+        let device_rendezvous = response.rendezvous.expect("the device's rendezvous");
+        assert_eq!(device_rendezvous.address, RENDEZVOUS);
+        assert!(
+            device_rendezvous.key != gateway_rendezvous.key,
+            "each role gets its own key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_missing_direct_route_is_the_same_opaque_404() {
+        let (port, control) =
+            serve_direct(ControlRegistry::new(), IpLimitConfig::socket_peer()).await;
+        let body = offer_body();
+
+        let reply = post_offer(port, "node-1", None, &body, None).await;
+        assert_eq!(reply.status, 401, "admission runs first");
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+
+        assert_no_direct_route(&post_offer(port, "ghost", Some("inst-A"), &body, None).await);
+        let _legacy = gateway(port, &control, "legacy", None).await;
+        assert_no_direct_route(&post_offer(port, "legacy", Some("inst-A"), &body, None).await);
+        let _future = gateway(
+            port,
+            &control,
+            "future",
+            Some(serde_json::json!({ "version": DIRECT_PROTOCOL_VERSION + 1, "udp": true })),
+        )
+        .await;
+        assert_no_direct_route(&post_offer(port, "future", Some("inst-A"), &body, None).await);
+        let mut gw = gateway(port, &control, "node-1", Some(capable())).await;
+        assert_no_direct_route(&post_offer(port, "node-1", Some("inst-B"), &body, None).await);
+        let too_long = "n".repeat(MAX_RELAY_NODE_ID_BYTES + 1);
+        assert_no_direct_route(&post_offer(port, &too_long, Some("inst-A"), &body, None).await);
+
+        let declined = tokio::spawn({
+            let body = body.clone();
+            async move { post_offer(port, "node-1", Some("inst-A"), &body, None).await }
+        });
+        let (punch_id, _, register) = next_direct_offer(&mut gw).await;
+        assert_eq!(register, None, "C runs no rendezvous");
+        send_report(&mut gw, &ControlReport::DirectDeclined { punch_id }).await;
+        assert_no_direct_route(&declined.await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_offer_route_refuses_a_malformed_or_oversized_body() {
+        let port = serve_direct(ControlRegistry::new(), IpLimitConfig::socket_peer())
+            .await
+            .0;
+        let reply = post_offer(port, "node-1", Some("inst-A"), "not json", None).await;
+        assert_eq!(reply.status, 400);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        let oversized = serde_json::to_string(&DirectOfferRequest {
+            offer: SealedCandidates {
+                n: String::new(),
+                enc: "x".repeat(MAX_SEALED_CANDIDATES_BYTES + 1),
+            },
+        })
+        .unwrap();
+        assert!(oversized.len() <= MAX_DIRECT_OFFER_BODY_BYTES);
+        let reply = post_offer(port, "node-1", Some("inst-A"), &oversized, None).await;
+        assert_eq!(reply.status, 400);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        let too_long = "x".repeat(MAX_DIRECT_OFFER_BODY_BYTES + 1);
+        let reply = post_offer(port, "node-1", Some("inst-A"), &too_long, None).await;
+        assert_eq!(reply.status, 413);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+    }
+
+    /// The per-IP limiter and admission answer before the offer handler runs;
+    /// their responses on the offer route are no more cacheable than its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_offer_routes_outer_layers_answer_uncacheably_too() {
+        let port = serve_direct(
+            ControlRegistry::new(),
+            IpLimitConfig::with_trusted_headers(vec![HeaderName::from_static(CF_CONNECTING_IP)]),
+        )
+        .await
+        .0;
+        let body = offer_body();
+        let mut saw_429 = false;
+        for _ in 0..(remote_host_edge::ip_limit::IP_BURST as usize + 8) {
+            let reply = post_offer(port, "node-1", None, &body, Some("203.0.113.1")).await;
+            assert_eq!(reply.header("cache-control"), Some("no-store"));
+            match reply.status {
+                401 => {}
+                429 => {
+                    saw_429 = true;
+                    break;
+                }
+                other => panic!("unexpected status during flood: {other}"),
+            }
+        }
+        assert!(saw_429, "the flood reaches the per-IP limiter");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_offer_gets_504() {
+        let answer_timeout = Duration::from_millis(100);
+        let (port, control) = serve_direct(
+            ControlRegistry::new().with_direct_answer_timeout(answer_timeout),
+            IpLimitConfig::socket_peer(),
+        )
+        .await;
+        let _gw = gateway(port, &control, "node-1", Some(capable())).await;
+        let started = Instant::now();
+        let reply = post_offer(port, "node-1", Some("inst-A"), &offer_body(), None).await;
+        assert_eq!(reply.status, 504);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        assert!(started.elapsed() >= answer_timeout);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_control_connection_ends_a_waiting_offer_with_504() {
+        let (port, control) = serve_direct(
+            ControlRegistry::new().with_direct_answer_timeout(Duration::from_secs(30)),
+            IpLimitConfig::socket_peer(),
+        )
+        .await;
+        let mut gw = gateway(port, &control, "node-1", Some(capable())).await;
+        let body = offer_body();
+        let post =
+            tokio::spawn(
+                async move { post_offer(port, "node-1", Some("inst-A"), &body, None).await },
+            );
+        next_direct_offer(&mut gw).await;
+        drop(gw);
+        let reply = tokio::time::timeout(Duration::from_secs(5), post)
+            .await
+            .expect("the POST ends with its control connection")
+            .unwrap();
+        assert_eq!(reply.status, 504);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_offer_budget_keys_on_the_header_resolved_client_ip() {
+        let (port, control) = serve_direct(
+            ControlRegistry::new().with_direct_answer_timeout(Duration::from_millis(20)),
+            IpLimitConfig::with_trusted_headers(vec![HeaderName::from_static(CF_CONNECTING_IP)]),
+        )
+        .await;
+        let _gw = gateway(port, &control, "node-1", Some(capable())).await;
+        let body = offer_body();
+        for _ in 0..crate::punch::DIRECT_OFFERS_PER_SOURCE_PER_MINUTE {
+            let reply =
+                post_offer(port, "node-1", Some("inst-A"), &body, Some("203.0.113.1")).await;
+            assert_eq!(reply.status, 504);
+        }
+        let reply = post_offer(port, "node-1", Some("inst-A"), &body, Some("203.0.113.1")).await;
+        assert_eq!(reply.status, 429);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        let retry_after: u64 = reply.header("retry-after").unwrap().parse().unwrap();
+        assert!((1..=60).contains(&retry_after), "{retry_after}");
+
+        let reply = post_offer(port, "node-1", Some("inst-A"), &body, Some("203.0.113.2")).await;
+        assert_eq!(reply.status, 504, "another client IP has its own budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_ipv6_64_of_one_48_shares_one_offer_budget() {
+        let (port, control) = serve_direct(
+            ControlRegistry::new().with_direct_answer_timeout(Duration::from_millis(20)),
+            IpLimitConfig::with_trusted_headers(vec![HeaderName::from_static(CF_CONNECTING_IP)]),
+        )
+        .await;
+        let _gw = gateway(port, &control, "node-1", Some(capable())).await;
+        let body = offer_body();
+        for subnet in 0..crate::punch::DIRECT_OFFERS_PER_SOURCE_PER_MINUTE {
+            let ip = format!("2001:db8:1:{subnet:x}::1");
+            let reply = post_offer(port, "node-1", Some("inst-A"), &body, Some(&ip)).await;
+            assert_eq!(reply.status, 504);
+        }
+        let reply = post_offer(
+            port,
+            "node-1",
+            Some("inst-A"),
+            &body,
+            Some("2001:db8:1:ff::1"),
+        )
+        .await;
+        assert_eq!(
+            reply.status, 429,
+            "a fresh /64 of the same /48 is the same client"
+        );
+        let reply = post_offer(port, "node-1", Some("inst-A"), &body, Some("2001:db8:2::1")).await;
+        assert_eq!(reply.status, 504, "another /48 has its own budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_control_channel_answers_503_with_retry_after() {
+        let (port, control) =
+            serve_direct(ControlRegistry::new(), IpLimitConfig::socket_peer()).await;
+        let (_rx, _) = control
+            .register(
+                "node-1",
+                "inst-A",
+                Some(DirectCapability {
+                    version: DIRECT_PROTOCOL_VERSION,
+                    udp: false,
+                }),
+            )
+            .unwrap();
+        while control
+            .signal_open("node-1", "inst-A", "dl-fill", LegClass::Chat)
+            .is_ok()
+        {}
+        let reply = post_offer(port, "node-1", Some("inst-A"), &offer_body(), None).await;
+        assert_eq!(reply.status, 503);
+        assert_eq!(reply.header("retry-after"), Some("1"));
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+    }
+
+    /// Only the gateway's own frames count as its liveness: one that has sent
+    /// nothing since its hello is closed at the idle timeout, even while C
+    /// keeps forwarding it signals more often than that.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_gateway_is_closed_at_the_idle_timeout_while_c_signals_it() {
+        let (port, control) =
+            serve_direct(ControlRegistry::new(), IpLimitConfig::socket_peer()).await;
+        let mut ws = gateway(port, &control, "node-1", None).await;
+        let registered = tokio::time::Instant::now();
+        let signal_every = CONTROL_IDLE_TIMEOUT / 3;
+        let still_open = tokio::time::sleep(CONTROL_IDLE_TIMEOUT * 2);
+        tokio::pin!(still_open);
+        let closed = loop {
+            tokio::select! {
+                frame = ws.next() => match frame {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                        break tokio::time::Instant::now();
+                    }
+                    Some(Ok(_)) => {}
+                },
+                () = tokio::time::sleep(signal_every) => {
+                    let _ = control.signal_open("node-1", "inst-A", "dl-keep", LegClass::Chat);
+                }
+                () = &mut still_open => panic!("C's signals reset the idle timeout"),
+            }
+        };
+        let open_for = closed.duration_since(registered);
+        assert!(
+            open_for < CONTROL_IDLE_TIMEOUT + signal_every,
+            "open for {open_for:?}: C's signals reset the idle timeout"
+        );
+        assert_eq!(control.connected(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_capability_or_report_keeps_control() {
+        let (port, control) =
+            serve_direct(ControlRegistry::new(), IpLimitConfig::socket_peer()).await;
+        let mut malformed = gateway(
+            port,
+            &control,
+            "node-1",
+            Some(serde_json::json!("not a capability")),
+        )
+        .await;
+        assert_no_direct_route(
+            &post_offer(port, "node-1", Some("inst-A"), &offer_body(), None).await,
+        );
+        let _phone = connect_content_join(port, "node-1", Some("inst-A"))
+            .await
+            .expect("the relay still reaches a gateway with a malformed capability");
+        assert_eq!(
+            recv_control_json(&mut malformed).await["t"],
+            "open_data_leg"
+        );
+
+        let mut gw = gateway(port, &control, "node-2", Some(capable())).await;
+        for frame in [
+            b"not json".to_vec(),
+            br#"{"t":"direct_answer","punch_id":"zz"}"#.to_vec(),
+            serde_json::to_vec(&ControlReport::DirectDeclined {
+                punch_id: PunchId::generate(),
+            })
+            .unwrap(),
+        ] {
+            gw.send(Message::Binary(frame)).await.unwrap();
+        }
+        gw.send(Message::Text("hello again".into())).await.unwrap();
+
+        let body = offer_body();
+        let post =
+            tokio::spawn(
+                async move { post_offer(port, "node-2", Some("inst-A"), &body, None).await },
+            );
+        let (punch_id, _, _) = next_direct_offer(&mut gw).await;
+        send_report(
+            &mut gw,
+            &ControlReport::DirectAnswer {
+                punch_id,
+                answer: sealed("answer"),
+            },
+        )
+        .await;
+        assert_eq!(post.await.unwrap().status, 200);
+        let _phone = connect_content_join(port, "node-2", Some("inst-A"))
+            .await
+            .expect("the relay still reaches the gateway");
+        assert_eq!(recv_control_json(&mut gw).await["t"], "open_data_leg");
     }
 
     async fn recv_bin(ws: &mut WebSocketStream<TcpStream>) -> Vec<u8> {
