@@ -149,13 +149,20 @@ pub(crate) async fn run_content_session<Si: BinarySink, So: BinarySource>(
     // this — it never learns `device_id` — so it is enforced here. A confirmed
     // handshake proves the initiator live; a two-message one does not, since
     // the relay sees every msg1 it carries and could replay one, so such a leg
-    // installs only once its first transport message decrypts.
+    // installs only once its first transport message decrypts, within a
+    // deadline. A leg opened before the live one never installs, so one whose
+    // first message the relay held back cannot displace a later leg.
     let pending_dedup = match dedup {
         Some(dedup) if Si::CONFIRMS_HANDSHAKE => {
-            dedup.install(&device_id);
+            if !dedup.install(&device_id) {
+                return Err(RelaySessionError::Ended(
+                    "a chat leg opened later is live".to_string(),
+                ));
+            }
             None
         }
         Some(dedup) => Some(PendingDedup {
+            deadline: tokio::time::Instant::now() + state.chat_legs.first_message_deadline(),
             dedup,
             device_id: device_id.clone(),
         }),
@@ -414,11 +421,13 @@ impl<S: BinarySink> FrameSink for NoiseFrameSink<S> {
 
 /// A chat leg's [`LegDedup`], held until the initiator proves it is live:
 /// its first transport message decrypts under keys only the initiator that
-/// wrote msg1 holds. A replayed msg1 gets msg2 but never produces one, so it
-/// never displaces the device's live chat leg.
+/// wrote msg1 holds, before `deadline`. A replayed msg1 gets msg2 but never
+/// produces one, so it never displaces the device's live chat leg; a leg
+/// silent past the deadline closes uninstalled.
 struct PendingDedup {
     dedup: LegDedup,
     device_id: String,
+    deadline: tokio::time::Instant,
 }
 
 /// Inbound: Noise-decrypt each binary message into an encoded [`Frame`].
@@ -439,7 +448,21 @@ impl<R: BinarySource> FrameSource for NoiseFrameSource<R> {
             if let Some(frame) = self.pending.pop_front() {
                 return Some(frame);
             }
-            let bytes = self.source.next_bytes().await?;
+            let bytes = match self.pending_dedup.as_ref() {
+                Some(pending) => {
+                    match tokio::time::timeout_at(pending.deadline, self.source.next_bytes()).await
+                    {
+                        Ok(bytes) => bytes?,
+                        Err(_) => {
+                            tracing::info!(
+                                "chat leg closed: no transport message before its deadline"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                None => self.source.next_bytes().await?,
+            };
             let reassembled = {
                 let mut transport = self.transport.lock();
                 match self.reassembler.read(&mut transport, &bytes) {
@@ -452,8 +475,13 @@ impl<R: BinarySource> FrameSource for NoiseFrameSource<R> {
                     }
                 }
             };
-            if let Some(PendingDedup { dedup, device_id }) = self.pending_dedup.take() {
-                dedup.install(&device_id);
+            if let Some(PendingDedup {
+                dedup, device_id, ..
+            }) = self.pending_dedup.take()
+                && !dedup.install(&device_id)
+            {
+                tracing::info!("chat leg closed: a chat leg opened later is live");
+                return None;
             }
             for frame_bytes in reassembled {
                 match wire::decode(&frame_bytes) {

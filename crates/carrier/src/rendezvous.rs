@@ -1,12 +1,13 @@
 //! One side's UDP rendezvous for one punch, shared by A and P: register the
 //! side's IPv4 socket with C for its role until C returns the other role's
-//! mapping, and latch that mapping.
+//! mapping, and latch that mapping. Every exchange is tagged under the role's
+//! key, which C delivered over TLS.
 
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use remote_host_protocol::relay::{
-    AddressPolicy, ProbeDatagram, PunchId, PunchRole, RendezvousTicket,
+    AddressPolicy, ProbeDatagram, PunchId, PunchRole, RendezvousKey,
 };
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
@@ -17,13 +18,36 @@ use crate::socket::{DemuxSocket, ReceivedProbe};
 /// `Register` or a lost `Peer` costs one interval, since C answers every
 /// `Register`.
 pub const REGISTER_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-/// How long a side registers for one punch before it gives up on a `Peer`.
-pub const PEER_WAIT: Duration = Duration::from_secs(5);
+
+/// The addresses on a side's own interfaces. Neither the rendezvous address
+/// nor a `Peer` mapping may be one of them: a datagram to its own address is
+/// delivered locally, past the side's firewall, to whatever listens there.
+/// Loopback addresses are left out: the address policy already refuses them
+/// in production, and the test policy reaches its fakes through them.
+#[derive(Debug, Clone, Default)]
+pub struct OwnAddresses(Vec<IpAddr>);
+
+impl OwnAddresses {
+    pub fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
+        Self(
+            addresses
+                .into_iter()
+                .map(AddressPolicy::canonical_ip)
+                .filter(|ip| !ip.is_loopback())
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = AddressPolicy::canonical_ip(ip);
+        self.0.contains(&ip)
+    }
+}
 
 /// What one received probe datagram meant to a punch's registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerEvent {
-    /// C confirmed the ticket; the other role has not registered yet.
+    /// C verified the `Register`; the other role has not registered yet.
     Registered,
     /// The first valid `Peer`: the other role's mapping, now latched.
     Latched(SocketAddrV4),
@@ -33,29 +57,41 @@ pub enum PeerEvent {
     /// dropped and logged as `peer_conflict`.
     Conflict,
     /// Anything else: a datagram from another source than the rendezvous
-    /// address, for another punch, or a `Peer` whose mapping is not a
-    /// `Public` IPv4 address with a port.
+    /// address, for another punch, not tagged under the role's key, or a
+    /// `Peer` whose mapping is not a `Public` IPv4 address with a port or is
+    /// one of the side's own addresses.
     Ignored,
 }
 
-/// The `Peer` rule of one punch. A `Peer` counts only when it comes from the
-/// resolved rendezvous address, names this punch, and carries a `Public`
-/// IPv4 mapping with a non-zero port; the first such one is latched for the
-/// life of the punch.
+/// The `Peer` rule of one punch. A reply counts only when it comes from the
+/// resolved rendezvous address, names this punch and is tagged under the
+/// role's key; a `Peer` must also carry a `Public` IPv4 mapping with a
+/// non-zero port that is none of the side's own addresses. The first such
+/// `Peer` is latched for the life of the punch.
 #[derive(Debug)]
 pub struct PeerLatch {
     punch_id: PunchId,
     rendezvous: SocketAddr,
+    key: RendezvousKey,
     policy: AddressPolicy,
+    own: OwnAddresses,
     latched: Option<SocketAddrV4>,
 }
 
 impl PeerLatch {
-    pub fn new(punch_id: PunchId, rendezvous: SocketAddrV4, policy: AddressPolicy) -> Self {
+    pub fn new(
+        punch_id: PunchId,
+        rendezvous: SocketAddrV4,
+        key: RendezvousKey,
+        policy: AddressPolicy,
+        own: OwnAddresses,
+    ) -> Self {
         Self {
             punch_id,
             rendezvous: SocketAddr::V4(rendezvous),
+            key,
             policy,
+            own,
             latched: None,
         }
     }
@@ -65,15 +101,19 @@ impl PeerLatch {
     }
 
     pub fn observe(&mut self, probe: &ReceivedProbe) -> PeerEvent {
-        if probe.source != self.rendezvous {
+        if probe.source != self.rendezvous || !self.key.verifies(&probe.datagram) {
             return PeerEvent::Ignored;
         }
         match probe.datagram {
-            ProbeDatagram::Registered { punch_id } if punch_id == self.punch_id => {
+            ProbeDatagram::Registered { punch_id, .. } if punch_id == self.punch_id => {
                 PeerEvent::Registered
             }
-            ProbeDatagram::Peer { punch_id, srflx } if punch_id == self.punch_id => {
-                if srflx.port() == 0 || self.policy.public_v4(IpAddr::V4(*srflx.ip())).is_none() {
+            ProbeDatagram::Peer {
+                punch_id, srflx, ..
+            } if punch_id == self.punch_id => {
+                let ip = IpAddr::V4(*srflx.ip());
+                if srflx.port() == 0 || self.policy.public_v4(ip).is_none() || self.own.contains(ip)
+                {
                     return PeerEvent::Ignored;
                 }
                 match self.latched {
@@ -105,7 +145,7 @@ pub enum RegisterOutcome {
     /// C returned the other role's mapping, now latched.
     Peer(SocketAddrV4),
     /// The deadline passed, or the replies ended, without a valid `Peer`.
-    /// `registered` says whether C confirmed the ticket.
+    /// `registered` says whether C verified the `Register`.
     NoPeer { registered: bool },
 }
 
@@ -121,29 +161,31 @@ pub struct Registration {
 
 impl Registration {
     /// `rendezvous` is the address `UdpRendezvous::resolve_public_v4`
-    /// returned; replies are accepted only from it.
+    /// returned; replies are accepted only from it. `None` when it is one of
+    /// the side's `own` addresses, or when the key yields no tag: the side
+    /// then does not register.
     pub fn new(
         punch_id: PunchId,
         role: PunchRole,
-        ticket: RendezvousTicket,
+        key: RendezvousKey,
         rendezvous: SocketAddrV4,
         policy: AddressPolicy,
-    ) -> Self {
-        Self {
-            register: ProbeDatagram::Register {
-                punch_id,
-                role,
-                ticket,
-            },
-            rendezvous,
-            latch: PeerLatch::new(punch_id, rendezvous, policy),
-            registered: false,
+        own: OwnAddresses,
+    ) -> Option<Self> {
+        if own.contains(IpAddr::V4(*rendezvous.ip())) {
+            return None;
         }
+        Some(Self {
+            register: key.register(punch_id, role)?,
+            rendezvous,
+            latch: PeerLatch::new(punch_id, rendezvous, key, policy, own),
+            registered: false,
+        })
     }
 
     /// Sends `Register` from `socket` every [`REGISTER_RETRY_INTERVAL`] until
     /// a valid `Peer` arrives on `replies` or `deadline` passes. A
-    /// `Registered` reply confirms the ticket and does not end the loop. A
+    /// `Registered` reply confirms the `Register` and does not end the loop. A
     /// send error is logged and the next interval tries again.
     pub async fn until_peer(
         &mut self,
@@ -211,7 +253,7 @@ impl Registration {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use remote_host_protocol::relay::RENDEZVOUS_TICKET_LEN;
+    use remote_host_protocol::relay::RENDEZVOUS_KEY_LEN;
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
 
@@ -231,12 +273,63 @@ mod tests {
         }
     }
 
+    const OWN_PUBLIC: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 40_000);
+
+    fn key() -> RendezvousKey {
+        RendezvousKey::from_bytes([3; RENDEZVOUS_KEY_LEN])
+    }
+
     fn peer(punch_id: PunchId, srflx: SocketAddrV4) -> ProbeDatagram {
-        ProbeDatagram::Peer { punch_id, srflx }
+        key().peer(punch_id, srflx).unwrap()
+    }
+
+    fn registered(punch_id: PunchId) -> ProbeDatagram {
+        key().registered(punch_id).unwrap()
+    }
+
+    fn own() -> OwnAddresses {
+        OwnAddresses::new([IpAddr::V4(*OWN_PUBLIC.ip())])
     }
 
     fn latch(punch_id: PunchId) -> PeerLatch {
-        PeerLatch::new(punch_id, RENDEZVOUS, AddressPolicy::active())
+        PeerLatch::new(punch_id, RENDEZVOUS, key(), AddressPolicy::active(), own())
+    }
+
+    #[test]
+    fn a_rendezvous_at_an_own_address_is_never_registered_with() {
+        let at_own = SocketAddrV4::new(*OWN_PUBLIC.ip(), 7777);
+        assert!(
+            Registration::new(
+                PunchId::generate(),
+                PunchRole::Gateway,
+                key(),
+                at_own,
+                AddressPolicy::active(),
+                own()
+            )
+            .is_none()
+        );
+        assert!(
+            Registration::new(
+                PunchId::generate(),
+                PunchRole::Gateway,
+                key(),
+                RENDEZVOUS,
+                AddressPolicy::active(),
+                own()
+            )
+            .is_some()
+        );
+        assert!(
+            OwnAddresses::new(["::ffff:9.9.9.9".parse().unwrap()])
+                .contains(IpAddr::V4(*OWN_PUBLIC.ip())),
+            "an IPv4-mapped own address is the same address"
+        );
+        assert!(
+            !OwnAddresses::new([IpAddr::V4(Ipv4Addr::LOCALHOST)])
+                .contains(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "loopback is left to the address policy"
+        );
     }
 
     #[test]
@@ -251,18 +344,22 @@ mod tests {
             from(RENDEZVOUS, peer(PunchId::generate(), SRFLX)),
             from(RENDEZVOUS, peer(punch_id, private)),
             from(RENDEZVOUS, peer(punch_id, no_port)),
+            from(RENDEZVOUS, peer(punch_id, OWN_PUBLIC)),
             from(
                 RENDEZVOUS,
-                ProbeDatagram::Registered {
-                    punch_id: PunchId::generate(),
-                },
+                RendezvousKey::generate().peer(punch_id, SRFLX).unwrap(),
+            ),
+            from(RENDEZVOUS, registered(PunchId::generate())),
+            from(
+                RENDEZVOUS,
+                RendezvousKey::generate().registered(punch_id).unwrap(),
             ),
         ] {
             assert_eq!(latch.observe(&ignored), PeerEvent::Ignored);
         }
         assert_eq!(latch.latched(), None);
         assert_eq!(
-            latch.observe(&from(RENDEZVOUS, ProbeDatagram::Registered { punch_id })),
+            latch.observe(&from(RENDEZVOUS, registered(punch_id))),
             PeerEvent::Registered
         );
     }
@@ -321,26 +418,25 @@ mod tests {
         let (c, rendezvous) = mock_c().await;
         let (socket, _endpoint, mut replies) = side_socket();
         let punch_id = PunchId::generate();
-        let ticket = RendezvousTicket::from_bytes([3; RENDEZVOUS_TICKET_LEN]);
         let mut registration = Registration::new(
             punch_id,
             PunchRole::Gateway,
-            ticket.clone(),
+            key(),
             rendezvous,
             AddressPolicy::active(),
-        );
+            own(),
+        )
+        .unwrap();
         let c_side = async {
             let (first, side) = next_register(&c).await;
-            assert_eq!(
-                first,
-                ProbeDatagram::Register {
-                    punch_id,
-                    role: PunchRole::Gateway,
-                    ticket,
-                }
-            );
-            let registered = ProbeDatagram::Registered { punch_id }.encode();
-            c.send_to(&registered, side).await.unwrap();
+            assert_eq!(first, key().register(punch_id, PunchRole::Gateway).unwrap());
+            let forged = RendezvousKey::generate()
+                .peer(punch_id, OTHER_SRFLX)
+                .unwrap();
+            c.send_to(&forged.encode(), side).await.unwrap();
+            c.send_to(&registered(punch_id).encode(), side)
+                .await
+                .unwrap();
             // The second Register's Peer is lost; the third's arrives.
             next_register(&c).await;
             next_register(&c).await;
@@ -364,10 +460,12 @@ mod tests {
         let mut registration = Registration::new(
             punch_id,
             PunchRole::Device,
-            RendezvousTicket::from_bytes([4; RENDEZVOUS_TICKET_LEN]),
+            key(),
             rendezvous,
             AddressPolicy::active(),
-        );
+            own(),
+        )
+        .unwrap();
         let deadline = Instant::now() + REGISTER_RETRY_INTERVAL * 2;
         let outcome = registration
             .until_peer(&socket, &mut replies, deadline)

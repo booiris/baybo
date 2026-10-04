@@ -88,8 +88,10 @@ impl fmt::Debug for ServerIdentity {
 }
 
 /// A's server configuration: TLS 1.3 with [`DIRECT_QUIC_ALPN`], no session
-/// tickets, and the pinned transport limits (bidirectional streams only, no
-/// datagrams, bounded receive windows).
+/// tickets, the pinned transport limits (bidirectional streams only, no
+/// datagrams, bounded receive windows) and no connection migration, so an
+/// admitted connection never moves A's sends to an address outside the
+/// allowed set.
 pub fn server_config(
     identity: &ServerIdentity,
     provider: Arc<CryptoProvider>,
@@ -191,7 +193,9 @@ fn server_config_with(crypto: Arc<dyn quinn::crypto::ServerConfig>) -> quinn::Se
         .stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW));
     let mut config = quinn::ServerConfig::with_crypto(crypto);
-    config.transport_config(Arc::new(transport));
+    config
+        .transport_config(Arc::new(transport))
+        .migration(false);
     config
 }
 

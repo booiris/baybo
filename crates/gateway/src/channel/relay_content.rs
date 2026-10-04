@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use super::api_tunnel::run_api_tunnel_over_relay;
 use super::carrier::runtime::{BindingDevice, CarrierProcess, CarrierRuntime};
 use super::device_content::run_content_over_relay;
-use super::state::{LegDedup, WsChannelState};
+use super::state::WsChannelState;
 use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::{ControlReport, LegClass};
 
@@ -720,10 +720,7 @@ async fn open_data_leg(
         // right after spawn) so a fresh leg aborts a stale predecessor; if it never
         // arrives, run without dedup.
         LegClass::Chat => {
-            let dedup = ah_rx.await.ok().map(|abort| LegDedup {
-                registry: state.device_leg_registry.clone(),
-                abort,
-            });
+            let dedup = ah_rx.await.ok().map(|abort| state.chat_legs.opened(abort));
             run_content_over_relay(ws, state, dedup).await;
         }
     }

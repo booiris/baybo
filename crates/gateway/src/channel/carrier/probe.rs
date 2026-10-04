@@ -10,10 +10,10 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use carrier::burst::{PUNCH_BURST, PunchBurst};
-use carrier::rendezvous::{PEER_WAIT, RegisterOutcome, Registration};
+use carrier::rendezvous::{OwnAddresses, RegisterOutcome, Registration};
 use carrier::socket::{DemuxSocket, ProbeReceiver, ReceivedProbe};
 use remote_host_protocol::relay::{
-    PUNCH_TAG_LEN, ProbeDatagram, PunchId, PunchRole, PunchTag, UdpRendezvous,
+    PEER_WAIT, PUNCH_TAG_LEN, ProbeDatagram, PunchId, PunchRole, PunchTag, UdpRendezvous,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -87,23 +87,24 @@ async fn send_punch(
 
 /// Registers A's IPv4 socket for `punch_id` at C's rendezvous, and punches
 /// the mapping C returns. The rendezvous address resolves to `Public` IPv4
-/// or registration is skipped. A latched `Peer` joins the punch's allowed
-/// set; a later conflicting one is dropped.
+/// that is none of A's `own` addresses, or registration is skipped. A latched
+/// `Peer` joins the punch's allowed set; a later conflicting one is dropped.
 pub(crate) async fn register_and_punch(
     context: Arc<RuntimeContext>,
     socket: Arc<DemuxSocket>,
     punch_id: PunchId,
     rendezvous: UdpRendezvous,
+    own: OwnAddresses,
     mut replies: mpsc::Receiver<ReceivedProbe>,
 ) {
     let policy = context.policy;
     let resolved = tokio::task::spawn_blocking(move || {
         let address = rendezvous.resolve_public_v4(&policy);
-        (rendezvous.ticket, address)
+        (rendezvous.key, address)
     })
     .await;
-    let (ticket, address) = match resolved {
-        Ok((ticket, Ok(address))) => (ticket, address),
+    let (key, address) = match resolved {
+        Ok((key, Ok(address))) => (key, address),
         Ok((_, Err(error))) => {
             tracing::info!(punch = %punch_id.tag(), outcome = "unresolved", "udp_register");
             tracing::debug!(punch = %punch_id.tag(), %error, "udp_register: rendezvous address refused");
@@ -115,7 +116,12 @@ pub(crate) async fn register_and_punch(
         }
     };
     let deadline = Instant::now() + PEER_WAIT;
-    let mut registration = Registration::new(punch_id, PunchRole::Gateway, ticket, address, policy);
+    let Some(mut registration) =
+        Registration::new(punch_id, PunchRole::Gateway, key, address, policy, own)
+    else {
+        tracing::info!(punch = %punch_id.tag(), outcome = "own_address", "udp_register");
+        return;
+    };
     match registration
         .until_peer(&socket, &mut replies, deadline)
         .await
@@ -180,7 +186,7 @@ pub(crate) async fn route_probes(mut probes: ProbeReceiver, context: Arc<Runtime
                     }
                 }
             }
-            ProbeDatagram::Registered { punch_id } | ProbeDatagram::Peer { punch_id, .. } => {
+            ProbeDatagram::Registered { punch_id, .. } | ProbeDatagram::Peer { punch_id, .. } => {
                 let route = context
                     .punches
                     .lock()

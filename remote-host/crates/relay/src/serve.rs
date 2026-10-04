@@ -44,7 +44,7 @@ use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::{
     AddressPolicy, CONTENT_HOST, CONTENT_JOIN, CONTROL, ControlReport, DIRECT_OFFER,
     DirectOfferRequest, LegClass, MAX_DIRECT_OFFER_BODY_BYTES, PAIR_HOST, PAIR_JOIN,
-    RELAY_LEG_CLASS_HEADER,
+    RELAY_LEG_CLASS_HEADER, SourceKey,
 };
 // `build_router` (pub) takes an `IpLimitConfig` and a `RelayServices` carrying an
 // `IpTrafficRegistry`, so downstream callers must be able to name both without
@@ -750,12 +750,21 @@ async fn control_handler(
         remote_api_key: key,
         ..
     }): Extension<Admitted>,
+    headers: HeaderMap,
+    OptPeer(peer): OptPeer,
     ws: WebSocketUpgrade,
 ) -> Response {
-    capped(ws).on_upgrade(move |socket| run_control(socket, state, key))
+    let client = resolve_client_ip_from(&headers, peer.map(|p| p.ip()), &state.trusted_headers)
+        .map(AddressPolicy::client_key);
+    capped(ws).on_upgrade(move |socket| run_control(socket, state, key, client))
 }
 
-async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
+async fn run_control(
+    mut socket: WebSocket,
+    state: RelayState,
+    key: String,
+    client: Option<SourceKey>,
+) {
     let hello = match socket.recv().await {
         Some(Ok(AxumMessage::Binary(b))) => match serde_json::from_slice::<ControlHello>(&b) {
             Ok(h) => h,
@@ -810,9 +819,12 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
         return;
     }
     // An unknown capability version reads as not direct-capable; control stays up.
-    let direct = hello.supported_direct().copied();
-    let (mut rx, control_token) = match state.control.register(&hello.relay_node_id, &key, direct) {
-        Ok(registered) => registered,
+    let offered = hello.supported_direct().copied();
+    let registered = state
+        .control
+        .register_from(&hello.relay_node_id, &key, offered, client);
+    let (mut rx, control_token, direct) = match registered {
+        Ok(registered) => (registered.signals, registered.token, registered.direct),
         Err(ControlRegisterError::OwnerMismatch { owner }) => {
             tracing::warn!(
                 node = %hello.relay_node_id,
@@ -836,6 +848,7 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
         key_tag = %key_tag(&key),
         direct = direct.is_some(),
         direct_udp = direct.is_some_and(|capability| capability.udp),
+        direct_refused_client_cap = offered.is_some() && direct.is_none(),
         unsupported_direct_version = ?hello
             .direct
             .filter(|_| direct.is_none())
@@ -1088,7 +1101,7 @@ async fn direct_offer_handler(
         }
     };
     let client = resolve_client_ip_from(&headers, peer.map(|p| p.ip()), &state.trusted_headers)
-        .map(AddressPolicy::source_key);
+        .map(AddressPolicy::client_key);
     let offered = state.control.offer_direct(
         OfferSource {
             relay_node_id: &relay_node_id,
@@ -2407,8 +2420,8 @@ mod tests {
         let device_rendezvous = response.rendezvous.expect("the device's rendezvous");
         assert_eq!(device_rendezvous.address, RENDEZVOUS);
         assert!(
-            device_rendezvous.ticket != gateway_rendezvous.ticket,
-            "each role gets its own ticket"
+            device_rendezvous.key != gateway_rendezvous.key,
+            "each role gets its own key"
         );
     }
 
@@ -2560,6 +2573,36 @@ mod tests {
 
         let reply = post_offer(port, "node-1", Some("inst-A"), &body, Some("203.0.113.2")).await;
         assert_eq!(reply.status, 504, "another client IP has its own budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_ipv6_64_of_one_48_shares_one_offer_budget() {
+        let (port, control) = serve_direct(
+            ControlRegistry::new().with_direct_answer_timeout(Duration::from_millis(20)),
+            IpLimitConfig::with_trusted_headers(vec![HeaderName::from_static(CF_CONNECTING_IP)]),
+        )
+        .await;
+        let _gw = gateway(port, &control, "node-1", Some(capable())).await;
+        let body = offer_body();
+        for subnet in 0..crate::punch::DIRECT_OFFERS_PER_SOURCE_PER_MINUTE {
+            let ip = format!("2001:db8:1:{subnet:x}::1");
+            let reply = post_offer(port, "node-1", Some("inst-A"), &body, Some(&ip)).await;
+            assert_eq!(reply.status, 504);
+        }
+        let reply = post_offer(
+            port,
+            "node-1",
+            Some("inst-A"),
+            &body,
+            Some("2001:db8:1:ff::1"),
+        )
+        .await;
+        assert_eq!(
+            reply.status, 429,
+            "a fresh /64 of the same /48 is the same client"
+        );
+        let reply = post_offer(port, "node-1", Some("inst-A"), &body, Some("2001:db8:2::1")).await;
+        assert_eq!(reply.status, 504, "another /48 has its own budget");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -34,6 +34,11 @@ use crate::udp::RendezvousAddress;
 
 /// Bounded backlog of control signals toward one gateway.
 const CONTROL_CHANNEL_CAP: usize = 32;
+/// Control connections from one client (`AddressPolicy::client_key`) whose
+/// direct capability C honours. A connection past it still registers and
+/// relays, but is never offered a punch, so one client cannot spread its
+/// punches over unboundedly many nodes.
+pub(crate) const MAX_DIRECT_CONTROLS_PER_CLIENT: usize = 32;
 
 /// The control-plane wire types ([`ControlHello`] in, [`ControlSignal`] out)
 /// live in the shared protocol crate, so the gateway encodes/decodes the exact
@@ -54,6 +59,8 @@ struct ControlEntry {
     /// The supported direct capability from the gateway's hello; `None` means
     /// C never forwards it an offer.
     direct: Option<DirectCapability>,
+    /// The client the connection came from, when known.
+    client: Option<SourceKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +153,15 @@ impl From<PunchRefusal> for OfferRefusal {
     }
 }
 
+/// A registered control connection: the signals C sends it, its token for
+/// [`ControlRegistry::unregister_if_owned`], and the direct capability C
+/// honours for it.
+pub struct RegisteredControl {
+    pub signals: mpsc::Receiver<ControlSignal>,
+    pub token: u64,
+    pub direct: Option<DirectCapability>,
+}
+
 /// Registry of gateways' live control connections, keyed by `relay_node_id`,
 /// and of the punches forwarded on them.
 pub struct ControlRegistry {
@@ -201,6 +217,21 @@ impl ControlRegistry {
         remote_api_key: &str,
         direct: Option<DirectCapability>,
     ) -> Result<(mpsc::Receiver<ControlSignal>, u64), ControlRegisterError> {
+        self.register_from(relay_node_id, remote_api_key, direct, None)
+            .map(|registered| (registered.signals, registered.token))
+    }
+
+    /// [`Self::register`] for a connection from `client`. The direct
+    /// capability is honoured only while `client` holds fewer than
+    /// [`MAX_DIRECT_CONTROLS_PER_CLIENT`] other direct-capable connections;
+    /// [`RegisteredControl::direct`] is the capability C honours.
+    pub fn register_from(
+        &self,
+        relay_node_id: &str,
+        remote_api_key: &str,
+        direct: Option<DirectCapability>,
+        client: Option<SourceKey>,
+    ) -> Result<RegisteredControl, ControlRegisterError> {
         if !node_id_within_bound(relay_node_id) {
             return Err(ControlRegisterError::NodeIdTooLong {
                 len: relay_node_id.len(),
@@ -222,7 +253,20 @@ impl ControlRegistry {
                     "control: new registration superseded a live control connection for this relay_node_id"
                 );
             }
-            instances
+            let direct = direct.filter(|_| {
+                client.is_none_or(|client| {
+                    let held = instances
+                        .iter()
+                        .filter(|(node, entry)| {
+                            node.as_str() != relay_node_id
+                                && entry.direct.is_some()
+                                && entry.client == Some(client)
+                        })
+                        .count();
+                    held < MAX_DIRECT_CONTROLS_PER_CLIENT
+                })
+            });
+            let superseded = instances
                 .insert(
                     relay_node_id.to_string(),
                     ControlEntry {
@@ -230,14 +274,21 @@ impl ControlRegistry {
                         remote_api_key: remote_api_key.to_string(),
                         token,
                         direct,
+                        client,
                     },
                 )
-                .map(|previous| previous.token)
+                .map(|previous| previous.token);
+            (superseded, direct)
         };
+        let (superseded, direct) = superseded;
         if let Some(previous) = superseded {
             self.punches.drop_control(relay_node_id, previous);
         }
-        Ok((rx, token))
+        Ok(RegisteredControl {
+            signals: rx,
+            token,
+            direct,
+        })
     }
 
     /// Signal a registered gateway to open a data leg under `relay_key` of the
@@ -372,7 +423,7 @@ mod tests {
     use crate::RelayBroker;
     use crate::punch::{DIRECT_OFFERS_PER_SOURCE_PER_MINUTE, OfferOutcome};
     use remote_host_protocol::relay::{
-        DIRECT_PROTOCOL_VERSION, MAX_SEALED_CANDIDATES_BYTES, PunchId,
+        AddressPolicy, DIRECT_PROTOCOL_VERSION, MAX_SEALED_CANDIDATES_BYTES, PunchId,
     };
 
     const CAPABLE: Option<DirectCapability> = Some(DirectCapability {
@@ -785,5 +836,45 @@ mod tests {
         let (_new_rx, _) = reg.register("node-1", "inst-A", CAPABLE).unwrap();
         assert!(!reg.punches().contains(stale_id));
         assert!(matches!(stale.outcome().await, OfferOutcome::NoAnswer));
+    }
+
+    #[tokio::test]
+    async fn one_client_gets_its_direct_capability_honoured_on_a_bounded_number_of_nodes() {
+        let reg = ControlRegistry::new();
+        let client = Some(AddressPolicy::client_key("203.0.113.9".parse().unwrap()));
+        let other = Some(AddressPolicy::client_key("203.0.113.10".parse().unwrap()));
+        let mut held = Vec::new();
+        for node in 0..MAX_DIRECT_CONTROLS_PER_CLIENT {
+            let registered = reg
+                .register_from(&format!("node-{node}"), "inst-A", CAPABLE, client)
+                .unwrap();
+            assert_eq!(registered.direct, CAPABLE);
+            held.push(registered);
+        }
+        let over = reg
+            .register_from("node-over", "inst-A", CAPABLE, client)
+            .unwrap();
+        assert_eq!(
+            over.direct, None,
+            "past the cap the control relays but is never offered"
+        );
+        assert!(matches!(
+            reg.offer_direct(from("node-over", "inst-A"), sealed()),
+            Err(OfferRefusal::NoRoute(NoRoute::NotCapable))
+        ));
+        let again = reg
+            .register_from("node-0", "inst-A", CAPABLE, client)
+            .unwrap();
+        assert_eq!(
+            again.direct, CAPABLE,
+            "a reconnect of a held node keeps its share"
+        );
+        assert_eq!(
+            reg.register_from("node-elsewhere", "inst-A", CAPABLE, other)
+                .unwrap()
+                .direct,
+            CAPABLE,
+            "another client has its own share"
+        );
     }
 }

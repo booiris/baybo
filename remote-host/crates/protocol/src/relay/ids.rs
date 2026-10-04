@@ -1,5 +1,5 @@
 //! Identifiers and secrets of direct-carrier signalling: C's per-punch id and
-//! role tickets, and A's per-runtime `DirectOpen` token. Each travels as
+//! role keys, and A's per-runtime `DirectOpen` token. Each travels as
 //! lowercase hex on the JSON wire and is validated on decode.
 
 use std::fmt;
@@ -11,8 +11,8 @@ use zeroize::Zeroizing;
 
 /// Raw length of a [`PunchId`].
 pub const PUNCH_ID_LEN: usize = 16;
-/// Raw length of a [`RendezvousTicket`].
-pub const RENDEZVOUS_TICKET_LEN: usize = 16;
+/// Raw length of a [`RendezvousKey`].
+pub const RENDEZVOUS_KEY_LEN: usize = 32;
 /// Raw length of a [`DirectToken`] before hex encoding.
 pub const DIRECT_TOKEN_LEN: usize = 32;
 
@@ -63,51 +63,57 @@ impl<'de> Deserialize<'de> for PunchId {
     }
 }
 
-/// C's per-punch, per-role registration credential: 16 CSPRNG bytes. Each
-/// role receives only its own ticket. Redacted by `Debug`, compared in
-/// constant time.
+/// C's per-punch, per-role rendezvous key: 32 CSPRNG bytes. Each role
+/// receives only its own key, and only over TLS (A's in its `DirectOffer`, P's
+/// in its POST response); it never crosses the UDP rendezvous, where it keys
+/// the tags of that role's `Register` and of C's replies to it. Zeroized on
+/// drop, redacted by `Debug`, compared in constant time.
 #[derive(Clone)]
-pub struct RendezvousTicket([u8; RENDEZVOUS_TICKET_LEN]);
+pub struct RendezvousKey(Zeroizing<[u8; RENDEZVOUS_KEY_LEN]>);
 
-impl RendezvousTicket {
+impl RendezvousKey {
     pub fn generate() -> Self {
-        Self(rand::random())
+        let mut key = Zeroizing::new([0u8; RENDEZVOUS_KEY_LEN]);
+        rand::fill(key.as_mut_slice());
+        Self(key)
     }
 
-    pub fn from_bytes(bytes: [u8; RENDEZVOUS_TICKET_LEN]) -> Self {
-        Self(bytes)
+    pub fn from_bytes(bytes: [u8; RENDEZVOUS_KEY_LEN]) -> Self {
+        Self(Zeroizing::new(bytes))
     }
 
-    pub fn as_bytes(&self) -> &[u8; RENDEZVOUS_TICKET_LEN] {
+    pub fn as_bytes(&self) -> &[u8; RENDEZVOUS_KEY_LEN] {
         &self.0
     }
 }
 
-impl PartialEq for RendezvousTicket {
+impl PartialEq for RendezvousKey {
     fn eq(&self, other: &Self) -> bool {
         self.0[..].ct_eq(&other.0[..]).into()
     }
 }
 
-impl Eq for RendezvousTicket {}
+impl Eq for RendezvousKey {}
 
-impl fmt::Debug for RendezvousTicket {
+impl fmt::Debug for RendezvousKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RendezvousTicket({REDACTED})")
+        write!(f, "RendezvousKey({REDACTED})")
     }
 }
 
-impl Serialize for RendezvousTicket {
+impl Serialize for RendezvousKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&encode_lower_hex(&self.0))
+        let mut hex = Zeroizing::new(String::with_capacity(RENDEZVOUS_KEY_LEN * 2));
+        push_lower_hex(&mut hex, self.0.as_slice());
+        serializer.serialize_str(&hex)
     }
 }
 
-impl<'de> Deserialize<'de> for RendezvousTicket {
+impl<'de> Deserialize<'de> for RendezvousKey {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer
-            .deserialize_str(LowerHexBytes::<RENDEZVOUS_TICKET_LEN>)
-            .map(Self)
+            .deserialize_str(LowerHexBytes::<RENDEZVOUS_KEY_LEN>)
+            .map(|bytes| Self(Zeroizing::new(bytes)))
     }
 }
 
@@ -265,7 +271,7 @@ mod tests {
             let json = format!("\"{bad}\"");
             assert!(serde_json::from_str::<PunchId>(&json).is_err(), "{bad}");
             assert!(
-                serde_json::from_str::<RendezvousTicket>(&json).is_err(),
+                serde_json::from_str::<RendezvousKey>(&json).is_err(),
                 "{bad}"
             );
         }
@@ -275,7 +281,7 @@ mod tests {
     #[test]
     fn generated_ids_differ() {
         assert_ne!(PunchId::generate(), PunchId::generate());
-        assert_ne!(RendezvousTicket::generate(), RendezvousTicket::generate());
+        assert_ne!(RendezvousKey::generate(), RendezvousKey::generate());
         assert_ne!(DirectToken::generate(), DirectToken::generate());
     }
 
@@ -288,22 +294,14 @@ mod tests {
     }
 
     #[test]
-    fn ticket_is_redacted_and_compared_by_value() {
-        let ticket = RendezvousTicket::from_bytes([7; RENDEZVOUS_TICKET_LEN]);
-        assert_eq!(format!("{ticket:?}"), "RendezvousTicket(<redacted>)");
-        assert_eq!(
-            ticket,
-            RendezvousTicket::from_bytes([7; RENDEZVOUS_TICKET_LEN])
-        );
-        assert_ne!(
-            ticket,
-            RendezvousTicket::from_bytes([8; RENDEZVOUS_TICKET_LEN])
-        );
-        let json = serde_json::to_string(&ticket).unwrap();
-        assert_eq!(
-            serde_json::from_str::<RendezvousTicket>(&json).unwrap(),
-            ticket
-        );
+    fn rendezvous_key_is_64_lowercase_hex_redacted_and_compared_by_value() {
+        let key = RendezvousKey::from_bytes([7; RENDEZVOUS_KEY_LEN]);
+        assert_eq!(format!("{key:?}"), "RendezvousKey(<redacted>)");
+        assert_eq!(key, RendezvousKey::from_bytes([7; RENDEZVOUS_KEY_LEN]));
+        assert_ne!(key, RendezvousKey::from_bytes([8; RENDEZVOUS_KEY_LEN]));
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(json, format!("\"{}\"", "07".repeat(RENDEZVOUS_KEY_LEN)));
+        assert_eq!(serde_json::from_str::<RendezvousKey>(&json).unwrap(), key);
     }
 
     #[test]

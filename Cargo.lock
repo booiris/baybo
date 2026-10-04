@@ -4769,8 +4769,10 @@ dependencies = [
 name = "remote-host-protocol"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "rand 0.9.4",
  "serde",
+ "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.18",
  "tracing",

@@ -15,11 +15,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub use address::{AddressClass, AddressPolicy, SourceKey};
 pub use ids::{
-    DIRECT_TOKEN_LEN, DirectToken, PUNCH_ID_LEN, PunchId, RENDEZVOUS_TICKET_LEN, RendezvousTicket,
+    DIRECT_TOKEN_LEN, DirectToken, PUNCH_ID_LEN, PunchId, RENDEZVOUS_KEY_LEN, RendezvousKey,
 };
 pub use probe::{
     PROBE_DATAGRAM_MAGIC, PUNCH_TAG_LEN, ProbeDatagram, PunchRole, PunchTag, QUIC_FIRST_BYTE_MASK,
-    REGISTER_DATAGRAM_LEN, is_probe_datagram,
+    REGISTER_DATAGRAM_LEN, RENDEZVOUS_TAG_LEN, RendezvousTag, is_probe_datagram,
 };
 
 // Keep the original public path source-compatible after the header became a
@@ -107,6 +107,10 @@ pub const MAX_DIRECT_OFFER_BODY_BYTES: usize = 4 * 1024;
 pub const PUNCH_TTL: Duration = Duration::from_secs(20);
 /// Live punches per gateway node, enforced by C and, as defence in depth, by A.
 pub const MAX_INFLIGHT_PUNCHES_PER_NODE: usize = 2;
+/// How long A and P each register for one punch before giving up on a
+/// `Peer`; C keeps a paired punch this long after pairing for their re-sent
+/// `Register`s.
+pub const PEER_WAIT: Duration = Duration::from_secs(5);
 /// First delay after a UDP socket receive error at A, P or C; it doubles per
 /// consecutive error up to [`SOCKET_RECV_BACKOFF_MAX`].
 pub const SOCKET_RECV_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
@@ -202,8 +206,10 @@ pub struct UdpRendezvous {
     /// `host:port` as normalised by [`UdpRendezvous::normalize_address`];
     /// resolved by its recipient with [`UdpRendezvous::resolve_public_v4`].
     pub address: String,
-    /// The recipient's role ticket only.
-    pub ticket: RendezvousTicket,
+    /// The recipient's role key only. It keys the tags of the recipient's
+    /// `Register` and of C's replies to it, and never crosses the UDP
+    /// rendezvous itself.
+    pub key: RendezvousKey,
 }
 
 /// A → C over [`CONTROL`], only ever in reply to a [`ControlSignal::DirectOffer`].
@@ -335,7 +341,7 @@ mod tests {
     fn rendezvous() -> UdpRendezvous {
         UdpRendezvous {
             address: "rdv.example:7777".into(),
-            ticket: RendezvousTicket::from_bytes([0x22; RENDEZVOUS_TICKET_LEN]),
+            key: RendezvousKey::from_bytes([0x22; RENDEZVOUS_KEY_LEN]),
         }
     }
 
@@ -435,10 +441,7 @@ mod tests {
         assert_eq!(json["punch_id"], "11".repeat(PUNCH_ID_LEN));
         assert_eq!(json["offer"]["n"], "nonce-offer");
         assert_eq!(json["register"]["address"], "rdv.example:7777");
-        assert_eq!(
-            json["register"]["ticket"],
-            "22".repeat(RENDEZVOUS_TICKET_LEN)
-        );
+        assert_eq!(json["register"]["key"], "22".repeat(RENDEZVOUS_KEY_LEN));
 
         let without_register = ControlSignal::DirectOffer {
             punch_id: punch_id(),

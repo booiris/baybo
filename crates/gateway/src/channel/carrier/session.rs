@@ -16,7 +16,7 @@ use crate::channel::api_tunnel::run_tunnel_session;
 use crate::channel::device_content::{
     AuthenticatedDevice, BinarySink, BinarySource, RelaySessionError, run_content_session,
 };
-use crate::channel::state::{LegDedup, WsChannelState};
+use crate::channel::state::WsChannelState;
 
 /// How long a new stream may take to deliver its `DirectOpen` preface.
 pub(crate) const DIRECT_OPEN_DEADLINE: Duration = Duration::from_secs(1);
@@ -81,10 +81,7 @@ where
     let sink = state.device_links.tracked(sink, class, kind);
     match class {
         LegClass::Chat => {
-            let dedup = abort.await.ok().map(|abort| LegDedup {
-                registry: state.device_leg_registry.clone(),
-                abort,
-            });
+            let dedup = abort.await.ok().map(|abort| state.chat_legs.opened(abort));
             run_content_session(sink, source, state, dedup).await
         }
         LegClass::Api | LegClass::Blob => {

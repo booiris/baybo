@@ -280,11 +280,15 @@ does not probe yet (PR2), so today every leg rides the relay.
   `device_id` and cannot dedup. Instead, each content leg is handed its own
   `AbortHandle`; once its handshake resolves the `device_id` and the leg proves
   live (its first decrypted transport message on the relay, P's handshake
-  confirmation on a direct carrier) it registers in
-  `WsChannelState.device_leg_registry` (`device_id → AbortHandle`) and **aborts the
-  stale predecessor** for that device (e.g. a half-open leg from a prior foreground
-  reconnect). `DashMap::insert` is atomic, so two legs racing for one `device_id`
-  leave exactly one survivor; one gateway = one app, so the map holds ~one entry.
+  confirmation on a direct carrier) it registers in `WsChannelState.chat_legs`
+  (`device_id → (sequence, AbortHandle)`) and **aborts the stale predecessor** for
+  that device (e.g. a half-open leg from a prior foreground reconnect). A stamps
+  each chat leg with a sequence when it opens it, and a leg installs only over one
+  opened before it, so a relay leg whose first message was held back never
+  displaces a later one; a relay chat leg silent past
+  `FIRST_TRANSPORT_MESSAGE_DEADLINE` closes uninstalled. The map entry is locked
+  across the check, so two legs racing for one `device_id` leave the later-opened
+  one; one gateway = one app, so the map holds ~one entry.
 - **Remote-host hardening** (C side) — relay abuse controls are keyed on
   `remote_api_key`, resolved through one shared seam
   (`Admission::resolve(remote_api_key) -> Admit{Ok|Unknown|Expired}`, which applies

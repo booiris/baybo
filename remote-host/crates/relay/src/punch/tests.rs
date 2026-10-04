@@ -56,8 +56,20 @@ fn spend(registry: &Arc<PunchRegistry>, request: PunchRequest<'_>) {
 
 struct Paired {
     punch_id: PunchId,
-    gateway: RendezvousTicket,
-    device: RendezvousTicket,
+    gateway: RendezvousKey,
+    device: RendezvousKey,
+}
+
+/// A role's `Register` for `punch_id`, tagged under `key`, as C receives it
+/// from `source`.
+fn register(
+    registry: &PunchRegistry,
+    punch_id: PunchId,
+    role: PunchRole,
+    key: &RendezvousKey,
+    source: SocketAddrV4,
+) -> Option<ProbeDatagram> {
+    registry.register_datagram(&key.register(punch_id, role).unwrap(), source)
 }
 
 /// A punch whose POST ended `200` with a rendezvous, so it stays for the
@@ -85,8 +97,8 @@ async fn answered(registry: &Arc<PunchRegistry>, node: &str) -> Paired {
     assert_eq!(response.answer, sealed());
     Paired {
         punch_id,
-        gateway: register.expect("gateway rendezvous").ticket,
-        device: response.rendezvous.expect("device rendezvous").ticket,
+        gateway: register.expect("gateway rendezvous").key,
+        device: response.rendezvous.expect("device rendezvous").key,
     }
 }
 
@@ -250,65 +262,85 @@ async fn an_answer_without_a_rendezvous_frees_its_slot_at_once() {
 async fn a_rendezvous_punch_stays_in_flight_until_both_roles_have_their_peer() {
     let registry = registry();
     let first = answered(&registry, NODE).await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    let waited = Duration::from_secs(1);
+    tokio::time::advance(waited).await;
     let _second = answered(&registry, NODE).await;
     assert_eq!(
         refused(&registry, request(NODE, None, true)),
         PunchRefusal::Limited {
             limit: OfferLimit::InFlight,
-            retry_after: PUNCH_TTL - Duration::from_secs(5),
+            retry_after: REGISTRATION_GRACE - waited,
         },
         "the wait is until the oldest in-flight punch expires"
     );
 
     let gateway = mapping(1, 4000);
     let device = mapping(2, 5000);
-    registry.register_datagram(first.punch_id, PunchRole::Gateway, &first.gateway, gateway);
-    registry.register_datagram(first.punch_id, PunchRole::Device, &first.device, device);
+    register(
+        &registry,
+        first.punch_id,
+        PunchRole::Gateway,
+        &first.gateway,
+        gateway,
+    );
+    register(
+        &registry,
+        first.punch_id,
+        PunchRole::Device,
+        &first.device,
+        device,
+    );
     assert!(
         registry.admit(request(NODE, None, true)).is_err(),
         "the gateway has not had its Peer yet"
     );
     assert_eq!(
-        registry.register_datagram(first.punch_id, PunchRole::Gateway, &first.gateway, gateway),
-        Some(ProbeDatagram::Peer {
-            punch_id: first.punch_id,
-            srflx: device,
-        })
+        register(
+            &registry,
+            first.punch_id,
+            PunchRole::Gateway,
+            &first.gateway,
+            gateway
+        ),
+        first.gateway.peer(first.punch_id, device)
     );
     let _third = registry
         .admit(request(NODE, None, true))
         .expect("a punch paired for both roles frees its slot");
     assert_eq!(
-        registry.register_datagram(first.punch_id, PunchRole::Device, &first.device, device),
-        Some(ProbeDatagram::Peer {
-            punch_id: first.punch_id,
-            srflx: gateway,
-        }),
-        "a re-sent Register is still answered until the TTL"
+        register(
+            &registry,
+            first.punch_id,
+            PunchRole::Device,
+            &first.device,
+            device
+        ),
+        first.device.peer(first.punch_id, gateway),
+        "a re-sent Register is still answered after pairing"
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_punch_expires_at_its_ttl_and_the_sweep_drops_it() {
+async fn an_answered_punch_that_p_never_registers_for_expires_after_the_grace() {
     let registry = registry();
     let paired = answered(&registry, NODE).await;
     let gateway = mapping(1, 4000);
-    tokio::time::advance(PUNCH_TTL - Duration::from_millis(1)).await;
+    tokio::time::advance(REGISTRATION_GRACE - Duration::from_millis(1)).await;
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             paired.punch_id,
             PunchRole::Gateway,
             &paired.gateway,
             gateway
         ),
-        Some(ProbeDatagram::Registered {
-            punch_id: paired.punch_id
-        })
+        paired.gateway.registered(paired.punch_id),
+        "the gateway's own Register does not extend the grace"
     );
     tokio::time::advance(Duration::from_millis(1)).await;
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             paired.punch_id,
             PunchRole::Gateway,
             &paired.gateway,
@@ -320,6 +352,76 @@ async fn a_punch_expires_at_its_ttl_and_the_sweep_drops_it() {
     assert_eq!(registry.len(), 1);
     registry.sweep();
     assert_eq!(registry.len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_paired_punch_lasts_peer_wait_after_pairing_and_never_past_its_ttl() {
+    let registry = registry();
+    let paired = answered(&registry, NODE).await;
+    let gateway = mapping(1, 4000);
+    let device = mapping(2, 5000);
+    register(
+        &registry,
+        paired.punch_id,
+        PunchRole::Device,
+        &paired.device,
+        device,
+    );
+    tokio::time::advance(REGISTRATION_GRACE * 2).await;
+    assert_eq!(
+        register(
+            &registry,
+            paired.punch_id,
+            PunchRole::Gateway,
+            &paired.gateway,
+            gateway
+        ),
+        paired.gateway.peer(paired.punch_id, device),
+        "P registered within the grace, so the punch waits for the gateway"
+    );
+    tokio::time::advance(PEER_WAIT - Duration::from_millis(1)).await;
+    assert!(
+        register(
+            &registry,
+            paired.punch_id,
+            PunchRole::Device,
+            &paired.device,
+            device
+        )
+        .is_some()
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        register(
+            &registry,
+            paired.punch_id,
+            PunchRole::Device,
+            &paired.device,
+            device
+        ),
+        None
+    );
+
+    let late = answered(&registry, NODE).await;
+    register(
+        &registry,
+        late.punch_id,
+        PunchRole::Device,
+        &late.device,
+        device,
+    );
+    tokio::time::advance(PUNCH_TTL).await;
+    assert_eq!(
+        register(
+            &registry,
+            late.punch_id,
+            PunchRole::Gateway,
+            &late.gateway,
+            gateway
+        ),
+        None,
+        "an unpaired punch P registered for still ends at its TTL"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -346,37 +448,82 @@ async fn the_pending_cap_answers_with_the_oldest_expiry() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_role_ticket_registers_only_its_own_role() {
+async fn one_client_holds_at_most_its_share_of_the_pending_punches() {
+    let registry = registry();
+    let nodes = MAX_PENDING_PUNCHES_PER_CLIENT / MAX_INFLIGHT_PUNCHES_PER_NODE;
+    let mut held = Vec::with_capacity(MAX_PENDING_PUNCHES_PER_CLIENT);
+    for node in 0..nodes {
+        let node = format!("node-{node}");
+        for _ in 0..MAX_INFLIGHT_PUNCHES_PER_NODE {
+            held.push(registry.admit(request(&node, source(1), false)).unwrap());
+        }
+    }
+    assert_eq!(
+        refused(&registry, request("one-more", source(1), false)),
+        PunchRefusal::Limited {
+            limit: OfferLimit::ClientPending,
+            retry_after: PUNCH_TTL,
+        }
+    );
+    held.push(
+        registry
+            .admit(request("one-more", source(2), false))
+            .expect("another client keeps its own share"),
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_role_key_registers_only_its_own_role() {
     let registry = registry();
     let paired = answered(&registry, NODE).await;
     let source = mapping(1, 4000);
     assert_eq!(
-        registry.register_datagram(paired.punch_id, PunchRole::Gateway, &paired.device, source),
+        register(
+            &registry,
+            paired.punch_id,
+            PunchRole::Gateway,
+            &paired.device,
+            source
+        ),
         None,
-        "the device's ticket cannot register the gateway's role"
+        "the device's key cannot register the gateway's role"
     );
     assert_eq!(
-        registry.register_datagram(paired.punch_id, PunchRole::Device, &paired.gateway, source),
+        register(
+            &registry,
+            paired.punch_id,
+            PunchRole::Device,
+            &paired.gateway,
+            source
+        ),
         None,
-        "the gateway's ticket cannot register the device's role"
+        "the gateway's key cannot register the device's role"
     );
-    assert_eq!(
-        registry.register_datagram(paired.punch_id, PunchRole::Device, &paired.device, source),
-        Some(ProbeDatagram::Registered {
-            punch_id: paired.punch_id
-        })
+    let reply = register(
+        &registry,
+        paired.punch_id,
+        PunchRole::Device,
+        &paired.device,
+        source,
+    )
+    .expect("the device's own key registers it");
+    assert!(
+        paired.device.verifies(&reply),
+        "C tags its reply under the role's key"
     );
+    assert!(!paired.gateway.verifies(&reply));
 }
 
 #[tokio::test(start_paused = true)]
 async fn only_a_live_rendezvous_punch_answers() {
     let registry = registry();
-    let ticket = RendezvousTicket::generate();
+    let key = RendezvousKey::generate();
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             PunchId::generate(),
             PunchRole::Gateway,
-            &ticket,
+            &key,
             mapping(1, 4000)
         ),
         None
@@ -384,14 +531,15 @@ async fn only_a_live_rendezvous_punch_answers() {
     let host_only = registry.admit(request(NODE, None, false)).unwrap();
     assert_eq!(host_only.register, None);
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             host_only.pending.punch_id(),
             PunchRole::Gateway,
-            &ticket,
+            &key,
             mapping(1, 4000)
         ),
         None,
-        "a punch without a rendezvous has no tickets to match"
+        "a punch without a rendezvous has no keys to verify under"
     );
 }
 
@@ -401,11 +549,10 @@ async fn each_role_latches_its_first_source() {
     let paired = answered(&registry, NODE).await;
     let gateway = mapping(1, 4000);
     let device = mapping(2, 5000);
-    let registered = Some(ProbeDatagram::Registered {
-        punch_id: paired.punch_id,
-    });
+    let registered = paired.gateway.registered(paired.punch_id);
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             paired.punch_id,
             PunchRole::Gateway,
             &paired.gateway,
@@ -414,7 +561,8 @@ async fn each_role_latches_its_first_source() {
         registered
     );
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             paired.punch_id,
             PunchRole::Gateway,
             &paired.gateway,
@@ -424,7 +572,8 @@ async fn each_role_latches_its_first_source() {
         "a Register for an observed role from a new source is dropped"
     );
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             paired.punch_id,
             PunchRole::Gateway,
             &paired.gateway,
@@ -433,44 +582,93 @@ async fn each_role_latches_its_first_source() {
         registered
     );
     assert_eq!(
-        registry.register_datagram(paired.punch_id, PunchRole::Device, &paired.device, device),
-        Some(ProbeDatagram::Peer {
-            punch_id: paired.punch_id,
-            srflx: gateway,
-        })
+        register(
+            &registry,
+            paired.punch_id,
+            PunchRole::Device,
+            &paired.device,
+            device
+        ),
+        paired.device.peer(paired.punch_id, gateway)
     );
     assert_eq!(
-        registry.register_datagram(
+        register(
+            &registry,
             paired.punch_id,
             PunchRole::Gateway,
             &paired.gateway,
             gateway
         ),
-        Some(ProbeDatagram::Peer {
-            punch_id: paired.punch_id,
-            srflx: device,
-        })
+        paired.gateway.peer(paired.punch_id, device)
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_punch_considers_at_most_its_datagram_budget() {
+async fn only_verified_registers_from_the_latched_source_spend_the_datagram_budget() {
     let registry = registry();
     let paired = answered(&registry, NODE).await;
     let source = mapping(1, 4000);
-    let wrong = RendezvousTicket::generate();
-    for _ in 0..MAX_DATAGRAMS_PER_PUNCH / 2 {
-        registry.register_datagram(paired.punch_id, PunchRole::Gateway, &wrong, source);
+    let forged = RendezvousKey::generate();
+    for _ in 0..MAX_DATAGRAMS_PER_PUNCH {
+        assert_eq!(
+            register(
+                &registry,
+                paired.punch_id,
+                PunchRole::Gateway,
+                &forged,
+                source
+            ),
+            None
+        );
     }
-    let answered_count = (0..MAX_DATAGRAMS_PER_PUNCH)
-        .filter_map(|_| {
-            registry.register_datagram(paired.punch_id, PunchRole::Gateway, &paired.gateway, source)
-        })
-        .count();
+    let first = register(
+        &registry,
+        paired.punch_id,
+        PunchRole::Gateway,
+        &paired.gateway,
+        source,
+    );
+    assert!(first.is_some(), "a forged tag spent nothing");
+    for _ in 0..MAX_DATAGRAMS_PER_PUNCH {
+        assert_eq!(
+            register(
+                &registry,
+                paired.punch_id,
+                PunchRole::Gateway,
+                &paired.gateway,
+                mapping(9, 9000)
+            ),
+            None,
+            "a copy replayed from another source is dropped"
+        );
+    }
+    let answered_count = 1
+        + (1..MAX_DATAGRAMS_PER_PUNCH)
+            .filter_map(|_| {
+                register(
+                    &registry,
+                    paired.punch_id,
+                    PunchRole::Gateway,
+                    &paired.gateway,
+                    source,
+                )
+            })
+            .count();
     assert_eq!(
         answered_count,
-        usize::try_from(MAX_DATAGRAMS_PER_PUNCH / 2).unwrap(),
-        "every Register naming the punch counts, valid or not"
+        usize::try_from(MAX_DATAGRAMS_PER_PUNCH).unwrap(),
+        "the latched source keeps its whole budget"
+    );
+    assert_eq!(
+        register(
+            &registry,
+            paired.punch_id,
+            PunchRole::Gateway,
+            &paired.gateway,
+            source
+        ),
+        None,
+        "and no more"
     );
 }
 

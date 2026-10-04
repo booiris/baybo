@@ -26,6 +26,9 @@ const QUIET_WINDOW: Duration = Duration::from_millis(200);
 /// RFC 9000 §14.1: a server ignores a client Initial in a smaller datagram.
 const MIN_INITIAL_DATAGRAM_LEN: usize = 1200;
 const RECV_BUFFER_LEN: usize = 2048;
+/// Long enough for a stream from a moved client to reach A over loopback,
+/// were A to follow it.
+const MIGRATION_WINDOW: Duration = Duration::from_millis(500);
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
@@ -72,6 +75,38 @@ fn negotiated_alpn(connection: &Connection) -> Option<Vec<u8>> {
         .downcast::<quinn::crypto::rustls::HandshakeData>()
         .ok()?
         .protocol
+}
+
+#[tokio::test]
+async fn a_connection_that_moves_to_a_new_address_is_not_followed() {
+    let identity = ServerIdentity::generate().unwrap();
+    let server = endpoint(Some(server_config(&identity, provider()).unwrap()));
+    let runtime = quinn::default_runtime().unwrap();
+    let client = Endpoint::new(
+        endpoint_config(),
+        None,
+        std::net::UdpSocket::bind(LOOPBACK).unwrap(),
+        runtime,
+    )
+    .unwrap();
+    let config = client_config(identity.cert_hash(), provider()).unwrap();
+    let (client_conn, server_conn) = handshake(&server, &client, config).await;
+    let (client_conn, server_conn) = (client_conn.unwrap(), server_conn.unwrap());
+    let admitted = server_conn.remote_address();
+
+    client
+        .rebind(std::net::UdpSocket::bind(LOOPBACK).unwrap())
+        .unwrap();
+    let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+    send.write_all(b"moved").await.unwrap();
+
+    assert!(
+        tokio::time::timeout(MIGRATION_WINDOW, server_conn.accept_bi())
+            .await
+            .is_err(),
+        "A drops packets from an address the connection was not admitted from"
+    );
+    assert_eq!(server_conn.remote_address(), admitted);
 }
 
 #[tokio::test]

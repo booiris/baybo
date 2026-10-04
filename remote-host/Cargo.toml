@@ -74,6 +74,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_r
 tower = { version = "0.5", features = ["util"] }
 parking_lot = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 # Constant-time comparison of the direct-carrier secrets (role tickets, the
 # `DirectOpen` token) in the protocol crate.
 subtle = "2"

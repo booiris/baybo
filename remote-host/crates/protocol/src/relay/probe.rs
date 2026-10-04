@@ -4,9 +4,11 @@
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use super::ids::{PUNCH_ID_LEN, PunchId, RENDEZVOUS_TICKET_LEN, RendezvousTicket};
+use super::ids::{PUNCH_ID_LEN, PunchId, RendezvousKey};
 use crate::error::ProbeDecodeError;
 
 /// First byte of every probe datagram.
@@ -19,7 +21,11 @@ pub const QUIC_FIRST_BYTE_MASK: u8 = 0x80 | 0x40;
 pub const REGISTER_DATAGRAM_LEN: usize = 64;
 /// Length of a punch authentication tag.
 pub const PUNCH_TAG_LEN: usize = 16;
+/// Length of a rendezvous tag: `HMAC-SHA256(role key, RENDEZVOUS_TAG_DOMAIN ‖
+/// the datagram up to its tag)[..16]`.
+pub const RENDEZVOUS_TAG_LEN: usize = 16;
 
+const RENDEZVOUS_TAG_DOMAIN: &[u8] = b"baybo/direct/rendezvous/v1";
 const HEADER_LEN: usize = 2;
 const KIND_REGISTER: u8 = 1;
 const KIND_REGISTERED: u8 = 2;
@@ -31,9 +37,9 @@ const ROLE_LEN: usize = 1;
 const IPV4_LEN: usize = 4;
 const PORT_LEN: usize = 2;
 const SEQ_LEN: usize = 2;
-const REGISTER_UNPADDED_LEN: usize = HEADER_LEN + PUNCH_ID_LEN + ROLE_LEN + RENDEZVOUS_TICKET_LEN;
-const REGISTERED_LEN: usize = HEADER_LEN + PUNCH_ID_LEN;
-const PEER_LEN: usize = HEADER_LEN + PUNCH_ID_LEN + IPV4_LEN + PORT_LEN;
+const REGISTER_UNPADDED_LEN: usize = HEADER_LEN + PUNCH_ID_LEN + ROLE_LEN + RENDEZVOUS_TAG_LEN;
+const REGISTERED_LEN: usize = HEADER_LEN + PUNCH_ID_LEN + RENDEZVOUS_TAG_LEN;
+const PEER_LEN: usize = HEADER_LEN + PUNCH_ID_LEN + IPV4_LEN + PORT_LEN + RENDEZVOUS_TAG_LEN;
 const PUNCH_LEN: usize = HEADER_LEN + SEQ_LEN + PUNCH_TAG_LEN;
 
 const _: () = assert!(PROBE_DATAGRAM_MAGIC & QUIC_FIRST_BYTE_MASK == 0);
@@ -49,7 +55,7 @@ pub fn is_probe_datagram(datagram: &[u8]) -> bool {
 }
 
 /// Which side of a direct attempt an endpoint is: the role a `Register` speaks
-/// for, each with its own ticket.
+/// for, each with its own key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PunchRole {
     Gateway,
@@ -96,63 +102,167 @@ impl PartialEq for PunchTag {
 
 impl Eq for PunchTag {}
 
+/// The tag of a `Register`, `Registered` or `Peer` under one role's
+/// [`RendezvousKey`]. Compared in constant time.
+#[derive(Debug, Clone, Copy)]
+pub struct RendezvousTag([u8; RENDEZVOUS_TAG_LEN]);
+
+impl RendezvousTag {
+    pub fn from_bytes(bytes: [u8; RENDEZVOUS_TAG_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; RENDEZVOUS_TAG_LEN] {
+        &self.0
+    }
+}
+
+impl PartialEq for RendezvousTag {
+    fn eq(&self, other: &Self) -> bool {
+        self.0[..].ct_eq(&other.0[..]).into()
+    }
+}
+
+impl Eq for RendezvousTag {}
+
 /// One probe datagram.
 ///
 /// ```text
 /// byte 0   PROBE_DATAGRAM_MAGIC
 /// byte 1   kind
-///   1 Register     punch_id[16] role[1] ticket[16]   zero-padded to REGISTER_DATAGRAM_LEN
-///   2 Registered   punch_id[16]
-///   3 Peer         punch_id[16] ipv4[4] port[2]
+///   1 Register     punch_id[16] role[1] tag[16]          zero-padded to REGISTER_DATAGRAM_LEN
+///   2 Registered   punch_id[16] tag[16]
+///   3 Peer         punch_id[16] ipv4[4] port[2] tag[16]
 ///   4 Punch        seq[2] tag[16]
 /// ```
 ///
 /// Integers are big-endian; `role` is 1 for the gateway and 2 for the device.
-/// Decoding requires the exact length of each kind and zero padding.
+/// A rendezvous tag covers every byte before it, under the key of the role
+/// that sends the `Register` or receives the reply. Decoding requires the
+/// exact length of each kind and zero padding; it does not check tags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeDatagram {
     /// A or P → C: register this socket for one role of one punch.
     Register {
         punch_id: PunchId,
         role: PunchRole,
-        ticket: RendezvousTicket,
+        tag: RendezvousTag,
     },
-    /// C → sender: the ticket is valid; the other role has not registered yet.
-    Registered { punch_id: PunchId },
+    /// C → sender: the `Register` verified; the other role has not
+    /// registered yet.
+    Registered {
+        punch_id: PunchId,
+        tag: RendezvousTag,
+    },
     /// C → sender: the other role's mapping, as C observed it.
     Peer {
         punch_id: PunchId,
         srflx: SocketAddrV4,
+        tag: RendezvousTag,
     },
     /// A ↔ P: opens the sender's NAT or firewall toward the receiver.
     Punch { seq: u16, tag: PunchTag },
 }
 
+impl RendezvousKey {
+    /// The role's `Register` for `punch_id`, tagged under this key. `None`
+    /// only if HMAC refuses the key, which no 32-byte key makes it do.
+    pub fn register(&self, punch_id: PunchId, role: PunchRole) -> Option<ProbeDatagram> {
+        let mut body = header(KIND_REGISTER, REGISTER_UNPADDED_LEN);
+        push_register_fields(&mut body, punch_id, role);
+        Some(ProbeDatagram::Register {
+            punch_id,
+            role,
+            tag: self.tag(&body)?,
+        })
+    }
+
+    /// C's `Registered` to the role this key belongs to.
+    pub fn registered(&self, punch_id: PunchId) -> Option<ProbeDatagram> {
+        let mut body = header(KIND_REGISTERED, REGISTERED_LEN);
+        body.extend_from_slice(punch_id.as_bytes());
+        Some(ProbeDatagram::Registered {
+            punch_id,
+            tag: self.tag(&body)?,
+        })
+    }
+
+    /// C's `Peer` to the role this key belongs to, naming the other role's
+    /// mapping.
+    pub fn peer(&self, punch_id: PunchId, srflx: SocketAddrV4) -> Option<ProbeDatagram> {
+        let mut body = header(KIND_PEER, PEER_LEN);
+        push_peer_fields(&mut body, punch_id, srflx);
+        Some(ProbeDatagram::Peer {
+            punch_id,
+            srflx,
+            tag: self.tag(&body)?,
+        })
+    }
+
+    /// Whether `datagram` is a rendezvous datagram tagged under this key. A
+    /// `Punch` never is.
+    pub fn verifies(&self, datagram: &ProbeDatagram) -> bool {
+        let expected = match datagram {
+            ProbeDatagram::Register { punch_id, role, .. } => self.register(*punch_id, *role),
+            ProbeDatagram::Registered { punch_id, .. } => self.registered(*punch_id),
+            ProbeDatagram::Peer {
+                punch_id, srflx, ..
+            } => self.peer(*punch_id, *srflx),
+            ProbeDatagram::Punch { .. } => None,
+        };
+        expected.is_some_and(|expected| {
+            expected.rendezvous_tag().is_some()
+                && expected.rendezvous_tag() == datagram.rendezvous_tag()
+        })
+    }
+
+    fn tag(&self, body: &[u8]) -> Option<RendezvousTag> {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.as_bytes()).ok()?;
+        mac.update(RENDEZVOUS_TAG_DOMAIN);
+        mac.update(body);
+        let digest = mac.finalize().into_bytes();
+        let tag = digest.first_chunk::<RENDEZVOUS_TAG_LEN>()?;
+        Some(RendezvousTag(*tag))
+    }
+}
+
 impl ProbeDatagram {
+    fn rendezvous_tag(&self) -> Option<RendezvousTag> {
+        match self {
+            Self::Register { tag, .. } | Self::Registered { tag, .. } | Self::Peer { tag, .. } => {
+                Some(*tag)
+            }
+            Self::Punch { .. } => None,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::Register {
                 punch_id,
                 role,
-                ticket,
+                tag,
             } => {
                 let mut out = header(KIND_REGISTER, REGISTER_DATAGRAM_LEN);
-                out.extend_from_slice(punch_id.as_bytes());
-                out.push(role.to_byte());
-                out.extend_from_slice(ticket.as_bytes());
+                push_register_fields(&mut out, *punch_id, *role);
+                out.extend_from_slice(tag.as_bytes());
                 out.resize(REGISTER_DATAGRAM_LEN, 0);
                 out
             }
-            Self::Registered { punch_id } => {
+            Self::Registered { punch_id, tag } => {
                 let mut out = header(KIND_REGISTERED, REGISTERED_LEN);
                 out.extend_from_slice(punch_id.as_bytes());
+                out.extend_from_slice(tag.as_bytes());
                 out
             }
-            Self::Peer { punch_id, srflx } => {
+            Self::Peer {
+                punch_id,
+                srflx,
+                tag,
+            } => {
                 let mut out = header(KIND_PEER, PEER_LEN);
-                out.extend_from_slice(punch_id.as_bytes());
-                out.extend_from_slice(&srflx.ip().octets());
-                out.extend_from_slice(&srflx.port().to_be_bytes());
+                push_peer_fields(&mut out, *punch_id, *srflx);
+                out.extend_from_slice(tag.as_bytes());
                 out
             }
             Self::Punch { seq, tag } => {
@@ -192,8 +302,8 @@ impl ProbeDatagram {
                 let (&[role], rest) = rest
                     .split_first_chunk::<ROLE_LEN>()
                     .ok_or_else(length_error)?;
-                let (ticket, padding) = rest
-                    .split_first_chunk::<RENDEZVOUS_TICKET_LEN>()
+                let (tag, padding) = rest
+                    .split_first_chunk::<RENDEZVOUS_TAG_LEN>()
                     .ok_or_else(length_error)?;
                 if padding.iter().any(|byte| *byte != 0) {
                     return Err(ProbeDecodeError::Padding);
@@ -201,15 +311,19 @@ impl ProbeDatagram {
                 Ok(Self::Register {
                     punch_id: PunchId::from_bytes(*punch_id),
                     role: PunchRole::from_byte(role)?,
-                    ticket: RendezvousTicket::from_bytes(*ticket),
+                    tag: RendezvousTag::from_bytes(*tag),
                 })
             }
             KIND_REGISTERED => {
-                let punch_id = body
-                    .first_chunk::<PUNCH_ID_LEN>()
+                let (punch_id, rest) = body
+                    .split_first_chunk::<PUNCH_ID_LEN>()
+                    .ok_or_else(length_error)?;
+                let tag = rest
+                    .first_chunk::<RENDEZVOUS_TAG_LEN>()
                     .ok_or_else(length_error)?;
                 Ok(Self::Registered {
                     punch_id: PunchId::from_bytes(*punch_id),
+                    tag: RendezvousTag::from_bytes(*tag),
                 })
             }
             KIND_PEER => {
@@ -219,10 +333,16 @@ impl ProbeDatagram {
                 let (ip, rest) = rest
                     .split_first_chunk::<IPV4_LEN>()
                     .ok_or_else(length_error)?;
-                let port = rest.first_chunk::<PORT_LEN>().ok_or_else(length_error)?;
+                let (port, rest) = rest
+                    .split_first_chunk::<PORT_LEN>()
+                    .ok_or_else(length_error)?;
+                let tag = rest
+                    .first_chunk::<RENDEZVOUS_TAG_LEN>()
+                    .ok_or_else(length_error)?;
                 Ok(Self::Peer {
                     punch_id: PunchId::from_bytes(*punch_id),
                     srflx: SocketAddrV4::new(Ipv4Addr::from(*ip), u16::from_be_bytes(*port)),
+                    tag: RendezvousTag::from_bytes(*tag),
                 })
             }
             _ => {
@@ -241,6 +361,17 @@ impl ProbeDatagram {
     }
 }
 
+fn push_register_fields(out: &mut Vec<u8>, punch_id: PunchId, role: PunchRole) {
+    out.extend_from_slice(punch_id.as_bytes());
+    out.push(role.to_byte());
+}
+
+fn push_peer_fields(out: &mut Vec<u8>, punch_id: PunchId, srflx: SocketAddrV4) {
+    out.extend_from_slice(punch_id.as_bytes());
+    out.extend_from_slice(&srflx.ip().octets());
+    out.extend_from_slice(&srflx.port().to_be_bytes());
+}
+
 fn header(kind: u8, len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     out.push(PROBE_DATAGRAM_MAGIC);
@@ -251,6 +382,7 @@ fn header(kind: u8, len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::ids::RENDEZVOUS_KEY_LEN;
 
     const PROPERTY_CASES: usize = 4096;
     const MAX_FUZZ_LEN: usize = REGISTER_DATAGRAM_LEN + 8;
@@ -259,25 +391,18 @@ mod tests {
         PunchId::from_bytes(std::array::from_fn(|i| i as u8))
     }
 
+    fn key(byte: u8) -> RendezvousKey {
+        RendezvousKey::from_bytes([byte; RENDEZVOUS_KEY_LEN])
+    }
+
     fn samples() -> Vec<ProbeDatagram> {
         vec![
-            ProbeDatagram::Register {
-                punch_id: punch_id(),
-                role: PunchRole::Gateway,
-                ticket: RendezvousTicket::from_bytes([0xee; RENDEZVOUS_TICKET_LEN]),
-            },
-            ProbeDatagram::Register {
-                punch_id: punch_id(),
-                role: PunchRole::Device,
-                ticket: RendezvousTicket::from_bytes([0xdd; RENDEZVOUS_TICKET_LEN]),
-            },
-            ProbeDatagram::Registered {
-                punch_id: punch_id(),
-            },
-            ProbeDatagram::Peer {
-                punch_id: punch_id(),
-                srflx: "203.0.113.7:40000".parse().unwrap(),
-            },
+            key(0xee).register(punch_id(), PunchRole::Gateway).unwrap(),
+            key(0xdd).register(punch_id(), PunchRole::Device).unwrap(),
+            key(0xee).registered(punch_id()).unwrap(),
+            key(0xee)
+                .peer(punch_id(), "203.0.113.7:40000".parse().unwrap())
+                .unwrap(),
             ProbeDatagram::Punch {
                 seq: 0x0102,
                 tag: PunchTag::from_bytes([0xaa; PUNCH_TAG_LEN]),
@@ -287,21 +412,25 @@ mod tests {
 
     fn random_datagram() -> ProbeDatagram {
         let punch_id = PunchId::from_bytes(rand::random());
+        let key = RendezvousKey::from_bytes(rand::random());
         match rand::random_range(0..4u8) {
-            0 => ProbeDatagram::Register {
-                punch_id,
-                role: if rand::random() {
-                    PunchRole::Gateway
-                } else {
-                    PunchRole::Device
-                },
-                ticket: RendezvousTicket::from_bytes(rand::random()),
-            },
-            1 => ProbeDatagram::Registered { punch_id },
-            2 => ProbeDatagram::Peer {
-                punch_id,
-                srflx: SocketAddrV4::new(Ipv4Addr::from(rand::random::<u32>()), rand::random()),
-            },
+            0 => key
+                .register(
+                    punch_id,
+                    if rand::random() {
+                        PunchRole::Gateway
+                    } else {
+                        PunchRole::Device
+                    },
+                )
+                .unwrap(),
+            1 => key.registered(punch_id).unwrap(),
+            2 => key
+                .peer(
+                    punch_id,
+                    SocketAddrV4::new(Ipv4Addr::from(rand::random::<u32>()), rand::random()),
+                )
+                .unwrap(),
             _ => ProbeDatagram::Punch {
                 seq: rand::random(),
                 tag: PunchTag::from_bytes(rand::random()),
@@ -332,14 +461,82 @@ mod tests {
     }
 
     #[test]
-    fn peer_layout_is_big_endian_ipv4_then_port() {
-        let bytes = ProbeDatagram::Peer {
-            punch_id: punch_id(),
-            srflx: "1.2.3.4:258".parse().unwrap(),
-        }
-        .encode();
+    fn peer_layout_is_big_endian_ipv4_then_port_then_tag() {
+        let bytes = key(1)
+            .peer(punch_id(), "1.2.3.4:258".parse().unwrap())
+            .unwrap()
+            .encode();
         assert_eq!(&bytes[..2], &[PROBE_DATAGRAM_MAGIC, KIND_PEER]);
-        assert_eq!(&bytes[HEADER_LEN + PUNCH_ID_LEN..], &[1, 2, 3, 4, 1, 2]);
+        let fields = HEADER_LEN + PUNCH_ID_LEN;
+        assert_eq!(
+            &bytes[fields..fields + IPV4_LEN + PORT_LEN],
+            &[1, 2, 3, 4, 1, 2]
+        );
+        assert_eq!(
+            bytes.len() - (fields + IPV4_LEN + PORT_LEN),
+            RENDEZVOUS_TAG_LEN
+        );
+    }
+
+    #[test]
+    fn a_rendezvous_tag_verifies_only_under_its_own_key_and_fields() {
+        let gateway = key(1);
+        let device = key(2);
+        let srflx: SocketAddrV4 = "203.0.113.7:40000".parse().unwrap();
+        for datagram in [
+            gateway.register(punch_id(), PunchRole::Gateway).unwrap(),
+            gateway.registered(punch_id()).unwrap(),
+            gateway.peer(punch_id(), srflx).unwrap(),
+        ] {
+            assert!(gateway.verifies(&datagram), "{datagram:?}");
+            assert!(
+                !device.verifies(&datagram),
+                "another role's key: {datagram:?}"
+            );
+            let decoded = ProbeDatagram::decode(&datagram.encode()).unwrap();
+            assert!(gateway.verifies(&decoded));
+        }
+
+        let other_id = PunchId::from_bytes([9; PUNCH_ID_LEN]);
+        let ProbeDatagram::Peer { tag, .. } = gateway.peer(punch_id(), srflx).unwrap() else {
+            panic!("a Peer");
+        };
+        for forged in [
+            ProbeDatagram::Peer {
+                punch_id: other_id,
+                srflx,
+                tag,
+            },
+            ProbeDatagram::Peer {
+                punch_id: punch_id(),
+                srflx: "203.0.113.8:40000".parse().unwrap(),
+                tag,
+            },
+            ProbeDatagram::Registered {
+                punch_id: punch_id(),
+                tag,
+            },
+        ] {
+            assert!(!gateway.verifies(&forged), "{forged:?}");
+        }
+
+        let ProbeDatagram::Register { tag, .. } =
+            gateway.register(punch_id(), PunchRole::Gateway).unwrap()
+        else {
+            panic!("a Register");
+        };
+        assert!(
+            !gateway.verifies(&ProbeDatagram::Register {
+                punch_id: punch_id(),
+                role: PunchRole::Device,
+                tag,
+            }),
+            "the role is covered"
+        );
+        assert!(
+            !gateway.verifies(&samples().remove(4)),
+            "a Punch never verifies"
+        );
     }
 
     #[test]

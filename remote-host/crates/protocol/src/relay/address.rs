@@ -69,6 +69,9 @@ const IPV6_EXCLUDED_GLOBAL: [V6Range; 4] = [
 const IPV6_TEST_PUBLIC: V6Range = (Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0), 48);
 
 const SOURCE_KEY_IPV6_PREFIX_LEN: u32 = 64;
+/// The IPv6 prefix one client is assumed to hold: an end site is routinely
+/// delegated a /48, so C's per-client budgets count a /48 as one client.
+const CLIENT_KEY_IPV6_PREFIX_LEN: u32 = 48;
 
 impl AddressPolicy {
     /// The policy every caller uses: [`AddressPolicy::for_tests`] when the
@@ -125,10 +128,21 @@ impl AddressPolicy {
     /// The per-source cap key of `ip`: the canonical IPv4 address, or the
     /// IPv6 /64.
     pub fn source_key(ip: IpAddr) -> SourceKey {
+        Self::prefix_key(ip, SOURCE_KEY_IPV6_PREFIX_LEN)
+    }
+
+    /// The key of C's per-client budgets: the canonical IPv4 address, or the
+    /// IPv6 /48, so a client cannot multiply its share by rotating through
+    /// the /64s of its own delegation.
+    pub fn client_key(ip: IpAddr) -> SourceKey {
+        Self::prefix_key(ip, CLIENT_KEY_IPV6_PREFIX_LEN)
+    }
+
+    fn prefix_key(ip: IpAddr, ipv6_prefix_len: u32) -> SourceKey {
         match Self::canonical_ip(ip) {
             IpAddr::V4(v4) => SourceKey(IpAddr::V4(v4)),
             IpAddr::V6(v6) => SourceKey(IpAddr::V6(Ipv6Addr::from(
-                u128::from(v6) & v6_mask(SOURCE_KEY_IPV6_PREFIX_LEN),
+                u128::from(v6) & v6_mask(ipv6_prefix_len),
             ))),
         }
     }
@@ -338,6 +352,27 @@ mod tests {
         assert_ne!(
             AddressPolicy::source_key(ip("2001:db8:1:2::1")),
             AddressPolicy::source_key(ip("2001:db8:1:3::1"))
+        );
+    }
+
+    #[test]
+    fn client_key_is_the_ipv4_address_or_the_ipv6_slash_48() {
+        assert_eq!(
+            AddressPolicy::client_key(ip("203.0.113.9")),
+            AddressPolicy::client_key(ip("::ffff:203.0.113.9"))
+        );
+        assert_ne!(
+            AddressPolicy::client_key(ip("203.0.113.9")),
+            AddressPolicy::client_key(ip("203.0.113.10"))
+        );
+        assert_eq!(
+            AddressPolicy::client_key(ip("2001:db8:1:2::1")),
+            AddressPolicy::client_key(ip("2001:db8:1:ff00::1")),
+            "every /64 of one /48 is one client"
+        );
+        assert_ne!(
+            AddressPolicy::client_key(ip("2001:db8:1::1")),
+            AddressPolicy::client_key(ip("2001:db8:2::1"))
         );
     }
 }

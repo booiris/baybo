@@ -1,7 +1,7 @@
 //! C's per-punch direct-carrier state. A punch exists from the moment C
 //! forwards P's offer to A: it holds the wait for A's report, the offer
 //! budgets that admitted it and, when C runs a UDP rendezvous, both roles'
-//! tickets and observed mappings. C keeps no direct state outside a punch.
+//! keys and observed mappings. C keeps no direct state outside a punch.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddrV4;
@@ -11,15 +11,16 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::{
-    ControlReport, DirectOfferResponse, MAX_INFLIGHT_PUNCHES_PER_NODE, PUNCH_TTL, ProbeDatagram,
-    PunchId, PunchRole, RendezvousTicket, SealedCandidates, SourceKey, UdpRendezvous,
+    ControlReport, DirectOfferResponse, MAX_INFLIGHT_PUNCHES_PER_NODE, PEER_WAIT, PUNCH_TTL,
+    ProbeDatagram, PunchId, PunchRole, RendezvousKey, SealedCandidates, SourceKey, UdpRendezvous,
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 /// How long C holds P's `POST /direct` open for A's report.
 pub(crate) const DIRECT_ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
-/// `Register` datagrams C considers per punch; later ones are dropped.
+/// Verified `Register`s from a role's latched source that C answers per
+/// punch; later ones are dropped.
 pub(crate) const MAX_DATAGRAMS_PER_PUNCH: u32 = 64;
 /// Offers per minute to one gateway node from one client source.
 pub(crate) const DIRECT_OFFERS_PER_SOURCE_PER_MINUTE: usize = 6;
@@ -27,6 +28,14 @@ pub(crate) const DIRECT_OFFERS_PER_SOURCE_PER_MINUTE: usize = 6;
 pub(crate) const DIRECT_OFFERS_PER_NODE_PER_MINUTE: usize = 30;
 /// Punches C holds across all nodes.
 pub(crate) const MAX_PENDING_PUNCHES: usize = 4096;
+/// Punches C holds for offers from one client (`AddressPolicy::client_key`),
+/// so no client can fill [`MAX_PENDING_PUNCHES`] alone. Sized for many phones
+/// sharing a carrier-grade NAT address.
+pub(crate) const MAX_PENDING_PUNCHES_PER_CLIENT: usize = 64;
+/// How long an answered punch waits for P's first `Register`. A punch P never
+/// registers for can never pair, so C drops it then instead of at
+/// [`PUNCH_TTL`].
+pub(crate) const REGISTRATION_GRACE: Duration = Duration::from_secs(3);
 /// How often the rendezvous loop drops expired punches. Every lookup already
 /// ignores an expired punch; the sweep reclaims its memory and logs its end.
 pub(crate) const PUNCH_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -39,22 +48,22 @@ pub(crate) enum DirectReply {
     Declined,
 }
 
-/// The per-role registration credentials C mints for a punch when it runs a
-/// UDP rendezvous. Each role only ever receives its own.
-struct RoleTickets {
-    gateway: RendezvousTicket,
-    device: RendezvousTicket,
+/// The per-role rendezvous keys C mints for a punch when it runs a UDP
+/// rendezvous. Each role only ever receives its own, over TLS.
+struct RoleKeys {
+    gateway: RendezvousKey,
+    device: RendezvousKey,
 }
 
-impl RoleTickets {
+impl RoleKeys {
     fn generate() -> Self {
         Self {
-            gateway: RendezvousTicket::generate(),
-            device: RendezvousTicket::generate(),
+            gateway: RendezvousKey::generate(),
+            device: RendezvousKey::generate(),
         }
     }
 
-    fn for_role(&self, role: PunchRole) -> &RendezvousTicket {
+    fn for_role(&self, role: PunchRole) -> &RendezvousKey {
         match role {
             PunchRole::Gateway => &self.gateway,
             PunchRole::Device => &self.device,
@@ -69,8 +78,9 @@ fn other_role(role: PunchRole) -> PunchRole {
     }
 }
 
-/// One role's view at the rendezvous: the first source that registered with a
-/// valid ticket (its IPv4 mapping), and whether C has sent it a `Peer`.
+/// One role's view at the rendezvous: the first source whose `Register`
+/// verified under the role's key (its IPv4 mapping), and whether C has sent it
+/// a `Peer`.
 #[derive(Default)]
 struct RoleState {
     source: Option<SocketAddrV4>,
@@ -82,17 +92,30 @@ struct Punch {
     remote_api_key: String,
     control_token: u64,
     answer: Option<oneshot::Sender<DirectReply>>,
-    tickets: Option<RoleTickets>,
+    keys: Option<RoleKeys>,
+    client: Option<SourceKey>,
     gateway: RoleState,
     device: RoleState,
     datagrams: u32,
     created: Instant,
+    answered_at: Option<Instant>,
     paired_at: Option<Instant>,
 }
 
 impl Punch {
+    /// [`PUNCH_TTL`] after creation at the latest; [`PEER_WAIT`] after
+    /// pairing, the longest either role keeps re-sending its `Register`; and
+    /// [`REGISTRATION_GRACE`] after the answer while P has not registered.
     fn expires_at(&self) -> Instant {
-        self.created + PUNCH_TTL
+        let ttl = self.created + PUNCH_TTL;
+        let early = match (self.paired_at, self.answered_at) {
+            (Some(paired), _) => Some(paired + PEER_WAIT),
+            (None, Some(answered)) if self.device.source.is_none() => {
+                Some(answered + REGISTRATION_GRACE)
+            }
+            (None, _) => None,
+        };
+        early.map_or(ttl, |early| early.min(ttl))
     }
 
     fn is_live(&self, now: Instant) -> bool {
@@ -125,7 +148,7 @@ impl Punch {
             punch_id,
             node: self.node,
             remote_api_key: self.remote_api_key,
-            rendezvous: self.tickets.is_some(),
+            rendezvous: self.keys.is_some(),
             gateway_registered: self.gateway.source.is_some(),
             device_registered: self.device.source.is_some(),
             paired_after: self.paired_at.map(|at| at.duration_since(self.created)),
@@ -272,6 +295,25 @@ impl PunchTable {
         soonest.map(|expires_at| expires_at.saturating_duration_since(now))
     }
 
+    /// `None` while `client` holds fewer than
+    /// [`MAX_PENDING_PUNCHES_PER_CLIENT`] punches, else how long until its
+    /// soonest one expires. An unknown client is not counted.
+    fn client_wait(&self, client: Option<SourceKey>, now: Instant) -> Option<Duration> {
+        let client = client?;
+        let held: Vec<Instant> = self
+            .punches
+            .values()
+            .filter(|punch| punch.client == Some(client))
+            .map(Punch::expires_at)
+            .collect();
+        if held.len() < MAX_PENDING_PUNCHES_PER_CLIENT {
+            return None;
+        }
+        held.into_iter()
+            .min()
+            .map(|expires_at| expires_at.saturating_duration_since(now))
+    }
+
     fn capacity_wait(&self, now: Instant) -> Option<Duration> {
         if self.punches.len() < MAX_PENDING_PUNCHES {
             return None;
@@ -301,6 +343,10 @@ impl PunchTable {
                 OfferLimit::InFlight,
                 self.in_flight_wait(request.relay_node_id, now),
             ),
+            (
+                OfferLimit::ClientPending,
+                self.client_wait(request.source, now),
+            ),
         ];
         let mut refusals = waits
             .into_iter()
@@ -320,19 +366,19 @@ impl PunchTable {
             }
         };
         let (answer_tx, answer) = oneshot::channel();
-        let tickets = request.rendezvous.map(|address| {
-            let tickets = RoleTickets::generate();
+        let keys = request.rendezvous.map(|address| {
+            let keys = RoleKeys::generate();
             let rendezvous_for = |role| UdpRendezvous {
                 address: address.to_owned(),
-                ticket: tickets.for_role(role).clone(),
+                key: keys.for_role(role).clone(),
             };
             let issued = (
                 rendezvous_for(PunchRole::Gateway),
                 rendezvous_for(PunchRole::Device),
             );
-            (tickets, issued)
+            (keys, issued)
         });
-        let (tickets, issued) = tickets.unzip();
+        let (keys, issued) = keys.unzip();
         self.punches.insert(
             punch_id,
             Punch {
@@ -340,11 +386,13 @@ impl PunchTable {
                 remote_api_key: request.remote_api_key.to_owned(),
                 control_token: request.control_token,
                 answer: Some(answer_tx),
-                tickets,
+                keys,
+                client: request.source,
                 gateway: RoleState::default(),
                 device: RoleState::default(),
                 datagrams: 0,
                 created: now,
+                answered_at: None,
                 paired_at: None,
             },
         );
@@ -372,7 +420,8 @@ pub(crate) struct PunchRequest<'a> {
     /// The admitted control connection the offer is forwarded on. Only a
     /// report arriving on it settles the punch.
     pub(crate) control_token: u64,
-    /// The client source the offer budget is keyed on.
+    /// The client (`AddressPolicy::client_key`) the offer budget and the
+    /// per-client punch cap are keyed on.
     pub(crate) source: Option<SourceKey>,
     /// The rendezvous address both roles register at, when C runs one and the
     /// gateway registers on demand.
@@ -393,6 +442,7 @@ pub(crate) enum OfferLimit {
     SourceRate,
     NodeRate,
     InFlight,
+    ClientPending,
 }
 
 impl OfferLimit {
@@ -401,13 +451,15 @@ impl OfferLimit {
             Self::SourceRate => "source_rate",
             Self::NodeRate => "node_rate",
             Self::InFlight => "in_flight",
+            Self::ClientPending => "client_pending",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PunchRefusal {
-    /// A per-source rate, the per-node ceiling or the in-flight cap. When
+    /// A per-source rate, the per-node ceiling, the in-flight cap or the
+    /// per-client punch cap. When
     /// several refuse, `limit` is the first of them and `retry_after` the
     /// longest wait.
     Limited {
@@ -530,28 +582,30 @@ impl PunchRegistry {
     }
 
     /// C's reply to a `Register` from `source`, or `None` to drop it
-    /// silently: an unknown or expired punch, a spent datagram budget, a
-    /// wrong ticket, or a second source for a role. The first valid source of
-    /// each role is latched; the reply is `Peer` with the other role's
-    /// mapping once both are latched, `Registered` before that.
+    /// silently: an unknown or expired punch, a tag that does not verify under
+    /// the role's key, a second source for a role, or a spent datagram
+    /// budget. Only a verified `Register` from the role's latched source (the
+    /// first verified one latches it) counts toward
+    /// [`MAX_DATAGRAMS_PER_PUNCH`], so nobody without the key, and no copy
+    /// replayed from another source, can spend it. The reply, tagged under the
+    /// same key, is `Peer` with the other role's mapping once both are
+    /// latched, `Registered` before that.
     pub(crate) fn register_datagram(
         &self,
-        punch_id: PunchId,
-        role: PunchRole,
-        ticket: &RendezvousTicket,
+        register: &ProbeDatagram,
         source: SocketAddrV4,
     ) -> Option<ProbeDatagram> {
+        let ProbeDatagram::Register { punch_id, role, .. } = *register else {
+            return None;
+        };
         let now = Instant::now();
         let mut table = self.table.lock();
         let punch = table
             .punches
             .get_mut(&punch_id)
             .filter(|punch| punch.is_live(now))?;
-        if punch.datagrams >= MAX_DATAGRAMS_PER_PUNCH {
-            return None;
-        }
-        punch.datagrams += 1;
-        if punch.tickets.as_ref()?.for_role(role) != ticket {
+        let key = punch.keys.as_ref()?.for_role(role).clone();
+        if !key.verifies(register) {
             return None;
         }
         let own = punch.role_mut(role);
@@ -560,12 +614,24 @@ impl PunchRegistry {
             Some(_) => {}
             None => own.source = Some(source),
         }
+        if punch.datagrams >= MAX_DATAGRAMS_PER_PUNCH {
+            return None;
+        }
+        punch.datagrams += 1;
         let Some(srflx) = punch.role(other_role(role)).source else {
-            return Some(ProbeDatagram::Registered { punch_id });
+            return key.registered(punch_id);
         };
         punch.role_mut(role).peer_sent = true;
         punch.paired_at.get_or_insert(now);
-        Some(ProbeDatagram::Peer { punch_id, srflx })
+        key.peer(punch_id, srflx)
+    }
+
+    /// Starts the answered punch's [`REGISTRATION_GRACE`]: its POST ended
+    /// `200` with a rendezvous.
+    fn mark_answered(&self, punch_id: PunchId) {
+        if let Some(punch) = self.table.lock().punches.get_mut(&punch_id) {
+            punch.answered_at.get_or_insert_with(Instant::now);
+        }
     }
 
     /// Drops every expired punch and every offer window that has emptied.
@@ -607,7 +673,7 @@ pub(crate) enum OfferOutcome {
 
 /// The POST's hold on its punch. Dropping it drops the punch, unless the POST
 /// ended `200` with a rendezvous: that punch stays for the roles' `Register`s
-/// until it is paired and then until [`PUNCH_TTL`].
+/// until it expires (see `Punch::expires_at`).
 pub(crate) struct PendingOffer {
     punches: Arc<PunchRegistry>,
     punch_id: PunchId,
@@ -629,6 +695,9 @@ impl PendingOffer {
             Ok(Ok(DirectReply::Answer(answer))) => {
                 let rendezvous = self.device_rendezvous.take();
                 self.keep = rendezvous.is_some();
+                if self.keep {
+                    self.punches.mark_answered(self.punch_id);
+                }
                 OfferOutcome::Answered(DirectOfferResponse {
                     punch_id: self.punch_id,
                     answer,

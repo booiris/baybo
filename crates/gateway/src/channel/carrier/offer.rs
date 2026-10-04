@@ -48,6 +48,17 @@ impl Decline {
             Self::Unbound => "declined:unbound",
         }
     }
+
+    /// Whether the offer opened under the binding's key before it was
+    /// declined, so it came from the paired device. Only such an outcome
+    /// may replace the device's last offer: anyone holding the node id can
+    /// make C forward garbage.
+    pub(crate) fn authenticated(self) -> bool {
+        match self {
+            Self::Stale | Self::Replayed | Self::OverCap => true,
+            Self::Auth | Self::Unbound => false,
+        }
+    }
 }
 
 /// The freshness rule and replay cache of a gateway process's carriers.

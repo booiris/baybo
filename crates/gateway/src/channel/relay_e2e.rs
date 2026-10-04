@@ -42,7 +42,7 @@ use baybo_model::ChannelType;
 use baybo_pairing::DevicePairingService;
 use baybo_store::{DeviceRow, DeviceStatus};
 use carrier::kind::CarrierKind;
-use carrier::rendezvous::{PEER_WAIT, RegisterOutcome, Registration};
+use carrier::rendezvous::{OwnAddresses, RegisterOutcome, Registration};
 use device_proto::aead::KEY_LEN;
 use device_proto::candidates::{DeviceOffer, DeviceSealer, GatewayAnswer, OfferId};
 use device_proto::delegation;
@@ -55,8 +55,8 @@ use futures::{SinkExt, StreamExt};
 use remote_host_admission::InMemoryAdmission;
 use remote_host_protocol::REMOTE_API_KEY_HEADER;
 use remote_host_protocol::relay::{
-    AddressPolicy, DirectOfferRequest, DirectOfferResponse, LegClass, ProbeDatagram, PunchId,
-    PunchRole, SealedCandidates, UdpRendezvous, direct_offer_url,
+    AddressPolicy, DirectOfferRequest, DirectOfferResponse, LegClass, PEER_WAIT, ProbeDatagram,
+    PunchId, PunchRole, SealedCandidates, UdpRendezvous, direct_offer_url,
 };
 use remote_host_relay::serve::{IpLimitConfig, IpTrafficRegistry, RelayServices, build_router};
 use remote_host_relay::udp::{RendezvousAddress, RendezvousServer};
@@ -754,12 +754,20 @@ async fn register_device(
     rendezvous: UdpRendezvous,
 ) -> SocketAddrV4 {
     let policy = AddressPolicy::active();
-    let ticket = rendezvous.ticket.clone();
+    let key = rendezvous.key.clone();
     let address = tokio::task::spawn_blocking(move || rendezvous.resolve_public_v4(&policy))
         .await
         .unwrap()
         .expect("C's rendezvous address resolves to Public IPv4");
-    let mut registration = Registration::new(punch_id, PunchRole::Device, ticket, address, policy);
+    let mut registration = Registration::new(
+        punch_id,
+        PunchRole::Device,
+        key,
+        address,
+        policy,
+        OwnAddresses::default(),
+    )
+    .expect("C's rendezvous is not one of the phone's own addresses");
     let deadline = tokio::time::Instant::now() + PEER_WAIT;
     match registration
         .until_peer(&phone.socket, &mut phone.probes, deadline)
@@ -939,8 +947,8 @@ async fn a_tampered_offer_is_declined_and_c_answers_404() {
     );
     assert_eq!(
         rig.listed().1,
-        Some(Err(Decline::Auth)),
-        "the 404 is A's decline, not a missing route"
+        None,
+        "an offer that does not open never becomes the device's last offer"
     );
     rig.offer(Vec::new()).await;
     assert_eq!(rig.listed().1, Some(Ok(())));

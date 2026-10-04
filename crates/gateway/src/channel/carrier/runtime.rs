@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use carrier::quic::{ServerIdentity, server_config};
+use carrier::rendezvous::OwnAddresses;
 use device_proto::aead::KEY_LEN;
 use device_proto::candidates::{
     CANDIDATE_SET_VERSION, CertHash, DeviceOffer, GatewayAnswer, GatewaySealer,
@@ -301,9 +302,10 @@ impl CarrierRuntime {
     /// writes the report back on the control connection that delivered the
     /// offer. It never waits: the punches, the registration and the
     /// rendezvous lookup run as runtime tasks. Any failed rule declines the
-    /// offer, with no punch. An active runtime records the outcome as the
-    /// binding device's last offer in the link table; an inactive one has
-    /// sent no capability, so no offer is meant to reach it.
+    /// offer, with no punch. An active runtime records the outcome of an
+    /// offer that authenticated as the binding device's last offer in the
+    /// link table; an inactive one has sent no capability, so no offer is
+    /// meant to reach it.
     pub(crate) fn handle_offer(
         &mut self,
         punch_id: PunchId,
@@ -313,10 +315,14 @@ impl CarrierRuntime {
         let answered = match self.active.as_mut() {
             Some(runtime) => {
                 let answered = runtime.answer(punch_id, &offer, register);
-                runtime.context.state.device_links.record_offer(
-                    &runtime.context.device_id,
-                    answered.as_ref().map(|_| ()).map_err(|decline| *decline),
-                );
+                let outcome = answered.as_ref().map(|_| ()).map_err(|decline| *decline);
+                if outcome.map_or_else(Decline::authenticated, |()| true) {
+                    runtime
+                        .context
+                        .state
+                        .device_links
+                        .record_offer(&runtime.context.device_id, outcome);
+                }
                 answered
             }
             None => Err(Decline::Unbound),
@@ -435,7 +441,9 @@ impl ActiveRuntime {
         })?;
 
         let local: Vec<SocketAddr> = bound.iter().map(|socket| socket.local_addr).collect();
-        let own = gather(&local, &context.policy, interfaces::enumerate);
+        let interfaces = interfaces::enumerate();
+        let own_addresses = OwnAddresses::new(interfaces.iter().map(|address| address.ip));
+        let own = gather(&local, &context.policy, || interfaces);
         let answer = GatewayAnswer {
             v: CANDIDATE_SET_VERSION,
             issued_at_ms: now_ms,
@@ -496,6 +504,7 @@ impl ActiveRuntime {
                     socket,
                     punch_id,
                     rendezvous,
+                    own_addresses,
                     replies_rx,
                 ),
             );

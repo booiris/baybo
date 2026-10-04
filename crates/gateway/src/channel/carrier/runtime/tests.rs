@@ -18,8 +18,8 @@ use device_proto::delegation::{device_id_for, generate_signing_key};
 use device_proto::noise::{NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};
 use futures::StreamExt;
 use remote_host_protocol::relay::{
-    DirectOpen, LegClass, PUNCH_TAG_LEN, ProbeDatagram, PunchRole, PunchTag, RENDEZVOUS_TICKET_LEN,
-    RendezvousTicket,
+    DirectOpen, LegClass, PUNCH_TAG_LEN, ProbeDatagram, PunchRole, PunchTag, RENDEZVOUS_KEY_LEN,
+    RendezvousKey,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
@@ -28,7 +28,7 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::channel::device_content::{BinarySink, BinarySource, run_content_session};
-use crate::channel::state::LegDedup;
+use crate::channel::state::{ChatLegs, WsChannelState};
 use crate::config::FamilyBinds;
 use crate::device::load_or_create_static_keypair;
 use crate::test_support::{TestGateway, build_test_deps};
@@ -811,7 +811,7 @@ async fn an_accepted_offer_punches_the_device_candidates_and_a_declined_one_noth
 struct MockRendezvous {
     socket: UdpSocket,
     address: SocketAddrV4,
-    ticket: RendezvousTicket,
+    key: RendezvousKey,
 }
 
 impl MockRendezvous {
@@ -820,14 +820,14 @@ impl MockRendezvous {
         Self {
             socket,
             address,
-            ticket: RendezvousTicket::from_bytes([9; RENDEZVOUS_TICKET_LEN]),
+            key: RendezvousKey::from_bytes([9; RENDEZVOUS_KEY_LEN]),
         }
     }
 
     fn register(&self) -> UdpRendezvous {
         UdpRendezvous {
             address: self.address.to_string(),
-            ticket: self.ticket.clone(),
+            key: self.key.clone(),
         }
     }
 
@@ -836,11 +836,7 @@ impl MockRendezvous {
         let (datagram, source) = next_probe(&self.socket).await;
         assert_eq!(
             datagram,
-            ProbeDatagram::Register {
-                punch_id,
-                role: PunchRole::Gateway,
-                ticket: self.ticket.clone(),
-            }
+            self.key.register(punch_id, PunchRole::Gateway).unwrap()
         );
         source
     }
@@ -868,44 +864,34 @@ async fn a_lost_peer_is_recovered_by_the_next_register_and_the_first_is_latched(
     let (_, punch_id, _) = pairing.answered(&mut runtime, vec![host(40_000)], Some(c.register()));
     let gateway = c.next_register(punch_id).await;
     assert_eq!(gateway, udp_address(&runtime), "from A's IPv4 socket");
-    c.reply(ProbeDatagram::Registered { punch_id }, gateway)
-        .await;
+    c.reply(c.key.registered(punch_id).unwrap(), gateway).await;
     // The second Register's Peer is lost; the third one's arrives.
     c.next_register(punch_id).await;
     c.next_register(punch_id).await;
     impostor
         .send_to(
-            &ProbeDatagram::Peer {
-                punch_id,
-                srflx: conflict_address,
-            }
-            .encode(),
+            &c.key.peer(punch_id, conflict_address).unwrap().encode(),
             gateway,
         )
         .await
         .unwrap();
     c.reply(
-        ProbeDatagram::Peer {
-            punch_id,
-            srflx: srflx_address,
-        },
+        RendezvousKey::generate()
+            .peer(punch_id, conflict_address)
+            .unwrap(),
         gateway,
     )
     .await;
+    c.reply(c.key.peer(punch_id, srflx_address).unwrap(), gateway)
+        .await;
 
     count_punches(&srflx, PUNCH_BURST).await;
     assert!(admits(&runtime, &srflx_address.ip().to_string()));
-    c.reply(
-        ProbeDatagram::Peer {
-            punch_id,
-            srflx: conflict_address,
-        },
-        gateway,
-    )
-    .await;
+    c.reply(c.key.peer(punch_id, conflict_address).unwrap(), gateway)
+        .await;
     assert!(
         stays_silent(&conflict).await,
-        "neither a Peer from another source nor a conflicting one is punched"
+        "a Peer from another source, one tagged under another key, and a conflicting one are never punched"
     );
     c.drain();
     assert!(
@@ -938,14 +924,8 @@ async fn a_private_peer_is_ignored_and_registration_goes_on() {
     let (_, punch_id, _) = pairing.answered(&mut runtime, vec![host(40_000)], Some(c.register()));
     let gateway = c.next_register(punch_id).await;
     let private = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 40_000);
-    c.reply(
-        ProbeDatagram::Peer {
-            punch_id,
-            srflx: private,
-        },
-        gateway,
-    )
-    .await;
+    c.reply(c.key.peer(punch_id, private).unwrap(), gateway)
+        .await;
     c.next_register(punch_id).await;
     assert!(!admits(&runtime, "10.0.0.9"), "a private Peer is ignored");
     runtime.stop().await;
@@ -1349,7 +1329,7 @@ impl BinarySource for ChannelSource {
 /// A content session over an in-memory relay leg, deduped by its own abort
 /// handle as `relay_content` runs one; its halves are the phone's.
 fn spawn_relay_chat_session(
-    pairing: &Pairing,
+    state: WsChannelState,
 ) -> (
     JoinHandle<()>,
     mpsc::Sender<Vec<u8>>,
@@ -1358,12 +1338,11 @@ fn spawn_relay_chat_session(
     let (to_gateway, from_phone) = mpsc::channel(8);
     let (to_phone, from_gateway) = mpsc::channel(8);
     let (abort_tx, abort_rx) = oneshot::channel();
-    let state = pairing.state.clone();
     let leg = tokio::spawn(async move {
-        let dedup = abort_rx.await.ok().map(|abort| LegDedup {
-            registry: state.device_leg_registry.clone(),
-            abort,
-        });
+        let dedup = abort_rx
+            .await
+            .ok()
+            .map(|abort| state.chat_legs.opened(abort));
         let _ = run_content_session(
             ChannelSink(to_phone),
             ChannelSource(from_phone),
@@ -1380,28 +1359,15 @@ fn spawn_relay_chat_session(
 /// transport message, a `Pong`, which draws no reply; returns once the
 /// gateway has installed it as the device's live chat leg.
 async fn relay_chat_leg(pairing: &Pairing) -> (JoinHandle<()>, mpsc::Sender<Vec<u8>>) {
-    let (leg, to_gateway, mut from_gateway) = spawn_relay_chat_session(pairing);
-    let mut handshake = pairing
-        .device
-        .ik_initiator(&pairing.gateway_public)
-        .unwrap();
-    let mut buffer = vec![0u8; NOISE_MAX_MESSAGE];
-    let len = handshake.write_message(&[], &mut buffer).unwrap();
-    to_gateway.send(buffer[..len].to_vec()).await.unwrap();
-    let reply = timeout(STEP, from_gateway.recv()).await.unwrap().unwrap();
-    handshake.read_message(&reply, &mut buffer).unwrap();
-    let mut transport = handshake.into_transport_mode().unwrap();
+    let (leg, to_gateway, mut from_gateway) = spawn_relay_chat_session(pairing.state.clone());
+    let mut transport = relay_handshake(pairing, &to_gateway, &mut from_gateway).await;
     let pong = wire::encode(&Frame::Pong).unwrap();
     for message in write_chunked(&mut transport, &pong).unwrap() {
         to_gateway.send(message).await.unwrap();
     }
     let leg_id = leg.id();
     until("the gateway installs the relay chat leg", || {
-        pairing
-            .state
-            .device_leg_registry
-            .get(&pairing.device_id)
-            .is_some_and(|live| live.id() == leg_id)
+        pairing.state.chat_legs.live_task(&pairing.device_id) == Some(leg_id)
     })
     .await;
     (leg, to_gateway)
@@ -1456,7 +1422,7 @@ async fn a_replayed_relay_handshake_never_displaces_the_live_carrier_chat_leg() 
         .await;
     let (msg1, confirmation) = pairing.observed_handshake().await;
 
-    let (replayed, to_gateway, mut from_gateway) = spawn_relay_chat_session(&pairing);
+    let (replayed, to_gateway, mut from_gateway) = spawn_relay_chat_session(pairing.state.clone());
     let replayed_id = replayed.id();
     to_gateway.send(msg1).await.unwrap();
     timeout(STEP, from_gateway.recv())
@@ -1467,9 +1433,9 @@ async fn a_replayed_relay_handshake_never_displaces_the_live_carrier_chat_leg() 
     assert!(
         pairing
             .state
-            .device_leg_registry
-            .get(&pairing.device_id)
-            .is_some_and(|live| live.id() != replayed_id),
+            .chat_legs
+            .live_task(&pairing.device_id)
+            .is_some_and(|live| live != replayed_id),
         "the replay displaced the live carrier chat leg"
     );
     to_gateway.send(confirmation).await.unwrap();
@@ -1486,6 +1452,86 @@ async fn a_replayed_relay_handshake_never_displaces_the_live_carrier_chat_leg() 
         "the carrier chat leg still serves"
     );
     runtime.stop().await;
+}
+
+/// Runs P's half of a relay chat leg's Noise IK handshake over the leg's
+/// in-memory halves and returns P's transport state, without sending any
+/// transport message.
+async fn relay_handshake(
+    pairing: &Pairing,
+    to_gateway: &mpsc::Sender<Vec<u8>>,
+    from_gateway: &mut mpsc::Receiver<Vec<u8>>,
+) -> snow::TransportState {
+    let mut handshake = pairing
+        .device
+        .ik_initiator(&pairing.gateway_public)
+        .unwrap();
+    let mut buffer = vec![0u8; NOISE_MAX_MESSAGE];
+    let len = handshake.write_message(&[], &mut buffer).unwrap();
+    to_gateway.send(buffer[..len].to_vec()).await.unwrap();
+    let reply = timeout(STEP, from_gateway.recv()).await.unwrap().unwrap();
+    handshake.read_message(&reply, &mut buffer).unwrap();
+    handshake.into_transport_mode().unwrap()
+}
+
+/// C holds back a genuine relay chat leg's first transport message and
+/// releases it after P has moved its chat onto a carrier. The relay leg was
+/// opened first, so it never installs over the carrier chat leg and closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_back_relay_chat_leg_never_displaces_a_later_carrier_chat_leg() {
+    let pairing = Pairing::new().await;
+    let mut runtime = pairing.runtime(&loopback()).await;
+    let phone = Phone::bind(socket(LOOPBACK));
+    let (answer, _, _) = pairing.answered(&mut runtime, vec![phone.address()], None);
+    let connection = phone
+        .connect(answer.quic_cert_sha256, udp_address(&runtime))
+        .await;
+
+    let (held, to_gateway, mut from_gateway) = spawn_relay_chat_session(pairing.state.clone());
+    let mut transport = relay_handshake(&pairing, &to_gateway, &mut from_gateway).await;
+    let mut carrier_chat = pairing
+        .session(&connection, &answer.token, LegClass::Chat)
+        .await;
+    until("the carrier chat leg is live", || {
+        pairing
+            .state
+            .chat_legs
+            .live_task(&pairing.device_id)
+            .is_some()
+    })
+    .await;
+
+    let pong = wire::encode(&Frame::Pong).unwrap();
+    for message in write_chunked(&mut transport, &pong).unwrap() {
+        to_gateway.send(message).await.unwrap();
+    }
+    timeout(STEP, held)
+        .await
+        .expect("the held-back relay leg closes")
+        .expect("it ends on its own, not by abort");
+
+    let ping = wire::encode(&Frame::Ping).unwrap();
+    carrier_chat.send_plaintext(&ping).await;
+    assert_eq!(
+        wire::decode(&carrier_chat.recv_plaintext().await).unwrap(),
+        Frame::Pong,
+        "the carrier chat leg is still the live one"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_chat_leg_silent_past_its_deadline_closes_uninstalled() {
+    let pairing = Pairing::new().await;
+    let mut state = pairing.state.clone();
+    state.chat_legs = Arc::new(ChatLegs::new(SHORT_DEADLINE));
+    let (silent, to_gateway, mut from_gateway) = spawn_relay_chat_session(state.clone());
+    let _transport = relay_handshake(&pairing, &to_gateway, &mut from_gateway).await;
+    timeout(STEP, silent)
+        .await
+        .expect("a leg with no transport message closes at its deadline")
+        .expect("it ends on its own, not by abort");
+    assert_eq!(state.chat_legs.live_task(&pairing.device_id), None);
 }
 
 type ListedLeg = (LegClass, Option<CarrierKind>);
@@ -1559,6 +1605,19 @@ async fn the_link_table_lists_each_carrier_leg_by_kind_and_each_offers_outcome()
         ControlReport::DirectDeclined { punch_id: replayed }
     );
     assert_eq!(listed(&pairing).1, Some(Err(Decline::Replayed)));
+
+    let (mut garbage, _) = pairing.offer(Vec::new());
+    garbage.enc = garbage.enc.chars().rev().collect();
+    let refused = PunchId::generate();
+    assert_eq!(
+        runtime.handle_offer(refused, garbage, None),
+        ControlReport::DirectDeclined { punch_id: refused }
+    );
+    assert_eq!(
+        listed(&pairing).1,
+        Some(Err(Decline::Replayed)),
+        "an offer that does not open leaves the device's last offer alone"
+    );
 
     drop((quic_chat, quic_api));
     until("ended legs leave the table", || {

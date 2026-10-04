@@ -465,13 +465,17 @@ message and reassembled by `FrameReassembler`.
 
 Chat leg deduplication happens only on A. C cannot deduplicate by `device_id`
 because it never sees the Noise plaintext or the authenticated device identity.
-A installs a new chat leg in `WsChannelState.device_leg_registry` only once IK
-has succeeded, the `device_id` is known and the leg has proven live: a relay
-chat leg when its first transport message from P decrypts, a direct-carrier chat
-leg when P's handshake confirmation does. The new leg aborts the stale
-predecessor. C sees every relay leg's msg1 and could replay it, but only the
-initiator that wrote it can produce a transport message after it, so a replay
-never displaces the live chat leg.
+A installs a new chat leg in `WsChannelState.chat_legs` only once IK has
+succeeded, the `device_id` is known and the leg has proven live: a relay chat
+leg when its first transport message from P decrypts, within
+`FIRST_TRANSPORT_MESSAGE_DEADLINE`, a direct-carrier chat leg when P's handshake
+confirmation does. A stamps each chat leg with a sequence when it opens it, and
+a leg installs only over one opened before it, aborting it; a leg opened before
+the live one closes instead. C sees every relay leg's msg1 and could replay it,
+but only the initiator that wrote it can produce a transport message after it,
+so a replay never installs; and a genuine relay leg whose first message C holds
+back was opened before any leg P moved its chat to, so its late release only
+closes it.
 
 ## Direct Carriers
 
@@ -493,11 +497,13 @@ C's role is signalling only:
 1. P posts a candidate offer, sealed under a key derived from the pairing
    statics, to `POST /direct/{relay_node_id}`, admitted like the relay routes.
 2. C forwards it over A's control connection as `ControlSignal::DirectOffer`,
-   with a per-punch rendezvous ticket when it runs a UDP rendezvous, and returns
+   with a per-punch, per-role rendezvous key when it runs a UDP rendezvous, and returns
    A's sealed `DirectAnswer` (or an opaque `404` when A declines) as the POST's
    response.
 3. When a rendezvous applies, both sides register from the UDP socket their QUIC
    uses, and C tells each the IPv4 mapping it observed for the other (`Peer`).
+   Each `Register` and each reply carries a tag under that role's key, which C
+   delivered only over TLS.
 
 Every carrier session then opens with a `DirectOpen` preface (a per-runtime token
 from the sealed answer) and runs the same Noise IK handshake as a relay leg, which
@@ -1052,8 +1058,9 @@ offer.
   ids, call the push routes for another device id, or race public
   rendezvous joins.
 - With direct carriers: an on-path LAN attacker between P and A, network
-  observers on the direct path, and C forging, replaying or withholding
-  candidate advertisements and `Peer` messages.
+  observers on the direct path, an on-path observer between a side and C's UDP
+  rendezvous, and C forging, replaying or withholding candidate advertisements
+  and `Peer` messages.
 
 ### Out of scope
 
@@ -1082,7 +1089,8 @@ offer.
 - Replay a relay leg's Noise msg1, which carries no replay protection. A answers
   with msg2, lists the leg for the device and bumps its `last_seen` until C
   closes it, but the session never decrypts anything and never displaces the
-  device's live chat leg (see the chat leg deduplication above).
+  device's live chat leg (see the chat leg deduplication above). Holding back a
+  genuine relay chat leg's first transport message does not displace it either.
 - Store, drop, or prune provider tokens in its push token store.
 - Send the honest generic placeholder notification.
 - If malicious and holding `.p8`, send arbitrary ordinary APNs alerts outside the
@@ -1137,9 +1145,12 @@ With direct carriers, C also cannot:
   candidates either side has.
 - Tamper with candidate sets. It cannot inject, alter or drop an individual host
   candidate: any tampering fails the AEAD, and the whole set is rejected.
-- Point either side at a private address. Both sides require the rendezvous and
-  `Peer` addresses to be `Public` IPv4, and private targets come only from
-  sealed, authenticated sets.
+- Point either side at a private address, or at one of its own interface
+  addresses. Both sides require the rendezvous and `Peer` addresses to be
+  `Public` IPv4 and none of their own, and private targets come only from
+  sealed, authenticated sets. A side behind a NAT does not know its own public
+  address, so C can still name it, and a hairpinning router then delivers the
+  side's `Register`s or inert punches to a port it forwards.
 - Admit any other source at A. An authenticated punch needs the punch key, so C
   cannot forge one. An observer on the P→A path can race a copy from its own
   address, which admits that address to the same pre-authentication surface, at
@@ -1154,6 +1165,12 @@ With direct carriers, C also cannot:
 - Mint an offer that A accepts: doing so needs P's static secret.
 - Read, modify or misroute content on a direct carrier, or impersonate either
   end (Claim 5).
+
+An on-path observer of the UDP rendezvous holds no rendezvous key, so it cannot
+forge a `Peer` or `Registered` to either side or a `Register` to C, and cannot
+spend a punch's datagram budget. It can still race a copy of a side's
+`Register` from its own address, which makes C latch that address as the side's
+mapping and costs that punch its punched-IPv4 tier.
 
 ## Operational Notes
 

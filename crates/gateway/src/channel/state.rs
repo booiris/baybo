@@ -7,6 +7,8 @@
 //! frames onto the router's incoming mpsc.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use baybo_agent::SessionManager;
 use baybo_channels::{ChannelRegistry, RouterInbound};
@@ -27,6 +29,7 @@ use crate::relay::dial::RelayDialer;
 use crate::server::GatewayDeps;
 use baybo_channels::InboundDedup;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 /// State bundle used only by the relay API tunnel's in-process HTTP forwarder.
 #[derive(Clone)]
@@ -96,7 +99,7 @@ pub struct WsChannelState {
     /// **chat** content leg dedups; blob legs run concurrently (one per transfer,
     /// bounded by the relay's per-key connection cap), so they are not registered
     /// here.
-    pub device_leg_registry: Arc<DashMap<String, tokio::task::AbortHandle>>,
+    pub(crate) chat_legs: Arc<ChatLegs>,
     /// The link table: each device's live legs and last direct offer. The
     /// relay legs and the carrier runtime write it; every state built from
     /// the same [`GatewayDeps`] shares one table.
@@ -154,7 +157,7 @@ impl WsChannelState {
             bot_reconciler: Arc::clone(&deps.bot_reconciler),
             pairing,
             device_store: deps.stores.device.clone(),
-            device_leg_registry: Arc::new(DashMap::new()),
+            chat_legs: Arc::new(ChatLegs::new(FIRST_TRANSPORT_MESSAGE_DEADLINE)),
             device_links: deps.device_links.clone(),
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
@@ -170,29 +173,96 @@ impl WsChannelState {
     }
 }
 
-/// A chat leg's handle into the [`WsChannelState::device_leg_registry`]. The
-/// relay-content manager builds one from a relay leg's own `AbortHandle`, and
-/// the carrier runtime from a carrier chat session's; the content session
-/// calls [`install`](Self::install) once Noise has resolved the `device_id`
-/// and proven the initiator live (its handshake confirmation on a carrier,
-/// its first decrypted transport message on the relay), registering this leg
-/// as the device's live one and aborting any stale predecessor, on whichever
-/// carrier it runs. A does not rank carriers: the
-/// phone decides which chat leg is current, and the last to install wins. The
-/// device-blind relay can't dedup, so the gateway must.
+/// How long a relay chat leg may wait for P's first transport message before
+/// it is closed uninstalled. P's `Subscribe` is immediate; at the latest it
+/// answers A's first keepalive `Ping`, sent one interval after the leg starts.
+pub(crate) const FIRST_TRANSPORT_MESSAGE_DEADLINE: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    FIRST_TRANSPORT_MESSAGE_DEADLINE.as_millis()
+        > super::adapter::KEEPALIVE_PING_INTERVAL.as_millis()
+);
+
+/// Every device's live chat leg. A stamps each chat leg with a sequence when it
+/// opens it, relay or carrier, and a leg installs only over one opened before
+/// it: a leg C held back can never displace a leg opened after it.
+pub(crate) struct ChatLegs {
+    live: DashMap<String, LiveChatLeg>,
+    next_sequence: AtomicU64,
+    first_message_deadline: Duration,
+}
+
+struct LiveChatLeg {
+    sequence: u64,
+    abort: tokio::task::AbortHandle,
+}
+
+impl ChatLegs {
+    pub(crate) fn new(first_message_deadline: Duration) -> Self {
+        Self {
+            live: DashMap::new(),
+            next_sequence: AtomicU64::new(0),
+            first_message_deadline,
+        }
+    }
+
+    /// A chat leg A has just opened, identified by its task's `abort` handle.
+    pub(crate) fn opened(self: &Arc<Self>, abort: tokio::task::AbortHandle) -> LegDedup {
+        LegDedup {
+            legs: Arc::clone(self),
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            abort,
+        }
+    }
+
+    /// How long a relay chat leg waits for P's first transport message.
+    pub(crate) fn first_message_deadline(&self) -> Duration {
+        self.first_message_deadline
+    }
+    /// The task of `device_id`'s live chat leg.
+    #[cfg(test)]
+    pub(crate) fn live_task(&self, device_id: &str) -> Option<tokio::task::Id> {
+        self.live.get(device_id).map(|live| live.abort.id())
+    }
+}
+
+/// A chat leg's handle into [`ChatLegs`]. The relay-content manager takes one
+/// for a relay leg, and the carrier runtime for a carrier chat session; the
+/// content session calls [`install`](Self::install) once Noise has resolved
+/// the `device_id` and proven the initiator live (its handshake confirmation
+/// on a carrier, its first decrypted transport message on the relay). A does
+/// not rank carriers: the phone decides which chat leg is current, and the
+/// leg it opened last wins. The device-blind relay can't dedup, so the
+/// gateway must.
 pub(crate) struct LegDedup {
-    pub(crate) registry: Arc<DashMap<String, tokio::task::AbortHandle>>,
-    pub(crate) abort: tokio::task::AbortHandle,
+    legs: Arc<ChatLegs>,
+    sequence: u64,
+    abort: tokio::task::AbortHandle,
 }
 
 impl LegDedup {
-    /// Install this leg as the live one for `device_id`, aborting the stale leg it
-    /// displaces (if any). `DashMap::insert` is atomic per key, so two legs racing
-    /// for the same `device_id` leave exactly one survivor — the last to install.
-    pub(crate) fn install(self, device_id: &str) {
-        if let Some(stale) = self.registry.insert(device_id.to_string(), self.abort) {
-            stale.abort();
+    /// Installs this leg as the live one for `device_id` and aborts the leg it
+    /// displaces, unless the live leg was opened after this one: then nothing
+    /// changes and this leg must close. Returns whether it installed. The
+    /// entry is locked across the check, so two legs racing for one device
+    /// leave the later-opened one live.
+    pub(crate) fn install(self, device_id: &str) -> bool {
+        let leg = LiveChatLeg {
+            sequence: self.sequence,
+            abort: self.abort,
+        };
+        match self.legs.live.entry(device_id.to_owned()) {
+            Entry::Occupied(mut live) => {
+                if live.get().sequence > leg.sequence {
+                    return false;
+                }
+                live.insert(leg).abort.abort();
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(leg);
+            }
         }
+        true
     }
 }
 
@@ -200,25 +270,21 @@ impl LegDedup {
 mod tests {
     use super::*;
 
-    /// A second leg for the same `device_id` displaces and aborts the first; the
-    /// survivor is the last to install (the relay-content dedup invariant).
+    fn legs() -> Arc<ChatLegs> {
+        Arc::new(ChatLegs::new(FIRST_TRANSPORT_MESSAGE_DEADLINE))
+    }
+
+    /// A later-opened leg for the same `device_id` displaces and aborts the
+    /// earlier one.
     #[tokio::test]
     async fn dedup_aborts_the_displaced_leg_for_a_device() {
-        let registry: Arc<DashMap<String, tokio::task::AbortHandle>> = Arc::new(DashMap::new());
+        let legs = legs();
         let first = tokio::spawn(std::future::pending::<()>());
         let second = tokio::spawn(std::future::pending::<()>());
         let second_handle = second.abort_handle();
 
-        LegDedup {
-            registry: Arc::clone(&registry),
-            abort: first.abort_handle(),
-        }
-        .install("dev-1");
-        LegDedup {
-            registry: Arc::clone(&registry),
-            abort: second.abort_handle(),
-        }
-        .install("dev-1");
+        assert!(legs.opened(first.abort_handle()).install("dev-1"));
+        assert!(legs.opened(second.abort_handle()).install("dev-1"));
 
         assert!(
             first.await.unwrap_err().is_cancelled(),
@@ -231,25 +297,38 @@ mod tests {
         second.abort();
     }
 
+    /// A leg opened before the live one installs late, as a leg whose first
+    /// message C held back would: it is refused and the live leg survives.
+    #[tokio::test]
+    async fn a_leg_opened_earlier_never_displaces_one_opened_later() {
+        let legs = legs();
+        let held = tokio::spawn(std::future::pending::<()>());
+        let live = tokio::spawn(std::future::pending::<()>());
+        let live_handle = live.abort_handle();
+        let held_dedup = legs.opened(held.abort_handle());
+        assert!(legs.opened(live.abort_handle()).install("dev-1"));
+
+        assert!(
+            !held_dedup.install("dev-1"),
+            "the earlier-opened leg is refused"
+        );
+        assert!(!live_handle.is_finished(), "the live leg is untouched");
+        live.abort();
+        held.abort();
+    }
+
     /// Legs for different devices are independent — installing one never aborts
     /// the other.
     #[tokio::test]
     async fn dedup_is_per_device() {
-        let registry: Arc<DashMap<String, tokio::task::AbortHandle>> = Arc::new(DashMap::new());
+        let legs = legs();
         let a = tokio::spawn(std::future::pending::<()>());
         let b = tokio::spawn(std::future::pending::<()>());
         let (a_handle, b_handle) = (a.abort_handle(), b.abort_handle());
 
-        LegDedup {
-            registry: Arc::clone(&registry),
-            abort: a.abort_handle(),
-        }
-        .install("dev-1");
-        LegDedup {
-            registry: Arc::clone(&registry),
-            abort: b.abort_handle(),
-        }
-        .install("dev-2");
+        let a_dedup = legs.opened(a.abort_handle());
+        assert!(legs.opened(b.abort_handle()).install("dev-2"));
+        assert!(a_dedup.install("dev-1"));
 
         assert!(!a_handle.is_finished(), "dev-1 leg untouched");
         assert!(!b_handle.is_finished(), "dev-2 leg untouched");

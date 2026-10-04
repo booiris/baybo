@@ -2,7 +2,9 @@ use std::future::poll_fn;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::time::Duration;
 
-use remote_host_protocol::relay::{PROBE_DATAGRAM_MAGIC, PUNCH_TAG_LEN, PunchId, PunchTag};
+use remote_host_protocol::relay::{
+    PROBE_DATAGRAM_MAGIC, PUNCH_TAG_LEN, PunchId, PunchTag, RENDEZVOUS_KEY_LEN, RendezvousKey,
+};
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout};
 
@@ -21,11 +23,17 @@ const FOREIGN_VERSION: u32 = 0x1a2a_3a4a;
 const DCID_LEN: u8 = 8;
 const RECV_BUFFER_LEN: usize = 128;
 
+fn key() -> RendezvousKey {
+    RendezvousKey::from_bytes([7; RENDEZVOUS_KEY_LEN])
+}
+
 fn peer(punch_id: PunchId) -> ProbeDatagram {
-    ProbeDatagram::Peer {
-        punch_id,
-        srflx: SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 40_000),
-    }
+    key()
+        .peer(
+            punch_id,
+            SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 40_000),
+        )
+        .unwrap()
 }
 
 fn punch(seq: u16) -> ProbeDatagram {
@@ -73,7 +81,7 @@ fn datagrams(delivered: &[ReceivedProbe]) -> Vec<ProbeDatagram> {
 #[test]
 fn a_gro_buffer_of_peer_and_registered_yields_both_datagrams() {
     let punch_id = PunchId::generate();
-    let registered = ProbeDatagram::Registered { punch_id };
+    let registered = key().registered(punch_id).unwrap();
     let stride = peer(punch_id).encode().len();
     let mut storage = [peer(punch_id).encode(), registered.encode()].concat();
     let len = storage.len();

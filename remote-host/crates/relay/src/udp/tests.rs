@@ -1,7 +1,7 @@
 use std::net::{Ipv6Addr, SocketAddrV6};
 
 use remote_host_protocol::relay::{
-    ControlReport, DIRECT_PROTOCOL_VERSION, DirectCapability, PunchId, PunchRole, RendezvousTicket,
+    ControlReport, DIRECT_PROTOCOL_VERSION, DirectCapability, PunchId, PunchRole, RendezvousKey,
     SealedCandidates,
 };
 use tokio::sync::mpsc;
@@ -78,15 +78,15 @@ impl Harness {
     }
 }
 
-struct Tickets {
+struct Keys {
     punch_id: PunchId,
-    gateway: RendezvousTicket,
-    device: RendezvousTicket,
+    gateway: RendezvousKey,
+    device: RendezvousKey,
 }
 
 /// Registers a capable gateway, forwards one offer and answers it, as the
 /// control connection and the POST would.
-async fn answered_punch(control: &ControlRegistry, node: &str) -> Tickets {
+async fn answered_punch(control: &ControlRegistry, node: &str) -> Keys {
     let (mut rx, token) = control
         .register(
             node,
@@ -132,20 +132,15 @@ async fn answered_punch(control: &ControlRegistry, node: &str) -> Tickets {
     let OfferOutcome::Answered(response) = pending.outcome().await else {
         panic!("expected an answer");
     };
-    Tickets {
+    Keys {
         punch_id,
-        gateway: register.ticket,
-        device: response.rendezvous.expect("device rendezvous").ticket,
+        gateway: register.key,
+        device: response.rendezvous.expect("device rendezvous").key,
     }
 }
 
-fn register(punch_id: PunchId, role: PunchRole, ticket: &RendezvousTicket) -> Vec<u8> {
-    ProbeDatagram::Register {
-        punch_id,
-        role,
-        ticket: ticket.clone(),
-    }
-    .encode()
+fn register(punch_id: PunchId, role: PunchRole, key: &RendezvousKey) -> Vec<u8> {
+    key.register(punch_id, role).unwrap().encode()
 }
 
 fn v4(octets: [u8; 4], port: u16) -> SocketAddr {
@@ -160,7 +155,7 @@ async fn a_punch_hands_each_role_the_others_mapping_over_real_sockets() {
     let server_addr = server.local_addr().unwrap();
     let address = RendezvousAddress::parse(&server_addr.to_string()).unwrap();
     let control = Arc::new(ControlRegistry::new().with_udp_rendezvous(address));
-    let tickets = answered_punch(&control, NODE).await;
+    let keys = answered_punch(&control, NODE).await;
     tokio::spawn(server.serve(Arc::clone(&control)));
 
     let gateway = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -175,14 +170,14 @@ async fn a_punch_hands_each_role_the_others_mapping_over_real_sockets() {
         );
         ProbeDatagram::decode(&buffer[..len]).unwrap()
     };
-    let punch_id = tickets.punch_id;
+    let punch_id = keys.punch_id;
     assert_eq!(
         exchange(
             &gateway,
-            register(punch_id, PunchRole::Gateway, &tickets.gateway)
+            register(punch_id, PunchRole::Gateway, &keys.gateway)
         )
         .await,
-        ProbeDatagram::Registered { punch_id }
+        keys.gateway.registered(punch_id).unwrap()
     );
     let SocketAddr::V4(gateway_mapping) = gateway.local_addr().unwrap() else {
         panic!("IPv4 socket");
@@ -191,34 +186,24 @@ async fn a_punch_hands_each_role_the_others_mapping_over_real_sockets() {
         panic!("IPv4 socket");
     };
     assert_eq!(
-        exchange(
-            &device,
-            register(punch_id, PunchRole::Device, &tickets.device)
-        )
-        .await,
-        ProbeDatagram::Peer {
-            punch_id,
-            srflx: gateway_mapping,
-        }
+        exchange(&device, register(punch_id, PunchRole::Device, &keys.device)).await,
+        keys.device.peer(punch_id, gateway_mapping).unwrap()
     );
     assert_eq!(
         exchange(
             &gateway,
-            register(punch_id, PunchRole::Gateway, &tickets.gateway)
+            register(punch_id, PunchRole::Gateway, &keys.gateway)
         )
         .await,
-        ProbeDatagram::Peer {
-            punch_id,
-            srflx: device_mapping,
-        }
+        keys.gateway.peer(punch_id, device_mapping).unwrap()
     );
 }
 
 #[tokio::test]
 async fn sources_the_rendezvous_cannot_observe_are_ignored() {
     let mut harness = Harness::start();
-    let tickets = answered_punch(&harness.control, NODE).await;
-    let gateway = register(tickets.punch_id, PunchRole::Gateway, &tickets.gateway);
+    let keys = answered_punch(&harness.control, NODE).await;
+    let gateway = register(keys.punch_id, PunchRole::Gateway, &keys.gateway);
 
     harness.receive(
         gateway.clone(),
@@ -240,25 +225,22 @@ async fn sources_the_rendezvous_cannot_observe_are_ignored() {
     harness.receive(gateway, mapped);
     assert_eq!(
         harness.next_reply().await,
-        (
-            ProbeDatagram::Registered {
-                punch_id: tickets.punch_id
-            },
-            mapped
-        ),
+        (keys.gateway.registered(keys.punch_id).unwrap(), mapped),
         "only the v4-mapped source is answered, at the address it came from"
     );
 
     harness.receive(
-        register(tickets.punch_id, PunchRole::Device, &tickets.device),
+        register(keys.punch_id, PunchRole::Device, &keys.device),
         v4([127, 0, 0, 2], 5000),
     );
     assert_eq!(
         harness.next_reply().await.0,
-        ProbeDatagram::Peer {
-            punch_id: tickets.punch_id,
-            srflx: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 4000),
-        },
+        keys.device
+            .peer(
+                keys.punch_id,
+                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 4000)
+            )
+            .unwrap(),
         "the latched mapping is the canonical IPv4 address"
     );
 }
@@ -266,36 +248,36 @@ async fn sources_the_rendezvous_cannot_observe_are_ignored() {
 #[tokio::test]
 async fn unknown_punches_and_malformed_datagrams_get_no_reply() {
     let mut harness = Harness::start();
-    let tickets = answered_punch(&harness.control, NODE).await;
+    let keys = answered_punch(&harness.control, NODE).await;
     let source = v4([127, 0, 0, 1], 4000);
 
     harness.receive(
-        register(PunchId::generate(), PunchRole::Gateway, &tickets.gateway),
+        register(PunchId::generate(), PunchRole::Gateway, &keys.gateway),
         source,
     );
-    let mut oversized = register(tickets.punch_id, PunchRole::Gateway, &tickets.gateway);
+    let mut oversized = register(keys.punch_id, PunchRole::Gateway, &keys.gateway);
     oversized.push(0);
     harness.receive(oversized, source);
     harness.receive(b"GET / HTTP/1.1\r\n".to_vec(), source);
     harness.receive(
-        ProbeDatagram::Registered {
-            punch_id: tickets.punch_id,
-        }
-        .encode(),
+        keys.gateway.registered(keys.punch_id).unwrap().encode(),
         source,
     );
     harness.receive(
-        register(tickets.punch_id, PunchRole::Gateway, &tickets.gateway),
+        register(
+            keys.punch_id,
+            PunchRole::Gateway,
+            &RendezvousKey::generate(),
+        ),
+        source,
+    );
+    harness.receive(
+        register(keys.punch_id, PunchRole::Gateway, &keys.gateway),
         source,
     );
     assert_eq!(
         harness.next_reply().await,
-        (
-            ProbeDatagram::Registered {
-                punch_id: tickets.punch_id
-            },
-            source
-        ),
+        (keys.gateway.registered(keys.punch_id).unwrap(), source),
         "the first reply answers the only valid Register"
     );
 }
@@ -303,29 +285,26 @@ async fn unknown_punches_and_malformed_datagrams_get_no_reply() {
 #[tokio::test]
 async fn per_punch_the_rendezvous_emits_no_more_than_it_receives() {
     let mut harness = Harness::start();
-    let tickets = answered_punch(&harness.control, NODE).await;
+    let keys = answered_punch(&harness.control, NODE).await;
     let sentinel = answered_punch(&harness.control, "node-2").await;
     let gateway = v4([127, 0, 0, 1], 4000);
     let device = v4([127, 0, 0, 2], 5000);
-    let wrong = RendezvousTicket::generate();
+    let wrong = RendezvousKey::generate();
 
     let mut script = Vec::new();
     for round in 0..MAX_DATAGRAMS_PER_PUNCH {
         script.push((
-            register(tickets.punch_id, PunchRole::Gateway, &tickets.gateway),
+            register(keys.punch_id, PunchRole::Gateway, &keys.gateway),
             gateway,
         ));
+        script.push((register(keys.punch_id, PunchRole::Gateway, &wrong), gateway));
         script.push((
-            register(tickets.punch_id, PunchRole::Gateway, &wrong),
-            gateway,
-        ));
-        script.push((
-            register(tickets.punch_id, PunchRole::Gateway, &tickets.gateway),
+            register(keys.punch_id, PunchRole::Gateway, &keys.gateway),
             v4([127, 0, 0, 1], 4001),
         ));
         if round % 2 == 0 {
             script.push((
-                register(tickets.punch_id, PunchRole::Device, &tickets.device),
+                register(keys.punch_id, PunchRole::Device, &keys.device),
                 device,
             ));
         }
@@ -368,7 +347,7 @@ async fn per_punch_the_rendezvous_emits_no_more_than_it_receives() {
 #[tokio::test(start_paused = true)]
 async fn receive_errors_back_off_and_a_datagram_clears_the_streak() {
     let mut harness = Harness::start();
-    let tickets = answered_punch(&harness.control, NODE).await;
+    let keys = answered_punch(&harness.control, NODE).await;
     let source = v4([127, 0, 0, 1], 4000);
     let started = Instant::now();
     for _ in 0..3 {
@@ -378,7 +357,7 @@ async fn receive_errors_back_off_and_a_datagram_clears_the_streak() {
             .unwrap();
     }
     harness.receive(
-        register(tickets.punch_id, PunchRole::Gateway, &tickets.gateway),
+        register(keys.punch_id, PunchRole::Gateway, &keys.gateway),
         source,
     );
     harness.next_reply().await;
@@ -391,7 +370,7 @@ async fn receive_errors_back_off_and_a_datagram_clears_the_streak() {
         .send(Err(io::Error::other("receive failed")))
         .unwrap();
     harness.receive(
-        register(tickets.punch_id, PunchRole::Gateway, &tickets.gateway),
+        register(keys.punch_id, PunchRole::Gateway, &keys.gateway),
         source,
     );
     harness.next_reply().await;

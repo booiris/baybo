@@ -2,9 +2,9 @@
 //! so that C can tell each the IPv4 mapping it observed for the other.
 //!
 //! It is IPv4 by design, because its job is to observe IPv4 NAT mappings.
-//! C answers a `Register` only for a live punch, with the role's ticket, from
-//! the role's latched source, and replies once, to the sender only, with a
-//! datagram shorter than the request. Anything else is dropped silently, so the
+//! C answers a `Register` only for a live punch, tagged under the role's key,
+//! from the role's latched source, and replies once, to the sender only, with
+//! a datagram shorter than the request and tagged under the same key. Anything else is dropped silently, so the
 //! socket offers no oracle and cannot reflect or amplify.
 
 use std::future::Future;
@@ -187,12 +187,8 @@ fn reply_to(
     policy: &AddressPolicy,
     warnings: &mut SourceWarnings,
 ) -> Option<Vec<u8>> {
-    let Ok(ProbeDatagram::Register {
-        punch_id,
-        role,
-        ticket,
-    }) = ProbeDatagram::decode(datagram)
-    else {
+    let register = ProbeDatagram::decode(datagram).ok()?;
+    let ProbeDatagram::Register { punch_id, role, .. } = register else {
         return None;
     };
     let SocketAddr::V4(observed) = AddressPolicy::canonical_socket_addr(source) else {
@@ -203,7 +199,7 @@ fn reply_to(
         warnings.note(SourceRejection::NotPublic, source);
         return None;
     }
-    let reply = punches.register_datagram(punch_id, role, &ticket, observed);
+    let reply = punches.register_datagram(&register, observed);
     tracing::debug!(
         punch = %punch_id.tag(),
         ?role,

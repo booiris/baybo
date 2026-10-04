@@ -123,12 +123,12 @@ fn is_ldh_hostname(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::RendezvousTicket;
+    use crate::relay::{RENDEZVOUS_KEY_LEN, RendezvousKey};
 
     fn rendezvous(address: &str) -> UdpRendezvous {
         UdpRendezvous {
             address: address.to_owned(),
-            ticket: RendezvousTicket::from_bytes([1; 16]),
+            key: RendezvousKey::from_bytes([1; RENDEZVOUS_KEY_LEN]),
         }
     }
 

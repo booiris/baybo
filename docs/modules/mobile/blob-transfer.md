@@ -284,7 +284,7 @@ in-band, whose shared FIFO and shared Noise stream force one).
 Blob legs run **concurrently — one dedicated leg per transfer — and are NOT deduped.**
 (An earlier revision deduped them by `device_id` to a single warm leg per device, but that
 made two concurrent transfers for the same device abort each other; the dedup was dropped.)
-Only the **chat** content leg dedups (`device_leg_registry` + `LegDedup` — a fresh chat leg
+Only the **chat** content leg dedups (`ChatLegs` + `LegDedup` — a chat leg opened later
 aborts a stale predecessor). Concurrent blob transfers are bounded instead by the relay's
 per-key connection cap.
 

@@ -361,7 +361,7 @@ async fn translator_loop(
 /// Each `Ping` also draws a client `Pong`; either frame resets the
 /// client's `lastFrameAt`. Comfortably under the client's liveness budget
 /// so a single dropped frame doesn't trip it.
-const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(20);
+pub(super) const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(20);
 
 async fn pump_loop<S: FrameSink>(mut sink: S, mut frame_rx: mpsc::Receiver<Frame>) {
     // First tick fires one interval out, not immediately, so a chatty
