@@ -325,10 +325,17 @@ final class ProjectCardUITests: BayboUITestCase {
         ).firstMatch
         XCTAssertTrue(body.waitForExistence(timeout: Self.webviewTimeout))
 
-        body.press(forDuration: 1.0)
+        // Held well past the moment WebKit starts selecting, the way a person
+        // holds until the word lights up. WebKit first tries a drag lift and
+        // makes its content view first responder, so the select-word gesture
+        // only begins 0.9-1.0s into the press on CI; a 1.0s press lifted before
+        // the select-word reply landed, which highlights the word but raises no
+        // edit menu. Don't re-press on failure: a second long press over an
+        // existing selection behaves differently and would mask an inert page.
+        body.press(forDuration: 2.0)
 
         XCTAssertTrue(
-            app.menuItems["Copy"].waitForExistence(timeout: 5)
+            app.menuItems["Copy"].waitForExistence(timeout: 8)
                 || app.buttons["Copy"].waitForExistence(timeout: 1),
             "a long press on the description raised no Copy — the page is still inert")
     }

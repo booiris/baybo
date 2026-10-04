@@ -60,10 +60,27 @@ final class RenameMenuUITests: BayboUITestCase {
     /// green-looking test that renamed a conversation to something nobody asked
     /// for. The dialog focuses the field itself and parks the caret at the end,
     /// so this needs no tap (one would move the caret into the middle).
-    private func replaceText(_ field: XCUIElement, with text: String) {
+    ///
+    /// Returns only once the field HOLDS `text`: on a loaded runner `typeText`
+    /// returns, and the app reports idle, while the keyboard is still draining
+    /// the queued deletes — a caller that tapped Save then would commit a
+    /// half-deleted title. An empty field reports its placeholder as its value.
+    private func replaceText(
+        _ field: XCUIElement, with text: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
         let existing = (field.value as? String) ?? ""
         field.typeText(
             String(repeating: XCUIKeyboardKey.delete.rawValue, count: existing.count) + text)
+        let expected = text.isEmpty ? (field.placeholderValue ?? "") : text
+        XCTAssertTrue(
+            settles(field, NSPredicate(format: "value == %@", expected)),
+            "the field never settled on \"\(text)\"", file: file, line: line)
+    }
+
+    private func settles(_ element: XCUIElement, _ predicate: NSPredicate) -> Bool {
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter().wait(for: [expectation], timeout: 3) == .completed
     }
 
     /// Main list → ☰ → Archived.
@@ -146,7 +163,10 @@ final class RenameMenuUITests: BayboUITestCase {
         let field = try editorField(app)
         replaceText(field, with: "")
 
-        XCTAssertFalse(
-            app.buttons[Self.save].isEnabled, "an empty title left the commit button live")
+        // A wait, not one read: `.disabled` follows the field through a SwiftUI
+        // state update and re-render, which can trail the field by a turn.
+        XCTAssertTrue(
+            settles(app.buttons[Self.save], NSPredicate(format: "isEnabled == false")),
+            "an empty title left the commit button live")
     }
 }
