@@ -314,7 +314,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "baybo"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-agent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-bench-memory"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "baybo-memory",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-bench-swe"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "baybo-process",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-bench-web"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-channels"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-config"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "baybo-model",
  "baybo-tools",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-context"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-cost"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-cron"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-gateway"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-integration-tests"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-janitor"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "baybo-model",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-llm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-memory"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-model"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "baybo-workspace",
  "chrono",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-pairing"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "baybo-model",
  "baybo-storage",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-process"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "parking_lot",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-query"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "baybo-cost",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-sandbox"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "baybo-process",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-search"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-security"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-session"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-setup"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "baybo-agent",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-skills"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "baybo-model",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-skills-assessor"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "baybo-llm",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-storage"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-subagent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "baybo-model",
@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-task"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "baybo-model",
@@ -1195,14 +1195,14 @@ dependencies = [
 
 [[package]]
 name = "baybo-term-harness"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "baybo-tools"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-trace"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-turn"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "baybo-workspace"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "device-proto"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -7096,7 +7096,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "baybo-model",
  "chrono",
