@@ -332,6 +332,11 @@ without touching `app/ios` at all.
   screenshot headlessly; add **`-baybo-home-tab <agents|projects|chats|settings>`**
   to preselect a section.
 
+- **`-baybo-demo-hold-undo`** (with `-baybo-open-home`) keeps the archive undo
+  toast up for 60s instead of 3s, so a test that taps Undo is not racing the
+  clock — on CI one XCUITest tap has spent 2.3s before landing. Leave it off
+  any test that asserts the toast dismisses itself.
+
 - **`-baybo-appstore-data`** — add it to `-baybo-open-home` for the denser,
   English-only App Store chat-list fixture. It keeps the ordinary six-row UI-test
   seed unchanged and expands only the release screenshot launch to ten realistic

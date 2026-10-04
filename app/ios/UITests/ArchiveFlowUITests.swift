@@ -63,8 +63,13 @@ final class ArchiveFlowUITests: BayboUITestCase {
             row(app, 1).waitForExistence(timeout: 3), "back did not pop to the main list")
     }
 
+    /// `-baybo-demo-hold-undo` keeps the toast up instead of its 3s: no budget
+    /// inside the window is safe on CI, where one tap has been measured
+    /// spending 2.3s in XCUITest's pre-tap interruption check and landing on a
+    /// toast that had already gone. The auto-dismiss itself is
+    /// `testFullSwipeCommitsArchive`'s to prove, on the real clock.
     func testSwipeRevealsActionsAndUndoRestores() throws {
-        let app = launchHome()
+        let app = launch(["-baybo-open-home", "-baybo-demo-hold-undo"])
         let target = row(app, 6)
         XCTAssertTrue(target.waitForExistence(timeout: 5))
         reveal(target)
@@ -74,14 +79,10 @@ final class ArchiveFlowUITests: BayboUITestCase {
         XCTAssertTrue(app.buttons["Delete"].exists, "swipe revealed no Delete")
 
         archive.tap()
-        // Toast first: it lives only 3s, and row-nonexistence is a stable state
-        // that can wait; querying it first would eat the toast's whole window.
         let undo = app.buttons["Undo"]
-        XCTAssertTrue(undo.waitForExistence(timeout: 2), "no undo toast after archive")
-        // Instant single-snapshot check: the optimistic flip has already landed
-        // by the time the toast is up, and a wait here would push the undo tap
-        // past the toast's 3s window.
-        XCTAssertFalse(target.exists, "archived row stayed in the list")
+        XCTAssertTrue(undo.waitForExistence(timeout: 3), "no undo toast after archive")
+        XCTAssertTrue(
+            target.waitForNonExistence(timeout: 3), "archived row stayed in the list")
         undo.tap()
         XCTAssertTrue(target.waitForExistence(timeout: 3), "undo did not restore the row")
         XCTAssertTrue(
