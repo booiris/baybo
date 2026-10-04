@@ -50,7 +50,17 @@ struct ChatListScreen: View {
     /// Top-overscroll (points) that, once released past it, fires a refresh.
     private static let pullThreshold: CGFloat = 72
     /// How long the undo toast lingers after an archive.
-    private static let undoWindow: Duration = .seconds(3)
+    private static var undoWindow: Duration {
+        #if DEBUG
+            // A UI test that taps 撤销 cannot race a 3s clock: on a loaded CI
+            // runner one XCUITest tap spent 2.3s in its pre-tap interruption
+            // check (a SpringBoard query) and landed after the toast was gone.
+            if ProcessInfo.processInfo.arguments.contains("-baybo-demo-hold-undo") {
+                return .seconds(60)
+            }
+        #endif
+        return .seconds(3)
+    }
     /// Ground for a pinned row — a touch deeper than paper so the pinned block
     /// stands apart. Drawn INSIDE the row content (not `.listRowBackground`) so a
     /// pin flip never swaps the cell's background configuration — that swap is
