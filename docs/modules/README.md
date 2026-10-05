@@ -1,5 +1,8 @@
 # Baybo Module Documentation Index
 
+For client guides, testing, operations and planned work, see the
+[documentation index](../README.md).
+
 Each document covers: module responsibilities, design decisions, key constraints, and collaboration with other modules.
 
 ## Reading Order

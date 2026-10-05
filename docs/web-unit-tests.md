@@ -244,11 +244,11 @@ Two implementation notes for whoever picks up the remaining layers:
   `sendMessage` method — mock `../api/chatWs` to capture `onFrame`/`onStatus` and spy
   `sendMessage`, and the whole client flow drives with no backend. A Playwright layer
   instead points at a gateway launched with a stub/echo LLM (the `test-support` fakes
-  in [`../testing.md`](../testing.md)) so completions are instant and canned.
+  in [`../testing.md`](testing.md)) so completions are instant and canned.
 
 ## Related
 
-- [`../webui.md`](../webui.md) — dashboard build, OpenAPI codegen, design tokens.
-- [`../web-chat.md`](../web-chat.md) — what the chat UI does, i.e. what the tests assert.
-- [`../testing.md`](../testing.md) — the workspace (Rust) test conventions.
+- [`../webui.md`](webui.md) — dashboard build, OpenAPI codegen, design tokens.
+- [`../web-chat.md`](web-chat.md) — what the chat UI does, i.e. what the tests assert.
+- [`../testing.md`](testing.md) — the workspace (Rust) test conventions.
 - `app/web/vitest.config.ts` — the jsdom-as-import-sandbox config.
