@@ -126,6 +126,44 @@ an orphan, and the dial child carries a send-on-drop report so a panic inside
 `establish` (foreign dial code has panicked before) can never strand the
 supervisor in `Dialing` with held replies.
 
+## Rotating onto a direct carrier
+
+A relay binding's chat leg always dials the relay; it moves onto a direct
+carrier ([`direct-carriers.md`](../../../docs/modules/mobile/direct-carriers.md))
+only by **rotation**, a supervisor transition on a live leg. Answer deltas are
+never replayed, so a switch mid-turn would leave a hole in the answer: the
+supervisor starts one only when the leg is live on the relay, no session is
+`Subscribing`, the pump's active-turn set is empty, and nothing but keepalives
+crossed the leg for `CHAT_ROTATION_QUIET`. The pump is the active-turn set's
+only writer (`LegActivity`: `TurnState` adds and removes, every
+`SubscribeState` re-seeds), and it reports a turn starting as `TurnStarted`.
+
+The seam is `LegDialer`'s `rotation_events` / `can_rotate` / `rotate`; the
+direct leg has none. **`RotationGate` is the commit point**: the dial commits
+right before it writes the carrier stream's `DirectOpen`, and the supervisor
+may abandon the rotation (a turn started, an `Open` arrived, the carrier hub's
+generation ticked) only before that. Past it the gateway may already have
+retired the relay leg, so:
+
+- `Send` / `ResolveApproval` — and an `Open` past the commit point — are held
+  and replayed onto whichever leg is current when the rotation resolves;
+- the relay leg's death is held too: a success retires it silently, the way
+  `disconnect` does, and a failure runs the ordinary `leg_death`.
+
+A success installs the carrier pump and re-subscribes every session that rode
+the relay leg. A rotated leg is marked `on_carrier` and never rotates again;
+when its carrier dies, it dies like any leg and the reconnect goes over the
+relay.
+
+A foreground edge updates carrier state synchronously, then spawns its network
+re-proof; it cannot be queued behind a later background edge. The re-proof is
+fenced by its carrier id and lifecycle epoch.
+Backgrounding again makes the result stale even if the app has returned to the
+foreground by the time it arrives. Its API proof leg keeps the pool epoch from
+before the await, so it cannot repopulate a pool invalidated during the proof.
+An unsolicited carrier death schedules the next probe; the end of a stream
+dial cool-off wakes the supervisor to reconsider a deferred rotation.
+
 ## What stays OUTSIDE the supervisor (and when that changes)
 
 The api legs (`relay/api.rs` + `leg_pool.rs`, direct's plain HTTPS) and the
@@ -149,6 +187,12 @@ grow a parallel set of fences. The one real coupling today is capacity, not
 lifecycle: parked api-pool legs and chat reconnects share relay connection
 slots (see `MAX_POOLED_LEGS`).
 
+Api and blob legs dial a live direct carrier first (`dial_tunnel_leg`) and
+re-dial the relay at once when that fails; the carrier hub judges the carrier
+from the failure. Every carrier transition, up or down, invalidates the pool,
+so parked relay legs stop serving once a carrier is live and parked carrier
+legs die with their carrier.
+
 ## The Swift half
 
 `connState` has four states and few writers on purpose:
@@ -170,6 +214,22 @@ into an existing dial task, while `sendWhenReady` supersedes it (its message
 must ride the new dial behind its Subscribe); they also differ in notice
 clearing and `reconcileOutboxOnConnect(justSent:)`. Only the continuations are
 shared — do not merge the entries.
+
+**The direct carrier's Swift side** is three calls and one row (the policy is
+[`direct-carriers.md`](../../../docs/modules/mobile/direct-carriers.md)
+§ Connection policy on P). `PathMonitor` (`App/Core/PathMonitor.swift`), started
+once at launch and never stopped, hands every `NWPathMonitor` delivery to
+`networkChanged` on its own serial queue. The call is synchronous because a
+primary-interface change must retire the carrier and abort any probe before it
+returns. The `.background` barrier in `BayboApp` calls `carrierBackground()`
+right after `relayInvalidateApiLegs()`, on the same edge and for the same
+reason: nothing a later Task does may dial a leg on a carrier the suspend is
+about to strand. `didBecomeActive` fires `carrierForeground()` best-effort; it
+re-proves the suspended carrier or retires it, and a chat leg that died with it
+goes through `leg_death` like any relay corpse. Carrier state comes back
+through `CarrierEventsRelay` (`setCarrierSink`) into `ConnectionStore`, which
+only the Settings Connection row reads; the chat header still shows nothing but
+`legDown`.
 
 ## Testing
 

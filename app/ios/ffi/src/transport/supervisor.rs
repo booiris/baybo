@@ -10,14 +10,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 use crate::api::FrameSink;
 use crate::core::{WireApprovalDecision, WireAttachment};
 
-use super::pump::{PumpCtx, pump};
+use super::pump::{LegActivity, PumpCtx, pump};
 use super::{
-    Connection, LegDialer, OutboundMessage, RoutingMap, SharedDeckSink, SharedListSink,
-    SharedProjectSink, TransportError,
+    Connection, LegDialer, OutboundMessage, RotationGate, RoutingMap, SharedDeckSink,
+    SharedListSink, SharedProjectSink, TransportError,
 };
 
 /// Upper bound on a whole [`SessionRegistry::connect`] dial + handshake. Without
@@ -25,6 +26,16 @@ use super::{
 /// would wedge `connect` with the `connecting` flag held, deadlocking every later
 /// reconnect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A chat rotation waits for this long with no `Send`, no `ResolveApproval`
+/// and no inbound frame but keepalives: a lull, not just a turn boundary.
+pub(super) const CHAT_ROTATION_QUIET: Duration = Duration::from_secs(5);
+
+/// The netns matrix holds rotation off so an idle phase crosses the NATs
+/// with nothing but the carrier's QUIC keepalives.
+#[cfg(feature = "test-support")]
+pub(crate) static ROTATION_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// A request handed to the pump task to build + seal + send on the live leg.
 pub(super) enum OutboundCmd {
@@ -113,6 +124,19 @@ pub(super) enum Msg {
         attempt: u64,
         parked_at: Instant,
     },
+    /// The dialer's rotation target may have appeared or gone.
+    RotationTargetChanged,
+    /// Re-judge the rotation's idle predicate.
+    RotationCheck,
+    /// A turn started on leg `leg_id`: an uncommitted rotation is abandoned.
+    TurnStarted {
+        leg_id: u64,
+    },
+    /// The rotation dial on leg `leg_id` finished.
+    RotationFinished {
+        leg_id: u64,
+        result: Result<Box<Connection>, TransportError>,
+    },
     /// Abort the live pump WITHOUT the death transition — a stand-in for a
     /// panicked pump / a corpse in the probe window, so tests can pin that the
     /// other discovery channels still deliver `on_disconnected`.
@@ -173,7 +197,28 @@ enum Leg {
         /// The leg's proof-of-life cell, written by the pump on EVERY socket
         /// yield (keepalives included) and read by the ack-timeout judgment.
         last_inbound: Arc<parking_lot::Mutex<Instant>>,
+        /// The pump's active-turn set and last-frame stamp, which the
+        /// rotation's idle predicate reads.
+        activity: Arc<parking_lot::Mutex<LegActivity>>,
+        /// The leg rides a direct carrier, so it never rotates.
+        on_carrier: bool,
+        rotation: Option<Rotation>,
     },
+}
+
+/// A chat rotation in flight on the live leg: a chat leg dialing on the
+/// direct carrier, to replace the relay leg once it is up.
+struct Rotation {
+    gate: RotationGate,
+    task: tokio::task::JoinHandle<()>,
+    /// `Send` / `ResolveApproval` (and, past the commit point, `Open`)
+    /// held until the rotation resolves, then replayed onto whichever leg is
+    /// current.
+    held: Vec<Msg>,
+    /// The relay leg died while the rotation was past its commit point; its
+    /// death waits for the rotation's outcome.
+    relay_ended: bool,
+    started: Instant,
 }
 
 /// One session's lifecycle state. The sink here is the one the LATEST open
@@ -222,6 +267,12 @@ struct Supervisor {
     deck_sink: SharedDeckSink,
     project_sink: SharedProjectSink,
     ack_budget: Duration,
+    rotation_quiet: Duration,
+    /// The dialer has a rotation target to watch.
+    rotates: bool,
+    /// When the last `Send` or `ResolveApproval` went out.
+    last_command: Instant,
+    rotation_check: Option<AbortHandle>,
     /// Self-sender for dial children, pumps, and ack timers.
     tx: mpsc::UnboundedSender<Msg>,
     leg: Leg,
@@ -239,6 +290,9 @@ impl Supervisor {
     }
 
     async fn handle(&mut self, msg: Msg) {
+        let Some(msg) = self.hold_for_rotation(msg) else {
+            return;
+        };
         match msg {
             Msg::Open {
                 session_id,
@@ -274,6 +328,17 @@ impl Supervisor {
                 attempt,
                 parked_at,
             } => self.ack_timed_out(leg_id, session_id, attempt, parked_at),
+            Msg::RotationTargetChanged => {
+                self.abandon_rotation("target_changed");
+                self.arm_rotation_check(Duration::ZERO);
+            }
+            Msg::RotationCheck => self.rotation_check(),
+            Msg::TurnStarted { leg_id } => {
+                if self.live_leg_id() == Some(leg_id) {
+                    self.abandon_rotation("turn_started");
+                }
+            }
+            Msg::RotationFinished { leg_id, result } => self.rotation_finished(leg_id, result),
             #[cfg(test)]
             Msg::AbortPumpForTest { reply } => {
                 if let Leg::Live { task, .. } = &self.leg {
@@ -380,19 +445,27 @@ impl Supervisor {
     /// Park an open whose `Subscribe` is on `leg_id`'s wire, and arm its ack
     /// timer. The `attempt` fences the timer to this exact park.
     fn park_subscribing(&mut self, session_id: String, leg_id: u64, reply: Reply) {
+        self.park(session_id, leg_id, vec![reply]);
+    }
+
+    /// [`Self::park_subscribing`] for any number of waiters, none included: a
+    /// rotation re-subscribes sessions nobody is waiting on.
+    fn park(&mut self, session_id: String, leg_id: u64, waiters: Vec<Reply>) {
         self.next_id += 1;
         let attempt = self.next_id;
         let parked_at = Instant::now();
         let Some(session) = self.sessions.get_mut(&session_id) else {
             // `open` inserted the entry moments ago; its absence means an
             // interleaved teardown drained the map — fail rather than hang.
-            let _ = reply.send(Err(TransportError::SessionClosed));
+            for waiter in waiters {
+                let _ = waiter.send(Err(TransportError::SessionClosed));
+            }
             return;
         };
         session.phase = Phase::Subscribing {
             on_leg: leg_id,
             attempt,
-            waiters: vec![reply],
+            waiters,
         };
         let tx = self.tx.clone();
         let budget = self.ack_budget;
@@ -449,6 +522,7 @@ impl Supervisor {
                 attachments,
             })
             .is_ok();
+        self.last_command = Instant::now();
         if sent {
             let _ = reply.send(Ok(()));
         } else {
@@ -471,6 +545,7 @@ impl Supervisor {
         let sent = outbound_tx
             .send(OutboundCmd::ResolveApproval { call_id, decision })
             .is_ok();
+        self.last_command = Instant::now();
         if sent {
             let _ = reply.send(Ok(()));
         } else {
@@ -583,8 +658,8 @@ impl Supervisor {
                 // never awaits foreign I/O.
                 if let Ok(conn) = result {
                     tokio::spawn(async move {
-                        let mut ws = conn.ws;
-                        let _ = ws.close(None).await;
+                        let mut socket = conn.socket;
+                        socket.close().await;
                     });
                     log::info!("dial discarded: superseded by a teardown mid-dial");
                 }
@@ -593,7 +668,8 @@ impl Supervisor {
         };
         match result {
             Ok(conn) => {
-                let outbound_tx = self.install_pump(leg_id, *conn);
+                let on_carrier = conn.socket.confirms_handshake();
+                let outbound_tx = self.install_pump(leg_id, *conn, on_carrier);
                 let mut waiters = adopters.into_iter().chain(latecomers);
                 while let Some(waiter) = waiters.next() {
                     match waiter {
@@ -653,16 +729,20 @@ impl Supervisor {
         }
     }
 
+    /// `on_carrier`: the leg rides the rotation target already, so it never
+    /// rotates.
     fn install_pump(
         &mut self,
         leg_id: u64,
         conn: Connection,
+        on_carrier: bool,
     ) -> mpsc::UnboundedSender<OutboundCmd> {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         // Seeded now, not at the pump's first poll: the handshake reply that
         // produced `conn` already crossed the wire, so the leg is proven as of
         // this instant.
         let last_inbound = Arc::new(parking_lot::Mutex::new(Instant::now()));
+        let activity = Arc::new(parking_lot::Mutex::new(LegActivity::new()));
         let task = tokio::spawn(pump(
             conn,
             PumpCtx {
@@ -671,6 +751,7 @@ impl Supervisor {
                 deck_sink: self.deck_sink.clone(),
                 project_sink: self.project_sink.clone(),
                 last_inbound: last_inbound.clone(),
+                activity: activity.clone(),
                 leg_id,
                 events: self.tx.clone(),
             },
@@ -681,7 +762,13 @@ impl Supervisor {
             outbound_tx: outbound_tx.clone(),
             task,
             last_inbound,
+            activity,
+            on_carrier,
+            rotation: None,
         };
+        if !on_carrier {
+            self.arm_rotation_check(self.rotation_quiet);
+        }
         outbound_tx
     }
 
@@ -696,6 +783,18 @@ impl Supervisor {
         if !ours {
             return;
         }
+        // A rotation past its commit point owns what happens to this leg: on
+        // success it is retired silently, on failure this death runs then.
+        if let Leg::Live {
+            rotation: Some(rotation),
+            ..
+        } = &mut self.leg
+            && !rotation.gate.abandon()
+        {
+            rotation.relay_ended = true;
+            return;
+        }
+        self.abandon_rotation("leg_died");
         if let Leg::Live { task, .. } = std::mem::replace(&mut self.leg, Leg::Idle) {
             task.abort();
         }
@@ -792,11 +891,22 @@ impl Supervisor {
     }
 
     async fn disconnect(&mut self, reply: Reply) {
+        if let Some(check) = self.rotation_check.take() {
+            check.abort();
+        }
         match std::mem::replace(&mut self.leg, Leg::Idle) {
             // Deliberate teardown: abort WITHOUT the death transition, so no
             // on_disconnected fires (the logout contract). A late PumpEnded
             // from this leg no-ops on the leg_id mismatch.
-            Leg::Live { task, .. } => task.abort(),
+            Leg::Live { task, rotation, .. } => {
+                task.abort();
+                if let Some(rotation) = rotation {
+                    rotation.task.abort();
+                    for held in rotation.held {
+                        fail_held(held);
+                    }
+                }
+            }
             Leg::Dialing {
                 adopters,
                 latecomers,
@@ -819,6 +929,241 @@ impl Supervisor {
         }
         self.sinks.lock().await.clear();
         let _ = reply.send(Ok(()));
+    }
+
+    fn live_leg_id(&self) -> Option<u64> {
+        match &self.leg {
+            Leg::Live { leg_id, .. } => Some(*leg_id),
+            Leg::Idle | Leg::Dialing { .. } => None,
+        }
+    }
+
+    /// While a rotation is in flight, `Send` and `ResolveApproval` wait for
+    /// its outcome. An `Open` abandons a rotation still before its commit
+    /// point — a session about to subscribe is not idle — and past it waits
+    /// too. Returns the message when it runs now.
+    fn hold_for_rotation(&mut self, msg: Msg) -> Option<Msg> {
+        if !matches!(
+            &self.leg,
+            Leg::Live {
+                rotation: Some(_),
+                ..
+            }
+        ) {
+            return Some(msg);
+        }
+        let held = match msg {
+            Msg::Send { .. } | Msg::ResolveApproval { .. } => msg,
+            Msg::Open { .. } if self.abandon_rotation("open") => return Some(msg),
+            Msg::Open { .. } => msg,
+            other => return Some(other),
+        };
+        match &mut self.leg {
+            Leg::Live {
+                rotation: Some(rotation),
+                ..
+            } => {
+                rotation.held.push(held);
+                None
+            }
+            _ => Some(held),
+        }
+    }
+
+    /// Abandon the live leg's rotation if it has not reached its commit
+    /// point, replaying what it held. `false` when there is none, or it is
+    /// past its commit point.
+    fn abandon_rotation(&mut self, reason: &str) -> bool {
+        let Leg::Live { rotation, .. } = &mut self.leg else {
+            return false;
+        };
+        if !rotation
+            .as_ref()
+            .is_some_and(|rotation| rotation.gate.abandon())
+        {
+            return false;
+        }
+        let Some(abandoned) = rotation.take() else {
+            return false;
+        };
+        abandoned.task.abort();
+        log::info!(
+            "chat_rotation outcome=abandoned reason={reason} waited_ms={}",
+            abandoned.started.elapsed().as_millis()
+        );
+        self.replay(abandoned.held);
+        // The predicate is judged again once the leg is idle again.
+        self.arm_rotation_check(self.rotation_quiet);
+        true
+    }
+
+    /// Re-queue held messages behind everything already queued, in order.
+    fn replay(&self, held: Vec<Msg>) {
+        for msg in held {
+            let _ = self.tx.send(msg);
+        }
+    }
+
+    fn arm_rotation_check(&mut self, delay: Duration) {
+        if !self.rotates {
+            return;
+        }
+        if let Some(previous) = self.rotation_check.take() {
+            previous.abort();
+        }
+        let tx = self.tx.clone();
+        let check = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(Msg::RotationCheck);
+        });
+        self.rotation_check = Some(check.abort_handle());
+    }
+
+    /// The rotation's idle predicate. A chat leg moves onto the direct
+    /// carrier only when it is live on the relay with no rotation in flight,
+    /// no session is subscribing, no turn is active, and nothing but
+    /// keepalives crossed it for `rotation_quiet`: answer deltas are never
+    /// replayed, so a switch mid-turn would leave a hole in the answer.
+    fn rotation_check(&mut self) {
+        self.rotation_check = None;
+        let Leg::Live {
+            leg_id,
+            activity,
+            on_carrier: false,
+            rotation: None,
+            ..
+        } = &self.leg
+        else {
+            return;
+        };
+        let leg_id = *leg_id;
+        if !self.dialer.can_rotate() {
+            // Nothing to rotate onto; the next target change re-arms.
+            return;
+        }
+        #[cfg(feature = "test-support")]
+        if ROTATION_HELD.load(std::sync::atomic::Ordering::SeqCst) {
+            self.arm_rotation_check(self.rotation_quiet);
+            return;
+        }
+        let (turns, last_frame) = {
+            let activity = activity.lock();
+            (!activity.turns.is_empty(), activity.last_frame)
+        };
+        let subscribing = self
+            .sessions
+            .values()
+            .any(|session| matches!(session.phase, Phase::Subscribing { .. }));
+        if turns || subscribing {
+            self.arm_rotation_check(self.rotation_quiet);
+            return;
+        }
+        let quiet_for = last_frame.max(self.last_command).elapsed();
+        if quiet_for < self.rotation_quiet {
+            self.arm_rotation_check(self.rotation_quiet - quiet_for);
+            return;
+        }
+        self.start_rotation(leg_id);
+    }
+
+    fn start_rotation(&mut self, leg_id: u64) {
+        let gate = RotationGate::default();
+        let dialer = self.dialer.clone();
+        let report = RotationReport {
+            tx: self.tx.clone(),
+            leg_id,
+            armed: true,
+        };
+        let dial_gate = gate.clone();
+        let task = tokio::spawn(async move {
+            let result = dialer.rotate(dial_gate).await.map(Box::new);
+            report.finish(result);
+        });
+        if let Leg::Live { rotation, .. } = &mut self.leg {
+            *rotation = Some(Rotation {
+                gate,
+                task,
+                held: Vec::new(),
+                relay_ended: false,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    fn rotation_finished(&mut self, leg_id: u64, result: Result<Box<Connection>, TransportError>) {
+        let rotation = match &mut self.leg {
+            Leg::Live {
+                leg_id: current,
+                rotation,
+                ..
+            } if *current == leg_id => rotation.take(),
+            _ => None,
+        };
+        let Some(rotation) = rotation else {
+            // Abandoned or superseded: the leg must not survive as an orphan.
+            if let Ok(conn) = result {
+                tokio::spawn(async move {
+                    let mut socket = conn.socket;
+                    socket.close().await;
+                });
+            }
+            return;
+        };
+        let waited_ms = rotation.started.elapsed().as_millis();
+        match result {
+            Ok(conn) => {
+                log::info!("chat_rotation outcome=ok waited_ms={waited_ms}");
+                self.rotated(leg_id, *conn);
+            }
+            Err(e) => {
+                log::info!("chat_rotation outcome=failed waited_ms={waited_ms} reason=\"{e}\"");
+                if rotation.relay_ended {
+                    self.leg_death(leg_id);
+                } else {
+                    // The dialer has judged the carrier (retired, or cooling
+                    // off), so the next check will not simply retry it.
+                    self.arm_rotation_check(self.rotation_quiet);
+                }
+            }
+        }
+        self.replay(rotation.held);
+    }
+
+    /// Install the rotated chat leg in place of the relay leg. The relay
+    /// pump is retired without fan-out, the way `disconnect` retires one, and
+    /// every session that rode it re-subscribes on the new leg.
+    fn rotated(&mut self, relay_leg: u64, conn: Connection) {
+        if let Leg::Live { task, .. } = std::mem::replace(&mut self.leg, Leg::Idle) {
+            task.abort();
+        }
+        self.next_id += 1;
+        let leg_id = self.next_id;
+        let outbound_tx = self.install_pump(leg_id, conn, true);
+        let riding: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.phase.rides() == Some(relay_leg))
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in &riding {
+            let waiters = match self
+                .sessions
+                .get_mut(session_id)
+                .map(|session| std::mem::replace(&mut session.phase, Phase::Registered))
+            {
+                Some(Phase::Subscribing { waiters, .. }) => waiters,
+                _ => Vec::new(),
+            };
+            self.park(session_id.clone(), leg_id, waiters);
+        }
+        let enqueued = riding.into_iter().all(|session_id| {
+            outbound_tx
+                .send(OutboundCmd::Subscribe { session_id })
+                .is_ok()
+        });
+        if !enqueued {
+            self.leg_death(leg_id);
+        }
     }
 }
 
@@ -868,6 +1213,49 @@ fn clone_for_waiter(e: &TransportError) -> TransportError {
     }
 }
 
+/// Fail a message held for a rotation that will never resolve (a teardown).
+fn fail_held(msg: Msg) {
+    let reply = match msg {
+        Msg::Open { reply, .. } | Msg::Send { reply, .. } | Msg::ResolveApproval { reply, .. } => {
+            reply
+        }
+        _ => return,
+    };
+    let _ = reply.send(Err(TransportError::SessionClosed));
+}
+
+/// Send-on-drop for the rotation dial, like `start_dial`'s report: held
+/// messages wait on `RotationFinished`, so a rotation that dies without
+/// reporting must still resolve.
+struct RotationReport {
+    tx: mpsc::UnboundedSender<Msg>,
+    leg_id: u64,
+    armed: bool,
+}
+
+impl RotationReport {
+    fn finish(mut self, result: Result<Box<Connection>, TransportError>) {
+        self.armed = false;
+        let _ = self.tx.send(Msg::RotationFinished {
+            leg_id: self.leg_id,
+            result,
+        });
+    }
+}
+
+impl Drop for RotationReport {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.tx.send(Msg::RotationFinished {
+                leg_id: self.leg_id,
+                result: Err(TransportError::Other(
+                    "rotation task died before reporting".into(),
+                )),
+            });
+        }
+    }
+}
+
 /// Spawn the supervisor loop for one registry, returning its queue. The loop
 /// runs for the life of the process (the registry holds a sender forever).
 pub(super) fn spawn(
@@ -877,8 +1265,20 @@ pub(super) fn spawn(
     deck_sink: SharedDeckSink,
     project_sink: SharedProjectSink,
     ack_budget: Duration,
+    rotation_quiet: Duration,
 ) -> mpsc::UnboundedSender<Msg> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let rotation_events = dialer.rotation_events();
+    if let Some(mut events) = rotation_events.clone() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while events.changed().await.is_ok() {
+                if tx.send(Msg::RotationTargetChanged).is_err() {
+                    return;
+                }
+            }
+        });
+    }
     let supervisor = Supervisor {
         dialer,
         sinks,
@@ -886,6 +1286,10 @@ pub(super) fn spawn(
         deck_sink,
         project_sink,
         ack_budget,
+        rotation_quiet,
+        rotates: rotation_events.is_some(),
+        last_command: Instant::now(),
+        rotation_check: None,
         tx: tx.clone(),
         leg: Leg::Idle,
         sessions: HashMap::new(),

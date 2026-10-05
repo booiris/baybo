@@ -60,11 +60,22 @@ const UNPROVEN_LEG_TTL: Duration = Duration::from_secs(12);
 /// a previous binding must never be reused — re-pairing to a different gateway is
 /// the case that matters, and the epoch alone would not catch a rebind to a
 /// gateway that happens to reuse the epoch.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BindingKey {
     relay_node_id: String,
     gateway_static_pubkey: [u8; 32],
     device_id: String,
+}
+
+#[cfg(test)]
+impl BindingKey {
+    pub(crate) fn for_tests(relay_node_id: &str) -> Self {
+        Self {
+            relay_node_id: relay_node_id.into(),
+            gateway_static_pubkey: [7u8; 32],
+            device_id: "device-1".into(),
+        }
+    }
 }
 
 impl From<&PairedRecord> for BindingKey {
@@ -233,9 +244,10 @@ impl<F: TunnelFrames> ApiLegPool<F> {
         None
     }
 
-    /// Park a leg the gateway has never answered on. Only [`warm`] produces one, and
-    /// it carries `UNPROVEN_LEG_TTL` rather than an advertised budget.
-    fn park_unproven(&self, leg: PooledLeg<F>) -> Option<PooledLeg<F>> {
+    /// Park a leg the gateway has never answered on: [`warm`]'s, or a direct
+    /// carrier's proof leg. It carries `UNPROVEN_LEG_TTL` rather than an
+    /// advertised budget.
+    pub(crate) fn park_unproven(&self, leg: PooledLeg<F>) -> Option<PooledLeg<F>> {
         let mut inner = self.inner.lock();
         inner.prune();
         if leg.epoch != inner.epoch || inner.legs.len() >= MAX_POOLED_LEGS {

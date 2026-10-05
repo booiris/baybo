@@ -103,7 +103,7 @@ out and must log in again.
   - `candidates` — the direct-carrier candidate sets sealed under keys derived
     from the pairing statics (`DeviceSealer` for P, `GatewaySealer` for A), the
     `DeviceOffer` / `GatewayAnswer` bodies, and P's punch tags.
-- `crates/carrier` — the QUIC direct carrier shared by A (now) and P (PR2):
+- `crates/carrier` — the QUIC direct carrier shared by A and P:
   `DemuxSocket` (the one UDP socket per family that QUIC, the rendezvous and the
   punches share), the QUIC endpoint and TLS configs with A's per-process
   certificate and P's pin, `DirectOpen` framing, `PunchBurst` pacing, the
@@ -254,8 +254,9 @@ connection and, when it runs a UDP rendezvous, lets both sides learn each
 other's IPv4 NAT mapping; the sealed candidate sets stay opaque to C. New API and blob legs
 then dial the carrier, and the chat leg moves only while no turn is in flight.
 Every carrier session runs the same Noise IK handshake as a relay leg, so C's
-position for content is unchanged. The gateway and C sides are built; the app
-does not probe yet (PR2), so today every leg rides the relay.
+position for content is unchanged. The app's prober and carrier lifecycle live
+in `app/ios/ffi/src/relay/carrier/`; Settings shows the carrier and the last
+probe's per-tier outcomes.
 
 - **Content control plane** (`channel/relay_content.rs`): whenever an approved
   device exists the gateway holds a persistent outbound **control connection** to

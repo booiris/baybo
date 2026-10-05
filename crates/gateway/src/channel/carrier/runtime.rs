@@ -27,7 +27,6 @@ use zeroize::Zeroizing;
 
 use super::error::CarrierBindingError;
 use super::gather::{gather, is_candidate, punch_pairs};
-use super::interfaces;
 use super::offer::{ACCEPTED, Decline, OfferGate};
 use super::probe::{
     MAX_HOST_PUNCH_PAIRS, PunchTarget, REPLY_QUEUE_CAPACITY, punch_hosts, register_and_punch,
@@ -441,7 +440,7 @@ impl ActiveRuntime {
         })?;
 
         let local: Vec<SocketAddr> = bound.iter().map(|socket| socket.local_addr).collect();
-        let interfaces = interfaces::enumerate();
+        let interfaces = carrier::interfaces::enumerate();
         let own_addresses = OwnAddresses::new(interfaces.iter().map(|address| address.ip));
         let own = gather(&local, &context.policy, || interfaces);
         let answer = GatewayAnswer {

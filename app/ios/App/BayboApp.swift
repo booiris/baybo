@@ -40,6 +40,9 @@ struct BayboApp: App {
             // suspend is about to kill.
             if phase == .background {
                 Baybo.client.relayInvalidateApiLegs()
+                // Same edge, same reason: suspend the direct carrier and abort
+                // any probe before a later Task can dial a leg on it.
+                Baybo.client.carrierBackground()
                 store.didEnterBackground()
             }
         }

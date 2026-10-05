@@ -90,6 +90,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var blobCachedReads: [String] = []
 
     private var apiLegInvalidations = 0
+    private var carrierBackgrounds = 0
+    private var carrierForegrounds = 0
+    private var networkPaths: [NetworkPath] = []
 
     private var connectError: Error?
     private var sendError: Error?
@@ -163,6 +166,12 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// barrier. iOS suspends without warning and takes the sockets with it, so a
     /// leg that outlives a suspend is a zombie.
     var apiLegInvalidationCount: Int { lock.withLock { apiLegInvalidations } }
+    /// The direct carrier's halves of the `.background` barrier and the
+    /// `.active` re-proof.
+    var carrierBackgroundCount: Int { lock.withLock { carrierBackgrounds } }
+    var carrierForegroundCount: Int { lock.withLock { carrierForegrounds } }
+    /// Every `NWPathMonitor` delivery handed to the core, in order.
+    var networkChanges: [NetworkPath] { lock.withLock { networkPaths } }
 
     /// Every transmission of a message, however it reached the wire — the
     /// initial `chatSendAfterConnect` on a cold leg and every later `chatSend`.
@@ -941,6 +950,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func pairedDevice() -> String? { nil }
     func registerPush() async throws -> String? { throw Self.unsupported }
     func relayInvalidateApiLegs() { lock.withLock { apiLegInvalidations += 1 } }
+    func carrierBackground() { lock.withLock { carrierBackgrounds += 1 } }
+    func carrierForeground() { lock.withLock { carrierForegrounds += 1 } }
+    func networkChanged(path: NetworkPath) { lock.withLock { networkPaths.append(path) } }
+    func setCarrierSink(sink: CarrierSink) {}
     func relayPreconnect() async throws { throw Self.unsupported }
     func setPushToken(token: PushToken) {}
     func setSessionListSink(sink: SessionListSink) {}

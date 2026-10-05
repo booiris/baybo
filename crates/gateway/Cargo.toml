@@ -25,8 +25,10 @@ linux = []
 macos = []
 # Exposes test helpers to downstream crate-level tests. Never enabled in
 # release builds. Pulls in `baybo-llm/test-support` so the gateway's own
-# test fixtures can construct `BillableLlm::passthrough`.
-test-support = ["baybo-llm/test-support"]
+# test fixtures can construct `BillableLlm::passthrough`, and the protocol's
+# test address policy, so a `baybo` built with it (the netns matrix's
+# gateway) treats the matrix's documentation ranges as public.
+test-support = ["baybo-llm/test-support", "remote-host-protocol/test-support"]
 
 [dependencies]
 baybo-process = { workspace = true }
@@ -152,3 +154,9 @@ remote-host-protocol = { workspace = true, features = ["test-support"] }
 carrier = { workspace = true, features = ["test-support"] }
 # `test-util` backs `#[tokio::test(start_paused = true)]`; `full` omits it.
 tokio = { workspace = true, features = ["test-util"] }
+
+# Writes an approved relay binding into a workspace and prints the phone's
+# pairing record: the netns matrix's gateway setup (`app/ios/ffi/tests/netns_matrix.rs`).
+[[example]]
+name = "seed_relay_binding"
+required-features = ["test-support"]

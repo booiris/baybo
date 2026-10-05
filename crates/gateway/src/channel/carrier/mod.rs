@@ -6,8 +6,8 @@
 //! - [`offer`]: the freshness and replay rules an opened offer must pass.
 //! - [`punches`]: the live punches and their allowed-IP sets, which gate QUIC
 //!   admission, and authenticated-punch verification.
-//! - [`gather`] and [`interfaces`]: A's host candidates, and the pairs it
-//!   punches.
+//! - [`gather`]: A's host candidates (from `carrier::interfaces`), and the
+//!   pairs it punches.
 //! - [`probe`]: A's punches and on-demand rendezvous registration, and the
 //!   routing of received probe datagrams.
 //! - [`udp`]: each family's stable socket, rebound only on a persistent
@@ -20,7 +20,6 @@
 
 pub(crate) mod error;
 pub(crate) mod gather;
-pub(crate) mod interfaces;
 pub(crate) mod offer;
 #[cfg(test)]
 pub(crate) mod phone;

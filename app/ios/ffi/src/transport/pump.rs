@@ -6,17 +6,16 @@
 //! (`PumpEnded` / `SubscribeAcked`) to the supervisor tagged with its
 //! `leg_id`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::tungstenite::Message;
 
 use crate::api::FrameSink;
 use crate::core::{Frame, ProjectChangeScope, resolve_approval_frame, subscribe_frame};
 
+use super::socket::ReadEvent;
 use super::supervisor::{Msg, OutboundCmd};
 use super::{Connection, RoutingMap, SharedDeckSink, SharedListSink, SharedProjectSink};
 
@@ -25,20 +24,62 @@ use super::{Connection, RoutingMap, SharedDeckSink, SharedListSink, SharedProjec
 /// the pump exits so the next foreground reconnect re-subscribes. The gateway
 /// sends an application keepalive every 20s, so a silent window this long means
 /// the socket is gone.
-const INBOUND_LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
+pub(super) const INBOUND_LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Everything [`pump`] needs besides the socket: where inbound frames go, the
-/// leg's proof-of-life stamp, and the supervisor queue its lifecycle events
-/// (`PumpEnded`, `SubscribeAcked`) are reported on, tagged with this pump's
-/// `leg_id`.
+/// leg's proof-of-life stamp and activity, and the supervisor queue its
+/// lifecycle events (`PumpEnded`, `SubscribeAcked`, `TurnStarted`) are
+/// reported on, tagged with this pump's `leg_id`.
 pub(super) struct PumpCtx {
     pub(super) sinks: RoutingMap,
     pub(super) list_sink: SharedListSink,
     pub(super) deck_sink: SharedDeckSink,
     pub(super) project_sink: SharedProjectSink,
     pub(super) last_inbound: Arc<parking_lot::Mutex<Instant>>,
+    pub(super) activity: Arc<parking_lot::Mutex<LegActivity>>,
     pub(super) leg_id: u64,
     pub(super) events: mpsc::UnboundedSender<Msg>,
+}
+
+/// What the chat rotation's idle predicate reads off a leg: the sessions
+/// with a turn in flight, and when the last frame other than a keepalive
+/// arrived. The pump is its only writer.
+pub(super) struct LegActivity {
+    pub(super) turns: HashSet<String>,
+    pub(super) last_frame: Instant,
+}
+
+impl LegActivity {
+    pub(super) fn new() -> Self {
+        Self {
+            turns: HashSet::new(),
+            last_frame: Instant::now(),
+        }
+    }
+
+    /// Record one inbound frame (never a keepalive). `TurnState` adds or
+    /// removes its session; every `SubscribeState` re-seeds its session from
+    /// the bundle's turn snapshot, so a latch stuck at `true` clears on the
+    /// next re-subscribe. Returns whether a turn just started.
+    fn observe(&mut self, frame: &Frame) -> bool {
+        self.last_frame = Instant::now();
+        let (session_id, active) = match frame {
+            Frame::TurnState {
+                session_id, active, ..
+            } => (session_id, *active),
+            Frame::SubscribeState {
+                session_id, turn, ..
+            } => (session_id, turn.active),
+            _ => return false,
+        };
+        let session_id = session_id.as_str().to_owned();
+        if active {
+            self.turns.insert(session_id) && matches!(frame, Frame::TurnState { .. })
+        } else {
+            self.turns.remove(&session_id);
+            false
+        }
+    }
 }
 
 /// Own the socket for the binding's lifetime: fan inbound frames to per-session
@@ -70,18 +111,18 @@ async fn run_pump(
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
     let Connection {
-        ws,
+        socket,
         mut codec,
         user_frame,
     } = conn;
-    let (mut sink_ws, mut stream) = ws.split();
+    let (mut writer, mut reader) = socket.split();
 
     let liveness = tokio::time::sleep(INBOUND_LIVENESS_TIMEOUT);
     tokio::pin!(liveness);
 
     'session: loop {
         tokio::select! {
-            inbound = stream.next() => {
+            inbound = reader.next() => {
                 liveness
                     .as_mut()
                     .reset(tokio::time::Instant::now() + INBOUND_LIVENESS_TIMEOUT);
@@ -92,7 +133,7 @@ async fn run_pump(
                 // keepalives count as life.
                 *ctx.last_inbound.lock() = Instant::now();
                 match inbound {
-                    Some(Ok(Message::Binary(bytes))) => {
+                    ReadEvent::Message(bytes) => {
                         // Relay: a decrypt desync is fatal (Err → break). Direct: an
                         // unknown future variant decodes to Ok(vec![]) and is skipped.
                         let frames = match codec.decode_inbound(&bytes) {
@@ -109,10 +150,13 @@ async fn run_pump(
                             if matches!(frame, Frame::Ping) {
                                 if let Ok(messages) = codec.encode_outbound(&Frame::Pong) {
                                     for bytes in messages {
-                                        let _ = sink_ws.send(Message::Binary(bytes)).await;
+                                        let _ = writer.send(bytes).await;
                                     }
                                 }
                                 continue;
+                            }
+                            if ctx.activity.lock().observe(&frame) {
+                                let _ = ctx.events.send(Msg::TurnStarted { leg_id: ctx.leg_id });
                             }
                             // The sink is a foreign callback and can't signal a
                             // dropped consumer (unlike the old webview channel);
@@ -120,28 +164,12 @@ async fn run_pump(
                             dispatch_inbound_frame(&ctx, frame).await;
                         }
                     }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(frame))) => {
-                        match frame {
-                            Some(cf) => log::info!(
-                                "chat connection ended: socket closed by peer (code={} reason={:?})",
-                                u16::from(cf.code),
-                                cf.reason
-                            ),
-                            None => log::info!(
-                                "chat connection ended: socket closed by peer (no close frame body)"
-                            ),
-                        }
+                    ReadEvent::Control => {}
+                    ReadEvent::Ended(how) => {
+                        log::info!("chat connection ended: {how}");
                         break 'session;
                     }
-                    None => {
-                        log::info!(
-                            "chat connection ended: socket stream ended"
-                        );
-                        break 'session;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => {
+                    ReadEvent::Failed(e) => {
                         log::info!(
                             "chat connection ended: socket read error: {e}"
                         );
@@ -180,7 +208,7 @@ async fn run_pump(
                 match codec.encode_outbound(&frame) {
                     Ok(messages) => {
                         for bytes in messages {
-                            if let Err(e) = sink_ws.send(Message::Binary(bytes)).await {
+                            if let Err(e) = writer.send(bytes).await {
                                 log::warn!(
                                     "chat connection ended: outbound send failed ({cmd_kind}): {e}"
                                 );
@@ -205,7 +233,7 @@ async fn run_pump(
             }
         }
     }
-    let _ = sink_ws.close().await;
+    writer.close().await;
 }
 
 /// Run `deliver` against a connection-global sink slot, if one is installed.

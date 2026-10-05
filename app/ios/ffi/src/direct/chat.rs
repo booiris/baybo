@@ -9,16 +9,14 @@
 //! admin listener validates the Bearer + device id header on the HTTP upgrade,
 //! then marks the connection as `AuthedClient::Device`.
 
-use futures_util::SinkExt;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::StatusCode;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::core::{Frame, MobileError, decode, encode, register_device_frame, user_message_frame};
 use crate::transport::{
-    Connection, FrameCodec, LegDialer, SessionLeg, TransportError, UserFrameFn, WsStream,
-    recv_binary_handshake,
+    Connection, FrameCodec, LegDialer, LegSocket, SessionLeg, TransportError, UserFrameFn,
 };
 
 /// The direct frame codec: raw MessagePack, one frame per WS message — no Noise,
@@ -61,7 +59,7 @@ impl LegDialer for DirectDialer {
                 .http
                 .http_client()
                 .map_err(TransportError::Precondition)?;
-            let ws = establish_ws(&http).await?;
+            let socket = establish_ws(&http).await?;
 
             let codec: Box<dyn FrameCodec> = Box::new(DirectCodec);
 
@@ -75,7 +73,7 @@ impl LegDialer for DirectDialer {
             });
 
             Ok(Connection {
-                ws,
+                socket,
                 codec,
                 user_frame,
             })
@@ -84,9 +82,9 @@ impl LegDialer for DirectDialer {
 }
 
 /// Complete the WS handshake as the admin-authenticated direct device.
-async fn establish_ws(http: &super::DirectHttp) -> Result<WsStream, TransportError> {
+async fn establish_ws(http: &super::DirectHttp) -> Result<LegSocket, TransportError> {
     match dial_and_register(http).await {
-        Ok(ws) => Ok(ws),
+        Ok(socket) => Ok(socket),
         Err(DialErr::Unauthorized) => {
             Err(TransportError::Other(super::INVALID_TOKEN_CODE.to_string()))
         }
@@ -115,7 +113,7 @@ enum DialErr {
 
 /// Dial `/v1/channel-ws` with the gateway Bearer, then run the device Register /
 /// RegisterAck handshake.
-async fn dial_and_register(http: &super::DirectHttp) -> Result<WsStream, DialErr> {
+async fn dial_and_register(http: &super::DirectHttp) -> Result<LegSocket, DialErr> {
     let url = super::channel_ws_url(http.base_url()).map_err(DialErr::Other)?;
     let mut req = url
         .as_str()
@@ -125,8 +123,8 @@ async fn dial_and_register(http: &super::DirectHttp) -> Result<WsStream, DialErr
         req.headers_mut().insert(name.clone(), value.clone());
     }
 
-    let mut ws = match connect_async(req).await {
-        Ok((ws, _)) => ws,
+    let mut socket = match connect_async(req).await {
+        Ok((ws, _)) => LegSocket::ws(ws),
         Err(WsError::Http(resp)) if resp.status() == StatusCode::UNAUTHORIZED => {
             return Err(DialErr::Unauthorized);
         }
@@ -135,12 +133,13 @@ async fn dial_and_register(http: &super::DirectHttp) -> Result<WsStream, DialErr
 
     let register = encode(&register_device_frame())
         .map_err(|e| DialErr::Other(format!("encode register: {e}")))?;
-    ws.send(Message::Binary(register))
+    socket
+        .send(register)
         .await
         .map_err(|e| DialErr::Other(format!("send register: {e}")))?;
 
-    match recv_frame(&mut ws).await.map_err(DialErr::Other)? {
-        Frame::RegisterAck { ok: true, .. } => Ok(ws),
+    match recv_frame(&mut socket).await.map_err(DialErr::Other)? {
+        Frame::RegisterAck { ok: true, .. } => Ok(socket),
         Frame::RegisterAck { ok: false, reason } => Err(DialErr::Other(
             reason.unwrap_or_else(|| "register rejected".into()),
         )),
@@ -150,7 +149,7 @@ async fn dial_and_register(http: &super::DirectHttp) -> Result<WsStream, DialErr
 
 /// Read the next binary WS message and decode it as a `Frame` (skipping ping/pong)
 /// — used for the `RegisterAck` reply before the pump takes over.
-async fn recv_frame(ws: &mut WsStream) -> Result<Frame, String> {
-    let bytes = recv_binary_handshake(ws).await.map_err(|e| e.to_string())?;
+async fn recv_frame(socket: &mut LegSocket) -> Result<Frame, String> {
+    let bytes = socket.recv_handshake().await.map_err(|e| e.to_string())?;
     decode(&bytes).map_err(|e| format!("decode frame: {e}"))
 }

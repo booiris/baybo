@@ -370,6 +370,12 @@ final class AppStore: ObservableObject {
         // Board invalidations are session-less; this is their only live route.
         Baybo.client.setProjectSink(
             sink: ProjectEventsRelay(store: { AppStore.shared?.projectsStore }))
+        // The Settings Connection row's only source; the core delivers the
+        // current carrier state at once, then every change.
+        Baybo.client.setCarrierSink(sink: CarrierEventsRelay())
+        // From launch on, whatever the binding: a direct carrier must be
+        // retired the moment its network goes, and only the monitor knows.
+        PathMonitor.start()
         #if DEBUG
         // UI-verification hooks: land straight on interaction-gated screens so
         // they are screenshotable/log-verifiable headlessly on the simulator.
@@ -637,8 +643,8 @@ final class AppStore: ObservableObject {
 
     /// Foreground hook (scenePhase → .active): re-arm APNs registration while
     /// no token landed, refresh the direct push binding or warm the relay leg,
-    /// and re-subscribe cached chat stores so catch-up does not wait for a
-    /// screen to reappear.
+    /// re-prove the direct carrier, and re-subscribe cached chat stores so
+    /// catch-up does not wait for a screen to reappear.
     func didBecomeActive() {
         recycleWebHostsIfStale()
         reviveParkedWebHosts()
@@ -652,6 +658,10 @@ final class AppStore: ObservableObject {
         } else if Baybo.client.pairedDevice() != nil {
             preconnectRelayBestEffort()
         }
+        // The other half of the `.background` barrier's carrier suspend:
+        // re-prove the suspended direct carrier or retire it, then look for
+        // one. Best-effort, and a no-op unless the binding is a relay one.
+        Baybo.client.carrierForeground()
         for store in chatStores.values {
             store.scheduleReconnect()
         }

@@ -333,7 +333,7 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(all(not(target_os = "ios"), not(feature = "test-support")))]
 mod imp {
     use super::KEY_LEN;
     pub(super) fn store_push_key(_bid: &str, _key: &[u8; KEY_LEN]) -> Result<(), String> {
@@ -353,6 +353,47 @@ mod imp {
     }
     pub(super) fn delete_push_key(_bid: &str) -> Result<(), String> {
         Ok(())
+    }
+}
+
+/// A host keychain that keeps what is written, for the netns matrix's phone
+/// process: it is seeded with a pairing and reads it back like the app does.
+#[cfg(all(not(target_os = "ios"), feature = "test-support"))]
+mod imp {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    use parking_lot::Mutex;
+
+    use super::KEY_LEN;
+
+    const PUSH_KEY_PREFIX: &str = "push-key:";
+
+    fn items() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+        static ITEMS: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+        ITEMS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
+        store_private_blob(&format!("{PUSH_KEY_PREFIX}{bid}"), key)
+    }
+    pub(super) fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
+        Ok(read_private_blob(&format!("{PUSH_KEY_PREFIX}{bid}"))?
+            .and_then(|bytes| bytes.as_slice().try_into().ok()))
+    }
+    pub(super) fn store_private_blob(account: &str, bytes: &[u8]) -> Result<(), String> {
+        items().lock().insert(account.to_owned(), bytes.to_vec());
+        Ok(())
+    }
+    pub(super) fn read_private_blob(account: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(items().lock().get(account).cloned())
+    }
+    pub(super) fn delete_private_blob(account: &str) -> Result<(), String> {
+        items().lock().remove(account);
+        Ok(())
+    }
+    pub(super) fn delete_push_key(bid: &str) -> Result<(), String> {
+        delete_private_blob(&format!("{PUSH_KEY_PREFIX}{bid}"))
     }
 }
 

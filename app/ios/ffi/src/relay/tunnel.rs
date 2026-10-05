@@ -20,15 +20,15 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use device_proto::noise::StaticKeypair;
-use futures_util::SinkExt;
-use tokio_tungstenite::tungstenite::Message;
 
+use super::carrier;
 use super::dial::dial_content_join;
+use super::leg_pool::BindingKey;
 use super::pairing::PairedRecord;
 use crate::core::{
     ApiTunnelSession, ContentHandshake, TunnelHeader, TunnelRequest, TunnelResponse,
 };
-use crate::transport::WsStream;
+use crate::transport::LegSocket;
 
 pub(crate) use device_proto::api_tunnel::TunnelReuse;
 
@@ -103,9 +103,10 @@ pub(crate) trait TunnelFrames: Send {
     fn close(&mut self) -> impl std::future::Future<Output = ()> + Send;
 }
 
-/// The real wire: msgpack frames sealed into a Noise transport over a WebSocket.
+/// The real wire: msgpack frames sealed into a Noise transport over a leg's
+/// socket (the relay's WebSocket, or a direct carrier's stream).
 pub(crate) struct NoiseFrames {
-    ws: WsStream,
+    socket: LegSocket,
     session: ApiTunnelSession,
 }
 
@@ -116,8 +117,8 @@ impl TunnelFrames for NoiseFrames {
             .seal(request)
             .map_err(|e| LegError::dead(format!("seal tunnel request: {e}")))?
         {
-            self.ws
-                .send(Message::Binary(message))
+            self.socket
+                .send(message)
                 .await
                 .map_err(|e| LegError::dead(format!("send tunnel request: {e}")))?;
         }
@@ -125,7 +126,9 @@ impl TunnelFrames for NoiseFrames {
     }
 
     async fn recv(&mut self) -> Result<Vec<TunnelResponse>, LegError> {
-        let bytes = crate::transport::recv_binary(&mut self.ws)
+        let bytes = self
+            .socket
+            .recv()
             .await
             .map_err(|e| LegError::dead(e.to_string()))?;
         self.session
@@ -134,7 +137,7 @@ impl TunnelFrames for NoiseFrames {
     }
 
     async fn close(&mut self) {
-        let _ = self.ws.close(None).await;
+        self.socket.close().await;
     }
 }
 
@@ -301,29 +304,69 @@ impl<F: TunnelFrames> LegIo<F> {
     }
 }
 
+/// Dial an API or blob leg: on the live direct carrier when one is usable,
+/// and on the relay otherwise. A carrier dial that fails, or exceeds
+/// `DIRECT_LEG_DIAL_TIMEOUT`, re-dials this leg on the relay at once; the
+/// hub then judges the carrier.
 pub(crate) async fn dial_tunnel_leg(
     record: &PairedRecord,
     local: &StaticKeypair,
     leg_class: remote_host_protocol::relay::LegClass,
 ) -> Result<LegIo, String> {
-    let mut ws = dial_content_join(record, Some(leg_class)).await?;
-    let (handshake, msg1) = ContentHandshake::start(local, &record.gateway_static_pubkey)
-        .map_err(|e| format!("start handshake: {e}"))?;
-    ws.send(Message::Binary(msg1))
+    let hub = carrier::hub();
+    if let Some(lease) = hub.lease(&BindingKey::from(record)) {
+        match carrier::dial_leg(
+            &lease.handle,
+            leg_class,
+            || true,
+            |socket| tunnel_handshake(socket, record, local),
+        )
         .await
-        .map_err(|e| format!("send handshake: {e}"))?;
-    let msg2 = recv_binary_with_timeout(&mut ws, TUNNEL_HANDSHAKE_TIMEOUT).await?;
-    let session = handshake
-        .finish_api_tunnel(&msg2)
-        .map_err(|e| format!("finish handshake: {e}"))?;
-    Ok(LegIo::new(NoiseFrames { ws, session }))
+        {
+            Ok(io) => return Ok(io),
+            Err(failure) => {
+                log::info!(
+                    "carrier leg dial failed, dialing the relay: {}",
+                    failure.reason()
+                );
+                hub.dial_failed(lease.id, &failure);
+            }
+        }
+    }
+    let socket = LegSocket::ws(dial_content_join(record, Some(leg_class)).await?);
+    tunnel_handshake(socket, record, local).await
 }
 
-async fn recv_binary_with_timeout(ws: &mut WsStream, timeout: Duration) -> Result<Vec<u8>, String> {
-    tokio::time::timeout(timeout, crate::transport::recv_binary(ws))
+/// Run the Noise IK initiator over a dialed leg socket, confirming it when the
+/// socket is a carrier stream, and wrap the result as a tunnel leg.
+pub(crate) async fn tunnel_handshake(
+    mut socket: LegSocket,
+    record: &PairedRecord,
+    local: &StaticKeypair,
+) -> Result<LegIo, String> {
+    let (handshake, msg1) = ContentHandshake::start(local, &record.gateway_static_pubkey)
+        .map_err(|e| format!("start handshake: {e}"))?;
+    socket
+        .send(msg1)
+        .await
+        .map_err(|e| format!("send handshake: {e}"))?;
+    let msg2 = tokio::time::timeout(TUNNEL_HANDSHAKE_TIMEOUT, socket.recv())
         .await
         .map_err(|_| "handshake timed out".to_string())?
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let mut session = handshake
+        .finish_api_tunnel(&msg2)
+        .map_err(|e| format!("finish handshake: {e}"))?;
+    if socket.confirms_handshake() {
+        let confirmation = session
+            .confirmation()
+            .map_err(|e| format!("confirm handshake: {e}"))?;
+        socket
+            .send(confirmation)
+            .await
+            .map_err(|e| format!("send handshake confirmation: {e}"))?;
+    }
+    Ok(LegIo::new(NoiseFrames { socket, session }))
 }
 
 /// Body chunks for `request_id`, sized to the tunnel's chunk ceiling.

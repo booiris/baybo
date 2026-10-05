@@ -60,6 +60,8 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 | `remote-host-protocol` | `AddressPolicy::for_tests`                                          | With `test-support`, `AddressPolicy::active()` returns it: 127/8, 198.18/15 and 2001:2::/48 are `Public` and `::1` is `Lan`, so direct-carrier tests run over loopback. `remote-host-relay`'s and `baybo-gateway`'s tests enable it. Features unify per build, so any crate tested in the same `cargo`/`nextest` invocation as those sees the test policy too: tests that classify addresses use data that reads the same under either policy. |
 | `remote-host-relay` | `ControlRegistry::with_direct_answer_timeout`, `ConnectionRegistry::register_for_test` | Shortens how long `POST /direct` waits for the gateway's report, so the no-answer path does not sleep 3 s; registers a live connection to drive a revoke kick. |
 | `carrier`          | `DemuxSocket::inject_recv_errors`                                       | Records failed receives on a real socket, backing off as real ones do, so the gateway's rebind test drives the receive-error streak its supervisor polls. |
+| `baybo-gateway`    | `examples/seed_relay_binding.rs` (and the forwarded `remote-host-protocol/test-support`) | Writes an approved relay binding into a workspace and prints the phone's pairing record — the netns matrix's gateway setup. A `baybo` built with `--features baybo-gateway/test-support` uses the test address policy. |
+| `baybo-ios-ffi` (`app/ios`) | in-memory keychain, `test_support::{seed_relay_pairing, hold_chat_rotation}`, `examples/netns_phone.rs` | A host keychain that keeps writes, so the netns matrix's phone process is seeded with a pairing; a knob that holds chat rotation off; the protocol's test address policy. App builds never enable it, and `ios-core`'s nextest runs without it. |
 | `baybo-workspace`   | `back_date`, `back_date_tree`, `back_date_symlink`                      | mtime back-dating for tests that drive the `walk::tree_stats` staleness gates (janitor sweeps). `back_date_symlink` sets the link's *own* lstat mtime via `utimensat(AT_SYMLINK_NOFOLLOW)`. |
 
 The integration-tests crate composes these into higher-level builders:
@@ -253,9 +255,24 @@ with zero-warnings; new tests must clear that gate.
 
 The direct-carrier tests that run over IPv6 loopback self-skip, through
 `carrier::phone::ipv6_loopback_available`, on a host that cannot bind `::1`
-(a container with IPv6 disabled). The carrier's IPv6 interface flags have a
-macOS-only reader; CI's `gateway-macos` job runs its tests on macOS whenever
-`crates/gateway/src/channel/carrier/` changes.
+(a container with IPv6 disabled). The carrier's IPv6 interface flags have an
+Apple-only reader; CI's `gateway-macos` job runs its tests on macOS whenever
+`crates/carrier/` or `crates/gateway/src/channel/carrier/` changes.
+
+The direct-carrier NAT matrix runs the real C, A and P binaries in network
+namespaces (`app/ios/ffi/tests/netns_matrix.rs`, `#[ignore]`d; see
+[`direct-carriers.md`](modules/mobile/direct-carriers.md#testing)). It needs
+root, `ip`, `iptables`, `tc` and `sqlite3`:
+
+```bash
+scripts/netns-matrix.sh                                   # every cell, 5 runs each
+NETNS_CELLS="cone/cone same-lan" NETNS_RUNS=1 scripts/netns-matrix.sh
+```
+
+The script runs `cargo test` under `sudo`, which leaves root-owned files in
+`app/ios/target`; on a workstation, build with the script once and then run
+the compiled `netns_matrix` test binary under `sudo` directly, with the same
+`NETNS_*_BIN` variables the script exports.
 
 `remote-host/` is its own cargo workspace, excluded from the root one, so the
 commands above never run its tests. Run them from inside it

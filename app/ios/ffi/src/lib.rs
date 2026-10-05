@@ -23,6 +23,8 @@ mod qr;
 mod relay;
 mod runtime;
 mod server_cache;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod transport;
 
 use std::sync::Arc;
@@ -31,15 +33,17 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    BlobServeOutcome, ChatSearchGroup, ChatSearchHit, ChatSearchResults, ChatSessionSummary,
-    ChatSubagentList, ChatSubagentStatus, ChatSubagentSummary, ClientConfig, CronJobStatus,
-    CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
-    FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput,
-    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog,
-    LlmModelInfo, MessageLookup, NewIssue, NewProject, PairAbortListener, PairChallenge,
-    PairTarget, PairedSummary, ProjectActivity, ProjectAttention, ProjectInfo, ProjectSettings,
-    ProjectSink, PushToken, RunStatus, RunTrigger, SessionListSink, SessionModelPin, StringPatch,
-    SubIssueProgress, SubagentCursor, TeamMemberInfo,
+    BlobServeOutcome, CarrierLabel, CarrierSink, CarrierStatus, ChatSearchGroup, ChatSearchHit,
+    ChatSearchResults, ChatSessionSummary, ChatSubagentList, ChatSubagentStatus,
+    ChatSubagentSummary, ClientConfig, CronJobStatus, CronJobSummary, DeckCardInfo,
+    DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink, HiredBy,
+    IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput, IssueInfo, IssuePatch,
+    IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog, LlmModelInfo,
+    MessageLookup, NetworkInterfaceKind, NetworkPath, NewIssue, NewProject, PairAbortListener,
+    PairChallenge, PairTarget, PairedSummary, ProbeReport, ProjectActivity, ProjectAttention,
+    ProjectInfo, ProjectSettings, ProjectSink, PushToken, RunStatus, RunTrigger, SessionListSink,
+    SessionModelPin, StringPatch, SubIssueProgress, SubagentCursor, TeamMemberInfo, TierOutcome,
+    TierReport,
 };
 use binding::{ActiveLeg, active_leg};
 use gateway_client::ActiveGatewayClient;
@@ -139,6 +143,35 @@ impl BayboClient {
     /// races the chat list's own foreground refresh besides.
     pub fn relay_invalidate_api_legs(&self) {
         relay::leg_pool::pool().invalidate();
+    }
+
+    /// The direct carrier's half of the `.background` barrier: abort any
+    /// probe and any uncommitted chat rotation, and suspend the carrier so no
+    /// new leg dials it. Its connection and open streams are left alone, as a
+    /// relay chat leg's are. Synchronous for the same reason as
+    /// [`Self::relay_invalidate_api_legs`], and called right after it.
+    pub fn carrier_background(&self) {
+        relay::carrier::hub().background();
+    }
+
+    /// `.active`: re-prove a suspended direct carrier (or retire it), then
+    /// look for one if none is live. The lifecycle edge is synchronous so it
+    /// cannot overtake a later background barrier; network work is spawned.
+    pub fn carrier_foreground(&self) {
+        relay::carrier::hub().foreground();
+    }
+
+    /// One `NWPathMonitor` delivery. Synchronous: a primary-interface change
+    /// retires the direct carrier and aborts any probe before this returns,
+    /// so no leg dials a carrier on the network the phone just left.
+    pub fn network_changed(&self, path: NetworkPath) {
+        relay::carrier::hub().network_changed(path);
+    }
+
+    /// Install the Settings screen's carrier sink. It receives the current
+    /// state at once, then every change.
+    pub fn set_carrier_sink(&self, sink: Arc<dyn CarrierSink>) {
+        relay::carrier::hub().set_sink(sink);
     }
 
     /// Install the chat list's session-activity sink: the connection-global

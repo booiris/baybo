@@ -1,7 +1,8 @@
-//! The host's interface addresses, read once per accepted offer: `getifaddrs`
-//! for the addresses and interface flags, plus each IPv6 address's own flags
-//! (`/proc/net/if_inet6` on Linux, `SIOCGIFAFLAG_IN6` on macOS), so a
-//! temporary, deprecated, tentative or duplicate address is never offered.
+//! The host's interface addresses: `getifaddrs` for the addresses and
+//! interface flags, plus each IPv6 address's own flags (`/proc/net/if_inet6`
+//! on Linux, `SIOCGIFAFLAG_IN6` on Apple platforms). The gateway reads them
+//! once per accepted offer, the phone once per probe; each applies its own
+//! rule to [`InterfaceAddress::temporary`].
 
 use std::ffi::CStr;
 use std::io;
@@ -9,20 +10,22 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// One address of one interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InterfaceAddress {
-    pub(crate) interface: String,
-    pub(crate) ip: IpAddr,
+pub struct InterfaceAddress {
+    pub interface: String,
+    pub ip: IpAddr,
     /// The interface is UP and RUNNING.
-    pub(crate) up_running: bool,
-    /// An IPv6 address the host may drop or has not confirmed: temporary,
-    /// deprecated, tentative or duplicate. Also set when its flags could not
-    /// be read.
-    pub(crate) unstable: bool,
+    pub up_running: bool,
+    /// An IPv6 privacy address. The gateway never offers one, since it
+    /// rotates; the phone does, because iOS sends from one.
+    pub temporary: bool,
+    /// An IPv6 address the host may drop or has not confirmed: deprecated,
+    /// tentative or duplicate. Also set when its flags could not be read.
+    pub unusable: bool,
 }
 
 /// Every address of every interface. A failure is logged and reads as no
-/// address, so an offer is answered with no host candidate.
-pub(crate) fn enumerate() -> Vec<InterfaceAddress> {
+/// address, so the side offers no host candidate.
+pub fn enumerate() -> Vec<InterfaceAddress> {
     let raw = match raw_addresses() {
         Ok(raw) => raw,
         Err(error) => {
@@ -33,18 +36,34 @@ pub(crate) fn enumerate() -> Vec<InterfaceAddress> {
     let ipv6_flags = platform::Ipv6Flags::read();
     raw.into_iter()
         .map(|raw| {
-            let unstable = match raw.ip {
-                IpAddr::V4(_) => false,
-                IpAddr::V6(ip) => ipv6_flags.unstable(&raw.interface, ip),
+            let state = match raw.ip {
+                IpAddr::V4(_) => Ipv6State::default(),
+                IpAddr::V6(ip) => ipv6_flags.state(&raw.interface, ip),
             };
             InterfaceAddress {
                 interface: raw.interface,
                 ip: raw.ip,
                 up_running: raw.up_running,
-                unstable,
+                temporary: state.temporary,
+                unusable: state.unusable,
             }
         })
         .collect()
+}
+
+/// What an IPv6 address's own flags say about it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Ipv6State {
+    temporary: bool,
+    unusable: bool,
+}
+
+impl Ipv6State {
+    /// The state of an address whose flags could not be read.
+    const UNREADABLE: Self = Self {
+        temporary: false,
+        unusable: true,
+    };
 }
 
 struct RawAddress {
@@ -112,11 +131,11 @@ mod platform {
     use std::collections::HashMap;
     use std::net::Ipv6Addr;
 
+    use super::Ipv6State;
+
     const IF_INET6: &str = "/proc/net/if_inet6";
-    const UNSTABLE: u32 = libc::IFA_F_TEMPORARY
-        | libc::IFA_F_DEPRECATED
-        | libc::IFA_F_TENTATIVE
-        | libc::IFA_F_DADFAILED;
+    const TEMPORARY: u32 = libc::IFA_F_TEMPORARY;
+    const UNUSABLE: u32 = libc::IFA_F_DEPRECATED | libc::IFA_F_TENTATIVE | libc::IFA_F_DADFAILED;
     const HEX: u32 = 16;
 
     /// Each IPv6 address's `IFA_F_*` flags, keyed by interface and address.
@@ -124,16 +143,20 @@ mod platform {
 
     impl Ipv6Flags {
         /// No readable table (a kernel without IPv6) marks every IPv6
-        /// address unstable.
+        /// address unusable.
         pub(super) fn read() -> Self {
             let table = std::fs::read_to_string(IF_INET6).unwrap_or_default();
             Self(parse(&table))
         }
 
-        pub(super) fn unstable(&self, interface: &str, ip: Ipv6Addr) -> bool {
-            self.0
-                .get(&(interface.to_owned(), ip))
-                .is_none_or(|flags| flags & UNSTABLE != 0)
+        pub(super) fn state(&self, interface: &str, ip: Ipv6Addr) -> Ipv6State {
+            match self.0.get(&(interface.to_owned(), ip)) {
+                Some(flags) => Ipv6State {
+                    temporary: flags & TEMPORARY != 0,
+                    unusable: flags & UNUSABLE != 0,
+                },
+                None => Ipv6State::UNREADABLE,
+            }
         }
     }
 
@@ -159,7 +182,7 @@ mod platform {
         use super::*;
 
         #[test]
-        fn the_ipv6_table_marks_every_unstable_flag() {
+        fn the_ipv6_table_separates_temporary_from_unusable() {
             let table = "\
 20010db8000000000000000000000001 02 40 00 80 eth0
 20010db8000000000000000000000002 02 40 00 01 eth0
@@ -170,20 +193,41 @@ malformed line
 ";
             let flags = Ipv6Flags(parse(table));
             let ip = |last: u16| Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last);
-            assert!(!flags.unstable("eth0", ip(1)));
-            for unstable in 2..=5 {
-                assert!(flags.unstable("eth0", ip(unstable)), "address {unstable}");
+            let stable = Ipv6State::default();
+            assert_eq!(flags.state("eth0", ip(1)), stable);
+            assert_eq!(
+                flags.state("eth0", ip(2)),
+                Ipv6State {
+                    temporary: true,
+                    unusable: false
+                }
+            );
+            for unusable in 3..=5 {
+                assert!(
+                    flags.state("eth0", ip(unusable)).unusable,
+                    "address {unusable}"
+                );
             }
-            assert!(flags.unstable("eth1", ip(1)), "another interface's entry");
-            assert!(flags.unstable("eth0", ip(6)), "an address the table lacks");
+            assert_eq!(
+                flags.state("eth1", ip(1)),
+                Ipv6State::UNREADABLE,
+                "another interface's entry"
+            );
+            assert_eq!(
+                flags.state("eth0", ip(6)),
+                Ipv6State::UNREADABLE,
+                "an address the table lacks"
+            );
         }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod platform {
     use std::net::Ipv6Addr;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use super::Ipv6State;
 
     const IOC_INOUT: libc::c_ulong = 0xc000_0000;
     const IOCPARM_MASK: libc::c_ulong = 0x1fff;
@@ -202,8 +246,7 @@ mod platform {
     const IN6_IFF_DUPLICATED: libc::c_int = 0x04;
     const IN6_IFF_DEPRECATED: libc::c_int = 0x10;
     const IN6_IFF_TEMPORARY: libc::c_int = 0x80;
-    const UNSTABLE: libc::c_int =
-        IN6_IFF_TENTATIVE | IN6_IFF_DUPLICATED | IN6_IFF_DEPRECATED | IN6_IFF_TEMPORARY;
+    const UNUSABLE: libc::c_int = IN6_IFF_TENTATIVE | IN6_IFF_DUPLICATED | IN6_IFF_DEPRECATED;
 
     /// An `AF_INET6` socket to ask each address's flags on.
     pub(super) struct Ipv6Flags(Option<OwnedFd>);
@@ -216,16 +259,16 @@ mod platform {
             Self((fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) }))
         }
 
-        /// An address whose flags cannot be read counts as unstable.
-        pub(super) fn unstable(&self, interface: &str, ip: Ipv6Addr) -> bool {
+        /// An address whose flags cannot be read counts as unusable.
+        pub(super) fn state(&self, interface: &str, ip: Ipv6Addr) -> Ipv6State {
             let Some(socket) = &self.0 else {
-                return true;
+                return Ipv6State::UNREADABLE;
             };
             let name = interface.as_bytes();
             // SAFETY: `in6_ifreq` is plain old data, valid when zeroed.
             let mut request: libc::in6_ifreq = unsafe { std::mem::zeroed() };
             if name.len() >= request.ifr_name.len() {
-                return true;
+                return Ipv6State::UNREADABLE;
             }
             for (slot, byte) in request.ifr_name.iter_mut().zip(name) {
                 *slot = *byte as libc::c_char;
@@ -247,11 +290,14 @@ mod platform {
                 )
             };
             if status != 0 {
-                return true;
+                return Ipv6State::UNREADABLE;
             }
             // SAFETY: on success the kernel filled the `ifru_flags6` member.
             let flags = unsafe { request.ifr_ifru.ifru_flags6 };
-            flags & UNSTABLE != 0
+            Ipv6State {
+                temporary: flags & IN6_IFF_TEMPORARY != 0,
+                unusable: flags & UNUSABLE != 0,
+            }
         }
     }
 }
@@ -272,7 +318,7 @@ mod tests {
     }
 
     /// Reads the IPv6 flags through the platform's own path: a wrong ioctl
-    /// request or table parse marks every IPv6 address unstable. macOS always
+    /// request or table parse marks every IPv6 address unusable. macOS always
     /// has `::1`; a Linux host with IPv6 disabled has none and skips.
     #[test]
     fn the_ipv6_loopback_reads_as_a_stable_address() {
@@ -288,6 +334,6 @@ mod tests {
             return;
         };
         assert!(loopback.up_running, "{loopback:?}");
-        assert!(!loopback.unstable, "{loopback:?}");
+        assert!(!loopback.unusable && !loopback.temporary, "{loopback:?}");
     }
 }
