@@ -215,9 +215,11 @@ must ride the new dial behind its Subscribe); they also differ in notice
 clearing and `reconcileOutboxOnConnect(justSent:)`. Only the continuations are
 shared — do not merge the entries.
 
-**The direct carrier's Swift side** is three calls and one row (the policy is
+## Direct-carrier lifecycle
+
+The carrier policy is defined in
 [`direct-carriers.md`](../../../docs/modules/mobile/direct-carriers.md)
-§ Connection policy on P). `PathMonitor` (`App/Core/PathMonitor.swift`), started
+§ Connection policy on P. `PathMonitor` (`App/Core/PathMonitor.swift`), started
 once at launch and never stopped, hands every `NWPathMonitor` delivery to
 `networkChanged` on its own serial queue. It selects the first Wi-Fi, wired,
 or cellular interface in system preference order whose type the path uses
@@ -234,8 +236,11 @@ reason: nothing a later Task does may dial a leg on a carrier the suspend is
 about to strand. `didBecomeActive` fires `carrierForeground()` best-effort; it
 re-proves the suspended carrier or retires it, and a chat leg that died with it
 goes through `leg_death` like any relay corpse. Carrier state comes back
-through `CarrierEventsRelay` (`setCarrierSink`) into `ConnectionStore`. Settings
-shows one tappable Connection row; `ConnectionDetailsScreen` shows the current
+through `CarrierEventsRelay` (`setCarrierSink`) into `ConnectionStore`.
+
+## Connection details and diagnostics
+
+Settings shows one tappable Connection row; `ConnectionDetailsScreen` shows the current
 carrier and per-tier outcomes, without a last-check timestamp row. The chat
 header still shows only `legDown`. Labels use “LAN”, “Relay”, “IPv6”, “IPv4”
 and “IPv4 traversal”; internal carrier and wire names stay stable. Connection
@@ -244,8 +249,9 @@ rows and the diagnostics toggle have no explanatory captions.
 The details page has an opt-in live diagnostic console. Its height fills the
 remaining safe-area viewport, reserving a stable Follow latest row and bottom
 padding. The outer page scrolls only when its content exceeds the viewport
-(such as compact windows); it does not bounce when everything fits. Timestamps are muted and stage
-labels are colored, while copied logs remain plain text. `connection_diagnostics.rs`
+(such as compact windows); it does not bounce when everything fits.
+Timestamps are muted and stage labels are colored, while copied logs remain
+plain text. `connection_diagnostics.rs`
 owns a bounded in-memory queue of dedicated events (network changes, relay dials,
 candidate exchange, rendezvous, QUIC proof and chat rotation). It does not copy
 general logs, credentials, URLs, server response bodies or conversation frames.
@@ -254,8 +260,9 @@ hands batches to `ConnectionDiagnosticsStore` every 250 ms while enabled. Rust's
 `connection_diagnostics_capacity` supplies the shared retention limit. Disabling
 keeps displayed lines for copying; re-enabling appends to them. Leaving the page
 disables capture and clears the display. Scrolling pauses tail-following until
-the user scrolls back to the bottom or chooses Follow latest. Backgrounding keeps the opt-in so returning to
-the page captures suspend and recovery; nothing is persisted across app launches.
+the user scrolls back to the bottom or chooses Follow latest. Backgrounding
+keeps the opt-in so returning to the page captures suspend and recovery;
+nothing is persisted across app launches.
 
 ## Testing
 

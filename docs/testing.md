@@ -259,20 +259,61 @@ The direct-carrier tests that run over IPv6 loopback self-skip, through
 Apple-only reader; CI's `gateway-macos` job runs its tests on macOS whenever
 `crates/carrier/` or `crates/gateway/src/channel/carrier/` changes.
 
-The direct-carrier NAT matrix runs the real C, A and P binaries in network
-namespaces (`app/ios/ffi/tests/netns_matrix.rs`, `#[ignore]`d; see
-[`direct-carriers.md`](modules/mobile/direct-carriers.md#testing)). It needs
-root, `ip`, `iptables`, `tc` and `sqlite3`:
+### Direct-carrier NAT matrix
+
+This Linux integration test runs the real relay, gateway and iOS Rust networking
+core under simulated router/NAT conditions. It verifies carrier selection,
+relay fallback, idle keepalives and chat rotation. It does not run the iPhone UI
+or validate iOS VPN routing, Local Network permission, real relay HTTPS, or
+NAT64 without CLAT. The topology and expected outcomes live in
+[the carrier spec](modules/mobile/direct-carriers.md#testing); hardware checks
+live in [the iOS device checklist](../app/ios/docs/testing.md#manual-verification-checklist-device).
+
+Use a disposable Linux VM or CI runner. The test is ignored by ordinary test
+runs and is not part of the production app or gateway. It requires root,
+`ip`, `iptables`, `ip6tables`, `tc`, `sqlite3`, and `sch_netem` support for the
+packet-loss case. It cannot run natively on macOS.
 
 ```bash
 scripts/netns-matrix.sh                                   # every cell, 5 runs each
 NETNS_CELLS="cone/cone same-lan" NETNS_RUNS=1 scripts/netns-matrix.sh
 ```
 
-The script runs `cargo test` under `sudo`, which leaves root-owned files in
-`app/ios/target`; on a workstation, build with the script once and then run
-the compiled `netns_matrix` test binary under `sudo` directly, with the same
-`NETNS_*_BIN` variables the script exports.
+`NETNS_IDLE_SECS` defaults to 40 seconds; shortening it weakens the idle
+keepalive check. The script builds all three workspaces with `test-support`,
+exports `NETNS_*_BIN` paths and invokes the ignored test under `sudo`.
+Do not use these test-policy binaries as your normal gateway installation.
+The non-gating `netns-matrix` CI job runs only on non-draft PRs matching its
+path filters; a skipped draft job is not evidence the matrix passed.
+
+#### Isolation and cleanup
+
+- Bridges, virtual links, routes, NAT/firewall rules, forwarding settings and
+  packet loss are configured inside the test namespaces. No test link is
+  attached to the host's physical interfaces; host routes, DNS and VPN settings
+  are not rewritten. Namespaces share the host kernel and consume host resources;
+  this is not a VM security boundary.
+- Namespace names are currently `bnm<run_index>-<role>`, with roles `a`,
+  `nata`, `inet`, `natp`, `p` and `c`. Setup deletes existing namespaces
+  with those exact names. **Run only one matrix per host**, and do not use that
+  naming scheme for unrelated namespaces. Concurrent checkouts also collide.
+- Normal completion and Rust panic unwinding attempt to kill/wait for child
+  processes and delete the namespaces. Cleanup errors are ignored. Signals
+  that terminate the runner without unwinding, including SIGKILL, can leave
+  processes and namespaces behind. Reboot removes live network state, but
+  test files may remain.
+- Workspaces, databases and logs remain under
+  `/tmp/netns-matrix-<pid>-<cell>-<run_index>`. Running Cargo through `sudo`
+  can also leave root-owned build files in `app/ios/target`.
+
+After an interrupted run, inspect `sudo ip netns list` and
+`sudo ip netns pids <exact-name>`. Confirm no matrix is still running and
+identify the resources belonging to that run before stopping its processes
+and deleting its namespaces. Deleting a namespace name alone does not stop
+processes that still hold it. Avoid a broad namespace deletion or host firewall
+flush. In a disposable VM, discarding the VM is the simplest complete cleanup.
+
+### Remote-host workspace
 
 `remote-host/` is its own cargo workspace, excluded from the root one, so the
 commands above never run its tests. Run them from inside it

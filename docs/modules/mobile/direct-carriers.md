@@ -777,7 +777,7 @@ Browser remote access is out of scope and is not affected.
   - `not_offered`: no candidates of that tier, no rendezvous, or a path that may not dial it;
   - `denied`: the iOS Local Network permission is refused or pending (see *The prober*);
   - `skipped`.
-- **iOS.** `SettingsScreen` shows one tappable **Connection** row with "Via relay server", "Local network", "Direct · IPv6", "Direct · IPv4" or "IPv4 traversal". `ConnectionDetailsScreen` shows the last connection check time, network and per-path outcomes, explains the active route and router traversal, and offers a live connection console with copy/clear and tail-following. Capture is bounded in memory and stops on leaving the details page; dedicated events exclude secrets and conversation data (see [`connection.md`](../../../app/ios/docs/connection.md)). State reaches Swift through `CarrierSink`. **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
+- **iOS.** `SettingsScreen` shows one tappable **Connection** row with "Via relay server", "Local network", "IPv6", "Direct · IPv4" or "IPv4 traversal". `ConnectionDetailsScreen` shows the last connection check time, network and per-path outcomes, explains the active route and router traversal, and offers a live connection console with copy/clear and tail-following. Capture is bounded in memory and stops on leaving the details page; dedicated events exclude secrets and conversation data (see [`connection.md`](../../../app/ios/docs/connection.md)). State reaches Swift through `CarrierSink`. **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
 - **Gateway.** `baybo device status` (PR1) lists, for each approved device, its approval and last-seen times, its live legs by class with their carrier and start time, and its last offer's outcome and time.
   - It reads the running gateway's admin route `GET /v1/mobile/links`, authenticated with the vault's admin token, at the address `baybo_gateway::config::admin_dial_addr` derives from `gateway.bind_address` and `gateway.port` (a wildcard bind is dialed on loopback, as `baybo tui` does). It is the first `baybo device` command that queries the running gateway instead of the stores. When no link table comes back, it says why in one line (nothing answered, the gateway refused the token, or the vault holds none) and prints the device rows alone. With `--json`, `gateway.error` carries that line and each device's `legs` is `null`, not empty, while unknown.
   - It is shell-only, like the rest of the `device` family, which `crates/cli/src/slash.rs` already rejects as a whole.
@@ -871,7 +871,10 @@ Browser remote access is out of scope and is not affected.
 - a stream-level failure keeping the carrier; early and late unsolicited deaths returning the next probe deadline; the background suspend and foreground re-proof, including a second background/foreground cycle, a network change, and a duplicate proof finishing after a successful one;
 - pool invalidation on every transition; `forget_pairing` clearing carrier state.
 
-**The netns NAT matrix (PR2)** is `#[ignore]`d because it needs root. A non-gating `netns-matrix` CI job (`continue-on-error`, PR-only, path-filtered on the carrier code of all three sides) runs `scripts/netns-matrix.sh`. The script builds the three workspaces' binaries with `test-support` (`remote-host-protocol/test-support` for C, `baybo-gateway/test-support` for A, which forwards it, and the ffi's own `test-support` for P), passes their paths to the test through `NETNS_*_BIN`, and runs `sudo -E cargo test … -- --ignored`. `NETNS_CELLS`, `NETNS_RUNS` and `NETNS_IDLE_SECS` narrow and size a local run. It drives three real processes, each in its own namespace:
+**The netns NAT matrix** lives in `app/ios/ffi/tests/netns_matrix.rs`.
+[Running it, isolation boundaries, cleanup and CI behavior](../../testing.md#direct-carrier-nat-matrix)
+are documented in the testing guide. The script builds test-support binaries
+from all three workspaces. It drives three real processes:
 
 - C: the `remote-host` binary, its admission table seeded with one key;
 - A: the `baybo` gateway binary, so the gateway under test is the shipped entry point. The `seed_relay_binding` example (`crates/gateway/examples/`, behind `test-support`) first writes an approved relay binding (the device row and relay settings, and A's Noise static and relay node id in its vault) into the workspace, prints the phone's matching pairing record, then exits. The test reads A's link table through `baybo device status --json`;
@@ -931,11 +934,13 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 3. after an idle phase of at least 40 s, with rotation held off through a `test-support` knob so that only QUIC keepalives cross the NATs, the `CarrierKind` is unchanged and a second API request runs on the carrier with no relay fallback;
 4. once rotation is released, the chat rotates and a chat frame round-trips on the carrier.
 
-**Real-device checklist.** The owner runs this before PR2 is marked ready:
+**Real-device checklist.** The owner runs this before the iOS PR is marked ready.
+The [iOS testing guide](../../../app/ios/docs/testing.md#manual-verification-checklist-device)
+also covers VPN interface selection and diagnostic-console interactions:
 
-1. **Same Wi-Fi.** "Direct · LAN" appears within seconds of opening the app, and the Local Network prompt appears at most once. On first launch, "Direct · LAN" appears within `LOCAL_NETWORK_RETRY` of tapping Allow.
-2. **Cellular with IPv6.** "Direct · IPv6".
-3. **Cellular with IPv4 only.** "Direct · IPv4 (punched)" or "Relay", with the per-tier outcomes shown.
+1. **Same Wi-Fi.** "LAN" appears within seconds of opening the app, and the Local Network prompt appears at most once. On first launch, "LAN" appears within `LOCAL_NETWORK_RETRY` of tapping Allow.
+2. **Cellular with IPv6.** "IPv6".
+3. **Cellular with IPv4 only.** "IPv4 traversal" or "Relay", with the per-tier outcomes shown.
 4. **Walk out of Wi-Fi mid-conversation.** There is at most one reconnect, the app falls back to the relay, and it then re-upgrades.
 5. **Switch apps for under 5 s mid-reply.** The answer has no hole, and the carrier is kept.
 6. **Background for over a minute, then foreground.** The carrier is re-proven, or the chat resumes over the relay and then rotates.
@@ -943,7 +948,7 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 8. **Blob upload and download over a direct carrier.**
 9. **Gateway restart while on a direct carrier.** The app recovers to the relay, then re-upgrades.
 10. **`baybo device revoke`.** The app's carrier legs die within 5 s.
-11. **`baybo device status`** matches the app's Connection row, except that a hairpinned "Direct · IPv4 (punched)" carrier is listed as `lan` (see *Link table*).
+11. **`baybo device status`** matches the app's Connection row, except that a hairpinned "IPv4 traversal" carrier is listed as `lan` (see *Link table*).
 
 ## Deploying C (operators)
 
