@@ -219,7 +219,14 @@ shared — do not merge the entries.
 [`direct-carriers.md`](../../../docs/modules/mobile/direct-carriers.md)
 § Connection policy on P). `PathMonitor` (`App/Core/PathMonitor.swift`), started
 once at launch and never stopped, hands every `NWPathMonitor` delivery to
-`networkChanged` on its own serial queue. The call is synchronous because a
+`networkChanged` on its own serial queue. It selects the first Wi-Fi, wired,
+or cellular interface in system preference order whose type the path uses
+(`usesInterfaceType` includes the physical interface beneath a VPN). If none
+is available, it uses the first used interface or leaves the primary unset.
+This prevents a leading VPN tunnel
+from suppressing LAN probes without selecting an unused Wi-Fi interface on a
+cellular path. Sockets still follow system routing and VPN policy.
+The call is synchronous because a
 primary-interface change must retire the carrier and abort any probe before it
 returns. The `.background` barrier in `BayboApp` calls `carrierBackground()`
 right after `relayInvalidateApiLegs()`, on the same edge and for the same
@@ -227,9 +234,28 @@ reason: nothing a later Task does may dial a leg on a carrier the suspend is
 about to strand. `didBecomeActive` fires `carrierForeground()` best-effort; it
 re-proves the suspended carrier or retires it, and a chat leg that died with it
 goes through `leg_death` like any relay corpse. Carrier state comes back
-through `CarrierEventsRelay` (`setCarrierSink`) into `ConnectionStore`, which
-only the Settings Connection row reads; the chat header still shows nothing but
-`legDown`.
+through `CarrierEventsRelay` (`setCarrierSink`) into `ConnectionStore`. Settings
+shows one tappable Connection row; `ConnectionDetailsScreen` shows the current
+carrier and per-tier outcomes, without a last-check timestamp row. The chat
+header still shows only `legDown`. Labels use “LAN”, “Relay”, “IPv6”, “IPv4”
+and “IPv4 traversal”; internal carrier and wire names stay stable. Connection
+rows and the diagnostics toggle have no explanatory captions.
+
+The details page has an opt-in live diagnostic console. Its height fills the
+remaining safe-area viewport, reserving a stable Follow latest row and bottom
+padding. The outer page scrolls only when its content exceeds the viewport
+(such as compact windows); it does not bounce when everything fits. Timestamps are muted and stage
+labels are colored, while copied logs remain plain text. `connection_diagnostics.rs`
+owns a bounded in-memory queue of dedicated events (network changes, relay dials,
+candidate exchange, rendezvous, QUIC proof and chat rotation). It does not copy
+general logs, credentials, URLs, server response bodies or conversation frames.
+`set_connection_diagnostics` starts/stops capture; `drain_connection_diagnostics`
+hands batches to `ConnectionDiagnosticsStore` every 250 ms while enabled. Rust's
+`connection_diagnostics_capacity` supplies the shared retention limit. Disabling
+keeps displayed lines for copying; re-enabling appends to them. Leaving the page
+disables capture and clears the display. Scrolling pauses tail-following until
+the user scrolls back to the bottom or chooses Follow latest. Backgrounding keeps the opt-in so returning to
+the page captures suspend and recovery; nothing is persisted across app launches.
 
 ## Testing
 

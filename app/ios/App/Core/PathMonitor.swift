@@ -31,10 +31,29 @@ enum PathMonitor {
         _ = monitor
     }
 
-    /// The primary interface is the path's first available one — the one
-    /// `NWPath` itself prefers.
+    struct Interface: Equatable {
+        let name: String
+        let type: NWInterface.InterfaceType
+        let isUsed: Bool
+    }
+
+    // A VPN tunnel can lead the list while Wi-Fi still carries the path.
+    // Only a physical interface the path uses may supply LAN candidates.
+    static func primaryInterface(in interfaces: [Interface]) -> Interface? {
+        interfaces.first { interface in
+            guard interface.isUsed else { return false }
+            switch interface.type {
+            case .wifi, .wiredEthernet, .cellular: return true
+            default: return false
+            }
+        } ?? interfaces.first(where: \.isUsed)
+    }
+
     static func networkPath(from path: NWPath) -> NetworkPath {
-        let primary = path.availableInterfaces.first
+        let interfaces = path.availableInterfaces.map {
+            Interface(name: $0.name, type: $0.type, isUsed: path.usesInterfaceType($0.type))
+        }
+        let primary = primaryInterface(in: interfaces)
         return NetworkPath(
             satisfied: path.status == .satisfied,
             interfaceKind: primary.map { interfaceKind($0.type) } ?? .other,

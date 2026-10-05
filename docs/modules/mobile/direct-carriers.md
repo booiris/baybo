@@ -164,6 +164,12 @@ Neither side needs a port-forward rule, and a stateful firewall on either side i
 
 **P** gathers from the primary interface of the currently satisfied `NWPath`:
 
+- The primary is the first physical interface (Wi-Fi, wired or cellular) in
+  system preference order whose type `NWPath.usesInterfaceType` reports as
+  used, including beneath a VPN. With none, P uses the first used interface
+  or leaves the primary unset. A leading VPN tunnel must not hide active Wi-Fi, but an unused
+  Wi-Fi interface must not enable LAN probing on a cellular path. This only
+  selects candidate addresses; sockets continue to obey system routing.
 - It reports **all** non-deprecated GUAs, up to `MAX_UDP_HOST_CANDIDATES`. iOS picks a temporary address as the outbound source, so P cannot know in advance which one it will use.
 - It reports `Lan` IPv4 addresses and ULAs **only from a Wi-Fi or wired interface.** A private address on `pdp_ip*` (cellular CGNAT) can never be reached by a peer, and reporting it would make A spray datagrams at unrelated hosts on its own LAN.
 
@@ -771,7 +777,7 @@ Browser remote access is out of scope and is not affected.
   - `not_offered`: no candidates of that tier, no rendezvous, or a path that may not dial it;
   - `denied`: the iOS Local Network permission is refused or pending (see *The prober*);
   - `skipped`.
-- **iOS.** (PR2) `SettingsScreen` (`app/ios/App/Screens/SettingsScreen.swift`) gets a **Connection** row showing "Relay", "Direct · LAN", "Direct · IPv6", "Direct · IPv4" or "Direct · IPv4 (punched)". A **Last probe** detail shows the time, the network kind and the per-tier outcomes. State reaches Swift through a new `CarrierSink` callback interface, registered like the existing sinks (`app/ios/ffi/src/lib.rs:149-171`). **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
+- **iOS.** `SettingsScreen` shows one tappable **Connection** row with "Via relay server", "Local network", "Direct · IPv6", "Direct · IPv4" or "IPv4 traversal". `ConnectionDetailsScreen` shows the last connection check time, network and per-path outcomes, explains the active route and router traversal, and offers a live connection console with copy/clear and tail-following. Capture is bounded in memory and stops on leaving the details page; dedicated events exclude secrets and conversation data (see [`connection.md`](../../../app/ios/docs/connection.md)). State reaches Swift through `CarrierSink`. **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
 - **Gateway.** `baybo device status` (PR1) lists, for each approved device, its approval and last-seen times, its live legs by class with their carrier and start time, and its last offer's outcome and time.
   - It reads the running gateway's admin route `GET /v1/mobile/links`, authenticated with the vault's admin token, at the address `baybo_gateway::config::admin_dial_addr` derives from `gateway.bind_address` and `gateway.port` (a wildcard bind is dialed on loopback, as `baybo tui` does). It is the first `baybo device` command that queries the running gateway instead of the stores. When no link table comes back, it says why in one line (nothing answered, the gateway refused the token, or the vault holds none) and prints the device rows alone. With `--json`, `gateway.error` carries that line and each device's `legs` is `null`, not empty, while unknown.
   - It is shell-only, like the rest of the `device` family, which `crates/cli/src/slash.rs` already rejects as a whole.

@@ -2143,6 +2143,176 @@
         }
       }
     },
+    "connection.back": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back to settings"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "返回设置"
+          }
+        }
+      }
+    },
+    "connection.clear": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Clear"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清空"
+          }
+        }
+      }
+    },
+    "connection.copied": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Copied"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已复制"
+          }
+        }
+      }
+    },
+    "connection.copy": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Copy"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "复制"
+          }
+        }
+      }
+    },
+    "connection.details": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connection details"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "连接详情"
+          }
+        }
+      }
+    },
+    "connection.diagnostics": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connection diagnostics"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "连接诊断"
+          }
+        }
+      }
+    },
+    "connection.latest": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Follow latest"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "跟随最新日志"
+          }
+        }
+      }
+    },
+    "connection.live": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Live"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "实时"
+          }
+        }
+      }
+    },
+    "connection.stopped": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recording stopped"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已停止记录"
+          }
+        }
+      }
+    },
+    "connection.waiting": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for connection activity…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等待连接变化…"
+          }
+        }
+      }
+    },
     "cron.daily": {
       "extractionState": "stale",
       "localizations": {
@@ -5056,13 +5226,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Direct · IPv4"
+            "value": "IPv4"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "直连 · IPv4"
+            "value": "IPv4"
           }
         }
       }
@@ -5073,13 +5243,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Direct · IPv4 (punched)"
+            "value": "IPv4 traversal"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "直连 · IPv4（打洞）"
+            "value": "IPv4 穿透"
           }
         }
       }
@@ -5090,13 +5260,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Direct · IPv6"
+            "value": "IPv6"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "直连 · IPv6"
+            "value": "IPv6"
           }
         }
       }
@@ -5107,13 +5277,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Direct · LAN"
+            "value": "LAN"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "直连 · 局域网"
+            "value": "LAN"
           }
         }
       }
@@ -5130,7 +5300,7 @@
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "中继"
+            "value": "Relay"
           }
         }
       }
@@ -5169,36 +5339,19 @@
         }
       }
     },
-    "settings.lastProbe": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Last probe"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "上次探测"
-          }
-        }
-      }
-    },
     "settings.networkCellular": {
       "extractionState": "manual",
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Cellular"
+            "value": "Mobile data"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "蜂窝网络"
+            "value": "移动网络"
           }
         }
       }
@@ -5209,13 +5362,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Other"
+            "value": "Other network"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "其他"
+            "value": "其他网络"
           }
         }
       }
@@ -5243,13 +5396,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Wired"
+            "value": "Wired network"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "有线"
+            "value": "有线网络"
           }
         }
       }
@@ -5260,13 +5413,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "denied"
+            "value": "Access blocked"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "无权限"
+            "value": "访问被阻止"
           }
         }
       }
@@ -5277,13 +5430,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "failed"
+            "value": "Could not connect"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "失败"
+            "value": "连接失败"
           }
         }
       }
@@ -5294,13 +5447,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "not offered"
+            "value": "Unavailable"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "未提供"
+            "value": "当前不可用"
           }
         }
       }
@@ -5311,13 +5464,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "ok"
+            "value": "Succeeded"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "成功"
+            "value": "连接成功"
           }
         }
       }
@@ -5328,13 +5481,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "skipped"
+            "value": "Not tried"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "跳过"
+            "value": "未尝试"
           }
         }
       }
@@ -5345,13 +5498,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "timeout"
+            "value": "Timed out"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "超时"
+            "value": "等待超时"
           }
         }
       }
@@ -5413,13 +5566,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Punched"
+            "value": "IPv4 traversal"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "打洞"
+            "value": "IPv4 穿透"
           }
         }
       }
@@ -5453,7 +5606,7 @@
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "局域网"
+            "value": "LAN"
           }
         }
       }

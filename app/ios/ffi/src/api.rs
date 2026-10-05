@@ -8,6 +8,25 @@ use crate::binding::NOT_BOUND_MSG;
 use crate::direct::INVALID_TOKEN_CODE;
 use crate::transport::{NOT_CONNECTED_MSG, SESSION_CLOSED_MSG};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ConnectionLogStage {
+    Lifecycle,
+    Network,
+    Relay,
+    Probe,
+    Rendezvous,
+    Quic,
+    Chat,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ConnectionLogEntry {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub stage: ConnectionLogStage,
+    pub message: String,
+}
+
 /// The FFI error surface. `InvalidToken` and `NotBound` used to be string codes
 /// the webview matched on (`invalid_token` / the unbound prose); as enum variants
 /// the cross-language contract can't drift with a rewording.

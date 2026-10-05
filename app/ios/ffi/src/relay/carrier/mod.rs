@@ -36,8 +36,10 @@ use self::state::{
 use super::leg_pool::{BindingKey, PooledLeg, pool};
 use super::pairing::{PairedRecord, load_paired_record};
 use super::tunnel::LegIo;
+use crate::api::ConnectionLogStage as Stage;
 use crate::api::{CarrierSink, CarrierStatus, NetworkPath, ProbeReport};
 use crate::binding::{ActiveLeg, active_leg};
+use crate::connection_diagnostics::record as trace;
 
 pub(crate) use self::quic::{CarrierHandle, DialFailure, dial_leg};
 pub(crate) use self::state::{Lease, Trigger};
@@ -145,6 +147,13 @@ impl CarrierHub {
     /// satisfied, non-duplicate path then asks for a probe once the path
     /// settles.
     pub(crate) fn network_changed(&'static self, path: NetworkPath) {
+        trace(
+            Stage::Network,
+            format!(
+                "path satisfied={} interface={:?} ipv4={} ipv6={}",
+                path.satisfied, path.interface_kind, path.supports_ipv4, path.supports_ipv6
+            ),
+        );
         let satisfied = path.satisfied;
         let next = satisfied.then(|| {
             let interfaces = interfaces::enumerate();
@@ -279,6 +288,10 @@ impl CarrierHub {
         let ticket = match admitted {
             Ok(ticket) => ticket,
             Err(skip) => {
+                trace(
+                    Stage::Probe,
+                    format!("trigger={} skipped={}", trigger.as_str(), skip.as_str()),
+                );
                 log::debug!(
                     "direct_probe trigger={} skipped={}",
                     trigger.as_str(),
@@ -288,6 +301,15 @@ impl CarrierHub {
             }
         };
         let started = Instant::now();
+        trace(
+            Stage::Probe,
+            format!(
+                "probe={} trigger={} network={:?} started",
+                ticket.id,
+                trigger.as_str(),
+                ticket.local.kind
+            ),
+        );
         let task = {
             let ticket = ticket.clone();
             let record = record.clone();
@@ -359,10 +381,21 @@ impl CarrierHub {
             started.elapsed().as_millis(),
             tiers.summary()
         );
+        trace(
+            Stage::Probe,
+            format!(
+                "probe={} outcome={} elapsed_ms={} {}",
+                ticket.id,
+                outcome,
+                started.elapsed().as_millis(),
+                tiers.summary()
+            ),
+        );
         match finished {
             Finished::Up => {
                 if let (Some((handle, kind)), Some(id)) = (carrier, live_id) {
                     log::info!("carrier_up kind={}", label_str(kind));
+                    trace(Stage::Quic, format!("carrier up: {}", label_str(kind)));
                     self.generation.send_modify(|generation| *generation += 1);
                     if let Some(io) = proof {
                         park(io, record, pool_epoch).await;
@@ -400,6 +433,14 @@ impl CarrierHub {
             return;
         };
         retired.handle.close("retired");
+        trace(
+            Stage::Quic,
+            format!(
+                "carrier retired: {} lifetime_ms={}",
+                label_str(retired.kind),
+                retired.lifetime.as_millis()
+            ),
+        );
         log::info!(
             "carrier_down kind={} reason=\"{reason}\" lifetime_ms={}",
             label_str(retired.kind),

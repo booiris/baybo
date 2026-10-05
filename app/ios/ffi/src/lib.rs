@@ -12,6 +12,7 @@
 mod api;
 mod binding;
 mod blob_helper;
+mod connection_diagnostics;
 mod core;
 mod direct;
 mod gateway_api;
@@ -35,19 +36,24 @@ pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
     BlobServeOutcome, CarrierLabel, CarrierSink, CarrierStatus, ChatSearchGroup, ChatSearchHit,
     ChatSearchResults, ChatSessionSummary, ChatSubagentList, ChatSubagentStatus,
-    ChatSubagentSummary, ClientConfig, CronJobStatus, CronJobSummary, DeckCardInfo,
-    DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink, HiredBy,
-    IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput, IssueInfo, IssuePatch,
-    IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog, LlmModelInfo,
-    MessageLookup, NetworkInterfaceKind, NetworkPath, NewIssue, NewProject, PairAbortListener,
-    PairChallenge, PairTarget, PairedSummary, ProbeReport, ProjectActivity, ProjectAttention,
-    ProjectInfo, ProjectSettings, ProjectSink, PushToken, RunStatus, RunTrigger, SessionListSink,
-    SessionModelPin, StringPatch, SubIssueProgress, SubagentCursor, TeamMemberInfo, TierOutcome,
-    TierReport,
+    ChatSubagentSummary, ClientConfig, ConnectionLogEntry, ConnectionLogStage, CronJobStatus,
+    CronJobSummary, DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView,
+    FrameSink, HiredBy, IssueApprovalDecision, IssueAttachmentInfo, IssueAttachmentInput,
+    IssueInfo, IssuePatch, IssuePriority, IssueRunInfo, IssueRunLog, IssueStatus, LlmModelCatalog,
+    LlmModelInfo, MessageLookup, NetworkInterfaceKind, NetworkPath, NewIssue, NewProject,
+    PairAbortListener, PairChallenge, PairTarget, PairedSummary, ProbeReport, ProjectActivity,
+    ProjectAttention, ProjectInfo, ProjectSettings, ProjectSink, PushToken, RunStatus, RunTrigger,
+    SessionListSink, SessionModelPin, StringPatch, SubIssueProgress, SubagentCursor,
+    TeamMemberInfo, TierOutcome, TierReport,
 };
 use binding::{ActiveLeg, active_leg};
 use gateway_client::ActiveGatewayClient;
 use push::PushState;
+
+#[uniffi::export]
+pub fn connection_diagnostics_capacity() -> u32 {
+    connection_diagnostics::MAX_ENTRIES as u32
+}
 
 uniffi::setup_scaffolding!();
 
@@ -151,6 +157,10 @@ impl BayboClient {
     /// relay chat leg's are. Synchronous for the same reason as
     /// [`Self::relay_invalidate_api_legs`], and called right after it.
     pub fn carrier_background(&self) {
+        connection_diagnostics::record(
+            ConnectionLogStage::Lifecycle,
+            "App background: suspend carrier and cancel probes",
+        );
         relay::carrier::hub().background();
     }
 
@@ -158,6 +168,10 @@ impl BayboClient {
     /// look for one if none is live. The lifecycle edge is synchronous so it
     /// cannot overtake a later background barrier; network work is spawned.
     pub fn carrier_foreground(&self) {
+        connection_diagnostics::record(
+            ConnectionLogStage::Lifecycle,
+            "App foreground: verify carrier and resume discovery",
+        );
         relay::carrier::hub().foreground();
     }
 
@@ -172,6 +186,14 @@ impl BayboClient {
     /// state at once, then every change.
     pub fn set_carrier_sink(&self, sink: Arc<dyn CarrierSink>) {
         relay::carrier::hub().set_sink(sink);
+    }
+
+    pub fn set_connection_diagnostics(&self, enabled: bool) {
+        connection_diagnostics::set_enabled(enabled);
+    }
+
+    pub fn drain_connection_diagnostics(&self) -> Vec<ConnectionLogEntry> {
+        connection_diagnostics::drain()
     }
 
     /// Install the chat list's session-activity sink: the connection-global

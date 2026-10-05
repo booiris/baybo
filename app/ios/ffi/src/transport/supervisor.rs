@@ -585,6 +585,10 @@ impl Supervisor {
     }
 
     fn start_dial(&mut self, adopters: Vec<DialWaiter>) {
+        crate::connection_diagnostics::record(
+            crate::api::ConnectionLogStage::Chat,
+            "Starting chat connection",
+        );
         self.next_id += 1;
         let leg_id = self.next_id;
         self.leg = Leg::Dialing {
@@ -714,6 +718,10 @@ impl Supervisor {
             }
             Err(e) => {
                 log::warn!("chat dial failed: {e}");
+                crate::connection_diagnostics::record(
+                    crate::api::ConnectionLogStage::Chat,
+                    "Chat connection failed; waiting callers notified",
+                );
                 for waiter in adopters {
                     waiter.fail(clone_for_waiter(&e));
                 }
@@ -737,6 +745,10 @@ impl Supervisor {
         conn: Connection,
         on_carrier: bool,
     ) -> mpsc::UnboundedSender<OutboundCmd> {
+        crate::connection_diagnostics::record(
+            crate::api::ConnectionLogStage::Chat,
+            format!("Chat authenticated and ready; direct_carrier={on_carrier}"),
+        );
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         // Seeded now, not at the pump's first poll: the handshake reply that
         // produced `conn` already crossed the wire, so the leg is proven as of
@@ -795,6 +807,10 @@ impl Supervisor {
             return;
         }
         self.abandon_rotation("leg_died");
+        crate::connection_diagnostics::record(
+            crate::api::ConnectionLogStage::Chat,
+            "Chat disconnected; subscriptions will reconnect",
+        );
         if let Leg::Live { task, .. } = std::mem::replace(&mut self.leg, Leg::Idle) {
             task.abort();
         }
@@ -1068,6 +1084,10 @@ impl Supervisor {
 
     fn start_rotation(&mut self, leg_id: u64) {
         let gate = RotationGate::default();
+        crate::connection_diagnostics::record(
+            crate::api::ConnectionLogStage::Chat,
+            "Chat idle; rotating relay connection onto direct carrier",
+        );
         let dialer = self.dialer.clone();
         let report = RotationReport {
             tx: self.tx.clone(),
@@ -1113,10 +1133,18 @@ impl Supervisor {
         match result {
             Ok(conn) => {
                 log::info!("chat_rotation outcome=ok waited_ms={waited_ms}");
+                crate::connection_diagnostics::record(
+                    crate::api::ConnectionLogStage::Chat,
+                    format!("Chat rotation complete elapsed_ms={waited_ms}"),
+                );
                 self.rotated(leg_id, *conn);
             }
             Err(e) => {
                 log::info!("chat_rotation outcome=failed waited_ms={waited_ms} reason=\"{e}\"");
+                crate::connection_diagnostics::record(
+                    crate::api::ConnectionLogStage::Chat,
+                    format!("Chat rotation failed elapsed_ms={waited_ms}; recovering connection"),
+                );
                 if rotation.relay_ended {
                     self.leg_death(leg_id);
                 } else {

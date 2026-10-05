@@ -28,7 +28,9 @@ use std::io::ErrorKind;
 use super::network::LocalPath;
 use super::quic::{CarrierHandle, dial_leg};
 use super::state::{ProbeEnd, ProbeTicket};
+use crate::api::ConnectionLogStage as Stage;
 use crate::api::{CarrierLabel, TierOutcome, TierReport};
+use crate::connection_diagnostics::record as trace;
 use crate::relay::pairing::PairedRecord;
 use crate::relay::tunnel::{LegIo, tunnel_handshake};
 
@@ -338,6 +340,7 @@ pub(crate) async fn run(ticket: &ProbeTicket, record: &PairedRecord) -> ProbeRun
     let mut sockets = Sockets::bind(local);
     let mut tiers = Tiers::default();
     if sockets.v4.is_none() && sockets.v6.is_none() {
+        trace(Stage::Probe, "No usable UDP socket for this network");
         return ProbeRun::ended(ProbeEnd::Failed, tiers);
     }
 
@@ -356,6 +359,16 @@ pub(crate) async fn run(ticket: &ProbeTicket, record: &PairedRecord) -> ProbeRun
     };
 
     let (targets, targeted) = dial_targets(&offered.answer_udp, local, sockets.ports(), &policy);
+    trace(
+        Stage::Probe,
+        format!(
+            "gateway candidates={} eligible={} ipv4_socket={} ipv6_socket={}",
+            offered.answer_udp.len(),
+            targets.len(),
+            sockets.v4.is_some(),
+            sockets.v6.is_some()
+        ),
+    );
     tiers = targeted;
     let v4_probes = sockets.v4.as_mut().and_then(|socket| socket.probes.take());
     let rendezvous = offered.rendezvous.zip(v4_probes);
@@ -403,6 +416,7 @@ pub(crate) async fn run(ticket: &ProbeTicket, record: &PairedRecord) -> ProbeRun
                     Err(AttemptError::Failed) => TierOutcome::Failed,
                 };
                 tiers.record(target.tier, outcome);
+                trace(Stage::Quic, format!("tier={} outcome={} elapsed_ms={}", label_str(target.tier), outcome_str(outcome), elapsed.as_millis()));
                 log::info!(
                     "direct_attempt tier={} family={} candidate_class={} outcome={} elapsed_ms={}",
                     label_str(target.tier),
@@ -499,8 +513,16 @@ pub(crate) async fn run(ticket: &ProbeTicket, record: &PairedRecord) -> ProbeRun
         winner.endpoint.clone(),
         winner.socket.clone(),
     );
+    trace(
+        Stage::Quic,
+        "QUIC connected; proving gateway identity with Noise IK",
+    );
     match prove(&handle, record).await {
         Ok(proof) => {
+            trace(
+                Stage::Quic,
+                "Gateway identity verified; API proof leg ready",
+            );
             let local_ip = handle
                 .local_ip()
                 .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
@@ -515,6 +537,7 @@ pub(crate) async fn run(ticket: &ProbeTicket, record: &PairedRecord) -> ProbeRun
             }
         }
         Err(reason) => {
+            trace(Stage::Quic, "Gateway proof failed; retaining relay");
             log::info!("direct_probe: the carrier did not prove itself: {reason}");
             handle.close("proof failed");
             tiers.set(target.tier, TierOutcome::Failed);
@@ -591,14 +614,30 @@ async fn exchange(record: &PairedRecord, sealer: &DeviceSealer, offer: &DeviceOf
             &record.remote_api_key,
         );
     }
+    trace(
+        Stage::Probe,
+        "Sending encrypted candidate offer through relay",
+    );
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             log::info!("direct_probe: offer POST failed: {error}");
+            trace(
+                Stage::Probe,
+                format!(
+                    "Offer request failed: timeout={} connect={}",
+                    error.is_timeout(),
+                    error.is_connect()
+                ),
+            );
             return Exchange::Failed;
         }
     };
     let status = response.status();
+    trace(
+        Stage::Probe,
+        format!("Offer response HTTP {}", status.as_u16()),
+    );
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
     {
@@ -621,6 +660,7 @@ async fn exchange(record: &PairedRecord, sealer: &DeviceSealer, offer: &DeviceOf
         Ok(body) => body,
         Err(error) => {
             log::info!("direct_probe: unreadable offer response: {error}");
+            trace(Stage::Probe, "Offer response has invalid format");
             return Exchange::Failed;
         }
     };
@@ -633,6 +673,7 @@ async fn exchange(record: &PairedRecord, sealer: &DeviceSealer, offer: &DeviceOf
         Ok(answer) => answer,
         Err(error) => {
             log::warn!("direct_probe: the answer was refused: {error}");
+            trace(Stage::Probe, "Encrypted answer failed verification");
             return Exchange::Failed;
         }
     };
@@ -695,6 +736,18 @@ async fn attempt(
 ) -> AttemptResult {
     let started = Instant::now();
     let guarded = is_local_network_destination(target.address.ip(), local, policy);
+    trace(
+        Stage::Quic,
+        format!(
+            "Trying {} over {}; sending authenticated punch",
+            label_str(target.tier),
+            if target.address.is_ipv4() {
+                "IPv4"
+            } else {
+                "IPv6"
+            }
+        ),
+    );
     let punches = async {
         let mut burst = PunchBurst::new();
         while burst.next_round().await.is_some() {
@@ -805,6 +858,10 @@ async fn register(
     let (key, address) = match resolved {
         Ok((key, Ok(address))) => (key, address),
         Ok((_, Err(error))) => {
+            trace(
+                Stage::Rendezvous,
+                "DNS lookup rejected: resolution failed or returned a non-public IPv4 address",
+            );
             log::debug!("direct_probe: rendezvous address refused: {error}");
             return Registered::Unresolved;
         }
@@ -823,6 +880,10 @@ async fn register(
     else {
         return Registered::Unresolved;
     };
+    trace(
+        Stage::Rendezvous,
+        "Public IPv4 resolved; registering UDP mapping",
+    );
     // A's punches land on the same queue; the latch ignores them.
     match registration
         .until_peer(
@@ -832,8 +893,17 @@ async fn register(
         )
         .await
     {
-        RegisterOutcome::Peer(srflx) => Registered::Peer(srflx),
-        RegisterOutcome::NoPeer { .. } => Registered::NoPeer,
+        RegisterOutcome::Peer(srflx) => {
+            trace(Stage::Rendezvous, "Peer UDP mapping received");
+            Registered::Peer(srflx)
+        }
+        RegisterOutcome::NoPeer { .. } => {
+            trace(
+                Stage::Rendezvous,
+                "No peer mapping within rendezvous budget",
+            );
+            Registered::NoPeer
+        }
     }
 }
 

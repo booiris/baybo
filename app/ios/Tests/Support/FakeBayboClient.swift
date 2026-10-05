@@ -954,6 +954,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func carrierForeground() { lock.withLock { carrierForegrounds += 1 } }
     func networkChanged(path: NetworkPath) { lock.withLock { networkPaths.append(path) } }
     func setCarrierSink(sink: CarrierSink) {}
+    func setConnectionDiagnostics(enabled: Bool) {}
+    func drainConnectionDiagnostics() -> [ConnectionLogEntry] { [] }
     func relayPreconnect() async throws { throw Self.unsupported }
     func setPushToken(token: PushToken) {}
     func setSessionListSink(sink: SessionListSink) {}

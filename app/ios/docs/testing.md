@@ -611,3 +611,15 @@ see the device checklist below.
    outbox (send offline → red dot / auto-retry → reconnect resend confirms).
 5. Keyboard: composer rides the keyboard, header never moves, transcript holds
    the newest edge through the resize.
+6. Relay binding on the gateway's Wi-Fi: enable a VPN that permits LAN traffic
+   and return to the app. Settings must reach LAN, and `baybo device status`
+   must show LAN legs. Repeat with VPN off, then switch to cellular with VPN
+   on: the LAN tier must be `not_offered`. `PathMonitorTests` covers physical
+   interface selection beneath a tunnel and excludes unused Wi-Fi interfaces.
+7. Settings shows only Connection. Open it for probe/tier details, enable
+   Connection diagnostics, switch networks or background/foreground the app,
+   then check the real event stream, copy and clear. Leaving and reopening must
+   disable capture and clear the console. `ConnectionDiagnosticsTests` covers
+   capture lifetime and bounded display; `ConnectionDetailsUITests` covers the
+   navigation and the real FFI start event using `-baybo-open-home
+   -baybo-home-tab settings -baybo-demo-connection` (debug-only fixture status).

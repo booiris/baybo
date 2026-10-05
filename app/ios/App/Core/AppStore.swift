@@ -54,6 +54,7 @@ final class AppStore: ObservableObject {
     /// One entry on the outer NavigationStack over the home shell: a pushed
     /// conversation, the archived list, or one scheduled job's fires.
     enum ChatRoute: Hashable {
+        case connection
         case session(String)
         case archived
         /// A **cron group** (`docs/cron-groups.md`): every fire of one cron job,
@@ -559,6 +560,17 @@ final class AppStore: ObservableObject {
             // arrival so the overlay is screenshotable headlessly.
             if args.contains("-baybo-demo-logout-confirm") {
                 confirmLogout = true
+            }
+            if args.contains("-baybo-demo-connection") {
+                ConnectionStore.shared.apply(CarrierStatus(
+                    carrier: .lan,
+                    lastProbe: ProbeReport(
+                        finishedAtMs: Int64(Date().timeIntervalSince1970 * 1000),
+                        network: .wifi, endedOn: .lan,
+                        tiers: [TierReport(tier: .lan, outcome: .ok),
+                                TierReport(tier: .ipv6, outcome: .notOffered),
+                                TierReport(tier: .ipv4, outcome: .notOffered),
+                                TierReport(tier: .ipv4Punched, outcome: .skipped)])))
             }
             if args.contains("-baybo-demo-board") {
                 homeTab = .projects
