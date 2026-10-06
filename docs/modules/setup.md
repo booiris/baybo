@@ -310,7 +310,10 @@ pub mod test_support {
 `flow::run_subscription_login` owns the shared setup and CLI sign-in UI. It
 offers local automatic callback or remote callback URL paste, displays numbered
 instructions for the selected mode, and uses `Prompter::password` for hidden
-callback input. OAuth validation and credential persistence stay in `baybo-llm`.
+callback input. Remote instructions explicitly mark a localhost browser error
+as normal, with bold yellow emphasis on a color-capable terminal (`NO_COLOR`
+and `TERM=dumb` use plain text). OAuth validation and credential persistence
+stay in `baybo-llm`.
 
 | Crate                | What setup uses                                                         |
 | -------------------- | ----------------------------------------------------------------------- |

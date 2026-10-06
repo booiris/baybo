@@ -1,7 +1,7 @@
 //! LLM provider step. Mutates `BayboConfig::llm` in place; never writes
 //! `baybo.json` itself.
 
-use std::sync::Arc;
+use std::{io::IsTerminal, sync::Arc};
 
 use baybo_config::{BayboConfig, LlmEntry, LlmModelSpec};
 use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
@@ -306,7 +306,10 @@ pub async fn run_subscription_login<P: Prompter>(
 {{url}}
 
 2. Sign in to ChatGPT and approve the Baybo connection.
-3. At the final redirect, even if the page cannot connect, select the browser
+
+{{callback_notice}}
+
+3. At the final redirect, select the browser
    address bar (Ctrl+L on Linux, Cmd+L on macOS) and copy the COMPLETE URL.
    It must start with:
 
@@ -323,6 +326,7 @@ pub async fn run_subscription_login<P: Prompter>(
                     INSTRUCTIONS
                         .replace("{{url}}", url)
                         .replace("{{redirect}}", redirect)
+                        .replace("{{callback_notice}}", &remote_callback_notice())
                 );
                 prompter
                     .password("Paste complete callback URL (input hidden): ")
@@ -367,6 +371,21 @@ Complete sign-in within 5 minutes; Ctrl+C cancels.
         "openai-subscription sign-in complete"
     );
     Ok(())
+}
+
+fn remote_callback_notice() -> String {
+    const NOTICE: &str = r#"A browser error such as "This site can't be reached" at 127.0.0.1 is NORMAL in this mode.
+Keep the browser tab open. Copy its COMPLETE address-bar URL and paste it below."#;
+    const EMPHASIS: &str = "\x1b[1;33m";
+    const RESET: &str = "\x1b[0m";
+    if std::io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+    {
+        format!("{EMPHASIS}{NOTICE}{RESET}")
+    } else {
+        NOTICE.into()
+    }
 }
 
 #[cfg(test)]
