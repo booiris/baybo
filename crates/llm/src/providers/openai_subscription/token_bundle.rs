@@ -10,8 +10,10 @@ use crate::LlmError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OAuthTokenBundle {
-    /// JWT bearer sent as `Authorization: Bearer ...` to the Codex Responses
-    /// API. Refreshed via the OAuth `refresh_token` grant when nearly expired
+    #[serde(default)]
+    pub connection: Option<ChatGptConnection>,
+    /// OAuth bearer sent as `Authorization: Bearer ...` to the Codex Responses
+    /// API. New connections may use opaque tokens. Refreshed via the OAuth `refresh_token` grant when nearly expired
     /// or when the API rejects it with 401.
     pub access_token: String,
     /// Opaque token used to mint a new `access_token`. Server may rotate it
@@ -33,7 +35,34 @@ pub struct OAuthTokenBundle {
     pub obtained_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatGptConnection {
+    pub client_id: String,
+    pub subject: String,
+    pub scopes: Vec<String>,
+}
+
 impl OAuthTokenBundle {
+    pub fn require_sharing(&self) -> crate::Result<()> {
+        if self.sharing_enabled() {
+            Ok(())
+        } else {
+            Err(LlmError::Auth(format!(
+                "ChatGPT identity connected, but plan usage is disabled. Re-authenticate to enable it, or use an API-key provider. Manage usage: {}",
+                super::MANAGE_USAGE_URL,
+            )))
+        }
+    }
+
+    pub fn sharing_enabled(&self) -> bool {
+        self.connection.as_ref().is_some_and(|connection| {
+            connection
+                .scopes
+                .iter()
+                .any(|scope| scope == super::oauth::SHARING_SCOPE)
+        })
+    }
+
     /// Build a fresh bundle from a token endpoint response. Parses the JWTs
     /// to populate the cached `account_id` and `expires_at` fields. Failure
     /// here is a "definitely-broken upstream" condition — the refresh / login
@@ -67,6 +96,7 @@ impl OAuthTokenBundle {
             .unwrap_or(0);
 
         Ok(Self {
+            connection: None,
             access_token,
             refresh_token,
             id_token,
@@ -80,6 +110,9 @@ impl OAuthTokenBundle {
     /// us refresh proactively rather than racing the server's clock tolerance
     /// on a request that's "still valid for 4 seconds".
     pub fn is_near_expiry(&self, skew_secs: i64) -> bool {
+        if self.connection.is_some() && !self.sharing_enabled() {
+            return false;
+        }
         let now = Utc::now().timestamp();
         now >= self.expires_at.saturating_sub(skew_secs)
     }
@@ -109,10 +142,7 @@ impl OAuthTokenBundle {
     }
 }
 
-/// Decode and parse the payload (middle segment) of a JWT. Signature verification
-/// is intentionally skipped: the JWT is something we *minted via OAuth in this
-/// process*, not something we received from a third party we don't trust.
-/// Tampered tokens get rejected by the upstream API on the next call anyway.
+/// Decode display metadata and legacy expiry only; new OAuth identities are verified before storage.
 fn parse_jwt_payload(jwt: &str) -> Result<Value, JwtParseError> {
     let mut parts = jwt.split('.');
     let (_header, payload, _signature) = match (parts.next(), parts.next(), parts.next()) {
@@ -201,6 +231,7 @@ mod tests {
     fn is_near_expiry_respects_skew() {
         let now = Utc::now().timestamp();
         let bundle = OAuthTokenBundle {
+            connection: None,
             access_token: "a".into(),
             refresh_token: "r".into(),
             id_token: "i".into(),

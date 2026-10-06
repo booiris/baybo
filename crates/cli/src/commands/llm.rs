@@ -6,8 +6,7 @@ use std::time::Instant;
 use baybo_config::{BayboConfig, LlmEntry};
 use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
 use baybo_llm::providers::openai_subscription::{
-    DeviceCode, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS, VaultTokenStore,
-    device_code_login, pkce_login, revoke,
+    MANAGE_USAGE_URL, PROVIDER_NAME as SUB_PROVIDER_NAME, VaultTokenStore, revoke,
 };
 use baybo_llm::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry};
 use baybo_security::SecretVault;
@@ -541,6 +540,7 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
     // we're removing the only subscription entry — otherwise leave
     // it alone so the surviving entry keeps its login.
     let mut sub_revoked = false;
+    let mut sub_revoke_failed = false;
     if provider == SUB_PROVIDER_NAME {
         let other_sub_entries = ctx
             .config
@@ -552,12 +552,12 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
             if let Ok(Some(bundle)) = store.load().await {
                 let http = baybo_security::http::client(ctx.proxy_settings().as_ref())
                     .map_err(|e| CliError::Manager(format!("build proxied http client: {e}")))?;
-                match revoke(&bundle.refresh_token, &http).await {
+                match revoke(&bundle, &http).await {
                     Ok(()) => sub_revoked = true,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "remove: openai-subscription server-side revoke failed; clearing local vault entry"
-                    ),
+                    Err(e) => {
+                        sub_revoke_failed = true;
+                        tracing::warn!(error = %e, "remove: remote OAuth revocation was not confirmed");
+                    }
                 }
             }
             if let Err(e) = store.clear().await {
@@ -576,11 +576,14 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
         .map_err(|e| CliError::Config(format!("config validation failed: {e}")))?;
     new_config.write_to_file(&target).await?;
 
-    let human = format!(
+    let mut human = format!(
         "removed entry {entry_name:?} (provider={provider}); wrote {}{}",
         target.display(),
         notify_running_gateway(ctx),
     );
+    if sub_revoke_failed {
+        human.push_str(&format!("\nRemote revocation was not confirmed. Disconnect Baybo in ChatGPT Settings: {MANAGE_USAGE_URL}"));
+    }
     Ok(CommandOutput {
         human,
         data: Some(json!({
@@ -825,46 +828,9 @@ async fn run_subscription_login(
     vault: &Arc<SecretVault>,
     proxy: Option<baybo_security::http::ProxySettings>,
 ) -> Result<()> {
-    let store = VaultTokenStore::new(vault.clone());
-    let http = baybo_security::http::client(proxy.as_ref())
-        .map_err(|e| CliError::Manager(format!("build proxied http client: {e}")))?;
-    // PKCE wants a browser that can reach 127.0.0.1; device code
-    // only needs a browser somewhere. On a headless SSH box the TTY
-    // is fine but the localhost callback won't reach a browser, so
-    // we ask rather than auto-pick on is_terminal alone.
-    let methods = ["PKCE (open browser, localhost callback)", "Device code"];
-    let bundle = if !std::io::stdin().is_terminal() {
-        device_code_login(print_device_code, &http).await
-    } else {
-        match select_one("Login method:", &methods)? {
-            0 => pkce_login(print_pkce_url, &http).await,
-            _ => device_code_login(print_device_code, &http).await,
-        }
-    }
-    .map_err(|e| CliError::Manager(format!("openai-subscription login: {e}")))?;
-    store
-        .save(&bundle)
-        .await
-        .map_err(|e| CliError::Manager(format!("openai-subscription vault save: {e}")))?;
-    eprintln!(
-        "signed in as {} (plan: {})\ntoken stored at vault://{}",
-        bundle.email().unwrap_or_else(|| "<unknown>".into()),
-        bundle.plan_type().unwrap_or_else(|| "<unknown>".into()),
-        VAULT_KEY_TOKENS,
-    );
+    let mut prompter = baybo_setup::TtyPrompter::new()?;
+    baybo_setup::flow::run_subscription_login(&mut prompter, vault, proxy).await?;
     Ok(())
-}
-
-fn print_pkce_url(url: &str) -> std::io::Result<()> {
-    println!("\nopen this URL to sign in:\n  {url}\n");
-    Ok(())
-}
-
-fn print_device_code(code: &DeviceCode) {
-    println!(
-        "\nopen this URL on any device, sign in, and enter the code:\n  url:  {}\n  code: {}\n",
-        code.verification_url, code.user_code,
-    );
 }
 
 /// The thinking rungs `provider` can actually be told, cheapest first.

@@ -307,11 +307,19 @@ pub mod test_support {
 
 ## Collaboration
 
+`flow::run_subscription_login` owns the shared setup and CLI sign-in UI. It
+offers local automatic callback or remote callback URL paste, displays numbered
+instructions for the selected mode, and uses `Prompter::password` for hidden
+callback input. Remote instructions explicitly mark a localhost browser error
+as normal, with bold yellow emphasis on a color-capable terminal (`NO_COLOR`
+and `TERM=dumb` use plain text). OAuth validation and credential persistence
+stay in `baybo-llm`.
+
 | Crate                | What setup uses                                                         |
 | -------------------- | ----------------------------------------------------------------------- |
 | `baybo-config`        | `BayboConfig` (load/validate/write), `LlmEntry`, `BrowserConfig`         |
 | `baybo-security`      | `EncryptionKey::new`, `SecretVault::new`/`store_secret`                 |
-| `baybo-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, `LITE_MODEL`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`). (The provider picker is driven by `LlmProviderRegistry::with_default_providers().provider_names()`, so registry additions appear automatically — and **registration order is picker order**, which is why `openai-subscription` is registered first: it is the only keyless provider and the menu viewport shows ~12 of the 19 rows.) |
+| `baybo-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, `LITE_MODEL`, dynamic OAuth (`pkce_login_with_callback`, `LoginCallback`, `VaultTokenStore`). (The provider picker is driven by `LlmProviderRegistry::with_default_providers().provider_names()`, so registry additions appear automatically — and **registration order is picker order**, which is why `openai-subscription` is registered first: it is the only keyless provider and the menu viewport shows ~12 of the 19 rows.) |
 | `baybo-channels`      | `register_wire::*`, `registration::Prompter` + `RegistrationResult`     |
 | `baybo-storage`       | `Store::open`, `retry_on_busy`. (`ChannelBotStore` is defined in `baybo-store` and imported via `baybo_store::ChannelBotStore`.) |
 | `baybo-workspace`     | `WorkspacePaths`, `ensure_layout`, `default_workspace_root` |
