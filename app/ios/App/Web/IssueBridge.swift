@@ -4,7 +4,7 @@ import UIKit
 import WebKit
 
 @MainActor
-final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
+final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink, BottomInsetSink {
     /// Same name as the transcript's. See the type doc.
     static let messageHandlerName = TranscriptBridge.messageHandlerName
 
@@ -13,7 +13,7 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
     private(set) weak var store: IssueStore?
 
     private var ready = false
-    private var pending: [String] = []
+    private(set) var pending: [String] = []
     private var lastBottomInset = Int.min
     private var composerTop: CGFloat?
     private var targetId: String?
@@ -350,7 +350,7 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink {
         pushBottomInset()
     }
 
-    private func pushBottomInset() {
+    func pushBottomInset() {
         guard let composerTop, let window = webView?.window else { return }
         let px = max(0, Int((window.bounds.height - composerTop).rounded()))
         guard px != lastBottomInset else { return }
