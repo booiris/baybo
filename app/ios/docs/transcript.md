@@ -428,6 +428,13 @@ frame while following.
 
 One signal covers keyboard, composer growth, and the notice line.
 
+The bridge retains the composer edge even before the webview has a window.
+`InsetTrackingWebView` (shared with the issue page) retries the inset on window attachment and layout, with
+whole-pixel deduplication in the bridge. Notification entry can measure the
+composer and finish page readiness before attachment; neither event is guaranteed
+to fire again afterward. Window layout also retries when the window height changes
+without a new composer edge. Page readiness still forces a replay after a reload.
+
 ## Wire-type sentinels
 
 Two compile-time pins, both type-only, both enforced by `pnpm build` (`ios-web` in CI is

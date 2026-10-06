@@ -12,7 +12,7 @@ import WebKit
 /// eval before the page commits would vanish). Web→native messages arrive on
 /// the `baybo` script message handler as `{ type: ... }` objects.
 @MainActor
-final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
+final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomInsetSink {
     static let messageHandlerName = "baybo"
 
     private weak var store: (any TranscriptTarget)?			
@@ -407,7 +407,8 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink {
     /// the value itself — is replayed from the `ready` handler because a
     /// jetsammed web process silently reloads to a page whose inset var is
     /// back at 0 while the composer geometry never re-fires.
-    private func pushBottomInset() {
+    /// `InsetTrackingWebView` also retries on window attachment and layout.
+    func pushBottomInset() {
         guard let composerTop, let window = webView?.window else { return }
         let px = max(0, Int((window.bounds.height - composerTop).rounded()))
         guard px != lastBottomInset else { return }
