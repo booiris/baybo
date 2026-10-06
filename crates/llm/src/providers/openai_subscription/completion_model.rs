@@ -1,5 +1,5 @@
-//! Codex Responses API client driven by an OAuth bearer.
-//! Endpoint: `<base_url>/codex/responses`. See
+//! Responses API client driven by a Baybo OAuth bearer, with legacy Codex routing.
+//! Endpoint: `<base_url>/responses`. See
 //! `docs/modules/llm-openai-subscription.md` for design rationale.
 
 use std::collections::HashMap;
@@ -18,16 +18,18 @@ use rig::message::Message;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use super::MANAGE_USAGE_URL;
 use super::catalog;
-use super::oauth::ORIGINATOR;
+use super::legacy_oauth::LEGACY_ORIGINATOR;
 use super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
 use super::token_bundle::OAuthTokenBundle;
 use super::token_store::VaultTokenStore;
 use crate::tool_name::{sanitize_tool_name, unsanitize_tool_name};
 use crate::{DOCUMENT_FILENAME_PARAM, LlmError, LlmStream, StreamEvent, TokenUsage, ToolCallInfo};
 
-pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const RESPONSES_PATH: &str = "/codex/responses";
+pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const LEGACY_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const RESPONSES_PATH: &str = "/responses";
 // The endpoint 400s on any field it doesn't know, and it knows neither
 // `prompt_cache_retention` nor `prompt_cache_options`: cache lifetime is
 // not ours to set.
@@ -81,7 +83,9 @@ impl OpenAiSubscriptionCompletionModel {
         http: reqwest::Client,
         background: BackgroundRefresh,
     ) -> Self {
-        let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let base_url = base_url
+            .filter(|url| url.trim_end_matches('/') != LEGACY_BASE_URL)
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let reasoning_effort = super::reasoning::resolve_effort(&model, reasoning_effort);
         Self {
             model,
@@ -89,6 +93,19 @@ impl OpenAiSubscriptionCompletionModel {
             reasoning_effort,
             refresh: RefreshCoordinator::shared(token_store, http.clone(), background),
             http,
+        }
+    }
+
+    fn endpoint(&self, bundle: &OAuthTokenBundle, path: &str) -> String {
+        if bundle.connection.is_none() {
+            let base = if self.base_url_is_default() {
+                LEGACY_BASE_URL
+            } else {
+                &self.base_url
+            };
+            format!("{}/codex{path}", base.trim_end_matches('/'))
+        } else {
+            format!("{}{path}", self.base_url.trim_end_matches('/'))
         }
     }
 
@@ -254,16 +271,17 @@ impl OpenAiSubscriptionCompletionModel {
         Ok(self.adapt_response(response, extras.prompt_cache_key))
     }
 
-    /// Live model discovery against `<base>/codex/models`, widened by
-    /// [`catalog::supplement`] with the gpt-5.6 slugs the endpoint may
-    /// not list yet.
+    /// Discover the account's visible models; only legacy credentials use the static supplement.
     pub async fn list_remote_models(&self) -> crate::Result<Vec<crate::LiveModelInfo>> {
-        let url = format!(
-            "{}/codex/models?client_version={}",
-            self.base_url,
-            env!("CARGO_PKG_VERSION")
-        );
         let bundle = self.refresh.ensure_fresh_bundle().await?;
+        if bundle.connection.is_some() {
+            bundle.require_sharing()?;
+        }
+        let mut url = self.endpoint(&bundle, "/models");
+        if bundle.connection.is_none() {
+            url.push_str(&format!("?client_version={}", env!("CARGO_PKG_VERSION")));
+        }
+
         let resp = self.send_models_get(&url, &bundle).await?;
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             let refreshed = self.refresh.force_refresh(&bundle).await?;
@@ -279,7 +297,17 @@ impl OpenAiSubscriptionCompletionModel {
                 format!("openai-subscription: GET /codex/models returned {status}: {body}"),
             ));
         }
-        Ok(catalog::supplement(parse_models_response(resp).await?))
+        let models = parse_models_response(resp).await?;
+        if bundle.connection.is_some() {
+            Ok(models
+                .into_iter()
+                .filter(|model| {
+                    model.extras.get("visibility").and_then(Value::as_str) == Some("list")
+                })
+                .collect())
+        } else {
+            Ok(catalog::supplement(models))
+        }
     }
 
     async fn send_models_get(
@@ -305,9 +333,13 @@ impl OpenAiSubscriptionCompletionModel {
         let mut req = self
             .http
             .request(method, url)
-            .bearer_auth(&bundle.access_token)
-            .header("originator", ORIGINATOR);
-        if let Some(account_id) = &bundle.account_id {
+            .bearer_auth(&bundle.access_token);
+        if bundle.connection.is_none() {
+            req = req.header("originator", LEGACY_ORIGINATOR);
+        }
+        if bundle.connection.is_none()
+            && let Some(account_id) = &bundle.account_id
+        {
             req = req.header("ChatGPT-Account-Id", account_id);
         }
         req
@@ -319,12 +351,20 @@ impl OpenAiSubscriptionCompletionModel {
         body: &Value,
         affinity: &HeaderMap,
     ) -> crate::Result<reqwest::Response> {
-        let url = format!("{}{}", self.base_url, RESPONSES_PATH);
+        if bundle.connection.is_some() {
+            bundle.require_sharing()?;
+        }
+        let url = self.endpoint(bundle, RESPONSES_PATH);
+
         debug!(url = %url, "POST openai-subscription Responses");
-        self.authed_request(reqwest::Method::POST, &url, bundle)
-            .header("OpenAI-Beta", "responses=experimental")
+        let mut request = self.authed_request(reqwest::Method::POST, &url, bundle);
+        if bundle.connection.is_none() {
+            request = request
+                .header("OpenAI-Beta", "responses=experimental")
+                .headers(affinity.clone());
+        }
+        request
             .header("Accept", "text/event-stream")
-            .headers(affinity.clone())
             .json(body)
             .send()
             .await
@@ -338,12 +378,11 @@ impl OpenAiSubscriptionCompletionModel {
             // provider message rather than an empty stream.
             let stream = stream::once(async move {
                 let body = response.text().await.unwrap_or_default();
-                let message =
-                    format!("openai-subscription: Codex Responses returned {status}: {body}");
+                let message = format!("openai-subscription: Responses returned {status}: {body}");
                 Err(quota_exhausted(&body)
                     .map(|resets_in| LlmError::QuotaExhausted {
                         resets_in,
-                        message: message.clone(),
+                        message: format!("{message}; manage usage: {MANAGE_USAGE_URL}"),
                     })
                     .unwrap_or_else(|| crate::status_to_error(status.as_u16(), message)))
             });
@@ -393,7 +432,14 @@ fn quota_exhausted(body: &str) -> Option<Option<std::time::Duration>> {
         .ok()?
         .get(ERROR_FIELD)?
         .clone();
-    if error.get(ERROR_TYPE_FIELD).and_then(Value::as_str)? != USAGE_LIMIT_REACHED {
+    let kind = error
+        .get("code")
+        .or_else(|| error.get(ERROR_TYPE_FIELD))
+        .and_then(Value::as_str)?;
+    if !matches!(
+        kind,
+        USAGE_LIMIT_REACHED | "subscription_sharing_usage_limit_exceeded"
+    ) {
         return None;
     }
     Some(
@@ -809,6 +855,7 @@ fn parse_sse_stream(
     let mut byte_stream = response.bytes_stream();
 
     async_stream::stream! {
+        let mut completed = false;
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
                 Ok(b) => b,
@@ -822,8 +869,8 @@ fn parse_sse_stream(
             buffer.extend_from_slice(&chunk);
             // SSE events are separated by blank lines (\n\n). Pull all
             // complete events out of the buffer.
-            while let Some(idx) = find_event_boundary(&buffer) {
-                let raw = buffer.split_to(idx + 2);
+            while let Some((idx, separator_len)) = find_event_boundary(&buffer) {
+                let raw = buffer.split_to(idx + separator_len);
                 let raw_str = match std::str::from_utf8(&raw) {
                     Ok(s) => s,
                     Err(e) => {
@@ -834,16 +881,27 @@ fn parse_sse_stream(
                     }
                 };
                 let Some(event) = parse_sse_event(raw_str) else { continue };
+                let is_completed = event.event_type == RESPONSE_COMPLETED_EVENT
+                    && serde_json::from_str::<Value>(&event.data).ok()
+                        .is_some_and(|payload| payload.get("response").is_some_and(Value::is_object));
+                completed |= is_completed;
                 log_cache_key_echo(cache_key.as_deref(), &event);
                 match translate_event(&mut function_calls, event) {
                     Some(events) => {
                         for ev in events {
+                            let failed = ev.is_err();
                             yield ev;
+                            if failed { return; }
                         }
+                        if completed { return; }
                     }
+                    None if completed => return,
                     None => continue,
                 }
             }
+        }
+        if !completed {
+            yield Err(LlmError::Transient("Responses stream ended without response.completed".into()));
         }
     }
 }
@@ -876,8 +934,17 @@ fn log_cache_key_echo(sent: Option<&str>, event: &SseEvent) {
     );
 }
 
-fn find_event_boundary(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    buf.windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|idx| (idx, 2))
+        .into_iter()
+        .chain(
+            buf.windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|idx| (idx, 4)),
+        )
+        .min_by_key(|(idx, _)| *idx)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1065,6 +1132,24 @@ fn translate_event(
                 })));
             }
         }
+        "response.failed" | "response.incomplete" => {
+            let error = payload
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .cloned()
+                .unwrap_or_else(|| json!({"message": "response did not complete"}));
+            let body = json!({"error": error}).to_string();
+            out.push(Err(quota_exhausted(&body)
+                .map(|resets_in| LlmError::QuotaExhausted {
+                    resets_in,
+                    message: format!(
+                        "ChatGPT usage unavailable; manage usage at {MANAGE_USAGE_URL}: {body}"
+                    ),
+                })
+                .unwrap_or_else(|| {
+                    LlmError::Transient(format!("Responses inference failed: {body}"))
+                })));
+        }
         "response.error" | "error" => {
             let message = payload
                 .get("error")
@@ -1167,7 +1252,7 @@ mod tests {
     use rig::completion::ToolDefinition;
     use serde_json::json;
 
-    fn empty_request() -> CompletionRequest {
+    pub(super) fn empty_request() -> CompletionRequest {
         CompletionRequest {
             model: None,
             preamble: None,
@@ -1236,10 +1321,22 @@ mod tests {
     /// Serves one completed response and hands back the request head it got.
     async fn spawn_capturing_responses_endpoint() -> (String, tokio::sync::oneshot::Receiver<String>)
     {
+        spawn_capturing_endpoint(
+            "event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "text/event-stream",
+        ).await
+    }
+
+    pub(super) async fn spawn_capturing_endpoint(
+        body: &str,
+        content_type: &str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = body.to_owned();
+        let content_type = content_type.to_owned();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut head = Vec::new();
@@ -1252,13 +1349,9 @@ mod tests {
                 head.extend_from_slice(&buf[..n]);
             }
             let _ = tx.send(String::from_utf8_lossy(&head).to_lowercase());
-            let sse = r#"event: response.completed
-data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
-
-"#;
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
-                sse.len()
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
         });
@@ -1278,6 +1371,7 @@ data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
         let now = chrono::Utc::now().timestamp();
         store
             .save(&OAuthTokenBundle {
+                connection: None,
                 access_token: "at".into(),
                 refresh_token: "rt".into(),
                 id_token: "id".into(),
@@ -1905,3 +1999,7 @@ data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
         }
     }
 }
+
+#[cfg(test)]
+#[path = "completion_tests.rs"]
+mod protocol_tests;

@@ -7,8 +7,9 @@ use baybo_config::{BayboConfig, LlmEntry, LlmModelSpec};
 use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
 use baybo_llm::effort::ReasoningEffort;
 use baybo_llm::providers::openai_subscription::{
-    DeviceCode, LITE_MODEL as SUB_LITE_MODEL, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS,
-    VaultTokenStore, device_code_login, pkce_login,
+    LITE_MODEL as SUB_LITE_MODEL, LoginCallback, MANAGE_USAGE_URL,
+    PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS, VaultTokenStore,
+    pkce_login_with_callback,
 };
 use baybo_llm::{
     LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, default_base_url_for_provider,
@@ -281,7 +282,7 @@ async fn fetch_live_models(
         .map_err(|e| SetupError::Llm(format!("live model discovery: {e}")))
 }
 
-async fn run_subscription_login<P: Prompter>(
+pub async fn run_subscription_login<P: Prompter>(
     prompter: &mut P,
     vault: &Arc<SecretVault>,
     proxy: Option<baybo_security::http::ProxySettings>,
@@ -289,19 +290,76 @@ async fn run_subscription_login<P: Prompter>(
     let store = VaultTokenStore::new(vault.clone());
     let http = baybo_security::http::client(proxy.as_ref())
         .map_err(|e| SetupError::Llm(format!("build proxied http client: {e}")))?;
-    // PKCE wants a browser that can reach 127.0.0.1; device code only
-    // needs a browser somewhere. Both modes are offered so the user
-    // can pick what their environment supports.
-    let methods = ["PKCE (open browser, localhost callback)", "Device code"];
-    let bundle = match prompter.select("Login method:", &methods)? {
-        0 => pkce_login(print_pkce_url, &http).await,
-        _ => device_code_login(print_device_code, &http).await,
-    }
+    let manual = prompter.select(
+        "Where will you open the sign-in link?",
+        &[
+            "On this computer (automatic browser callback)",
+            "On another computer / SSH (paste callback URL)",
+        ],
+    )? == 1;
+    let bundle = pkce_login_with_callback(
+        |url, redirect| {
+            if manual {
+                const INSTRUCTIONS: &str = r#"
+1. Keep this terminal open. Open the sign-in link below in your browser:
+
+{{url}}
+
+2. Sign in to ChatGPT and approve the Baybo connection.
+3. At the final redirect, even if the page cannot connect, select the browser
+   address bar (Ctrl+L on Linux, Cmd+L on macOS) and copy the COMPLETE URL.
+   It must start with:
+
+{{redirect}}?
+
+   Copy everything, including code, state and any client_id parameter.
+4. Return to this terminal, paste the complete URL below, and press Enter.
+   Paste the callback URL, not the sign-in link above or just the code.
+5. Complete these steps within 5 minutes. To retry, cancel with Ctrl+C,
+   start sign-in again, and use the new link.
+"#;
+                eprintln!(
+                    "{}",
+                    INSTRUCTIONS
+                        .replace("{{url}}", url)
+                        .replace("{{redirect}}", redirect)
+                );
+                prompter
+                    .password("Paste complete callback URL (input hidden): ")
+                    .map(LoginCallback::Pasted)
+                    .map_err(std::io::Error::other)
+            } else {
+                const INSTRUCTIONS: &str = r#"
+1. Open this link in a browser on this computer:
+
+{{url}}
+
+2. Sign in to ChatGPT and approve the Baybo connection.
+3. Return to this terminal after the browser redirects.
+Complete sign-in within 5 minutes; Ctrl+C cancels.
+"#;
+                eprintln!("{}", INSTRUCTIONS.replace("{{url}}", url));
+                Ok(LoginCallback::Browser)
+            }
+        },
+        &http,
+        &store,
+    )
+    .await
     .map_err(|e| SetupError::Llm(format!("openai-subscription login: {e}")))?;
-    store
-        .save(&bundle)
-        .await
-        .map_err(|e| SetupError::Vault(format!("openai-subscription vault save: {e}")))?;
+
+    bundle
+        .require_sharing()
+        .map_err(|e| SetupError::Llm(e.to_string()))?;
+    if let Some(connection) = &bundle.connection {
+        eprintln!("Baybo application client ID: {}", connection.client_id);
+    }
+    eprintln!(
+        "signed in as {} (plan: {})\ntoken stored at vault://{}\nManage usage: {MANAGE_USAGE_URL}",
+        bundle.email().unwrap_or_else(|| "<unknown>".into()),
+        bundle.plan_type().unwrap_or_else(|| "<unknown>".into()),
+        VAULT_KEY_TOKENS,
+    );
     tracing::info!(
         email = bundle.email().unwrap_or_else(|| "<unknown>".into()),
         plan = bundle.plan_type().unwrap_or_else(|| "<unknown>".into()),
@@ -309,18 +367,6 @@ async fn run_subscription_login<P: Prompter>(
         "openai-subscription sign-in complete"
     );
     Ok(())
-}
-
-fn print_pkce_url(url: &str) -> std::io::Result<()> {
-    println!("\nopen this URL to sign in:\n  {url}\n");
-    Ok(())
-}
-
-fn print_device_code(code: &DeviceCode) {
-    println!(
-        "\nopen this URL on any device, sign in, and enter the code:\n  url:  {}\n  code: {}\n",
-        code.verification_url, code.user_code,
-    );
 }
 
 #[cfg(test)]

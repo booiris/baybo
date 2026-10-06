@@ -4207,7 +4207,7 @@ mod provider_metadata_helpers_tests {
         assert!(default_api_key_env_for_provider("openai-subscription").is_none());
         assert_eq!(
             default_base_url_for_provider("openai-subscription"),
-            Some("https://chatgpt.com/backend-api"),
+            Some(crate::providers::openai_subscription::DEFAULT_BASE_URL),
         );
 
         // llamafile is keyless, ollama has an optional key — both

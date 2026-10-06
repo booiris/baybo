@@ -6,6 +6,9 @@ use baybo_security::SecretVault;
 use baybo_store::StoreIdentity;
 
 use super::VAULT_KEY_TOKENS;
+use super::oauth::Registration;
+const HOST_KEY: &str = "llm.openai-subscription.host";
+const REGISTRATION_KEY: &str = "llm.openai-subscription.registration";
 use super::token_bundle::OAuthTokenBundle;
 use crate::{LlmError, Result};
 
@@ -67,6 +70,47 @@ impl VaultTokenStore {
         }
     }
 
+    pub(super) async fn host_id(&self) -> Result<String> {
+        static HOST_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = HOST_INIT.lock().await;
+        let path = self.credential_key().lock_path();
+        let file_guard = super::refresh_coordinator::lock_credential(path.clone()).await;
+        if path.is_some() && file_guard.is_none() {
+            return Err(LlmError::Config(
+                "ChatGPT host initialization could not acquire the credential lock".into(),
+            ));
+        }
+
+        if let Some(id) = self
+            .vault
+            .get_typed::<String>(HOST_KEY)
+            .await
+            .map_err(|e| LlmError::Config(format!("ChatGPT host read: {e}")))?
+        {
+            return Ok(id);
+        }
+        let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+        self.vault
+            .store_typed(HOST_KEY, &id)
+            .await
+            .map_err(|e| LlmError::Config(format!("ChatGPT host write: {e}")))?;
+        Ok(id)
+    }
+
+    pub(super) async fn registration(&self) -> Result<Option<Registration>> {
+        self.vault
+            .get_typed(REGISTRATION_KEY)
+            .await
+            .map_err(|e| LlmError::Config(format!("ChatGPT registration read: {e}")))
+    }
+
+    pub(super) async fn save_registration(&self, registration: &Registration) -> Result<()> {
+        self.vault
+            .store_typed(REGISTRATION_KEY, registration)
+            .await
+            .map_err(|e| LlmError::Config(format!("ChatGPT registration write: {e}")))
+    }
+
     pub async fn load(&self) -> Result<Option<OAuthTokenBundle>> {
         self.vault
             .get_typed::<OAuthTokenBundle>(VAULT_KEY_TOKENS)
@@ -79,6 +123,17 @@ impl VaultTokenStore {
             .store_typed(VAULT_KEY_TOKENS, bundle)
             .await
             .map_err(|e| LlmError::Config(format!("openai-subscription: vault write failed: {e}")))
+    }
+
+    pub(super) async fn save_login(
+        &self,
+        bundle: &OAuthTokenBundle,
+        http: &reqwest::Client,
+    ) -> Result<()> {
+        use super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
+        RefreshCoordinator::shared(self.clone(), http.clone(), BackgroundRefresh::Disabled)
+            .replace_credentials(bundle)
+            .await
     }
 
     pub async fn clear(&self) -> Result<()> {
@@ -112,6 +167,7 @@ mod tests {
     async fn save_then_load_round_trip() {
         let store = make_store();
         let bundle = OAuthTokenBundle {
+            connection: None,
             access_token: "at".into(),
             refresh_token: "rt".into(),
             id_token: "it".into(),
@@ -128,6 +184,7 @@ mod tests {
     async fn clear_removes_entry() {
         let store = make_store();
         let bundle = OAuthTokenBundle {
+            connection: None,
             access_token: "x".into(),
             refresh_token: "x".into(),
             id_token: "x".into(),
@@ -138,5 +195,73 @@ mod tests {
         store.save(&bundle).await.unwrap();
         store.clear().await.unwrap();
         assert!(store.load().await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn concurrent_host_initialization_and_logout_retain_the_same_installation() {
+        let store = make_store();
+        let peer = store.clone();
+        let (first, concurrent) = tokio::join!(store.host_id(), peer.host_id());
+        let host = first.unwrap();
+        assert!(host.starts_with("urn:uuid:"));
+        assert_eq!(host, concurrent.unwrap());
+        let registration = Registration {
+            client_id: "oaiapp_test".into(),
+            subject: Some("user".into()),
+        };
+        store.save_registration(&registration).await.unwrap();
+        store.clear().await.unwrap();
+        assert_eq!(store.host_id().await.unwrap(), host);
+        assert_eq!(store.registration().await.unwrap(), Some(registration));
+    }
+
+    #[tokio::test]
+    async fn legacy_bundles_without_connection_remain_readable() {
+        let legacy = serde_json::json!({
+            "access_token": "a", "refresh_token": "r", "id_token": "i",
+            "account_id": null, "expires_at": 1000, "obtained_at": 500
+        });
+        let bundle: OAuthTokenBundle = serde_json::from_value(legacy).unwrap();
+        assert!(bundle.connection.is_none());
+        let store = make_store();
+        store.save(&bundle).await.unwrap();
+        assert_eq!(store.load().await.unwrap(), Some(bundle));
+    }
+    #[tokio::test]
+    async fn login_replaces_a_cached_legacy_bundle_even_with_a_shorter_expiry() {
+        use super::super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
+        use super::super::token_bundle::ChatGptConnection;
+        let store = make_store();
+        let now = chrono::Utc::now().timestamp();
+        let old = OAuthTokenBundle {
+            connection: None,
+            access_token: "old".into(),
+            refresh_token: "old-refresh".into(),
+            id_token: "old-id".into(),
+            account_id: None,
+            expires_at: now + 7200,
+            obtained_at: now,
+        };
+        store.save(&old).await.unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let coordinator =
+            RefreshCoordinator::shared(store.clone(), http.clone(), BackgroundRefresh::Disabled);
+        assert_eq!(
+            coordinator
+                .ensure_fresh_bundle()
+                .await
+                .unwrap()
+                .access_token,
+            "old"
+        );
+        let mut new = old.clone();
+        new.connection = Some(ChatGptConnection {
+            client_id: "oaiapp_test".into(),
+            subject: "user".into(),
+            scopes: vec![super::super::oauth::SHARING_SCOPE.into()],
+        });
+        new.access_token = "new".into();
+        new.expires_at = now + 3600;
+        store.save_login(&new, &http).await.unwrap();
+        assert_eq!(*coordinator.ensure_fresh_bundle().await.unwrap(), new);
     }
 }

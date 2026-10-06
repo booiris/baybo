@@ -15,7 +15,7 @@ pub use channel::{
     run_registration,
 };
 pub use external_agents::{ExternalAgentsStepOutcome, configure_external_agents_step};
-pub use llm::{LlmStepOutcome, configure_llm_step};
+pub use llm::{LlmStepOutcome, configure_llm_step, run_subscription_login};
 
 use crate::error::Result;
 use crate::prompt::Prompter;
