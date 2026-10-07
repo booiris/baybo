@@ -2470,16 +2470,18 @@ export interface components {
         /**
          * @description `POST /v1/llm/models` body — create an entry.
          *
-         *     Deliberately smaller than the entry it creates: per-model overrides,
-         *     `lite_model` and `model_list` are edits made afterwards against the entry's
-         *     own routes, so this carries only what an entry cannot exist without.
+         *     Creates the served model set and optional auxiliary selection atomically.
          */
         CreateLlmModelRequest: {
             /** @description Stored in the vault under this entry's name. Never echoed back. */
             api_key?: string | null;
             api_key_env?: string | null;
             base_url?: string | null;
+            /** @description Optional auxiliary model; must belong to the served set. */
+            lite_model?: string | null;
             model: string;
+            /** @description Additional served model ids. The default model is included automatically. */
+            models?: string[];
             /**
              * @description Unique entry name. It is also a URL path segment on every other
              *     `/v1/llm/models/{name}` route and the suffix of this entry's vault key,
@@ -4053,6 +4055,8 @@ export interface components {
             base_url?: string | null;
             /** @description `context_window` override for the default model, or `null` to clear. */
             context_window?: number | null;
+            /** @description Auxiliary model from this entry's served models, or null to clear. */
+            lite_model?: string | null;
             /** @description Set the model id (e.g. `"gpt-4o"`). Requires gateway restart. */
             model?: string | null;
             pricing?: null | components["schemas"]["LlmPricingOverrideDto"];

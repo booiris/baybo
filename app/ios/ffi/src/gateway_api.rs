@@ -673,6 +673,10 @@ struct CreateLlmModelRequest<'a> {
     name: &'a str,
     provider: &'a str,
     model: &'a str,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    models: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lite_model: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     base_url: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1417,6 +1421,7 @@ pub(crate) async fn list_llm_models<C: GatewayJsonClient + Sync>(
 fn entry_edit_body(edit: &LlmEntryEdit) -> serde_json::Value {
     match edit {
         LlmEntryEdit::Model { model } => serde_json::json!({ "model": model }),
+        LlmEntryEdit::LiteModel { model } => serde_json::json!({ "lite_model": model }),
         LlmEntryEdit::BaseUrl { url } => serde_json::json!({ "base_url": url }),
         LlmEntryEdit::ApiKey { key } => serde_json::json!({ "api_key": key }),
         LlmEntryEdit::ApiKeyEnv { env } => serde_json::json!({ "api_key_env": env }),
@@ -1562,6 +1567,8 @@ pub(crate) async fn create_llm_model<C: GatewayJsonClient + Sync>(
         name: entry.name.trim(),
         provider: entry.provider.trim(),
         model: entry.model.trim(),
+        models: &entry.models,
+        lite_model: entry.lite_model.as_deref(),
         base_url: base_url.as_deref(),
         api_key_env: api_key_env.as_deref(),
         api_key: api_key.as_deref(),
@@ -3921,6 +3928,16 @@ mod tests {
     async fn each_entry_edit_sends_exactly_its_own_key() {
         let cases = [
             (
+                LlmEntryEdit::LiteModel {
+                    model: Some("small".into()),
+                },
+                r#"{"lite_model":"small"}"#,
+            ),
+            (
+                LlmEntryEdit::LiteModel { model: None },
+                r#"{"lite_model":null}"#,
+            ),
+            (
                 LlmEntryEdit::BaseUrl {
                     url: Some("https://example.test/v1".to_string()),
                 },
@@ -4129,6 +4146,8 @@ mod tests {
                 name: "  kimi  ".to_string(),
                 provider: " moonshot ".to_string(),
                 model: " kimi-k2 ".to_string(),
+                models: Vec::new(),
+                lite_model: None,
                 base_url: None,
                 api_key_env: Some("   ".to_string()),
                 api_key: None,
@@ -4156,6 +4175,8 @@ mod tests {
                 name: "local".to_string(),
                 provider: "ollama".to_string(),
                 model: "qwen3".to_string(),
+                models: vec!["qwen3-small".into(), "vendor/custom".into()],
+                lite_model: Some("qwen3-small".into()),
                 base_url: Some("http://localhost:11434".to_string()),
                 api_key_env: None,
                 api_key: Some("sk-live".to_string()),
@@ -4167,7 +4188,7 @@ mod tests {
         assert!(result.requires_restart);
         assert_eq!(
             client.only_call().body,
-            r#"{"name":"local","provider":"ollama","model":"qwen3","base_url":"http://localhost:11434","api_key":"sk-live"}"#
+            r#"{"name":"local","provider":"ollama","model":"qwen3","models":["qwen3-small","vendor/custom"],"lite_model":"qwen3-small","base_url":"http://localhost:11434","api_key":"sk-live"}"#
         );
     }
 

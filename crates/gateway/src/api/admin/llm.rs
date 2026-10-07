@@ -154,7 +154,13 @@ async fn update_model(
         entry.provider = provider;
     }
     if let Some(model) = req.model {
+        if entry.lite_model.as_ref() == Some(&entry.model) && entry.model != model {
+            entry.default_spec_mut();
+        }
         entry.model = model;
+    }
+    if let Some(lite_model) = req.lite_model {
+        entry.lite_model = lite_model;
     }
     if let Some(base_url) = req.base_url {
         entry.base_url = base_url.filter(|s| !s.is_empty());
@@ -437,12 +443,17 @@ async fn create_model(
         )));
     }
 
+    let models = validate_model_ids(&req.models)?;
+    let model_list = models
+        .into_iter()
+        .map(baybo_config::LlmModelSpec::bare)
+        .collect();
     current.llm.push(LlmEntry {
         name: name.clone().into(),
         provider,
         model,
-        model_list: Vec::new(),
-        lite_model: None,
+        model_list,
+        lite_model: req.lite_model,
         api_key_env: req.api_key_env.filter(|s| !s.trim().is_empty()),
         base_url: req.base_url.filter(|s| !s.trim().is_empty()),
         reasoning_effort: None,
@@ -596,23 +607,7 @@ async fn set_model_list(
         .find(|e| e.name == name)
         .ok_or_else(|| GatewayError::NotFound(format!("llm entry {name:?}")))?;
 
-    let mut models: Vec<String> = Vec::with_capacity(req.models.len());
-    for raw in &req.models {
-        let model = raw.trim();
-        if model.is_empty() {
-            return Err(GatewayError::BadRequest(
-                "model ids must be non-empty".into(),
-            ));
-        }
-        // A duplicate would make `spec_for` ambiguous — it returns the first
-        // match, so the second copy's overrides would be silently inert.
-        if models.iter().any(|m| m == model) {
-            return Err(GatewayError::BadRequest(format!(
-                "model {model:?} is listed twice"
-            )));
-        }
-        models.push(model.to_string());
-    }
+    let models = validate_model_ids(&req.models)?;
 
     // The default model has to stay in its own entry's list. `LlmEntry::models`
     // prepends it when absent, so omitting it would not actually remove it —
@@ -872,6 +867,28 @@ async fn get_usage(
         until,
         items,
     }))
+}
+
+fn validate_model_ids(raw_models: &[String]) -> GatewayResult<Vec<String>> {
+    let mut models: Vec<String> = Vec::with_capacity(raw_models.len());
+    for raw in raw_models {
+        let model = raw.trim();
+        if model.is_empty() {
+            return Err(GatewayError::BadRequest(
+                "model ids must be non-empty".into(),
+            ));
+        }
+        // A duplicate would make `spec_for` ambiguous — it returns the first
+        // match, so the second copy's overrides would be silently inert.
+        if models.iter().any(|m| m == model) {
+            return Err(GatewayError::BadRequest(format!(
+                "model {model:?} is listed twice"
+            )));
+        }
+        models.push(model.to_string());
+    }
+
+    Ok(models)
 }
 
 fn check_entry_removal(config: &BayboConfig, entry: &LlmEntry) -> GatewayResult<()> {

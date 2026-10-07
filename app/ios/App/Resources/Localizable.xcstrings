@@ -4070,13 +4070,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Pick from what this provider currently offers. Models already served are ticked."
+            "value": "Select multiple models from the provider catalog, or enter IDs above."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "从这个服务商当前提供的模型里选。已经在用的打勾。"
+            "value": "可从服务商目录中选择多个模型，也可在上方输入 ID。"
           }
         }
       }
@@ -7476,6 +7476,108 @@
           "stringUnit": {
             "state": "translated",
             "value": "更改已保存，重启网关后生效。"
+          }
+        }
+      }
+    },
+    "llm.addModels": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add selected and entered models"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加选中和输入的模型"
+          }
+        }
+      }
+    },
+    "llm.liteModel": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lite model"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lite 模型"
+          }
+        }
+      }
+    },
+    "llm.liteModelExplain": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose an auxiliary model from this entry. Add it to the model list first if needed."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从当前 entry 的模型中选择辅助模型；如未列出，请先添加到模型列表。"
+          }
+        }
+      }
+    },
+    "llm.manualModels": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Additional model IDs"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加模型 ID"
+          }
+        }
+      }
+    },
+    "llm.manualModelsHint": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Separate IDs with commas, spaces or newlines. Use the exact IDs supported by your provider."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用逗号、空格或换行分隔，填写服务商支持的完整模型 ID。"
+          }
+        }
+      }
+    },
+    "llm.noLiteModel": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "None"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "不设置"
           }
         }
       }

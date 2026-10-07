@@ -9272,7 +9272,7 @@
       },
       "CreateLlmModelRequest": {
         "type": "object",
-        "description": "`POST /v1/llm/models` body — create an entry.\n\nDeliberately smaller than the entry it creates: per-model overrides,\n`lite_model` and `model_list` are edits made afterwards against the entry's\nown routes, so this carries only what an entry cannot exist without.",
+        "description": "`POST /v1/llm/models` body — create an entry.\n\nCreates the served model set and optional auxiliary selection atomically.",
         "required": [
           "name",
           "provider",
@@ -9298,8 +9298,22 @@
               "null"
             ]
           },
+          "lite_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional auxiliary model; must belong to the served set."
+          },
           "model": {
             "type": "string"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional served model ids. The default model is included automatically."
           },
           "name": {
             "type": "string",
@@ -12735,6 +12749,13 @@
             ],
             "description": "`context_window` override for the default model, or `null` to clear.",
             "minimum": 0
+          },
+          "lite_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Auxiliary model from this entry's served models, or null to clear."
           },
           "model": {
             "type": [

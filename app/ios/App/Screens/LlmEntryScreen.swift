@@ -41,6 +41,8 @@ struct LlmEntryScreen: View {
     @State private var catalogItems: [LlmCatalogModel] = []
     @State private var loadingCatalog = false
     @State private var catalogFailure: String?
+    @State private var modelsDraft = ""
+    @State private var selectedModels = Set<String>()
     /// Removing a stored key is irreversible from here — there is no read-back
     /// to restore from, and the entry stops working for every device until a
     /// new one is set. The one action on this screen that earns a confirm.
@@ -53,6 +55,7 @@ struct LlmEntryScreen: View {
         case fields
         case model
         case addModel
+        case liteModel
         case effort
         case vision
         case baseUrl
@@ -83,6 +86,7 @@ struct LlmEntryScreen: View {
                         case .fields: fieldsBody(entry)
                         case .model: modelLevel(entry)
                         case .addModel: addModelLevel(entry)
+                        case .liteModel: liteModelLevel(entry)
                         case .effort: effortLevel(entry)
                         case .vision: visionLevel(entry)
                         case .baseUrl: baseUrlLevel(entry)
@@ -200,6 +204,10 @@ struct LlmEntryScreen: View {
                 label: lang.t("llm.model"), value: entry.model, pinned: true,
                 identifier: "llm-field-model"
             ) { level = .model }
+            fieldRow(
+                label: lang.t("llm.liteModel"), value: entry.liteModel ?? lang.t("llm.noLiteModel"),
+                pinned: entry.liteModel != nil, identifier: "llm-field-lite-model"
+            ) { level = .liteModel }
             fieldRow(
                 label: lang.t("llm.baseUrl"), value: entry.baseUrl ?? "—",
                 pinned: entry.baseUrl != nil, identifier: "llm-field-base-url"
@@ -393,14 +401,9 @@ struct LlmEntryScreen: View {
             ForEach(catalog.models(of: entry), id: \.self) { model in
                 optionRow(
                     title: model, selected: model == entry.model,
-                    // Switching away from the model `lite_model` names can be
-                    // rejected outright, and the 400 has no phone-side repair —
-                    // so the warning sits on the row that would cause it.
-                    note: entry.liteModel == entry.model && model != entry.model
-                        ? lang.t("llm.liteModelWarning") : nil,
-                    // The default cannot be dropped: the entry prepends it to
-                    // its own list, so removing it would not remove it.
-                    onRemove: model == entry.model ? nil : { removeModel(model, from: entry) },
+                    note: model == entry.liteModel ? lang.t("llm.liteModel") : nil,
+                    onRemove: model == entry.model || model == entry.liteModel
+                        ? nil : { removeModel(model, from: entry) },
                     identifier: "llm-option-\(model)"
                 ) {
                     commit(.model(model: model), field: lang.t("llm.model"))
@@ -413,11 +416,36 @@ struct LlmEntryScreen: View {
         }
     }
 
-    /// The provider's live catalog. A PICK, never free text — nothing
-    /// gateway-side checks a model id against the vendor, so a typo would
-    /// build, list, validate, and only fail at the first real completion.
+    @ViewBuilder private func liteModelLevel(_ entry: LlmModelInfo) -> some View {
+        levelTitle(lang.t("llm.liteModel"))
+        explain(lang.t("llm.liteModelExplain"))
+        optionRow(
+            title: lang.t("llm.noLiteModel"), selected: entry.liteModel == nil,
+            identifier: "llm-lite-none"
+        ) {
+            commit(.liteModel(model: nil), field: lang.t("llm.liteModel"))
+        }
+        ForEach(catalog.models(of: entry), id: \.self) { model in
+            optionRow(
+                title: model, selected: entry.liteModel == model,
+                identifier: "llm-lite-\(model)"
+            ) {
+                commit(.liteModel(model: model), field: lang.t("llm.liteModel"))
+            }
+        }
+    }
+
     @ViewBuilder private func addModelLevel(_ entry: LlmModelInfo) -> some View {
         levelTitle(lang.t("llm.addModel"))
+        LlmModelIdsField(text: $modelsDraft, identifier: "llm-input-models").disabled(saving)
+        commitButton(
+            title: lang.t("llm.addModels"),
+            enabled: !pendingModels(entry).isEmpty, identifier: "llm-commit-models"
+        ) {
+            writeModelList(
+                catalog.models(of: entry) + pendingModels(entry),
+                field: lang.t("llm.modelList"), returnTo: .model)
+        }
         if loadingCatalog {
             HStack(spacing: 10) {
                 ProgressView().progressViewStyle(.circular).tint(Theme.inkSoft).scaleEffect(0.8)
@@ -441,11 +469,15 @@ struct LlmEntryScreen: View {
                 ForEach(catalogItems, id: \.id) { item in
                     optionRow(
                         title: item.id,
-                        selected: item.configured,
+                        selected: item.configured || selectedModels.contains(item.id),
                         note: catalogNote(item),
+                        allowsDeselection: true,
                         identifier: "llm-catalog-\(item.id)"
                     ) {
-                        addModel(item.id, to: entry)
+                        guard !item.configured else { return }
+                        if !selectedModels.insert(item.id).inserted {
+                            selectedModels.remove(item.id)
+                        }
                     }
                 }
             }
@@ -713,13 +745,14 @@ struct LlmEntryScreen: View {
     /// config anyway.
     private func optionRow(
         title: String, selected: Bool, note: String? = nil,
+        allowsDeselection: Bool = false,
         onRemove: (() -> Void)? = nil, identifier: String,
         action: @escaping () -> Void
     ) -> some View {
         Button {
             guard !saving else { return }
             Haptics.tap()
-            if selected {
+            if selected && !allowsDeselection {
                 level = .fields
             } else {
                 action()
@@ -950,6 +983,8 @@ struct LlmEntryScreen: View {
     /// loading and failure states rather than blocking the transition.
     private func openCatalog(_ entry: LlmModelInfo) {
         catalogItems = []
+        modelsDraft = ""
+        selectedModels = []
         catalogFailure = nil
         loadingCatalog = true
         level = .addModel
@@ -966,13 +1001,12 @@ struct LlmEntryScreen: View {
     /// Both list edits send the whole SET, because that is the endpoint's shape:
     /// idempotent, and the gateway carries each surviving id's overrides across
     /// so plain ids never destroy them.
-    private func addModel(_ model: String, to entry: LlmModelInfo) {
-        let models = catalog.models(of: entry)
-        guard !models.contains(model) else {
-            level = .model
-            return
-        }
-        writeModelList(models + [model], field: lang.t("llm.modelList"), returnTo: .model)
+    private func pendingModels(_ entry: LlmModelInfo) -> [String] {
+        let existing = Set(catalog.models(of: entry))
+        return LlmModelInput.parse(
+            (selectedModels.sorted() + [modelsDraft]).joined(separator: "\n")
+        )
+        .filter { !existing.contains($0) }
     }
 
     private func removeModel(_ model: String, from entry: LlmModelInfo) {

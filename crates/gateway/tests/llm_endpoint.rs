@@ -1320,3 +1320,71 @@ async fn removal_capability_matches_default_and_oauth_refusals() {
     let (status, _) = delete_entry(&router, "subscription").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn lite_model_can_be_set_preserved_and_cleared() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+    for body in [
+        json!({"lite_model":"gpt-4o"}),
+        json!({"model":"gpt-4o-mini"}),
+    ] {
+        let (status, response) = put_entry(&router, "primary", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+    }
+    let saved = BayboConfig::load_from_file(&path).await.unwrap();
+    let entry = saved.llm_entry("primary").unwrap();
+    assert_eq!(entry.lite_model.as_deref(), Some("gpt-4o"));
+    assert!(entry.models().iter().any(|m| m.model == "gpt-4o"));
+    let (status, _) = put_entry(&router, "primary", json!({"lite_model":"missing"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, response) = put_entry(&router, "primary", json!({"lite_model":null})).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(
+        BayboConfig::load_from_file(&path)
+            .await
+            .unwrap()
+            .llm_entry("primary")
+            .unwrap()
+            .lite_model
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn create_accepts_multiple_models_and_lite_atomically() {
+    let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
+    let body = json!({"name":"local", "provider":"ollama", "model":"qwen3",
+        "models":["qwen3", " qwen3-small ", "vendor/custom"], "lite_model":"qwen3-small"});
+    let (status, response) = post_entry(&router, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let saved = BayboConfig::load_from_file(&path).await.unwrap();
+    let entry = saved.llm_entry("local").unwrap();
+    assert_eq!(
+        entry
+            .models()
+            .iter()
+            .map(|m| m.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["qwen3", "qwen3-small", "vendor/custom"]
+    );
+    assert_eq!(entry.lite_model.as_deref(), Some("qwen3-small"));
+    for (name, models, lite) in [
+        ("bad-lite", json!(["qwen3"]), "absent"),
+        ("duplicate", json!(["qwen3", " qwen3 "]), "qwen3"),
+        ("empty-id", json!([""]), "qwen3"),
+    ] {
+        let mut invalid = body.clone();
+        invalid["name"] = json!(name);
+        invalid["models"] = models;
+        invalid["lite_model"] = json!(lite);
+        let (status, _) = post_entry(&router, invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            BayboConfig::load_from_file(&path)
+                .await
+                .unwrap()
+                .llm_entry(name)
+                .is_none()
+        );
+    }
+}

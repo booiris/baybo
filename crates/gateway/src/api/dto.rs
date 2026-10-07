@@ -344,6 +344,9 @@ pub struct UpdateLlmModelRequest {
     /// Reasoning-effort override, or `null` to clear.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub reasoning_effort: Option<Option<String>>,
+    /// Auxiliary model from this entry's served models, or null to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub lite_model: Option<Option<String>>,
     /// `supports_vision` override for the entry's **default** model, or
     /// `null` to clear. Lands in that model's `model_list` spec; the
     /// entry's other models are file-edited only.
@@ -442,9 +445,7 @@ pub struct LlmProvidersResponse {
 
 /// `POST /v1/llm/models` body — create an entry.
 ///
-/// Deliberately smaller than the entry it creates: per-model overrides,
-/// `lite_model` and `model_list` are edits made afterwards against the entry's
-/// own routes, so this carries only what an entry cannot exist without.
+/// Creates the served model set and optional auxiliary selection atomically.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateLlmModelRequest {
     /// Unique entry name. It is also a URL path segment on every other
@@ -454,6 +455,12 @@ pub struct CreateLlmModelRequest {
     /// Must be one of `GET /v1/llm/providers`, and not an OAuth one.
     pub provider: String,
     pub model: String,
+    /// Additional served model ids. The default model is included automatically.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Optional auxiliary model; must belong to the served set.
+    #[serde(default)]
+    pub lite_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

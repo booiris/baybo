@@ -30,6 +30,8 @@ struct NewLlmEntryScreen: View {
 
     @State private var name = ""
     @State private var model = ""
+    @State private var modelsDraft = ""
+    @State private var liteModel = ""
     @State private var baseUrl = ""
     @State private var apiKey = ""
 
@@ -137,6 +139,20 @@ struct NewLlmEntryScreen: View {
             field(
                 label: lang.t("llm.model"), text: $model, placeholder: "claude-sonnet-5",
                 hint: lang.t("llm.newModelHint"), identifier: "llm-new-model")
+
+            LlmModelIdsField(text: $modelsDraft, identifier: "llm-new-models").disabled(creating)
+            Picker(lang.t("llm.liteModel"), selection: $liteModel) {
+                Text(verbatim: lang.t("llm.noLiteModel")).tag("")
+                ForEach(LlmModelInput.parse(model + "\n" + modelsDraft), id: \.self) { id in
+                    Text(verbatim: id).tag(id)
+                }
+            }
+            .padding(.horizontal, 20)
+            .disabled(creating)
+            .accessibilityIdentifier("llm-new-lite-model")
+            .onChange(of: model + "\n" + modelsDraft) { _, value in
+                if !LlmModelInput.parse(value).contains(liteModel) { liteModel = "" }
+            }
 
             field(
                 label: lang.t("llm.baseUrl"), text: $baseUrl,
@@ -373,6 +389,8 @@ struct NewLlmEntryScreen: View {
                         name: name.trimmingCharacters(in: .whitespaces),
                         provider: picked.name,
                         model: model.trimmingCharacters(in: .whitespaces),
+                        models: LlmModelInput.parse(modelsDraft),
+                        liteModel: trimmed(liteModel),
                         baseUrl: trimmed(baseUrl),
                         apiKeyEnv: nil,
                         apiKey: trimmed(apiKey)))
@@ -412,6 +430,7 @@ struct NewLlmEntryScreen: View {
                     .strokeBorder(Theme.lineStrong, lineWidth: 1)
             )
             .accessibilityIdentifier(identifier)
+            .disabled(creating)
             if let hint {
                 Text(verbatim: hint)
                     .font(Theme.mono(10.5))

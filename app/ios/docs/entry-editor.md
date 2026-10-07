@@ -46,9 +46,9 @@ Two more absences, each load-bearing:
   client. It now really deletes, and the rollback below is what makes staging
   it before the pre-flight safe.)
 
-`lite_model` and pricing are read-only over HTTP and are not rendered — a row
-you cannot act on is noise. `lite_model` earns its keep only as the Model
-picker's warning.
+`lite_model` has a picker over served models and a None option that sends explicit
+JSON null. Default and lite models cannot be removed from the served set while
+selected. Switching away from a default that is also lite preserves its spec.
 
 Per-model overrides for a NON-default model are still config-file only:
 `PUT /llm/models/{name}` addresses the default model's spec and nothing else.
@@ -80,8 +80,8 @@ obvious way — read the entry, render a form, PUT the form back. One observable
 consequence IS already live, though: `default_spec_mut()` permanently
 materialises the departing default into `model_list`, `UpdateLlmModelRequest`
 has no field for it, and `model_list` is what feeds `entry.models()` — so the
-picker's candidate list grows with every default-model switch that followed an
-override, on both clients, with no way to shrink it.
+picker's candidate list retains departing models after overrides. The served-list
+editor can remove them once they are neither default nor lite.
 
 It also dissolves a UniFFI limit for free. The endpoint is three-state per field
 — key absent = keep, `null` = clear, a value = set — which wants
@@ -112,11 +112,11 @@ one-key-per-PUT rule gives it for free.
 Creation uses a non-replayed POST: if its response is lost, a retry would return
 a duplicate-name error even though the first request succeeded.
 
-`POST /v1/llm/models` takes only what an entry cannot exist without — name,
-provider, model, and optionally a base URL and a key. Everything else
-(`model_list`, per-model overrides, the thinking level) is an edit made
-afterwards against the entry's own routes, so the create form does not collect
-it and the handler does not accept it.
+`POST /v1/llm/models` accepts name, provider, default model, optional additional
+`models`, `lite_model`, base URL and key. The model list and lite selection are
+validated and persisted atomically. Per-model overrides remain separate edits.
+Lite edits and multi-model creation require a gateway with these DTO fields;
+older gateways may ignore unknown request fields and must be upgraded too.
 
 **The provider is a PICK, from `GET /v1/llm/providers`.** The registry is
 compiled into the gateway binary, so that route is the only way a client learns
@@ -194,8 +194,12 @@ Three refusals, each protecting something a silent success would break:
   its message already says how to fix it; the endpoint just has to run it before
   writing.
 
-**Adding is a PICK from `GET /llm/models/{name}/catalog`, never free text.**
-That route asks the provider what it currently offers, marking what the entry
+**Adding supports catalog multi-select and manual model IDs in one submission.**
+Manual IDs accept commas, whitespace and newlines, preserve provider paths, and
+deduplicate in input order. This input remains available when catalog loading
+fails; users must supply exact provider-supported IDs.
+
+`GET /llm/models/{name}/catalog` asks the provider what it currently offers, marking what the entry
 already serves. It exists because nothing gateway-side checks a model id against
 the vendor: a typo builds a client, gets listed in `entry_model_ids`, passes the
 session-pin validator, and only fails at the first real completion. The read is

@@ -484,6 +484,9 @@ pub enum LlmEntryEdit {
     Model {
         model: String,
     },
+    LiteModel {
+        model: Option<String>,
+    },
     BaseUrl {
         url: Option<String>,
     },
@@ -568,8 +571,7 @@ pub struct LlmProviderInfo {
 
 /// A new LLM entry, as the create form collects it.
 ///
-/// Smaller than the entry it makes: `model_list`, per-model overrides and the
-/// thinking level are edits made afterwards against the entry's own routes.
+/// Includes served model IDs and the optional auxiliary model in one request.
 /// `name` rides in the URL of every one of those, so the gateway constrains it
 /// to what a path segment can carry.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -577,6 +579,8 @@ pub struct NewLlmEntry {
     pub name: String,
     pub provider: String,
     pub model: String,
+    pub models: Vec<String>,
+    pub lite_model: Option<String>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     /// Stored in the gateway's vault. Never read back.

@@ -15,7 +15,8 @@ import XCTest
 /// `apiKeyEnv` shadow.
 final class LlmEntryUITests: BayboUITestCase {
     private func openModels(extra: [String] = []) -> XCUIApplication {
-        let app = launch(["-baybo-open-home", "-baybo-home-tab", "settings", "-baybo-demo-models"] + extra)
+        let app = launch(
+            ["-baybo-open-home", "-baybo-home-tab", "settings", "-baybo-demo-models"] + extra)
         let row = app.buttons["settings-models"]
         XCTAssertTrue(row.waitForExistence(timeout: 5), "the Settings Models row never appeared")
         // The trailing value is the default entry, and it is the row's
@@ -24,6 +25,19 @@ final class LlmEntryUITests: BayboUITestCase {
         XCTAssertEqual(row.value as? String, "claude")
         row.tap()
         return app
+    }
+
+    func testLitePickerOffersClearAndServedModels() {
+        let app = openModels()
+        app.buttons["llm-entry-gpt"].tap()
+        let lite = app.buttons["llm-field-lite-model"]
+        XCTAssertTrue(lite.waitForExistence(timeout: 5))
+        lite.tap()
+        XCTAssertTrue(app.buttons["llm-lite-none"].exists)
+        XCTAssertTrue(app.buttons["llm-lite-gpt-5.5-mini"].exists)
+        attachScreenshot(app, name: "llm-lite-picker")
+        app.buttons["llm-lite-none"].tap()
+        XCTAssertTrue(app.staticTexts["llm-outcome"].waitForExistence(timeout: 5))
     }
 
     /// The list marks the default and says which entries have no resolvable
@@ -125,7 +139,8 @@ final class LlmEntryUITests: BayboUITestCase {
 
         XCTAssertTrue(
             app.staticTexts.containing(
-                NSPredicate(format: "label CONTAINS %@", "OPENAI_KEY")).firstMatch.exists,
+                NSPredicate(format: "label CONTAINS %@", "OPENAI_KEY")
+            ).firstMatch.exists,
             "the env-var shadow must be stated before the tap")
         XCTAssertTrue(
             app.buttons["llm-clear-env"].exists,
@@ -188,11 +203,7 @@ final class LlmEntryUITests: BayboUITestCase {
         attachScreenshot(app, name: "llm-model-list")
     }
 
-    /// Adding is a PICK from what the provider currently offers, never free
-    /// text — nothing gateway-side checks an id against the vendor, so a typo
-    /// would survive every validation and fail at the first real completion.
-    /// With no gateway behind the demo catalog the fetch fails, and the level
-    /// has to say so rather than showing an empty list.
+    /// Manual entry remains available when the provider catalog fails.
     func testAddingAModelOpensTheProviderCatalog() {
         let app = openModels()
         app.buttons["llm-entry-claude"].tap()
@@ -207,7 +218,8 @@ final class LlmEntryUITests: BayboUITestCase {
         // pinning either one's wording.
         let failure = app.staticTexts["llm-catalog-failure"]
         let anyRow = app.buttons.matching(
-            NSPredicate(format: "identifier BEGINSWITH %@", "llm-catalog-")).firstMatch
+            NSPredicate(format: "identifier BEGINSWITH %@", "llm-catalog-")
+        ).firstMatch
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline && !failure.exists && !anyRow.exists {
             _ = failure.waitForExistence(timeout: 1)
@@ -215,9 +227,12 @@ final class LlmEntryUITests: BayboUITestCase {
         XCTAssertTrue(
             failure.exists || anyRow.exists,
             "the catalog level must resolve to a list or a stated failure, not stay blank")
-        XCTAssertFalse(
-            app.textFields["llm-input-add-model"].exists,
-            "adding a model must never be free text")
+        let input = app.descendants(matching: .any).matching(identifier: "llm-input-models").firstMatch
+        XCTAssertTrue(input.exists)
+        input.tap()
+        input.typeText("vendor/model-a,model-b")
+        let commit = app.buttons["llm-commit-models"]
+        XCTAssertTrue(commit.isEnabled)
         attachScreenshot(app, name: "llm-add-model")
     }
 
@@ -248,7 +263,8 @@ final class LlmEntryUITests: BayboUITestCase {
         app.buttons["llm-new-provider"].tap()
         let failure = app.staticTexts["llm-new-providers-failure"]
         let anyProvider = app.buttons.matching(
-            NSPredicate(format: "identifier BEGINSWITH %@", "llm-provider-")).firstMatch
+            NSPredicate(format: "identifier BEGINSWITH %@", "llm-provider-")
+        ).firstMatch
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline && !failure.exists && !anyProvider.exists {
             _ = failure.waitForExistence(timeout: 1)

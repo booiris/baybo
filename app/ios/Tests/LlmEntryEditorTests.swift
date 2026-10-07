@@ -318,9 +318,10 @@ struct LlmEntryEditorTests {
         client.answerLlmWritesStaged()
         client.failListModels(with: NSError(domain: "test", code: 1))
         do {
-            _ = try await catalog.create(NewLlmEntry(
-                name: "new", provider: "ollama", model: "qwen3",
-                baseUrl: nil, apiKeyEnv: nil, apiKey: nil))
+            _ = try await catalog.create(
+                NewLlmEntry(
+                    name: "new", provider: "ollama", model: "qwen3", models: [], liteModel: nil,
+                    baseUrl: nil, apiKeyEnv: nil, apiKey: nil))
             Issue.record("read-back should fail")
         } catch {}
         #expect(catalog.requiresRestart)
@@ -353,7 +354,7 @@ struct LlmEntryEditorTests {
                 items: [LlmFixtures.entry("kimi", provider: "moonshot", model: "kimi-k2")]))
         _ = try await catalog.create(
             NewLlmEntry(
-                name: "kimi", provider: "moonshot", model: "kimi-k2",
+                name: "kimi", provider: "moonshot", model: "kimi-k2", models: [], liteModel: nil,
                 baseUrl: nil, apiKeyEnv: nil, apiKey: "sk-x"))
 
         #expect(catalog.entry(named: "kimi")?.provider == "moonshot")
@@ -425,5 +426,14 @@ struct LlmEntryEditorTests {
         #expect(!result.ok)
         #expect(result.error == "401 invalid x-api-key")
         #expect(result.latencyMs == nil)
+    }
+}
+
+struct LlmModelInputTests {
+    @Test func pastedModelIdsPreserveOrderAndProviderPaths() {
+        #expect(
+            LlmModelInput.parse(" vendor/Model-A,model-b\n vendor/Model-A，model-c\tmodel-B ")
+                == ["vendor/Model-A", "model-b", "model-c", "model-B"])
+        #expect(LlmModelInput.parse(" ,，\n\t").isEmpty)
     }
 }
