@@ -21,7 +21,7 @@
   },
   "dependencies": {
     "chrome-devtools-mcp": "1.1.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@mozilla/readability": "^0.6.0",
     "@puppeteer/browsers": "^2.13.0",
     "turndown": "^7.2.0"
