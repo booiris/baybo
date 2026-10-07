@@ -1,13 +1,16 @@
 //! The unified remote-host ("C") binary: serve the relay and (optionally) push
 //! roles on a single listener, distinguished by their disjoint route paths
-//! (`/notify` + `/register` vs `/pair`, `/content`, `/control`). The **relay is
-//! always on**; **push turns on automatically when an APNs `.p8` is configured**
-//! (`APNS_P8_PATH` is set). The gateway admission allow-list is a SQLite
-//! table polled for external edits (`admission_db`). Bind + TLS are configured
-//! here (`BIND_ADDR`, and optional `TLS_CERT` + `TLS_KEY` to serve wss/https); the
-//! operator dashboard's separate listener takes its own optional `DASHBOARD_TLS_CERT`
-//! + `DASHBOARD_TLS_KEY`, defaulting to plain HTTP.
+//! (`/notify` + `/register` vs `/pair`, `/content`, `/control`, `/direct`). The
+//! **relay is always on**; **push turns on automatically when an APNs `.p8` is
+//! configured** (`APNS_P8_PATH` is set). The gateway admission allow-list is a
+//! SQLite table polled for external edits (`admission_db`). Bind + TLS are
+//! configured here (`BIND_ADDR`, and optional `TLS_CERT` + `TLS_KEY` to serve
+//! wss/https); the operator dashboard's separate listener takes its own optional
+//! `DASHBOARD_TLS_CERT` + `DASHBOARD_TLS_KEY`, defaulting to plain HTTP. The
+//! direct-carrier UDP rendezvous runs on its own socket when `UDP_PUBLIC_ADDR`
+//! is set (`UDP_BIND_ADDR`, default [`DEFAULT_UDP_BIND_ADDR`]).
 
+use std::net::SocketAddrV4;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +22,9 @@ use remote_host_protocol::key_tag;
 use remote_host_push::serve::{PushConfig, build_router as push_router};
 use remote_host_push::{DeviceTokenStore, InMemoryDeviceTokenStore};
 use remote_host_relay::serve::{RelayServices, build_router as relay_router};
+use remote_host_relay::udp::{
+    DEFAULT_UDP_BIND_ADDR, RendezvousAddress, RendezvousServer, parse_bind_address,
+};
 
 mod admission_db;
 mod dashboard_backend;
@@ -92,10 +98,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Two-level content-bandwidth throttle: per-remote_api_key ceiling ∧ per-server
     // sub-cap (see RELAY_BYTES_PER_SEC).
     let bandwidth = Arc::new(remote_host_relay::BandwidthRegistry::new());
+    // The direct-carrier UDP rendezvous: on only when UDP_PUBLIC_ADDR is set,
+    // which is normalised here (a hostname is not resolved) and bound before any
+    // offer can name it. A bad value or a failed bind fails startup.
+    let udp_rendezvous = match udp_rendezvous_config(
+        env_nonblank("UDP_PUBLIC_ADDR"),
+        env_nonblank("UDP_BIND_ADDR"),
+    )? {
+        Some(config) => {
+            let server = RendezvousServer::bind(config.bind)
+                .await
+                .map_err(|e| format!("UDP_BIND_ADDR: {e}"))?;
+            Some((config, server))
+        }
+        None => None,
+    };
     // Connected gateway control channels and the matching/piping broker; both are
     // threaded into the relay router (instead of being created inside it) so the
     // dashboard overview can read their connected/pending counts.
-    let control = Arc::new(remote_host_relay::ControlRegistry::new());
+    let control = Arc::new(match &udp_rendezvous {
+        Some((config, _)) => {
+            remote_host_relay::ControlRegistry::new().with_udp_rendezvous(config.public.clone())
+        }
+        None => remote_host_relay::ControlRegistry::new(),
+    });
+    let udp_public = udp_rendezvous.as_ref().map_or_else(
+        || "disabled".to_owned(),
+        |(config, _)| config.public.as_str().to_owned(),
+    );
+    let udp_bind = udp_rendezvous.as_ref().map(|(config, _)| config.bind);
+    let udp_serve = {
+        let control = control.clone();
+        async move {
+            match udp_rendezvous {
+                Some((_, server)) => server.serve(control).await,
+                None => std::future::pending::<()>().await,
+            }
+            Ok::<(), serve::ServeError>(())
+        }
+    };
     let broker = Arc::new(remote_host_relay::RelayBroker::new());
     // Per-(remote_api_key, server_id) traffic counters; the relay records into them
     // on the data path and the flush task (below) drains them to the durable ledger.
@@ -347,11 +388,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 admission_db_path = %db_path,
                 admission_poll_secs = poll.as_secs(),
                 keys_admitted = admission.len(),
+                udp_rendezvous = %udp_public,
+                udp_bind = ?udp_bind,
                 "remote-host: listening",
             );
             tokio::try_join!(
                 serve::serve(&bind_addr, tls.clone(), app),
                 serve::serve(&dash_addr, dashboard_tls, dash),
+                udp_serve,
             )?;
         }
         None => {
@@ -367,12 +411,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 admission_db_path = %db_path,
                 admission_poll_secs = poll.as_secs(),
                 keys_admitted = admission.len(),
+                udp_rendezvous = %udp_public,
+                udp_bind = ?udp_bind,
                 "remote-host: listening",
             );
-            serve::serve(&bind_addr, tls, app).await?;
+            tokio::try_join!(serve::serve(&bind_addr, tls, app), udp_serve)?;
         }
     }
     Ok(())
+}
+
+/// The UDP rendezvous knobs, validated.
+#[derive(Debug)]
+struct UdpRendezvousConfig {
+    public: RendezvousAddress,
+    bind: SocketAddrV4,
+}
+
+/// `UDP_PUBLIC_ADDR` and `UDP_BIND_ADDR`: `None` (no rendezvous) without a
+/// public address, else both validated; the bind defaults to
+/// [`DEFAULT_UDP_BIND_ADDR`] and must be IPv4.
+fn udp_rendezvous_config(
+    public: Option<String>,
+    bind: Option<String>,
+) -> Result<Option<UdpRendezvousConfig>, String> {
+    let Some(public) = public else {
+        return Ok(None);
+    };
+    let public = RendezvousAddress::parse(&public)
+        .map_err(|e| format!("UDP_PUBLIC_ADDR {public:?}: {e}"))?;
+    let bind = match bind {
+        Some(raw) => parse_bind_address(&raw).map_err(|e| format!("UDP_BIND_ADDR {raw:?}: {e}"))?,
+        None => DEFAULT_UDP_BIND_ADDR,
+    };
+    Ok(Some(UdpRendezvousConfig { public, bind }))
+}
+
+/// An env var's value, or `None` when unset or blank (Compose passes `${VAR:-}`
+/// as the empty string).
+fn env_nonblank(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Build one role's (always-on) per-source-IP throttle config from the shared
@@ -409,15 +489,11 @@ fn dashboard_token() -> Option<remote_host_dashboard::DashboardToken> {
 }
 
 /// Parse an env override, accepting only values `is_valid` passes. `None` (the
-/// caller's default applies) when the var is unset or blank — Compose passes
-/// `${VAR:-}` as the empty string — and, with a **warn**, when it is set to
-/// something unparseable or rejected, so a typo'd knob is self-diagnosing
-/// instead of silently falling back.
+/// caller's default applies) when the var is unset or blank ([`env_nonblank`]),
+/// and, with a **warn**, when it is set to something unparseable or rejected,
+/// so a typo'd knob is self-diagnosing instead of silently falling back.
 fn env_override<T: std::str::FromStr>(key: &str, is_valid: impl Fn(&T) -> bool) -> Option<T> {
-    let raw = std::env::var(key).ok()?;
-    if raw.trim().is_empty() {
-        return None;
-    }
+    let raw = env_nonblank(key)?;
     match raw.parse::<T>() {
         Ok(v) if is_valid(&v) => Some(v),
         _ => {
@@ -463,6 +539,37 @@ mod tests {
                 None => unsafe { std::env::remove_var(TOKEN_VAR) },
             }
         }
+    }
+
+    #[test]
+    fn the_udp_rendezvous_needs_a_public_address_and_an_ipv4_bind() {
+        assert!(
+            udp_rendezvous_config(None, Some("garbage".into()))
+                .unwrap()
+                .is_none(),
+            "no public address, no rendezvous"
+        );
+        let config = udp_rendezvous_config(Some("Rendezvous.Example.com:7777".into()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.public.as_str(), "rendezvous.example.com:7777");
+        assert_eq!(config.bind, DEFAULT_UDP_BIND_ADDR);
+        let config =
+            udp_rendezvous_config(Some("8.8.8.8:7777".into()), Some("0.0.0.0:9000".into()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(config.bind.port(), 9000);
+
+        let error = udp_rendezvous_config(Some("10.0.0.1:7777".into()), None).unwrap_err();
+        assert!(error.starts_with("UDP_PUBLIC_ADDR"), "{error}");
+        let error = udp_rendezvous_config(Some("rendezvous.example.com".into()), None).unwrap_err();
+        assert!(error.starts_with("UDP_PUBLIC_ADDR"), "{error}");
+        let error = udp_rendezvous_config(
+            Some("rendezvous.example.com:7777".into()),
+            Some("[::]:7777".into()),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("UDP_BIND_ADDR"), "{error}");
     }
 
     /// `dashboard_token`: unset/empty → `None` (dashboard off); any non-empty value

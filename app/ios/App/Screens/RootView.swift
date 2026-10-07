@@ -31,6 +31,8 @@ struct RootView: View {
                         .navigationDestination(for: AppStore.ChatRoute.self) { route in
                             Group {
                                 switch route {
+                                case .connection:
+                                    ConnectionDetailsScreen()
                                 case .session(let sessionId):
                                     ChatScreen(
                                         host: store.transcriptHost(for: sessionId),

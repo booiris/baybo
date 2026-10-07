@@ -68,6 +68,7 @@ pub const EP_PAIR_JOIN: &str = "pair/join";
 pub const EP_CONTROL: &str = "control";
 pub const EP_CONTENT_JOIN: &str = "content/join";
 pub const EP_CONTENT_HOST: &str = "content/host";
+pub const EP_DIRECT_OFFER: &str = "direct/offer";
 pub const EP_NOTIFY: &str = "notify";
 pub const EP_REGISTER: &str = "register";
 pub const EP_STATUS: &str = "status";
@@ -110,6 +111,8 @@ pub fn endpoint_label(path: &str) -> &'static str {
         EP_CONTENT_JOIN
     } else if p.starts_with("/content/host/") {
         EP_CONTENT_HOST
+    } else if p.starts_with("/direct/") {
+        EP_DIRECT_OFFER
     } else {
         EP_OTHER
     }
@@ -419,6 +422,8 @@ mod tests {
         assert_eq!(endpoint_label("/pair/host/rid"), EP_PAIR_HOST);
         assert_eq!(endpoint_label("/pair/join/rid"), EP_PAIR_JOIN);
         assert_eq!(endpoint_label("/control"), EP_CONTROL);
+        assert_eq!(endpoint_label("/direct/node-1"), EP_DIRECT_OFFER);
+        assert_eq!(endpoint_label("/directory"), EP_OTHER);
         assert_eq!(endpoint_label("/notify"), EP_NOTIFY);
         assert_eq!(endpoint_label("/register"), EP_REGISTER);
         assert_eq!(endpoint_label("/wat/ever"), EP_OTHER);

@@ -282,6 +282,8 @@ pub struct LlmModelEntry {
     /// key comes from the environment would be a button that reports success
     /// and changes nothing.
     pub api_key_in_vault: bool,
+    /// Whether this entry can be removed over HTTP (not the default or OAuth).
+    pub can_remove: bool,
     pub reasoning_effort: Option<String>,
     /// The thinking levels this entry's provider can actually be told, in
     /// display order (cheapest first). Empty when baybo sends this provider

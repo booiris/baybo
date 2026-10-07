@@ -50,9 +50,10 @@
 //!   clobber) a subscription on a different leg.
 //!
 //! File layout mirrors the concern boundary: this file holds the shared
-//! wire primitives every leg surface uses (`WsStream`, [`TransportError`],
-//! [`FrameCodec`], the readers) plus the seams and the [`SessionRegistry`]
-//! facade; [`supervisor`] is the lifecycle actor; [`pump`] is the hot path.
+//! wire primitives every leg surface uses ([`TransportError`], [`FrameCodec`])
+//! plus the seams and the [`SessionRegistry`] facade; [`socket`] is the binary
+//! transport under a leg (a WebSocket or a direct carrier's stream);
+//! [`supervisor`] is the lifecycle actor; [`pump`] is the hot path.
 //!
 //! The HOT PATH deliberately stays out of the loop: the pump routes inbound
 //! frames straight to per-session [`FrameSink`]s through the shared routing
@@ -69,23 +70,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::api::{DeckSink, FrameSink, ProjectSink, SessionListSink};
 use crate::core::{Frame, MobileError, WireApprovalDecision, WireAttachment};
 
 mod pump;
+mod socket;
 mod supervisor;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use socket::{CarrierStream, LegSocket};
+#[cfg(feature = "test-support")]
+pub(crate) use supervisor::ROTATION_HELD;
+
 use supervisor::{Msg, Reply};
 
-/// The concrete client socket both legs dial.
+/// The WebSocket both the relay and the direct leg dial.
 pub(crate) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// How long either leg's `establish` waits for the reply to its handshake — the
@@ -165,11 +169,12 @@ pub(crate) trait FrameCodec: Send {
 /// across the spawn. Args are `(session_id, text, msg_id, attachments)`.
 pub(crate) type UserFrameFn = Box<dyn Fn(&str, &str, &str, Vec<WireAttachment>) -> Frame + Send>;
 
-/// A live, handshaken leg ready to pump: the socket, its frame codec, and the
+/// A live, handshaken leg ready to pump: the socket (a WebSocket, or a direct
+/// carrier's stream), its frame codec, and the
 /// outbound frame builder. The initial and later `Subscribe` frames are ordinary
 /// outbound commands so one socket can carry many sessions.
 pub(crate) struct Connection {
-    pub ws: WsStream,
+    pub socket: LegSocket,
     pub codec: Box<dyn FrameCodec>,
     pub user_frame: UserFrameFn,
 }
@@ -186,6 +191,70 @@ pub(crate) trait LegDialer: Send + Sync {
     /// [`Connection`]. Boxed (dyn-compatible) — the dial is seconds of network
     /// I/O, so the allocation is noise.
     fn establish(&self) -> futures_util::future::BoxFuture<'_, Result<Connection, TransportError>>;
+
+    /// Ticks whenever a rotation target may have appeared or gone (the relay
+    /// leg's direct carrier). `None` for a leg that never rotates.
+    fn rotation_events(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
+
+    /// Whether a chat leg could be dialed on a better transport right now.
+    fn can_rotate(&self) -> bool {
+        false
+    }
+
+    /// Dial a chat leg on the rotation target. The dialer calls
+    /// [`RotationGate::commit`] right before it writes anything the gateway
+    /// acts on, and gives up when that returns `false`.
+    fn rotate(
+        &self,
+        _gate: RotationGate,
+    ) -> futures_util::future::BoxFuture<'_, Result<Connection, TransportError>> {
+        Box::pin(async { Err(TransportError::Other("this leg never rotates".into())) })
+    }
+}
+
+/// The commit point of a chat rotation, shared by the supervisor and the
+/// rotation's dial. Before it, the supervisor may abandon the rotation (a
+/// turn started, the carrier went away); after it, the gateway may already
+/// have retired the relay leg, so the rotation runs to success or failure.
+#[derive(Clone, Default)]
+pub(crate) struct RotationGate(Arc<parking_lot::Mutex<GateState>>);
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum GateState {
+    #[default]
+    Open,
+    Committed,
+    Abandoned,
+}
+
+impl RotationGate {
+    /// The dial's side: `true` when the rotation may proceed past the commit
+    /// point, `false` when it was abandoned first.
+    pub(crate) fn commit(&self) -> bool {
+        let mut state = self.0.lock();
+        match *state {
+            GateState::Open | GateState::Committed => {
+                *state = GateState::Committed;
+                true
+            }
+            GateState::Abandoned => false,
+        }
+    }
+
+    /// The supervisor's side: `true` when the rotation was abandoned before
+    /// its commit point.
+    fn abandon(&self) -> bool {
+        let mut state = self.0.lock();
+        match *state {
+            GateState::Open | GateState::Abandoned => {
+                *state = GateState::Abandoned;
+                true
+            }
+            GateState::Committed => false,
+        }
+    }
 }
 
 /// The connection-global session-activity sink, shared by both legs (only one is
@@ -224,6 +293,8 @@ pub(crate) struct SessionRegistry {
     /// unanswered subscribe cost milliseconds instead of seconds. Read at
     /// supervisor spawn, so a test override must precede the first operation.
     subscribe_ack_timeout: Duration,
+    /// [`supervisor::CHAT_ROTATION_QUIET`], injectable like the ack budget.
+    rotation_quiet: Duration,
 }
 
 impl SessionRegistry {
@@ -236,6 +307,7 @@ impl SessionRegistry {
             deck_sink: Arc::new(parking_lot::Mutex::new(None)),
             project_sink: Arc::new(parking_lot::Mutex::new(None)),
             subscribe_ack_timeout: SUBSCRIBE_ACK_TIMEOUT,
+            rotation_quiet: supervisor::CHAT_ROTATION_QUIET,
         }
     }
 }
@@ -247,6 +319,13 @@ impl SessionRegistry {
     #[cfg(test)]
     fn with_subscribe_ack_timeout(mut self, budget: Duration) -> Self {
         self.subscribe_ack_timeout = budget;
+        self
+    }
+
+    /// Shrink the quiet period a rotation waits for, the same way.
+    #[cfg(test)]
+    fn with_rotation_quiet(mut self, quiet: Duration) -> Self {
+        self.rotation_quiet = quiet;
         self
     }
 
@@ -262,6 +341,7 @@ impl SessionRegistry {
                 self.deck_sink.clone(),
                 self.project_sink.clone(),
                 self.subscribe_ack_timeout,
+                self.rotation_quiet,
             )
         })
     }
@@ -498,49 +578,4 @@ pub(crate) fn set_deck_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn DeckSin
 
 pub(crate) fn set_project_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn ProjectSink>>) {
     leg.registry().set_project_sink(sink);
-}
-
-/// Read the next binary WS message (skipping ping/pong).
-///
-/// UNBOUNDED, and it must stay that way: this is not a handshake helper. It is
-/// also `relay::tunnel::NoiseFrames::recv`, i.e. the read under every
-/// REST-over-relay response frame and every blob chunk, whose budgets are owned
-/// by their own callers (`POOLED_LEG_FIRST_BYTE_TIMEOUT`,
-/// `TUNNEL_REQUEST_TIMEOUT`, `TUNNEL_HANDSHAKE_TIMEOUT`) and are far wider than
-/// any handshake's. A blanket timeout here silently caps all of them — and a
-/// 100 MiB upload's post-transfer wait, which is deliberately uncapped. Wrap the
-/// CALL SITE that wants a bound; see [`recv_binary_handshake`].
-pub(crate) async fn recv_binary(ws: &mut WsStream) -> Result<Vec<u8>, TransportError> {
-    loop {
-        match ws.next().await {
-            Some(Ok(Message::Binary(b))) => return Ok(b),
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            Some(Ok(Message::Close(_))) | None => {
-                return Err(TransportError::Other("connection closed".into()));
-            }
-            Some(Ok(_)) => continue,
-            Some(Err(e)) => return Err(TransportError::Other(format!("ws: {e}"))),
-        }
-    }
-}
-
-/// [`recv_binary`] for the ONE thing that deserves a short leash: a leg's
-/// handshake reply (the relay's Noise message 2, the direct leg's
-/// `RegisterAck`).
-///
-/// The upgrade completing does not mean anyone is on the other end yet. The
-/// relay parks a content-join leg the moment it accepts it, and only then does
-/// the gateway dial in to claim it — so a gateway that fails to claim leaves the
-/// phone blocked on a perfectly healthy socket with nothing ever coming back.
-/// Left unbounded that costs the whole [`CONNECT_TIMEOUT`]; bounded, it costs
-/// one step of the retry ladder.
-pub(crate) async fn recv_binary_handshake(ws: &mut WsStream) -> Result<Vec<u8>, TransportError> {
-    tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT, recv_binary(ws))
-        .await
-        .map_err(|_| {
-            TransportError::Other(format!(
-                "no handshake reply within {}s (the peer accepted the socket but never answered)",
-                HANDSHAKE_REPLY_TIMEOUT.as_secs()
-            ))
-        })?
 }

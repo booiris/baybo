@@ -12,7 +12,7 @@ The headline win is **LLM identity** (`provider`, `model`, `model_list` — incl
 ## Non-goals
 
 - Hot-reloading anything outside the whitelist (ports, bind address, workspace path, encryption key file, channels, memory, the rest of `agent`). These **hard-reject** on reload.
-- HTTP add/remove model endpoints — the `baybo llm` CLI already does full CRUD, and reload rebuilds the whole pool from `config.llm` regardless of which surface triggered it.
+- The original reload work did not add HTTP entry CRUD. It now exists in the LLM admin API; its create handler checks the pre-flight outcome for the new entry before persisting.
 - TUI inline reload (the TUI boot path has no admin HTTP server; SIGHUP only, if wired).
 - Making `skill_assessor` *follow* a hot-reload model swap — it's now on the billed path (a system-attributed `BoundBilledLlm`) but stays pinned to the boot-time default; see the TODO below.
 

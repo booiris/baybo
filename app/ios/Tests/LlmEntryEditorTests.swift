@@ -158,6 +158,7 @@ struct LlmEntryEditorTests {
     /// passes a guard that was never asked the real question.
     @Test func aWriteStraddlingALogoutDoesNotRepopulate() async throws {
         let catalog = await makeCatalog()
+        client.answerLlmWritesStaged()
         client.stallLlmWrite(ms: 80)
 
         let write = Task { try? await catalog.apply(.supportsVision(on: true), to: "claude") }
@@ -167,6 +168,7 @@ struct LlmEntryEditorTests {
 
         #expect(catalog.models.isEmpty)
         #expect(catalog.defaultName == nil)
+        #expect(!catalog.requiresRestart)
     }
 
     // MARK: - The mirror
@@ -179,6 +181,7 @@ struct LlmEntryEditorTests {
         let cold = ModelCatalog(client: FakeBayboClient(), directory: temp.url)
         let gpt = cold.entry(named: "gpt")
         #expect(gpt?.apiKeyConfigured == false)
+        #expect(gpt?.canRemove == true)
         #expect(gpt?.contextWindowOverride == 400_000)
         #expect(gpt?.effectiveContextWindow == 400_000)
         #expect(cold.entry(named: "claude")?.apiKeyConfigured == true)
@@ -308,6 +311,29 @@ struct LlmEntryEditorTests {
         #expect(first[0].configured, "an already-served model is marked, not offered as new")
         #expect(!first[1].configured)
         #expect(client.llmCatalogFetches == ["claude", "claude"], "never cached")
+    }
+
+    @Test func stagedCreationSurvivesAFailedReadBack() async throws {
+        let catalog = await makeCatalog()
+        client.answerLlmWritesStaged()
+        client.failListModels(with: NSError(domain: "test", code: 1))
+        do {
+            _ = try await catalog.create(NewLlmEntry(
+                name: "new", provider: "ollama", model: "qwen3",
+                baseUrl: nil, apiKeyEnv: nil, apiKey: nil))
+            Issue.record("read-back should fail")
+        } catch {}
+        #expect(catalog.requiresRestart)
+        catalog.unload()
+        #expect(!catalog.requiresRestart)
+    }
+
+    @Test func stagedDeletionKeepsTheRestartNotice() async throws {
+        let catalog = await makeCatalog()
+        client.answerLlmWritesStaged()
+        let result = try await catalog.delete("gpt")
+        #expect(result.requiresRestart)
+        #expect(catalog.requiresRestart)
     }
 
     // MARK: - Create and delete

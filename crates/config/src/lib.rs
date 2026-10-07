@@ -44,7 +44,7 @@ pub use crate::channels::{
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig};
-pub use crate::gateway::GatewayConfig;
+pub use crate::gateway::{DirectUdpConfig, GatewayConfig};
 pub use crate::llm::{LlmEntry, LlmModelSpec, LlmPricingOverride};
 pub use crate::memory::{MemoryConfig, MemoryProvider};
 pub use crate::permission::PermissionPolicy;

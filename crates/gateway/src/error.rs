@@ -10,6 +10,9 @@ pub enum GatewayError {
     #[error("bind to {addr} failed: {reason}")]
     Bind { addr: String, reason: String },
 
+    #[error("invalid gateway.bind_address {addr:?}: {reason}")]
+    AdminAddress { addr: String, reason: String },
+
     #[error("auth token not initialized; run `baybo gateway enable`")]
     TokenMissing,
 

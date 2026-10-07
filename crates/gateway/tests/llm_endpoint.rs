@@ -1248,3 +1248,75 @@ async fn create_then_delete_round_trips() {
     let after = tokio::fs::read_to_string(&path).await.expect("after");
     assert_eq!(before, after, "create+delete is a no-op on disk");
 }
+
+struct DroppingCreatedEntryReloader;
+
+#[async_trait::async_trait]
+impl baybo_gateway::reload::ConfigReloader for DroppingCreatedEntryReloader {
+    async fn reload(
+        &self,
+    ) -> Result<baybo_gateway::reload::ReloadOutcome, baybo_gateway::reload::ReloadError> {
+        panic!("a dropped create must not reach reload")
+    }
+
+    async fn dry_run(
+        &self,
+        candidate: &BayboConfig,
+    ) -> Result<baybo_gateway::reload::ReloadOutcome, baybo_gateway::reload::ReloadError> {
+        Ok(baybo_gateway::reload::ReloadOutcome {
+            active_model: "gpt-4o".into(),
+            default_entry: candidate.default_llm.to_string(),
+            entries: vec![candidate.default_llm.to_string()],
+            dropped: vec!["ghost".into()],
+        })
+    }
+}
+
+#[tokio::test]
+async fn create_rejects_a_dropped_non_default_and_restores_its_key() {
+    let (router, _dir, path, vault) = router_with_vault(
+        seed_two_entries(),
+        Some(Arc::new(DroppingCreatedEntryReloader)),
+    )
+    .await;
+    let before = tokio::fs::read(&path).await.expect("before");
+    let (status, _) = post_entry(
+        &router,
+        json!({
+            "name": "ghost", "provider": "openai", "model": "gpt-4o", "api_key": "sk-test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(tokio::fs::read(&path).await.expect("after"), before);
+    assert_eq!(vault_key(&vault, "ghost").await, None);
+}
+
+#[tokio::test]
+async fn removal_capability_matches_default_and_oauth_refusals() {
+    let mut config = seed_two_entries();
+    let mut oauth = config.llm[1].clone();
+    oauth.name = "subscription".into();
+    oauth.provider = "openai-subscription".into();
+    config.llm.push(oauth);
+    let (router, _dir, _path) = router_with_seed_config(config).await;
+    let response = router
+        .clone()
+        .oneshot(auth(
+            Request::builder()
+                .uri("/v1/llm/models")
+                .body(Body::empty())
+                .expect("request"),
+        ))
+        .await
+        .expect("list");
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let list: Value = serde_json::from_slice(&bytes).expect("json");
+    for item in list["items"].as_array().expect("items") {
+        assert_eq!(item["can_remove"], item["name"] == "secondary");
+    }
+    let (status, _) = delete_entry(&router, "subscription").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

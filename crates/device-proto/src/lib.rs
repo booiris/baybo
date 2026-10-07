@@ -20,6 +20,9 @@
 //!   content and API tunnel legs.
 //! - [`pairing`] — the wire messages swapped during the pairing handshake
 //!   (the `DeviceHello` body, routing, push registration, confirm decision).
+//! - [`candidates`] — the sealed candidate sets P and A exchange through C to
+//!   find a direct carrier, and the tags that authenticate P's punches. The
+//!   keys come from the pairing statics, so C forwards sets it cannot read.
 //! - [`fixtures`] — pinned cross-language test vectors the iOS NSE's Swift
 //!   tests consume so the native CryptoKit path matches this crate exactly.
 //!
@@ -29,6 +32,7 @@
 
 pub mod aead;
 pub mod api_tunnel;
+pub mod candidates;
 pub mod delegation;
 pub mod error;
 pub mod fixtures;

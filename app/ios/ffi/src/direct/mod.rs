@@ -299,6 +299,24 @@ impl GatewayJsonClient for DirectHttp {
         }
     }
 
+    fn delete_json<'a, T>(
+        &'a self,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let resp = self
+                .client()
+                .delete(self.url(path))
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Baybo: {e}"))?;
+            parse_json_response(resp).await
+        }
+    }
+
     fn delete_empty<'a>(
         &'a self,
         path: &'a str,

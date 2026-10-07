@@ -46,6 +46,11 @@ pub struct ContentSession {
 }
 
 impl ContentSession {
+    /// See [`confirmation`].
+    pub fn confirmation(&mut self) -> Result<Vec<u8>, MobileError> {
+        confirmation(&mut self.transport)
+    }
+
     pub fn seal(&mut self, frame: &Frame) -> Result<Vec<Vec<u8>>, MobileError> {
         let plaintext = encode(frame)?;
         Ok(write_chunked(&mut self.transport, &plaintext)?)
@@ -64,6 +69,17 @@ impl ContentSession {
         }
         Ok(frames)
     }
+}
+
+/// P's handshake confirmation on a carrier session: one transport message with
+/// an empty payload, sent right after msg2 and before anything else. The
+/// gateway counts a carrier session as the device's only once it decrypts,
+/// which a replayed msg1 can never produce.
+pub(crate) fn confirmation(transport: &mut TransportState) -> Result<Vec<u8>, MobileError> {
+    let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
+    let n = transport.write_message(&[], &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 pub fn subscribe_frame(session_id: &str) -> Frame {

@@ -215,12 +215,10 @@ was tried and failed, and several name a bug that shipped once already.
 - [`docs/entry-editor.md`](docs/entry-editor.md) — Settings → Models: the
   gateway's `llm` entries and the editor for one. The GLOBAL half of the model
   story (the picker above is the per-session half). Read it before touching
-  `LlmEntryScreen` or any `llm_*` write: the one-key-per-PUT rule is what keeps
-  a latent gateway defect unreachable (no in-tree client triggers it today —
-  it bites the next one written the obvious way), and the API-key row's three
-  refusals
-  (no clear, no cleartext binding, warn on an env shadow) each name a way the
-  obvious design loses a real secret.
+  `LlmEntryScreen` or any `llm_*` write: the one-key-per-PUT rule prevents ambiguous model/override edits. Key removal
+  applies only to vault credentials; direct cleartext bindings hide key entry,
+  and an explicit environment override earns a warning. Creation must pass the
+  entry-specific pre-flight, and all mutations preserve restart-pending status.
 - [`docs/approvals.md`](docs/approvals.md) — the native tool-approval card and
   the four frames that drive it.
 - [`docs/projects.md`](docs/projects.md) — the Projects tab: the cards root,

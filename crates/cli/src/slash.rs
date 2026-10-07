@@ -546,6 +546,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn slash_rejects_the_whole_device_family_including_status() {
+        let handler = handler_with(SkillRegistry::new());
+        let names: Vec<String> = handler.commands().into_iter().map(|c| c.name).collect();
+        assert!(
+            !names.contains(&"/device".to_string()),
+            "/device must not appear in the slash menu, got {names:?}"
+        );
+        for raw in ["/device status", "/device list"] {
+            match handler.handle(raw).await {
+                SlashOutcome::Handled(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    assert!(
+                        text.contains("terminal-only"),
+                        "expected slash-rejection for {raw}, got: {text}"
+                    );
+                }
+                other => panic!("expected Handled rejection for {raw}, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn slash_menu_drops_process_lifecycle_families() {
         let handler = handler_with(SkillRegistry::new());

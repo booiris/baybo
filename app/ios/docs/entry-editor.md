@@ -109,6 +109,9 @@ one-key-per-PUT rule gives it for free.
 
 ## Creating an entry
 
+Creation uses a non-replayed POST: if its response is lost, a retry would return
+a duplicate-name error even though the first request succeeded.
+
 `POST /v1/llm/models` takes only what an entry cannot exist without — name,
 provider, model, and optionally a base URL and a key. Everything else
 (`model_list`, per-model overrides, the thinking level) is an edit made
@@ -144,6 +147,14 @@ Two rules the create handler owns that `validate()` does not:
 - **The first entry on a fresh install becomes `default-llm`.** `validate()`
   rejects an empty default once entries exist, so the handler sets it rather
   than writing a config it just made invalid.
+
+Creation checks the pre-flight pool outcome, not just whether the pool built:
+a non-default entry can fail construction while the default still works. If the
+new name is absent, creation is rejected and the staged key restored.
+
+`can_remove` is computed by the same gateway predicate that guards deletion.
+The phone offers removal only for explicit `true`; an older gateway or mirror
+that cannot answer does not earn a destructive button.
 
 Deletion refuses the current `default-llm` — removing it would leave the config
 pointing at a row that is gone. The vault key is dropped **after** the config
@@ -283,6 +294,12 @@ the old client, so in exactly that state a green probe certifies settings nobody
 is serving. Reading `requires_restart` at all is why `put_json` had to exist —
 `put_empty` discards the body, and persisted-but-not-live would be
 indistinguishable from live.
+
+Create and delete preserve `requires_restart` too. `ModelCatalog` records it
+before read-back, so a failed refresh cannot erase the warning. The entry list
+keeps a restart notice after either form dismisses, and reopening an editor
+still hides its probe. This binding-scoped notice lasts until unload and is not
+a durable claim about whether the server has since restarted.
 
 `requires_restart` itself means *on disk, not in the pool*: the reloader stored
 the new baseline and returned before rebuilding, which happens when some other

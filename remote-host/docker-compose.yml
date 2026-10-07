@@ -1,7 +1,8 @@
-# remote-host "C" role — one service, one listener. The relay is always on; the
-# push role turns on automatically when you configure an APNs .p8
+# remote-host "C" role — one service, one HTTP/WS listener, plus an optional UDP
+# rendezvous for direct carriers (UDP_PUBLIC_ADDR in .env). The relay is always
+# on; the push role turns on automatically when you configure an APNs .p8
 # (APNS_P8_HOST_PATH in .env). Their route paths are disjoint (/notify +
-# /register vs /pair, /content, /control).
+# /register vs /pair, /content, /control, /direct).
 #
 # Admitted gateways live in a SQLite table (./data/admission.db by default),
 # hot-reloaded by polling — add/remove keys out of band (see DEPLOY.md), no
@@ -31,6 +32,13 @@ services:
       # The listen port, host + container the same (default 7777). The container
       # runs as root, so a privileged PORT like 443 binds fine.
       BIND_ADDR: 0.0.0.0:${PORT:-7777}
+      # Direct-carrier UDP rendezvous — on only when UDP_PUBLIC_ADDR is set (an
+      # IPv4 literal or a DNS-only hostname, plus the port clients send to; see
+      # DEPLOY.md). The UDP port is the same on host and container, like PORT.
+      # UDP_BIND_ADDR in .env is only for host networking on a multi-homed host
+      # (see DEPLOY.md); blank binds every IPv4 address on UDP_PORT.
+      UDP_PUBLIC_ADDR: ${UDP_PUBLIC_ADDR:-}
+      UDP_BIND_ADDR: ${UDP_BIND_ADDR:-0.0.0.0:${UDP_PORT:-7777}}
       # gateway admission allow-list — a SQLite table on the /data volume
       ADMISSION_DB_PATH: /data/admission.db
       ADMISSION_POLL_SECS: ${ADMISSION_POLL_SECS:-30}
@@ -108,6 +116,10 @@ services:
       - ${DASHBOARD_TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/dashboard-key.pem:ro
     ports:
       - "${PORT:-7777}:${PORT:-7777}"
+      # The UDP rendezvous must see each client's real source address: keep the
+      # default kernel DNAT publishing (a userland proxy rewrites the source, and
+      # C then refuses every registration with udp_source_not_public).
+      - "0.0.0.0:${UDP_PORT:-7777}:${UDP_PORT:-7777}/udp"
       # Operator dashboard listener (HTTP, or HTTPS with a dashboard cert). Bind to
       # 127.0.0.1 on the host if you only reach it via an SSH tunnel.
       - "${DASHBOARD_PORT:-7778}:7778"

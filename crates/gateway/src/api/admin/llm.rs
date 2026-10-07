@@ -462,7 +462,15 @@ async fn create_model(
     // first — and put back if the pre-flight then rejects the entry.
     let staged = stage_api_key(&state, &name, req.api_key.as_deref()).await?;
 
-    if let Err(e) = state.config_reloader.dry_run(&current).await {
+    if let Err(e) = state.config_reloader.dry_run(&current).await.and_then(|outcome| {
+        if outcome.entries.contains(&name) {
+            Ok(())
+        } else {
+            Err(crate::reload::ReloadError::Config(format!(
+                "llm entry {name:?} could not be built; check its credentials and provider settings"
+            )))
+        }
+    }) {
         staged.restore(&state).await;
         return Err(e.into());
     }
@@ -513,22 +521,7 @@ async fn delete_model(
         .ok_or_else(|| GatewayError::NotFound(format!("llm entry {name:?}")))?
         .clone();
 
-    if current.default_llm.as_str() == name {
-        return Err(GatewayError::BadRequest(format!(
-            "{name:?} is the current default-llm; point it at another entry \
-             (PUT /v1/llm/default) before removing this one"
-        )));
-    }
-    // An OAuth entry's credential is a refresh token that wants a server-side
-    // revoke, and whether the bundle may be cleared at all depends on the other
-    // subscription entries. `baybo llm remove` owns that; deleting the config
-    // row here would strand a live token in the vault.
-    if baybo_llm::auth_for_provider(&entry.provider).is_some_and(|auth| !auth.is_api_key_shaped()) {
-        return Err(GatewayError::BadRequest(format!(
-            "{name:?} signs in interactively; run `baybo llm remove` on the gateway host so its \
-             login is revoked rather than stranded"
-        )));
-    }
+    check_entry_removal(&current, &entry)?;
 
     current.llm.retain(|e| e.name.as_str() != name);
     current
@@ -881,6 +874,28 @@ async fn get_usage(
     }))
 }
 
+fn check_entry_removal(config: &BayboConfig, entry: &LlmEntry) -> GatewayResult<()> {
+    let name = entry.name.as_str();
+    if config.default_llm.as_str() == entry.name.as_str() {
+        return Err(GatewayError::BadRequest(format!(
+            "{name:?} is the current default-llm; point it at another entry \
+             (PUT /v1/llm/default) before removing this one"
+        )));
+    }
+    // An OAuth entry's credential is a refresh token that wants a server-side
+    // revoke, and whether the bundle may be cleared at all depends on the other
+    // subscription entries. `baybo llm remove` owns that; deleting the config
+    // row here would strand a live token in the vault.
+    if baybo_llm::auth_for_provider(&entry.provider).is_some_and(|auth| !auth.is_api_key_shaped()) {
+        return Err(GatewayError::BadRequest(format!(
+            "{name:?} signs in interactively; run `baybo llm remove` on the gateway host so its \
+             login is revoked rather than stranded"
+        )));
+    }
+
+    Ok(())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// A vault edit made ahead of the pre-flight that can still reject it, plus
@@ -1048,6 +1063,7 @@ async fn build_model_entry(
         .is_some();
 
     LlmModelEntry {
+        can_remove: check_entry_removal(cfg, entry).is_ok(),
         name: entry.name.to_string(),
         provider: entry.provider.clone(),
         model: entry.model.clone(),

@@ -99,6 +99,13 @@ pub(crate) trait GatewayJsonClient {
     where
         T: DeserializeOwned + Send + 'static;
 
+    fn delete_json<'a, T>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static;
+
     fn delete_empty<'a>(
         &'a self,
         path: &'a str,
@@ -589,6 +596,7 @@ struct WireLlmModel {
     /// distinguishable from `false` — see the record's own doc comment.
     #[serde(default)]
     api_key_in_vault: Option<bool>,
+    can_remove: Option<bool>,
     #[serde(default)]
     context_window_override: Option<u32>,
     #[serde(default)]
@@ -1390,6 +1398,7 @@ pub(crate) async fn list_llm_models<C: GatewayJsonClient + Sync>(
                 api_key_env: m.api_key_env,
                 api_key_configured: m.api_key_configured,
                 api_key_in_vault: m.api_key_in_vault,
+                can_remove: m.can_remove,
                 context_window_override: m.context_window_override,
                 effective_context_window: m.effective_context_window,
                 supports_vision_override: m.supports_vision_override,
@@ -1559,7 +1568,7 @@ pub(crate) async fn create_llm_model<C: GatewayJsonClient + Sync>(
     })
     .map_err(|e| format!("encode create llm entry request: {e}"))?;
 
-    let wire: WireMutateResponse = client.post_json(PATH_LLM_MODELS, body).await?;
+    let wire: WireMutateResponse = client.post_json_once(PATH_LLM_MODELS, body).await?;
     Ok(LlmMutateResult {
         requires_restart: wire.requires_restart,
     })
@@ -1573,10 +1582,13 @@ pub(crate) async fn create_llm_model<C: GatewayJsonClient + Sync>(
 pub(crate) async fn delete_llm_model<C: GatewayJsonClient + Sync>(
     client: &C,
     name: String,
-) -> Result<(), String> {
+) -> Result<LlmMutateResult, String> {
     validate_path_segment(&name, "llm entry name")?;
     let path = format!("{PATH_LLM_MODELS}/{}", percent_encode(&name));
-    client.delete_empty(&path).await
+    let wire: WireMutateResponse = client.delete_json(&path).await?;
+    Ok(LlmMutateResult {
+        requires_restart: wire.requires_restart,
+    })
 }
 
 /// Move the gateway's `default-llm` to `name` — the GLOBAL entry every unpinned
@@ -2847,6 +2859,19 @@ mod tests {
             }
         }
 
+        fn delete_json<'a, T>(
+            &'a self,
+            path: &'a str,
+        ) -> impl Future<Output = Result<T, String>> + Send + 'a
+        where
+            T: DeserializeOwned + Send + 'static,
+        {
+            async move {
+                self.record("DELETE", path, b"");
+                self.decode()
+            }
+        }
+
         fn delete_empty<'a>(
             &'a self,
             path: &'a str,
@@ -3718,7 +3743,7 @@ mod tests {
         let client = RecordingClient::new(
             r#"{"default_name":"fast","items":[
                 {"name":"fast","provider":"anthropic","model":"claude-haiku-4-5","api_key_configured":true,"is_default":true,"effective_context_window":200000,"effective_supports_vision":true,"effective_pricing":{}},
-                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","available_efforts":["low","medium","high","xhigh","max"],"lite_model":"gpt-5.5-mini","base_url":"https://proxy.test/v1","api_key_env":"OPENAI_KEY","api_key_configured":false,"api_key_in_vault":true,"is_default":false,"context_window_override":400000,"effective_context_window":400000,"supports_vision_override":false,"effective_supports_vision":false,"effective_pricing":{}}
+                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","available_efforts":["low","medium","high","xhigh","max"],"lite_model":"gpt-5.5-mini","base_url":"https://proxy.test/v1","api_key_env":"OPENAI_KEY","api_key_configured":false,"api_key_in_vault":true,"can_remove":true,"is_default":false,"context_window_override":400000,"effective_context_window":400000,"supports_vision_override":false,"effective_supports_vision":false,"effective_pricing":{}}
             ]}"#,
         );
         let catalog = list_llm_models(&client).await.expect("models");
@@ -3779,6 +3804,8 @@ mod tests {
             "this row omits the field, which is not the same as saying `false`"
         );
         assert_eq!(entry.api_key_in_vault, Some(true));
+        assert_eq!(entry.can_remove, Some(true));
+        assert_eq!(bare.can_remove, None);
     }
 
     /// The pin read rides the session detail with `limit=1` — the smallest page
@@ -4111,7 +4138,7 @@ mod tests {
         .expect("create");
 
         let call = client.only_call();
-        assert_eq!(call.method, "POST");
+        assert_eq!(call.method, "POST_ONCE");
         assert_eq!(call.path, "/v1/llm/models");
         // Trimmed, and a whitespace-only optional is absent rather than "".
         assert_eq!(
@@ -4145,11 +4172,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_an_entry_addresses_it_by_path() {
-        let client = RecordingClient::empty();
-        delete_llm_model(&client, "kimi".to_string())
+    async fn deleting_an_entry_preserves_restart_status() {
+        let client = RecordingClient::new(r#"{"requires_restart":true}"#);
+        let result = delete_llm_model(&client, "kimi".to_string())
             .await
             .expect("delete");
+        assert!(result.requires_restart);
 
         let call = client.only_call();
         assert_eq!(call.method, "DELETE");

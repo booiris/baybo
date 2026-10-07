@@ -54,6 +54,7 @@ use crate::api;
 use crate::auth::admin::{AdminAuthState, require_admin_token};
 use crate::auth::{ChannelTokenTable, channel as channel_auth};
 use crate::channel::WsChannelState;
+use crate::channel::links::DeviceLinks;
 use crate::config::RuntimeGatewayConfig;
 use crate::log_buffer::LogBuffer;
 use crate::{GatewayError, Result};
@@ -98,6 +99,10 @@ pub struct GatewayDeps {
     /// and the router's gate-rejection un-record must reach the same
     /// window the record went into.
     pub inbound_dedup: Arc<baybo_channels::InboundDedup>,
+    /// The ONE link table: the relay legs and the carrier runtime write it
+    /// through the WS channel state built from these deps, and
+    /// `GET /v1/mobile/links` reads it through the admin state.
+    pub device_links: DeviceLinks,
     /// Shared ring buffer of recent tracing events surfaced by
     /// `/v1/logs`. Installed as a `tracing::Layer` at process init.
     pub log_buffer: Arc<LogBuffer>,
@@ -186,6 +191,8 @@ pub struct AdminState {
     pub workspace_paths: Arc<baybo_workspace::WorkspacePaths>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
+    /// The link table `GET /v1/mobile/links` serves.
+    pub device_links: DeviceLinks,
 }
 
 /// State shared with channel-TCP handlers. Cheap to clone.
@@ -243,6 +250,7 @@ impl AdminState {
             project_manager: Arc::clone(&deps.project_manager),
             workspace_paths: Arc::clone(&deps.workspace_paths),
             bind_display: deps.runtime_config.admin_bind.to_string(),
+            device_links: deps.device_links.clone(),
         }
     }
 }
@@ -316,14 +324,19 @@ impl GatewayServer {
 /// Holds an outbound A→C control link so a phone can reach this (possibly NAT'd)
 /// gateway for chat via the relay. The manager self-gates on the approved device
 /// row (idle until one is paired), reading the relay URL + admission key from it —
-/// there is no `relay` config block. It dials through [`GatewayDeps::relay_dialer`].
-/// Spawned alongside the other gateway managers so it rides the same
-/// `ShutdownSignal` + task tracker and is drained on shutdown.
+/// there is no `relay` config block. While a binding exists it also runs the
+/// binding's direct carriers (`gateway.direct_udp`). It dials through
+/// [`GatewayDeps::relay_dialer`]. Spawned alongside the other gateway managers so
+/// it rides the same `ShutdownSignal` + task tracker and is drained on shutdown.
 pub fn spawn_relay_content(
     deps: &GatewayDeps,
     shutdown: ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
-    crate::channel::relay_content::spawn(WsChannelState::from_deps(deps), shutdown)
+    crate::channel::relay_content::spawn(
+        WsChannelState::from_deps(deps),
+        deps.runtime_config.carrier.clone(),
+        shutdown,
+    )
 }
 
 fn build_admin_router(deps: &GatewayDeps) -> Router {

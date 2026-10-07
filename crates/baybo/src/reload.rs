@@ -624,7 +624,7 @@ impl ConfigReloader for RuntimeConfigReloader {
         Ok(outcome)
     }
 
-    async fn dry_run(&self, candidate: &BayboConfig) -> Result<(), ReloadError> {
+    async fn dry_run(&self, candidate: &BayboConfig) -> Result<ReloadOutcome, ReloadError> {
         // Build the candidate's pool to confirm it's buildable, then discard
         // it (no swap, no pricing reseed, no refresh spawn). Serialized
         // against real reloads so a concurrent swap can't interleave.
@@ -638,8 +638,8 @@ impl ConfigReloader for RuntimeConfigReloader {
         self.llm
             .prepare(candidate)
             .await
-            .map_err(ReloadError::LlmRebuild)?;
-        Ok(())
+            .map(|prepared| prepared.outcome)
+            .map_err(ReloadError::LlmRebuild)
     }
 }
 
@@ -704,6 +704,67 @@ mod tests {
             entry("b", "openai", "gpt-5", vec![]),
         ]);
         assert_eq!(refresh_pairs(&cfg).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_reports_a_non_default_entry_that_cannot_build() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stores = baybo_storage::Store::open(dir.path().join("state.db"))
+            .await
+            .expect("store");
+        let vault = vault();
+        let cost = CostManager::new(stores.cost, HashMap::new(), SpendingLimits::default());
+        let config = config_with(vec![entry("local", "ollama", "qwen3", vec![])]);
+        let built = build_pool_clients(
+            &config,
+            &LlmProviderRegistry::with_default_providers(),
+            stores.blob.clone(),
+            vault.clone(),
+            &cost,
+        )
+        .await
+        .expect("initial pool");
+        let pool = Arc::new(parking_lot::RwLock::new(Arc::new(
+            LlmClientPool::new(built.clients, config.default_llm.clone()).expect("pool"),
+        )));
+        let reloader = RuntimeConfigReloader::from_config(RuntimeConfigReloaderConfig {
+            config_path: None,
+            handle: ConfigHandle::new(Arc::new(config.clone())),
+            llm: LlmReloader {
+                pool_handle: pool.clone(),
+                cost_manager: cost.clone(),
+                blob: stores.blob,
+                vault: vault.clone(),
+                shutdown: ShutdownSignal::new(),
+                proxy: None,
+                refresh_cancel: Mutex::new(CancellationToken::new()),
+            },
+            cost: CostReloader::new(cost, LiveRateLimit::new(10, Duration::from_secs(1))),
+            web_search: WebSearchReloader::new(
+                Arc::new(baybo_tools::ToolRegistry::new()),
+                vault,
+                None,
+            ),
+            bash_permission: Arc::new(baybo_tools::builtin::LivePermissionMode::new(
+                baybo_tools::builtin::PermissionMode::Auto,
+            )),
+        });
+        let mut candidate = config.clone();
+        // An invalid client URL makes this deterministic even on hosts with provider keys.
+        let mut broken = entry("new", "openai", "gpt-4o", vec![]);
+        broken.base_url = Some("not a URL".into());
+        candidate.llm.push(broken);
+        let outcome = reloader
+            .dry_run(&candidate)
+            .await
+            .expect("default still builds");
+        assert_eq!(outcome.entries, vec!["local"]);
+        assert_eq!(outcome.dropped, vec!["new"]);
+        assert_eq!(
+            pool.read().entry_names().len(),
+            1,
+            "preflight must not swap"
+        );
     }
 
     // -- web search ---------------------------------------------------------

@@ -1000,6 +1000,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/mobile/links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["mobile_links"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/mobile/push-token": {
         parameters: {
             query?: never;
@@ -2650,6 +2666,13 @@ export interface components {
             /** Format: int64 */
             seq: number;
         };
+        /** @description One device's live legs and last direct offer. */
+        DeviceLink: {
+            device_id: string;
+            last_offer?: null | components["schemas"]["LastOffer"];
+            /** @description The device's authenticated legs, oldest first. */
+            legs: components["schemas"]["LiveLeg"][];
+        };
         /**
          * @description Uniform error envelope for every non-2xx admin response.
          *
@@ -3076,6 +3099,22 @@ export interface components {
             /** @description Oldest first. */
             items: components["schemas"]["IssueEventDto"][];
         };
+        /** @description The time and outcome of a device's latest direct offer. */
+        LastOffer: {
+            /** Format: date-time */
+            at: string;
+            outcome: components["schemas"]["OfferOutcome"];
+        };
+        /**
+         * @description What a leg rides on: C's relay splice or one of the direct carriers.
+         * @enum {string}
+         */
+        LinkCarrier: "relay" | "lan" | "ipv6" | "ipv4" | "ipv4_punched";
+        /**
+         * @description A leg's class, as the leg announced it.
+         * @enum {string}
+         */
+        LinkClass: "chat" | "api" | "blob";
         /**
          * @description Envelope for list endpoints. `next_cursor` is opaque — clients
          *     pass it back as `?cursor=` to fetch the next page, and treat
@@ -3088,6 +3127,16 @@ export interface components {
                 description: string;
             }[];
             next_cursor?: string | null;
+        };
+        /** @description A leg that has authenticated its device and not yet ended. */
+        LiveLeg: {
+            carrier?: null | components["schemas"]["LinkCarrier"];
+            class: components["schemas"]["LinkClass"];
+            /**
+             * Format: date-time
+             * @description When Noise authenticated the device on this leg.
+             */
+            started_at: string;
         };
         /**
          * @description One model as the provider's own catalog reports it
@@ -3151,6 +3200,8 @@ export interface components {
              */
             available_efforts: string[];
             base_url?: string | null;
+            /** @description Whether this entry can be removed over HTTP (not the default or OAuth). */
+            can_remove: boolean;
             /**
              * @description The default model's `context_window` override. `None` = factory
              *     default.
@@ -3391,6 +3442,11 @@ export interface components {
              */
             ordinal: number;
         };
+        /** @description Response of `GET /v1/mobile/links`. */
+        MobileLinks: {
+            /** @description Every device with a live leg or a recorded offer, by `device_id`. */
+            devices: components["schemas"]["DeviceLink"][];
+        };
         MoveFolderRequest: {
             /** @description New parent id, or `null` to promote the folder to top-level. */
             parent_id?: string | null;
@@ -3427,6 +3483,12 @@ export interface components {
              */
             text: string;
         };
+        /**
+         * @description How the carrier runtime answered an offer, spelled as the `direct_offer`
+         *     log line's `outcome` field spells it.
+         * @enum {string}
+         */
+        OfferOutcome: "accepted" | "declined:auth" | "declined:stale" | "declined:replayed" | "declined:over_cap" | "declined:unbound";
         ProjectDto: {
             /**
              * @description Whether this board's agents may land a card's branch in the
@@ -7642,6 +7704,35 @@ export interface operations {
                 };
                 content: {
                     "text/event-stream": unknown;
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    mobile_links: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Each paired device's live legs, by class and carrier, and its last direct offer */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MobileLinks"];
                 };
             };
             /** @description Unauthorized */

@@ -25,6 +25,7 @@ final class ModelCatalog: ObservableObject {
     /// The `default-llm` entry name — what an unpinned session resolves
     /// against, and therefore the pill's label when `ChatStore.modelPin` is nil.
     @Published private(set) var defaultName: String?
+    @Published private(set) var requiresRestart = false
     @Published private(set) var models: [LlmModelInfo] = []
 
     private let client: any BayboClientProtocol
@@ -112,6 +113,7 @@ final class ModelCatalog: ObservableObject {
     }
 
     func unload() {
+        requiresRestart = false
         epoch += 1
         fetchTask?.cancel()
         fetchTask = nil
@@ -165,6 +167,7 @@ final class ModelCatalog: ObservableObject {
     func apply(_ edit: LlmEntryEdit, to entry: String) async throws -> LlmMutateResult {
         let epoch = epoch
         let result = try await client.llmUpdateModel(name: entry, edit: edit)
+        record(result, expecting: epoch)
         try await reload(expecting: epoch)
         return result
     }
@@ -176,6 +179,7 @@ final class ModelCatalog: ObservableObject {
     func setDefault(_ name: String) async throws -> LlmMutateResult {
         let epoch = epoch
         let result = try await client.llmSetDefault(name: name)
+        record(result, expecting: epoch)
         try await reload(expecting: epoch)
         return result
     }
@@ -190,6 +194,7 @@ final class ModelCatalog: ObservableObject {
     func setModels(_ models: [String], of entry: String) async throws -> LlmMutateResult {
         let epoch = epoch
         let result = try await client.llmSetModelList(name: entry, models: models)
+        record(result, expecting: epoch)
         try await reload(expecting: epoch)
         return result
     }
@@ -223,16 +228,25 @@ final class ModelCatalog: ObservableObject {
     func create(_ entry: NewLlmEntry) async throws -> LlmMutateResult {
         let epoch = epoch
         let result = try await client.llmCreateModel(entry: entry)
+        record(result, expecting: epoch)
         try await reload(expecting: epoch)
         return result
     }
 
     /// Remove an entry and the key the gateway holds for it. Refused by the
     /// gateway for the current `default-llm` and for an OAuth entry.
-    func delete(_ name: String) async throws {
+    @discardableResult
+    func delete(_ name: String) async throws -> LlmMutateResult {
         let epoch = epoch
-        try await client.llmDeleteModel(name: name)
+        let result = try await client.llmDeleteModel(name: name)
+        record(result, expecting: epoch)
         try await reload(expecting: epoch)
+        return result
+    }
+
+    private func record(_ result: LlmMutateResult, expecting epoch: Int) {
+        guard epoch == self.epoch else { return }
+        requiresRestart = requiresRestart || result.requiresRestart
     }
 
     // MARK: - Mirror (`models.json` — a pure cache, never a source of truth)
@@ -265,6 +279,7 @@ final class ModelCatalog: ObservableObject {
             /// written before the field, and absent from a gateway that has
             /// none. Both mean "unknown", which is the same answer.
             var apiKeyInVault: Bool?
+            var canRemove: Bool?
             var contextWindowOverride: UInt32?
             var effectiveContextWindow: UInt32?
             var supportsVisionOverride: Bool?
@@ -287,6 +302,7 @@ final class ModelCatalog: ObservableObject {
                 apiKeyEnv: $0.apiKeyEnv,
                 apiKeyConfigured: $0.apiKeyConfigured ?? false,
                 apiKeyInVault: $0.apiKeyInVault,
+                canRemove: $0.canRemove,
                 contextWindowOverride: $0.contextWindowOverride,
                 effectiveContextWindow: $0.effectiveContextWindow ?? 0,
                 supportsVisionOverride: $0.supportsVisionOverride,
@@ -307,6 +323,7 @@ final class ModelCatalog: ObservableObject {
                     apiKeyEnv: $0.apiKeyEnv,
                     apiKeyConfigured: $0.apiKeyConfigured,
                     apiKeyInVault: $0.apiKeyInVault,
+                    canRemove: $0.canRemove,
                     contextWindowOverride: $0.contextWindowOverride,
                     effectiveContextWindow: $0.effectiveContextWindow,
                     supportsVisionOverride: $0.supportsVisionOverride,
@@ -322,22 +339,24 @@ final class ModelCatalog: ObservableObject {
         /// list from). Never persisted: a later plain launch on the same
         /// simulator must not inherit it.
         ///
-        /// The two entries are deliberately opposite: `claude` inherits
+        /// `claude` and `gpt` are deliberately opposite: `claude` inherits
         /// everything (no overrides, a resolvable key), `gpt` pins every
         /// override and carries the `apiKeyEnv` shadow — between them they
         /// cover both halves of the editor's inherited-vs-pinned language.
+        /// `subscription` exercises the non-removable OAuth entry.
         private func seedDemoIfRequested() -> Bool {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-models") else {
                 return false
             }
             guard models.isEmpty else { return true }
             defaultName = "claude"
+            requiresRestart = ProcessInfo.processInfo.arguments.contains("-baybo-demo-models-staged")
             models = [
                 LlmModelInfo(
                     name: "claude", provider: "anthropic", model: "claude-sonnet-5",
                     modelCandidates: ["claude-opus-4-8"], reasoningEffort: nil,
                     availableEfforts: ["low", "medium", "high", "xhigh", "max"],
-                    liteModel: nil, baseUrl: nil, apiKeyEnv: nil, apiKeyConfigured: true, apiKeyInVault: true,
+                    liteModel: nil, baseUrl: nil, apiKeyEnv: nil, apiKeyConfigured: true, apiKeyInVault: true, canRemove: false,
                     contextWindowOverride: nil, effectiveContextWindow: 200_000,
                     supportsVisionOverride: nil, effectiveSupportsVision: true),
                 LlmModelInfo(
@@ -345,9 +364,16 @@ final class ModelCatalog: ObservableObject {
                     modelCandidates: ["gpt-5.5-mini", "o3"], reasoningEffort: "xhigh",
                     availableEfforts: ["low", "medium", "high", "xhigh", "max"],
                     liteModel: "gpt-5.5-mini", baseUrl: "https://proxy.test/v1",
-                    apiKeyEnv: "OPENAI_KEY", apiKeyConfigured: false, apiKeyInVault: false,
+                    apiKeyEnv: "OPENAI_KEY", apiKeyConfigured: false, apiKeyInVault: false, canRemove: true,
                     contextWindowOverride: 400_000, effectiveContextWindow: 400_000,
                     supportsVisionOverride: false, effectiveSupportsVision: false),
+                LlmModelInfo(
+                    name: "subscription", provider: "openai-subscription", model: "gpt-5.5",
+                    modelCandidates: [], reasoningEffort: nil, availableEfforts: [],
+                    liteModel: nil, baseUrl: nil, apiKeyEnv: nil, apiKeyConfigured: false,
+                    apiKeyInVault: false, canRemove: false, contextWindowOverride: nil,
+                    effectiveContextWindow: 400_000, supportsVisionOverride: nil,
+                    effectiveSupportsVision: true),
             ]
             return true
         }

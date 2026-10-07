@@ -1,4 +1,28 @@
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use serde::{Deserialize, Serialize};
+
+/// `gateway.direct_udp`: the gateway's direct-carrier UDP sockets, one per
+/// address family (see `docs/modules/mobile/direct-carriers.md`). On by
+/// default whenever a relay binding exists; `enabled: false` is the off
+/// switch, and a `null` bind leaves that family unbound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DirectUdpConfig {
+    pub enabled: bool,
+    pub ipv4_bind: Option<SocketAddr>,
+    pub ipv6_bind: Option<SocketAddr>,
+}
+
+impl Default for DirectUdpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ipv4_bind: Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
+            ipv6_bind: Some(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))),
+        }
+    }
+}
 
 /// HTTP gateway configuration.
 ///
@@ -34,6 +58,7 @@ pub struct GatewayConfig {
     /// Seconds the process waits for graceful shutdown before the
     /// force-exit watchdog kicks in.
     pub shutdown_grace_secs: u64,
+    pub direct_udp: DirectUdpConfig,
 }
 
 impl Default for GatewayConfig {
@@ -44,6 +69,7 @@ impl Default for GatewayConfig {
             port: 8888,
             cors_allowed_origins: Vec::new(),
             shutdown_grace_secs: 30,
+            direct_udp: DirectUdpConfig::default(),
         }
     }
 }

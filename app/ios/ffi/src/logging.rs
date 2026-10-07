@@ -21,8 +21,9 @@ const LOG_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Rotated files kept beside the live one (`baybo.log.1`, `baybo.log.2`).
 const LOG_FILES_KEPT: usize = 2;
 
-/// Crates logged at Debug; everything else at Warn.
-const DEBUG_TARGETS: [&str; 2] = ["baybo_ffi", "baybo_ffi::core"];
+/// Crates logged at Debug (the shared carrier crate included); everything
+/// else at Warn.
+const DEBUG_TARGETS: [&str; 3] = ["baybo_ffi", "baybo_ffi::core", "carrier"];
 
 struct FileState {
     file: File,

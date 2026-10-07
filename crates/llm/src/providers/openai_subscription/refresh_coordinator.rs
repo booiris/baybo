@@ -114,6 +114,18 @@ impl RefreshTrigger {
 /// `exp` claim, so it survives clock skew between processes sharing one
 /// vault file; `obtained_at` only breaks same-second ties.
 fn is_at_least_as_fresh(candidate: &OAuthTokenBundle, baseline: &OAuthTokenBundle) -> bool {
+    match (&candidate.connection, &baseline.connection) {
+        (Some(_), None) => return true,
+        (None, Some(_)) => return false,
+        (Some(connection), Some(previous)) if connection != previous => {
+            return candidate.obtained_at >= baseline.obtained_at;
+        }
+        (Some(_), Some(_)) => {
+            return (candidate.obtained_at, candidate.expires_at)
+                >= (baseline.obtained_at, baseline.expires_at);
+        }
+        (None, None) => {}
+    }
     (candidate.expires_at, candidate.obtained_at) >= (baseline.expires_at, baseline.obtained_at)
 }
 
@@ -243,62 +255,19 @@ impl RefreshCoordinator {
     /// any other opener in this process; the in-process `flight` mutex has
     /// already funnelled us, so that costs nothing.
     async fn lock_refresh_across_processes(&self) -> Option<std::fs::File> {
-        let path = self.lock_path.clone()?;
-        let handle = tokio::task::spawn_blocking(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(|e| (path.clone(), e.to_string()))?;
-            // Poll rather than block outright: a blocking `lock()` is
-            // uncancellable, so a wedged or SIGSTOPped peer would pin this
-            // thread — and the user's chat — forever, and would also hang
-            // runtime shutdown.
-            let deadline = std::time::Instant::now() + REFRESH_LOCK_WAIT_BUDGET;
-            loop {
-                match file.try_lock() {
-                    Ok(()) => return Ok(file),
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err((
-                                path,
-                                format!(
-                                    "a peer process held the refresh lock for more than {}s",
-                                    REFRESH_LOCK_WAIT_BUDGET.as_secs()
-                                ),
-                            ));
-                        }
-                        std::thread::sleep(REFRESH_LOCK_POLL_INTERVAL);
-                    }
-                    Err(std::fs::TryLockError::Error(e)) => return Err((path, e.to_string())),
-                }
-            }
-        })
-        .await;
-        match handle {
-            Ok(Ok(file)) => Some(file),
-            Ok(Err((path, error))) => {
-                tracing::warn!(
-                    event = "openai_subscription_refresh_lock",
-                    outcome = "unavailable",
-                    path = %path.display(),
-                    %error,
-                    "cross-process refresh lock unavailable; proceeding without it"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    event = "openai_subscription_refresh_lock",
-                    outcome = "join_failed",
-                    %error,
-                    "cross-process refresh lock task failed; proceeding without it"
-                );
-                None
-            }
-        }
+        lock_credential(self.lock_path.clone()).await
+    }
+
+    pub(super) async fn replace_credentials(&self, bundle: &OAuthTokenBundle) -> crate::Result<()> {
+        let _flight = self.flight.lock().await;
+        let _peer = self.lock_refresh_across_processes().await;
+        self.token_store.save(bundle).await?;
+        *self.cache.lock().await = Some(CachedBundle {
+            bundle: Arc::new(bundle.clone()),
+            persisted: true,
+            last_vault_check: chrono::Utc::now().timestamp(),
+        });
+        Ok(())
     }
 
     pub(super) async fn ensure_fresh_bundle(&self) -> crate::Result<Arc<OAuthTokenBundle>> {
@@ -417,7 +386,7 @@ impl RefreshCoordinator {
         // (e.g. a rotated bundle that is itself now near expiry) but whose
         // refresh_token still supersedes the caller's. Sending the older
         // one would draw `refresh_token_reused`, which clears the vault.
-        let mut effective_refresh_token = {
+        let mut effective_bundle = {
             let guard = self.cache.lock().await;
             match guard.as_ref() {
                 Some(cached) if trigger.satisfied_by(&cached.bundle, superseded) => {
@@ -429,9 +398,9 @@ impl RefreshCoordinator {
                     return Ok(Arc::clone(&cached.bundle));
                 }
                 Some(cached) if is_at_least_as_fresh(&cached.bundle, superseded) => {
-                    cached.bundle.refresh_token.clone()
+                    (*cached.bundle).clone()
                 }
-                _ => superseded.refresh_token.clone(),
+                _ => superseded.clone(),
             }
         };
 
@@ -458,11 +427,11 @@ impl RefreshCoordinator {
             // we planned to spend — a peer may have rotated to a bundle that
             // is itself near expiry. Post the freshest token we know of.
             if is_at_least_as_fresh(&adopted, superseded) {
-                effective_refresh_token = adopted.refresh_token.clone();
+                effective_bundle = (*adopted).clone();
             }
         }
 
-        let refreshed = match refresh_at(&self.issuer, &effective_refresh_token, &self.http).await {
+        let refreshed = match refresh_at(&self.issuer, &effective_bundle, &self.http).await {
             Ok(b) => b,
             Err(RefreshError::Permanent(msg)) => {
                 self.token_store.clear().await.ok();
@@ -588,6 +557,65 @@ impl RefreshCoordinator {
     }
 }
 
+pub(super) async fn lock_credential(path: Option<PathBuf>) -> Option<std::fs::File> {
+    let path = path?;
+    let handle = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| (path.clone(), e.to_string()))?;
+        // Poll rather than block outright: a blocking `lock()` is
+        // uncancellable, so a wedged or SIGSTOPped peer would pin this
+        // thread — and the user's chat — forever, and would also hang
+        // runtime shutdown.
+        let deadline = std::time::Instant::now() + REFRESH_LOCK_WAIT_BUDGET;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err((
+                            path,
+                            format!(
+                                "a peer process held the refresh lock for more than {}s",
+                                REFRESH_LOCK_WAIT_BUDGET.as_secs()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(REFRESH_LOCK_POLL_INTERVAL);
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err((path, e.to_string())),
+            }
+        }
+    })
+    .await;
+    match handle {
+        Ok(Ok(file)) => Some(file),
+        Ok(Err((path, error))) => {
+            tracing::warn!(
+                event = "openai_subscription_refresh_lock",
+                outcome = "unavailable",
+                path = %path.display(),
+                %error,
+                "cross-process refresh lock unavailable; proceeding without it"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "openai_subscription_refresh_lock",
+                outcome = "join_failed",
+                %error,
+                "cross-process refresh lock task failed; proceeding without it"
+            );
+            None
+        }
+    }
+}
+
 /// Retry vault save with bounded exponential backoff. The backoff
 /// schedule is small ({100ms, 500ms, 2s}) — vault writes hit local
 /// sqlite, so any failure is either "disk is genuinely broken" (retry
@@ -634,6 +662,7 @@ mod tests {
 
     fn sample_bundle(now: i64, expires_at: i64) -> OAuthTokenBundle {
         OAuthTokenBundle {
+            connection: None,
             access_token: "a".into(),
             refresh_token: "r".into(),
             id_token: "i".into(),
@@ -650,6 +679,7 @@ mod tests {
         expires_at: i64,
     ) -> OAuthTokenBundle {
         OAuthTokenBundle {
+            connection: None,
             access_token: access.into(),
             refresh_token: refresh_token.into(),
             id_token: "id".into(),
@@ -1204,6 +1234,7 @@ mod cross_process_tests {
 
     fn stale(now: i64) -> OAuthTokenBundle {
         OAuthTokenBundle {
+            connection: None,
             access_token: "stale-at".into(),
             refresh_token: "stale-rt".into(),
             id_token: "id".into(),
@@ -1279,6 +1310,7 @@ mod cross_process_tests {
         let coord = Arc::new(RefreshCoordinator::new(store.clone(), direct_client()));
         // A rotation that never reached disk: the cache is its only copy.
         let dirty = OAuthTokenBundle {
+            connection: None,
             access_token: "dirty-at".into(),
             refresh_token: "dirty-rt".into(),
             id_token: "id".into(),

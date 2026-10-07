@@ -4550,6 +4550,36 @@
         }
       }
     },
+    "/v1/mobile/links": {
+      "get": {
+        "tags": [
+          "mobile"
+        ],
+        "operationId": "mobile_links",
+        "responses": {
+          "200": {
+            "description": "Each paired device's live legs, by class and carrier, and its last direct offer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileLinks"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/mobile/push-token": {
       "post": {
         "tags": [
@@ -9649,6 +9679,37 @@
           }
         }
       },
+      "DeviceLink": {
+        "type": "object",
+        "description": "One device's live legs and last direct offer.",
+        "required": [
+          "device_id",
+          "legs"
+        ],
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "last_offer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LastOffer",
+                "description": "The latest offer this process's carrier runtime answered for the\ndevice; `null` when none has been."
+              }
+            ]
+          },
+          "legs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LiveLeg"
+            },
+            "description": "The device's authenticated legs, oldest first."
+          }
+        }
+      },
       "ErrorBody": {
         "type": "object",
         "description": "Uniform error envelope for every non-2xx admin response.\n\n`GatewayError::into_response` already emits `{\"error\": \"...\"}`; this\ntype just pins the shape in the spec so clients can discriminate on\nit rather than on status codes alone.",
@@ -10749,6 +10810,43 @@
           }
         }
       },
+      "LastOffer": {
+        "type": "object",
+        "description": "The time and outcome of a device's latest direct offer.",
+        "required": [
+          "at",
+          "outcome"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/OfferOutcome"
+          }
+        }
+      },
+      "LinkCarrier": {
+        "type": "string",
+        "description": "What a leg rides on: C's relay splice or one of the direct carriers.",
+        "enum": [
+          "relay",
+          "lan",
+          "ipv6",
+          "ipv4",
+          "ipv4_punched"
+        ]
+      },
+      "LinkClass": {
+        "type": "string",
+        "description": "A leg's class, as the leg announced it.",
+        "enum": [
+          "chat",
+          "api",
+          "blob"
+        ]
+      },
       "ListResponse_SlashCommandEntry": {
         "type": "object",
         "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
@@ -10780,6 +10878,35 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "LiveLeg": {
+        "type": "object",
+        "description": "A leg that has authenticated its device and not yet ended.",
+        "required": [
+          "class",
+          "started_at"
+        ],
+        "properties": {
+          "carrier": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LinkCarrier",
+                "description": "What the leg rides on; `null` for a QUIC carrier whose address pair\nthe gateway could not classify."
+              }
+            ]
+          },
+          "class": {
+            "$ref": "#/components/schemas/LinkClass"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When Noise authenticated the device on this leg."
           }
         }
       },
@@ -10859,6 +10986,7 @@
           "model",
           "api_key_configured",
           "api_key_in_vault",
+          "can_remove",
           "available_efforts",
           "is_default",
           "effective_context_window",
@@ -10892,6 +11020,10 @@
               "string",
               "null"
             ]
+          },
+          "can_remove": {
+            "type": "boolean",
+            "description": "Whether this entry can be removed over HTTP (not the default or OAuth)."
           },
           "context_window_override": {
             "type": [
@@ -11384,6 +11516,22 @@
           }
         }
       },
+      "MobileLinks": {
+        "type": "object",
+        "description": "Response of `GET /v1/mobile/links`.",
+        "required": [
+          "devices"
+        ],
+        "properties": {
+          "devices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeviceLink"
+            },
+            "description": "Every device with a live leg or a recorded offer, by `device_id`."
+          }
+        }
+      },
       "MoveFolderRequest": {
         "type": "object",
         "properties": {
@@ -11462,6 +11610,18 @@
             "description": "May be empty when `attachments` is not: \"here, look at this\" with a\nscreenshot under it is a real thing to say on a card."
           }
         }
+      },
+      "OfferOutcome": {
+        "type": "string",
+        "description": "How the carrier runtime answered an offer, spelled as the `direct_offer`\nlog line's `outcome` field spells it.",
+        "enum": [
+          "accepted",
+          "declined:auth",
+          "declined:stale",
+          "declined:replayed",
+          "declined:over_cap",
+          "declined:unbound"
+        ]
       },
       "ProjectDto": {
         "type": "object",
@@ -12719,6 +12879,10 @@
     {
       "name": "push",
       "description": "Direct-mode device push registration"
+    },
+    {
+      "name": "mobile",
+      "description": "Paired devices' live legs and direct carriers"
     },
     {
       "name": "llm",

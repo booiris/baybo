@@ -57,6 +57,11 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 | domain crates      | `MemoryTurnStore` (`baybo-turn`), `MemoryTraceStore` (`baybo-trace`), `MemoryCostStore` (`baybo-cost`), `RecordingMemory` (`baybo-memory` — records `recall` / `on_turn_complete` calls), `MemorySessionStore` + `MemorySessionFolderStore` (`baybo-session`) | In-memory backends for the `*Store` traits (the trait contracts live in `baybo-store`; each fake sits in its domain crate's `test_support.rs`). Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage lookups (`list_lineage_children` returns empty); tests that need that surface should use the real sqlite store via `Store::open` against a tempfile. |
 | `baybo-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
 | `baybo-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
+| `remote-host-protocol` | `AddressPolicy::for_tests`                                          | With `test-support`, `AddressPolicy::active()` returns it: 127/8, 198.18/15 and 2001:2::/48 are `Public` and `::1` is `Lan`, so direct-carrier tests run over loopback. `remote-host-relay`'s and `baybo-gateway`'s tests enable it. Features unify per build, so any crate tested in the same `cargo`/`nextest` invocation as those sees the test policy too: tests that classify addresses use data that reads the same under either policy. |
+| `remote-host-relay` | `ControlRegistry::with_direct_answer_timeout`, `ConnectionRegistry::register_for_test` | Shortens how long `POST /direct` waits for the gateway's report, so the no-answer path does not sleep 3 s; registers a live connection to drive a revoke kick. |
+| `carrier`          | `DemuxSocket::inject_recv_errors`                                       | Records failed receives on a real socket, backing off as real ones do, so the gateway's rebind test drives the receive-error streak its supervisor polls. |
+| `baybo-gateway`    | `examples/seed_relay_binding.rs` (and the forwarded `remote-host-protocol/test-support`) | Writes an approved relay binding into a workspace and prints the phone's pairing record — the netns matrix's gateway setup. A `baybo` built with `--features baybo-gateway/test-support` uses the test address policy. |
+| `baybo-ios-ffi` (`app/ios`) | in-memory keychain, `test_support::{seed_relay_pairing, hold_chat_rotation}`, `examples/netns_phone.rs` | A host keychain that keeps writes, so the netns matrix's phone process is seeded with a pairing; a knob that holds chat rotation off; the protocol's test address policy. App builds never enable it, and `ios-core`'s nextest runs without it. |
 | `baybo-workspace`   | `back_date`, `back_date_tree`, `back_date_symlink`                      | mtime back-dating for tests that drive the `walk::tree_stats` staleness gates (janitor sweeps). `back_date_symlink` sets the link's *own* lstat mtime via `utimensat(AT_SYMLINK_NOFOLLOW)`. |
 
 The integration-tests crate composes these into higher-level builders:
@@ -247,3 +252,73 @@ The real-terminal suites need `tmux` on `PATH`; without it they self-skip
 
 CI runs `cargo clippy --all --benches --tests --examples --all-features`
 with zero-warnings; new tests must clear that gate.
+
+The direct-carrier tests that run over IPv6 loopback self-skip, through
+`carrier::phone::ipv6_loopback_available`, on a host that cannot bind `::1`
+(a container with IPv6 disabled). The carrier's IPv6 interface flags have an
+Apple-only reader; CI's `gateway-macos` job runs its tests on macOS whenever
+`crates/carrier/` or `crates/gateway/src/channel/carrier/` changes.
+
+### Direct-carrier NAT matrix
+
+This Linux integration test runs the real relay, gateway and iOS Rust networking
+core under simulated router/NAT conditions. It verifies carrier selection,
+relay fallback, idle keepalives and chat rotation. It does not run the iPhone UI
+or validate iOS VPN routing, Local Network permission, real relay HTTPS, or
+NAT64 without CLAT. The topology and expected outcomes live in
+[the carrier spec](modules/mobile/direct-carriers.md#testing); hardware checks
+live in [the iOS device checklist](../app/ios/docs/testing.md#manual-verification-checklist-device).
+
+Use a disposable Linux VM or CI runner. The test is ignored by ordinary test
+runs and is not part of the production app or gateway. It requires root,
+`ip`, `iptables`, `ip6tables`, `tc`, `sqlite3`, and `sch_netem` support for the
+packet-loss case. It cannot run natively on macOS.
+
+```bash
+scripts/netns-matrix.sh                                   # every cell, 5 runs each
+NETNS_CELLS="cone/cone same-lan" NETNS_RUNS=1 scripts/netns-matrix.sh
+```
+
+`NETNS_IDLE_SECS` defaults to 40 seconds; shortening it weakens the idle
+keepalive check. The script builds all three workspaces with `test-support`,
+exports `NETNS_*_BIN` paths and invokes the ignored test under `sudo`.
+Do not use these test-policy binaries as your normal gateway installation.
+The non-gating `netns-matrix` CI job runs only on non-draft PRs matching its
+path filters; a skipped draft job is not evidence the matrix passed.
+
+#### Isolation and cleanup
+
+- Bridges, virtual links, routes, NAT/firewall rules, forwarding settings and
+  packet loss are configured inside the test namespaces. No test link is
+  attached to the host's physical interfaces; host routes, DNS and VPN settings
+  are not rewritten. Namespaces share the host kernel and consume host resources;
+  this is not a VM security boundary.
+- Namespace names are currently `bnm<run_index>-<role>`, with roles `a`,
+  `nata`, `inet`, `natp`, `p` and `c`. Setup deletes existing namespaces
+  with those exact names. **Run only one matrix per host**, and do not use that
+  naming scheme for unrelated namespaces. Concurrent checkouts also collide.
+- Normal completion and Rust panic unwinding attempt to kill/wait for child
+  processes and delete the namespaces. Cleanup errors are ignored. Signals
+  that terminate the runner without unwinding, including SIGKILL, can leave
+  processes and namespaces behind. Reboot removes live network state, but
+  test files may remain.
+- Workspaces, databases and logs remain under
+  `/tmp/netns-matrix-<pid>-<cell>-<run_index>`. Running Cargo through `sudo`
+  can also leave root-owned build files in `app/ios/target`.
+
+After an interrupted run, inspect `sudo ip netns list` and
+`sudo ip netns pids <exact-name>`. Confirm no matrix is still running and
+identify the resources belonging to that run before stopping its processes
+and deleting its namespaces. Deleting a namespace name alone does not stop
+processes that still hold it. Avoid a broad namespace deletion or host firewall
+flush. In a disposable VM, discarding the VM is the simplest complete cleanup.
+
+### Remote-host workspace
+
+`remote-host/` is its own cargo workspace, excluded from the root one, so the
+commands above never run its tests. Run them from inside it
+(`cd remote-host && cargo nextest run --workspace`). nextest reads that
+workspace's own `remote-host/.config/nextest.toml`, which carries the same
+hang guard as the root config (`slow-timeout` terminating after 4 × 30 s). In
+CI, the `remote-host` job runs fmt, clippy and nextest there on every PR that
+touches `remote-host/` or `rust-toolchain.toml`.

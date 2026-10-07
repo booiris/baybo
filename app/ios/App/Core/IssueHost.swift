@@ -22,7 +22,8 @@ final class IssueHost {
             TranscriptSchemeHandler(dynamicRoute: .staticOnly),
             forURLScheme: TranscriptSchemeHandler.scheme)
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = InsetTrackingWebView(frame: .zero, configuration: config)
+        webView.insetSink = bridge
         navigationPolicy.bridge = bridge
         webView.navigationDelegate = navigationPolicy
         webView.isOpaque = false

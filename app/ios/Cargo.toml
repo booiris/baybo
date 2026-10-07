@@ -22,6 +22,12 @@ wire = { path = "../../crates/wire" }
 device-proto = { path = "../../crates/device-proto" }
 # The remote-host (C) wire contract: relay route/URL builders + header names.
 remote-host-protocol = { path = "../../remote-host/crates/protocol" }
+# The QUIC direct carrier P shares with the gateway (docs/modules/mobile/direct-carriers.md).
+carrier = { path = "../../crates/carrier" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# `log` forwards the carrier crate's `tracing` events into the app's `log` bridge
+# (ffi/src/logging.rs); without it they have no subscriber and vanish.
+tracing = { version = "0.1", features = ["log"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

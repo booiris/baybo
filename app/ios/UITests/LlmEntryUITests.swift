@@ -14,8 +14,8 @@ import XCTest
 /// `claude` inherits everything, `gpt` pins every override and carries an
 /// `apiKeyEnv` shadow.
 final class LlmEntryUITests: BayboUITestCase {
-    private func openModels() -> XCUIApplication {
-        let app = launch(["-baybo-open-home", "-baybo-home-tab", "settings", "-baybo-demo-models"])
+    private func openModels(extra: [String] = []) -> XCUIApplication {
+        let app = launch(["-baybo-open-home", "-baybo-home-tab", "settings", "-baybo-demo-models"] + extra)
         let row = app.buttons["settings-models"]
         XCTAssertTrue(row.waitForExistence(timeout: 5), "the Settings Models row never appeared")
         // The trailing value is the default entry, and it is the row's
@@ -282,6 +282,26 @@ final class LlmEntryUITests: BayboUITestCase {
             "removing an entry must confirm first")
         attachScreenshot(app, name: "llm-delete-entry-confirm")
         app.buttons["Cancel"].tap()
+    }
+
+    func testOAuthEntryDoesNotOfferRemoval() {
+        let app = openModels()
+        let row = app.buttons["llm-entry-subscription"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.tap()
+        XCTAssertTrue(app.buttons["llm-field-model"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["llm-delete-entry"].exists)
+    }
+
+    func testRestartNoticeSurvivesOpeningAnEntry() {
+        let app = openModels(extra: ["-baybo-demo-models-staged"])
+        XCTAssertTrue(app.staticTexts["llm-restart-pending"].waitForExistence(timeout: 5))
+        attachScreenshot(app, name: "llm-restart-pending")
+        app.buttons["llm-entry-gpt"].tap()
+        XCTAssertTrue(app.buttons["llm-field-model"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["llm-test"].exists)
+        app.buttons["llm-entry-back"].tap()
+        XCTAssertTrue(app.staticTexts["llm-restart-pending"].waitForExistence(timeout: 5))
     }
 
     /// A pick commits immediately — there is no Save button on the fields

@@ -9,6 +9,7 @@
 
 mod api;
 mod blob;
+pub(crate) mod carrier;
 mod chat;
 mod dial;
 pub(crate) mod leg_pool;

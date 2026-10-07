@@ -5,6 +5,7 @@ members = [
     "crates/channels",
     "crates/wire",
     "crates/device-proto",
+    "crates/carrier",
     "crates/llm",
     "crates/process",
     "crates/tools",
@@ -59,6 +60,7 @@ baybo-model = { path = "crates/model" }
 baybo-channels = { path = "crates/channels" }
 wire = { path = "crates/wire" }
 device-proto = { path = "crates/device-proto" }
+carrier = { path = "crates/carrier" }
 # The remote-host (C) wire contract, path-depended across the workspace boundary
 # (like wire/device-proto) so the gateway uses C's route paths + types directly.
 remote-host-protocol = { path = "remote-host/crates/protocol" }
@@ -123,6 +125,8 @@ tracing-subscriber = { version = "0.3", features = [
     "registry",
 ] }
 tracing-appender = "0.2"
+jsonwebtoken = { version = "9" }
+aws-lc-rs = "1"
 uuid = { version = "1", features = ["v4"] }
 ulid = { version = "1", features = ["serde"] }
 regex = "1"
@@ -168,6 +172,8 @@ chacha20poly1305 = "0.10"
 # Zeroize the 32-byte pairing secret (the Noise PSK) on drop so it never
 # lingers in freed memory; cross-compiles to aarch64-apple-ios.
 zeroize = { version = "1", features = ["derive"] }
+# Constant-time comparison of the pinned QUIC certificate hash (device-proto).
+subtle = "2.6"
 # `Connection` is `Send` but deliberately NOT `Sync`, so the compiler
 # forbids two threads from entering one sqlite handle — the invariant the
 # C API requires and that a driver cannot uphold with a comment alone.
@@ -200,12 +206,21 @@ serenity = { version = "0.12", features = ["client", "gateway", "model"] }
 tower = { version = "0.5", features = ["util"] }
 url = "2"
 reqwest = { version = "0.13", features = ["json", "socks"] }
-# Direct handle on rustls so the gateway can pin the process-wide CryptoProvider.
-# The graph enables BOTH aws-lc-rs and ring (via reqwest/hyper-rustls), so rustls
-# can't auto-select one; we install aws-lc-rs explicitly. default-features off —
-# the rest of the graph already unions in std/tls12/ring.
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+# No crypto provider here: each consumer names its own. The gateway enables
+# aws_lc_rs; crates/carrier, which the iOS workspace builds too, never drags
+# aws-lc-rs into the app.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false }
+# QUIC for direct carriers (crates/carrier). No rustls feature here either:
+# crates/carrier enables `rustls-ring`, and the gateway `rustls-aws-lc-rs`.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+# Test-only: reads the QUIC transport parameters a carrier endpoint advertises.
+quinn-proto = { version = "0.11", default-features = false }
+# A's per-process self-signed QUIC certificate. Key generation uses ring, which
+# the root and iOS graphs already build; it is not rustls's provider.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+# Binds a carrier's IPv6 UDP socket with IPV6_V6ONLY set.
+socket2 = "0.6"
 dom_smoothie = "0.17"
 htmd = "0.5"
 bytes = "1"

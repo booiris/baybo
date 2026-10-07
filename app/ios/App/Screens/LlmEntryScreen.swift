@@ -31,10 +31,6 @@ struct LlmEntryScreen: View {
     @State private var level: Level = .fields
     @State private var saving = false
     @State private var outcome: Outcome?
-    /// Set once a write comes back staged. While true the entry on disk and the
-    /// entry the pool is running have diverged, which is exactly the state where
-    /// a probe reads the file and certifies settings nobody is serving.
-    @State private var staged = false
     @State private var draft = ""
     @State private var probe: LlmTestResult?
     @State private var probing = false
@@ -260,7 +256,7 @@ struct LlmEntryScreen: View {
         // probe reads the FILE — so it would come back green for settings the
         // gateway is not serving. Hiding it beats captioning it: a button that
         // is present but lying is worse than one that is absent and explained.
-        if staged {
+        if catalog.requiresRestart {
             Text(verbatim: lang.t("llm.probeHiddenWhileStaged"))
                 .font(Theme.mono(10.5))
                 .foregroundStyle(Theme.inkSoft)
@@ -296,7 +292,7 @@ struct LlmEntryScreen: View {
             }
         }
 
-        if entry.name != catalog.defaultName {
+        if entry.canRemove == true && entry.name != catalog.defaultName {
             Button {
                 Haptics.tap()
                 setAsDefault()
@@ -327,11 +323,7 @@ struct LlmEntryScreen: View {
                 .padding(.top, 20)
         }
 
-        // Offered only for a non-default entry, because the gateway refuses the
-        // default one — it would leave `default-llm` pointing at a row that is
-        // gone. Hiding it beats surfacing that 400: the fix (point the default
-        // elsewhere first) is a different screen's action.
-        if entry.name != catalog.defaultName {
+        if entry.canRemove == true && entry.name != catalog.defaultName {
             Button {
                 Haptics.tap()
                 confirmingDelete = true
@@ -925,7 +917,6 @@ struct LlmEntryScreen: View {
             defer { saving = false }
             do {
                 let result = try await catalog.apply(edit, to: entryName)
-                staged = staged || result.requiresRestart
                 outcome = result.requiresRestart ? .staged(field) : .saved(field)
                 // A config change invalidates whatever the last probe proved.
                 probe = nil
@@ -944,7 +935,6 @@ struct LlmEntryScreen: View {
             defer { saving = false }
             do {
                 let result = try await catalog.setDefault(entryName)
-                staged = staged || result.requiresRestart
                 outcome =
                     result.requiresRestart
                     ? .staged(lang.t("llm.defaultField")) : .saved(lang.t("llm.defaultField"))
@@ -997,7 +987,6 @@ struct LlmEntryScreen: View {
             defer { saving = false }
             do {
                 let result = try await catalog.setModels(models, of: entryName)
-                staged = staged || result.requiresRestart
                 outcome = result.requiresRestart ? .staged(field) : .saved(field)
                 probe = nil
                 level = returnTo

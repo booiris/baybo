@@ -12,7 +12,7 @@ use crate::{AnyCompletionModel, LlmClient, LlmError, ModelInfo, ModelPricing};
 /// non-default `base_url` outside the list is rejected at factory time
 /// so a malicious baybo.json can't exfiltrate the OAuth bearer to an
 /// attacker host on the next chat call.
-const ALLOWED_HOST_SUFFIXES: &[&str] = &["chatgpt.com", "auth.openai.com"];
+const ALLOWED_HOST_SUFFIXES: &[&str] = &["api.openai.com", "chatgpt.com", "auth.openai.com"];
 
 /// Env-var escape hatch for non-OpenAI hosts. Env rather than baybo.json
 /// so flipping a credential-leak guard requires an explicit shell action.

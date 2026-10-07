@@ -3,15 +3,16 @@
 
 use std::time::Instant;
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 
-use super::pump::{PumpCtx, dispatch_inbound_frame};
+use super::pump::{LegActivity, PumpCtx, dispatch_inbound_frame};
 use super::supervisor::Msg;
 use super::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{accept_async, client_async};
 
@@ -168,6 +169,7 @@ impl Fixture {
                         project.clone() as Arc<dyn ProjectSink>
                     ))),
                     last_inbound: Arc::new(parking_lot::Mutex::new(Instant::now())),
+                    activity: Arc::new(parking_lot::Mutex::new(LegActivity::new())),
                     leg_id: 1,
                     events: mpsc::unbounded_channel().0,
                 },
@@ -691,7 +693,7 @@ impl LegDialer for LoopbackDialer {
                 user_message_frame(session_id, "device-1", text, msg_id, attachments)
             });
             Ok(Connection {
-                ws,
+                socket: LegSocket::ws(ws),
                 codec: Box::new(LoopbackCodec),
                 user_frame,
             })
@@ -1130,7 +1132,7 @@ async fn a_live_leg_survives_one_sessions_unanswered_subscribe() {
 }
 
 /// `HANDSHAKE_REPLY_TIMEOUT` belongs to the handshake CALL SITE, never to
-/// the shared reader. `recv_binary` is also `relay::tunnel::NoiseFrames::recv`
+/// the shared reader. `LegSocket::recv` is also `relay::tunnel::NoiseFrames::recv`
 /// — every REST-over-relay response frame and every blob chunk — where the
 /// budgets are `POOLED_LEG_FIRST_BYTE_TIMEOUT` (15s), `TUNNEL_REQUEST_TIMEOUT`
 /// (30s) and `TUNNEL_HANDSHAKE_TIMEOUT` (15s), all wider than 6s, plus a
@@ -1138,7 +1140,7 @@ async fn a_live_leg_survives_one_sessions_unanswered_subscribe() {
 /// the shared reader and you silently cap all of them.
 ///
 /// The tunnel's own tests drive a `ScriptedFrames` fake and never reach
-/// `recv_binary`, so this is the only place the separation can be seen.
+/// `LegSocket::recv`, so this is the only place the separation can be seen.
 /// Paused clock is safe here (unlike the registry tests): nothing in this
 /// test wraps a dial in a timeout, so there is no budget for the
 /// auto-advance to consume before the socket is up. A server apiece —
@@ -1147,9 +1149,9 @@ async fn a_live_leg_survives_one_sessions_unanswered_subscribe() {
 #[tokio::test(start_paused = true)]
 async fn only_the_handshake_reader_is_time_bounded() {
     let handshake_server = Server::silent().await;
-    let mut ws = dial_raw(handshake_server.addr).await;
+    let mut socket = dial_raw(handshake_server.addr).await;
     assert!(
-        tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT * 2, recv_binary_handshake(&mut ws))
+        tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT * 2, socket.recv_handshake())
             .await
             .expect("the handshake reader must give up on its own")
             .is_err(),
@@ -1157,9 +1159,9 @@ async fn only_the_handshake_reader_is_time_bounded() {
     );
 
     let tunnel_server = Server::silent().await;
-    let mut ws = dial_raw(tunnel_server.addr).await;
+    let mut socket = dial_raw(tunnel_server.addr).await;
     assert!(
-        tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT * 2, recv_binary(&mut ws))
+        tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT * 2, socket.recv())
             .await
             .is_err(),
         "the shared reader must still be waiting — a tunnel response or blob \
@@ -1168,8 +1170,8 @@ async fn only_the_handshake_reader_is_time_bounded() {
 }
 
 /// A bare client socket, no registry or pump — the two readers under test
-/// take a `WsStream` directly.
-async fn dial_raw(addr: std::net::SocketAddr) -> WsStream {
+/// are the socket's own.
+async fn dial_raw(addr: std::net::SocketAddr) -> LegSocket {
     let tcp = TcpStream::connect(addr).await.expect("tcp");
     let (ws, _) = client_async(
         format!("ws://{addr}/v1/channel-ws"),
@@ -1177,7 +1179,7 @@ async fn dial_raw(addr: std::net::SocketAddr) -> WsStream {
     )
     .await
     .expect("ws");
-    ws
+    LegSocket::ws(ws)
 }
 
 /// `send` refuses a session with no registered sink rather than writing into a
@@ -1578,5 +1580,353 @@ async fn latecomers_of_a_failed_dial_share_one_fresh_dial() {
         dials.load(Ordering::Relaxed),
         2,
         "the latecomer batch gets exactly one fresh dial"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Chat rotation: an idle relay leg moves onto the direct carrier.
+// ---------------------------------------------------------------------------
+
+/// How the test steers one rotation dial.
+#[derive(Default)]
+struct RotationScript {
+    /// Hold the dial before its commit point until notified.
+    before_commit: Option<Arc<tokio::sync::Notify>>,
+    /// Hold the dial past its commit point until notified.
+    after_commit: Option<Arc<tokio::sync::Notify>>,
+    /// Fail the dial past its commit point.
+    fail_after_commit: bool,
+}
+
+/// A relay leg whose rotation target is a second loopback server, standing
+/// in for the direct carrier. The test offers the target the way the carrier
+/// hub does: flip `target`, tick `events`.
+struct RotatingDialer {
+    relay: std::net::SocketAddr,
+    carrier: std::net::SocketAddr,
+    target: Arc<std::sync::atomic::AtomicBool>,
+    events: tokio::sync::watch::Receiver<u64>,
+    script: Arc<parking_lot::Mutex<RotationScript>>,
+    progress: mpsc::UnboundedSender<&'static str>,
+}
+
+async fn loopback_connection(addr: std::net::SocketAddr) -> Result<Connection, TransportError> {
+    let tcp = TcpStream::connect(addr)
+        .await
+        .map_err(|e| TransportError::Other(format!("tcp: {e}")))?;
+    let (ws, _) = client_async(
+        format!("ws://{addr}/v1/channel-ws"),
+        MaybeTlsStream::Plain(tcp),
+    )
+    .await
+    .map_err(|e| TransportError::Other(format!("ws: {e}")))?;
+    let user_frame: UserFrameFn = Box::new(|session_id, text, msg_id, attachments| {
+        user_message_frame(session_id, "device-1", text, msg_id, attachments)
+    });
+    Ok(Connection {
+        socket: LegSocket::ws(ws),
+        codec: Box::new(LoopbackCodec),
+        user_frame,
+    })
+}
+
+impl LegDialer for RotatingDialer {
+    fn establish(&self) -> futures_util::future::BoxFuture<'_, Result<Connection, TransportError>> {
+        Box::pin(loopback_connection(self.relay))
+    }
+
+    fn rotation_events(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.events.clone())
+    }
+
+    fn can_rotate(&self) -> bool {
+        self.target.load(Ordering::SeqCst)
+    }
+
+    fn rotate(
+        &self,
+        gate: RotationGate,
+    ) -> futures_util::future::BoxFuture<'_, Result<Connection, TransportError>> {
+        Box::pin(async move {
+            let _ = self.progress.send("started");
+            let (before, after, fail) = {
+                let script = self.script.lock();
+                (
+                    script.before_commit.clone(),
+                    script.after_commit.clone(),
+                    script.fail_after_commit,
+                )
+            };
+            if let Some(before) = before {
+                before.notified().await;
+            }
+            if !gate.commit() {
+                let _ = self.progress.send("withdrawn");
+                return Err(TransportError::Other("withdrawn".into()));
+            }
+            let _ = self.progress.send("committed");
+            if let Some(after) = after {
+                after.notified().await;
+            }
+            if fail {
+                return Err(TransportError::Other("rotation dial failed".into()));
+            }
+            loopback_connection(self.carrier).await
+        })
+    }
+}
+
+struct RotationHarness {
+    relay: Server,
+    carrier: Server,
+    registry: Arc<SessionRegistry>,
+    sink: Arc<RecordingSink>,
+    target: Arc<std::sync::atomic::AtomicBool>,
+    events: tokio::sync::watch::Sender<u64>,
+    progress: mpsc::UnboundedReceiver<&'static str>,
+}
+
+impl RotationHarness {
+    /// A registry with session `s1` subscribed on the relay leg.
+    async fn start(script: RotationScript) -> Self {
+        let mut relay = Server::start().await;
+        let carrier = Server::start().await;
+        let target = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (events, events_rx) = tokio::sync::watch::channel(0);
+        let (progress_tx, progress) = mpsc::unbounded_channel();
+        let registry = Arc::new(
+            SessionRegistry::new(Arc::new(RotatingDialer {
+                relay: relay.addr,
+                carrier: carrier.addr,
+                target: target.clone(),
+                events: events_rx,
+                script: Arc::new(parking_lot::Mutex::new(script)),
+                progress: progress_tx,
+            }))
+            .with_rotation_quiet(Duration::from_millis(50)),
+        );
+        let sink = Arc::new(RecordingSink::default());
+        registry.connect("s1", sink.clone()).await.expect("connect");
+        assert!(matches!(
+            relay.next_frame().await,
+            Frame::Subscribe { session_id } if session_id.as_str() == "s1"
+        ));
+        Self {
+            relay,
+            carrier,
+            registry,
+            sink,
+            target,
+            events,
+            progress,
+        }
+    }
+
+    /// The carrier hub's signal: a rotation target is usable now.
+    fn offer_target(&self) {
+        self.target.store(true, Ordering::SeqCst);
+        self.events.send_modify(|generation| *generation += 1);
+    }
+
+    async fn next_progress(&mut self) -> &'static str {
+        tokio::time::timeout(Duration::from_secs(5), self.progress.recv())
+            .await
+            .expect("the rotation progresses in time")
+            .expect("the dialer is alive")
+    }
+
+    async fn no_progress(&mut self, window: Duration) -> bool {
+        tokio::time::timeout(window, self.progress.recv())
+            .await
+            .is_err()
+    }
+
+    async fn send(&self, text: &str) -> Result<(), TransportError> {
+        self.registry
+            .send("s1".into(), text.into(), format!("m-{text}"), Vec::new())
+            .await
+    }
+}
+
+fn turn_state(session_id: &str, active: bool) -> Frame {
+    Frame::TurnState {
+        session_id: session_id.into(),
+        user_id: String::new(),
+        active,
+        started_at: None,
+    }
+}
+
+fn is_subscribe(frame: &Frame, session: &str) -> bool {
+    matches!(frame, Frame::Subscribe { session_id } if session_id.as_str() == session)
+}
+
+fn is_message(frame: &Frame, text: &str) -> bool {
+    matches!(frame, Frame::Message(message) if message.content == text)
+}
+
+/// The whole transition: an idle relay leg rotates, the session re-subscribes
+/// on the new leg, sends go there, and nobody hears a disconnect — the relay
+/// pump is retired without fan-out.
+#[tokio::test]
+async fn an_idle_relay_leg_rotates_and_resubscribes_its_sessions() {
+    let mut harness = RotationHarness::start(RotationScript::default()).await;
+    harness.offer_target();
+    assert_eq!(harness.next_progress().await, "started");
+    assert_eq!(harness.next_progress().await, "committed");
+    assert!(is_subscribe(&harness.carrier.next_frame().await, "s1"));
+
+    harness
+        .send("hello")
+        .await
+        .expect("send on the rotated leg");
+    assert!(is_message(&harness.carrier.next_frame().await, "hello"));
+    assert!(
+        harness.relay.stayed_quiet(Duration::from_millis(200)).await,
+        "nothing more goes over the relay"
+    );
+    assert!(harness.sink.disconnects().is_empty());
+
+    harness.offer_target();
+    assert!(
+        harness.no_progress(Duration::from_millis(300)).await,
+        "a leg on the carrier never rotates again"
+    );
+}
+
+/// Answer deltas are never replayed, so a switch mid-turn would leave a hole
+/// in the answer: an active turn holds the rotation until it ends.
+#[tokio::test]
+async fn an_active_turn_holds_the_rotation_until_it_ends() {
+    let mut harness = RotationHarness::start(RotationScript::default()).await;
+    harness.relay.send(turn_state("s1", true));
+    harness.offer_target();
+    assert!(
+        harness.no_progress(Duration::from_millis(400)).await,
+        "no rotation while a turn is active"
+    );
+    harness.relay.send(turn_state("s1", false));
+    assert_eq!(harness.next_progress().await, "started");
+}
+
+/// Sends made while a rotation is in flight wait for it, and then go out on
+/// whichever leg is current — here, the rotated one, behind its Subscribe.
+#[tokio::test]
+async fn sends_during_a_rotation_wait_and_land_on_the_new_leg() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut harness = RotationHarness::start(RotationScript {
+        after_commit: Some(release.clone()),
+        ..RotationScript::default()
+    })
+    .await;
+    harness.offer_target();
+    assert_eq!(harness.next_progress().await, "started");
+    assert_eq!(harness.next_progress().await, "committed");
+
+    let registry = harness.registry.clone();
+    let send = tokio::spawn(async move {
+        registry
+            .send("s1".into(), "held".into(), "m-held".into(), Vec::new())
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!send.is_finished(), "the send waits for the rotation");
+
+    release.notify_one();
+    assert!(is_subscribe(&harness.carrier.next_frame().await, "s1"));
+    assert!(is_message(&harness.carrier.next_frame().await, "held"));
+    send.await.expect("join").expect("the held send went out");
+}
+
+/// Before its commit point a rotation is abandoned when a turn starts; the
+/// chat stays on the relay and keeps working.
+#[tokio::test]
+async fn a_turn_starting_before_the_commit_point_abandons_the_rotation() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut harness = RotationHarness::start(RotationScript {
+        before_commit: Some(release.clone()),
+        ..RotationScript::default()
+    })
+    .await;
+    harness.offer_target();
+    assert_eq!(harness.next_progress().await, "started");
+    harness.relay.send(turn_state("s1", true));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release.notify_one();
+
+    harness.send("still relay").await.expect("send");
+    assert!(is_message(&harness.relay.next_frame().await, "still relay"));
+    assert!(
+        harness
+            .carrier
+            .stayed_quiet(Duration::from_millis(200))
+            .await
+    );
+}
+
+/// Past the commit point the gateway may already have retired the relay leg,
+/// so its death waits for the rotation: a success retires it silently.
+#[tokio::test]
+async fn the_relay_legs_death_waits_for_a_committed_rotation() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut harness = RotationHarness::start(RotationScript {
+        after_commit: Some(release.clone()),
+        ..RotationScript::default()
+    })
+    .await;
+    harness.offer_target();
+    assert_eq!(harness.next_progress().await, "started");
+    assert_eq!(harness.next_progress().await, "committed");
+    harness.relay.close(CloseFrame {
+        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away,
+        reason: "displaced".into(),
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(harness.sink.disconnects().is_empty(), "held");
+
+    release.notify_one();
+    assert!(is_subscribe(&harness.carrier.next_frame().await, "s1"));
+    assert!(harness.sink.disconnects().is_empty(), "retired silently");
+}
+
+/// ... and a failed rotation then delivers the held death, so the chat
+/// reconnects over the relay.
+#[tokio::test]
+async fn a_failed_rotation_delivers_the_held_relay_death() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut harness = RotationHarness::start(RotationScript {
+        after_commit: Some(release.clone()),
+        fail_after_commit: true,
+        ..RotationScript::default()
+    })
+    .await;
+    harness.offer_target();
+    assert_eq!(harness.next_progress().await, "started");
+    assert_eq!(harness.next_progress().await, "committed");
+    harness.relay.close(CloseFrame {
+        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away,
+        reason: "displaced".into(),
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(harness.sink.disconnects().is_empty(), "held");
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.sink.disconnects().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the held death is delivered");
+    assert_eq!(harness.sink.disconnects(), vec!["s1".to_string()]);
+}
+
+/// A chat leg on a direct carrier dies of the QUIC idle timeout or of the
+/// pump's liveness window at the same moment, so neither masks the other.
+#[test]
+fn the_carrier_idle_timeout_equals_the_pump_liveness_window() {
+    assert_eq!(
+        carrier::quic::DIRECT_QUIC_IDLE_TIMEOUT,
+        super::pump::INBOUND_LIVENESS_TIMEOUT
     );
 }

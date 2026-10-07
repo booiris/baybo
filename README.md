@@ -267,8 +267,10 @@ cargo nextest run --workspace
 pnpm --filter @baybo/channel-sdk test
 ```
 
-Start with [`docs/architecture.md`](docs/architecture.md), then the per-module design
-docs in [`docs/modules/README.md`](docs/modules/README.md). Contributor rules:
+The [documentation index](docs/README.md) groups architecture, module specs,
+client guides, testing and operations. Start with
+[`docs/architecture.md`](docs/architecture.md), then the relevant
+[module design](docs/modules/README.md). Contributor rules:
 [`CLAUDE.md`](CLAUDE.md) · direction: [`docs/roadmap.md`](docs/roadmap.md).
 
 ## License

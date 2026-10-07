@@ -23,7 +23,16 @@ struct LlmEntriesScreen: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            Group {
+            VStack(spacing: 0) {
+                if catalog.requiresRestart {
+                    Text(verbatim: lang.t("llm.restartPending"))
+                        .font(Theme.mono(12))
+                        .foregroundStyle(Theme.inkSoft)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 24)
+                        .padding(.top, ChatHeaderView.barHeight + 12)
+                        .accessibilityIdentifier("llm-restart-pending")
+                }
                 if catalog.models.isEmpty {
                     message(lang.t("llm.emptyWithAdd"))
                 } else {
@@ -98,7 +107,7 @@ struct LlmEntriesScreen: View {
                 }
             }
             .padding(.horizontal, 24)
-            .padding(.top, ChatHeaderView.barHeight + 12)
+            .padding(.top, catalog.requiresRestart ? 12 : ChatHeaderView.barHeight + 12)
             .padding(.bottom, 40)
         }
         .scrollContentBackground(.hidden)

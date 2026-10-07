@@ -611,3 +611,28 @@ see the device checklist below.
    outbox (send offline → red dot / auto-retry → reconnect resend confirms).
 5. Keyboard: composer rides the keyboard, header never moves, transcript holds
    the newest edge through the resize.
+6. Relay binding on the gateway's Wi-Fi: enable a VPN that permits LAN traffic
+   and return to the app. Settings must reach LAN, and `baybo device status`
+   must show LAN legs. Repeat with VPN off, then switch to cellular with VPN
+   on: the LAN tier must be `not_offered`. `PathMonitorTests` covers physical
+   interface selection beneath a tunnel and excludes unused Wi-Fi interfaces.
+7. Settings shows only Connection. Open it for probe/tier details, enable
+   Connection diagnostics, switch networks or background/foreground the app,
+   then check the real event stream, copy and clear. Disabling and re-enabling
+   capture must retain old lines and append new ones. Scrolling away from the
+   bottom shows Follow latest; manually scrolling back hides it and resumes
+   following. The button must not change the console height, and a page whose
+   content fits must not bounce as a whole. Leaving and reopening must
+   disable capture and clear the console. `ConnectionDiagnosticsTests` covers
+   capture lifetime and bounded display; `ConnectionDetailsUITests` covers the
+   navigation and the real FFI start event using `-baybo-open-home
+   -baybo-home-tab settings -baybo-demo-connection` (debug-only fixture status).
+
+The [Linux NAT matrix](../../../docs/testing.md#direct-carrier-nat-matrix)
+exercises the Rust networking core in isolated virtual networks. It does not
+replace this device checklist; its prerequisites and cleanup limitations live
+in the linked guide.
+
+`-baybo-demo-models-staged` together with `-baybo-demo-models` seeds the
+restart-pending catalog state for the LLM entry smoke tests. The models fixture
+also includes a non-removable OAuth entry.

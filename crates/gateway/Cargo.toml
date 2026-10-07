@@ -25,8 +25,10 @@ linux = []
 macos = []
 # Exposes test helpers to downstream crate-level tests. Never enabled in
 # release builds. Pulls in `baybo-llm/test-support` so the gateway's own
-# test fixtures can construct `BillableLlm::passthrough`.
-test-support = ["baybo-llm/test-support"]
+# test fixtures can construct `BillableLlm::passthrough`, and the protocol's
+# test address policy, so a `baybo` built with it (the netns matrix's
+# gateway) treats the matrix's documentation ranges as public.
+test-support = ["baybo-llm/test-support", "remote-host-protocol/test-support"]
 
 [dependencies]
 baybo-process = { workspace = true }
@@ -40,6 +42,11 @@ baybo-deck = { workspace = true }
 baybo-project = { workspace = true }
 baybo-cost = { workspace = true }
 device-proto = { workspace = true }
+# Direct carriers: the demux socket, QUIC configuration and DirectOpen framing
+# shared with the phone. Its config builders take the aws-lc-rs provider the
+# gateway already uses.
+carrier = { workspace = true }
+quinn = { workspace = true }
 remote-host-protocol = { workspace = true }
 baybo-turn = { workspace = true }
 baybo-llm = { workspace = true }
@@ -62,6 +69,7 @@ parking_lot = { workspace = true }
 # channel frame loop). Same major as device-proto so the handshake/transport
 # types unify across the two crates.
 snow = { workspace = true }
+zeroize = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
 tokio-stream = { workspace = true }
@@ -88,8 +96,9 @@ axum = { workspace = true, features = ["ws"] }
 # upgraded stream, so `handshake` is enough.
 tokio-tungstenite = { workspace = true }
 # Pin the process-wide rustls CryptoProvider (see `relay_content::spawn`): the
-# graph has both aws-lc-rs + ring, so rustls can't auto-select one.
-rustls = { workspace = true }
+# graph has both aws-lc-rs + ring, so rustls can't auto-select one. The
+# workspace entry names no provider, so the gateway enables aws-lc-rs here.
+rustls = { workspace = true, features = ["aws_lc_rs", "tls12", "logging"] }
 libc = { workspace = true }
 hyper = { workspace = true }
 # `client-proxy`: the relay dialer asks reqwest's own proxy matcher which targets
@@ -137,3 +146,17 @@ tokio-rustls = { workspace = true }
 # so the spliced A<->C<->P path is proven across the workspace boundary.
 remote-host-relay = { workspace = true }
 remote-host-admission = { workspace = true }
+# `AddressPolicy::for_tests`: loopback carriers count as `Public` / `Lan`, so
+# the direct-carrier tests can run A and a mock phone over 127.0.0.1 and ::1.
+remote-host-protocol = { workspace = true, features = ["test-support"] }
+# `DemuxSocket::inject_recv_errors`: the rebind test drives the real receive-
+# error streak a socket reports.
+carrier = { workspace = true, features = ["test-support"] }
+# `test-util` backs `#[tokio::test(start_paused = true)]`; `full` omits it.
+tokio = { workspace = true, features = ["test-util"] }
+
+# Writes an approved relay binding into a workspace and prints the phone's
+# pairing record: the netns matrix's gateway setup (`app/ios/ffi/tests/netns_matrix.rs`).
+[[example]]
+name = "seed_relay_binding"
+required-features = ["test-support"]
