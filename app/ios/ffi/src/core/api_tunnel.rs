@@ -21,6 +21,11 @@ impl ApiTunnelSession {
         }
     }
 
+    /// See [`super::content::confirmation`].
+    pub fn confirmation(&mut self) -> Result<Vec<u8>, MobileError> {
+        super::content::confirmation(&mut self.transport)
+    }
+
     pub fn seal(&mut self, req: &TunnelRequest) -> Result<Vec<Vec<u8>>, MobileError> {
         let plaintext = api_tunnel::encode(req)?;
         Ok(write_chunked(&mut self.transport, &plaintext)?)

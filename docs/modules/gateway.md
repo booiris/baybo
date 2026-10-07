@@ -1230,7 +1230,7 @@ crates/gateway/
 │   │   ├── carrier/         #   a relay binding's direct carriers (the binding scope's CarrierRuntime):
 │   │   │                    #   runtime (offers, stop, the per-process certificate + offer gate),
 │   │   │                    #   offer (freshness + the process's replay cache), punches (allowed-IP sets,
-│   │   │                    #   authenticated punches), gather + interfaces (host candidates), probe (punching,
+│   │   │                    #   authenticated punches), gather (host candidates, from carrier::interfaces), probe (punching,
 │   │   │                    #   registration, probe routing), udp (per-family socket + rebind), quic (admission,
 │   │   │                    #   connections, streams), session (DirectOpen gate + responder hand-off),
 │   │   │                    #   phone (tests only: the

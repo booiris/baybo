@@ -498,6 +498,9 @@ async fn finish_pair(
     // has just rotated away: a 401, and (because a 401 is a perfectly well-formed
     // response) one that gets re-parked with a refreshed TTL. Drop them.
     super::leg_pool::pool().invalidate();
+    // A direct carrier, its epoch's probe and the failure cache belong to the
+    // binding that was just replaced.
+    super::carrier::hub().clear();
     // One app binds one Baybo: a fresh scan-pairing supersedes any direct-login
     // credentials so the two binding modes can't both linger. Best-effort — the
     // marker above keeps resolution correct even if this leaves the direct creds.
@@ -524,6 +527,7 @@ pub(crate) fn forget_pairing() -> Result<(), String> {
     // login that supersedes a pairing, and a re-pair all reach this function, and
     // none of them should have to remember.
     super::leg_pool::pool().invalidate();
+    super::carrier::hub().clear();
     // Read the record first to learn the device_id, so its push key
     // (`baybo.push-key.<device_id>`) is cleared too; a missing record is fine.
     if let Some(record) = load_paired_record()? {

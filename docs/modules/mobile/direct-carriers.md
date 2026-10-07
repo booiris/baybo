@@ -1,6 +1,6 @@
 # Direct Carriers for Relay Bindings
 
-**Status: PR1 (protocol, C and gateway) is implemented; PR2 (the app) is planned.** The design is delivered as two stacked PRs:
+**Status: implemented: PR1 (protocol, C and gateway) and PR2 (the app).** The design is delivered as two stacked PRs:
 
 - **PR1: protocol, C and gateway.**
   - Wire types and the address policy (`remote-host/crates/protocol`).
@@ -10,9 +10,9 @@
   - The gateway's carrier runtime, link table and `baybo device status`.
 
   PR1 is inert until an app speaks it and is covered by gateway↔C e2e tests. C deploys after PR1 merges.
-- **PR2: the app (planned).** The iOS ffi prober, carriers and idle chat rotation; the Swift path monitor and Settings row; the netns NAT matrix.
+- **PR2: the app.** The iOS ffi prober, carriers and idle chat rotation; the Swift path monitor and Settings row; the netns NAT matrix.
 
-Paths cited with a line number point into this tree. PR1 changes nothing under `app/ios` but its lockfile, so every `app/ios` citation describes the app as PR2 finds it. Everything about P is planned: a statement marked (PR2), a constant whose *Where* is P, and an `app/ios` path that does not exist yet all describe PR2. A statement marked (PR1) describes code PR1 changed or added. The *Delivery plan* lists both PRs.
+Paths cited with a line number point into this tree. A statement marked (PR1) or (PR2) describes code that PR changed or added. The *Delivery plan* lists both PRs.
 
 A paired phone (P) reaches its gateway (A) through the operator's blind WSS relay (C), even when both sit on the same Wi-Fi. This design keeps that relay as the baseline that always works, and adds **direct carriers**: QUIC over UDP, on a LAN address, an IPv6 address, a public IPv4 address or a hole-punched IPv4 mapping.
 
@@ -156,7 +156,7 @@ Neither side needs a port-forward rule, and a stateful firewall on either side i
 
 **A** enumerates its interface addresses once per accepted offer. It does so only while at least one direct socket is bound, so a gateway with direct carriers disabled never walks its interfaces.
 
-- It reads addresses and interface flags through `getifaddrs`, and each IPv6 address's own flags from `/proc/net/if_inet6` on Linux and through `SIOCGIFAFLAG_IN6` on macOS. It skips IPv6 addresses flagged temporary, deprecated, tentative or duplicate (DAD failed), and an IPv6 address whose flags it cannot read. A failed enumeration reads as no address, so the answer carries no host candidate.
+- It reads addresses and interface flags through `getifaddrs`, and each IPv6 address's own flags from `/proc/net/if_inet6` on Linux and through `SIOCGIFAFLAG_IN6` on Apple platforms. The enumeration is `carrier::interfaces` (`crates/carrier/src/interfaces.rs`), which A and P share; it reports a temporary IPv6 address apart from an unusable one, because the two sides treat them differently. A skips IPv6 addresses flagged temporary, deprecated, tentative or duplicate (DAD failed), and an IPv6 address whose flags it cannot read. A failed enumeration reads as no address, so the answer carries no host candidate.
 - It keeps addresses on UP+RUNNING interfaces whose class is `Lan` or `Public`.
 - It skips interfaces whose names start with one of `VIRTUAL_INTERFACE_PREFIXES`: container bridges and veths (`docker`, `br-`, `veth`, `virbr`, `cni`, `lxc`) and VPN tunnels (`tailscale`, `wg`, `tun`, `utun`, `zt`).
 - It keeps at most one GUA per /64 and at most `MAX_GATEWAY_GUAS` GUAs, `MAX_GATEWAY_ULAS` ULAs and `MAX_GATEWAY_IPV4_HOSTS` IPv4 addresses, ranked ULA/private < GUA < public IPv4.
@@ -164,6 +164,12 @@ Neither side needs a port-forward rule, and a stateful firewall on either side i
 
 **P** gathers from the primary interface of the currently satisfied `NWPath`:
 
+- The primary is the first physical interface (Wi-Fi, wired or cellular) in
+  system preference order whose type `NWPath.usesInterfaceType` reports as
+  used, including beneath a VPN. With none, P uses the first used interface
+  or leaves the primary unset. A leading VPN tunnel must not hide active Wi-Fi, but an unused
+  Wi-Fi interface must not enable LAN probing on a cellular path. This only
+  selects candidate addresses; sockets continue to obey system routing.
 - It reports **all** non-deprecated GUAs, up to `MAX_UDP_HOST_CANDIDATES`. iOS picks a temporary address as the outbound source, so P cannot know in advance which one it will use.
 - It reports `Lan` IPv4 addresses and ULAs **only from a Wi-Fi or wired interface.** A private address on `pdp_ip*` (cellular CGNAT) can never be reached by a peer, and reporting it would make A spray datagrams at unrelated hosts on its own LAN.
 
@@ -451,7 +457,7 @@ The codec is `ProbeDatagram::{encode, decode}`, in the protocol crate. Integers 
 
 ## Constants
 
-The protocol, C, A and carrier values are in the code (PR1), at the place the *Where* column names; P's values are planned (PR2).
+Every value is in the code, at the place the *Where* column names: the protocol, C, A and carrier values since PR1, P's (`app/ios/ffi/src/relay/carrier/` and the chat supervisor) since PR2.
 
 | Value | Where | Buys | Costs |
 |---|---|---|---|
@@ -497,7 +503,7 @@ The protocol, C, A and carrier values are in the code (PR1), at the place the *W
 **Relay first.**
 
 - `RelayDialer::establish` (`app/ios/ffi/src/relay/chat.rs:47`) never consults a carrier. A chat dial always goes to the relay.
-- (PR2) `dial_tunnel_leg` (`app/ios/ffi/src/relay/tunnel.rs:304`, relay-only today) dials on the live direct carrier when it is usable (not suspended, not cooling off), and on the relay otherwise. If a carrier dial fails before Noise completes, or exceeds `DIRECT_LEG_DIAL_TIMEOUT`, P **immediately re-dials that leg on the relay**, then judges the carrier:
+- (PR2) `dial_tunnel_leg` (`app/ios/ffi/src/relay/tunnel.rs`) dials on the live direct carrier when it is usable (not suspended, not cooling off), and on the relay otherwise. If a carrier dial fails before Noise completes, or exceeds `DIRECT_LEG_DIAL_TIMEOUT`, P **immediately re-dials that leg on the relay**, then judges the carrier:
   - **QUIC.** P retires the carrier only on connection-level evidence: `Connection::close_reason()` is `Some`, or the connection received no datagram while the dial ran (`Connection::stats().udp_rx`). Any other failure belongs to the stream (A's caps, a slow device lookup): new legs go to the relay for `CARRIER_DIAL_COOLOFF`, and the carrier and a chat leg on it stay up.
 
 **The prober** lives in `app/ios/ffi/src/relay/carrier/` (PR2). It runs at most one probe per binding at a time, and **nothing waits on it**.
@@ -520,6 +526,7 @@ The protocol, C, A and carrier values are in the code (PR1), at the place the *W
 - `NetworkKey` is the first `NETWORK_KEY_LEN` bytes of `SHA-256("baybo/direct/network/v1" ‖ primary interface kind ‖ Wi-Fi/wired only: the primary interface's sorted IPv4 /24s and the path's gateway addresses)`. A cellular path is keyed by its kind alone: its IPv6 prefix and CGNAT address change on every re-attach and would reset the backoff.
 - A failure advances that network's backoff step through `PROBE_BACKOFF`. A success clears the entry.
 - A carrier that dies **unsolicited** within `CARRIER_MIN_LIFETIME` counts as a failure: a `CONNECTION_CLOSE` from A, a QUIC idle timeout, or a connection-level leg or rotation dial failure. A retirement P initiates (a failed foreground re-proof, `network_changed`, pair/forget, a stale epoch) never touches the cache.
+- An unsolicited death schedules a probe at the backoff deadline, or immediately for a carrier that lived at least `CARRIER_MIN_LIFETIME`. Recovery does not depend on another chat reconnect or path update. The end of a stream-level dial cool-off wakes the chat supervisor to reconsider rotation.
 - A new network key's first probe is immediate.
 
 **Upgrade per class.**
@@ -563,6 +570,8 @@ Before the commit point, the rotation is **abandoned** when the carrier dies, th
 - **Pairing changes.** `finish_pair` and `forget_pairing` (`app/ios/ffi/src/relay/pairing.rs`) clear the carrier state, epoch and failure cache infallibly.
 
 **No route hints.** P persists no carrier state, and `forget_pairing` clears only in-memory carrier state. Every probe must deliver P's candidates to A, because A's allowed-IP set and firewall punches depend on them, and the probe runs off the critical path, so a remembered route would save nothing.
+
+Both foreground and background update carrier state synchronously at the Swift scene edge; only the network work is spawned. A foreground re-proof carries the carrier id and epoch. Its verdict is accepted only while that same carrier remains suspended in that epoch and the app is active. A late success cannot undo a newer background barrier, and a late failure cannot retire a replacement or a carrier another proof already resumed. Proof legs retain the pool epoch captured before the re-proof await (or at the probe's accepted upgrade); background invalidation and suspension share the carrier lock, so an old proof cannot re-enter the pool with a new epoch. Stale probe results never replace the Settings report.
 
 ## Gateway (A)
 
@@ -768,7 +777,7 @@ Browser remote access is out of scope and is not affected.
   - `not_offered`: no candidates of that tier, no rendezvous, or a path that may not dial it;
   - `denied`: the iOS Local Network permission is refused or pending (see *The prober*);
   - `skipped`.
-- **iOS.** (PR2) `SettingsScreen` (`app/ios/App/Screens/SettingsScreen.swift`) gets a **Connection** row showing "Relay", "Direct · LAN", "Direct · IPv6", "Direct · IPv4" or "Direct · IPv4 (punched)". A **Last probe** detail shows the time, the network kind and the per-tier outcomes. State reaches Swift through a new `CarrierSink` callback interface, registered like the existing sinks (`app/ios/ffi/src/lib.rs:149-171`). **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
+- **iOS.** `SettingsScreen` shows one tappable **Connection** row with "Via relay server", "Local network", "IPv6", "Direct · IPv4" or "IPv4 traversal". `ConnectionDetailsScreen` shows the last connection check time, network and per-path outcomes, explains the active route and router traversal, and offers a live connection console with copy/clear and tail-following. Capture is bounded in memory and stops on leaving the details page; dedicated events exclude secrets and conversation data (see [`connection.md`](../../../app/ios/docs/connection.md)). State reaches Swift through `CarrierSink`. **The chat screen gets no badge**: the chat header keeps showing only `legDown`.
 - **Gateway.** `baybo device status` (PR1) lists, for each approved device, its approval and last-seen times, its live legs by class with their carrier and start time, and its last offer's outcome and time.
   - It reads the running gateway's admin route `GET /v1/mobile/links`, authenticated with the vault's admin token, at the address `baybo_gateway::config::admin_dial_addr` derives from `gateway.bind_address` and `gateway.port` (a wildcard bind is dialed on loopback, as `baybo tui` does). It is the first `baybo device` command that queries the running gateway instead of the stores. When no link table comes back, it says why in one line (nothing answered, the gateway refused the token, or the vault holds none) and prints the device rows alone. With `--json`, `gateway.error` carries that line and each device's `legs` is `null`, not empty, while unknown.
   - It is shell-only, like the rest of the `device` family, which `crates/cli/src/slash.rs` already rejects as a whole.
@@ -856,45 +865,47 @@ Browser remote access is out of scope and is not affected.
 
 **Unit tests (PR2):**
 
-- the prober state machine: single flight, backoff steps, a new network key probing immediately, stale-epoch discard, `429` leaving the cache alone, `denied` scheduling one re-probe, a P-initiated retirement leaving the cache alone, a cellular path not dialing `Lan` candidates;
-- `network_changed`: two identical paths cause no retirement; cellular toggling under Wi-Fi causes none; Wi-Fi to cellular causes exactly one;
+- the prober state machine: single flight, backoff steps, a new network key probing immediately, stale-epoch discard, `429` leaving the cache alone, an unrepresentable `Retry-After` falling back to the longest backoff, `denied` waiting once on its own network before re-probing, a P-initiated retirement leaving the cache alone, a cellular path not dialing `Lan` candidates;
+- `network_changed`: two identical paths cause no retirement; cellular toggling under Wi-Fi causes none; Wi-Fi to cellular causes exactly one; a new subnet on the same interface invalidates the old probe;
 - rotation: the idle predicate, the commit point, sends held during a rotation, `PumpEnded` held during a rotation, each abandonment cause;
-- a stream-level failure keeping the carrier; the background suspend and foreground re-proof;
+- a stream-level failure keeping the carrier; early and late unsolicited deaths returning the next probe deadline; the background suspend and foreground re-proof, including a second background/foreground cycle, a network change, and a duplicate proof finishing after a successful one;
 - pool invalidation on every transition; `forget_pairing` clearing carrier state.
 
-**The netns NAT matrix (PR2)** is `#[ignore]`d because it needs root. A non-gating `netns-matrix` CI job (`continue-on-error`, PR-only, path-filtered on the carrier code) runs `scripts/netns-matrix.sh`. The script builds the three workspaces' binaries with `--features test-support`, passes their paths to the test through environment variables, and runs `sudo -E cargo test … -- --ignored`. It drives three real processes, each in its own namespace:
+**The netns NAT matrix** lives in `app/ios/ffi/tests/netns_matrix.rs`.
+[Running it, isolation boundaries, cleanup and CI behavior](../../testing.md#direct-carrier-nat-matrix)
+are documented in the testing guide. The script builds test-support binaries
+from all three workspaces. It drives three real processes:
 
-- C: the `remote-host` binary;
-- A: the `baybo` gateway binary, so the gateway under test is the shipped entry point. A `test-support` seed example first writes an approved relay binding (the device row and relay settings) into its workspace's stores, then exits;
-- P: the ffi client, run from an example binary with the in-memory keychain backend (PR2, `test-support`) seeded with the matching `PairedRecord`.
+- C: the `remote-host` binary, its admission table seeded with one key;
+- A: the `baybo` gateway binary, so the gateway under test is the shipped entry point. The `seed_relay_binding` example (`crates/gateway/examples/`, behind `test-support`) first writes an approved relay binding (the device row and relay settings, and A's Noise static and relay node id in its vault) into the workspace, prints the phone's matching pairing record, then exits. The test reads A's link table through `baybo device status --json`;
+- P: the ffi client, run from the `netns_phone` example, one command per stdin line, with the in-memory keychain backend (`test-support`) seeded with that record.
 
-The test lives in `app/ios/ffi/tests/netns_matrix.rs`, with the topology script in `scripts/netns-matrix.sh`.
+The test lives in `app/ios/ffi/tests/netns_matrix.rs`; every namespace and link is built per run, so no conntrack state crosses runs.
 
 ```
  ns:a ── ns:nat-a ──┐                        ┌── ns:nat-p ── ns:p
- 10.0.1.2 · 2001:2:0:a::2   ns:inet (router)  10.0.2.2 · 2001:2:0:b::2
+ 10.0.1.2 · 2001:2:0:a::2   ns:inet (bridge)  10.0.2.2 · 2001:2:0:b::2
                     ├──── 198.18.0.0/24 ─────┤
                     │     2001:2::/64        │
-                    └──────── ns:c ──────────┘   198.18.0.10 (HTTPS/WSS + UDP rendezvous)
-                                                 2001:2::10  (HTTPS/WSS only, IPv6 variant)
+                    └──────── ns:c ──────────┘   198.18.0.10 (HTTP/WS + UDP rendezvous)
  same-LAN variant: ns:p on ns:a's bridge (10.0.1.3)
+ open profile: the side's LAN is public and routed (198.18.1.2 for A, 198.18.2.2 for P)
 ```
 
-Every NAT namespace sets `net.netfilter.nf_conntrack_udp_timeout=30` and `nf_conntrack_udp_timeout_stream=30`, both per namespace, so that the keepalive is exercised. Every profile's input chain drops unsolicited WAN traffic before conntrack confirms it, as a consumer router does:
+Every NAT namespace sets `net.netfilter.nf_conntrack_udp_timeout=30` and `nf_conntrack_udp_timeout_stream=30`, both per namespace, so that the keepalive is exercised. Every profile drops unsolicited WAN traffic to the NAT box before conntrack confirms it, as a consumer router does:
 
 ```
-chain input { type filter hook input priority 0; policy accept; iifname "wan" ct state new drop }
+iptables -A INPUT -i wan -m conntrack --ctstate NEW -j DROP
 ```
 
-Without that chain, an early inbound punch pins a conntrack entry, and masquerade then remaps the host's port. Each NAT box applies one profile to UDP (nftables):
+Without that rule, an early inbound punch pins a conntrack entry, and masquerade then remaps the host's port. The rules are iptables (its nftables backend on current distributions), which needs only the `xt_*` matches every distribution kernel ships. Each NAT box applies one profile to IPv4:
 
 - `open`: routed; no NAT, no filter.
-- `cone` (endpoint-independent mapping and filtering): `snat to <wan>`, which preserves the port, plus `udp dport 1024-65535 dnat to <host>`.
-- `port-restricted` (endpoint-independent mapping, address-and-port-dependent filtering): `masquerade` (conntrack filters replies to the exact remote).
-- `symmetric` (address-and-port-dependent mapping): `masquerade fully-random`.
-- `v6-firewall`: IPv6 is routed but not NATed. Forwarded traffic is accepted when `ct state established,related`, and new inbound connections from the WAN interface are dropped.
-- `udp-blocked`: `meta l4proto udp drop` on forward.
-- `nat64`: nat-p runs a `jool` NAT64 for an IPv6-only P without CLAT.
+- `cone` (endpoint-independent mapping and filtering): `-j SNAT --to-source <wan>`, which preserves the port, plus `-i wan -p udp --dport 1024:65535 -j DNAT --to-destination <host>`.
+- `port-restricted` (endpoint-independent mapping, address-and-port-dependent filtering): `-j MASQUERADE` (conntrack filters replies to the exact remote).
+- `symmetric` (address-and-port-dependent mapping): `-j MASQUERADE --random-fully`.
+- `v6-firewall`: IPv6 is routed but not NATed. `ip6tables` drops new inbound connections from the WAN interface, so forwarded traffic is accepted only when established or related.
+- `udp-blocked`: `-p udp -j DROP` on forward, both families.
 
 Expected IPv4 results, with no IPv6 and different networks. Each cell is the carrier P ends on:
 
@@ -909,11 +920,12 @@ Additional rows and variants:
 
 - same LAN → `Lan`;
 - both sides `v6-firewall` with GUAs → `Ipv6`, whatever the IPv4 profile;
+- `ipv6-relay`: both sides reach C's HTTP/WS signalling over IPv6, with IPv4 UDP rendezvous still enabled → `Ipv6` (the namespace fixture uses plaintext HTTP/WS);
 - `udp-blocked` on either side → `Relay`;
 - C without `UDP_PUBLIC_ADDR` → A `open` gives `Ipv4`, and every other IPv4 cell gives `Relay`;
-- P IPv6-only behind `nat64` → `Ipv6` when A has a GUA, otherwise `Relay`;
-- P reaching C's HTTPS over IPv6 → the IPv4 table unchanged, because admission never depends on the HTTPS client IP;
 - `tc netem loss 5%` on both WANs, port-restricted × port-restricted → `Ipv4Punched`.
+
+P IPv6-only behind a NAT64 without CLAT is not in the matrix yet: it needs `jool`, which neither CI's runner nor a stock distribution kernel ships. That path, and HTTPS on the real relay, remain real-device checks.
 
 Each cell runs five times to catch order-dependence. Every run asserts, in order (steps 2 to 4 only for a cell that ends on a direct carrier):
 
@@ -922,11 +934,13 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 3. after an idle phase of at least 40 s, with rotation held off through a `test-support` knob so that only QUIC keepalives cross the NATs, the `CarrierKind` is unchanged and a second API request runs on the carrier with no relay fallback;
 4. once rotation is released, the chat rotates and a chat frame round-trips on the carrier.
 
-**Real-device checklist.** The owner runs this before PR2 is marked ready:
+**Real-device checklist.** The owner runs this before the iOS PR is marked ready.
+The [iOS testing guide](../../../app/ios/docs/testing.md#manual-verification-checklist-device)
+also covers VPN interface selection and diagnostic-console interactions:
 
-1. **Same Wi-Fi.** "Direct · LAN" appears within seconds of opening the app, and the Local Network prompt appears at most once. On first launch, "Direct · LAN" appears within `LOCAL_NETWORK_RETRY` of tapping Allow.
-2. **Cellular with IPv6.** "Direct · IPv6".
-3. **Cellular with IPv4 only.** "Direct · IPv4 (punched)" or "Relay", with the per-tier outcomes shown.
+1. **Same Wi-Fi.** "LAN" appears within seconds of opening the app, and the Local Network prompt appears at most once. On first launch, "LAN" appears within `LOCAL_NETWORK_RETRY` of tapping Allow.
+2. **Cellular with IPv6.** "IPv6".
+3. **Cellular with IPv4 only.** "IPv4 traversal" or "Relay", with the per-tier outcomes shown.
 4. **Walk out of Wi-Fi mid-conversation.** There is at most one reconnect, the app falls back to the relay, and it then re-upgrades.
 5. **Switch apps for under 5 s mid-reply.** The answer has no hole, and the carrier is kept.
 6. **Background for over a minute, then foreground.** The carrier is re-proven, or the chat resumes over the relay and then rotates.
@@ -934,7 +948,7 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 8. **Blob upload and download over a direct carrier.**
 9. **Gateway restart while on a direct carrier.** The app recovers to the relay, then re-upgrades.
 10. **`baybo device revoke`.** The app's carrier legs die within 5 s.
-11. **`baybo device status`** matches the app's Connection row, except that a hairpinned "Direct · IPv4 (punched)" carrier is listed as `lan` (see *Link table*).
+11. **`baybo device status`** matches the app's Connection row, except that a hairpinned "IPv4 traversal" carrier is listed as `lan` (see *Link table*).
 
 ## Deploying C (operators)
 
@@ -996,7 +1010,7 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
   - on the responder seam, the handshake confirmation (`BinarySink::CONFIRMS_HANDSHAKE`) and the `authenticated` hook; the API tunnel polls a forwarded request's router inside its session, so a dropped session drops the handler;
   - `DeviceLinks`, `GET /v1/mobile/links` and `baybo device status`. The route is registered in the OpenAPI doc under a `mobile` tag; `docs/openapi.json` is regenerated with `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync`, and `app/web/src/api/schema.d.ts` from it with `pnpm --filter baybo-web gen:api`. The rule for dialing the admin listener from the same host moves from `crates/baybo/src/gateway_client.rs` to `baybo_gateway::config::admin_dial_addr`, which `baybo tui`, `baybo prompt` and `baybo device status` share;
   - config in `crates/config/src/{gateway,validate}.rs`.
-- **Tests:** unit tests plus the `relay_e2e.rs` direct cases. `.github/workflows/ci.yml` gains a `remote-host` job (fmt, clippy `-D warnings`, nextest in the `remote-host/` workspace, whose own `remote-host/.config/nextest.toml` fails a hung test instead of wedging the job), path-filtered on `remote-host/` and `rust-toolchain.toml`. The root workspace excludes `remote-host/`, so without this job no CI run executes the protocol and C tests. It also gains a `gateway-macos` job on `macos-26`, path-filtered on `crates/gateway/src/channel/carrier/`, that runs the carrier's interface tests: the IPv6 address flags have a macOS-only reader, whose ioctl request is pinned at compile time to the SDK's value, and no other CI job builds the gateway for macOS.
+- **Tests:** unit tests plus the `relay_e2e.rs` direct cases. `.github/workflows/ci.yml` gains a `remote-host` job (fmt, clippy `-D warnings`, nextest in the `remote-host/` workspace, whose own `remote-host/.config/nextest.toml` fails a hung test instead of wedging the job), path-filtered on `remote-host/` and `rust-toolchain.toml`. The root workspace excludes `remote-host/`, so without this job no CI run executes the protocol and C tests. It also gains a `gateway-macos` job on `macos-26`, path-filtered on the carrier code (`crates/carrier/` since PR2 moved the enumeration there, and `crates/gateway/src/channel/carrier/`), that runs the interface tests: the IPv6 address flags have an Apple-only reader, whose ioctl request is pinned at compile time to the SDK's value, and no other CI job runs Rust tests on an Apple platform.
 - **Docs:**
   - `companion.md`: "Reaching a NAT'd gateway" (content may bypass the relay on a direct carrier; pairing stays relay-only), the binding scope, and the E2E's direct cases;
   - `relay-push-security.md`: what C may see, the C can / cannot additions, and Claim 5;
@@ -1009,16 +1023,17 @@ Each cell runs five times to catch order-dependence. Every run asserts, in order
 
   `.github/workflows/ci.yml` changes only by the `remote-host` and `gateway-macos` jobs: no `app/ios` crate depends on `crates/carrier` in PR1, so the iOS filters stay as they are until PR2.
 
-**PR2: the app** (planned):
+**PR2: the app**:
 
 - **ffi:**
-  - Generalise `WsStream` to a binary transport in `app/ios/ffi/src/transport/{mod,pump}.rs`, `app/ios/ffi/src/relay/tunnel.rs` and `app/ios/ffi/src/relay/chat.rs` (the chat leg's Noise handshake over a carrier stream). On a carrier session every handshake ends with P's confirmation, one empty transport message sent right after msg2; the relay leg's handshake is unchanged. `app/ios/ffi/src/relay/dial.rs` stays WS-only.
-  - Add `app/ios/ffi/src/relay/carrier/`: the prober, the QUIC carrier, the network fingerprint and key, and the failure cache. Add `carrier = { path = "../../crates/carrier" }` to `app/ios/Cargo.toml` `[workspace.dependencies]`, and refresh `app/ios/Cargo.lock` in the same commit. The same commit widens `.github/workflows/ci.yml`'s `IOS_DEPS` and `ios_native` filters to `crates/(wire|device-proto|model|carrier)/`, and adds `crates/carrier/**` to the `ios-sim` job's ffi cache key, since from then on a carrier change can break the iOS build.
-  - In the supervisor: the active-turn set and the rotation transition, with its commit point and held sends. Invalidate the pool on transitions.
-  - In `app/ios/ffi/src/lib.rs`: `network_changed` and `CarrierSink`. The `.background` barrier suspends the carrier and `.active` re-proves it; pair and forget clear carrier state.
-  - An in-memory keychain backend for non-iOS builds, behind a `test-support` feature, so the netns client can be seeded with a `PairedRecord`. Today's non-iOS keychain (`app/ios/ffi/src/keychain.rs:336-357`) discards writes.
-- **Swift:** `app/ios/App/Core/PathMonitor.swift` and the Settings Connection row. `NSLocalNetworkUsageDescription` is already present in `app/ios/App/Info.plist:33`.
-- **Tests and docs:** the netns matrix and its CI job; `app/ios/docs/connection.md` (rotation, suspension and the carrier seam).
+  - `WsStream` is generalised to a leg socket (`app/ios/ffi/src/transport/socket.rs`: a WebSocket, or a carrier stream framed by `carrier::framing`) across `transport/{mod,pump}.rs`, `relay/tunnel.rs` and `relay/chat.rs`. On a carrier session every handshake ends with P's confirmation, one empty transport message sent right after msg2; the relay leg's handshake is unchanged. `relay/dial.rs` stays WS-only.
+  - `app/ios/ffi/src/relay/carrier/`: the pure state machine (`state.rs`: single flight, the epoch, the per-network failure cache, suspension, cool-off), the network fingerprint and key (`network.rs`), the prober (`probe.rs`), the carrier handle and leg dials (`quic.rs`), and the hub that runs them (`mod.rs`). `carrier` joins `app/ios/Cargo.toml`'s `[workspace.dependencies]` with `quinn`, and `tracing` with its `log` feature so the carrier crate's events reach the app's log. `.github/workflows/ci.yml`'s `IOS_DEPS` and `ios_native` filters widen to `crates/(wire|device-proto|model|carrier)/`, and `crates/carrier/**` joins the `ios-sim` job's ffi cache key.
+  - The interface enumeration moves from the gateway to `crates/carrier/src/interfaces.rs`, shared by both sides, with temporary IPv6 addresses reported apart from unusable ones.
+  - In the supervisor: the active-turn set and the rotation transition, with its commit gate (`RotationGate`), held sends and the held relay death. Every carrier transition invalidates the API leg pool.
+  - In `app/ios/ffi/src/lib.rs`: `network_changed`, `set_carrier_sink` and `CarrierSink`, and `carrier_background` / `carrier_foreground` for the `.background` barrier and `.active`. Pair and forget clear carrier state.
+  - Behind the ffi's `test-support` feature: an in-memory keychain backend for host builds, so the netns client can be seeded with a `PairedRecord`, the rotation-hold knob, and the protocol's test address policy.
+- **Swift:** `app/ios/App/Core/PathMonitor.swift`, `ConnectionStore.swift` (the carrier sink's store) and the Settings Connection row. `NSLocalNetworkUsageDescription` was already present.
+- **Tests and docs:** the netns matrix, its CI job, the gateway's `seed_relay_binding` example and the ffi's `netns_phone` example; `app/ios/docs/connection.md`.
 - **Before ready:** the owner runs the real-device checklist.
 
 ## Related

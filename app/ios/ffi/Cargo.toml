@@ -14,11 +14,25 @@ name = "baybo_ffi"
 crate-type = ["staticlib", "cdylib", "lib"]
 doctest = false
 
+[features]
+# Host-only hooks for the netns matrix's phone process: an in-memory keychain
+# a test can seed with a pairing, a knob that holds chat rotation off, and the
+# protocol's test address policy (the matrix's documentation ranges count as
+# public). Never enabled in an app build.
+test-support = ["remote-host-protocol/test-support"]
+
+[[example]]
+name = "netns_phone"
+required-features = ["test-support"]
+
 [dependencies]
 baybo-model = { workspace = true }
 device-proto = { workspace = true }
 wire = { workspace = true }
 remote-host-protocol = { workspace = true }
+carrier = { workspace = true }
+quinn = { workspace = true }
+tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

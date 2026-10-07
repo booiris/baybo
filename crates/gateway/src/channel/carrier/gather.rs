@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use remote_host_protocol::relay::{AddressClass, AddressPolicy, MAX_UDP_HOST_CANDIDATES};
 
-use super::interfaces::InterfaceAddress;
+use carrier::interfaces::InterfaceAddress;
 
 /// At most this many IPv6 global unicast addresses, one per /64.
 pub(crate) const MAX_GATEWAY_GUAS: usize = 2;
@@ -86,7 +86,8 @@ fn host_candidates(
         .iter()
         .filter(|address| {
             address.up_running
-                && !address.unstable
+                && !address.temporary
+                && !address.unusable
                 && !VIRTUAL_INTERFACE_PREFIXES
                     .iter()
                     .any(|prefix| address.interface.starts_with(prefix))
@@ -183,7 +184,8 @@ mod tests {
             interface: interface.to_owned(),
             ip: ip.parse().unwrap(),
             up_running: true,
-            unstable: false,
+            temporary: false,
+            unusable: false,
         }
     }
 
@@ -257,12 +259,14 @@ mod tests {
     }
 
     #[test]
-    fn down_unstable_and_virtual_interfaces_are_never_offered() {
+    fn down_temporary_unusable_and_virtual_interfaces_are_never_offered() {
         let mut down = address("eth0", "192.168.1.2");
         down.up_running = false;
         let mut temporary = address("eth0", "2606:4700:1::9");
-        temporary.unstable = true;
-        let mut interfaces = vec![down, temporary];
+        temporary.temporary = true;
+        let mut deprecated = address("eth0", "2606:4700:1::8");
+        deprecated.unusable = true;
+        let mut interfaces = vec![down, temporary, deprecated];
         interfaces.extend(
             VIRTUAL_INTERFACE_PREFIXES
                 .iter()

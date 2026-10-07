@@ -8,6 +8,25 @@ use crate::binding::NOT_BOUND_MSG;
 use crate::direct::INVALID_TOKEN_CODE;
 use crate::transport::{NOT_CONNECTED_MSG, SESSION_CLOSED_MSG};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ConnectionLogStage {
+    Lifecycle,
+    Network,
+    Relay,
+    Probe,
+    Rendezvous,
+    Quic,
+    Chat,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ConnectionLogEntry {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub stage: ConnectionLogStage,
+    pub message: String,
+}
+
 /// The FFI error surface. `InvalidToken` and `NotBound` used to be string codes
 /// the webview matched on (`invalid_token` / the unbound prose); as enum variants
 /// the cross-language contract can't drift with a rewording.
@@ -734,6 +753,97 @@ pub trait ProjectSink: Send + Sync {
     fn on_project_changed(&self, project_id: String, scope: String, issue_number: Option<u32>);
     /// A connection gap may have dropped an invalidation; refetch visible boards.
     fn on_project_stale(&self);
+}
+
+/// The kind of a path's primary interface, from `NWPath.usesInterfaceType` on
+/// its first available interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum NetworkInterfaceKind {
+    Wifi,
+    Wired,
+    Cellular,
+    Loopback,
+    Other,
+}
+
+/// One `NWPathMonitor` delivery, as `network_changed` receives it. The primary
+/// interface (kind, name, gateways) is what decides whether the direct carrier
+/// survives the change; the rest only tells a duplicate delivery apart from a
+/// change confined to secondary interfaces.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NetworkPath {
+    /// `NWPath.status == .satisfied`.
+    pub satisfied: bool,
+    pub interface_kind: NetworkInterfaceKind,
+    /// The primary interface's BSD name (`en0`, `pdp_ip0`); empty when the
+    /// path has no interface.
+    pub interface_name: String,
+    /// `NWPath.gateways`, each rendered as its host string.
+    pub gateways: Vec<String>,
+    pub supports_ipv4: bool,
+    pub supports_ipv6: bool,
+    /// Every available interface's name, primary first.
+    pub available_interfaces: Vec<String>,
+    pub is_expensive: bool,
+    pub is_constrained: bool,
+}
+
+/// What the binding's legs ride on. `Relay` is C's WSS splice; the rest are
+/// the direct carrier kinds, in the order a probe prefers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum CarrierLabel {
+    Relay,
+    Lan,
+    Ipv6,
+    Ipv4,
+    Ipv4Punched,
+}
+
+/// How one tier of a probe ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TierOutcome {
+    Ok,
+    Failed,
+    Timeout,
+    /// No candidate of the tier, no rendezvous, or a path that may not dial it.
+    NotOffered,
+    /// The iOS Local Network permission is refused or still pending.
+    Denied,
+    /// The tier never ran: the probe ended before it, or a better tier won.
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TierReport {
+    pub tier: CarrierLabel,
+    pub outcome: TierOutcome,
+}
+
+/// The last probe, for the Settings screen's Connection detail.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ProbeReport {
+    /// Unix ms.
+    pub finished_at_ms: i64,
+    pub network: NetworkInterfaceKind,
+    /// The carrier the probe ended on: a direct kind, or `Relay`.
+    pub ended_on: CarrierLabel,
+    pub tiers: Vec<TierReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CarrierStatus {
+    pub carrier: CarrierLabel,
+    pub last_probe: Option<ProbeReport>,
+}
+
+/// Receives the binding's carrier state on every change: a carrier coming up
+/// or going down, and every finished probe. Registered once via
+/// [`crate::BayboClient::set_carrier_sink`], which delivers the current state
+/// at once. Calls arrive on the core's tokio workers; hop to the main actor,
+/// and avoid UniFFI's generated `CarrierSinkImpl` name.
+#[uniffi::export(with_foreign)]
+pub trait CarrierSink: Send + Sync {
+    fn on_carrier(&self, status: CarrierStatus);
 }
 
 /// Unknown is a tolerant decode fallback and must never be sent as a move.

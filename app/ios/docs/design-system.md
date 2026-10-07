@@ -312,3 +312,8 @@ only, borderless composer pill, bare glass on the discs) and the `glassSurface` 
 custom glass surface must go through.
 
 The system above still governs everything else.
+
+The connection diagnostic console uses indigo, blue, purple and teal stage
+labels to distinguish lifecycle, network checks, relay negotiation and direct
+transport activity. This scoped diagnostic color exception leaves timestamps
+muted and message text in the standard ink color.

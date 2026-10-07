@@ -126,6 +126,44 @@ an orphan, and the dial child carries a send-on-drop report so a panic inside
 `establish` (foreign dial code has panicked before) can never strand the
 supervisor in `Dialing` with held replies.
 
+## Rotating onto a direct carrier
+
+A relay binding's chat leg always dials the relay; it moves onto a direct
+carrier ([`direct-carriers.md`](../../../docs/modules/mobile/direct-carriers.md))
+only by **rotation**, a supervisor transition on a live leg. Answer deltas are
+never replayed, so a switch mid-turn would leave a hole in the answer: the
+supervisor starts one only when the leg is live on the relay, no session is
+`Subscribing`, the pump's active-turn set is empty, and nothing but keepalives
+crossed the leg for `CHAT_ROTATION_QUIET`. The pump is the active-turn set's
+only writer (`LegActivity`: `TurnState` adds and removes, every
+`SubscribeState` re-seeds), and it reports a turn starting as `TurnStarted`.
+
+The seam is `LegDialer`'s `rotation_events` / `can_rotate` / `rotate`; the
+direct leg has none. **`RotationGate` is the commit point**: the dial commits
+right before it writes the carrier stream's `DirectOpen`, and the supervisor
+may abandon the rotation (a turn started, an `Open` arrived, the carrier hub's
+generation ticked) only before that. Past it the gateway may already have
+retired the relay leg, so:
+
+- `Send` / `ResolveApproval` — and an `Open` past the commit point — are held
+  and replayed onto whichever leg is current when the rotation resolves;
+- the relay leg's death is held too: a success retires it silently, the way
+  `disconnect` does, and a failure runs the ordinary `leg_death`.
+
+A success installs the carrier pump and re-subscribes every session that rode
+the relay leg. A rotated leg is marked `on_carrier` and never rotates again;
+when its carrier dies, it dies like any leg and the reconnect goes over the
+relay.
+
+A foreground edge updates carrier state synchronously, then spawns its network
+re-proof; it cannot be queued behind a later background edge. The re-proof is
+fenced by its carrier id and lifecycle epoch.
+Backgrounding again makes the result stale even if the app has returned to the
+foreground by the time it arrives. Its API proof leg keeps the pool epoch from
+before the await, so it cannot repopulate a pool invalidated during the proof.
+An unsolicited carrier death schedules the next probe; the end of a stream
+dial cool-off wakes the supervisor to reconsider a deferred rotation.
+
 ## What stays OUTSIDE the supervisor (and when that changes)
 
 The api legs (`relay/api.rs` + `leg_pool.rs`, direct's plain HTTPS) and the
@@ -149,6 +187,12 @@ grow a parallel set of fences. The one real coupling today is capacity, not
 lifecycle: parked api-pool legs and chat reconnects share relay connection
 slots (see `MAX_POOLED_LEGS`).
 
+Api and blob legs dial a live direct carrier first (`dial_tunnel_leg`) and
+re-dial the relay at once when that fails; the carrier hub judges the carrier
+from the failure. Every carrier transition, up or down, invalidates the pool,
+so parked relay legs stop serving once a carrier is live and parked carrier
+legs die with their carrier.
+
 ## The Swift half
 
 `connState` has four states and few writers on purpose:
@@ -170,6 +214,55 @@ into an existing dial task, while `sendWhenReady` supersedes it (its message
 must ride the new dial behind its Subscribe); they also differ in notice
 clearing and `reconcileOutboxOnConnect(justSent:)`. Only the continuations are
 shared — do not merge the entries.
+
+## Direct-carrier lifecycle
+
+The carrier policy is defined in
+[`direct-carriers.md`](../../../docs/modules/mobile/direct-carriers.md)
+§ Connection policy on P. `PathMonitor` (`App/Core/PathMonitor.swift`), started
+once at launch and never stopped, hands every `NWPathMonitor` delivery to
+`networkChanged` on its own serial queue. It selects the first Wi-Fi, wired,
+or cellular interface in system preference order whose type the path uses
+(`usesInterfaceType` includes the physical interface beneath a VPN). If none
+is available, it uses the first used interface or leaves the primary unset.
+This prevents a leading VPN tunnel
+from suppressing LAN probes without selecting an unused Wi-Fi interface on a
+cellular path. Sockets still follow system routing and VPN policy.
+The call is synchronous because a
+primary-interface change must retire the carrier and abort any probe before it
+returns. The `.background` barrier in `BayboApp` calls `carrierBackground()`
+right after `relayInvalidateApiLegs()`, on the same edge and for the same
+reason: nothing a later Task does may dial a leg on a carrier the suspend is
+about to strand. `didBecomeActive` fires `carrierForeground()` best-effort; it
+re-proves the suspended carrier or retires it, and a chat leg that died with it
+goes through `leg_death` like any relay corpse. Carrier state comes back
+through `CarrierEventsRelay` (`setCarrierSink`) into `ConnectionStore`.
+
+## Connection details and diagnostics
+
+Settings shows one tappable Connection row; `ConnectionDetailsScreen` shows the current
+carrier and per-tier outcomes, without a last-check timestamp row. The chat
+header still shows only `legDown`. Labels use “LAN”, “Relay”, “IPv6”, “IPv4”
+and “IPv4 traversal”; internal carrier and wire names stay stable. Connection
+rows and the diagnostics toggle have no explanatory captions.
+
+The details page has an opt-in live diagnostic console. Its height fills the
+remaining safe-area viewport, reserving a stable Follow latest row and bottom
+padding. The outer page scrolls only when its content exceeds the viewport
+(such as compact windows); it does not bounce when everything fits.
+Timestamps are muted and stage labels are colored, while copied logs remain
+plain text. `connection_diagnostics.rs`
+owns a bounded in-memory queue of dedicated events (network changes, relay dials,
+candidate exchange, rendezvous, QUIC proof and chat rotation). It does not copy
+general logs, credentials, URLs, server response bodies or conversation frames.
+`set_connection_diagnostics` starts/stops capture; `drain_connection_diagnostics`
+hands batches to `ConnectionDiagnosticsStore` every 250 ms while enabled. Rust's
+`connection_diagnostics_capacity` supplies the shared retention limit. Disabling
+keeps displayed lines for copying; re-enabling appends to them. Leaving the page
+disables capture and clears the display. Scrolling pauses tail-following until
+the user scrolls back to the bottom or chooses Follow latest. Backgrounding
+keeps the opt-in so returning to the page captures suspend and recovery;
+nothing is persisted across app launches.
 
 ## Testing
 

@@ -197,6 +197,7 @@ jobs:
       install: ${{ steps.filter.outputs.install }}
       remote_host: ${{ steps.filter.outputs.remote_host }}
       gateway_macos: ${{ steps.filter.outputs.gateway_macos }}
+      netns: ${{ steps.filter.outputs.netns }}
     steps:
       # Full history so the merge-base diff against the PR base resolves.
       - uses: actions/checkout@v4
@@ -225,7 +226,7 @@ jobs:
           # of a `ChatTranscriptItem` field must reach this job. Note nothing
           # gates the freshness of app/web's committed schema against the spec;
           # its `gen:api` overwrites it in the runner and diffs nothing.
-          IOS_DEPS='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
+          IOS_DEPS='^(app/ios/|crates/(wire|device-proto|model|carrier)/|remote-host/|docs/openapi\.json)'
           if changed "$IOS_DEPS"; then
             echo "ios=true" >> "$GITHUB_OUTPUT"
           else
@@ -235,7 +236,7 @@ jobs:
           # A Mac is needed only for the Swift/Xcode half. A change confined to
           # app/ios docs (CLAUDE.md) leaves ios_native false and never queues
           # for a macOS runner at all.
-          if changed "^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/"; then
+          if changed "^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model|carrier)/|^remote-host/"; then
             echo "ios_native=true" >> "$GITHUB_OUTPUT"
           else
             echo "ios_native=false" >> "$GITHUB_OUTPUT"
@@ -261,12 +262,20 @@ jobs:
             echo "remote_host=false" >> "$GITHUB_OUTPUT"
           fi
 
-          # The gateway's direct-carrier code, whose interface enumeration has
-          # a macOS-only half (see `gateway-macos`).
-          if changed '^crates/gateway/src/channel/carrier/'; then
+          # The direct-carrier code, whose interface enumeration has an
+          # Apple-only half (see `gateway-macos`).
+          if changed '^(crates/gateway/src/channel/carrier/|crates/carrier/)'; then
             echo "gateway_macos=true" >> "$GITHUB_OUTPUT"
           else
             echo "gateway_macos=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Direct-carrier code on any of the three sides, and the matrix
+          # itself (see `netns-matrix`).
+          if changed '^(crates/carrier/|crates/gateway/src/channel/carrier/|crates/gateway/examples/|app/ios/ffi/src/relay/carrier/|app/ios/ffi/src/transport/|app/ios/ffi/tests/netns_matrix\.rs|app/ios/ffi/examples/|remote-host/crates/(relay|protocol)/|scripts/netns-matrix\.sh)'; then
+            echo "netns=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "netns=false" >> "$GITHUB_OUTPUT"
           fi
 
   # remote-host/ is its own cargo workspace, excluded from the root one, so the
@@ -301,9 +310,10 @@ jobs:
 
   # Every other Rust job builds the gateway on Linux; only the dispatch-only
   # release workflow builds it for macOS. The carrier's interface enumeration
-  # reads IPv6 address flags through a macOS-only ioctl whose request number
+  # reads IPv6 address flags through an Apple-only ioctl whose request number
   # is computed from libc's struct layout, so its compile-time pin and its
-  # `::1` test run here, on the one platform that has them.
+  # `::1` test run here, on the one platform that has them (`ios-sim` builds
+  # the same code for iOS but runs no Rust test).
   gateway-macos:
     name: gateway carrier (macOS)
     needs: changes
@@ -320,7 +330,35 @@ jobs:
         with:
           cache: false
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run -p baybo-gateway --lib --locked carrier::interfaces
+      - run: cargo nextest run -p carrier --lib --locked interfaces
+
+  # The direct-carrier NAT matrix (docs/modules/mobile/direct-carriers.md §
+  # Testing): the real C, A and P binaries, each in its own network namespace
+  # behind a NAT profile, five runs a cell. Non-gating and PR-only: it needs
+  # root and the better part of two hours, and a NAT corner it finds is a
+  # design question rather than a merge blocker.
+  netns-matrix:
+    name: netns NAT matrix (non-gating)
+    needs: changes
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.netns == 'true' }}
+    continue-on-error: true
+    timeout-minutes: 180
+    env:
+      BAYBO_SKIP_WEBUI: 1
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: |
+            .
+            remote-host
+            app/ios
+      - run: sudo apt-get update -qq && sudo apt-get install -y lld sqlite3 iproute2 iptables
+      # The loss cell's netem qdisc; the runner kernel ships it as a module.
+      - run: sudo modprobe sch_netem
+      - run: scripts/netns-matrix.sh
 
   # The tmux-driven render/smoke tests are flaky under load, so they're
   # `#[ignore]` and run here out of the gating `test` job. Gated on `changes`:
@@ -596,7 +634,7 @@ jobs:
           path: |
             app/ios/Externals/BayboCore.xcframework
             app/ios/Generated/BayboCore.swift
-          key: bayboffi-${{ runner.os }}-${{ hashFiles('app/ios/ffi/**', 'app/ios/bindgen/**', 'app/ios/Cargo.lock', 'rust-toolchain.toml', 'crates/wire/**', 'crates/device-proto/**', 'crates/model/**', 'remote-host/**') }}
+          key: bayboffi-${{ runner.os }}-${{ hashFiles('app/ios/ffi/**', 'app/ios/bindgen/**', 'app/ios/Cargo.lock', 'rust-toolchain.toml', 'crates/wire/**', 'crates/device-proto/**', 'crates/model/**', 'crates/carrier/**', 'remote-host/**') }}
 
       # --sim-only also SKIPS the codesign step, so this needs no keychain and no
       # Apple account (an unsigned xcframework is fine for a simulator build).

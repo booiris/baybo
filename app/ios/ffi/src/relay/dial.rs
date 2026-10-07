@@ -13,6 +13,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, http::StatusCode};
 
 use super::pairing::PairedRecord;
+use crate::api::ConnectionLogStage as Stage;
+use crate::connection_diagnostics::record as trace;
 use crate::transport::WsStream;
 
 /// Retry budget for the content dial while the gateway's relay control link is
@@ -77,6 +79,10 @@ pub(super) async fn dial_content_join(
 
     let mut attempt = 0usize;
     loop {
+        trace(
+            Stage::Relay,
+            format!("Connecting WebSocket leg={leg} attempt={}", attempt + 1),
+        );
         // Rebuilt per attempt (`into_client_request` yields an owned request).
         // Present the admission key the QR carried at pairing — the relay admits the
         // phone leg too.
@@ -102,6 +108,10 @@ pub(super) async fn dial_content_join(
         }
         match connect_async(req).await {
             Ok((ws, _)) => {
+                trace(
+                    Stage::Relay,
+                    format!("WebSocket ready leg={leg}; starting encrypted handshake"),
+                );
                 if attempt > 0 {
                     log::info!(
                         "relay content-join connected after {attempt} retries (node={} url={base} leg={leg})",
@@ -117,6 +127,10 @@ pub(super) async fn dial_content_join(
                 if resp.status() == StatusCode::SERVICE_UNAVAILABLE && attempt < DIAL_RETRIES =>
             {
                 attempt += 1;
+                trace(
+                    Stage::Relay,
+                    format!("Gateway offline (HTTP 503); retry {attempt}/{DIAL_RETRIES}"),
+                );
                 log::debug!(
                     "relay content-join 503, gateway control link absent; retrying (attempt {attempt}/{DIAL_RETRIES}, node={} url={base} leg={leg})",
                     record.relay_node_id
@@ -124,6 +138,10 @@ pub(super) async fn dial_content_join(
                 tokio::time::sleep(DIAL_RETRY_DELAY).await;
             }
             Err(WsError::Http(resp)) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                trace(
+                    Stage::Relay,
+                    "Gateway offline: relay retry budget exhausted",
+                );
                 log::warn!(
                     "relay content-join failed: gateway offline after {DIAL_RETRIES} retries (node={} url={base} key_tag={} leg={leg})",
                     record.relay_node_id,
@@ -134,6 +152,16 @@ pub(super) async fn dial_content_join(
                 ));
             }
             Err(e) => {
+                let reason = match &e {
+                    WsError::Http(response) => format!("HTTP {}", response.status().as_u16()),
+                    WsError::Io(error) => format!("I/O {:?}", error.kind()),
+                    WsError::Tls(_) => "TLS failed".into(),
+                    _ => "WebSocket protocol failure".into(),
+                };
+                trace(
+                    Stage::Relay,
+                    format!("WebSocket failed leg={leg}: {reason}"),
+                );
                 log::warn!(
                     "relay content-join refused/failed: {} (node={} url={base} key_tag={} leg={leg} attempt={attempt})",
                     ws_error_detail(&e),
