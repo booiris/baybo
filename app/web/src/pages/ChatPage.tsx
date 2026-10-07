@@ -86,6 +86,7 @@ import { withoutArchived } from './chat/sessionBuckets';
 import { anchorRowFor, clearSearchHighlight, paintSearchHighlight } from './chat/searchJump';
 import type { SessionSummary } from './chat/types';
 import { ISSUE_REF_COMPONENTS, remarkIssueRefs } from './projects/issueRefs';
+import { BROWSER_VIEW_HREF, isBrowserTool } from './browser/route';
 
 type ApiTranscriptItem = components['schemas']['ChatTranscriptItem'];
 type ApiAttachment = components['schemas']['ChatAttachment'];
@@ -6782,6 +6783,18 @@ export function WorkStepView({ step }: { step: WorkStep }) {
         <span className="font-bold text-ink break-words [overflow-wrap:anywhere]">{step.tool}</span>
         {step.toolLabel ? (
           <span className="text-ink-soft break-words [overflow-wrap:anywhere]">({step.toolLabel})</span>
+        ) : null}
+        {isBrowserTool(step.tool) ? (
+          // A new tab, so the chat stays put while the browser is watched.
+          <a
+            href={BROWSER_VIEW_HREF}
+            target="_blank"
+            rel="noopener"
+            title="Watch the agent's browser live"
+            className="text-info underline decoration-dotted hover:text-ink"
+          >
+            view
+          </a>
         ) : null}
         {/* A call parked on the approval card is NOT running — no spinner, or it
             would read as work in progress while nothing executes. */}

@@ -15,6 +15,8 @@ use std::time::Duration;
 use crate::auth::ChannelTokenTable;
 use baybo_agent::service::ShutdownSignal;
 use baybo_agent::{CronScheduler, SessionManager};
+use baybo_browser_view::hub::{BrowserLinkConfig, BrowserViewHub, BrowserViewHubConfig};
+use baybo_browser_view::params::BrowserLinkParams;
 use baybo_channels::{ChannelRegistry, RouterInbound};
 use baybo_config::BayboConfig;
 use baybo_llm::{LlmProviderConfig, LlmProviderRegistry};
@@ -127,6 +129,9 @@ pub struct TestGateway {
     /// Capability table shared with `deps.channel_tokens`. Tests mint
     /// tokens here to authenticate sidecar clients.
     pub channel_tokens: ChannelTokenTable,
+    /// The browser-view link a fake sidecar dials. `Some` only from
+    /// [`build_test_deps_with_browser_view`].
+    pub browser_link: Option<BrowserLinkParams>,
     pub _tempdir: TempDir,
 }
 
@@ -136,6 +141,30 @@ pub struct TestGateway {
 /// `AdminState::bind_display` matches what the `/v1/status` handler
 /// returns. Use `127.0.0.1:0` when the bind address doesn't matter.
 pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
+    build(admin_bind, BrowserView::Off).await
+}
+
+/// [`build_test_deps`] with the browser view on: the hub listens on a link
+/// socket under the tempdir (see [`TestGateway::browser_link`]) and stops
+/// with [`TestGateway::shutdown`].
+pub async fn build_test_deps_with_browser_view(admin_bind: SocketAddr) -> TestGateway {
+    build(admin_bind, BrowserView::On).await
+}
+
+/// [`build_test_deps`] with the browser view on but no link possible (as
+/// when the socket path cannot be resolved or the sidecar bundle is missing).
+pub async fn build_test_deps_with_unlinked_browser_view(admin_bind: SocketAddr) -> TestGateway {
+    build(admin_bind, BrowserView::Failed).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserView {
+    Off,
+    Failed,
+    On,
+}
+
+async fn build(admin_bind: SocketAddr, browser_view: BrowserView) -> TestGateway {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let db_path = tempdir.path().join("gateway-test.db");
     let stores = Store::open(&db_path)
@@ -250,8 +279,21 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         baybo_project::no_stopper(),
     ));
 
+    let browser_view = BrowserViewHub::from_config(BrowserViewHubConfig {
+        link: match browser_view {
+            BrowserView::Off => BrowserLinkConfig::Off,
+            BrowserView::Failed => BrowserLinkConfig::Failed,
+            BrowserView::On => BrowserLinkConfig::Listen(
+                BrowserLinkParams::resolve(&tempdir.path().join("state"))
+                    .expect("resolve browser link params"),
+            ),
+        },
+        shutdown: shutdown.cancellation_token(),
+    });
+
     let deps = GatewayDeps {
         config,
+        browser_viewer: browser_view.viewer,
         config_path: None,
         inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),
         relay_dialer: crate::relay::dial::RelayDialer::direct(),
@@ -286,6 +328,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         shutdown,
         incoming_rx,
         channel_tokens,
+        browser_link: browser_view.link,
         _tempdir: tempdir,
     }
 }

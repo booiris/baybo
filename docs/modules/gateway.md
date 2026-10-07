@@ -408,6 +408,19 @@ The web bundle is unauthenticated by design (see "WebUI" below), so
 the generated client is only a convenience for the operator's
 browser — `/v1/*` still enforces `require_admin_token`.
 
+### Live browser view — `GET /v1/browser/view/ws`
+
+The dashboard's view-only picture of the agent's browser
+(`api/admin/browser_view.rs`) is mounted on the admin v1 router. It sits
+behind the same `TraceLayer` + `require_admin_token` as every other admin
+route, and only `Web` / `Device` clients may upgrade (others get 403). It has
+no OpenAPI entry, the same as `/v1/channel-ws`. Boot (`gateway_cmd::start`)
+builds the `BrowserViewHub` **before** `collect_profiles` /
+`build_managers` spawn the browser sidecar. The hub binds the unix link the
+sidecar dials, and only a link that actually bound reaches the sidecar's env.
+The handler holds a `BrowserViewer` and nothing else. The protocol, limits
+and close codes are in [`browser-view.md`](browser-view.md).
+
 ### WebUI — embedded React dashboard, no `rust-embed`
 
 The admin TCP listener doubles as a web frontend. Sources live at

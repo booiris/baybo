@@ -6,6 +6,8 @@ mod admin_has_no_channels;
 mod agents_api;
 #[path = "auth.rs"]
 mod auth;
+#[path = "browser_view.rs"]
+mod browser_view;
 #[path = "channel_ws.rs"]
 mod channel_ws;
 #[path = "chat_api.rs"]

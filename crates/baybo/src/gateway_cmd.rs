@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
+use baybo_browser_view::hub::{BrowserLinkConfig, BrowserViewHub, BrowserViewHubConfig};
+use baybo_browser_view::params::BrowserLinkParams;
 use baybo_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use baybo_config::BayboConfig;
 use baybo_gateway::installer::{
@@ -400,6 +402,9 @@ async fn token_rotate(config: &BayboConfig) -> anyhow::Result<()> {
 
 // ---- start (long-running) ----
 
+/// Leak-detector rule name for the browser-view link secret.
+const BROWSER_LINK_SECRET_RULE: &str = "browser.link_secret";
+
 async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     // Per-workspace singleton. The gateway owns the same sqlite store as
     // the TUI, runs turn recovery, and drives cron ticks — two instances
@@ -448,6 +453,19 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         (admin_token, tui_token)
     };
 
+    // The browser-view link (socket path + one-time secret), resolved ONCE:
+    // the same value feeds the hub's listener and the browser sidecar's env,
+    // and must stay stable so the MCP reconciler never sees the env change.
+    // Resolved before the leak detector so the secret is redacted too.
+    let browser_link = config
+        .browser
+        .view_enabled()
+        .then(|| BrowserLinkParams::resolve(&workspace_paths.state_dir()));
+    let browser_link_secret = match &browser_link {
+        Some(Ok(link)) => link.secret().expose(),
+        Some(Err(_)) | None => "",
+    };
+
     // Build the leak detector (with every gateway-minted token
     // registered as a `LeakAction::Replace` rule) BEFORE initialising
     // tracing so log lines that accidentally echo any credential are
@@ -459,6 +477,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         &[
             ("gateway.admin_token", token.as_str()),
             (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
+            (BROWSER_LINK_SECRET_RULE, browser_link_secret),
         ],
     );
     let log_dir = workspace_paths.logs_dir();
@@ -517,6 +536,36 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
                 None
             }
         };
+
+    let shutdown = ShutdownSignal::new();
+
+    // Bind the browser-view link BEFORE the MCP reconciler (inside
+    // `build_managers`) spawns the browser sidecar, so its first dial finds
+    // a listener. The hub hands back the link it actually bound; only that
+    // reaches the sidecar's env. A build without the browser bundle has no
+    // sidecar to dial, so nothing is bound for it.
+    let has_browser_bundle = sidecar_runtime
+        .as_deref()
+        .is_some_and(baybo_gateway::has_browser_bundle);
+    let browser_link = match browser_link {
+        None => BrowserLinkConfig::Off,
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "browser view: no usable link socket path; live view unavailable");
+            BrowserLinkConfig::Failed
+        }
+        Some(Ok(_)) if !has_browser_bundle => {
+            tracing::warn!(
+                "browser view: this build has no browser sidecar; live view unavailable"
+            );
+            BrowserLinkConfig::Failed
+        }
+        Some(Ok(params)) => BrowserLinkConfig::Listen(params),
+    };
+    let mut browser_view = BrowserViewHub::from_config(BrowserViewHubConfig {
+        link: browser_link,
+        shutdown: shutdown.cancellation_token(),
+    });
+
     let embedded_mcp_servers: Vec<baybo_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
         .as_deref()
         .map(|rt| {
@@ -524,11 +573,11 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
                 rt,
                 &config,
                 &workspace_paths,
+                browser_view.link.as_ref(),
             ))
         })
         .unwrap_or_default();
 
-    let shutdown = ShutdownSignal::new();
     // The resolved config path, or the default path when none existed at
     // boot — so a first-run `baybo llm add` that creates the file and
     // SIGHUPs us still hot-reloads instead of silently returning
@@ -553,6 +602,9 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
 
     let mut task_tracker = TaskTracker::new();
     runtime::install_signal_handler(&mut task_tracker, shutdown.clone());
+    if let Some(listener_task) = browser_view.listener_task.take() {
+        task_tracker.track(listener_task);
+    }
 
     // SIGHUP → config hot-reload, draining the stream registered before
     // boot. Covers hand-edits to baybo.json and the `baybo llm` CLI (which
@@ -750,6 +802,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         relay_dialer: baybo_gateway::relay::dial::RelayDialer::new(boot::proxy_settings(
             &graph.config,
         )),
+        browser_viewer: browser_view.viewer,
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

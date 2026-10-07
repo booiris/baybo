@@ -30,5 +30,5 @@ pub(crate) mod pipe_pump;
 mod supervisor;
 
 pub use assets::{SidecarError, SidecarRuntime, domains};
-pub use embedded_mcp::collect_profiles;
+pub use embedded_mcp::{collect_profiles, has_browser_bundle};
 pub use supervisor::SidecarSupervisor;

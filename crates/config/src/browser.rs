@@ -89,6 +89,42 @@ pub struct BrowserConfig {
     /// sidecar transparently falls back to the host-headless path so
     /// boot never fails on a missing daemon. See [`BrowserDockerConfig`].
     pub docker: BrowserDockerConfig,
+
+    /// Live view of the agent's browser in the web dashboard. Elided from
+    /// the serialized config while it equals the default, so the default
+    /// `baybo.json` stays minimal. Restart to apply.
+    #[serde(skip_serializing_if = "BrowserViewConfig::is_default")]
+    pub view: BrowserViewConfig,
+}
+
+impl BrowserConfig {
+    /// Whether the dashboard's live browser view runs: the browser itself
+    /// and its view must both be on. The one home of that rule.
+    pub fn view_enabled(&self) -> bool {
+        self.enable && self.view.enable
+    }
+}
+
+/// Settings for the dashboard's live view of the agent's browser
+/// (`GET /v1/browser/view/ws`). Every key is restart-to-apply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BrowserViewConfig {
+    /// Stream the agent's browser to the web dashboard. **Default:
+    /// `true`**; has no effect while [`BrowserConfig::enable`] is off.
+    pub enable: bool,
+}
+
+impl BrowserViewConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for BrowserViewConfig {
+    fn default() -> Self {
+        Self { enable: true }
+    }
 }
 
 impl Default for BrowserConfig {
@@ -101,6 +137,7 @@ impl Default for BrowserConfig {
             height: 1080,
             profile_dir: None,
             docker: BrowserDockerConfig::default(),
+            view: BrowserViewConfig::default(),
         }
     }
 }
@@ -158,9 +195,10 @@ pub struct BrowserDockerConfig {
     /// agent — no native VNC client needed. **Default: unset** (no VNC
     /// stack started, no port published).
     ///
-    /// **No password by design.** The websockify HTTP/WS server binds
-    /// to `127.0.0.1` inside the container and is only published on
-    /// host-loopback — remote access requires an SSH tunnel (e.g.
+    /// **No password by design.** Inside the container websockify listens
+    /// on all interfaces (only `x11vnc` is loopback-bound); the port is
+    /// published on host loopback only — remote access requires an SSH
+    /// tunnel (e.g.
     /// `ssh -L 6080:127.0.0.1:6080 host`, then open
     /// `http://127.0.0.1:6080/vnc.html`). It's a debugging primitive,
     /// not an exposed service. Don't publish to a public interface.
@@ -298,6 +336,7 @@ mod tests {
                 mount_work_dir: false,
                 memory_limit_mb: Some(2048),
             },
+            view: BrowserViewConfig { enable: false },
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: BrowserConfig = serde_json::from_str(&json).unwrap();
@@ -322,6 +361,36 @@ mod tests {
             !json.contains("image_tag"),
             "None docker.image_tag elided so the default block stays minimal"
         );
+    }
+
+    #[test]
+    fn default_view_is_elided_and_on() {
+        let c = BrowserConfig::default();
+        assert!(c.view.enable);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(
+            !json.contains("\"view\""),
+            "default view block elided: {json}"
+        );
+    }
+
+    #[test]
+    fn disabled_view_round_trips() {
+        let c: BrowserConfig = serde_json::from_str(r#"{"view": {"enable": false}}"#).unwrap();
+        assert!(!c.view.enable);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: BrowserConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn view_enabled_needs_browser_and_view() {
+        let mut c = BrowserConfig::default();
+        assert!(!c.view_enabled(), "browser off by default");
+        c.enable = true;
+        assert!(c.view_enabled());
+        c.view.enable = false;
+        assert!(!c.view_enabled());
     }
 
     #[test]

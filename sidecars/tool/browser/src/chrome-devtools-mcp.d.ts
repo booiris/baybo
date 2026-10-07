@@ -41,3 +41,14 @@ declare module "chrome-devtools-mcp" {
     clearcutLogger: unknown;
   }>;
 }
+
+// Deliberately loose: `src/cddm_tap.ts` validates the shape at runtime and
+// degrades to "viewer unavailable" when a CDDM bump changes it, so nothing
+// here may promise more than "some object".
+declare module "chrome-devtools-mcp/McpContext" {
+  export const McpContext: unknown;
+}
+
+declare module "chrome-devtools-mcp/version" {
+  export const VERSION: unknown;
+}

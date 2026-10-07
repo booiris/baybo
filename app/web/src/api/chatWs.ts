@@ -9,6 +9,8 @@
 
 import { decode, encode } from '@msgpack/msgpack';
 import { uuid } from '../uuid';
+import { buildWsUrl } from './wsUrl';
+import { ReconnectBackoff } from './wsReconnect';
 
 // Wire frame shape pulled straight from the Rust ts-rs generation.
 // We re-declare a lightweight version here because the shipped
@@ -291,8 +293,7 @@ export type Frame =
   | { kind: 'ping' }
   | { kind: 'pong' };
 
-const RECONNECT_BASE_MS = 1000;
-const RECONNECT_MAX_MS = 30_000;
+const CHANNEL_WS_PATH = '/v1/channel-ws';
 
 /** How often the client sends an app-level Ping while connected.
  *  Tuned below the typical NAT idle window (30–120 s) so the same
@@ -347,7 +348,7 @@ export class ChatWs {
   /** True only after RegisterAck for the current socket. Subscribe frames are
    *  held until then so nothing can overtake the handshake. */
   private registered = false;
-  private retryAttempt = 0;
+  private readonly backoff = new ReconnectBackoff();
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   /** Combined heartbeat-send + liveness-watchdog tick. `null` while
@@ -522,7 +523,7 @@ export class ChatWs {
     this.registered = false;
     this.sentSubscriptions.clear();
     this.notifyStatus({ state: 'connecting' });
-    const url = buildWsUrl(this.opts.baseUrl, this.adminToken);
+    const url = buildWsUrl(this.opts.baseUrl, CHANNEL_WS_PATH, this.adminToken);
     let ws: WebSocket;
     try {
       ws = new WebSocket(url);
@@ -572,7 +573,7 @@ export class ChatWs {
           this.scheduleReconnect(reason);
           return;
         }
-        this.retryAttempt = 0;
+        this.backoff.reset();
         // Replay every subscription so the live stream resumes; each
         // Subscribe is answered with a `subscribe_state` snapshot. The
         // caller recovers missed transcript rows via the REST sync
@@ -619,11 +620,7 @@ export class ChatWs {
 
   private scheduleReconnect(reason: string): void {
     if (this.closed) return;
-    const delay = Math.min(
-      RECONNECT_BASE_MS * 2 ** this.retryAttempt,
-      RECONNECT_MAX_MS,
-    );
-    this.retryAttempt += 1;
+    const delay = this.backoff.nextDelayMs();
     this.notifyStatus({ state: 'disconnected', retryInMs: delay, lastError: reason });
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => {
@@ -659,17 +656,4 @@ export class ChatWs {
   private notifyStatus(status: ConnectionStatus): void {
     this.opts.onStatus?.(status);
   }
-}
-
-function buildWsUrl(baseUrl: string, token: string): string {
-  // Same origin as the admin listener in production; the dev Vite
-  // proxy rewrites /v1 (including the WS upgrade) to the gateway.
-  const u = new URL(baseUrl);
-  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-  u.pathname = '/v1/channel-ws';
-  u.search = '';
-  // Browser WebSocket cannot set Authorization, so the admin auth
-  // middleware accepts this query-param form and strips it before tracing.
-  u.searchParams.set('token', token);
-  return u.toString();
 }

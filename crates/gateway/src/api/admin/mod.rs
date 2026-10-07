@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod analytics;
+pub mod browser_view;
 pub mod channels;
 pub mod chat;
 pub mod config;
@@ -184,7 +185,8 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(agents::routes())
         .merge(deck::routes())
         .merge(projects::routes())
-        .merge(project_team::routes());
+        .merge(project_team::routes())
+        .merge(browser_view::routes());
     let (router, spec) = OpenApiRouter::with_openapi(AdminApiDoc::openapi())
         .nest("/v1", v1)
         .split_for_parts();

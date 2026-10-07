@@ -31,6 +31,7 @@ test-support = ["baybo-llm/test-support"]
 [dependencies]
 baybo-process = { workspace = true }
 baybo-agent = { workspace = true }
+baybo-browser-view = { workspace = true }
 baybo-channels = { workspace = true }
 # Cron-fire prompt reverse-parser for the admin chat panel.
 baybo-context = { workspace = true }
@@ -124,6 +125,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 baybo-gateway = { workspace = true, features = ["test-support"] }
+# `SidecarLinkCodec`: the browser-view tests drive a fake browser sidecar.
+baybo-browser-view = { workspace = true, features = ["test-support"] }
 # `media_probe::fixture`: the ingest probes must be proven against PDFs and
 # containers that really parse.
 baybo-llm = { workspace = true, features = ["test-support"] }
@@ -152,3 +155,5 @@ remote-host-protocol = { workspace = true, features = ["test-support"] }
 carrier = { workspace = true, features = ["test-support"] }
 # `test-util` backs `#[tokio::test(start_paused = true)]`; `full` omits it.
 tokio = { workspace = true, features = ["test-util"] }
+# `Framed` for the browser-view tests' fake sidecar.
+tokio-util = { workspace = true, features = ["codec"] }

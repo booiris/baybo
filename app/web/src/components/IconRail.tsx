@@ -6,6 +6,7 @@ import {
   RiChat3Line,
   RiCpuLine,
   RiFileList3Line,
+  RiGlobalLine,
   RiGitMergeLine,
   RiInstallLine,
   RiKanbanView2,
@@ -15,6 +16,7 @@ import type { IconType } from 'react-icons';
 import { useAuth } from '../api/auth';
 import { attentionSummary, needsAttention, useAttention } from '../pages/projects/useAttention';
 import { installPrompt } from '../pwa/registerSW';
+import { BROWSER_VIEW_ROUTE } from '../pages/browser/route';
 
 // Global app rail (replaces the old text sidebar): a solid amber, icon-only
 // vertical bar mounted on every route. Chat is the primary destination (the
@@ -35,6 +37,7 @@ const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
   { to: '/cron', label: 'Cron', Icon: RiAlarmLine },
   { to: '/analytics', label: 'Analytics', Icon: RiBarChartBoxLine },
   { to: '/llm', label: 'LLM', Icon: RiCpuLine },
+  { to: BROWSER_VIEW_ROUTE, label: 'Browser', Icon: RiGlobalLine },
 ];
 
 export function IconRail({ version }: { version?: string }) {

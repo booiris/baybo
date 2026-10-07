@@ -87,10 +87,13 @@ import {
   sweepStaleContainers,
   sweepStaleImages,
 } from "./docker.js";
+import { installCddmTap } from "./cddm_tap.js";
+import type { BrowserPhase } from "./generated/BrowserPhase.js";
 import { createLogger, errText } from "./log.js";
 import { type BrowserMode, type HintContext, annotateBrowserError } from "./net_hints.js";
 import { MAX_PAGES, type OpenPage, PageBudget, evictionNotice } from "./page_budget.js";
 import { READ_PAGE_TOOL, handleReadPage } from "./read_page.js";
+import { ScreencastHub } from "./screencast.js";
 import { augmentToolDescriptions } from "./tool_notes.js";
 import {
   BrowserActivity,
@@ -98,6 +101,7 @@ import {
   type BrowserHealer,
   type PhaseGate,
 } from "./watchdog.js";
+import { type LinkEnv, ViewLink, takeLinkEnv } from "./view_link.js";
 
 // CDDM tools we hide from the agent's tool list. Lighthouse audits are
 // slow and rarely useful for browsing; WebMCP only fires on pages that
@@ -131,6 +135,30 @@ interface InstallState {
   percent: number;
   error?: string;
   buildId?: string;
+  /** Observer for phase / progress changes; feeds the browser viewer. */
+  onChange?: () => void;
+}
+
+// Single write path for `state.phase`, so phase transitions have one hook.
+function setPhase(state: InstallState, phase: InstallPhase): void {
+  state.phase = phase;
+  state.onChange?.();
+}
+
+/** `state` as the viewer wire's `BrowserPhase` (clamping is the hub's job). */
+function toBrowserPhase(state: InstallState): BrowserPhase {
+  switch (state.phase) {
+    case "idle":
+    case "ready":
+    case "recovering":
+      return { type: state.phase };
+    case "installing":
+      return { type: "installing", percent: Math.max(0, Math.min(100, Math.floor(state.percent))) };
+    case "failed":
+      return { type: "failed", error: state.error ?? "unknown error" };
+    default:
+      return { type: "docker", phase: state.phase };
+  }
 }
 
 // Chrome takes no font-dir flag; the only way to add a font dir is via
@@ -308,6 +336,7 @@ async function installChromeInBackground(state: InstallState): Promise<string> {
         const mb = (n: number): string => (n / (1024 * 1024)).toFixed(1);
         log(`download ${percent}% (${mb(downloaded)}/${mb(total)} MiB)`);
         lastReport = percent;
+        state.onChange?.();
       }
     },
   });
@@ -598,14 +627,14 @@ async function runHostFallback(state: InstallState, args: ServerArgs): Promise<v
   try {
     initialPath = await findExistingChrome();
   } catch (e) {
-    state.phase = "failed";
     state.error = e instanceof Error ? e.message : String(e);
+    setPhase(state, "failed");
   }
 
   if (initialPath !== null) {
-    state.phase = "ready";
+    setPhase(state, "ready");
   } else if (state.phase !== "failed") {
-    state.phase = "installing";
+    setPhase(state, "installing");
   }
 
   args.executablePath = initialPath ?? undefined;
@@ -634,7 +663,7 @@ async function installChromeWithRetry(state: InstallState, args: ServerArgs): Pr
     try {
       const exe = await installChromeInBackground(state);
       args.executablePath = exe;
-      state.phase = "ready";
+      setPhase(state, "ready");
       state.percent = 100;
       state.error = undefined;
       log("Chrome ready; browser tools are live");
@@ -642,8 +671,8 @@ async function installChromeWithRetry(state: InstallState, args: ServerArgs): Pr
     } catch (e) {
       const reason = errText(e);
       if (attempt === CHROME_INSTALL_ATTEMPTS) {
-        state.phase = "failed";
         state.error = reason;
+        setPhase(state, "failed");
         logger.error(`Chrome install failed after ${attempt} attempts: ${reason}`);
         return;
       }
@@ -898,7 +927,7 @@ async function trySpawnDocker(
   state: InstallState,
   args: ServerArgs,
 ): Promise<DockerSpawnOutcome> {
-  state.phase = "docker-checking";
+  setPhase(state, "docker-checking");
   const check = await checkDockerAvailable();
   if (!check.ok) {
     throw new Error(`docker not available: ${check.reason}`);
@@ -950,7 +979,7 @@ async function trySpawnDocker(
     diskCacheBytes: DISK_CACHE_BYTES,
     viewport: parseViewport(envValue("BAYBO_BROWSER_VIEWPORT")) ?? { width: 1920, height: 1080 },
     onPhase: (p) => {
-      state.phase = p;
+      setPhase(state, p);
     },
   };
   const handle = await spawnContainer(opts);
@@ -1191,9 +1220,14 @@ function dockerHealer(
       // URL. Two corollaries for anyone editing this: never try to switch
       // *modes* (launched ↔ connected) at runtime — the guard ignores mode
       // entirely and would hand back the wrong browser — and don't reach for
-      // CDDM's `closeBrowser` to force the issue: it isn't exported from the
-      // package entry, and a deep import would be inlined by esbuild as a
-      // second module instance with its own singleton, silently doing nothing.
+      // CDDM's `closeBrowser` to force the issue. It isn't exported from the
+      // package entry, and an import esbuild does not externalise would be
+      // inlined as a second module instance with its own singleton, silently
+      // doing nothing. (Only the exact specifiers mapped in
+      // `esbuild.config.mjs` share CDDM's instances — that is how
+      // `cddm_tap.ts` patches the real `McpContext` — and mapping
+      // `browser.js` there to call `closeBrowser` would still race CDDM's
+      // own connection handling.)
       args.browserUrl = next.cdpUrl;
       log(`container replaced: ${next.containerName} at ${next.cdpUrl}`);
       // A container whose CDP port answers can still be unreachable through
@@ -1267,17 +1301,17 @@ async function resolveBrowserTarget(
       log(`docker.cdp_url set; connecting to existing CDP at ${selection.cdpUrl}`);
       args.browserUrl = selection.cdpUrl;
       args.headless = false;
-      state.phase = "ready";
+      setPhase(state, "ready");
       return { mode: "cdp_url", dockerHandle: null, dockerOpts: null };
     }
     case "docker": {
       try {
         const outcome = await trySpawnDocker(state, args);
-        state.phase = "ready";
+        setPhase(state, "ready");
         return { mode: "docker", dockerHandle: outcome.handle, dockerOpts: outcome.opts };
       } catch (e) {
         log(`docker mode unavailable: ${errText(e)}; falling back to host-headless`);
-        state.phase = "installing";
+        setPhase(state, "installing");
         state.error = undefined;
         await runHostFallback(state, args);
         return { mode: "host", dockerHandle: null, dockerOpts: null };
@@ -1297,7 +1331,39 @@ async function resolveBrowserTarget(
   }
 }
 
+interface BrowserView {
+  hub: ScreencastHub;
+  link: ViewLink;
+}
+
+/**
+ * Wire the dashboard's live view: tap CDDM's context, follow the agent's page
+ * and stream it to the gateway over the view link. Never throws; a CDDM the
+ * tap does not recognise leaves the viewer "unavailable" and tools untouched.
+ */
+async function startBrowserView(env: LinkEnv, mode: BrowserMode): Promise<BrowserView> {
+  const link = new ViewLink({
+    socketPath: env.socketPath,
+    secret: env.secret,
+    log: logger,
+    handler: {
+      linkUp: (limits) => hub.linkUp(limits),
+      linkDown: () => void hub.linkDown(),
+      startScreencast: () => void hub.start(),
+      stopScreencast: () => void hub.stop(),
+    },
+  });
+  const hub = new ScreencastHub({ sink: link, log: logger, mode });
+  const tap = await installCddmTap((ctx) => void hub.attach(ctx), logger);
+  if (!tap.installed) await hub.setAvailability(tap.reason);
+  link.start();
+  return { hub, link };
+}
+
 async function main(): Promise<void> {
+  // First, before anything can spawn a child: the link secret must not reach
+  // Chrome, which puppeteer launches with this process's environment.
+  const linkEnv = takeLinkEnv(process.env);
   // Keep MCP available while browser startup is deferred until first use.
   const state: InstallState = { phase: "idle", percent: 0 };
   const args = buildArgs(undefined);
@@ -1307,6 +1373,11 @@ async function main(): Promise<void> {
   let mode: BrowserMode = selection.mode;
 
   const { server: cddmServer } = await createMcpServer(args, {});
+  // Before the proxy connects, so the tap is in place for the first tool call.
+  const view = linkEnv === null ? null : await startBrowserView(linkEnv, mode);
+  state.onChange = (): void => {
+    void view?.hub.setStatus(mode, toBrowserPhase(state));
+  };
 
   // Proxy layer: CDDM speaks MCP on one end of an in-process transport
   // pair; we drive it via a Client on the other end. Our outer Server
@@ -1408,6 +1479,7 @@ async function main(): Promise<void> {
     const pageIdRaw = rawArgs.pageId;
     if (typeof pageIdRaw === "number") {
       pageBudget.noteUse(pageIdRaw);
+      view?.hub.noteAgentPage(pageIdRaw);
     }
 
     if (req.params.name === READ_PAGE_TOOL.name) {
@@ -1437,6 +1509,10 @@ async function main(): Promise<void> {
       );
       if (req.params.name === CDDM_CLOSE_PAGE_TOOL && typeof pageIdRaw === "number") {
         pageBudget.noteClosed(pageIdRaw);
+      } else if (typeof pageIdRaw === "number") {
+        // Again after the call: if it (re)launched Chrome, the new context
+        // reset the hub's page and the note before the call was lost.
+        view?.hub.noteAgentPage(pageIdRaw);
       }
       if (req.params.name === CDDM_NEW_PAGE_TOOL) {
         // `newPage` selects the tab it just created, so the entry flagged
@@ -1444,7 +1520,10 @@ async function main(): Promise<void> {
         // highest id instead would mis-attribute whenever the navigation
         // caused the site to open a popup, which CDDM snapshots too.
         const opened = selectedPageId(result);
-        if (opened !== undefined) pageBudget.noteUse(opened);
+        if (opened !== undefined) {
+          pageBudget.noteUse(opened);
+          view?.hub.noteAgentPage(opened);
+        }
       }
       return stripStructuredContent(annotateBrowserError(result, hintCtx)) as CallToolResult;
     };
@@ -1504,6 +1583,9 @@ async function main(): Promise<void> {
     watchdog?.stop();
     logger.debug("shutting down");
     const closes: Array<Promise<unknown>> = [
+      // Link first, so it stops reconnecting before anything else goes away.
+      view?.link.shutdown() ?? Promise.resolve(),
+      view?.hub.close() ?? Promise.resolve(),
       watchdog?.quiesce() ?? Promise.resolve(),
       proxy.close().catch(() => undefined),
       cddmClient.close().catch(() => undefined),
@@ -1558,11 +1640,11 @@ async function main(): Promise<void> {
     const phaseGate: PhaseGate = {
       isReady: () => state.phase === "ready",
       enterRecovering: (reason) => {
-        state.phase = "recovering";
+        setPhase(state, "recovering");
         state.error = reason;
       },
       markReady: () => {
-        state.phase = "ready";
+        setPhase(state, "ready");
         state.error = undefined;
       },
     };
@@ -1616,13 +1698,13 @@ async function main(): Promise<void> {
   // adoption would orphan an owned container.
   let browserStart: Promise<void> | undefined;
   const failStart = (e: unknown, note: string): void => {
-    state.phase = "failed";
     state.error = errText(e);
+    setPhase(state, "failed");
     logger.error(`browser start failed${note}: ${state.error}`);
   };
   const ensureBrowserStarted = (): void => {
     if (browserStart !== undefined) return;
-    state.phase = "idle";
+    setPhase(state, "idle");
     state.error = undefined;
     browserStart = (async () => {
       let target: BrowserTarget;
@@ -1639,6 +1721,7 @@ async function main(): Promise<void> {
         return;
       }
       mode = target.mode;
+      state.onChange?.();
       dockerHandle = target.dockerHandle;
       dockerOpts = target.dockerOpts;
       hintCtx.mode = mode;

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use baybo_agent::LlmPoolHandle;
 use baybo_agent::supervisor::AgentSupervisor;
 use baybo_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
+use baybo_browser_view::hub::BrowserViewer;
 use baybo_channels::{ChannelRegistry, RouterInbound};
 use baybo_config::BayboConfig;
 use baybo_turn::TurnLifecycle;
@@ -145,6 +146,9 @@ pub struct GatewayDeps {
     /// Dials the relay's control connection and data legs through the egress
     /// proxy with system trust roots.
     pub relay_dialer: crate::relay::dial::RelayDialer,
+    /// Live view of the agent's browser (`/v1/browser/view/ws`). Always
+    /// present; a hub built with the view off reports it unavailable.
+    pub browser_viewer: BrowserViewer,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -193,6 +197,8 @@ pub struct AdminState {
     pub bind_display: String,
     /// The link table `GET /v1/mobile/links` serves.
     pub device_links: DeviceLinks,
+    /// Subscribes `/v1/browser/view/ws` viewers to the browser screencast.
+    pub browser_viewer: BrowserViewer,
 }
 
 /// State shared with channel-TCP handlers. Cheap to clone.
@@ -251,6 +257,7 @@ impl AdminState {
             workspace_paths: Arc::clone(&deps.workspace_paths),
             bind_display: deps.runtime_config.admin_bind.to_string(),
             device_links: deps.device_links.clone(),
+            browser_viewer: deps.browser_viewer.clone(),
         }
     }
 }

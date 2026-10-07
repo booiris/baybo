@@ -39,6 +39,7 @@ members = [
     "crates/janitor",
     "crates/setup",
     "crates/term-harness",
+    "crates/browser-view",
     "crates/baybo",
     "bench/memory",
     "bench/swe",
@@ -102,6 +103,7 @@ baybo-integration-tests = { path = "crates/integration-tests" }
 baybo-janitor = { path = "crates/janitor" }
 baybo-setup = { path = "crates/setup" }
 baybo-term-harness = { path = "crates/term-harness" }
+baybo-browser-view = { path = "crates/browser-view" }
 baybo-bench-web = { path = "bench/bench-web" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }

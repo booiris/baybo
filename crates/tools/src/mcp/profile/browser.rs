@@ -23,6 +23,38 @@ use std::path::Path;
 use super::EmbeddedMcpProfile;
 use crate::ToolTriggerScope;
 
+/// MCP server name the embedded browser registers under; its tools surface
+/// as `browser/<tool>`.
+pub const BROWSER_MCP_SERVER_NAME: &str = "browser";
+
+/// Env var naming the unix socket the gateway's browser-view listener is
+/// bound on. Absent means the live view is off.
+pub const ENV_BROWSER_LINK_SOCKET: &str = "BAYBO_BROWSER_LINK_SOCKET";
+
+/// Env var carrying the one-time secret the sidecar presents in its link
+/// `Hello`.
+pub const ENV_BROWSER_LINK_SECRET: &str = "BAYBO_BROWSER_LINK_SECRET";
+
+/// Where the sidecar reaches the gateway's browser-view link, as resolved
+/// once per gateway process. Both values must stay stable for the process
+/// lifetime: they feed the profile's env, which the MCP reconciler hashes
+/// into the server identity, so a value that changed would respawn the
+/// sidecar.
+#[derive(Clone, Copy)]
+pub struct BrowserLinkEnv<'a> {
+    pub socket: &'a Path,
+    pub secret: &'a str,
+}
+
+impl std::fmt::Debug for BrowserLinkEnv<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserLinkEnv")
+            .field("socket", &self.socket)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Policy inputs for [`browser_mcp_profile`].
 ///
 /// Deliberately primitives + `Path`s rather than `baybo_config` types, so
@@ -53,6 +85,9 @@ pub struct BrowserProfileParams<'a> {
     pub docker_work_dir: Option<&'a Path>,
     /// Container memory ceiling in MiB. `None` leaves it uncapped.
     pub docker_memory_limit_mb: Option<u32>,
+    /// The gateway's browser-view link. `None` when the live view is off
+    /// (`browser.view.enable=false`) or its listener could not bind.
+    pub link: Option<BrowserLinkEnv<'a>>,
 }
 
 /// Build the `browser` MCP-server profile from the operator's policy
@@ -112,6 +147,9 @@ pub struct BrowserProfileParams<'a> {
 /// - `docker_memory_limit_mb`: container memory ceiling, plumbed as
 ///   `BAYBO_BROWSER_DOCKER_MEMORY_LIMIT` in docker's own `<N>m` syntax.
 ///   Ignored outside docker mode.
+/// - `link`: the browser-view link socket + secret, plumbed as
+///   [`ENV_BROWSER_LINK_SOCKET`] / [`ENV_BROWSER_LINK_SECRET`]. Absent
+///   leaves the sidecar's screencast tap uninstalled.
 ///
 /// `capabilities` is intentionally empty: dropping the
 /// `[Http, ExecCommand]` ceiling means `accessed_resources()` returns
@@ -140,6 +178,7 @@ pub fn browser_mcp_profile(params: BrowserProfileParams<'_>) -> Option<EmbeddedM
         docker_image_tag,
         docker_work_dir,
         docker_memory_limit_mb,
+        link,
     } = params;
     if !enable {
         return None;
@@ -229,8 +268,15 @@ pub fn browser_mcp_profile(params: BrowserProfileParams<'_>) -> Option<EmbeddedM
             extra_env.insert("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT".into(), format!("{mb}m"));
         }
     }
+    if let Some(link) = link {
+        extra_env.insert(
+            ENV_BROWSER_LINK_SOCKET.into(),
+            link.socket.display().to_string(),
+        );
+        extra_env.insert(ENV_BROWSER_LINK_SECRET.into(), link.secret.into());
+    }
     Some(EmbeddedMcpProfile {
-        server_name: "browser".into(),
+        server_name: BROWSER_MCP_SERVER_NAME.into(),
         command,
         args: vec![bundle_path.display().to_string()],
         // One Chrome, one profile, one cookie jar for the whole process —
@@ -287,6 +333,7 @@ mod tests {
             // the builder did.
             docker_work_dir: Some(Path::new("/ws/work")),
             docker_memory_limit_mb: Some(4096),
+            link: None,
         }
     }
 
@@ -302,7 +349,7 @@ mod tests {
     #[test]
     fn enabled_synthesises_a_profile_with_telemetry_off_and_no_sandbox() {
         let p = defaults_call(true).expect("profile when enabled");
-        assert_eq!(p.server_name, "browser");
+        assert_eq!(p.server_name, BROWSER_MCP_SERVER_NAME);
         assert_eq!(p.command, "node");
         assert_eq!(p.args, vec!["/x.mjs".to_string()]);
         assert!(
@@ -438,6 +485,40 @@ mod tests {
             "/work/.fonts:/usr/share/extra-fonts",
             "multiple font dirs encoded as colon-joined path list (PATH-style) for the TS wrapper",
         );
+    }
+
+    #[test]
+    fn no_link_omits_link_env() {
+        let p = defaults_call(true).expect("profile when enabled");
+        assert!(!p.extra_env.contains_key(ENV_BROWSER_LINK_SOCKET));
+        assert!(!p.extra_env.contains_key(ENV_BROWSER_LINK_SECRET));
+    }
+
+    #[test]
+    fn link_lands_in_env() {
+        let socket = PathBuf::from("/ws/state/browser-link/link.sock");
+        let p = browser_mcp_profile(BrowserProfileParams {
+            link: Some(BrowserLinkEnv {
+                socket: &socket,
+                secret: "s3cr3t",
+            }),
+            ..params(true)
+        })
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get(ENV_BROWSER_LINK_SOCKET).unwrap(),
+            "/ws/state/browser-link/link.sock"
+        );
+        assert_eq!(p.extra_env.get(ENV_BROWSER_LINK_SECRET).unwrap(), "s3cr3t");
+    }
+
+    #[test]
+    fn link_env_debug_is_redacted() {
+        let link = BrowserLinkEnv {
+            socket: Path::new("/s.sock"),
+            secret: "hunter2",
+        };
+        assert!(!format!("{link:?}").contains("hunter2"));
     }
 
     #[test]

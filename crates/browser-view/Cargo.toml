@@ -1,0 +1,41 @@
+[package]
+name = "baybo-browser-view"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# Emits ts-rs-generated TypeScript definitions for the link / viewer wire
+# types into `sidecars/tool/browser/src/generated/`. Kept behind a feature so
+# CI / release builds don't depend on ts-rs.
+ts-export = ["dep:ts-rs"]
+# Exposes the sidecar-side codec so other crates' tests can drive a fake
+# browser sidecar over the link socket.
+test-support = []
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["codec"] }
+tracing = { workspace = true }
+
+# Optional — only pulled in for the `ts-export` feature so that
+# release builds don't have to compile ts-rs.
+ts-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `test-util` backs `#[tokio::test(start_paused = true)]`; `full` omits it.
+tokio = { workspace = true, features = ["test-util"] }

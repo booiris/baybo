@@ -152,3 +152,14 @@ describe('WorkStepView reasoning sampling', () => {
     expect(container.textContent).toContain('tail');
   });
 });
+
+describe('WorkStepView browser view link', () => {
+  it('links browser tool steps to the live view, and nothing else', () => {
+    const browser = render(
+      <WorkStepView step={step({ kind: 'tool', tool: 'browser/navigate_page', toolStatus: 'ok' })} />,
+    );
+    expect(browser.container.querySelector('a')?.getAttribute('href')).toBe('#/browser');
+    const other = render(<WorkStepView step={step({ kind: 'tool', tool: 'read_file', toolStatus: 'ok' })} />);
+    expect(other.container.querySelector('a')).toBeNull();
+  });
+});

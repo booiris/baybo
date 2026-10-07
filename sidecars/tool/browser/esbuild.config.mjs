@@ -60,15 +60,35 @@ rmSync(resolve(distDir, "cddm"), { recursive: true, force: true });
 mkdirSync(cddmDist, { recursive: true });
 cpSync(cddmSrc, cddmDist, { recursive: true });
 
-const bayboResolveCddm = {
-  name: "baybo-resolve-cddm",
-  setup(build) {
-    build.onResolve({ filter: /^chrome-devtools-mcp$/ }, () => ({
-      path: "./cddm/build/src/index.js",
-      external: true,
-    }));
-  },
+// Exact CDDM specifiers the sources may import, each mapped to one file of
+// the materialised `cddm/build/src/` tree. Externalised imports resolve to the
+// same URL CDDM's own `index.js` uses internally, so they share its module
+// instances (e.g. `src/cddm_tap.ts` patches the very `McpContext` class
+// `index.js` calls). Anything else under `chrome-devtools-mcp/` is
+// deliberately unmapped: esbuild would inline it as a second, unshared copy.
+const CDDM_SPECIFIERS = {
+  "chrome-devtools-mcp": "index.js",
+  "chrome-devtools-mcp/McpContext": "McpContext.js",
+  "chrome-devtools-mcp/version": "version.js",
 };
+
+// `prefix` is the path from the output file's directory back to `dist/`.
+function bayboResolveCddm(prefix) {
+  return {
+    name: "baybo-resolve-cddm",
+    setup(build) {
+      build.onResolve({ filter: /^chrome-devtools-mcp(\/.*)?$/ }, (args) => {
+        const file = CDDM_SPECIFIERS[args.path];
+        if (file === undefined) {
+          return {
+            errors: [{ text: `unmapped CDDM specifier '${args.path}'; add it to CDDM_SPECIFIERS` }],
+          };
+        }
+        return { path: `${prefix}cddm/build/src/${file}`, external: true };
+      });
+    },
+  };
+}
 
 const start = Date.now();
 const result = await build({
@@ -100,7 +120,7 @@ const result = await build({
       `const __dirname = __bayboDirname(__filename);`,
     ].join("\n"),
   },
-  plugins: [bayboResolveCddm],
+  plugins: [bayboResolveCddm("./")],
   logLevel: "info",
 });
 // Test-only outputs. `dist/bundle.mjs` is an entrypoint, not a library — it
@@ -109,7 +129,15 @@ const result = await build({
 // with unit-testable logic is emitted once more, unminified and importable,
 // under `dist/test/`. The gateway's build.rs only ever picks up
 // `dist/bundle.mjs` plus the `baybo.auxAssets` paths, so these never ship.
-const TEST_MODULES = ["watchdog", "page_budget", "net_hints", "tool_notes"];
+const TEST_MODULES = [
+  "watchdog",
+  "page_budget",
+  "net_hints",
+  "tool_notes",
+  "cddm_tap",
+  "screencast",
+  "view_link",
+];
 const testResults = await Promise.all(
   TEST_MODULES.map((name) =>
     build({
@@ -122,7 +150,7 @@ const testResults = await Promise.all(
       minify: false,
       sourcemap: false,
       logLevel: "warning",
-      plugins: [bayboResolveCddm],
+      plugins: [bayboResolveCddm("../")],
     }),
   ),
 );

@@ -8,11 +8,23 @@
 //! the operator's [`BayboConfig`] into the profile list the reconciler
 //! consumes.
 
+use baybo_browser_view::params::BrowserLinkParams;
 use baybo_config::BayboConfig;
+use baybo_tools::mcp::profile::browser::BrowserLinkEnv;
 use baybo_tools::mcp::{BrowserProfileParams, EmbeddedMcpProfile, browser_mcp_profile};
 use baybo_workspace::WorkspacePaths;
 
 use crate::sidecar::SidecarRuntime;
+
+/// Embedded sidecar bundle name for the browser MCP wrapper, as resolved by
+/// [`SidecarRuntime::bundle_for`].
+pub(crate) const BROWSER_BUNDLE_NAME: &str = "browser";
+
+/// Whether this build ships the browser MCP sidecar, i.e. whether anything
+/// will ever dial the browser-view link.
+pub fn has_browser_bundle(runtime: &SidecarRuntime) -> bool {
+    runtime.bundle_for(BROWSER_BUNDLE_NAME).is_some()
+}
 
 /// Walk every tool-domain family and collect the [`EmbeddedMcpProfile`]
 /// list to hand to [`baybo_tools::mcp::embedded_servers`].
@@ -28,6 +40,10 @@ use crate::sidecar::SidecarRuntime;
 /// fontconfig search dir so user-dropped fonts (notably CJK) render in
 /// screenshots without operator intervention.
 ///
+/// `browser_link` is the browser-view link the hub actually bound
+/// (`BrowserViewHub::link`), resolved once per process so the sidecar's env
+/// — and with it the reconciler's identity hash — never churns.
+///
 /// Adding a future tool-domain MCP server (code_exec, db_query, …) is
 /// one more entry in the array literal — `runtime::build_managers`
 /// stays unchanged.
@@ -35,6 +51,7 @@ pub fn collect_profiles(
     runtime: &SidecarRuntime,
     config: &BayboConfig,
     workspace_paths: &WorkspacePaths,
+    browser_link: Option<&BrowserLinkParams>,
 ) -> Vec<EmbeddedMcpProfile> {
     let node_cmd = baybo_process::HostTool::node().path().display().to_string();
     let browser_font_dir = workspace_paths.browser_fonts_dir();
@@ -53,7 +70,7 @@ pub fn collect_profiles(
     // an artefact the agent just wrote resolves inside the container.
     // Opt-out leaves the container with no view of the workspace at all.
     let browser_work_dir = workspace_paths.work_dir();
-    [runtime.bundle_for("browser").and_then(|bundle| {
+    [runtime.bundle_for(BROWSER_BUNDLE_NAME).and_then(|bundle| {
         browser_mcp_profile(BrowserProfileParams {
             enable: config.browser.enable,
             chrome_path: config.browser.chrome_path.as_deref(),
@@ -74,6 +91,10 @@ pub fn collect_profiles(
                 .mount_work_dir
                 .then_some(browser_work_dir.as_path()),
             docker_memory_limit_mb: config.browser.docker.memory_limit_mb,
+            link: browser_link.map(|link| BrowserLinkEnv {
+                socket: link.socket(),
+                secret: link.secret().expose(),
+            }),
         })
     })]
     .into_iter()
@@ -87,6 +108,7 @@ mod tests {
 
     use super::*;
     use baybo_config::BayboConfig;
+    use baybo_tools::mcp::profile::browser::BROWSER_MCP_SERVER_NAME;
 
     fn ws() -> WorkspacePaths {
         WorkspacePaths::new(PathBuf::from("/tmp/baybo-test-workspace"))
@@ -108,7 +130,7 @@ mod tests {
         let cfg = BayboConfig::default();
         assert!(!cfg.browser.enable, "default browser config is opt-in");
         assert!(
-            collect_profiles(&rt, &cfg, &ws()).is_empty(),
+            collect_profiles(&rt, &cfg, &ws(), None).is_empty(),
             "browser.enable=false must keep the profile list empty even when the bundle is embedded",
         );
     }
@@ -122,14 +144,14 @@ mod tests {
         let Ok(rt) = SidecarRuntime::install() else {
             return;
         };
-        if rt.bundle_for("browser").is_none() {
+        if rt.bundle_for(BROWSER_BUNDLE_NAME).is_none() {
             return;
         }
         let mut cfg = BayboConfig::default();
         cfg.browser.enable = true;
-        let profiles = collect_profiles(&rt, &cfg, &ws());
+        let profiles = collect_profiles(&rt, &cfg, &ws(), None);
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].server_name, "browser");
+        assert_eq!(profiles[0].server_name, BROWSER_MCP_SERVER_NAME);
         let font_dirs = profiles[0]
             .extra_env
             .get("BAYBO_BROWSER_EXTRA_FONT_DIRS")
@@ -161,13 +183,13 @@ mod tests {
         let Ok(rt) = SidecarRuntime::install() else {
             return;
         };
-        if rt.bundle_for("browser").is_none() {
+        if rt.bundle_for(BROWSER_BUNDLE_NAME).is_none() {
             return;
         }
         let mut cfg = BayboConfig::default();
         cfg.browser.enable = true;
         cfg.browser.profile_dir = Some(PathBuf::from("/var/baybo/explicit-profile"));
-        let profiles = collect_profiles(&rt, &cfg, &ws());
+        let profiles = collect_profiles(&rt, &cfg, &ws(), None);
         assert_eq!(
             profiles[0]
                 .extra_env
@@ -187,7 +209,7 @@ mod tests {
         let Ok(rt) = SidecarRuntime::install() else {
             return;
         };
-        if rt.bundle_for("browser").is_none() {
+        if rt.bundle_for(BROWSER_BUNDLE_NAME).is_none() {
             return;
         }
         let mut cfg = BayboConfig::default();
@@ -195,7 +217,7 @@ mod tests {
         cfg.browser.docker.enable = true;
         cfg.browser.docker.web_vnc_port = Some(6080);
         cfg.browser.docker.image_tag = Some("custom/chrome:test".into());
-        let profiles = collect_profiles(&rt, &cfg, &ws());
+        let profiles = collect_profiles(&rt, &cfg, &ws(), None);
         assert_eq!(profiles.len(), 1);
         let env = &profiles[0].extra_env;
         assert_eq!(
@@ -221,13 +243,13 @@ mod tests {
         let Ok(rt) = SidecarRuntime::install() else {
             return;
         };
-        if rt.bundle_for("browser").is_none() {
+        if rt.bundle_for(BROWSER_BUNDLE_NAME).is_none() {
             return;
         }
         let mut cfg = BayboConfig::default();
         cfg.browser.enable = true;
         cfg.browser.docker.enable = true;
-        let profiles = collect_profiles(&rt, &cfg, &ws());
+        let profiles = collect_profiles(&rt, &cfg, &ws(), None);
         assert_eq!(
             profiles[0]
                 .extra_env
@@ -242,14 +264,14 @@ mod tests {
         let Ok(rt) = SidecarRuntime::install() else {
             return;
         };
-        if rt.bundle_for("browser").is_none() {
+        if rt.bundle_for(BROWSER_BUNDLE_NAME).is_none() {
             return;
         }
         let mut cfg = BayboConfig::default();
         cfg.browser.enable = true;
         cfg.browser.docker.enable = true;
         cfg.browser.docker.mount_work_dir = false;
-        let profiles = collect_profiles(&rt, &cfg, &ws());
+        let profiles = collect_profiles(&rt, &cfg, &ws(), None);
         assert!(
             !profiles[0]
                 .extra_env
@@ -266,17 +288,48 @@ mod tests {
         let Ok(rt) = SidecarRuntime::install() else {
             return;
         };
-        if rt.bundle_for("browser").is_none() {
+        if rt.bundle_for(BROWSER_BUNDLE_NAME).is_none() {
             return;
         }
         let mut cfg = BayboConfig::default();
         cfg.browser.enable = true;
         cfg.browser.docker.enable = true;
-        let profiles = collect_profiles(&rt, &cfg, &ws());
+        let profiles = collect_profiles(&rt, &cfg, &ws(), None);
         let env = &profiles[0].extra_env;
         assert_eq!(
             env.get("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT"),
             Some(&"4096m".to_string()),
+        );
+    }
+
+    #[test]
+    fn browser_link_reaches_the_child_env() {
+        use baybo_tools::mcp::profile::browser::{
+            ENV_BROWSER_LINK_SECRET, ENV_BROWSER_LINK_SOCKET,
+        };
+        let Ok(rt) = SidecarRuntime::install() else {
+            return;
+        };
+        if rt.bundle_for(BROWSER_BUNDLE_NAME).is_none() {
+            return;
+        }
+        let mut cfg = BayboConfig::default();
+        cfg.browser.enable = true;
+        let link = BrowserLinkParams::resolve(&ws().state_dir()).unwrap();
+        let profiles = collect_profiles(&rt, &cfg, &ws(), Some(&link));
+        let env = &profiles[0].extra_env;
+        assert_eq!(
+            env.get(ENV_BROWSER_LINK_SOCKET).map(String::as_str),
+            Some(link.socket().display().to_string().as_str())
+        );
+        assert_eq!(
+            env.get(ENV_BROWSER_LINK_SECRET).map(String::as_str),
+            Some(link.secret().expose())
+        );
+        let again = collect_profiles(&rt, &cfg, &ws(), Some(&link));
+        assert_eq!(
+            again[0].extra_env, *env,
+            "same link, same env: the reconciler identity must not churn"
         );
     }
 }
