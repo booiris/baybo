@@ -53,6 +53,12 @@ struct RootView: View {
                                     CronJobsScreen()
                                 case .deckRecycle:
                                     DeckRecycleScreen()
+                                case .llmEntries:
+                                    LlmEntriesScreen()
+                                case .llmEntry(let name):
+                                    LlmEntryScreen(entryName: name)
+                                case .newLlmEntry:
+                                    NewLlmEntryScreen()
                                 case .projectBoard(let projectId):
                                     ProjectBoardScreen(projectId: projectId, store: store.projectsStore)
                                 case .projectIssue(let issue):

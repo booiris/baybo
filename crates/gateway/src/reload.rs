@@ -61,8 +61,9 @@ pub trait ConfigReloader: Send + Sync {
     /// dropping it. Deliberately does **not** apply the hot/non-hot
     /// whitelist; that stays with `reload`, so a generic endpoint can
     /// still persist a non-hot field (restart-pending) after a clean
-    /// dry-run.
-    async fn dry_run(&self, candidate: &BayboConfig) -> Result<(), ReloadError>;
+    /// dry-run. Returns the candidate pool outcome so entry-specific callers
+    /// can require their entry to build even when it is not the default.
+    async fn dry_run(&self, candidate: &BayboConfig) -> Result<ReloadOutcome, ReloadError>;
 }
 
 impl From<ReloadError> for crate::error::GatewayError {

@@ -1,10 +1,19 @@
 //! `/v1/llm` — snapshot of the configured LLM provider plus the
 //! models-dashboard surface (`/v1/llm/models`, `/v1/llm/default`,
-//! `/v1/llm/usage`, `/v1/llm/models/{name}/test`).
+//! `/v1/llm/usage`, `/v1/llm/models/{name}/test`,
+//! `/v1/llm/models/{name}/model-list`, `/v1/llm/models/{name}/catalog`).
 //!
 //! `GET /v1/llm` returns the *currently active* provider/model (whatever
-//! the runtime loaded at startup). Edits land on disk and require a
-//! gateway restart to take effect — same contract as `PUT /v1/config`.
+//! the runtime loaded at startup). Edits land on disk and are hot-reloaded
+//! in-process; `requires_restart` in the answer means the write reached the
+//! file but not the running pool.
+//!
+//! **Which model an entry SERVES lives in two different places, on purpose.**
+//! `PUT /llm/models/{name}` sets `model` — the entry's default, and the only
+//! model whose overrides this API can edit. `PUT /llm/models/{name}/model-list`
+//! sets the whole served SET, preserving each surviving id's overrides. Before
+//! the latter existed, `model_list` could only grow (via `default_spec_mut`)
+//! and nothing over HTTP could shrink it.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -18,9 +27,10 @@ use utoipa_axum::routes;
 
 use crate::Result;
 use crate::api::dto::{
-    ErrorBody, LlmInfo, LlmModelEntry, LlmModelPricingDto, LlmModelTestResult, LlmModelUsage,
-    LlmModelsResponse, LlmPricingOverrideDto, LlmUsageQuery, LlmUsageResponse, MutateResponse,
-    SetDefaultLlmRequest, UpdateLlmModelRequest,
+    CreateLlmModelRequest, ErrorBody, LlmCatalogModel, LlmCatalogResponse, LlmInfo, LlmModelEntry,
+    LlmModelPricingDto, LlmModelTestResult, LlmModelUsage, LlmModelsResponse,
+    LlmPricingOverrideDto, LlmProviderInfo, LlmProvidersResponse, LlmUsageQuery, LlmUsageResponse,
+    MutateResponse, SetDefaultLlmRequest, SetLlmModelListRequest, UpdateLlmModelRequest,
 };
 use crate::server::AdminState;
 use crate::{GatewayError, Result as GatewayResult};
@@ -35,6 +45,11 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_models))
         .routes(routes!(update_model))
         .routes(routes!(test_model))
+        .routes(routes!(list_providers))
+        .routes(routes!(create_model))
+        .routes(routes!(delete_model))
+        .routes(routes!(set_model_list))
+        .routes(routes!(get_catalog))
         .routes(routes!(set_default))
         .routes(routes!(get_usage))
 }
@@ -110,6 +125,24 @@ async fn update_model(
         )
     })?;
 
+    // `context_window` / `supports_vision` / `pricing` describe A MODEL, and
+    // this request has no way to say WHICH — they land wherever `model` leaves
+    // the default pointing. A client that renders the entry and posts the form
+    // back therefore moves the departing model's overrides onto its successor,
+    // and gets a 200 for it. Refusing the combination is what makes that
+    // unrepresentable; the caller changes the model, sees what the new one
+    // actually resolves to, and then decides whether to override it.
+    if req.model.is_some()
+        && (req.context_window.is_some() || req.supports_vision.is_some() || req.pricing.is_some())
+    {
+        return Err(GatewayError::BadRequest(
+            "`model` cannot be changed in the same request as `context_window`, \
+             `supports_vision` or `pricing`: those describe a model, and this request cannot say \
+             which one they belong to. Send the model change on its own first."
+                .into(),
+        ));
+    }
+
     let mut current = read_config_for_dashboard(&state).await?;
     let entry = current
         .llm
@@ -121,7 +154,13 @@ async fn update_model(
         entry.provider = provider;
     }
     if let Some(model) = req.model {
+        if entry.lite_model.as_ref() == Some(&entry.model) && entry.model != model {
+            entry.default_spec_mut();
+        }
         entry.model = model;
+    }
+    if let Some(lite_model) = req.lite_model {
+        entry.lite_model = lite_model;
     }
     if let Some(base_url) = req.base_url {
         entry.base_url = base_url.filter(|s| !s.is_empty());
@@ -154,36 +193,29 @@ async fn update_model(
         .validate()
         .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
 
-    // Stage a rotated API key in the vault *before* the pre-flight build:
-    // every provider requires the key at client construction, so dry-run
-    // (and the rebuild) must resolve the new credential, not the old. Empty
-    // string = clear, a no-op here — there's no per-key delete on this
-    // path, so the prior secret stays until a fresh value is set.
-    if let Some(api_key) = req.api_key.as_deref() {
-        if api_key.is_empty() {
-            tracing::info!(
-                entry = %name,
-                "api_key clear requested; this path has no per-key vault delete, leaving the prior \
-                 secret in place (rotate by setting a fresh non-empty value)"
-            );
-        } else {
-            state
-                .secret_vault
-                .store_secret(&vault_api_key_name(&name), api_key.as_bytes())
-                .await
-                .map_err(|e| GatewayError::Internal(format!("vault write failed: {e}")))?;
-        }
-    }
+    // Stage the API-key change in the vault *before* the pre-flight build:
+    // every provider resolves its credential at client construction, so a dry
+    // run that still saw the old key would validate a build nobody asked for.
+    // An empty string is a CLEAR — the key is deleted, not left in place.
+    let staged = stage_api_key(&state, &name, req.api_key.as_deref()).await?;
 
     // Pre-flight before persisting, so an unbuildable edit is rejected
     // without dirtying the file (a later SIGHUP would otherwise re-read and
     // silently drop it). With the new key already staged, this validates
     // the real post-edit build.
-    state.config_reloader.dry_run(&current).await?;
-    current
-        .write_to_file(target)
-        .await
-        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+    //
+    // Both fallible steps below undo the vault first. Without that, a rejected
+    // pre-flight would answer 400 with the config untouched and the secret
+    // already gone — and since the clear IS the only way to remove a key,
+    // there would be nothing left to put back.
+    if let Err(e) = state.config_reloader.dry_run(&current).await {
+        staged.restore(&state).await;
+        return Err(e.into());
+    }
+    if let Err(e) = current.write_to_file(target).await {
+        staged.restore(&state).await;
+        return Err(GatewayError::Internal(e.to_string()));
+    }
 
     // Apply in-process. `reload` always rebuilds the LLM pool, so a vault
     // key rotation (invisible in the config diff) takes effect too. If a
@@ -292,6 +324,417 @@ async fn test_model(
             model: entry.model,
         })),
     }
+}
+
+/// Entry names reach the URL on every other `/v1/llm/models/{name}` route and
+/// become this entry's vault-key suffix, so a name that cannot survive a path
+/// segment produces an entry nothing can address afterwards. `validate()` only
+/// requires non-empty, which is why this lives here — the one place a name is
+/// born over HTTP.
+fn validate_entry_name(name: &str) -> GatewayResult<()> {
+    if name.is_empty() {
+        return Err(GatewayError::BadRequest("name must be non-empty".into()));
+    }
+    if name.len() > 64 {
+        return Err(GatewayError::BadRequest(
+            "name must be at most 64 characters".into(),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(GatewayError::BadRequest(
+            "name may use only letters, digits, '-', '_' and '.' — it rides in the URL of every \
+             other route for this entry"
+                .into(),
+        ));
+    }
+    // `.` and `..` would traverse rather than address.
+    if name.chars().all(|c| c == '.') {
+        return Err(GatewayError::BadRequest(
+            "name must contain more than dots".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[utoipa::path(
+    get,
+    path = "/llm/providers",
+    tag = "llm",
+    responses(
+        (status = 200, description = "Providers this build can serve, in registration order", body = LlmProvidersResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn list_providers() -> Result<Json<LlmProvidersResponse>> {
+    let registry = LlmProviderRegistry::with_default_providers();
+    Ok(Json(LlmProvidersResponse {
+        items: registry
+            .provider_names()
+            .into_iter()
+            .filter_map(|name| {
+                let factory = registry.factory_for(name)?;
+                Some(LlmProviderInfo {
+                    name: name.to_string(),
+                    auth: factory.auth().into(),
+                    default_base_url: factory.default_base_url().map(str::to_string),
+                    default_api_key_env: factory.default_api_key_env().map(str::to_string),
+                })
+            })
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/llm/models",
+    tag = "llm",
+    request_body = CreateLlmModelRequest,
+    responses(
+        (status = 200, description = "Entry created and hot-reloaded in-process.", body = MutateResponse),
+        (status = 400, description = "Bad name, unknown or OAuth provider, or an unbuildable entry", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 409, description = "An entry with that name already exists", body = ErrorBody),
+        (status = 500, description = "Write failure", body = ErrorBody),
+    )
+)]
+async fn create_model(
+    State(state): State<AdminState>,
+    Json(req): Json<CreateLlmModelRequest>,
+) -> Result<Json<MutateResponse>> {
+    let target = state.config_path.as_ref().ok_or_else(|| {
+        GatewayError::BadRequest(
+            "gateway was started without a config file; set BAYBO_CONFIG_PATH or pass --config \
+             <path> so the mutation has a destination"
+                .into(),
+        )
+    })?;
+
+    let name = req.name.trim().to_string();
+    validate_entry_name(&name)?;
+
+    let provider = req.provider.trim().to_string();
+    let auth = baybo_llm::auth_for_provider(&provider).ok_or_else(|| {
+        GatewayError::BadRequest(format!(
+            "unknown provider {provider:?}; see GET /v1/llm/providers"
+        ))
+    })?;
+    // The device-code flow and the token bundle it writes belong to the CLI.
+    // An entry created here would have no way to acquire a credential, so it
+    // would be listed, unbuildable, and silently dropped from the pool.
+    if !auth.is_api_key_shaped() {
+        return Err(GatewayError::BadRequest(format!(
+            "provider {provider:?} signs in interactively and cannot be set up over HTTP; run \
+             `baybo llm add` on the gateway host"
+        )));
+    }
+
+    let model = req.model.trim().to_string();
+    if model.is_empty() {
+        return Err(GatewayError::BadRequest("model must be non-empty".into()));
+    }
+
+    let mut current = read_config_for_dashboard(&state).await?;
+    if current.llm.iter().any(|e| e.name.as_str() == name) {
+        return Err(GatewayError::Conflict(format!(
+            "an llm entry named {name:?} already exists"
+        )));
+    }
+
+    let models = validate_model_ids(&req.models)?;
+    let model_list = models
+        .into_iter()
+        .map(baybo_config::LlmModelSpec::bare)
+        .collect();
+    current.llm.push(LlmEntry {
+        name: name.clone().into(),
+        provider,
+        model,
+        model_list,
+        lite_model: req.lite_model,
+        api_key_env: req.api_key_env.filter(|s| !s.trim().is_empty()),
+        base_url: req.base_url.filter(|s| !s.trim().is_empty()),
+        reasoning_effort: None,
+    });
+    // A fresh install has no `default-llm`; the first entry created becomes it,
+    // or `validate()` would reject the very config this request just produced.
+    if current.default_llm.as_str().trim().is_empty() {
+        current.default_llm = name.clone().into();
+    }
+
+    current
+        .validate()
+        .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+
+    // Same ordering and the same undo as `update_model`: the pre-flight builds
+    // a client, which resolves the credential, so the key has to be staged
+    // first — and put back if the pre-flight then rejects the entry.
+    let staged = stage_api_key(&state, &name, req.api_key.as_deref()).await?;
+
+    if let Err(e) = state.config_reloader.dry_run(&current).await.and_then(|outcome| {
+        if outcome.entries.contains(&name) {
+            Ok(())
+        } else {
+            Err(crate::reload::ReloadError::Config(format!(
+                "llm entry {name:?} could not be built; check its credentials and provider settings"
+            )))
+        }
+    }) {
+        staged.restore(&state).await;
+        return Err(e.into());
+    }
+    if let Err(e) = current.write_to_file(target).await {
+        staged.restore(&state).await;
+        return Err(GatewayError::Internal(e.to_string()));
+    }
+
+    let requires_restart = super::config::apply_after_write(&state).await?;
+
+    Ok(Json(MutateResponse {
+        path: format!("llm[{name}]"),
+        written_to: target.display().to_string(),
+        requires_restart,
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/llm/models/{name}",
+    tag = "llm",
+    params(
+        ("name" = String, Path, description = "Entry name (matches `llm[*].name`)"),
+    ),
+    responses(
+        (status = 200, description = "Entry removed and hot-reloaded in-process.", body = MutateResponse),
+        (status = 400, description = "The entry is `default-llm`, or signs in interactively", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Entry not found", body = ErrorBody),
+        (status = 500, description = "Write failure", body = ErrorBody),
+    )
+)]
+async fn delete_model(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Result<Json<MutateResponse>> {
+    let target = state.config_path.as_ref().ok_or_else(|| {
+        GatewayError::BadRequest(
+            "gateway was started without a config file; cannot remove an entry".into(),
+        )
+    })?;
+
+    let mut current = read_config_for_dashboard(&state).await?;
+    let entry = current
+        .llm
+        .iter()
+        .find(|e| e.name.as_str() == name)
+        .ok_or_else(|| GatewayError::NotFound(format!("llm entry {name:?}")))?
+        .clone();
+
+    check_entry_removal(&current, &entry)?;
+
+    current.llm.retain(|e| e.name.as_str() != name);
+    current
+        .validate()
+        .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+    state.config_reloader.dry_run(&current).await?;
+    current
+        .write_to_file(target)
+        .await
+        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+
+    // AFTER the write, which is the opposite of `update_model` and for the
+    // opposite reason: there the pre-flight had to see the new key, here a key
+    // dropped before a failed write would leave a live entry with no
+    // credential. Best-effort — the entry is already gone, so a surviving
+    // secret is inert, and failing the request would misreport a delete that
+    // did happen.
+    if let Err(e) = state
+        .secret_vault
+        .delete_secret(&vault_api_key_name(&name))
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            entry = %name,
+            "entry removed from config but its vault key could not be deleted"
+        );
+    }
+
+    let requires_restart = super::config::apply_after_write(&state).await?;
+
+    Ok(Json(MutateResponse {
+        path: format!("llm[{name}]"),
+        written_to: target.display().to_string(),
+        requires_restart,
+    }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/llm/models/{name}/model-list",
+    tag = "llm",
+    params(
+        ("name" = String, Path, description = "Entry name (matches `llm[*].name`)"),
+    ),
+    request_body = SetLlmModelListRequest,
+    responses(
+        (status = 200, description = "Model list replaced and hot-reloaded in-process.", body = MutateResponse),
+        (status = 400, description = "Empty id, duplicate, or the default model missing", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Entry not found", body = ErrorBody),
+        (status = 500, description = "Write failure", body = ErrorBody),
+    )
+)]
+async fn set_model_list(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetLlmModelListRequest>,
+) -> Result<Json<MutateResponse>> {
+    let target = state.config_path.as_ref().ok_or_else(|| {
+        GatewayError::BadRequest(
+            "gateway was started without a config file; set BAYBO_CONFIG_PATH or pass --config \
+             <path> so the mutation has a destination"
+                .into(),
+        )
+    })?;
+
+    let mut current = read_config_for_dashboard(&state).await?;
+    let entry = current
+        .llm
+        .iter_mut()
+        .find(|e| e.name == name)
+        .ok_or_else(|| GatewayError::NotFound(format!("llm entry {name:?}")))?;
+
+    let models = validate_model_ids(&req.models)?;
+
+    // The default model has to stay in its own entry's list. `LlmEntry::models`
+    // prepends it when absent, so omitting it would not actually remove it —
+    // the write would report a set the entry does not have.
+    if !models.iter().any(|m| m == entry.model.as_str()) {
+        return Err(GatewayError::BadRequest(format!(
+            "the entry's default model {:?} must stay in its model list; change `model` first if \
+             you meant to replace it",
+            entry.model
+        )));
+    }
+
+    // Carry each surviving id's overrides across. Only an id that was not
+    // there gets a bare spec, so a caller may send plain ids without having to
+    // know — or echo back — what the operator configured.
+    let previous = std::mem::take(&mut entry.model_list);
+    entry.model_list = models
+        .into_iter()
+        .map(|model| {
+            previous
+                .iter()
+                .find(|s| s.model == model)
+                .cloned()
+                .unwrap_or_else(|| baybo_config::LlmModelSpec::bare(model))
+        })
+        .collect();
+
+    // `lite_model` pointing outside the new list is caught here — the
+    // validator owns that rule and its message already says how to fix it.
+    current
+        .validate()
+        .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+    state.config_reloader.dry_run(&current).await?;
+    current
+        .write_to_file(target)
+        .await
+        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+
+    let requires_restart = super::config::apply_after_write(&state).await?;
+
+    Ok(Json(MutateResponse {
+        path: format!("llm[{name}].model_list"),
+        written_to: target.display().to_string(),
+        requires_restart,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/llm/models/{name}/catalog",
+    tag = "llm",
+    params(
+        ("name" = String, Path, description = "Entry name (matches `llm[*].name`)"),
+    ),
+    responses(
+        (status = 200, description = "The provider's live model catalog", body = LlmCatalogResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Entry not found", body = ErrorBody),
+        (status = 502, description = "The provider's catalog could not be read", body = ErrorBody),
+    )
+)]
+async fn get_catalog(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Result<Json<LlmCatalogResponse>> {
+    let cfg = read_config_for_dashboard(&state).await?;
+    let entry = cfg
+        .llm
+        .iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| GatewayError::NotFound(format!("llm entry {name:?}")))?
+        .clone();
+
+    let registry = LlmProviderRegistry::with_default_providers();
+    let provider_cfg = LlmProviderConfig {
+        provider: entry.provider.clone(),
+        api_key: resolve_api_key(
+            entry.name.as_str(),
+            &entry.provider,
+            entry.api_key_env.as_deref(),
+            Some(state.secret_vault.as_ref()),
+        )
+        .await,
+        base_url: entry.base_url.clone(),
+        // Listing a catalog names no model, and an entry mid-setup can have an
+        // empty one — the client still has to build.
+        model: if entry.model.is_empty() {
+            "unused".into()
+        } else {
+            entry.model.clone()
+        },
+        // Catalog listing only — no billing, no completion — so the entry's
+        // per-model overrides have nothing to say here.
+        supports_vision: None,
+        context_window: None,
+        pricing: None,
+        reasoning_effort: entry.reasoning_effort.clone(),
+        vault: Some(state.secret_vault.clone()),
+        proxy: cfg
+            .proxy
+            .as_ref()
+            .map(|p| baybo_security::http::ProxySettings {
+                url: p.url.clone(),
+                no_proxy: p.no_proxy.clone(),
+            }),
+    };
+
+    let live = registry
+        .list_live_models(&provider_cfg)
+        .await
+        // The failure is the provider's or the credential's, not this
+        // gateway's, and the operator's fix is on the entry.
+        .map_err(|e| GatewayError::BadRequest(format!("live model discovery: {e}")))?;
+
+    let configured = entry.models();
+    Ok(Json(LlmCatalogResponse {
+        items: live
+            .into_iter()
+            .map(|m| LlmCatalogModel {
+                configured: configured.iter().any(|s| s.model == m.id),
+                id: m.id,
+                display_name: m.display_name,
+                context_window: m.context_window,
+                supports_vision: m.supports_vision,
+            })
+            .collect(),
+    }))
 }
 
 #[utoipa::path(
@@ -426,7 +869,130 @@ async fn get_usage(
     }))
 }
 
+fn validate_model_ids(raw_models: &[String]) -> GatewayResult<Vec<String>> {
+    let mut models: Vec<String> = Vec::with_capacity(raw_models.len());
+    for raw in raw_models {
+        let model = raw.trim();
+        if model.is_empty() {
+            return Err(GatewayError::BadRequest(
+                "model ids must be non-empty".into(),
+            ));
+        }
+        // A duplicate would make `spec_for` ambiguous — it returns the first
+        // match, so the second copy's overrides would be silently inert.
+        if models.iter().any(|m| m == model) {
+            return Err(GatewayError::BadRequest(format!(
+                "model {model:?} is listed twice"
+            )));
+        }
+        models.push(model.to_string());
+    }
+
+    Ok(models)
+}
+
+fn check_entry_removal(config: &BayboConfig, entry: &LlmEntry) -> GatewayResult<()> {
+    let name = entry.name.as_str();
+    if config.default_llm.as_str() == entry.name.as_str() {
+        return Err(GatewayError::BadRequest(format!(
+            "{name:?} is the current default-llm; point it at another entry \
+             (PUT /v1/llm/default) before removing this one"
+        )));
+    }
+    // An OAuth entry's credential is a refresh token that wants a server-side
+    // revoke, and whether the bundle may be cleared at all depends on the other
+    // subscription entries. `baybo llm remove` owns that; deleting the config
+    // row here would strand a live token in the vault.
+    if baybo_llm::auth_for_provider(&entry.provider).is_some_and(|auth| !auth.is_api_key_shaped()) {
+        return Err(GatewayError::BadRequest(format!(
+            "{name:?} signs in interactively; run `baybo llm remove` on the gateway host so its \
+             login is revoked rather than stranded"
+        )));
+    }
+
+    Ok(())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// A vault edit made ahead of the pre-flight that can still reject it, plus
+/// what it takes to put the vault back.
+///
+/// The ordering is forced: providers resolve their credential when the client
+/// is constructed, so `dry_run` has to see the intended key. That leaves the
+/// window this type closes — a 400 after the secret already moved.
+struct StagedApiKey {
+    /// `None` when the request carried no `api_key` at all, i.e. nothing to
+    /// undo. Otherwise the vault name and whatever was there before.
+    undo: Option<(String, Option<Vec<u8>>)>,
+}
+
+impl StagedApiKey {
+    const NONE: Self = Self { undo: None };
+
+    /// Put the vault back the way it was. Best-effort and never fatal: the
+    /// caller is already returning an error, and a failed restore must not
+    /// replace that error's message with this one — but it does deserve a loud
+    /// log, because it is the one path that can strand a credential.
+    async fn restore(self, state: &AdminState) {
+        let Some((vault_name, previous)) = self.undo else {
+            return;
+        };
+        let result = match &previous {
+            Some(bytes) => state.secret_vault.store_secret(&vault_name, bytes).await,
+            None => state.secret_vault.delete_secret(&vault_name).await,
+        };
+        if let Err(e) = result {
+            tracing::error!(
+                error = %e,
+                secret = %vault_name,
+                restoring = if previous.is_some() { "previous key" } else { "absence" },
+                "failed to roll back a staged api key after a rejected edit; the vault may now \
+                 disagree with the config on disk"
+            );
+        }
+    }
+}
+
+/// Apply the request's `api_key` to the vault, returning the undo.
+///
+/// Three states, and they are the request's, not this function's invention:
+/// absent leaves the vault alone, `""` deletes the stored key, and a value
+/// replaces it.
+async fn stage_api_key(
+    state: &AdminState,
+    entry: &str,
+    api_key: Option<&str>,
+) -> GatewayResult<StagedApiKey> {
+    let Some(api_key) = api_key else {
+        return Ok(StagedApiKey::NONE);
+    };
+    let vault_name = vault_api_key_name(entry);
+    let previous = state
+        .secret_vault
+        .get_secret(&vault_name)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("vault read failed: {e}")))?
+        .map(|v| v.as_bytes().to_vec());
+
+    if api_key.is_empty() {
+        state
+            .secret_vault
+            .delete_secret(&vault_name)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("vault delete failed: {e}")))?;
+        tracing::info!(entry = %entry, "api key cleared from the vault");
+    } else {
+        state
+            .secret_vault
+            .store_secret(&vault_name, api_key.as_bytes())
+            .await
+            .map_err(|e| GatewayError::Internal(format!("vault write failed: {e}")))?;
+    }
+    Ok(StagedApiKey {
+        undo: Some((vault_name, previous)),
+    })
+}
 
 /// Read the on-disk config for dashboard reads/writes. Falls back to
 /// the cached `state.config` snapshot when no `config_path` was set
@@ -502,8 +1068,19 @@ async fn build_model_entry(
     )
     .await
     .is_some();
+    // Separate from `configured`, which an env var also satisfies: only a
+    // stored key can be deleted over HTTP, so only a stored key may be
+    // offered for deletion.
+    let api_key_in_vault = state
+        .secret_vault
+        .get_secret(&vault_api_key_name(entry.name.as_str()))
+        .await
+        .ok()
+        .flatten()
+        .is_some();
 
     LlmModelEntry {
+        can_remove: check_entry_removal(cfg, entry).is_ok(),
         name: entry.name.to_string(),
         provider: entry.provider.clone(),
         model: entry.model.clone(),
@@ -515,6 +1092,7 @@ async fn build_model_entry(
         base_url: entry.base_url.clone(),
         api_key_env: entry.api_key_env.clone(),
         api_key_configured,
+        api_key_in_vault,
         reasoning_effort: entry.reasoning_effort.clone(),
         available_efforts: baybo_llm::providers::effort_wire_for_provider(&entry.provider)
             .levels()

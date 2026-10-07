@@ -865,7 +865,7 @@ export interface paths {
         };
         get: operations["list_models"];
         put?: never;
-        post?: never;
+        post: operations["create_model"];
         delete?: never;
         options?: never;
         head?: never;
@@ -881,6 +881,38 @@ export interface paths {
         };
         get?: never;
         put: operations["update_model"];
+        post?: never;
+        delete: operations["delete_model"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/models/{name}/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_catalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/models/{name}/model-list": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_model_list"];
         post?: never;
         delete?: never;
         options?: never;
@@ -898,6 +930,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["test_model"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_providers"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2419,6 +2467,30 @@ export interface components {
             status?: null | components["schemas"]["IssueStatusDto"];
             title: string;
         };
+        /**
+         * @description `POST /v1/llm/models` body — create an entry.
+         *
+         *     Creates the served model set and optional auxiliary selection atomically.
+         */
+        CreateLlmModelRequest: {
+            /** @description Stored in the vault under this entry's name. Never echoed back. */
+            api_key?: string | null;
+            api_key_env?: string | null;
+            base_url?: string | null;
+            /** @description Optional auxiliary model; must belong to the served set. */
+            lite_model?: string | null;
+            model: string;
+            /** @description Additional served model ids. The default model is included automatically. */
+            models?: string[];
+            /**
+             * @description Unique entry name. It is also a URL path segment on every other
+             *     `/v1/llm/models/{name}` route and the suffix of this entry's vault key,
+             *     so the handler constrains it beyond `validate()`'s non-empty rule.
+             */
+            name: string;
+            /** @description Must be one of `GET /v1/llm/providers`, and not an OAuth one. */
+            provider: string;
+        };
         CreateProjectRequest: {
             /**
              * Format: int64
@@ -3068,6 +3140,27 @@ export interface components {
              */
             started_at: string;
         };
+        /**
+         * @description One model as the provider's own catalog reports it
+         *     (`GET /v1/llm/models/{name}/catalog`). A LIVE read over the provider's API,
+         *     not config — so it can be slow, and it can fail for an entry whose
+         *     credentials are not yet valid.
+         */
+        LlmCatalogModel: {
+            /**
+             * @description Whether this id is already in the entry's `model_list`, so a picker can
+             *     tell what it would be adding from what is already served.
+             */
+            configured: boolean;
+            context_window?: number | null;
+            display_name?: string | null;
+            id: string;
+            supports_vision?: boolean | null;
+        };
+        /** @description `GET /v1/llm/models/{name}/catalog` response. */
+        LlmCatalogResponse: {
+            items: components["schemas"]["LlmCatalogModel"][];
+        };
         /** @description Current LLM provider descriptor. */
         LlmInfo: {
             model_id: string;
@@ -3088,6 +3181,16 @@ export interface components {
             api_key_configured: boolean;
             api_key_env?: string | null;
             /**
+             * @description `true` when a key is stored in THIS gateway's vault, as opposed to
+             *     merely resolving from an environment variable.
+             *
+             *     The two differ in what a client may offer: only a vault key can be
+             *     removed over HTTP (`api_key: ""`), and offering that on an entry whose
+             *     key comes from the environment would be a button that reports success
+             *     and changes nothing.
+             */
+            api_key_in_vault: boolean;
+            /**
              * @description The thinking levels this entry's provider can actually be told, in
              *     display order (cheapest first). Empty when baybo sends this provider
              *     no effort at all, which is a picker's cue to offer none rather than a
@@ -3099,6 +3202,8 @@ export interface components {
              */
             available_efforts: string[];
             base_url?: string | null;
+            /** @description Whether this entry can be removed over HTTP (not the default or OAuth). */
+            can_remove: boolean;
             /**
              * @description The default model's `context_window` override. `None` = factory
              *     default.
@@ -3224,6 +3329,40 @@ export interface components {
             input_per_1m_tokens?: number | null;
             /** Format: int64 */
             output_per_1m_tokens?: number | null;
+        };
+        /**
+         * @description How a provider is credentialed (`GET /v1/llm/providers`). Mirrors
+         *     `baybo_llm::ProviderAuth`; the DTO exists separately so the wire shape
+         *     can't drift when that enum grows a variant.
+         * @enum {string}
+         */
+        LlmProviderAuthDto: "api_key" | "optional_api_key" | "keyless" | "oauth";
+        /**
+         * @description One provider this build can serve, in registration order.
+         *
+         *     The registry is compiled in, so this list is the ONLY way a client learns
+         *     which provider ids are legal. Without it a create form has to free-text the
+         *     field, and a wrong provider is not an error: `prepare` warns and drops the
+         *     entry from the pool, `dry_run` passes, the file is written, and
+         *     `GET /v1/llm/models` keeps listing a row that no longer exists.
+         */
+        LlmProviderInfo: {
+            auth: components["schemas"]["LlmProviderAuthDto"];
+            /**
+             * @description The env var this provider conventionally reads its key from, when it
+             *     has one. A client can offer it as the alternative to storing a key.
+             */
+            default_api_key_env?: string | null;
+            /**
+             * @description Prefill for the base-URL field; `None` means the provider's own client
+             *     supplies one and the operator need not.
+             */
+            default_base_url?: string | null;
+            name: string;
+        };
+        /** @description `GET /v1/llm/providers` response. */
+        LlmProvidersResponse: {
+            items: components["schemas"]["LlmProviderInfo"][];
         };
         /** @description `GET /v1/llm/usage` response. */
         LlmUsageResponse: {
@@ -3568,6 +3707,24 @@ export interface components {
         SetDefaultLlmRequest: {
             name: string;
         };
+        /**
+         * @description `PUT /v1/llm/models/{name}/model-list` body — the models this entry
+         *     serves, as a SET, in picker order.
+         *
+         *     Replace rather than add/remove, for two reasons. Model ids routinely
+         *     contain a slash (`meta-llama/Llama-3-70B`), which makes them unsafe as a
+         *     path segment; and a whole-set PUT is idempotent, so a client whose request
+         *     is replayed converges instead of double-adding.
+         *
+         *     **Replacing the list never destroys an override.** The handler keeps each
+         *     surviving id's existing `LlmModelSpec` and only mints a bare one for an id
+         *     that was not there — so a caller may send plain ids without knowing which
+         *     overrides exist. Dropping an id DOES drop its overrides, which is the point
+         *     of dropping it.
+         */
+        SetLlmModelListRequest: {
+            models: string[];
+        };
         /** @description Request body for `PUT /v1/chat/sessions/{session_id}/archive`. */
         SetSessionArchiveRequest: {
             /**
@@ -3884,8 +4041,12 @@ export interface components {
         UpdateLlmModelRequest: {
             /**
              * @description Set the literal API key in the vault (`llm.entry.<name>.api_key`).
-             *     Pass `""` to remove the vault entry, or omit the field to leave
-             *     the vault untouched. Never echoed back.
+             *     Pass `""` to delete the stored key, or omit the field to leave the
+             *     vault untouched. Never echoed back.
+             *
+             *     A delete only removes what THIS vault holds; if `api_key_env` or the
+             *     provider's default env var still resolves, the entry keeps working and
+             *     `api_key_configured` stays true.
              */
             api_key?: string | null;
             /** @description Environment variable name holding the API key, or `null` to clear. */
@@ -3894,6 +4055,8 @@ export interface components {
             base_url?: string | null;
             /** @description `context_window` override for the default model, or `null` to clear. */
             context_window?: number | null;
+            /** @description Auxiliary model from this entry's served models, or null to clear. */
+            lite_model?: string | null;
             /** @description Set the model id (e.g. `"gpt-4o"`). Requires gateway restart. */
             model?: string | null;
             pricing?: null | components["schemas"]["LlmPricingOverrideDto"];
@@ -7089,6 +7252,66 @@ export interface operations {
             };
         };
     };
+    create_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateLlmModelRequest"];
+            };
+        };
+        responses: {
+            /** @description Entry created and hot-reloaded in-process. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MutateResponse"];
+                };
+            };
+            /** @description Bad name, unknown or OAuth provider, or an unbuildable entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description An entry with that name already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Write failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     update_model: {
         parameters: {
             query?: never;
@@ -7115,6 +7338,178 @@ export interface operations {
                 };
             };
             /** @description Invalid update */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Write failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Entry name (matches `llm[*].name`) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Entry removed and hot-reloaded in-process. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MutateResponse"];
+                };
+            };
+            /** @description The entry is `default-llm`, or signs in interactively */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Write failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_catalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Entry name (matches `llm[*].name`) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The provider's live model catalog */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LlmCatalogResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The provider's catalog could not be read */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_model_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Entry name (matches `llm[*].name`) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetLlmModelListRequest"];
+            };
+        };
+        responses: {
+            /** @description Model list replaced and hot-reloaded in-process. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MutateResponse"];
+                };
+            };
+            /** @description Empty id, duplicate, or the default model missing */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -7184,6 +7579,35 @@ export interface operations {
             };
             /** @description Entry not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Providers this build can serve, in registration order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LlmProvidersResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

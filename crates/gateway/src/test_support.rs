@@ -56,9 +56,17 @@ impl crate::reload::ConfigReloader for StubConfigReloader {
 
     async fn dry_run(
         &self,
-        _candidate: &baybo_config::BayboConfig,
-    ) -> std::result::Result<(), crate::reload::ReloadError> {
-        Ok(())
+        candidate: &baybo_config::BayboConfig,
+    ) -> std::result::Result<crate::reload::ReloadOutcome, crate::reload::ReloadError> {
+        Ok(crate::reload::ReloadOutcome {
+            default_entry: candidate.default_llm.to_string(),
+            entries: candidate
+                .llm
+                .iter()
+                .map(|entry| entry.name.to_string())
+                .collect(),
+            ..canned_reload_outcome()
+        })
     }
 }
 
@@ -78,7 +86,7 @@ impl crate::reload::ConfigReloader for RejectingDryRunReloader {
     async fn dry_run(
         &self,
         _candidate: &baybo_config::BayboConfig,
-    ) -> std::result::Result<(), crate::reload::ReloadError> {
+    ) -> std::result::Result<crate::reload::ReloadOutcome, crate::reload::ReloadError> {
         Err(crate::reload::ReloadError::LlmRebuild(
             "test: default entry unbuildable".into(),
         ))
@@ -103,9 +111,17 @@ impl crate::reload::ConfigReloader for NonHotPendingReloader {
 
     async fn dry_run(
         &self,
-        _candidate: &baybo_config::BayboConfig,
-    ) -> std::result::Result<(), crate::reload::ReloadError> {
-        Ok(())
+        candidate: &baybo_config::BayboConfig,
+    ) -> std::result::Result<crate::reload::ReloadOutcome, crate::reload::ReloadError> {
+        Ok(crate::reload::ReloadOutcome {
+            default_entry: candidate.default_llm.to_string(),
+            entries: candidate
+                .llm
+                .iter()
+                .map(|entry| entry.name.to_string())
+                .collect(),
+            ..canned_reload_outcome()
+        })
     }
 }
 

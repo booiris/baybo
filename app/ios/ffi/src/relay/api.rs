@@ -159,6 +159,39 @@ impl GatewayJsonClient for GatewayApi {
         }
     }
 
+    fn put_json<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let body = request(
+                "PUT",
+                path,
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
+                Some(body),
+            )
+            .await?;
+            serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
+        }
+    }
+
+    fn delete_json<'a, T>(
+        &'a self,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let body = request("DELETE", path, Vec::new(), None).await?;
+            serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
+        }
+    }
+
     fn delete_empty<'a>(
         &'a self,
         path: &'a str,

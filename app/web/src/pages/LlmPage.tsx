@@ -137,14 +137,39 @@ export function LlmPage() {
 
   const handleSave = useCallback(
     async (name: string, body: UpdateLlmModelRequest): Promise<string | null> => {
-      const { response, error: apiError } = await client.PUT('/v1/llm/models/{name}', {
-        params: { path: { name } },
-        body,
-      });
-      if (response.status === 401) { logout(); return 'session expired'; }
-      if (apiError || !response.ok) {
-        return apiError?.error || `HTTP Error ${response.status}`;
+      const put = async (part: UpdateLlmModelRequest): Promise<string | null> => {
+        const { response, error: apiError } = await client.PUT('/v1/llm/models/{name}', {
+          params: { path: { name } },
+          body: part,
+        });
+        if (response.status === 401) { logout(); return 'session expired'; }
+        if (apiError || !response.ok) {
+          return apiError?.error || `HTTP Error ${response.status}`;
+        }
+        return null;
+      };
+
+      // `context_window` / `supports_vision` / `pricing` describe A MODEL, and
+      // the request cannot say which — they land wherever `model` leaves the
+      // default pointing. The endpoint refuses the combination rather than
+      // silently transplanting the departing model's overrides, so a save that
+      // changes both goes out as two requests: the model first, then the facts
+      // about it. Splitting here keeps the operator's one-click save.
+      const { model, ...rest } = body;
+      const perModel =
+        rest.context_window !== undefined ||
+        rest.supports_vision !== undefined ||
+        rest.pricing !== undefined;
+      if (model !== undefined && perModel) {
+        const first = await put({ model });
+        if (first !== null) return first;
+        const second = await put(rest);
+        if (second !== null) return second;
+      } else {
+        const only = await put(body);
+        if (only !== null) return only;
       }
+
       setEditing(null);
       setRefreshKey((k) => k + 1);
       return null;

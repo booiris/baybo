@@ -71,3 +71,4 @@ futures = { workspace = true }
 [dev-dependencies]
 # `SecretVault` over an in-memory store, for the hot-reload consumer tests.
 baybo-security = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

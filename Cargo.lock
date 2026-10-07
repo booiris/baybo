@@ -358,6 +358,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.2",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

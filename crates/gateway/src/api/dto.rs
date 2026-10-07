@@ -274,6 +274,16 @@ pub struct LlmModelEntry {
     /// (vault entry, explicit `api_key_env`, or provider-default env
     /// var). The literal value never leaves the gateway.
     pub api_key_configured: bool,
+    /// `true` when a key is stored in THIS gateway's vault, as opposed to
+    /// merely resolving from an environment variable.
+    ///
+    /// The two differ in what a client may offer: only a vault key can be
+    /// removed over HTTP (`api_key: ""`), and offering that on an entry whose
+    /// key comes from the environment would be a button that reports success
+    /// and changes nothing.
+    pub api_key_in_vault: bool,
+    /// Whether this entry can be removed over HTTP (not the default or OAuth).
+    pub can_remove: bool,
     pub reasoning_effort: Option<String>,
     /// The thinking levels this entry's provider can actually be told, in
     /// display order (cheapest first). Empty when baybo sends this provider
@@ -334,6 +344,9 @@ pub struct UpdateLlmModelRequest {
     /// Reasoning-effort override, or `null` to clear.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub reasoning_effort: Option<Option<String>>,
+    /// Auxiliary model from this entry's served models, or null to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub lite_model: Option<Option<String>>,
     /// `supports_vision` override for the entry's **default** model, or
     /// `null` to clear. Lands in that model's `model_list` spec; the
     /// entry's other models are file-edited only.
@@ -346,8 +359,12 @@ pub struct UpdateLlmModelRequest {
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub pricing: Option<Option<LlmPricingOverrideDto>>,
     /// Set the literal API key in the vault (`llm.entry.<name>.api_key`).
-    /// Pass `""` to remove the vault entry, or omit the field to leave
-    /// the vault untouched. Never echoed back.
+    /// Pass `""` to delete the stored key, or omit the field to leave the
+    /// vault untouched. Never echoed back.
+    ///
+    /// A delete only removes what THIS vault holds; if `api_key_env` or the
+    /// provider's default env var still resolves, the entry keeps working and
+    /// `api_key_configured` stays true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
@@ -367,6 +384,132 @@ where
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetDefaultLlmRequest {
     pub name: String,
+}
+
+/// How a provider is credentialed (`GET /v1/llm/providers`). Mirrors
+/// `baybo_llm::ProviderAuth`; the DTO exists separately so the wire shape
+/// can't drift when that enum grows a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProviderAuthDto {
+    /// A key is required; the entry cannot be built without one.
+    ApiKey,
+    /// A key is accepted but optional (a local Ollama behind no auth).
+    OptionalApiKey,
+    /// Takes no key at all.
+    Keyless,
+    /// Signed in interactively. `POST /v1/llm/models` refuses these: the
+    /// device-code flow and the token bundle it writes are the CLI's
+    /// (`baybo llm add`), and an entry created here would have no way to
+    /// acquire a credential.
+    Oauth,
+}
+
+impl From<baybo_llm::ProviderAuth> for LlmProviderAuthDto {
+    fn from(v: baybo_llm::ProviderAuth) -> Self {
+        match v {
+            baybo_llm::ProviderAuth::ApiKey => Self::ApiKey,
+            baybo_llm::ProviderAuth::OptionalApiKey => Self::OptionalApiKey,
+            baybo_llm::ProviderAuth::Keyless => Self::Keyless,
+            baybo_llm::ProviderAuth::OAuth => Self::Oauth,
+        }
+    }
+}
+
+/// One provider this build can serve, in registration order.
+///
+/// The registry is compiled in, so this list is the ONLY way a client learns
+/// which provider ids are legal. Without it a create form has to free-text the
+/// field, and a wrong provider is not an error: `prepare` warns and drops the
+/// entry from the pool, `dry_run` passes, the file is written, and
+/// `GET /v1/llm/models` keeps listing a row that no longer exists.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmProviderInfo {
+    pub name: String,
+    pub auth: LlmProviderAuthDto,
+    /// Prefill for the base-URL field; `None` means the provider's own client
+    /// supplies one and the operator need not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_base_url: Option<String>,
+    /// The env var this provider conventionally reads its key from, when it
+    /// has one. A client can offer it as the alternative to storing a key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_api_key_env: Option<String>,
+}
+
+/// `GET /v1/llm/providers` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmProvidersResponse {
+    pub items: Vec<LlmProviderInfo>,
+}
+
+/// `POST /v1/llm/models` body — create an entry.
+///
+/// Creates the served model set and optional auxiliary selection atomically.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateLlmModelRequest {
+    /// Unique entry name. It is also a URL path segment on every other
+    /// `/v1/llm/models/{name}` route and the suffix of this entry's vault key,
+    /// so the handler constrains it beyond `validate()`'s non-empty rule.
+    pub name: String,
+    /// Must be one of `GET /v1/llm/providers`, and not an OAuth one.
+    pub provider: String,
+    pub model: String,
+    /// Additional served model ids. The default model is included automatically.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Optional auxiliary model; must belong to the served set.
+    #[serde(default)]
+    pub lite_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Stored in the vault under this entry's name. Never echoed back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+/// `PUT /v1/llm/models/{name}/model-list` body — the models this entry
+/// serves, as a SET, in picker order.
+///
+/// Replace rather than add/remove, for two reasons. Model ids routinely
+/// contain a slash (`meta-llama/Llama-3-70B`), which makes them unsafe as a
+/// path segment; and a whole-set PUT is idempotent, so a client whose request
+/// is replayed converges instead of double-adding.
+///
+/// **Replacing the list never destroys an override.** The handler keeps each
+/// surviving id's existing `LlmModelSpec` and only mints a bare one for an id
+/// that was not there — so a caller may send plain ids without knowing which
+/// overrides exist. Dropping an id DOES drop its overrides, which is the point
+/// of dropping it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetLlmModelListRequest {
+    pub models: Vec<String>,
+}
+
+/// One model as the provider's own catalog reports it
+/// (`GET /v1/llm/models/{name}/catalog`). A LIVE read over the provider's API,
+/// not config — so it can be slow, and it can fail for an entry whose
+/// credentials are not yet valid.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmCatalogModel {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    /// Whether this id is already in the entry's `model_list`, so a picker can
+    /// tell what it would be adding from what is already served.
+    pub configured: bool,
+}
+
+/// `GET /v1/llm/models/{name}/catalog` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmCatalogResponse {
+    pub items: Vec<LlmCatalogModel>,
 }
 
 /// `POST /v1/llm/models/{name}/test` response. Carries the latency and

@@ -77,6 +77,13 @@ impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
         Some(super::DEFAULT_BASE_URL)
     }
 
+    /// The one OAuth provider. A client that can only carry an API key has no
+    /// way to credential an entry for it, so this is what lets such a client
+    /// refuse it by asking rather than by knowing this provider's name.
+    fn auth(&self) -> crate::ProviderAuth {
+        crate::ProviderAuth::OAuth
+    }
+
     // No `default_api_key_env` override: this provider's credential is
     // an OAuth bearer in the secret vault, not an env-var-backed API
     // key. Leaving the trait default (`None`) keeps `resolve_api_key`'s

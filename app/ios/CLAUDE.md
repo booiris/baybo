@@ -212,6 +212,13 @@ was tried and failed, and several name a bug that shipped once already.
   [`docs/sync-protocol.md`](../../docs/sync-protocol.md) first.
 - [`docs/model-picker.md`](docs/model-picker.md) — the header capsule, the
   hand-rolled menu panel, and the per-session `(entry, model, effort)` pin.
+- [`docs/entry-editor.md`](docs/entry-editor.md) — Settings → Models: the
+  gateway's `llm` entries and the editor for one. The GLOBAL half of the model
+  story (the picker above is the per-session half). Read it before touching
+  `LlmEntryScreen` or any `llm_*` write: the one-key-per-PUT rule prevents ambiguous model/override edits. Key removal
+  applies only to vault credentials; direct cleartext bindings hide key entry,
+  and an explicit environment override earns a warning. Creation must pass the
+  entry-specific pre-flight, and all mutations preserve restart-pending status.
 - [`docs/approvals.md`](docs/approvals.md) — the native tool-approval card and
   the four frames that drive it.
 - [`docs/projects.md`](docs/projects.md) — the Projects tab: the cards root,

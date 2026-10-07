@@ -775,8 +775,16 @@ PUT    /v1/agents/:agent_id/avatar      set the profile's avatar
 DELETE /v1/agents/:agent_id
 
 GET    /v1/llm                          currently active provider/model
+GET    /v1/llm/providers                providers this build can serve + how each authenticates
 GET    /v1/llm/models                   configured LLM entries + effective settings
+POST   /v1/llm/models                   create an entry (refuses OAuth providers)
+DELETE /v1/llm/models/:name             remove an entry + its vault key
+                                        (refuses default-llm and OAuth entries)
 PUT    /v1/llm/models/:name             edit an entry (hot-reloaded in-process)
+                                        `model` may not travel with a per-model
+                                        fact; `api_key: ""` deletes the key
+PUT    /v1/llm/models/:name/model-list  replace the models it serves (whole set)
+GET    /v1/llm/models/:name/catalog     the provider's LIVE model catalog
 POST   /v1/llm/models/:name/test        probe the entry's provider
 PUT    /v1/llm/default                  set default-llm (hot-reloaded)
 GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregates
@@ -858,6 +866,11 @@ GET    /v1/logs/stream                  SSE tail of the same buffer
 
 GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin surface
 ```
+
+LLM entry creation requires its name in the pre-flight `ReloadOutcome.entries`,
+not merely a buildable default pool. Rejected creations restore staged vault
+credentials. The list response's `can_remove` uses the deletion handler's own
+predicate, excluding the default and OAuth entries.
 
 `GET /v1/status` includes `server_key`, the lowercase hex encoding of the
 gateway's persisted Noise X25519 static public key. It is a public, stable

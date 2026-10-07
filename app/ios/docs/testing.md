@@ -632,3 +632,7 @@ The [Linux NAT matrix](../../../docs/testing.md#direct-carrier-nat-matrix)
 exercises the Rust networking core in isolated virtual networks. It does not
 replace this device checklist; its prerequisites and cleanup limitations live
 in the linked guide.
+
+`-baybo-demo-models-staged` together with `-baybo-demo-models` seeds the
+restart-pending catalog state for the LLM entry smoke tests. The models fixture
+also includes a non-removable OAuth entry.
