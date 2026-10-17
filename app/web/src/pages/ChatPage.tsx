@@ -34,6 +34,7 @@ import {
   RiCloseLine,
   RiDeleteBin6Line,
   RiErrorWarningLine,
+  RiGlobalLine,
   RiHistoryLine,
   RiInformation2Line,
   RiLoader4Line,
@@ -86,7 +87,10 @@ import { withoutArchived } from './chat/sessionBuckets';
 import { anchorRowFor, clearSearchHighlight, paintSearchHighlight } from './chat/searchJump';
 import type { SessionSummary } from './chat/types';
 import { ISSUE_REF_COMPONENTS, remarkIssueRefs } from './projects/issueRefs';
-import { BROWSER_VIEW_HREF, isBrowserTool } from './browser/route';
+import { isBrowserTool } from './browser/route';
+import { BrowserPanel } from './browser/BrowserPanel';
+import { OpenBrowserPanelContext, useOpenBrowserPanel } from './browser/panelContext';
+import { readPanelPrefs, writePanelPrefs, type PanelPrefs } from './browser/panelPrefs';
 
 type ApiTranscriptItem = components['schemas']['ChatTranscriptItem'];
 type ApiAttachment = components['schemas']['ChatAttachment'];
@@ -557,6 +561,14 @@ export function ChatPage() {
   const { baseUrl, token: adminToken } = useAuth();
   const queueStore = useQueueStore();
   const folderStore = useFolderStore();
+  const [browserPanel, setBrowserPanel] = useState<PanelPrefs>(readPanelPrefs);
+  useEffect(() => writePanelPrefs(browserPanel), [browserPanel]);
+  const openBrowserPanel = useCallback(() => setBrowserPanel((p) => ({ ...p, open: true })), []);
+  const closeBrowserPanel = useCallback(() => setBrowserPanel((p) => ({ ...p, open: false })), []);
+  const resizeBrowserPanel = useCallback(
+    (width: number) => setBrowserPanel((p) => (p.width === width ? p : { ...p, width })),
+    [],
+  );
   // Reactive interjection queue for the active session (drives the panel, the
   // park-vs-direct decision, and the Send-button affordance).
   const queue = useSessionQueue(sessionId);
@@ -3360,8 +3372,11 @@ export function ChatPage() {
         onNewChatInFolder={handleNewChatInFolder}
       />
 
+      <OpenBrowserPanelContext.Provider value={openBrowserPanel}>
+      {/* Thread + the optional browser panel docked on its right. */}
+      <div className="flex flex-1 min-w-0 overflow-hidden relative">
       {/* Main column */}
-      <main className="flex-1 flex flex-col overflow-hidden relative">
+      <main className="flex-1 min-w-0 flex flex-col overflow-hidden relative">
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-canvas">
           <div className="flex items-center gap-2 min-w-0 flex-1">
             {sessionId ? (
@@ -3390,6 +3405,18 @@ export function ChatPage() {
           </div>
           <div className="flex items-center gap-3 shrink-0">
             <ConnectionBadge status={status} />
+            <button
+              type="button"
+              onClick={browserPanel.open ? closeBrowserPanel : openBrowserPanel}
+              aria-pressed={browserPanel.open}
+              title={browserPanel.open ? 'Hide the agent browser' : "Show the agent's browser live"}
+              aria-label="Agent browser"
+              className={`h-7 w-7 flex items-center justify-center border-2 border-black rounded-md shadow-brutal-xs active:translate-x-[1px] active:translate-y-[1px] active:shadow-none ${
+                browserPanel.open ? 'bg-brand text-ink hover:bg-brand-hover' : 'bg-surface text-ink-soft hover:text-ink hover:bg-canvas'
+              }`}
+            >
+              <RiGlobalLine className="text-base" />
+            </button>
           </div>
         </header>
 
@@ -3695,6 +3722,16 @@ export function ChatPage() {
         </div>
         </div>
       </main>
+
+      {browserPanel.open ? (
+        <BrowserPanel
+          width={browserPanel.width}
+          onWidthChange={resizeBrowserPanel}
+          onClose={closeBrowserPanel}
+        />
+      ) : null}
+      </div>
+      </OpenBrowserPanelContext.Provider>
 
       {hidePrompt ? (
         <HideSessionModal
@@ -6732,6 +6769,7 @@ function ReasoningStepView({ text }: { text: string }) {
 // view. `prose` never reaches here: `segmentWorkSteps` routes the model's own
 // words to `WorkSpeechRun`, outside the collapse.
 export function WorkStepView({ step }: { step: WorkStep }) {
+  const openBrowserPanel = useOpenBrowserPanel();
   if (step.kind === 'reasoning') {
     return <ReasoningStepView text={step.text ?? ''} />;
   }
@@ -6784,17 +6822,15 @@ export function WorkStepView({ step }: { step: WorkStep }) {
         {step.toolLabel ? (
           <span className="text-ink-soft break-words [overflow-wrap:anywhere]">({step.toolLabel})</span>
         ) : null}
-        {isBrowserTool(step.tool) ? (
-          // A new tab, so the chat stays put while the browser is watched.
-          <a
-            href={BROWSER_VIEW_HREF}
-            target="_blank"
-            rel="noopener"
+        {openBrowserPanel && isBrowserTool(step.tool) ? (
+          <button
+            type="button"
+            onClick={openBrowserPanel}
             title="Watch the agent's browser live"
             className="text-info underline decoration-dotted hover:text-ink"
           >
             view
-          </a>
+          </button>
         ) : null}
         {/* A call parked on the approval card is NOT running — no spinner, or it
             would read as work in progress while nothing executes. */}

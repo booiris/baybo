@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, render } from '@testing-library/react';
+import { act, fireEvent, render } from '@testing-library/react';
 
 import { WorkSpeechRun, WorkStepView, type WorkStep } from './ChatPage';
+import { OpenBrowserPanelContext } from './browser/panelContext';
 
 // Which steps inside a work block are MARKDOWN and which are verbatim is a
 // contract, not a styling detail: the model writes its reasoning in the same
@@ -153,13 +154,29 @@ describe('WorkStepView reasoning sampling', () => {
   });
 });
 
-describe('WorkStepView browser view link', () => {
-  it('links browser tool steps to the live view, and nothing else', () => {
+describe('WorkStepView browser view button', () => {
+  it('opens the browser panel from browser tool steps, and nothing else', () => {
+    const open = vi.fn();
     const browser = render(
+      <OpenBrowserPanelContext.Provider value={open}>
+        <WorkStepView step={step({ kind: 'tool', tool: 'browser/navigate_page', toolStatus: 'ok' })} />
+      </OpenBrowserPanelContext.Provider>,
+    );
+    const button = browser.getByRole('button', { name: 'view' });
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledOnce();
+    const other = render(
+      <OpenBrowserPanelContext.Provider value={open}>
+        <WorkStepView step={step({ kind: 'tool', tool: 'read_file', toolStatus: 'ok' })} />
+      </OpenBrowserPanelContext.Provider>,
+    );
+    expect(other.container.querySelector('button')).toBeNull();
+  });
+
+  it('offers nothing where there is no panel to open (the board run transcript)', () => {
+    const { queryByRole } = render(
       <WorkStepView step={step({ kind: 'tool', tool: 'browser/navigate_page', toolStatus: 'ok' })} />,
     );
-    expect(browser.container.querySelector('a')?.getAttribute('href')).toBe('#/browser');
-    const other = render(<WorkStepView step={step({ kind: 'tool', tool: 'read_file', toolStatus: 'ok' })} />);
-    expect(other.container.querySelector('a')).toBeNull();
+    expect(queryByRole('button', { name: 'view' })).toBeNull();
   });
 });

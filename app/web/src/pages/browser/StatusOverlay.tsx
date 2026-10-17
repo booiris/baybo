@@ -10,7 +10,7 @@ const TONE_TEXT: Record<OverlayTone, string> = {
 export function StatusOverlay({ overlay }: { overlay: Overlay }) {
   const Icon = overlay.tone === 'info' ? RiInformationLine : RiErrorWarningLine;
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-canvas/85 p-6" role="status">
+    <div className="absolute inset-0 flex items-center justify-center bg-canvas/85 p-3 overflow-y-auto" role="status">
       <div className="max-w-md w-full bg-surface border-2 border-black rounded-brutal shadow-brutal-sm p-4 flex flex-col gap-2">
         <div className={`flex items-center gap-2 font-bold uppercase tracking-wider text-sm ${TONE_TEXT[overlay.tone]}`}>
           <Icon className="text-lg shrink-0" />

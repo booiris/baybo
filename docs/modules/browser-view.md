@@ -26,7 +26,7 @@ the gateway always answers it with `takeover_disabled`.
                                                └────────────┬─────────────┘
                                          WS, admin token, ≤ MAX_VIEWERS
                                                ┌────────────▼─────────────┐
-                                               │ web dashboard  #/browser │
+                                               │ web chat: browser panel  │
                                                └──────────────────────────┘
 ```
 

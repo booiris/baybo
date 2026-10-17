@@ -14,8 +14,6 @@ import { ProjectsIndex } from './pages/projects/ProjectsIndex';
 import { ProjectBoardPage } from './pages/projects/ProjectBoardPage';
 import { ColumnPage } from './pages/projects/ColumnPage';
 import { IssueDetailPage } from './pages/projects/IssueDetailPage';
-import { BrowserPage } from './pages/browser/BrowserPage';
-import { BROWSER_VIEW_ROUTE } from './pages/browser/route';
 import { useAuth } from './api/auth';
 
 export default function App() {
@@ -87,7 +85,6 @@ export default function App() {
           <Route path="/cron" element={<CronPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/llm" element={<LlmPage />} />
-          <Route path={BROWSER_VIEW_ROUTE} element={<BrowserPage />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Routes>
       </main>
