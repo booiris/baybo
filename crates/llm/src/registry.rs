@@ -10,6 +10,7 @@ use crate::providers::{
     minimax::MiniMaxProviderFactory,
     openai::OpenAIProviderFactory,
     openai_subscription::OpenAiSubscriptionProviderFactory,
+    opencode::OpencodeProviderFactory,
     rig_providers::{
         CohereProviderFactory, DeepSeekProviderFactory, GroqProviderFactory,
         HuggingFaceProviderFactory, HyperbolicProviderFactory, LlamafileProviderFactory,
@@ -87,6 +88,14 @@ impl std::fmt::Debug for LlmProviderConfig {
 pub trait LlmProviderFactory: Send + Sync {
     /// Returns the provider name this factory handles (e.g. `"openai"`, `"anthropic"`).
     fn provider_name(&self) -> &str;
+
+    /// Required even for providers with no effort support (`Unwired`).
+    fn effort_wire(&self, model: &str) -> crate::effort::EffortWire;
+
+    /// Model-specific fallbacks, available without credentials or network I/O.
+    fn model_defaults(&self, _model: &str) -> crate::FactoryDefaults {
+        crate::providers::factory_defaults_for(self.provider_name())
+    }
 
     /// Creates an `LlmClient` from the given configuration.
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient>;
@@ -215,7 +224,7 @@ impl LlmProviderRegistry {
         // First on purpose: the picker renders this order, only ~12 of the
         // rows fit on screen at once, and this is the one provider that
         // needs no API key — an operator with a ChatGPT/Codex plan and
-        // nothing else should not have to scroll past 18 key-gated
+        // nothing else should not have to scroll past the key-gated
         // providers to find the one they can actually use.
         registry.register(OpenAiSubscriptionProviderFactory);
         registry.register(OpenAIProviderFactory);
@@ -223,6 +232,8 @@ impl LlmProviderRegistry {
         registry.register(GeminiProviderFactory);
         registry.register(MiniMaxProviderFactory);
         registry.register(DeepSeekProviderFactory);
+        registry.register(OpencodeProviderFactory::Zen);
+        registry.register(OpencodeProviderFactory::Go);
         registry.register(XaiProviderFactory);
         registry.register(MistralProviderFactory);
         registry.register(CohereProviderFactory);
@@ -377,6 +388,52 @@ impl Default for LlmProviderRegistry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_uses_the_registered_factorys_model_specific_effort_before_validation() {
+        use crate::effort::EffortWire;
+
+        struct ModelAwareFactory;
+
+        #[async_trait::async_trait]
+        impl LlmProviderFactory for ModelAwareFactory {
+            fn provider_name(&self) -> &str {
+                "openai"
+            }
+
+            fn effort_wire(&self, model: &str) -> EffortWire {
+                match model {
+                    "responses-model" => EffortWire::OpenAiResponses,
+                    _ => EffortWire::OpenAiCompatible,
+                }
+            }
+
+            fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
+                let client = OpenAIProviderFactory.create(config)?;
+                Ok(LlmClient::new(
+                    client.model_info,
+                    client.model,
+                    self.effort_wire(&config.model),
+                ))
+            }
+        }
+
+        let mut registry = LlmProviderRegistry::new();
+        registry.register(ModelAwareFactory);
+        let mut config = bare_config("openai");
+        config.api_key = Some("test-key".into());
+        config.model = "responses-model".into();
+        config.reasoning_effort = Some("off".into());
+        let client = registry.build_client(&config).unwrap();
+        assert_eq!(client.effort_wire(), EffortWire::OpenAiResponses);
+        assert_eq!(client.effective_effort(None).as_deref(), Some("off"));
+
+        config.model = "chat-model".into();
+        assert!(matches!(
+            registry.build_client(&config),
+            Err(crate::LlmError::Config(_))
+        ));
+    }
+
     /// Stub factory that doesn't override `live_models` — exercises the
     /// default trait impl that maps the OpenRouter snapshot catalog into
     /// bare LiveModelInfo entries. `provider` selects which catalog.
@@ -386,6 +443,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmProviderFactory for StubFactory {
+        fn effort_wire(&self, _model: &str) -> crate::effort::EffortWire {
+            crate::effort::EffortWire::Unwired
+        }
+
         fn provider_name(&self) -> &str {
             self.provider
         }
@@ -449,6 +510,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmProviderFactory for EmptyLiveFactory {
+        fn effort_wire(&self, _model: &str) -> crate::effort::EffortWire {
+            crate::effort::EffortWire::Unwired
+        }
+
         fn provider_name(&self) -> &str {
             self.name
         }
@@ -507,6 +572,10 @@ mod tests {
         struct OneLiveFactory;
         #[async_trait::async_trait]
         impl LlmProviderFactory for OneLiveFactory {
+            fn effort_wire(&self, _model: &str) -> crate::effort::EffortWire {
+                crate::effort::EffortWire::Unwired
+            }
+
             fn provider_name(&self) -> &str {
                 "anthropic"
             }

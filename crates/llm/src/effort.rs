@@ -164,6 +164,9 @@ use ReasoningEffort as R;
 const OPENAI_LEVELS: &[ReasoningEffort] = &[R::Low, R::Medium, R::High, R::XHigh, R::Max];
 const ANTHROPIC_LEVELS: &[ReasoningEffort] = &[R::Low, R::Medium, R::High, R::XHigh, R::Max];
 const GEMINI_LEVELS: &[ReasoningEffort] = &[R::Minimal, R::Low, R::Medium, R::High];
+// rig's typed Responses request cannot serialize `max` yet.
+const RESPONSES_LEVELS: &[ReasoningEffort] =
+    &[R::Off, R::Minimal, R::Low, R::Medium, R::High, R::XHigh];
 /// Codex Responses spans the whole ladder across its model families, but
 /// which rungs a *given* model takes is narrower and moves — `gpt-5.6-sol`
 /// answers `level 'max' not supported, valid levels: low, medium, high,
@@ -186,6 +189,8 @@ pub enum EffortWire {
     /// Top-level `reasoning_effort` — OpenAI Chat Completions and the many
     /// providers that mirror its request shape.
     OpenAiCompatible,
+    /// OpenAI Responses API's nested `reasoning.effort`.
+    OpenAiResponses,
     /// `output_config.effort` — Anthropic Messages API. Note this is a
     /// sibling of `thinking`, not a field inside it.
     Anthropic,
@@ -206,6 +211,7 @@ impl EffortWire {
     fn dialect(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "the OpenAI `reasoning_effort` dialect",
+            Self::OpenAiResponses => "OpenAI Responses `reasoning.effort`",
             Self::Anthropic => "Anthropic `output_config.effort`",
             Self::Gemini => "Gemini `thinkingConfig.thinkingLevel`",
             Self::ProviderNative => "Codex Responses `reasoning.effort`",
@@ -218,6 +224,7 @@ impl EffortWire {
     pub fn levels(self) -> &'static [ReasoningEffort] {
         match self {
             Self::OpenAiCompatible => OPENAI_LEVELS,
+            Self::OpenAiResponses => RESPONSES_LEVELS,
             Self::Anthropic => ANTHROPIC_LEVELS,
             Self::Gemini => GEMINI_LEVELS,
             Self::ProviderNative => CODEX_LEVELS,
@@ -227,7 +234,7 @@ impl EffortWire {
 
     /// This dialect's name for `level`.
     ///
-    /// Only Codex can say "off", and it spells it `none`; the others disable
+    /// Responses dialects can say "off", and spell it `none`; the others disable
     /// thinking through a separate mechanism baybo does not drive, so `off`
     /// is reported as inexpressible rather than approximated by their lowest
     /// level. Every other rung shares baybo's own spelling, which is why the
@@ -254,6 +261,7 @@ impl EffortWire {
     pub(crate) fn params(self, level: &str) -> Option<Value> {
         match self {
             Self::OpenAiCompatible => Some(json!({ OPENAI_FIELD: level })),
+            Self::OpenAiResponses => Some(json!({ "reasoning": { "effort": level } })),
             Self::Anthropic => Some(json!({ "output_config": { "effort": level } })),
             Self::Gemini => Some(json!({
                 "generationConfig": { "thinkingConfig": { "thinkingLevel": level } }

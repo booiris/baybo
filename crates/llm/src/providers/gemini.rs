@@ -15,6 +15,7 @@ rig_provider_factory!(
     "gemini",
     gemini,
     Gemini,
+    effort = Gemini,
     priced = crate::providers::catalog::GEMINI_FLAT_DEFAULT_PRICING,
     live_models = gemini_live_models,
     api_key_env = "GEMINI_API_KEY",

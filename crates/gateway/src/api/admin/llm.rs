@@ -456,7 +456,7 @@ async fn build_model_entry(
     let caps = baybo_llm::openrouter::capabilities_for(&entry.provider, &entry.model);
     let factory_pricing =
         baybo_llm::openrouter::pricing_for(&entry.provider, &entry.model).unwrap_or_default();
-    let defaults = baybo_llm::factory_defaults_for(&entry.provider);
+    let defaults = baybo_llm::factory_defaults_for_model(&entry.provider, &entry.model);
 
     // The dashboard's "effective" columns describe the entry's DEFAULT
     // model, so they layer that model's own spec — not an entry-wide one.
@@ -516,11 +516,14 @@ async fn build_model_entry(
         api_key_env: entry.api_key_env.clone(),
         api_key_configured,
         reasoning_effort: entry.reasoning_effort.clone(),
-        available_efforts: baybo_llm::providers::effort_wire_for_provider(&entry.provider)
-            .levels()
-            .iter()
-            .map(|level| level.to_string())
-            .collect(),
+        available_efforts: baybo_llm::providers::effort_wire_for_model(
+            &entry.provider,
+            &entry.model,
+        )
+        .levels()
+        .iter()
+        .map(|level| level.to_string())
+        .collect(),
         is_default: cfg.default_llm == entry.name,
         effective_context_window,
         effective_supports_vision,

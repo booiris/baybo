@@ -69,6 +69,10 @@ pub struct OpenAiSubscriptionProviderFactory;
 
 #[async_trait::async_trait]
 impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
+    fn effort_wire(&self, _model: &str) -> crate::effort::EffortWire {
+        crate::effort::EffortWire::ProviderNative
+    }
+
     fn provider_name(&self) -> &str {
         PROVIDER_NAME
     }
@@ -98,6 +102,7 @@ impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
         Ok(LlmClient::new(
             model_info,
             AnyCompletionModel::OpenAiSubscription(model),
+            self.effort_wire(&config.model),
         ))
     }
 

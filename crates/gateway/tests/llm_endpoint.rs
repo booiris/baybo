@@ -156,6 +156,62 @@ async fn list_models_returns_default_and_effective_fields() {
 
 // ── update_model ─────────────────────────────────────────────────────
 
+#[tokio::test]
+async fn opencode_dashboard_metadata_matches_each_models_protocol() {
+    let seed = BayboConfig {
+        llm: vec![
+            entry("go-gpt", "opencode-go", "gpt-5.6-luna"),
+            entry("go-glm", "opencode-go", "glm-5.3"),
+            entry("zen-claude", "opencode", "claude-haiku-5-5"),
+        ],
+        default_llm: "go-gpt".into(),
+        ..Default::default()
+    };
+    let (router, _dir, _path) = router_with_seed_config(seed).await;
+    let request = auth(
+        Request::builder()
+            .uri("/v1/llm/models")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let (status, body) = read_json(router.oneshot(request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    let gpt = items.iter().find(|item| item["name"] == "go-gpt").unwrap();
+    let glm = items.iter().find(|item| item["name"] == "go-glm").unwrap();
+    let claude = items
+        .iter()
+        .find(|item| item["name"] == "zen-claude")
+        .unwrap();
+    assert_eq!(gpt["effective_supports_vision"], true);
+    assert!(
+        gpt["available_efforts"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("off"))
+    );
+    assert!(
+        !gpt["available_efforts"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("max"))
+    );
+    assert_eq!(glm["effective_supports_vision"], false);
+    assert!(
+        !glm["available_efforts"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("off"))
+    );
+    assert_eq!(claude["effective_supports_vision"], true);
+    assert!(
+        !claude["available_efforts"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("off"))
+    );
+}
+
 /// The per-model facts are addressed through the entry, but land on the
 /// entry's default model inside `model_list` — that is where the runtime
 /// reads them from when it builds that model's client.
