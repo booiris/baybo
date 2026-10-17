@@ -22,6 +22,10 @@ pub struct MiniMaxProviderFactory;
 
 #[async_trait::async_trait]
 impl LlmProviderFactory for MiniMaxProviderFactory {
+    fn effort_wire(&self, _model: &str) -> crate::effort::EffortWire {
+        crate::effort::EffortWire::Anthropic
+    }
+
     fn provider_name(&self) -> &str {
         "minimax"
     }
@@ -81,6 +85,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         Ok(LlmClient::new(
             model_info,
             AnyCompletionModel::Minimax(model),
+            self.effort_wire(&config.model),
         ))
     }
 

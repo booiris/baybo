@@ -8,6 +8,7 @@ index.scip
 baybo.json
 baybo_online.json
 **/node_modules/
+/package-lock.json
 sidecars/*/*/dist/
 app/web/dist/
 bench/bench-web/web/dist/

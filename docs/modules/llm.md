@@ -16,7 +16,7 @@ Core responsibilities:
 
 ### rig-based completion with enum dispatch
 
-`LlmClient` wraps `AnyCompletionModel`, an enum with one variant per provider — `OpenAI`, `Anthropic`, `Gemini`, `DeepSeek`, `Minimax`, a set of rig-backed hosts added via the `rig_provider_factory!` macro (xAI, Mistral, Cohere, Perplexity, Moonshot, Z.ai, XiaomiMiMo, Groq, Together, Ollama, llamafile, Hyperbolic, HuggingFace), and `OpenAiSubscription` (the Sign in with ChatGPT token-sharing path, documented in [`llm-openai-subscription.md`](llm-openai-subscription.md)). The MiniMax provider uses rig's dedicated MiniMax client on its Anthropic-compatible surface (default base URL `https://api.minimaxi.com/anthropic`), sharing the Anthropic variant's cache-bucket folding and stream path; DeepSeek uses rig's dedicated `deepseek` provider (default `https://api.deepseek.com`) rather than the generic OpenAI-compatible path, because thinking mode requires `reasoning_content` round-tripped on assistant tool-call turns. This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
+`LlmClient` wraps `AnyCompletionModel`, an enum with one variant per provider — `OpenAI`, `Anthropic`, `Gemini`, `DeepSeek`, `Minimax`, a set of rig-backed hosts added via the `rig_provider_factory!` macro (xAI, Mistral, Cohere, Perplexity, Moonshot, Z.ai, XiaomiMiMo, Groq, Together, Ollama, llamafile, Hyperbolic, HuggingFace), `OpenAIResponses` (native Responses), `Opencode` (plan/model routing and per-call session headers), and `OpenAiSubscription` (the Sign in with ChatGPT token-sharing path, documented in [`llm-openai-subscription.md`](llm-openai-subscription.md)). The MiniMax provider uses rig's dedicated MiniMax client on its Anthropic-compatible surface (default base URL `https://api.minimaxi.com/anthropic`), sharing the Anthropic variant's cache-bucket folding and stream path; DeepSeek uses rig's dedicated `deepseek` provider (default `https://api.deepseek.com`) rather than the generic OpenAI-compatible path, because thinking mode requires `reasoning_content` round-tripped on assistant tool-call turns. This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
 
 `OpenAiSubscription` bypasses the rig adapter: it speaks the public Responses API directly over HTTP with dynamic OAuth registration (and retains a legacy Codex route for old credentials); it plugs into the same enum dispatch as the rig providers — `LlmClient` builds the rig `CompletionRequest` normally, and `OpenAiSubscriptionCompletionModel` converts it into a Responses API request with custom auth and 401-refresh handling.
 
@@ -28,7 +28,88 @@ Subprocess-driven agents (the `claude` and `codex` binaries) are **not** LLM pro
 
 ### Provider registry pattern
 
-`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI-subscription, OpenAI, Anthropic, Gemini, MiniMax, DeepSeek, xAI, Mistral, Cohere, Perplexity, Moonshot, Z.ai, XiaomiMiMo, Groq, Together, Ollama, llamafile, Hyperbolic, HuggingFace) are registered by the crate itself. Registration order is picker order — `provider_names()` returns it verbatim and the setup wizard renders that — so `openai-subscription` is registered first: it is the only provider that needs no API key, and the wizard's menu shows ~12 of the 19 rows at a time. New providers are added by implementing `LlmProviderFactory` and registering it.
+`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI-subscription, OpenAI, Anthropic, Gemini, MiniMax, DeepSeek, OpenCode Zen, OpenCode Go, xAI, Mistral, Cohere, Perplexity, Moonshot, Z.ai, XiaomiMiMo, Groq, Together, Ollama, llamafile, Hyperbolic, HuggingFace) are registered by the crate itself. Registration order is picker order — `provider_names()` returns it verbatim and the setup wizard renders that — so `openai-subscription` is registered first: it is the only provider that needs no API key, and the wizard's menu shows ~12 provider rows at a time. New providers are added by implementing `LlmProviderFactory` and registering it.
+
+Each factory declares `effort_wire(model)` and may override
+`model_defaults(model)`. Metadata queries resolve through the registry without
+credentials or network I/O; the dashboard and CLI use these same methods.
+Effort declaration is required, including an explicit `Unwired` for providers
+without support. Client construction captures the registered factory's dialect
+before validating configured effort, so calls do not repeat metadata lookup.
+
+### OpenCode Zen and Go
+
+`opencode` is OpenCode Console's pay-as-you-go provider (formerly Zen);
+`opencode-go` uses the Go subscription endpoint. Both are API-key providers
+registered in the normal provider picker, so `baybo llm add` configures them
+through the existing encrypted-vault flow. No OpenCode CLI is required.
+The conventional environment variables are `OPENCODE_API_KEY` and
+`OPENCODE_GO_API_KEY`, respectively; they remain separate so configuring Go
+does not silently reuse a pay-as-you-go credential.
+
+For environment-based configuration, add entries to `baybo.json`:
+
+```json
+{
+  "llm": [
+    {
+      "name": "zen",
+      "provider": "opencode",
+      "model": "big-pickle",
+      "api_key_env": "OPENCODE_API_KEY"
+    },
+    {
+      "name": "go",
+      "provider": "opencode-go",
+      "model": "glm-5.3",
+      "api_key_env": "OPENCODE_GO_API_KEY"
+    }
+  ],
+  "default-llm": "go"
+}
+```
+
+Use a bare model id (`glm-5.3`), without an `opencode-go/` prefix. The
+wizard discovers models from the selected plan's `/v1/models` catalog;
+structured-decision Jev models are excluded because they do not support chat.
+Model availability depends on the account and can change.
+
+Defaults are the API roots `https://opencode.ai/inference` and
+`https://opencode.ai/inference/go`. A `base_url` override replaces that root,
+before protocol-specific suffixes. Do not append `/v1`, `/chat/completions`,
+or `/responses` to the configured root.
+
+`providers/opencode.rs` owns the plan and model routing rules from the
+[Console model table](https://opencode.ai/v2/docs/console/models/) and the
+[Go endpoint table](https://opencode.ai/v2/docs/console/go/#endpoints).
+GPT, Grok, and Muse Spark use Responses; Claude and selected Qwen/MiniMax
+models use Messages; Gemini uses its native API; the remaining chat models
+use rig's OpenAI Chat Completions adapter, preserving
+`reasoning_content` across tool turns. Some models use different protocols
+on Zen and Go. Both completion and streaming calls share the existing
+protocol adapters, including cache-token accounting and reasoning effort.
+Client construction and dashboard metadata share the model-specific vision
+and effort defaults, so Go's GLM models do not inherit GPT-only effort levels.
+One `OpencodeProviderFactory` with `Zen` and `Go` variants implements both
+registrations; plan-specific routing stays inside that module.
+The native Responses adapter preserves both tool item and call ids in an
+opaque transcript tool handle, so the next request can reconstruct both.
+
+Every request identifies itself as `baybo/<version>` and sends
+`x-opencode-session`. Billed calls use their session cache key; calls without
+one use a stable client-local id. Headers are constructed per call while the
+underlying HTTP connection pool is shared, so concurrent conversations
+cannot replace each other's session header. These implement Go's
+[client requirements](https://opencode.ai/v2/docs/console/go/#where-can-i-use-it).
+
+The catalog supplies model ids but no context or pricing metadata. Context
+uses the shared provider fallback unless overridden in `model_list`.
+Vision defaults conservatively to known native model families; other models
+can opt in with `supports_vision`. Neither provider borrows OpenRouter's
+prices: Go uses zero per-call pricing, and Zen also defaults to zero until
+the operator sets per-model `pricing`. Set those overrides when monetary
+budget enforcement is needed for Zen. Real token counts are recorded on
+both providers.
 
 ### Multimodal support
 

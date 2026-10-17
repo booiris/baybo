@@ -13,6 +13,10 @@ pub struct AnthropicProviderFactory;
 
 #[async_trait::async_trait]
 impl LlmProviderFactory for AnthropicProviderFactory {
+    fn effort_wire(&self, _model: &str) -> crate::effort::EffortWire {
+        crate::effort::EffortWire::Anthropic
+    }
+
     fn provider_name(&self) -> &str {
         "anthropic"
     }
@@ -77,6 +81,7 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         Ok(LlmClient::new(
             model_info,
             AnyCompletionModel::Anthropic(model),
+            self.effort_wire(&config.model),
         ))
     }
 

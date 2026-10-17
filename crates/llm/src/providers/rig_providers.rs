@@ -65,7 +65,7 @@ pub(crate) fn rig_model_info(name: &str, model_id: &str, pricing: ModelPricing) 
 /// callers additionally need `rig::client::Nothing`.
 macro_rules! rig_provider_factory {
     // --- shared skeleton: $build yields the configured rig client ---
-    (@factory $factory:ident, $name:literal, $variant:ident, $build:expr
+    (@factory $factory:ident, $name:literal, $variant:ident, $effort:ident, $build:expr
         $(, pricing = $pricing:expr)?
         $(, live_models = $live:path)?
         $(, api_key_env = $env:expr)?
@@ -77,6 +77,10 @@ macro_rules! rig_provider_factory {
         impl LlmProviderFactory for $factory {
             fn provider_name(&self) -> &str {
                 $name
+            }
+
+            fn effort_wire(&self, _model: &str) -> $crate::effort::EffortWire {
+                $crate::effort::EffortWire::$effort
             }
 
             $(fn flat_default_pricing(&self) -> ModelPricing { $pricing })?
@@ -92,7 +96,7 @@ macro_rules! rig_provider_factory {
                     &config.model,
                     self.pricing_for_model(&config.model),
                 );
-                Ok(LlmClient::new(model_info, AnyCompletionModel::$variant(model)))
+                Ok(LlmClient::new(model_info, AnyCompletionModel::$variant(model), self.effort_wire(&config.model)))
             }
 
             $(
@@ -107,12 +111,12 @@ macro_rules! rig_provider_factory {
     };
 
     // require an API key, snapshot-backed pricing
-    ($factory:ident, $name:literal, $module:ident, $variant:ident, priced = $pricing:expr
+    ($factory:ident, $name:literal, $module:ident, $variant:ident, effort = $effort:ident, priced = $pricing:expr
         $(, live_models = $live:path)?
         $(, api_key_env = $env:expr)?
         $(, base_url = $url:expr)?
     ) => {
-        rig_provider_factory!(@factory $factory, $name, $variant,
+        rig_provider_factory!(@factory $factory, $name, $variant, $effort,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let api_key = config.api_key.as_deref().ok_or_else(|| {
                     crate::LlmError::Config(format!("{} requires an API key", $name))
@@ -130,12 +134,12 @@ macro_rules! rig_provider_factory {
     };
 
     // require an API key, zero default pricing
-    ($factory:ident, $name:literal, $module:ident, $variant:ident
+    ($factory:ident, $name:literal, $module:ident, $variant:ident, effort = $effort:ident
         $(, live_models = $live:path)?
         $(, api_key_env = $env:expr)?
         $(, base_url = $url:expr)?
     ) => {
-        rig_provider_factory!(@factory $factory, $name, $variant,
+        rig_provider_factory!(@factory $factory, $name, $variant, $effort,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let api_key = config.api_key.as_deref().ok_or_else(|| {
                     crate::LlmError::Config(format!("{} requires an API key", $name))
@@ -152,12 +156,12 @@ macro_rules! rig_provider_factory {
     };
 
     // API key optional (local providers that may sit behind auth)
-    ($factory:ident, $name:literal, $module:ident, $variant:ident, optional_key
+    ($factory:ident, $name:literal, $module:ident, $variant:ident, effort = $effort:ident, optional_key
         $(, live_models = $live:path)?
         $(, api_key_env = $env:expr)?
         $(, base_url = $url:expr)?
     ) => {
-        rig_provider_factory!(@factory $factory, $name, $variant,
+        rig_provider_factory!(@factory $factory, $name, $variant, $effort,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let b = rig::providers::$module::Client::builder();
                 let b = match config.api_key.as_deref() {
@@ -175,12 +179,12 @@ macro_rules! rig_provider_factory {
     };
 
     // provider takes no API key
-    ($factory:ident, $name:literal, $module:ident, $variant:ident, keyless
+    ($factory:ident, $name:literal, $module:ident, $variant:ident, effort = $effort:ident, keyless
         $(, live_models = $live:path)?
         $(, api_key_env = $env:expr)?
         $(, base_url = $url:expr)?
     ) => {
-        rig_provider_factory!(@factory $factory, $name, $variant,
+        rig_provider_factory!(@factory $factory, $name, $variant, $effort,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let b = rig::providers::$module::Client::builder().api_key(Nothing);
                 let b = match config.base_url.as_deref() { Some(u) => b.base_url(u), None => b };
@@ -215,6 +219,7 @@ rig_provider_factory!(
     "deepseek",
     deepseek,
     DeepSeek,
+    effort = OpenAiCompatible,
     priced = catalog::DEEPSEEK_FLAT_DEFAULT_PRICING,
     api_key_env = "DEEPSEEK_API_KEY",
     base_url = "https://api.deepseek.com"
@@ -224,6 +229,7 @@ rig_provider_factory!(
     "xai",
     xai,
     Xai,
+    effort = OpenAiCompatible,
     priced = catalog::XAI_FLAT_DEFAULT_PRICING,
     api_key_env = "XAI_API_KEY",
     base_url = "https://api.x.ai"
@@ -233,6 +239,7 @@ rig_provider_factory!(
     "mistral",
     mistral,
     Mistral,
+    effort = Unwired,
     priced = catalog::MISTRAL_FLAT_DEFAULT_PRICING,
     api_key_env = "MISTRAL_API_KEY",
     base_url = "https://api.mistral.ai"
@@ -242,6 +249,7 @@ rig_provider_factory!(
     "cohere",
     cohere,
     Cohere,
+    effort = Unwired,
     priced = catalog::COHERE_FLAT_DEFAULT_PRICING,
     api_key_env = "COHERE_API_KEY",
     base_url = "https://api.cohere.ai"
@@ -251,6 +259,7 @@ rig_provider_factory!(
     "perplexity",
     perplexity,
     Perplexity,
+    effort = Unwired,
     priced = catalog::PERPLEXITY_FLAT_DEFAULT_PRICING,
     api_key_env = "PERPLEXITY_API_KEY",
     base_url = "https://api.perplexity.ai"
@@ -260,6 +269,7 @@ rig_provider_factory!(
     "moonshot",
     moonshot,
     Moonshot,
+    effort = OpenAiCompatible,
     priced = catalog::MOONSHOT_FLAT_DEFAULT_PRICING,
     api_key_env = "MOONSHOT_API_KEY",
     base_url = "https://api.moonshot.ai/v1"
@@ -269,6 +279,7 @@ rig_provider_factory!(
     "zai",
     zai,
     Zai,
+    effort = OpenAiCompatible,
     priced = catalog::ZAI_FLAT_DEFAULT_PRICING,
     api_key_env = "ZAI_API_KEY",
     base_url = "https://api.z.ai/api/paas/v4"
@@ -278,6 +289,7 @@ rig_provider_factory!(
     "xiaomimimo",
     xiaomimimo,
     XiaomiMimo,
+    effort = Unwired,
     priced = catalog::XIAOMIMIMO_FLAT_DEFAULT_PRICING,
     api_key_env = "XIAOMIMIMO_API_KEY",
     base_url = "https://api.xiaomimimo.com/v1"
@@ -293,6 +305,7 @@ rig_provider_factory!(
     "groq",
     groq,
     Groq,
+    effort = OpenAiCompatible,
     api_key_env = "GROQ_API_KEY",
     base_url = "https://api.groq.com/openai/v1"
 );
@@ -301,6 +314,7 @@ rig_provider_factory!(
     "together",
     together,
     Together,
+    effort = OpenAiCompatible,
     api_key_env = "TOGETHER_API_KEY",
     base_url = "https://api.together.xyz"
 );
@@ -309,6 +323,7 @@ rig_provider_factory!(
     "hyperbolic",
     hyperbolic,
     Hyperbolic,
+    effort = OpenAiCompatible,
     api_key_env = "HYPERBOLIC_API_KEY",
     base_url = "https://api.hyperbolic.xyz"
 );
@@ -317,6 +332,7 @@ rig_provider_factory!(
     "huggingface",
     huggingface,
     HuggingFace,
+    effort = Unwired,
     api_key_env = "HF_TOKEN",
     base_url = "https://router.huggingface.co"
 );
@@ -325,6 +341,7 @@ rig_provider_factory!(
     "ollama",
     ollama,
     Ollama,
+    effort = Unwired,
     optional_key,
     base_url = "http://localhost:11434"
 );
@@ -333,6 +350,7 @@ rig_provider_factory!(
     "llamafile",
     llamafile,
     Llamafile,
+    effort = Unwired,
     keyless,
     base_url = "http://localhost:8080"
 );

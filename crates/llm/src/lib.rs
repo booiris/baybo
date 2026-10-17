@@ -47,7 +47,7 @@ pub(crate) use crate::error::{
 };
 pub use crate::guard::{BillableLlm, LlmCallGuard};
 pub use crate::json_extract::extract_json_object;
-pub use crate::providers::{FactoryDefaults, factory_defaults_for};
+pub use crate::providers::{FactoryDefaults, factory_defaults_for, factory_defaults_for_model};
 pub use crate::registry::{
     LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,
 };
@@ -1188,6 +1188,8 @@ pub(crate) struct ProviderCallExtras<'a> {
 
 pub(crate) enum AnyCompletionModel {
     OpenAI(openai::completion::CompletionModel),
+    OpenAIResponses(openai::responses_api::ResponsesCompletionModel),
+    Opencode(crate::providers::opencode::OpencodeCompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
     /// DeepSeek's dedicated provider — round-trips `reasoning_content`
@@ -1251,6 +1253,7 @@ impl AnyCompletionModel {
             // Every Gemini chat model rig can build is natively
             // multimodal over audio; the text-only 1.0 line is retired.
             Self::Gemini(_) => true,
+            Self::Opencode(model) => model.accepts_audio_content(),
             _ => false,
         }
     }
@@ -1280,6 +1283,8 @@ impl AnyCompletionModel {
         let priced = match self {
             Self::Gemini(_) => gemini_image_tokens(width, height),
             Self::OpenAI(_) | Self::OpenAiSubscription(_) => openai_image_tokens(width, height),
+            Self::OpenAIResponses(_) => openai_image_tokens(width, height),
+            Self::Opencode(model) => model.image_tokens(width, height),
             Self::Anthropic(_) => anthropic_image_tokens(width, height),
             _ => provider_image_tokens(width, height),
         };
@@ -1293,9 +1298,15 @@ impl AnyCompletionModel {
     /// deliberately absent because it uses Chat Completions, whose rig
     /// converter flattens a base64 PDF into ordinary text.
     fn accepts_pdf_document(&self) -> bool {
+        if let Self::Opencode(model) = self {
+            return model.accepts_pdf_document();
+        }
         matches!(
             self,
-            Self::Anthropic(_) | Self::Gemini(_) | Self::OpenAiSubscription(_)
+            Self::Anthropic(_)
+                | Self::Gemini(_)
+                | Self::OpenAiSubscription(_)
+                | Self::OpenAIResponses(_)
         )
     }
 
@@ -1320,6 +1331,15 @@ impl AnyCompletionModel {
         extras: ProviderCallExtras<'_>,
     ) -> std::result::Result<completion::CompletionResponse<()>, CompletionError> {
         match self {
+            Self::Opencode(model) => {
+                let inner = model
+                    .for_session(extras.prompt_cache_key)
+                    .map_err(|e| CompletionError::RequestError(Box::new(e)))?;
+                Box::pin(inner.completion(request, extras)).await
+            }
+            Self::OpenAIResponses(model) => {
+                crate::providers::openai_responses::completion(model, request, extras).await
+            }
             Self::OpenAI(m) => {
                 let resp = m.completion(request).await?;
                 Ok(completion::CompletionResponse {
@@ -1393,6 +1413,15 @@ impl AnyCompletionModel {
         extras: ProviderCallExtras<'_>,
     ) -> std::result::Result<LlmStream, CompletionError> {
         match self {
+            Self::Opencode(model) => {
+                let inner = model
+                    .for_session(extras.prompt_cache_key)
+                    .map_err(|e| CompletionError::RequestError(Box::new(e)))?;
+                Box::pin(inner.stream(request, extras)).await
+            }
+            Self::OpenAIResponses(model) => {
+                crate::providers::openai_responses::stream(model, request, extras).await
+            }
             Self::OpenAI(m) => {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_rig_stream(stream))
@@ -1484,6 +1513,7 @@ pub trait BlobFetcher: Send + Sync {
 pub struct LlmClient {
     pub(crate) model_info: ModelInfo,
     model: AnyCompletionModel,
+    effort_wire: crate::effort::EffortWire,
     /// Optional blob fetcher. When set AND `model_info.supports_vision`
     /// is true, `ContentBlock::Image` / `Audio` / `File` user-content
     /// blocks are materialised into proper rig `Image` / `Audio` /
@@ -1504,10 +1534,15 @@ pub struct LlmClient {
 
 impl LlmClient {
     /// Creates a new `LlmClient` from a provider-specific completion model.
-    pub(crate) fn new(model_info: ModelInfo, model: AnyCompletionModel) -> Self {
+    pub(crate) fn new(
+        model_info: ModelInfo,
+        model: AnyCompletionModel,
+        effort_wire: crate::effort::EffortWire,
+    ) -> Self {
         Self {
             model_info,
             model,
+            effort_wire,
             blob_fetcher: None,
             entry_effort: None,
         }
@@ -2163,7 +2198,7 @@ impl LlmClient {
 
     /// The effort dialect this client's provider speaks.
     pub(crate) fn effort_wire(&self) -> crate::effort::EffortWire {
-        crate::providers::effort_wire_for_provider(&self.model_info.provider)
+        self.effort_wire
     }
 
     /// The pick governing this call — the request's pin, else the entry's.

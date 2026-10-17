@@ -313,7 +313,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
             )
         };
         options.push(api_key_label);
-        if !effort_levels_for(&working.provider).is_empty() {
+        if !effort_levels_for(&working.provider, &working.model).is_empty() {
             options.push(format!(
                 "reasoning    = {}",
                 working.reasoning_effort.as_deref().unwrap_or("(default)")
@@ -428,7 +428,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
             run_subscription_login(vault, ctx.proxy_settings()).await?;
             changed.push("oauth");
         } else if picked.starts_with("reasoning ") {
-            let levels = effort_levels_for(&working.provider);
+            let levels = effort_levels_for(&working.provider, &working.model);
             let labels: Vec<&str> = levels.iter().map(|l| l.as_str()).collect();
             let li = select_one("Thinking effort:", &labels)?;
             let new_effort = Some(labels[li].to_string());
@@ -833,11 +833,11 @@ async fn run_subscription_login(
     Ok(())
 }
 
-/// The thinking rungs `provider` can actually be told, cheapest first.
+/// The thinking rungs the selected model can actually be told, cheapest first.
 /// Empty when baybo sends that provider no effort at all, which is the
 /// picker's cue to hide the row rather than offer inert picks.
-fn effort_levels_for(provider: &str) -> Vec<String> {
-    baybo_llm::providers::effort_wire_for_provider(provider)
+fn effort_levels_for(provider: &str, model: &str) -> Vec<String> {
+    baybo_llm::providers::effort_wire_for_model(provider, model)
         .levels()
         .iter()
         .map(|l| l.to_string())
