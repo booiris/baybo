@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent } from 'react';
-import { RiCloseLine, RiErrorWarningLine, RiTeamLine } from 'react-icons/ri';
+import { RiCloseLine, RiErrorWarningLine } from 'react-icons/ri';
 import { useAuth } from '../../api/auth';
 import type { FrameHeader } from '../../api/browserViewTypes';
 import { BrowserViewConnection } from '../../api/browserViewWs';
@@ -150,11 +150,6 @@ export function BrowserPanel({
       </header>
 
       <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-2.5">
-        <p className="flex items-start gap-1.5 text-ink-soft font-mono text-[0.7rem] leading-snug">
-          <RiTeamLine className="shrink-0 mt-px" />
-          One browser is shared by every session — what you see may be driven by any of them.
-        </p>
-
         {insecure ? (
           <div
             role="alert"
