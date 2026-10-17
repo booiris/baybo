@@ -124,7 +124,7 @@ selected page. Each hop drops instead of queueing:
 
 | Hop | Mechanism |
 |-----|-----------|
-| Chrome → sidecar | `Page.startScreencast` with `quality` 60, max 1280×1280, `everyNthFrame` = round(60 / fps). The cap is 10 fps (5 fps in host mode, where the CDP pipe and event loop are shared with CDDM). Every frame is acked at once. |
+| Chrome → sidecar | `Page.startScreencast` with `quality` 60, max 1280×1280, `everyNthFrame` = round(60 / fps). The cap is 10 fps (5 fps in host mode, where the CDP pipe and event loop are shared with CDDM). Every frame is acked at once. Chrome emits frames only on repaint, so each opened stream is also seeded with one `Page.captureScreenshot` at the same size and quality, unless a real frame beats it; without it a still page shows nothing after the view is (re)opened. |
 | sidecar rate cap | Frames that arrive before the next `1000 / fps` slot are dropped; the newest dropped one is kept and sent when the slot opens, so a page that goes still shows its final state. |
 | sidecar → link | Once `socket.write()` returns false, frames are dropped (newest kept) until `'drain'`. JSON control messages are always written. |
 | gateway hub → viewers | Frames go into a `watch`: one slot, newest wins. A slow viewer skips frames and never holds up the link. State messages go through a 64-deep `broadcast`; a viewer that lags past that is resynced from the cached snapshot. |

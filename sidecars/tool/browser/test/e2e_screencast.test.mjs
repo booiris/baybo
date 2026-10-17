@@ -53,6 +53,9 @@ const ANIMATED_PAGE =
     "data:text/html,<title>e2e-cast</title><body><script>let i=0;setInterval(()=>{" +
     "document.body.style.background='hsl('+((i+=7)%25360)+',60%25,60%25)'},16)</script>";
 
+// Never repaints, so Chrome screencasts nothing for it on its own.
+const STATIC_PAGE = "data:text/html,<title>e2e-static</title><h1>still</h1>";
+
 async function cachedChrome() {
     const xdg = process.env.XDG_CACHE_HOME;
     const cacheDir = join(xdg && xdg.length > 0 ? xdg : join(homedir(), ".cache"), "baybo", "browser", "chrome");
@@ -350,4 +353,24 @@ test("real Chrome: frames, targets, stop, and CDDM's page list is undisturbed", 
 
     const pagesAfter = text(await sidecar.request("tools/call", { name: "list_pages", arguments: {} }));
     assert.equal(pagesAfter, pagesBefore);
+
+    // Reopening the view on a page that is not repainting still shows it.
+    const staticOpened = await sidecar.request("tools/call", { name: "new_page", arguments: { url: STATIC_PAGE } });
+    assert.notEqual(staticOpened.result.isError, true, text(staticOpened));
+    await sleep(500);
+    const seenBefore = gw.messages.length;
+    gw.send({ type: "start_screencast" });
+    const staticLive = await gw.waitFor(
+        (m) => gw.messages.indexOf(m) >= seenBefore && m.json?.type === "stream" && m.json.state === "live" && /e2e-static/.test(m.json.target?.title ?? ""),
+        "Stream live on the static page",
+    );
+    const staticFrame = await gw.waitFor(
+        (m) => gw.messages.indexOf(m) >= seenBefore && m.header?.target_id === staticLive.json.target.target_id,
+        "a frame of the static page",
+        5_000,
+    );
+    assert.equal(staticFrame.jpeg[0], 0xff);
+    assert.equal(staticFrame.jpeg[1], 0xd8);
+    assert.ok(staticFrame.header.device_width > 0);
+    gw.send({ type: "stop_screencast" });
 });

@@ -47,9 +47,14 @@ class Emitter {
 class FakeSession extends Emitter {
     sent = [];
     detached = false;
+    /** method -> (params) => result; anything else answers `{}`. */
+    constructor(responders = {}) {
+        super();
+        this.responders = responders;
+    }
     async send(method, params) {
         this.sent.push({ method, params });
-        return {};
+        return this.responders[method]?.(params) ?? {};
     }
     async detach() {
         this.detached = true;
@@ -83,15 +88,16 @@ function fakeTarget(id, url, title = "", type = "page") {
     };
 }
 
-function fakePage(id, url) {
+function fakePage(id, url, responders = {}) {
     const target = fakeTarget(id, url, `title ${id}`);
     const page = {
         closed: false,
         sessions: [],
+        responders,
         isClosed: () => page.closed,
         target: () => target,
         async createCDPSession() {
-            const s = new FakeSession();
+            const s = new FakeSession(page.responders);
             page.sessions.push(s);
             return s;
         },
@@ -525,4 +531,57 @@ test("clamped text is always well-formed UTF-16", () => {
     const limits = { ...LIMITS, max_text_chars: 2 };
     const info = toTargetInfo(fakeTarget("T1", "https://a/", "a" + emoji), limits);
     assert.equal(info.title, "a");
+});
+
+// A page that is not repainting: Chrome sends no screencast frame at all, so
+// the first one comes from a screenshot.
+const STATIC_PAGE_RESPONDERS = {
+    "Page.getLayoutMetrics": () => ({
+        cssVisualViewport: { clientWidth: 1920, clientHeight: 1080, pageX: 0, pageY: 300, scale: 1 },
+    }),
+    "Page.captureScreenshot": () => ({ data: JPEG_B64 }),
+};
+
+test("a page that never repaints still gets a first frame from a screenshot", async () => {
+    const { hub, sink } = newHub();
+    const page = fakePage("T1", "https://a.example/", STATIC_PAGE_RESPONDERS);
+    await hub.attach(fakeContext([page]));
+    await hub.start();
+    await flush();
+    assert.equal(sink.frames.length, 1);
+    const shot = page.sessions[0].sent.find((m) => m.method === "Page.captureScreenshot");
+    // Sized the way the screencast's maxWidth would size it.
+    assert.deepEqual(shot.params.clip, { x: 0, y: 300, width: 1920, height: 1080, scale: 1280 / 1920 });
+    const { header } = sink.frames[0];
+    assert.equal(header.target_id, "T1");
+    assert.equal(header.device_width, 1920);
+    assert.equal(header.scroll_offset_y, 300);
+
+    // Closing and reopening the view seeds the new stream again.
+    await hub.stop();
+    await hub.start();
+    await flush();
+    assert.equal(sink.frames.length, 2);
+    assert.equal(page.sessions.length, 2);
+});
+
+test("no seed frame once a real frame has arrived", async () => {
+    const { hub, sink } = newHub();
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const page = fakePage("T1", "https://a.example/", {
+        ...STATIC_PAGE_RESPONDERS,
+        "Page.captureScreenshot": async () => {
+            await gate;
+            return { data: JPEG_B64 };
+        },
+    });
+    await hub.attach(fakeContext([page]));
+    await hub.start();
+    await flush();
+    page.sessions[0].frame(1);
+    release();
+    await flush();
+    assert.equal(sink.frames.length, 1);
+    assert.equal(sink.frames[0].header.captured_at_ms, 1_700_000_000_500);
 });

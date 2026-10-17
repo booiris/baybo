@@ -19,6 +19,11 @@
 // animating page (spike finding (c)); dropping here is the hard cap on top.
 // The newest dropped frame is kept and sent when the next slot opens, so a
 // page that goes still after a burst still shows its final state.
+//
+// Chrome only screencasts on compositor damage, so a page that is not
+// repainting sends nothing after `startScreencast` — not even one frame. Each
+// opened stream is therefore seeded with a `Page.captureScreenshot`, unless a
+// real frame beat it.
 
 import type { BrowserMode } from "./generated/BrowserMode.js";
 import type { BrowserPhase } from "./generated/BrowserPhase.js";
@@ -55,6 +60,8 @@ const CDP_STOP_SCREENCAST = "Page.stopScreencast";
 const CDP_SCREENCAST_FRAME_ACK = "Page.screencastFrameAck";
 const CDP_SCREENCAST_FRAME = "Page.screencastFrame";
 const CDP_SCREENCAST_VISIBILITY = "Page.screencastVisibilityChanged";
+const CDP_GET_LAYOUT_METRICS = "Page.getLayoutMetrics";
+const CDP_CAPTURE_SCREENSHOT = "Page.captureScreenshot";
 const BROWSER_TARGET_EVENTS = ["targetcreated", "targetdestroyed", "targetchanged"] as const;
 const BROWSER_DISCONNECTED = "disconnected";
 
@@ -574,6 +581,58 @@ export class ScreencastHub {
     }
     this.#emitStream("live", info);
     this.#emitTargets();
+    void this.#seedFrame(active).catch((e: unknown) => {
+      this.#log.debug(`screencast: seed frame failed: ${errText(e)}`);
+    });
+  }
+
+  /** Whether `active` is still the stream and has shown nothing yet. */
+  #unseeded(active: ActiveStream): boolean {
+    return (
+      this.#active === active &&
+      active.lastSentAt === Number.NEGATIVE_INFINITY &&
+      active.pending === null
+    );
+  }
+
+  /** Paint the stream's first frame from a screenshot, sized the way the
+   *  screencast would size it. */
+  async #seedFrame(active: ActiveStream): Promise<void> {
+    if (!this.#unseeded(active)) return;
+    const s = active.session;
+    const metrics = await within(s.send(CDP_GET_LAYOUT_METRICS), ATTACH_TIMEOUT_MS, this.#clock, () => undefined);
+    const vp = isObject(metrics) ? metrics["cssVisualViewport"] : undefined;
+    if (!isObject(vp) || !this.#unseeded(active)) return;
+    const width = finite(vp["clientWidth"], 0);
+    const height = finite(vp["clientHeight"], 0);
+    if (width <= 0 || height <= 0) return;
+    const pageX = finite(vp["pageX"], 0);
+    const pageY = finite(vp["pageY"], 0);
+    const scale = Math.min(1, DEFAULT_MAX_WIDTH / width, DEFAULT_MAX_HEIGHT / height);
+    const shot = await within(
+      s.send(CDP_CAPTURE_SCREENSHOT, {
+        format: "jpeg",
+        quality: DEFAULT_QUALITY,
+        clip: { x: pageX, y: pageY, width, height, scale },
+        optimizeForSpeed: true,
+      }),
+      ATTACH_TIMEOUT_MS,
+      this.#clock,
+      () => undefined,
+    );
+    const data = isObject(shot) ? shot["data"] : undefined;
+    if (typeof data !== "string" || !this.#unseeded(active)) return;
+    this.#sendFrame(active, {
+      data,
+      metadata: {
+        deviceWidth: width,
+        deviceHeight: height,
+        offsetTop: 0,
+        pageScaleFactor: finite(vp["scale"], 1),
+        scrollOffsetX: pageX,
+        scrollOffsetY: pageY,
+      },
+    });
   }
 
   #detach(): void {
