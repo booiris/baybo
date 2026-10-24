@@ -260,6 +260,16 @@ extension View {
         modifier(ReadingColumnMargins())
     }
 
+    /// Ends a list row's separator where the row's content ends, as its leading
+    /// end already starts where the content starts. Left to the list, the
+    /// trailing end sits on the layout margin, which counts a side column's
+    /// inset on top of `readingColumnMargins` (a sum, where the rows take the
+    /// larger of the two), so beside the Duo's 84pt column it stopped 84pt
+    /// short of the content.
+    func separatorSpansContent() -> some View {
+        alignmentGuide(.listRowSeparatorTrailing) { $0[.trailing] }
+    }
+
     /// Web-page parity: tapping empty space blurs the focused field and drops
     /// the keyboard (a WKWebView resigns its input on outside taps; native
     /// SwiftUI does not). A plain tap gesture, so child buttons/fields keep

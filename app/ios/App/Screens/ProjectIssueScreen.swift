@@ -180,9 +180,7 @@ struct ProjectIssueScreen: View {
             stopButton
         }
         .background(alignment: .top) {
-            LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea(edges: .top)
-                .allowsHitTesting(false)
+            HeaderVeil()
         }
     }
 

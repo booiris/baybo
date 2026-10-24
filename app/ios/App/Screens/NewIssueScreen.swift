@@ -246,9 +246,7 @@ struct NewIssueScreen: View {
             BackCircle(label: lang.t("board.back")) { dismiss() }
         }
         .background(alignment: .top) {
-            LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea(edges: .top)
-                .allowsHitTesting(false)
+            HeaderVeil()
         }
     }
 

@@ -91,9 +91,7 @@ private struct DeckRecycleContent: View {
     }
 
     private var veil: some View {
-        LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        HeaderVeil()
     }
 
     private var cardList: some View {

@@ -312,6 +312,13 @@ the tab bar, backgrounds. The rules that keep this from breaking on a fold:
 `readingColumnMargins()` reaches every scroll view below it in the environment, so it
 only goes on a scroller whose rows host none of their own.
 
+A `List` beside a side column draws its separators short of the row content: rows take
+the LARGER of inset and margin per side, but the separator's trailing end takes their
+SUM. `View.separatorSpansContent()` pins the separator's trailing end to the row's own
+trailing edge; every banded list with separators carries it. On a phone it moves the
+trailing end in by the 8pt the system used to run past the content, so both ends sit
+24pt from the screen edge.
+
 ### Native-app feel
 
 Text selection, the iOS long-press callout, and the grey tap-highlight flash are disabled

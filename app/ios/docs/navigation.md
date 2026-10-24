@@ -238,7 +238,11 @@ shell hides the navigation bar, so the headers do the same move themselves:
 - **The chat header drops its paper veil in column mode**, because only glass
   (the model pill) is left at the top and no status bar needs washing out.
   Headers that keep a TEXT title (home wordmark, list titles, the card's `#n`)
-  keep their veil.
+  keep their veil, through `HeaderVeil`: with a bare top
+  (`SideRailLines.bareTop`) it is solid paper over the header and fades out
+  over the 20pt below it. The translucent top of the usual veil exists to
+  wash a status bar out; with none there it only let rows show through the
+  title. With a status bar (a phone, any sheet) the veil is unchanged.
 - Sheets don't use the rail. Their top edge isn't the window's, and their back
   buttons (`SubagentScreen`, `ProjectRunSheet`, `AgentProfileSheet`) stay in
   their own bars.

@@ -335,7 +335,7 @@ struct ChatHeaderView: View {
     static let barHeight: CGFloat = 46
     /// Solid → clear smoothstep the veil fades through, below its solid
     /// status-bar zone (the composer veil's grammar, mirrored to the top).
-    private static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]
+    static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]
     /// Cap on the pill's LABEL TEXT so a long model id can't outgrow a narrow
     /// screen. Applied to the string, not via `.frame(maxWidth:)` — a frame
     /// cap makes the Menu label greedy (it expands to the cap even for short
@@ -572,9 +572,7 @@ struct ChatHeaderView: View {
     /// itself carries `ignoresSafeArea(.top)`; nesting the flood inside a
     /// `.background` clips it (the parent doesn't ignore the inset).
     private var veil: some View {
-        LinearGradient(stops: Self.veilStops, startPoint: .top, endPoint: .bottom)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        HeaderVeil()
     }
 
     /// Solid through the status bar (~`solidFraction` of the flooded height on

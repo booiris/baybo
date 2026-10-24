@@ -63,6 +63,10 @@ struct SideRail: Equatable {
 struct SideRailLines: Equatable {
     var left: CGRect?
     var right: CGRect?
+    /// No status bar along the top: the window has no top inset on a runtime
+    /// that lays bars down the side. Screens are lifted off the edge, and a
+    /// header's veil has no status bar to wash out.
+    var bareTop = false
 
     func line(_ edge: UIRectEdge) -> CGRect? {
         edge == .left ? left : right
@@ -199,9 +203,10 @@ private struct SideRailProbe: UIViewRepresentable {
         /// read changes — the bar region settles a pass after the insets.
         private func report() {
             guard let window else { return }
+            let right = Self.barLine(in: window, edge: .right)
             let lines = SideRailLines(
-                left: Self.barLine(in: window, edge: .left),
-                right: Self.barLine(in: window, edge: .right))
+                left: Self.barLine(in: window, edge: .left), right: right,
+                bareTop: window.safeAreaInsets.top < 1 && right != nil)
             // A window with no top inset on a runtime that lays bars down the
             // side: the bar steps down off the bare top edge, as the system's
             // own bars do. Through the ROOT controller, the way a status bar
@@ -210,7 +215,7 @@ private struct SideRailProbe: UIViewRepresentable {
             // clearance measured from one move together. SwiftUI's
             // `safeAreaPadding` stops at the navigation and tab containers.
             if let root = window.rootViewController {
-                let lift = window.safeAreaInsets.top < 1 && lines.right != nil ? SideRail.spacing : 0
+                let lift = lines.bareTop ? SideRail.spacing : 0
                 if root.additionalSafeAreaInsets.top != lift {
                     root.additionalSafeAreaInsets.top = lift
                 }

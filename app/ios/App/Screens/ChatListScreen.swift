@@ -254,6 +254,7 @@ struct ChatListScreen: View {
         // (see SessionRowView), so a pin flip is a pure move, not a
         // background-config swap that would blank the sliding row.
         .listRowBackground(Theme.paper)
+        .separatorSpansContent()
         .listRowSeparatorTint(Theme.line)
         .listRowInsets(
             EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset))
@@ -319,6 +320,7 @@ struct ChatListScreen: View {
         }
         .background { arrivalRing(for: ChatListItem.cronGroup(group).id) }
         .listRowBackground(Theme.paper)
+        .separatorSpansContent()
         .listRowSeparatorTint(Theme.line)
         .listRowInsets(
             EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset))

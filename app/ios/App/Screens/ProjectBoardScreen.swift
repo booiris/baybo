@@ -590,9 +590,7 @@ struct ProjectBoardScreen: View {
             boardMenu
         }
         .background(alignment: .top) {
-            LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea(edges: .top)
-                .allowsHitTesting(false)
+            HeaderVeil()
         }
     }
 

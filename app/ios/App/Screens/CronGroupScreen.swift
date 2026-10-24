@@ -108,9 +108,7 @@ struct CronGroupScreen: View {
     }
 
     private var veil: some View {
-        LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        HeaderVeil()
     }
 
     private func fireList(_ group: CronGroup) -> some View {
@@ -122,6 +120,7 @@ struct CronGroupScreen: View {
                     SessionRowView(row: row, langCode: lang.current.lproj)
                 }
                 .listRowBackground(Theme.paper)
+                .separatorSpansContent()
                 .listRowSeparatorTint(Theme.line)
                 .listRowInsets(EdgeInsets(top: 0, leading: 24, bottom: 0, trailing: 24))
                 // A fire is an ordinary conversation — the main list's swipes

@@ -76,9 +76,7 @@ struct ArchivedScreen: View {
     }
 
     private var veil: some View {
-        LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        HeaderVeil()
     }
 
     private var sessionList: some View {
@@ -93,6 +91,7 @@ struct ArchivedScreen: View {
                     )
                 }
                 .listRowBackground(Theme.paper)
+                .separatorSpansContent()
                 .listRowSeparatorTint(Theme.line)
                 .listRowInsets(EdgeInsets(top: 0, leading: 24, bottom: 0, trailing: 24))
                 // First action = edge-most = full-swipe commit: unarchive. No
