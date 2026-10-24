@@ -47,6 +47,20 @@ enum Theme {
         max(0, (width - readingWidth) / 2)
     }
 
+    /// A `List`'s per-side content margins for the band. `width` is the list's
+    /// own frame, which stops at the safe area; `leading` / `trailing` are the
+    /// insets beside it. The list's scroller runs on under those insets and
+    /// measures its margins from ITS edges, taking the larger of a side's inset
+    /// and margin rather than their sum, so each side carries its inset plus
+    /// the band margin. A plain band margin lost to the outer display's 84pt
+    /// trailing column and pushed the band ~42pt right of centre.
+    static func readingMargins(
+        width: CGFloat, leading: CGFloat, trailing: CGFloat
+    ) -> (leading: CGFloat, trailing: CGFloat) {
+        let margin = readingMargin(in: width)
+        return (leading + margin, trailing + margin)
+    }
+
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("Space Mono", size: size).weight(weight)
     }
@@ -232,13 +246,12 @@ extension View {
         frame(maxWidth: Theme.readingWidth).frame(maxWidth: .infinity)
     }
 
-    /// `readingColumn` for a SCROLLER (`List`, `ScrollView`): the content is
-    /// inset to the band while the scroller itself — its bounce, its indicator,
-    /// its swipe-to-reveal rows' hit region off the column's flanks — stays full
-    /// width. The margin is measured off the scroller's own frame, which is
-    /// already inside the safe area, so an asymmetric leading/trailing inset
-    /// (Split View, a landscape notch) is added by the system on top and the
-    /// band centres in the space actually left.
+    /// `readingColumn` for a `List`: the content is inset to the band while the
+    /// list itself — its bounce, its indicator, its swipe-to-reveal rows' hit
+    /// region off the column's flanks — stays full width. The margins fold in
+    /// the horizontal safe-area insets (`Theme.readingMargins`), so an
+    /// asymmetric pair (a side rail, Split View) still centres the band in the
+    /// space actually left.
     ///
     /// `contentMargins` reaches every scroll view BELOW this one in the
     /// environment, so put it only on a scroller whose rows host no scroll view
@@ -299,11 +312,30 @@ struct CompactPillButtonStyle: ButtonStyle {
 }
 
 private struct ReadingColumnMargins: ViewModifier {
-    @State private var width: CGFloat = 0
+    /// The list's width and the horizontal safe-area insets beside it — a
+    /// background that ignores them reports them; the list itself would not.
+    @State private var span = HorizontalSpan()
+
+    private struct HorizontalSpan: Equatable {
+        var width: CGFloat = 0
+        var leading: CGFloat = 0
+        var trailing: CGFloat = 0
+    }
 
     func body(content: Content) -> some View {
+        let margins = Theme.readingMargins(
+            width: span.width, leading: span.leading, trailing: span.trailing)
         content
-            .contentMargins(.horizontal, Theme.readingMargin(in: width), for: .scrollContent)
-            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+            .contentMargins(.leading, margins.leading, for: .scrollContent)
+            .contentMargins(.trailing, margins.trailing, for: .scrollContent)
+            .background {
+                Color.clear
+                    .ignoresSafeArea(edges: .horizontal)
+                    .onGeometryChange(for: HorizontalSpan.self) { proxy in
+                        HorizontalSpan(
+                            width: proxy.size.width, leading: proxy.safeAreaInsets.leading,
+                            trailing: proxy.safeAreaInsets.trailing)
+                    } action: { span = $0 }
+            }
     }
 }

@@ -446,6 +446,34 @@ REPLACE anchor uses the same two functions. On a width change `.chat-log`'s
 ResizeObserver re-pins a following reader, and puts a parked one back on their
 row.
 
+**A long row is held by its block, not its top.** One agent reply can run several
+screens, and a fold rewraps every line of it. With only the row's top kept at its
+offset, the reader landed a paragraph or more away from where they were, which was
+measured on the 300-message test thread. The transcript passes
+`ROW_PART_SELECTOR` (paragraphs, list items, code blocks, headings, table rows,
+display math). When a row straddles the top edge, the anchor also records which of
+those blocks crossed it and where, and the restore puts that block back. Two
+refinements came out of the simulator pass:
+- A straddling row whose only on-screen part is its tail (the timestamp, with every
+  block above the edge) gives way to the NEXT row, whose top is on screen and exact.
+- Blocks with no box (hidden, not laid out) are ignored. Under jsdom every block
+  measures zero, and treating zero as "above the edge" skipped rows that were on
+  screen.
+
+The card page does not pass a selector: its `data-anchor` rows are already
+block-sized, and its anchor round-trips through native (`IssueStore.ScrollAnchor`),
+whose wire shape this does not change.
+
+**Known residual (2026-10-24, iPhone Duo simulator, iOS 27.1):**
+- Folding (inner → outer) holds the edge row to within 1pt.
+- Unfolding (outer → inner) can land the reader 24–76pt off: same rows, the edge one
+  part-way off screen. Not chased to the root. The suspect is the
+  `CV_REFRESH_DEBOUNCE_MS` pass below. Its restore covers the un-stamping, but the
+  re-stamp two frames later is not followed by one, and a row above the reader whose
+  remembered size is still the old width's would move the thread then.
+- To diagnose it, log `captureRowAnchor()` around the width-change restore, the
+  refresh, and the re-stamp, then compare.
+
 **The place has to be captured BEFORE the reflow, and that is the subtle part.**
 The observer runs after layout, so a row read inside its callback is already at the
 new width — the anchor would faithfully restore the wrong place. Nor can it be read

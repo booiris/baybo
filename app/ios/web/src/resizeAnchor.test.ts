@@ -85,6 +85,79 @@ describe("anchorShift", () => {
   });
 });
 
+describe("anchoring a long row by its blocks", () => {
+  const PARTS = "p";
+  let paraH = 50;
+
+  /// One row of `count` paragraphs, each `paraH` tall, starting at the top of
+  /// the content — a single long reply, as the transcript has them.
+  function longRow(count: number): HTMLElement {
+    const root = document.createElement("div");
+    const row = document.createElement("div");
+    row.setAttribute(ATTR, "reply");
+    row.getBoundingClientRect = () => rect(-scrolled, count * paraH);
+    for (let i = 0; i < count; i++) {
+      const p = document.createElement("p");
+      p.getBoundingClientRect = () => rect(i * paraH - scrolled, paraH);
+      row.appendChild(p);
+    }
+    root.appendChild(row);
+    document.body.appendChild(root);
+    return root;
+  }
+
+  beforeEach(() => {
+    paraH = 50;
+  });
+
+  it("refines a row that straddles the edge to the block holding it", () => {
+    const root = longRow(20);
+    scrolled = 420;
+    // p8 spans 400..450: 20px of it is still on screen.
+    expect(captureAnchor(root, ATTR, 0, PARTS)).toEqual({
+      id: "reply",
+      offset: -420,
+      part: { index: 8, offset: -20 },
+    });
+  });
+
+  it("restores by the block after every line rewrapped", () => {
+    const root = longRow(20);
+    scrolled = 420;
+    const anchor = captureAnchor(root, ATTR, 0, PARTS) as ScrollAnchor;
+    // A narrower window: every paragraph wraps to twice the height. The row's
+    // own offset would put p4 at the edge; the block puts p8 back there.
+    paraH = 100;
+    expect(anchorShift(root, ATTR, anchor, 0, PARTS)).toBe(800 - 420 + 20);
+  });
+
+  it("leaves a row that starts on screen to its own offset", () => {
+    const root = longRow(20);
+    scrolled = -30;
+    expect(captureAnchor(root, ATTR, 0, PARTS)).toEqual({ id: "reply", offset: 30 });
+  });
+
+  it("passes a row whose only on-screen part is its tail to the next row", () => {
+    const root = longRow(4);
+    const reply = root.firstElementChild as HTMLElement;
+    reply.getBoundingClientRect = () => rect(-scrolled, 230);
+    const next = document.createElement("div");
+    next.setAttribute(ATTR, "next");
+    next.getBoundingClientRect = () => rect(230 - scrolled, 40);
+    root.appendChild(next);
+    // The reply's paragraphs end at 200; its 30px tail (a timestamp) is all
+    // that is left on screen, and the next row starts 20px below the edge.
+    scrolled = 210;
+    expect(captureAnchor(root, ATTR, 0, PARTS)).toEqual({ id: "next", offset: 20 });
+  });
+
+  it("falls back to the row when the block is gone", () => {
+    const root = longRow(3);
+    const anchor: ScrollAnchor = { id: "reply", offset: -30, part: { index: 9, offset: -5 } };
+    expect(anchorShift(root, ATTR, anchor, 0, PARTS)).toBe(30);
+  });
+});
+
 describe("holdPlaceAcrossWidth", () => {
   let observed: ((width: number) => void) | null = null;
   let frames: FrameRequestCallback[] = [];

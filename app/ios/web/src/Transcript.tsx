@@ -289,6 +289,11 @@ function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
 }
 
+/// The blocks a long row is held by when it straddles the top edge — one agent
+/// reply can be several screens of paragraphs, and a fold rewraps all of them.
+const ROW_PART_SELECTOR =
+  "p, li, pre, blockquote, h1, h2, h3, h4, h5, h6, tr, figure, .katex-display";
+
 /// The topmost row still on screen, and how far below the viewport's top edge it
 /// sat — what a REPLACE or a width change has to put back under a reader parked
 /// in history. Every row carries `data-row-id` for exactly this (and for the
@@ -296,14 +301,14 @@ function scrollEl(): HTMLElement | null {
 /// handle is still findable in the rebuilt thread. `null` when no row is on
 /// screen to hold onto.
 function captureRowAnchor(): ScrollAnchor | null {
-  return captureAnchor(document, ROW_ID_ATTR);
+  return captureAnchor(document, ROW_ID_ATTR, 0, ROW_PART_SELECTOR);
 }
 
 /// Put an anchored row back under the pixel it was captured at. False when the
 /// row is gone, which each caller answers in its own way.
 function restoreRowAnchor(anchor: ScrollAnchor): boolean {
   const el = scrollEl();
-  const shift = anchorShift(document, ROW_ID_ATTR, anchor);
+  const shift = anchorShift(document, ROW_ID_ATTR, anchor, 0, ROW_PART_SELECTOR);
   if (el === null || shift === null) return false;
   el.scrollTop += shift;
   return true;

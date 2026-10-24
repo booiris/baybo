@@ -24,6 +24,32 @@ struct ReadingWidthTests {
         #expect(margin == CGFloat(951 - 720) / 2)
         #expect(951 - 2 * margin == Theme.readingWidth)
     }
+
+    /// The inner display with its 84pt trailing column, as measured: the list's
+    /// frame is 867pt, its scroller runs on under the column to 951pt and takes
+    /// the larger of inset and margin per side — so each side carries both, and
+    /// the band lands centred in the 867pt left.
+    @Test func aOneSidedColumnStillCentresTheBand() {
+        let margins = Theme.readingMargins(width: 867, leading: 0, trailing: 84)
+        #expect(951 - margins.leading - margins.trailing == Theme.readingWidth)
+        #expect(margins.leading == CGFloat(867 - 720) / 2)
+        #expect(margins.trailing == 84 + CGFloat(867 - 720) / 2)
+    }
+
+    /// No insets: exactly the symmetric margin a phone or Split View half had.
+    @Test(arguments: [CGFloat(402), 951])
+    func withoutInsetsTheMarginsAreSymmetric(width: CGFloat) {
+        let margins = Theme.readingMargins(width: width, leading: 0, trailing: 0)
+        #expect(margins.leading == Theme.readingMargin(in: width))
+        #expect(margins.trailing == Theme.readingMargin(in: width))
+    }
+
+    /// A window narrower than the band keeps just its insets.
+    @Test func aNarrowWindowKeepsItsInsets() {
+        let margins = Theme.readingMargins(width: 382, leading: 0, trailing: 84)
+        #expect(margins.leading == 0)
+        #expect(margins.trailing == 84)
+    }
 }
 
 @Suite @MainActor
