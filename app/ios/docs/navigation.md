@@ -193,10 +193,24 @@ own (`toolbarVerticalBehavior`). Every header here is hand-drawn, because the
 shell hides the navigation bar, so the headers do the same move themselves:
 
 - **Detection is geometric, not per-device.** A column is an inset of at least
-  60pt on ONE side, with none on the other side and none on top. A notched phone
-  in landscape has insets on both sides, so it never qualifies.
-  `SideRail.resolve` is the rule, and `SideRailTests` pins it with the measured
-  outer-display numbers.
+  60pt on ONE side, with none on the other. A notched phone in landscape has
+  insets on both sides, so it never qualifies. `SideRail.resolve` is the rule,
+  and `SideRailTests` pins it with the measured outer-display and Split View
+  numbers.
+- **Each SCREEN finds its own column; the window cannot.** The inner display has
+  the same trailing column as the outer one. In Split View each pane's column sits
+  on its OUTER edge: the left pane's tab rail runs down its left side. The left
+  pane's window reports NO side inset at all. Only the pushed screen's
+  `NavigationStackHostingController` carries the 84pt leading column, which the
+  navigation container reserves for its vertical bar. `UIKitNavigationController`
+  itself reads 0.
+  - The root probe therefore publishes only window-level facts: the bar line on
+    each edge (`SideRailLines`).
+  - `.resolvesSideRail()` sits on the NavigationStack's root and on its
+    destination, and resolves each screen's column from that screen's own safe
+    area.
+  - The first cut read `window.safeAreaInsets` and missed the pane's column,
+    leaving 84pt of blank page down its left side.
 - **Items sit on the system's bar line, not the column's middle.**
   `UIView.LayoutRegion.bar(onEdge:extent:)` answers x≈418 (clock, wifi glyph and
   tab rail all centre there) and a top of 174 (under the reserved block). The
@@ -211,6 +225,11 @@ shell hides the navigation bar, so the headers do the same move themselves:
   above it moves). Text pills and titles stay at the top.
 - **The 12pt top lift goes through the ROOT controller's
   `additionalSafeAreaInsets`, which is how a status bar inset would arrive.**
+  It applies whenever the window has no top inset on a runtime that lays bars
+  down the side, column or not: a Split View pane has no top status bar either,
+  and its headers sat flush against the glass edge. It does not depend on the
+  column, because the column is resolved per screen and the lift has to land
+  before any screen lays out.
   Every pushed screen, tab and webview (`safe-area-inset-top`) inherits it, so
   each header and every clearance derived from `barHeight` move together.
   SwiftUI's `safeAreaPadding` at the root was tried first. It stops at the

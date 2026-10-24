@@ -27,6 +27,7 @@ struct RootView: View {
                 // re-enables the edge-swipe pop that hiding disables.
                 NavigationStack(path: $store.chatPath) {
                     HomeTabView()
+                        .resolvesSideRail()
                         .toolbar(.hidden, for: .navigationBar)
                         .navigationDestination(for: AppStore.ChatRoute.self) { route in
                             Group {
@@ -64,6 +65,7 @@ struct RootView: View {
                                         projectId: projectId, initialStatus: status)
                                 }
                             }
+                            .resolvesSideRail()
                             .toolbar(.hidden, for: .navigationBar)
                             .navigationBarBackButtonHidden(true)
                         }
@@ -184,7 +186,7 @@ struct RootView: View {
                 .zIndex(1)
             }
         }
-        .publishesSideRail()
+        .publishesSideRailLines()
         .sheet(isPresented: $store.scanPresented) {
             ScanView()
         }

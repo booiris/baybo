@@ -178,6 +178,18 @@ struct SideRailTests {
         #expect(rail == SideRail(edge: .leading, width: 84, center: 36, top: 174))
     }
 
+    /// The inner display's LEFT Split View pane, as measured: the window has no
+    /// side inset, the pushed screen a leading 84 (lifted 12 off the top), and
+    /// the system's left bar line runs at x 25.5…70.5 from y 16.
+    @Test func aSplitViewPaneHasItsColumnOnItsOuterEdge() {
+        let pane = CGRect(x: 0, y: 0, width: 469, height: 669)
+        let insets = UIEdgeInsets(top: 12, left: 84, bottom: 34, right: 0)
+        let rail = SideRail.resolve(bounds: pane, insets: insets) { edge in
+            edge == .left ? CGRect(x: 25.5, y: 16, width: 45, height: 619) : nil
+        }
+        #expect(rail == SideRail(edge: .leading, width: 84, center: 36, top: 16))
+    }
+
     @Test(arguments: [
         UIEdgeInsets(top: 62, left: 0, bottom: 34, right: 0),   // portrait phone
         UIEdgeInsets(top: 0, left: 62, bottom: 21, right: 62),  // notched phone in landscape
