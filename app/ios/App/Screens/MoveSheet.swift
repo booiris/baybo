@@ -48,6 +48,7 @@ struct MoveSheet: View {
         .background(Theme.paper)
         .presentationDetents([.height(430)])
         .presentationDragIndicator(.visible)
+        .presentationSizing(.form.fitted(horizontal: false, vertical: true))
     }
 
     private func rowBody(_ row: MoveConsequence.Row) -> some View {
@@ -143,6 +144,7 @@ struct PriorityPicker: View {
         .background(Theme.paper)
         .presentationDetents([.height(330)])
         .presentationDragIndicator(.visible)
+        .presentationSizing(.form.fitted(horizontal: false, vertical: true))
     }
 
     private func row(_ level: IssuePriority) -> some View {
@@ -226,6 +228,7 @@ struct AssigneePicker: View {
         .background(Theme.paper)
         .presentationDetents([.medium])
         .presentationDragIndicator(.visible)
+        .presentationSizing(.form.fitted(horizontal: false, vertical: true))
     }
 
     private func memberRow(_ member: TeamMemberInfo) -> some View {

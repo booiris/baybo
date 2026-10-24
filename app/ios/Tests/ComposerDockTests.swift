@@ -20,8 +20,8 @@ import UIKit
 @Suite @MainActor
 struct ComposerDockTests {
     /// The `+`'s frame in dock space on a bare dock — the panel hangs off its x.
-    private static let plus = CGRect(x: 40, y: 0, width: 46, height: 48)
-    private static let dockWidth: CGFloat = 402
+    private nonisolated static let plus = CGRect(x: 40, y: 0, width: 46, height: 48)
+    private nonisolated static let dockWidth: CGFloat = 402
     private static let dockHeight: CGFloat = 60
     /// Room ABOVE the dock for the panel to float into. The panel's box is
     /// entirely negative (`y ∈ [-102, -10]`), and `ImageRenderer` sizes its
@@ -33,23 +33,28 @@ struct ComposerDockTests {
     /// The dock as the screen builds it, in a container that leaves the panel
     /// somewhere to be drawn. The composer's rows are a plain block: what is
     /// under test is the chain, not the pill.
+    ///
+    /// `width` is the WINDOW: the rows sit in the reading band inside it
+    /// (`readingColumn`, as `ComposerView` lays them out), so on a wide window
+    /// the `+` — and with it `anchor` — moves in by the band's margin.
     private static func harness(
-        panelOpen: Bool, collapsed: Bool = false, sources: [AttachSource] = AttachSource.always
+        panelOpen: Bool, collapsed: Bool = false, sources: [AttachSource] = AttachSource.always,
+        width: CGFloat = dockWidth, anchor: CGRect = plus
     ) -> some View {
         VStack(spacing: 0) {
-            Color.clear.frame(width: dockWidth, height: headroom)
+            Color.clear.frame(width: width, height: headroom)
             ComposerDock(collapsed: collapsed) {
-                Theme.surface.frame(width: dockWidth, height: dockHeight)
+                Theme.surface.frame(height: dockHeight).readingColumn()
             } panel: {
                 if panelOpen {
                     AttachMenuPanel(
-                        anchor: plus, sources: sources,
+                        anchor: anchor, sources: sources,
                         isPresented: .constant(true)
                     ) { _ in }
                 }
             }
         }
-        .frame(width: dockWidth, height: headroom + dockHeight)
+        .frame(width: width, height: headroom + dockHeight)
         .background(Theme.paper)
     }
 
@@ -59,9 +64,11 @@ struct ComposerDockTests {
     /// pixels rather than diffing images keeps the assertion independent of how
     /// the glass material happens to rasterize, which is the one part of this
     /// view an offscreen renderer may not reproduce faithfully.
-    private static func inkPixels(_ image: UIImage, in rect: CGRect) -> Int {
+    private static func inkPixels(
+        _ image: UIImage, in rect: CGRect, width: CGFloat = dockWidth
+    ) -> Int {
         guard let cg = image.cgImage else { return 0 }
-        let scale = CGFloat(cg.width) / dockWidth
+        let scale = CGFloat(cg.width) / width
         let box = CGRect(
             x: rect.minX * scale, y: rect.minY * scale,
             width: rect.width * scale, height: rect.height * scale
@@ -93,8 +100,10 @@ struct ComposerDockTests {
 
     /// Where the panel lands in the HARNESS's space: `box()` is in dock space,
     /// whose origin is `headroom` points down.
-    private static func panelRect(rows: Int = AttachSource.always.count) -> CGRect {
-        AttachMenuPanel.box(anchor: plus, rows: rows).offsetBy(dx: 0, dy: headroom)
+    private static func panelRect(
+        rows: Int = AttachSource.always.count, anchor: CGRect = plus
+    ) -> CGRect {
+        AttachMenuPanel.box(anchor: anchor, rows: rows).offsetBy(dx: 0, dy: headroom)
     }
 
     private static func render(_ view: some View) -> UIImage {
@@ -150,5 +159,25 @@ struct ComposerDockTests {
         let ink = Self.inkPixels(
             Self.render(Self.harness(panelOpen: true, collapsed: true)), in: Self.panelRect())
         #expect(ink == 0, "a collapsed dock still painted \(ink) ink pixels")
+    }
+
+    /// The foldable's two windows: the outer display (~470pt, a phone-width
+    /// column) and the inner one (951pt, where the rows hold to the reading
+    /// band). The `+` is band-relative, so the panel must paint over the band's
+    /// `+` — and on the wide window, nothing may land in the margin outside the
+    /// band, where a panel laid out against the WINDOW's edge would draw.
+    @Test(arguments: [CGFloat(470), 951])
+    func theOpenPanelPaintsOverTheBandsPlus(width: CGFloat) {
+        let margin = Theme.readingMargin(in: width)
+        let anchor = Self.plus.offsetBy(dx: margin, dy: 0)
+        let image = Self.render(Self.harness(panelOpen: true, width: width, anchor: anchor))
+
+        let ink = Self.inkPixels(image, in: Self.panelRect(anchor: anchor), width: width)
+        #expect(ink > 100, "at \(width)pt the panel drew nothing over the + (\(ink) ink pixels)")
+
+        guard margin > 0 else { return }
+        let outside = CGRect(x: 0, y: 0, width: margin + Self.plus.minX - 1, height: Self.headroom)
+        let stray = Self.inkPixels(image, in: outside, width: width)
+        #expect(stray == 0, "at \(width)pt the panel painted \(stray) ink pixels off the band")
     }
 }

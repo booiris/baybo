@@ -9,9 +9,68 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         let children: [IssueInfo]
     }
 
+    /// The card page's own view state, kept while the visit is covered and
+    /// handed back on the way in (`restoredState`). The wire shape is the web's
+    /// `IssueViewState` (`web/src/issue/bridge.ts`).
     struct PageState: Equatable {
         let scrollTop: Double
         let folds: [String: Bool]
+        /// The first block on screen and the page width it was read at. Only
+        /// `scrollTop` is the reader's place at the SAME width; a foldable folded
+        /// or unfolded while the visit was covered rewraps everything above it,
+        /// and the page then restores by this instead. Optional on the wire: a
+        /// page with nothing on screen sends none, and the page falls back to
+        /// `scrollTop` when none comes back.
+        let anchor: ScrollAnchor?
+
+        /// The web's `IssueScrollAnchor`.
+        struct ScrollAnchor: Equatable {
+            let id: String
+            let offset: Double
+            let width: Double
+
+            init(id: String, offset: Double, width: Double) {
+                self.id = id
+                self.offset = offset
+                self.width = width
+            }
+
+            init?(wire: Any?) {
+                guard let body = wire as? [String: Any],
+                    let id = body["id"] as? String,
+                    let offset = (body["offset"] as? NSNumber)?.doubleValue,
+                    let width = (body["width"] as? NSNumber)?.doubleValue,
+                    offset.isFinite, width.isFinite, width > 0
+                else { return nil }
+                self.init(id: id, offset: offset, width: width)
+            }
+
+            var wire: [String: Any] { ["id": id, "offset": offset, "width": width] }
+        }
+
+        init(scrollTop: Double, folds: [String: Bool], anchor: ScrollAnchor? = nil) {
+            self.scrollTop = scrollTop
+            self.folds = folds
+            self.anchor = anchor
+        }
+
+        /// A state as the page posts it (`issueState`, `snapshotState`). A
+        /// malformed anchor is dropped rather than the whole state: the page
+        /// still restores by `scrollTop` without it.
+        init?(wire body: [String: Any]) {
+            guard let scrollTop = (body["scrollTop"] as? NSNumber)?.doubleValue,
+                let folds = body["folds"] as? [String: Bool]
+            else { return nil }
+            self.init(scrollTop: scrollTop, folds: folds, anchor: ScrollAnchor(wire: body["anchor"]))
+        }
+
+        /// What `restoredState` carries back. No `anchor` key at all when there
+        /// is none — never a null the page would have to tell apart.
+        var wire: [String: Any] {
+            var body: [String: Any] = ["scrollTop": scrollTop, "folds": folds]
+            if let anchor { body["anchor"] = anchor.wire }
+            return body
+        }
     }
 
     let projectId: String
@@ -553,9 +612,9 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         atTop = value
     }
 
-    func rememberPageState(scrollTop: Double, folds: [String: Bool]) {
-        guard scrollTop.isFinite, scrollTop >= 0 else { return }
-        pageState = PageState(scrollTop: scrollTop, folds: folds)
+    func rememberPageState(_ state: PageState) {
+        guard state.scrollTop.isFinite, state.scrollTop >= 0 else { return }
+        pageState = state
     }
 
     func setComposerTop(_ value: CGFloat) {

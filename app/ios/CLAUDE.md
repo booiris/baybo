@@ -237,3 +237,12 @@ was tried and failed, and several name a bug that shipped once already.
   comment field's `@` mention strip is the piece that most wants hardware: it
   reads the caret off the focused UIKit document and holds itself back while an
   IME composition is open, so a Chinese keyboard is what would find its edges.
+- iPhone Duo (foldable, iOS 27.1): native adaptation started — one reading width
+  (`Theme.readingWidth`, see [`docs/design-system.md`](docs/design-system.md#the-reading-band)),
+  measured panel anchors and heights, window-sized approval detail, form-sheet sizing,
+  a scanner that tells a busy camera from a denied one, and header controls that move
+  into the outer display's side column (the side rail, see
+  [`docs/navigation.md`](docs/navigation.md#the-side-rail--appsupportsiderailswift)).
+  The outer display has been checked on the iPhone Duo simulator (iOS 27.1). The inner
+  display, Split View and fold/unfold scroll anchoring are still pending, and so is
+  the hinge API.

@@ -22,6 +22,24 @@ The pill toggles `ModelMenuPanel`, a HAND-ROLLED glass panel that `ChatScreen` o
 
 Width knob: `ModelMenuPanel.panelWidth` (232).
 
+**Its column is MEASURED.** The pill reports its frame (`ChatHeaderView.onPillFrame`) in
+`ModelMenuPanel.anchorSpace`, the coordinate space on `ChatScreen`'s stack that holds
+both the header and the panel, and the panel reads its own frame in the same space;
+`leadingInset(anchor:bounds:panelWidth:)` puts the panel on the pill's leading edge,
+clamped inside the layer. It used to be a hardcoded `78` (bar padding + back circle +
+spacing), which is right only while nothing to the pill's left changes — a landscape
+notch or a Split View half's leading inset moved the pill and not the panel.
+
+**It scrolls only when it has to.** The panel's layer is the stretch between the status
+bar and the dock's top edge (the dock's `.safeAreaInset`, keyboard included, is already
+out of it). The rows' natural height is measured and `scrollHeight(rows:available:)`
+decides: rows that fit draw as they always did; rows that don't go inside a `ScrollView`
+capped (`.frame(maxHeight:)`) at the room left, `bottomClearance` (12) above the dock,
+never shorter than one row. A short window — a foldable's outer display in landscape,
+the inner display or any phone in landscape with the keyboard up — is what this is
+for: an uncapped panel ran on behind the dock and the keyboard where its last rows
+could not be reached. The measure-then-scroll idiom is `ApprovalCardView`'s.
+
 ### The three levels
 
 Three levels replace in place, sub-levels headed by a back row:

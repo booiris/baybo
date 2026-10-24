@@ -18,6 +18,7 @@ struct DeckRecycleScreen: View {
 }
 
 private struct DeckRecycleContent: View {
+    @Environment(\.sideRail) private var rail
     @ObservedObject var deck: DeckStore
     let dismiss: () -> Void
     @ObservedObject private var lang = Lang.shared
@@ -72,25 +73,20 @@ private struct DeckRecycleContent: View {
                     .font(Theme.mono(16))
                     .foregroundStyle(Theme.ink)
 
-                HStack {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 42, height: 42)
+                if rail == nil {
+                    HStack {
+                        BackCircle(label: lang.t("chat.back")) { dismiss() }
+                        Spacer()
                     }
-                    .glassSurface(interactive: true, in: .circle)
-                    .accessibilityLabel(Text(verbatim: lang.t("chat.back")))
-
-                    Spacer()
                 }
             }
             .padding(.horizontal, 24)
             .frame(height: ChatHeaderView.barHeight)
         }
         .frame(maxWidth: .infinity)
+        .sideRailItems(rail) {
+            BackCircle(label: lang.t("chat.back")) { dismiss() }
+        }
         .background(alignment: .top) { veil }
     }
 

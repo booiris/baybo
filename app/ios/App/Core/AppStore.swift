@@ -384,6 +384,22 @@ final class AppStore: ObservableObject {
         // opens the chat screen unbound (the dial fails offline — the transcript
         // webview + bridge still come up, which is what these runs verify); a
         // back-pop from it lands on the (empty) chat list.
+        // `BAYBO_DEBUG_DIRECT_URL` + `BAYBO_DEBUG_DIRECT_TOKEN` in the launch
+        // environment log in exactly as the direct form would, binding a
+        // simulator to a local gateway without typing (host pasteboard sync
+        // overwrites `simctl pbcopy`). Environment rather than argv, which
+        // lands in launch logs.
+        let launchEnv = ProcessInfo.processInfo.environment
+        if let url = launchEnv["BAYBO_DEBUG_DIRECT_URL"],
+            let token = launchEnv["BAYBO_DEBUG_DIRECT_TOKEN"]
+        {
+            Task {
+                if let failure = await directConnect(baseUrl: url, token: token) {
+                    NSLog("baybo: debug direct login failed: %@", failure)
+                }
+            }
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-baybo-landing-direct") {
             landingView = .direct
             route = .landing

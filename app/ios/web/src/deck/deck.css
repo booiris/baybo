@@ -7,6 +7,13 @@
   --deck-muted: rgba(28, 27, 25, 0.55);
   --deck-gap: 12px;
   --deck-row-h: 150px;
+  --deck-gutter: 16px;
+  /* Tiles are authored for phone-width columns and adapt only to the semantic
+     `deck.size`, so on a regular-width window (iPhone Duo's inner display,
+     ~951pt) the grid stays this wide and centers rather than stretching a
+     Small tile to ~460pt. Still 2 columns: the column count is what defines
+     Wide/Large for every installed card. */
+  --deck-grid-max-width: 640px;
 }
 
 html,
@@ -37,11 +44,19 @@ body {
   grid-auto-rows: var(--deck-row-h);
   grid-auto-flow: dense;
   gap: var(--deck-gap);
+  max-width: var(--deck-grid-max-width);
+  margin: 0 auto;
   /* The webview is full-bleed under the native header (46pt bar + 8
      breathing); this padding is the resting offset, and scrolling runs
-     the cards under the header's paper veil like the chat list. */
-  padding: calc(env(safe-area-inset-top) + 54px) 16px
-    calc(env(safe-area-inset-bottom) + 24px);
+     the cards under the header's paper veil like the chat list. The side
+     gutters clear each safe-area inset on its OWN side: landscape puts the
+     camera inset on one edge only, and a Split View window on iPhone Duo's
+     inner display gets unequal left/right insets — never assume left ==
+     right. */
+  padding: calc(env(safe-area-inset-top) + 54px)
+    max(var(--deck-gutter), env(safe-area-inset-right))
+    calc(env(safe-area-inset-bottom) + 24px)
+    max(var(--deck-gutter), env(safe-area-inset-left));
 }
 
 .deck-card {
@@ -272,25 +287,41 @@ html.deck-maximized body {
   background: transparent;
 }
 
-/* Maximized card: lifted out of flow and filling the viewport (inline
-   left/top/width/height drive the rect). Full-bleed, so no border or radius;
-   the placeholder holds its grid slot for the collapse. The tab bar floats
-   over the bottom (per the maximize design); the iframe's injected base style
-   gives its max scroll surface enough trailing clearance. */
+/* Maximized card: lifted out of flow (inline left/top/width/height pin the
+   grid-slot rect at either end of the animation). Full-bleed, so no border or
+   radius; the placeholder holds its grid slot for the collapse. The tab bar
+   floats over the bottom (per the maximize design); the iframe's injected base
+   style gives its max scroll surface enough trailing clearance. */
 .deck-card.maximized {
   position: fixed;
   z-index: 20;
   margin: 0;
+  box-sizing: border-box;
   border: none;
   border-radius: 0;
   background: var(--deck-paper);
+}
+/* The expanded rect is CSS, not inline px, so it re-resolves on a live resize
+   (iPhone Duo folding/unfolding, Split View) without touching the iframe node.
+   The side insets are PADDING on the paper tile, not an offset: the iframe
+   stays clear of each inset while the tile still paints over the grid behind
+   those strips. A sandboxed card can't read the shell's insets itself. */
+.deck-card.maximized.deck-max-full {
+  left: 0;
+  top: 0;
+  width: 100vw;
+  height: 100dvh;
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
 }
 .deck-card.deck-max-animate {
   transition:
     left 260ms cubic-bezier(0.2, 0, 0, 1),
     top 260ms cubic-bezier(0.2, 0, 0, 1),
     width 260ms cubic-bezier(0.2, 0, 0, 1),
-    height 260ms cubic-bezier(0.2, 0, 0, 1);
+    height 260ms cubic-bezier(0.2, 0, 0, 1),
+    padding-left 260ms cubic-bezier(0.2, 0, 0, 1),
+    padding-right 260ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 /* Cards must never receive pointer events while editing — the drag owns

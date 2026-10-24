@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { I18nextProvider } from "react-i18next";
@@ -19,6 +19,7 @@ import {
   HTML_PREVIEW_DRAG_MOVE_EVENT,
   HTML_PREVIEW_MAXIMIZED_CLASS,
   htmlPreviewBlobId,
+  previewParking,
 } from "./htmlPreviewProtocol";
 
 const BLOB_ID = `sha256:${"a".repeat(64)}.${"b".repeat(32)}`;
@@ -245,6 +246,112 @@ describe("HtmlPreview", () => {
     expect(box).not.toHaveClass("is-maximized");
     expect(document.documentElement).not.toHaveClass(HTML_PREVIEW_MAXIMIZED_CLASS);
     expect(postMaximized).toHaveBeenLastCalledWith(false);
+  });
+
+  /// The thread scrolls under a parked preview's slot, and a foldable closing
+  /// or opening rewraps every row above it: the slot's DOCUMENT position moves
+  /// while the reader's scroll offset stays put (or clamps). jsdom has neither,
+  /// so both are supplied: the document scrolls `scrollTop`, and the slot sits
+  /// at `slotAt` in it.
+  describe("parks the thread by the card, not by a scroll offset", () => {
+    let scrollTop = 0;
+    let slotAt = 0;
+
+    function installScroller(box: HTMLElement): void {
+      scrollTop = 700;
+      slotAt = 1000;
+      const root = document.documentElement;
+      Object.defineProperty(document, "scrollingElement", {
+        configurable: true,
+        get: () => root,
+      });
+      Object.defineProperty(root, "scrollHeight", { configurable: true, get: () => 5000 });
+      Object.defineProperty(root, "clientHeight", { configurable: true, get: () => 800 });
+      Object.defineProperty(root, "scrollTop", {
+        configurable: true,
+        get: () => scrollTop,
+        set: (v: number) => {
+          scrollTop = Math.min(Math.max(0, v), 4200);
+        },
+      });
+      const slot = box.parentElement as HTMLElement;
+      slot.getBoundingClientRect = () =>
+        ({ left: 20, top: slotAt - scrollTop, width: 360, height: 420 }) as DOMRect;
+      box.getBoundingClientRect = () => ({ left: 0, top: 0, width: 400, height: 800 }) as DOMRect;
+      window.innerWidth = 400;
+    }
+
+    afterEach(() => {
+      const root = document.documentElement;
+      for (const key of ["scrollHeight", "clientHeight", "scrollTop"]) {
+        Reflect.deleteProperty(root, key);
+      }
+      Reflect.deleteProperty(document, "scrollingElement");
+    });
+
+    function previewBox(): HTMLElement {
+      return screen.getByTitle("Agent-created HTML preview").closest(".html-preview") as HTMLElement;
+    }
+
+    it("scrolls the card back to where it sat BEFORE measuring the way home", async () => {
+      const user = userEvent.setup();
+      renderPreview();
+      installScroller(previewBox());
+      const box = await maximize();
+      const landed = stubAnimations(box, 1);
+
+      // The phone unfolds under the preview: everything above the card rewraps
+      // and it now sits 600px further down the thread.
+      slotAt = 1600;
+      await user.click(screen.getByRole("button", { name: "Close full-screen HTML preview" }));
+
+      expect(scrollTop).toBe(1300);
+      // The morph lands on the card at the top it left from.
+      expect(box.style.top).toBe("300px");
+
+      landed[0]();
+      await waitFor(() =>
+        expect(document.documentElement).not.toHaveClass(HTML_PREVIEW_MAXIMIZED_CLASS),
+      );
+      // Nothing moves the thread again once the box is home.
+      expect(scrollTop).toBe(1300);
+    });
+
+    it("clamps the way back to what the thread can reach", async () => {
+      renderPreview();
+      installScroller(previewBox());
+      await maximize();
+
+      slotAt = 100;
+      fire(new Event(HTML_PREVIEW_COLLAPSE_EVENT));
+
+      expect(scrollTop).toBe(0);
+      expect(previewParking.slot).toBeNull();
+    });
+
+    it("puts the card back before an edge swipe starts uncovering the thread", async () => {
+      renderPreview();
+      installScroller(previewBox());
+      const box = await maximize();
+
+      slotAt = 1600;
+      fire(new Event(HTML_PREVIEW_DRAG_BEGIN_EVENT));
+      expect(scrollTop).toBe(1300);
+
+      // Half way home is half way to the card's ORIGINAL spot on screen.
+      fire(new CustomEvent(HTML_PREVIEW_DRAG_MOVE_EVENT, { detail: 200 }));
+      expect(box.style.top).toBe("150px");
+    });
+
+    it("leaves a thread that did not move exactly where it is", async () => {
+      renderPreview();
+      installScroller(previewBox());
+      await maximize();
+
+      fire(new Event(HTML_PREVIEW_COLLAPSE_EVENT));
+
+      expect(scrollTop).toBe(700);
+    });
   });
 
   it("renders an explicit error instead of navigating for a bad marker", () => {

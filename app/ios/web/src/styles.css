@@ -78,6 +78,22 @@
      home-indicator area (measured to the screen edge), so no extra env(). */
   --thread-bottom-inset: 0px;
 
+  /* The widest the reading column grows, gutters included. A phone never
+     reaches it; a foldable's inner display (~951pt), Split View on it and an
+     iPad do, and uncapped there assistant prose ran ~125 characters a line and
+     an 80% user bubble ~730pt wide. Native mirrors it as `Theme.readingWidth`
+     (App/Support/Theme.swift) for its own chrome — change the two together.
+     The band is cut out of a FULL-WIDTH scroller with padding, never with a
+     max-width on the scroller itself: the whole width must still scroll, and
+     fixed/full-bleed surfaces (a maximized HTML preview) must not inherit the
+     cap. Each side clears its OWN safe-area inset — Split View and a landscape
+     notch make them unequal, so never assume left == right. The `100%` is
+     resolved where the property is USED — padding percentages read the
+     containing block's width, which for both scrollers is the full page. */
+  --reading-width: 720px;
+  --reading-band-left: max((100% - var(--reading-width)) / 2, env(safe-area-inset-left));
+  --reading-band-right: max((100% - var(--reading-width)) / 2, env(safe-area-inset-right));
+
   /* Light-only: pin the scheme so iOS scrollbars/controls never render a dark
      variant the design doesn't define. */
   color-scheme: light;
@@ -150,7 +166,10 @@ button {
   display: flex;
   flex-direction: column;
   gap: var(--chat-row-gap);
-  padding: var(--thread-top-inset) 1.25rem calc(var(--thread-bottom-inset) + 4rem);
+  padding: var(--thread-top-inset) 0 calc(var(--thread-bottom-inset) + 4rem);
+  /* The reading band (`--reading-width`), with the thread's gutter inside it. */
+  padding-left: calc(var(--reading-band-left) + 1.25rem);
+  padding-right: calc(var(--reading-band-right) + 1.25rem);
   /* Fill from the TOP down. A fresh chat's first message rises to the top and
      the reply streams below it; any thread shorter than the screen is
      top-aligned with the empty space BELOW the last row (not above the first).
@@ -859,9 +878,10 @@ html.retargeting #root { visibility: hidden; }
 }
 /* The thread must not scroll behind the box: a vertical drag on a fixed element
    that scrolls nothing of its own is handed to the nearest scrollable ancestor,
-   which is the document. HtmlPreview.tsx restores `scrollY` when this comes off
-   — locking the scroller can clamp its offset, and the thread must be exactly
-   where the reader left it. */
+   which is the document. Locking the scroller can clamp its offset, and the
+   thread can rewrap under the box (a foldable closing or opening), so
+   HtmlPreview.tsx parks the card's slot by GEOMETRY and scrolls it back to
+   that spot as a dismissal starts (`previewParking`). */
 html.html-preview-maximized,
 html.html-preview-maximized body {
   overflow: hidden;

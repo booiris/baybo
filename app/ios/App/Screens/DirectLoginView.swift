@@ -85,7 +85,7 @@ struct DirectLoginForm: View {
                     .frame(maxWidth: .infinity)
             }
         }
-        .frame(maxWidth: 320) // .direct-form max-width 20rem
+        .frame(maxWidth: Theme.formWidth)
     }
 
     private func fieldLabel(_ text: String) -> some View {

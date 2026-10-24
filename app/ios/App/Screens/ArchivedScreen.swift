@@ -7,6 +7,7 @@ import SwiftUI
 /// appends the conversation, so the pop chain runs chat → archived → list.
 struct ArchivedScreen: View {
     @EnvironmentObject private var appStore: AppStore
+    @Environment(\.sideRail) private var rail
     @ObservedObject private var index = SessionIndex.shared
     @ObservedObject private var lang = Lang.shared
     @Environment(\.dismiss) private var dismiss
@@ -49,19 +50,11 @@ struct ArchivedScreen: View {
                     .font(Theme.mono(16))
                     .foregroundStyle(Theme.ink)
 
-                HStack {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 42, height: 42)
+                if rail == nil {
+                    HStack {
+                        BackCircle(label: lang.t("chat.back")) { dismiss() }
+                        Spacer()
                     }
-                    .glassSurface(interactive: true, in: .circle)
-                    .accessibilityLabel(Text(verbatim: lang.t("chat.back")))
-
-                    Spacer()
                 }
             }
             .padding(.horizontal, 24)
@@ -76,6 +69,9 @@ struct ArchivedScreen: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .sideRailItems(rail) {
+            BackCircle(label: lang.t("chat.back")) { dismiss() }
+        }
         .background(alignment: .top) { veil }
     }
 
@@ -124,6 +120,7 @@ struct ArchivedScreen: View {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .contentMargins(.top, ChatListScreen.topContentMargin, for: .scrollContent)
+        .readingColumnMargins()
         .scrollBounceBehavior(.always)
     }
 

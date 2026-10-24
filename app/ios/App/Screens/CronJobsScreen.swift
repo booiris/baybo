@@ -20,6 +20,7 @@ import SwiftUI
 /// is to answer "what is set up right now".
 struct CronJobsScreen: View {
     @EnvironmentObject private var appStore: AppStore
+    @Environment(\.sideRail) private var rail
     @ObservedObject private var lang = Lang.shared
     @Environment(\.dismiss) private var dismiss
 
@@ -63,19 +64,11 @@ struct CronJobsScreen: View {
                     .font(Theme.mono(16))
                     .foregroundStyle(Theme.ink)
 
-                HStack {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 42, height: 42)
+                if rail == nil {
+                    HStack {
+                        BackCircle(label: lang.t("chat.back")) { dismiss() }
+                        Spacer()
                     }
-                    .glassSurface(interactive: true, in: .circle)
-                    .accessibilityLabel(Text(verbatim: lang.t("chat.back")))
-
-                    Spacer()
                 }
             }
             .padding(.horizontal, 24)
@@ -90,6 +83,9 @@ struct CronJobsScreen: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .sideRailItems(rail) {
+            BackCircle(label: lang.t("chat.back")) { dismiss() }
+        }
         .background(alignment: .top) { veil }
     }
 

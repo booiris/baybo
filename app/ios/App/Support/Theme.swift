@@ -29,6 +29,24 @@ enum Theme {
     /// outside-tap dismiss surface.
     static let panelScrim = Color.black.opacity(0.06)
 
+    /// The ONE reading width: the widest a content column grows on a wide window
+    /// (the iPhone Duo's inner display, a Split View half, an iPad). Mirrors the
+    /// transcript's `--reading-width: 720px` in `web/src/styles.css` — the thread
+    /// is a `min(100%, 720)` band centred with its gutters INSIDE it, and the
+    /// native dock and list columns share that band so the two halves line up
+    /// across the webview boundary. Chrome and backgrounds stay full-bleed; only
+    /// the column is capped. A phone is always narrower, so it never engages there.
+    static let readingWidth: CGFloat = 720
+    /// The narrow form column (the direct-login form, the pairing confirm) — the
+    /// web `.direct-form`'s `max-width: 20rem`.
+    static let formWidth: CGFloat = 320
+
+    /// The horizontal margin, per side, that centres a `readingWidth` column in a
+    /// container `width` wide. Zero whenever the container is the band or narrower.
+    static func readingMargin(in width: CGFloat) -> CGFloat {
+        max(0, (width - readingWidth) / 2)
+    }
+
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("Space Mono", size: size).weight(weight)
     }
@@ -205,6 +223,30 @@ extension View {
         }
     }
 
+    /// Caps a plain (non-scrolling) column at `Theme.readingWidth` and centres it
+    /// in whatever width it is offered. Apply it OUTSIDE the column's own gutter
+    /// padding, so the gutters sit inside the band the way the transcript's do.
+    /// A modifier rather than a size-class branch: a live fold resizes the window
+    /// under it, and a swapped view tree would drop its `@State` / `@FocusState`.
+    func readingColumn() -> some View {
+        frame(maxWidth: Theme.readingWidth).frame(maxWidth: .infinity)
+    }
+
+    /// `readingColumn` for a SCROLLER (`List`, `ScrollView`): the content is
+    /// inset to the band while the scroller itself — its bounce, its indicator,
+    /// its swipe-to-reveal rows' hit region off the column's flanks — stays full
+    /// width. The margin is measured off the scroller's own frame, which is
+    /// already inside the safe area, so an asymmetric leading/trailing inset
+    /// (Split View, a landscape notch) is added by the system on top and the
+    /// band centres in the space actually left.
+    ///
+    /// `contentMargins` reaches every scroll view BELOW this one in the
+    /// environment, so put it only on a scroller whose rows host no scroll view
+    /// of their own.
+    func readingColumnMargins() -> some View {
+        modifier(ReadingColumnMargins())
+    }
+
     /// Web-page parity: tapping empty space blurs the focused field and drops
     /// the keyboard (a WKWebView resigns its input on outside taps; native
     /// SwiftUI does not). A plain tap gesture, so child buttons/fields keep
@@ -253,5 +295,15 @@ struct CompactPillButtonStyle: ButtonStyle {
             .contentShape(Rectangle())
             .opacity(configuration.isPressed ? 0.7 : 1)
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
+    }
+}
+
+private struct ReadingColumnMargins: ViewModifier {
+    @State private var width: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content
+            .contentMargins(.horizontal, Theme.readingMargin(in: width), for: .scrollContent)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
     }
 }

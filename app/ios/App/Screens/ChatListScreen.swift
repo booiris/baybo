@@ -203,6 +203,9 @@ struct ChatListScreen: View {
             }
         }
         .listStyle(.plain)
+        // Rows hold to the reading band on a wide window; the scroller, its
+        // pull-to-refresh and the header over it stay full width.
+        .readingColumnMargins()
         // No reorder animation: every reshuffle — pin, pull-refresh merge,
         // live-activity recency bump — snaps. A pin tapped from the swipe never
         // glided anyway (UIKit holds the cell; see `swipeDismissal`), so the

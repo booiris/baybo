@@ -4880,6 +4880,23 @@
         }
       }
     },
+    "scan.cameraUnavailable": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The camera is busy or unavailable right now. Scanning resumes as soon as it is free."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "相机正被占用或暂不可用，空闲后将自动继续扫描。"
+          }
+        }
+      }
+    },
     "scan.cancel": {
       "extractionState": "stale",
       "localizations": {

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ProjectBoardScreen: View {
     @EnvironmentObject private var appStore: AppStore
+    @Environment(\.sideRail) private var rail
     @ObservedObject private var lang = Lang.shared
     @ObservedObject private var projects: ProjectsStore
     @Environment(\.dismiss) private var dismiss
@@ -116,6 +117,7 @@ struct ProjectBoardScreen: View {
             ProjectTeamSheet(projectId: projectId)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+                .presentationSizing(.form)
                 .presentationBackground(Theme.paper)
         }
         .sheet(isPresented: $showsActivity) {
@@ -529,6 +531,25 @@ struct ProjectBoardScreen: View {
 
     // MARK: - Header
 
+    @ViewBuilder private var newIssueButton: some View {
+        if !isArchived {
+            Button {
+                Haptics.tap()
+                appStore.openNewIssue(project: projectId, status: stage)
+            } label: {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 42, height: 42)
+            }
+            .glassSurface(interactive: true, in: .circle)
+            .disabled(projects.isOffline)
+            .opacity(projects.isOffline ? 0.4 : 1)
+            .accessibilityIdentifier("board-new-issue")
+            .accessibilityLabel(Text(verbatim: lang.t("newIssue.title")))
+        }
+    }
+
     private var header: some View {
         ZStack {
             Text(verbatim: project?.name ?? lang.t("home.tab.projects"))
@@ -541,14 +562,9 @@ struct ProjectBoardScreen: View {
                 }
 
             HStack(spacing: 6) {
-                Button { dismiss() } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(Theme.ink)
-                        .frame(width: 42, height: 42)
+                if rail == nil {
+                    BackCircle(label: lang.t("board.back")) { dismiss() }
                 }
-                .glassSurface(interactive: true, in: .circle)
-                .accessibilityLabel(Text(verbatim: lang.t("board.back")))
                 Spacer()
                 if isArchived {
                     Text(verbatim: lang.t("projects.archivedChip"))
@@ -558,28 +574,21 @@ struct ProjectBoardScreen: View {
                         .frame(height: 22)
                         .background(Theme.paper, in: Capsule())
                         .overlay(Capsule().strokeBorder(Theme.lineStrong, lineWidth: 1))
-                } else {
-                    Button {
-                        Haptics.tap()
-                        appStore.openNewIssue(project: projectId, status: stage)
-                    } label: {
-                        Image(systemName: "square.and.pencil")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 42, height: 42)
-                    }
-                    .glassSurface(interactive: true, in: .circle)
-                    .disabled(projects.isOffline)
-                    .opacity(projects.isOffline ? 0.4 : 1)
-                    .accessibilityIdentifier("board-new-issue")
-                    .accessibilityLabel(Text(verbatim: lang.t("newIssue.title")))
                 }
-                boardMenu
+                if rail == nil {
+                    newIssueButton
+                    boardMenu
+                }
             }
         }
         .padding(.horizontal, 24)
         .frame(height: ChatHeaderView.barHeight)
         .frame(maxWidth: .infinity)
+        .sideRailItems(rail) {
+            BackCircle(label: lang.t("board.back")) { dismiss() }
+            newIssueButton
+            boardMenu
+        }
         .background(alignment: .top) {
             LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .top)

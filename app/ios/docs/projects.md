@@ -36,7 +36,26 @@ direct open with no team data fetches `/agents`. The native
 top. The arrow is present only while the page is away from the top, including
 after a later downward scroll; at the top the header is the plain issue number.
 Returning to an already-covered visit still restores that visit's saved scroll
-position. The header's ellipsis offers `Move status` through the same native
+position — and the block that was on screen with it. `IssueViewState` carries an
+`anchor` (the first `data-anchor` block on screen, its offset, and the page width
+it was read at) beside `scrollTop`, and a visit restored at a different width
+goes by the block: a foldable closed or opened while the card was covered
+rewraps everything above the reader, so the old offset points elsewhere. Native
+carries `anchor` through `issueState` / `snapshotState` and back in
+`restoredState` as a typed field of `IssueStore.PageState`
+(`PageState(wire:)` / `.wire`, pinned by `IssuePageStateTests`); a malformed one
+is dropped rather than the whole state, and with none the page falls back to
+`scrollTop`.
+
+The card page is resized live on a foldable (closing or opening the phone, Split
+View), so it holds the reader's place through a width change with the
+transcript's own scheme (`web/src/resizeAnchor.ts`): at the newest activity it
+re-pins, otherwise the block on screen is put back where it sat, and the
+`atBottom` / `atTop` / page-state reports go out again, since both edges may
+have moved. Anchors sit on each top-level block and each Activity row, never on
+an element that holds another. Its content is capped to the transcript's
+reading band (`--reading-width`) while `.issue-page` stays the full-width
+scroller. The header's ellipsis offers `Move status` through the same native
 `MoveSheet` as the status chip; run history and retry actions remain there too.
 
 Card descriptions and comments use the transcript bundle's shared Markdown renderer.

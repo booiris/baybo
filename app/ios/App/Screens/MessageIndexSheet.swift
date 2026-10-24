@@ -26,6 +26,10 @@ struct MessageIndexSheet: View {
     /// Whether the opening scroll has settled on the real answer — see
     /// `landOnReadersPosition`.
     @State private var landed = false
+    /// Regular width presents this as a centred form sheet, which has no drag
+    /// to advertise — the grabber hides there (a modifier, so a live fold
+    /// between the two displays doesn't rebuild the sheet's contents).
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     fileprivate static let rowHInset: CGFloat = 24
     /// Stable handle for the UI smoke: every row's label is localized prose fed
@@ -57,6 +61,8 @@ struct MessageIndexSheet: View {
             .fill(Theme.inkSoft.opacity(0.35))
             .frame(width: 36, height: 4)
             .padding(.vertical, 9)
+            .opacity(sizeClass == .regular ? 0 : 1)
+            .accessibilityHidden(true)
     }
 
     private var titleRow: some View {

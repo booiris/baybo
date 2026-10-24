@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ProjectIssueScreen: View {
     @EnvironmentObject private var appStore: AppStore
+    @Environment(\.sideRail) private var rail
     @ObservedObject private var lang = Lang.shared
     @StateObject private var visit: IssueVisit
     @Environment(\.dismiss) private var dismiss
@@ -18,6 +19,9 @@ struct ProjectIssueScreen: View {
     /// finish once somebody is on the card.
     @State private var assignThenMoveTo: IssueStatus?
     @State private var openRun: ProjectRunRoute?
+    /// The dock's approval-card detail ceiling for this window's free height —
+    /// `ChatScreen`'s measurement, for the card the two docks share.
+    @State private var approvalDetailCap = ApprovalCardView.detailCeiling
 
     init(visit: IssueVisit) {
         projectId = visit.store.projectId
@@ -42,6 +46,14 @@ struct ProjectIssueScreen: View {
         .ignoresSafeArea(.keyboard)
         .background(PopGestureEnabler().frame(width: 0, height: 0))
         .safeAreaInset(edge: .bottom, spacing: 0) { dock }
+        // Outside the inset, so it reads the screen's free height (keyboard out,
+        // dock rows not) — see `ChatScreen`.
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.height
+        } action: { height in
+            let cap = ApprovalCardView.detailCap(available: height)
+            if cap != approvalDetailCap { approvalDetailCap = cap }
+        }
         .task { await store.refresh() }
         .onChange(of: store.pickRequest) { _, field in
             guard let field else { return }
@@ -95,7 +107,9 @@ struct ProjectIssueScreen: View {
 
     private var dock: some View {
         ComposerDock(collapsed: false) {
-            IssueDock(store: store, staging: store.staging, attach: attach)
+            IssueDock(
+                store: store, staging: store.staging, attach: attach,
+                approvalDetailCap: approvalDetailCap)
                 .onGeometryChange(for: CGFloat.self) { proxy in
                     proxy.frame(in: .global).minY
                 } action: { _, minY in
@@ -148,40 +162,44 @@ struct ProjectIssueScreen: View {
                     .foregroundStyle(Theme.ink)
             }
 
-            HStack(spacing: 6) {
-                Button { dismiss() } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(Theme.ink)
-                        .frame(width: 42, height: 42)
+            if rail == nil {
+                HStack(spacing: 6) {
+                    BackCircle(label: lang.t("board.back")) { dismiss() }
+                    Spacer()
+                    stopButton
+                    if hasMenu { menu }
                 }
-                .glassSurface(interactive: true, in: .circle)
-                .accessibilityLabel(Text(verbatim: lang.t("board.back")))
-                Spacer()
-                if store.liveRun != nil {
-                    Button {
-                        Haptics.tap()
-                        confirmingStop = true
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 42, height: 42)
-                    }
-                    .glassSurface(interactive: true, in: .circle)
-                    .accessibilityIdentifier("issue-stop")
-                    .accessibilityLabel(Text(verbatim: lang.t("issue.stop")))
-                }
-                if hasMenu { menu }
             }
         }
         .padding(.horizontal, 24)
         .frame(height: ChatHeaderView.barHeight)
         .frame(maxWidth: .infinity)
+        .sideRailItems(rail) {
+            BackCircle(label: lang.t("board.back")) { dismiss() }
+            if hasMenu { menu }
+            stopButton
+        }
         .background(alignment: .top) {
             LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .top)
                 .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder private var stopButton: some View {
+        if store.liveRun != nil {
+            Button {
+                Haptics.tap()
+                confirmingStop = true
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 42, height: 42)
+            }
+            .glassSurface(interactive: true, in: .circle)
+            .accessibilityIdentifier("issue-stop")
+            .accessibilityLabel(Text(verbatim: lang.t("issue.stop")))
         }
     }
 

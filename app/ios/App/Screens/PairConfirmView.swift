@@ -65,6 +65,9 @@ struct PairConfirmView: View {
                     .multilineTextAlignment(.center)
             }
         }
+        // The direct-login form's column, so the code box and the button row
+        // don't stretch across a wide window.
+        .frame(maxWidth: Theme.formWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 20)
         .overlay(alignment: .topTrailing) {

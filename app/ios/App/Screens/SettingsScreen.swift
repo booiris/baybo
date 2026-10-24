@@ -64,6 +64,7 @@ struct SettingsScreen: View {
                 )
             }
             .padding(.horizontal, 24)
+            .readingColumn()
 
             Spacer(minLength: 40)
         }
@@ -73,6 +74,7 @@ struct SettingsScreen: View {
             VStack(spacing: 0) {
                 logoutButton
                     .padding(.horizontal, 24)
+                    .readingColumn()
             }
             .padding(.top, 16)
             .padding(.bottom, Self.bottomInset)

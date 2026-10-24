@@ -101,6 +101,7 @@ struct BoardFilterSheet: View {
         .background(Theme.paper)
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+        .presentationSizing(.form.fitted(horizontal: false, vertical: true))
     }
 
     private func sectionTitle(_ text: String) -> some View {

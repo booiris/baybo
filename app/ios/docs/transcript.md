@@ -1,6 +1,6 @@
 # The transcript webview
 
-_The single reused transcript `WKWebView` and everything that feeds it: `BayboClient`/`ChatStore` lifecycle, the native ⇄ web bridge, keyboard insets, markdown/LaTeX rendering, and the message index. Governs `app/ios/App/Core/TranscriptHost.swift`, `app/ios/App/Web/TranscriptBridge.swift`, `app/ios/App/Web/TranscriptWebView.swift`, `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/MessageOutline.swift`, `app/ios/App/Screens/MessageIndexSheet.swift`, and `app/ios/web/src/` (`bridge.ts`, `Transcript.tsx`, `mathDelimiters.ts`, `wireSentinel.ts`, `restSentinel.ts`)._
+_The single reused transcript `WKWebView` and everything that feeds it: `BayboClient`/`ChatStore` lifecycle, the native ⇄ web bridge, keyboard insets, markdown/LaTeX rendering, and the message index. Governs `app/ios/App/Core/TranscriptHost.swift`, `app/ios/App/Web/TranscriptBridge.swift`, `app/ios/App/Web/TranscriptWebView.swift`, `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/MessageOutline.swift`, `app/ios/App/Screens/MessageIndexSheet.swift`, and `app/ios/web/src/` (`bridge.ts`, `Transcript.tsx`, `resizeAnchor.ts`, `mathDelimiters.ts`, `wireSentinel.ts`, `restSentinel.ts`)._
 
 ## BayboClient and store lifecycle
 
@@ -242,8 +242,9 @@ attached the store to ITS bridge when it was built.
 A reader parked up in the history is put back where they were: before the old
 page is torn down, native asks it for the row at the top of the viewport and
 its offset (`readingPosition`, null while following the newest edge — measured
-against `previewParking` while a full-screen HTML preview has the scroller
-locked, since the lock can clamp the live offset) and hands
+as if a full-screen HTML preview had already put its card back
+(`parkedThreadShift`), since the lock can clamp the live offset and the thread
+can rewrap under the box) and hands
 that to the new page (`restoreReadingPosition`), which parks the row quietly —
 paging back for it if the mirror's window does not reach it, and staying at the
 newest edge if it cannot be found — then posts `readingPositionSettled`.
@@ -427,6 +428,59 @@ keyboard-like 250ms curve (`.chat-log.inset-animated`) and re-pins the newest ed
 frame while following.
 
 One signal covers keyboard, composer growth, and the notice line.
+
+## Width changes and the reading band
+
+The keyboard never resizes the webview, but the window does. For years that
+meant a rare rotation, and the web side was written as if the width were fixed.
+iPhone Duo made it routine: closing or opening the phone moves the app between
+the outer display (~466pt) and the inner one (~951pt, regular width) **live**,
+and Split View on the inner display gives a half-width window with unequal left
+and right safe areas. Every row rewraps, and WebKit has no scroll anchoring, so
+`scrollTop` keeps its pixel value and points at different content.
+
+**The reader's place is held by a row, not a pixel.** `resizeAnchor.ts` is the one
+scheme, shared with the card page so the two cannot drift: capture the first row
+still on screen and its offset, then write `scrollTop` so it sits there again. The
+REPLACE anchor uses the same two functions. On a width change `.chat-log`'s
+ResizeObserver re-pins a following reader, and puts a parked one back on their
+row.
+
+**The place has to be captured BEFORE the reflow, and that is the subtle part.**
+The observer runs after layout, so a row read inside its callback is already at the
+new width — the anchor would faithfully restore the wrong place. Nor can it be read
+on the way in: any geometry read in the frame the viewport changed forces the new
+layout. So `holdPlaceAcrossWidth` keeps the place warm instead — re-read once per
+frame while the reader scrolls, and after every observed resize (the log changes
+size whenever its content does) — and hands the width change the copy from the
+layout before. A scroll capture that finds the box's width changed under it skips
+that frame: WebKit clamping `scrollTop` to a shorter thread can fire a scroll event
+in the very frame of the resize, and reading there would overwrite the one good copy.
+Width means the CONTENT width: inside the capped band the viewport can change
+without a single row rewrapping, and then there is nothing to hold.
+
+**Containment's remembered sizes go stale too.** `contain-intrinsic-size: auto`
+remembers a row's height at the width it was last laid out at, so after a fold every
+offscreen row would scroll in at its old height and snap — the scroll-up shake,
+back one row at a time. Once the width has held still for `CV_REFRESH_DEBOUNCE_MS`
+(a Split View drag streams a resize per frame, and each pass lays out the whole
+mounted thread), `data-cv` comes off every mounted row and the ordinary stamping
+pass hands them back two frames later. Taking the stamps off reflows rows ABOVE the
+reader too, so the refresh captures the place first and puts it back in the same
+task, before anything paints. It renders every mounted row once — the bounded mount
+is what keeps that affordable; don't let it become the whole mirror.
+
+**The reading band.** Uncapped on the inner display, assistant prose ran ~125
+characters a line and an 80% user bubble ~730pt wide. `--reading-width` (720px,
+gutters included; native mirrors it as `Theme.readingWidth`) caps it, cut out of
+`.chat-log` with `padding-left`/`padding-right` — never `max-width` on the log: the
+document is the scroller, the whole width must still scroll, and the fixed
+full-screen HTML preview must not inherit the cap. The 1.25rem gutter applies
+inside the band, and each side clears its OWN `env(safe-area-inset-*)`
+(`--reading-band-left/right`); never assume the two are equal. Today the native
+side keeps the webview out of the side safe areas (`ChatScreen` ignores only top
+and bottom), so those insets read 0 — the `env()` terms are what keep it right
+if that changes. The card page uses the same band.
 
 The bridge retains the composer edge even before the webview has a window.
 `InsetTrackingWebView` (shared with the issue page) retries the inset on window attachment and layout, with
@@ -681,6 +735,16 @@ intermediate size rather than drawn scaled. The `<pre>` holds that slot open
 (`--html-preview-h`) so the collapse has somewhere true to land, and the
 collapse re-measures the slot rather than replaying a remembered rect (rows keep
 arriving while a preview is up, so its home may have moved down the thread).
+
+The thread under the box is **parked by geometry, not by offset**
+(`previewParking`): the expand records the slot and its viewport top, and a
+dismissal — button, swipe or native collapse — first scrolls the slot back to
+that top (clamped to what the thread can reach), THEN measures it as the morph's
+destination. It used to park `window.scrollY` and restore it verbatim when the
+class came off, after the morph had already measured its home. A fold or unfold
+while the preview was up then rewrapped the thread, so the restored pixel offset
+pointed at different content and the box shrank into a slot that moved out from
+under it at the last frame. Nothing scrolls at the far end any more.
 
 The transition itself is declared in `styles.css` and the geometry is written
 from `HtmlPreview.tsx`, which waits on `transitionend`; its timer is a loose

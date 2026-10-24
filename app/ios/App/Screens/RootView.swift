@@ -184,6 +184,7 @@ struct RootView: View {
                 .zIndex(1)
             }
         }
+        .publishesSideRail()
         .sheet(isPresented: $store.scanPresented) {
             ScanView()
         }
