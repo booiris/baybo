@@ -30,9 +30,8 @@ use baybo_agent::tool_executor::{BoardStores, ToolExecutor};
 use baybo_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_config::{BayboConfig, LlmEntryName};
-use baybo_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
+use baybo_context::{ContextManager, ContextManagerConfig, HeuristicTokenizer, Tokenizer};
 use baybo_cost::{CostManager, SpendingLimits};
-use baybo_llm::BillableLlm;
 use baybo_memory::Memory;
 use baybo_security::{LeakDetectionRule, LeakDetector};
 use baybo_skills::SkillRegistry;
@@ -145,23 +144,16 @@ pub struct ManagerGraph {
     /// subagent's `ContextManager`, which resolves the child's system prompt
     /// from it by profile name.
     pub subagent_registry: Arc<baybo_subagent::SubagentRegistry>,
-    /// Always already wrapped via `BillableLlm` — every
-    /// consumer (main loop, side-LLM in tools, skill_assessor)
-    /// shares the same budget gate. Constructed in
-    /// [`build_managers`] so a new consumer added downstream can't
-    /// accidentally pull a raw `Arc<LlmClient>` and bypass the gate;
-    /// the type signature alone is enough to refuse a raw
-    /// `Arc<dyn LlmCompletion>` at the call site.
-    pub llm_client: Arc<BillableLlm>,
-    /// `llm_client` is `pool.default_client()`. The pool exists so the
-    /// actor spawner can resolve a per-session pick from
-    /// `Session.state.last_llm`.
+    /// Every client in it is already wrapped via `BillableLlm`, so every
+    /// consumer (main loop, side-LLM in tools, skill_assessor) shares the
+    /// same budget gate. The pool exists so the actor spawner can resolve a
+    /// per-session pick from `Session.state.last_llm`.
     pub llm_pool: baybo_agent::LlmPoolHandle,
-    /// Owner of cost-record persistence and the budget gate used by
-    /// `llm_client` above. Kept on the graph so `wire_router` can
-    /// hand it to `AgentLoop` without reconstructing — and so the
-    /// gate built into `llm_client` and the records the agent loop
-    /// writes are guaranteed to come from the same instance.
+    /// Owner of cost-record persistence and the budget gate built into
+    /// every pool client. Kept on the graph so `wire_router` can hand it
+    /// to `AgentLoop` without reconstructing — and so that gate and the
+    /// records the agent loop writes are guaranteed to come from the same
+    /// instance.
     pub cost_manager: Arc<CostManager>,
     /// Live rate-limit knobs shared between the router's `RateLimiter`
     /// and the config-reload `CostReloader`. Created in
@@ -894,7 +886,6 @@ pub async fn build_managers(
         tool_registry,
         tool_executor,
         subagent_registry,
-        llm_client,
         llm_pool,
         cost_manager,
         rate_limit,
@@ -944,11 +935,7 @@ pub struct RouterRunHandle {
 pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let buffer = graph.config.channels.message_buffer_size;
 
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(TiktokenTokenizer::for_model(
-        graph.llm_client.model_info().id.as_str(),
-    ));
-
-    let token_calibration = Arc::new(baybo_context::TokenCalibration::new());
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(HeuristicTokenizer);
 
     let max_iterations = graph.config.agent.max_iterations;
     let compression_threshold = graph.config.agent.context.compression_threshold;
@@ -970,7 +957,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // already has.
     let trace_event_stream = TraceEventStream::new();
 
-    // `cost_manager` and the guarded `llm_client` are both built in
+    // `cost_manager` and the guarded pool clients are both built in
     // `build_managers` and live on `graph` — every consumer (main
     // loop, side-LLM in tools, skill_assessor) shares the same gate.
     // Re-binding here just to keep the local name changes below
@@ -992,7 +979,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let security_gateway = Arc::clone(&graph.security_gateway);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
-        let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
         // The actor stamps a one-shot cron result's delivery here once it has
@@ -1054,7 +1040,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         keep_recent,
                         compression_threshold,
                         max_active_tokens,
-                        calibration: Arc::clone(&token_calibration),
                         skill_registry: Arc::clone(&skill_registry),
                         channel: session.channel.clone(),
                         shape: baybo_context::prompts::soul::PromptShape::for_trigger(

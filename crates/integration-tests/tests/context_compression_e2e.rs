@@ -211,13 +211,15 @@ async fn compression_call_records_cost_with_matching_span_id() {
     harness.shutdown().await;
 }
 
-/// The compaction pass reports its phase: turn 2 crosses the tight budget,
-/// so the loop emits `Status(Compacting)` before the summariser call and
+/// The compaction pass reports its phase: turn 2 crosses the budget, so the
+/// loop emits `Status(Compacting)` before the summariser call and
 /// `Status(Compacted)` after; turn 1 stays under threshold and is silent.
+/// The ceiling (10k) has room for the request's tool schemas, which the gate
+/// counts, and turn 2's message alone is past it.
 #[tokio::test(start_paused = true)]
 async fn compaction_reports_compacting_then_compacted_status() {
     let mut harness = AgentTestHarness::builder()
-        .with_model_context_window(200)
+        .with_model_context_window(100_000)
         .with_compression_threshold(0.1)
         .with_keep_recent(1)
         .build();
@@ -244,12 +246,62 @@ async fn compaction_reports_compacting_then_compacted_status() {
         "turn 1 is under the budget — no compaction status, got {turn1:?}"
     );
 
-    harness.send_text("again").await.unwrap();
+    harness.send_text(&"again ".repeat(20_000)).await.unwrap();
     let turn2 = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
         status_phases(&turn2),
         vec![StatusPhase::Compacting, StatusPhase::Compacted],
         "turn 2 must report Compacting then Compacted, got {turn2:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The provider's own count from one turn is what the next turn's gate
+/// stands on: the estimate carries no vocabulary and only prices what was
+/// appended since. A tiny transcript the provider billed at 60k must compact
+/// against a 50k ceiling — the local estimate of it alone is nowhere near.
+#[tokio::test(start_paused = true)]
+async fn the_providers_count_from_one_turn_drives_the_next_turns_gate() {
+    let mut harness = AgentTestHarness::builder()
+        .with_model_context_window(100_000)
+        .with_compression_threshold(0.5)
+        .with_keep_recent(1)
+        .build();
+
+    harness.stub_llm.push_stream_results(vec![
+        Ok(StreamEvent::Text("first".into())),
+        Ok(StreamEvent::Usage(TokenUsage {
+            input_tokens: 60_000,
+            output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })),
+    ]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("second".into())]);
+    harness.stub_llm.push_response(LlmResponse {
+        content: "summary of earlier conversation".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    harness.send_text("hello").await.unwrap();
+    let turn1 = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert!(
+        status_phases(&turn1).is_empty(),
+        "nothing is anchored before the first call, got {turn1:?}"
+    );
+
+    harness.send_text("again").await.unwrap();
+    let turn2 = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        status_phases(&turn2),
+        vec![StatusPhase::Compacting, StatusPhase::Compacted],
+        "turn 2 must gate on the provider's 60k, got {turn2:?}"
     );
 
     harness.shutdown().await;

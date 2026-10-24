@@ -88,7 +88,7 @@ Every reload runs the full set of steps — the LLM pool is **always** rebuilt, 
 
 The loop's **lite** client (`resolve_lite`, driving the risk judges / page summary / title) is re-resolved on every turn *before* that pointer check, not inside it: the lite cascade can change while the main client does not — an entry gaining a `lite_model`, or `model_tiers.lite` being re-pointed — and the short-circuit would otherwise skip past it.
 
-The **tokenizer is deliberately not swapped**. `TiktokenTokenizer` is already an estimate and the `TokenCalibration` layer corrects drift against observed usage within a few turns; adding a mutable tokenizer surface to `ContextManager` isn't worth it.
+The **tokenizer is not swapped**: `HeuristicTokenizer` is vocabulary-free and model-independent, and it only prices what the last provider count does not already cover.
 
 Subagent pinning needs no special handling: `resolve(Some(removed_entry))` already falls back to the default with a `warn!`, and a pinned entry whose model changed picks up the new model on its next turn.
 

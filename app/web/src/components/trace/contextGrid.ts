@@ -62,7 +62,7 @@ function niceCellSize(raw: number): number {
  *
  * `usedTokens` is the number to trust for the total — the provider's reported
  * `input_tokens` when there is one. The segments only supply proportions:
- * they are a tiktoken estimate and their sum drifts from what was billed, so
+ * they are a heuristic estimate and their sum drifts from what was billed, so
  * scaling them onto the reported total keeps the grid's headline exact and
  * confines the estimate to the split.
  *

@@ -151,7 +151,6 @@ keeping it in lockstep with the Rust router is what lets the frontend
   under a tight token budget: cost/span join, the status pair, the
   summariser retry, and the failure contract (transcript kept whole,
   step closed `Failed`, one `Warn` notice to the user).
-- `token_calibration_e2e.rs` — the token-count calibration feedback loop.
 - `tool_concurrency.rs` — tool-call concurrency scheduling in
   `run_iteration`.
 

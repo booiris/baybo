@@ -26,13 +26,10 @@ Core responsibilities:
 ```
 ContextManager (struct)
 ├── TokenBudget       — pure state: max_tokens, threshold, current usage
-├── Tokenizer         — trait, counts tokens (no model id — calibration
-│                       is keyed by the model_id passed into maybe_compress)
-│   └── TiktokenTokenizer — BPE impl via `tiktoken-rs` (cl100k_base / o200k_base)
-├── TokenCalibration  — required, per-model EMA ratio of actual/estimate
-│                       fed back from `AgentLoop::call_llm`
+├── Tokenizer         — trait, counts tokens (no model id)
+│   └── HeuristicTokenizer — vocabulary-free: UTF-8 bytes/4, digits doubled, ×1.15
 ├── current_model     — Option<String>; written by maybe_compress, used as
-│                       calibration key + baseline-invalidation trigger
+│                       the baseline-invalidation trigger
 ├── workspace         — Arc<baybo_workspace::WorkspacePaths>; resolves
 │                       the transcript-recovery pointer, the identity files
 │                       (soul assembly), and the
@@ -338,8 +335,8 @@ two appears in neither the diff nor the live set.
 | When to compress                     | `ContextManager::maybe_compress`   | Caller (agent loop) triggers at the top of each iteration so cost recording can be wrapped |
 | How to compress                      | `compressor.rs` impl block         | One hardcoded flow on `ContextManager`; no swappable strategy                              |
 | Per-session paths                    | `Arc<WorkspacePaths>`              | Resolves the transcript-recovery pointer baked into the summary message                   |
-| Token counting                       | `Tokenizer` trait                  | Trait and `TiktokenTokenizer` impl both live here; no LLM-SDK coupling                     |
-| Calibration key (which model)        | `maybe_compress`'s `model_id` arg  | Caller passes the LLM id at compression time; `ContextManager` stores and reuses it        |
+| Token counting                       | `Tokenizer` trait                  | Trait and `HeuristicTokenizer` impl both live here; no vocabulary, no LLM-SDK coupling     |
+| Baseline owner (which model)         | the gates' `model_id` arg          | A different model than the baseline was measured on drops it; the old count is not this one's |
 
 ### The compaction flow
 
@@ -374,7 +371,7 @@ The context sent to the LLM is organized in descending priority:
 
 ### Dependency boundaries
 
-- Depends on `baybo-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
+- Depends on `baybo-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `HeuristicTokenizer` is arithmetic over the text's bytes, with no vocabulary and no provider SDK.
 - Depends on `baybo-workspace` for `WorkspacePaths` so the transcript-recovery pointer resolves through the same source of truth the rest of the runtime uses.
 - Does **not** depend on `memory` — memory recall is injected from the agent layer: `AgentLoop::recall_and_inject` recalls via `baybo-memory` and appends framed `RecalledMemory` rows through `ContextManager::append_recalled_memory`; context only supplies the envelope (`prompts/recalled_memory.rs`).
 - Depends on `baybo-trace` only for the `LlmCallInputs` marker type carried through the `ChatCallback` — the compressor builds a `Persisted`-ordinal/`Inline` input marker for the span, but opening the span and recording cost still happen inside the caller's closure; `context` only sees its `Result<LlmResponse, ContextError>`. No direct `storage` dependency — transcript persistence is brokered through the `Arc<SessionManager>` (from `baybo-session`) supplied at construction.
@@ -396,24 +393,28 @@ Failure handling: when the callback errors or returns nothing usable, the compre
 
 ## Token-count estimation: baseline + delta
 
-`TiktokenTokenizer` is at best a ~10% approximation for non-OpenAI providers (Anthropic, Gemini, …) and under-counts because per-message estimates don't include the request envelope (system prompt, tools schema). The agent loop closes that gap by feeding the provider's authoritative `usage.input_tokens` back into `ContextManager` after every main LLM call as a **baseline**. Subsequent budget queries return `baseline.actual_tokens + tokenize(messages[count_at_call..])` — the bulk of the count is the provider's exact number, and the only thing we tokenize locally is the suffix appended since.
+The provider's authoritative `usage.input_tokens` from every main LLM call is fed back into `ContextManager` as a **baseline**. Subsequent budget queries return `baseline.actual_tokens + estimate(messages[count_at_call..])` — the bulk of the count is the provider's exact number, and the only thing estimated locally is the suffix appended since.
 
 Lifecycle:
 
-1. Cold start (no baseline) → `count_tokens` falls back to a full BPE-and-calibrate sweep.
-2. After a main call lands `usage.input_tokens = N` for the current transcript of length `K` → `record_call_actual(N)` anchors the baseline (`actual_tokens=N`, `message_count_at_call=K`) and feeds a `(raw_text_estimate, N)` sample to `TokenCalibration` keyed by `current_model`. The slice argument from the previous API is gone — the manager owns the transcript outright now, so the call site has nothing useful to pass in.
-3. Within the turn, each new assistant/tool message is appended; budget grows as `N + tokenize(suffix)`.
-4. Compression mutates the prefix → `maybe_compress` calls `invalidate_baseline()`; next call resets the cycle.
-5. Compression LLM calls are *not* fed into calibration — they carry the instruction suffix and answer at a fixed low reasoning rung, so their shape differs from a main call's and would set a misleading baseline. (Their *prefix* is deliberately identical, tool list included; see step 2.)
+1. Cold start (no baseline) → `count_tokens` falls back to a full sweep: the estimate of every message, plus the tool schemas of the request being gated. `needs_compression` / `maybe_compress` / `force_compress` are handed the tool list and record its estimate before counting — the provider bills the schemas, an anchor already holds them, and no stored message does.
+2. After a main call lands `usage.input_tokens = N` for the current transcript of length `K` → `record_call_actual(N)` anchors the baseline (`actual_tokens=N`, `message_count_at_call=K`).
+3. Within the turn, each new assistant/tool message is appended; budget grows as `N + estimate(suffix)`.
+4. Compression mutates the prefix → `maybe_compress` calls `invalidate_baseline()`; next call resets the cycle. A candidate assembly is priced the way that unanchored count will price it — its rows plus the tool schemas and transient tail (`unanchored_request_tokens`) — in both `compaction_fits` and `run_compression`'s savings gate, so it is held to the number the budget reports once it is the transcript. Switching `model_id` between calls also invalidates it (the prior `actual_tokens` was tokenised by the old provider).
+5. Compression LLM calls do *not* set the baseline — they carry the instruction suffix and answer at a fixed low reasoning rung, so their shape differs from a main call's. (Their *prefix* is deliberately identical, tool list included.)
 
-`TokenCalibration` (per-model EMA ratio of `actual / estimate`, α=0.3, samples clamped to [0.5, 2.0], estimates < 100 tokens skipped) is still applied to the **delta** part — single-message BPE error is small but non-zero. The full-sweep fallback path also goes through calibration so cold-start estimates are scaled too.
+### The estimate is vocabulary-free
 
-### Media is priced outside the calibration loop
+`HeuristicTokenizer` ships no BPE table: a text costs `ceil((utf8_bytes + ascii_digits) × 1.15 / 4)`, plus one token a byte for the dense scripts (`is_dense_script`: every supplementary-plane character, CJK Ext-A, Yi, the Kangxi and CJK radicals, Cherokee), which `cl100k` and `o200k` both bill at 1.000 tokens a byte and the byte estimate would charge 0.29. Bytes rather than chars, because a CJK character is three UTF-8 bytes — 0.75 tokens here against the 0.56–0.75 that OpenAI, DeepSeek and Gemini bill — where `chars / 4` charges it a quarter. Digits are doubled because every vocabulary splits numbers finer than prose (Gemini bills digit-dense logs at ~2.2 bytes a token). The 1.15 pads the estimate over its own error: replayed against 76k production main calls, bytes/4 with digits doubled read a median 4–9% below the provider's count, and an under-count is the direction that overflows the window rather than compacting early.
+
+This replaced a `tiktoken-rs` `cl100k_base` tokenizer plus a process-wide per-model EMA calibration ratio. Both were measured and dropped: the vocabulary is several MB of embedded tables and was no provider's — gpt-6.* bills like `o200k`, DeepSeek and Gemini like their own — so its error depended on content (CJK vs code vs logs) in a way no single ratio can correct; and the ratio, shared by every session on a model and dominated by whichever was busiest, mis-corrected one content type to fix another. With the anchor carrying the prefix, the estimate only has to price a suffix and the occasional full sweep, which is what widely used agent harnesses (Claude Code, Codex, opencode) do with a byte or character heuristic.
+
+### Media is priced apart from text
 
 `Tokenizer::count_message_media` splits a message's estimate in two, and `per_message_tokens` stores both halves (`MessageTokens { text, media }`):
 
-- **text** — what the BPE really counted. Calibration scales this and only this.
-- **media** — what the provider will bill for an image, a native PDF, a voice note or an inlined document, priced by `baybo_llm::content_block_tokens` from facts probed or stat'd at ingest (`width`/`height`, `page_count`, `duration_ms`, `size_bytes`) and falling back to that arm's delivery cap when a fact is absent. Added to the budget beside the calibrated text, never through it.
+- **text** — the heuristic's estimate of real prompt text.
+- **media** — what the provider will bill for an image, a native PDF, a voice note or an inlined document, priced by `baybo_llm::content_block_tokens` from facts probed or stat'd at ingest (`width`/`height`, `page_count`, `duration_ms`, `size_bytes`) and falling back to that arm's delivery cap when a fact is absent.
 
   Charged **only on rows the provider actually receives media on**, which `baybo_llm::delivers_media(role)` decides: `build_completion_request` runs `user_content_for_block` — the only path that materialises bytes — on a **user** row alone. An assistant row keeps text, tool calls and thinking; a system row is flattened to text; a tool row keeps only its result. Media anywhere else is dropped without even a stub.
 
@@ -421,21 +422,11 @@ Lifecycle:
 
   The live case is the agent loop folding `AttachFile` output onto the turn's final **assistant** row so the file persists and rebuilds on cold start, not so the model re-reads it. Uncorrected, one attached SVG — no pixel grid to read, so it prices at the full `IMAGE_TOKEN_CEILING` of 9,288 — burned that much window for as long as the row survived, against a provider charge of zero.
 
-Both directions matter. As the *denominator* of a sample, a ceiling makes every observation over-count, so the EMA walks the ratio to the `SAMPLE_RATIO_MIN = 0.5` clamp — measured on a realistic session (5,000 tokens of chat + one `.md`; raw 22,529, provider actual 5,500) the ratio hit 0.5288 by turn 8, and from there a 40,002-token plain-CJK transcript on the *same model* was charged 21,154. As something the ratio *multiplies*, a ceiling stops being a ceiling.
-
-So a sample is refused **when the ceiling is big enough to swamp the signal** — `media > MAX_MEDIA_SHARE_FOR_SAMPLE (0.25) × raw_total`. That share bounds an admitted sample's inflation at a third **only while the media charge is an over-estimate of what the provider bills**, which is what the delivery caps in `baybo-llm` guarantee: every arm prices from a fact probed at ingest, and delivery re-derives the same fact from the same bytes and stubs anything its cap cannot cover. Break that premise and the gate reads the under-estimate on both sides at once — a 12000×9000 image charged 9,288 against a provider 49,536 sat at exactly 25% of a 27,864-token transcript, was admitted, and every sample read 2.78, clamped to `SAMPLE_RATIO_MAX` and walked the EMA there. `TokenCalibration` is one process-wide instance cloned into every `ContextManager`, so unrelated sessions on that model then charged plain text at 2× and compacted early. There is deliberately **no** second clamp on how far one sample may move the ratio: `SAMPLE_RATIO_MAX` already caps the sample and α caps the step, the walk came from repeated samples out of one contaminated session rather than from an outlier, and a tighter step would only slow convergence on the 1.4–1.5× drift the loop exists to track. Refusing every media-bearing transcript instead is not the neutral choice it looks like: one image in message 1 then suppresses the sample for the life of the session and the whole text history falls back to the identity ratio. Measured at 1.5× provider drift over eight turns with a 40k-token tool result landing after the last call — text only: ratio 1.471, budget 208,915 vs provider 210,068 (−0.5%); plus one image, sampled: 1.514, 216,832 vs 216,266 (+0.3%); plus one image, refused: identity, 196,263 vs 216,266 (−9.2%), and that miss grows with whatever lands after the anchor. A PDF at the delivery cap (93,600) is ~70% of the same transcript and is refused. The baseline is still anchored every turn, so the uncalibrated part of a refused session is only the suffix appended since the last call.
-
-Wiring contract:
-
-- `maybe_compress(model_id, chat)` is the single point that sets the calibration key. Pass `LlmCompletion::model_info().id` so `observe` and `adjust` key into the same bucket. Switching `model_id` between calls invalidates the baseline (the prior `actual_tokens` was tokenised by the old provider).
-- `TiktokenTokenizer::for_model(model)` only picks the BPE family — it stores no model id. Calibration granularity is decided by what the agent loop passes into `maybe_compress`, not by how the tokenizer was constructed.
-- Calibration state is in-memory only; cold start re-calibrates from scratch each process. The baseline is reset on every compression and re-anchored by the next main call.
-
 ## Context breakdown (read side)
 
 `breakdown.rs` answers a different question from everything above: not *how
-much context is there* but *what is in it*. `context_breakdown(model_id,
-messages, tools)` splits one recorded LLM call into per-part token estimates —
+much context is there* but *what is in it*. `context_breakdown(messages,
+tools)` splits one recorded LLM call into per-part token estimates —
 the system prompt, the tool definitions, the skill listing, recalled memories,
 each message, each tool result — for the trace viewer's context matrix
 (`GET /v1/traces/{session_id}/spans/{span_id}/context`).
@@ -449,15 +440,14 @@ Two things it deliberately does not do:
   would file the three things most likely to be bloating a context under
   "user". A tool result on a `Role::User` row — how providers without a tool
   role take them — is caught by the block shape for the same reason.
-- **It does not claim to be the total.** The split is a `TiktokenTokenizer`
+- **It does not claim to be the total.** The split is a `HeuristicTokenizer`
   estimate with all the drift described above, so the endpoint returns it
   beside the span's recorded `input_tokens` and the viewer scales the
   proportions onto that exact figure. Media rides in its own `Media` part
-  rather than inside the text estimate, matching the calibration split.
+  rather than inside the text estimate, matching the budget's split.
 
 It is a pure function over already-recorded data, so it never participates in
-the baseline/calibration loop — a read of the trace must not move the live
-budget of anything.
+the baseline — a read of the trace must not move the live budget of anything.
 
 ## Collaboration
 

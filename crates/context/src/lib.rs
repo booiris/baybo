@@ -1,6 +1,5 @@
 pub mod breakdown;
 pub mod budget;
-pub mod calibration;
 pub mod compressor;
 pub mod error;
 pub mod prompts;
@@ -9,12 +8,11 @@ mod transcript_repair;
 
 pub use breakdown::{ContextBreakdown, ContextPart, ContextSegment, context_breakdown};
 pub use budget::TokenBudget;
-pub use calibration::TokenCalibration;
 pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
 pub use prompts::deferred_tools::DeferredServerNotice;
-pub use tokenizer::{TiktokenTokenizer, Tokenizer};
+pub use tokenizer::{HeuristicTokenizer, Tokenizer};
 
 // ---------------------------------------------------------------------------
 // Recent-slice bounds for the compaction's backward atomic-pair walk.
@@ -73,6 +71,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use baybo_llm::{ChatRequest, LlmResponse, ToolDefinitionForLlm};
@@ -195,15 +194,10 @@ pub enum CompressionOutcome {
     Failed { reason: String },
 }
 
-/// One message's cost, split by what calibration is allowed to touch.
-///
-/// `text` is the tokenizer's own estimate of real prompt text, which
-/// [`TokenCalibration`] scales to close the gap between `cl100k` and the
-/// provider's tokenizer. `media` is what the provider bills for an image,
-/// PDF or voice note — its own arithmetic over a probed fact, not a
-/// tokenizer output — and is added to the budget *outside* that loop.
-/// Folding it in inverted the ceilings and then deflated plain text as
-/// well; see [`crate::calibration`].
+/// One message's cost, split into the tokenizer's estimate of its text and
+/// what the provider bills for its media — an image, PDF or voice note,
+/// priced by the provider's own arithmetic over a probed fact rather than
+/// by any text estimate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MessageTokens {
     text: usize,
@@ -214,56 +208,6 @@ impl MessageTokens {
     fn total(self) -> usize {
         self.text + self.media
     }
-}
-
-/// Largest share of a call's raw estimate that may be a media ceiling and
-/// still leave the sample worth taking. Above it the ceiling swamps the
-/// signal the sample is supposed to carry; below it, the observed ratio is
-/// inflated by at most a third of the true one, and always in the
-/// over-charging direction.
-///
-/// Measured — `one_image_in_a_long_session_still_calibrates` prints it —
-/// at 1.5x provider drift over eight turns with a 40k-token tool result
-/// landing between the last call and the budget read: text only → ratio
-/// 1.471, budget 208,915 against a provider 210,068 (−0.5%). Add one
-/// image and the sample is still taken: ratio 1.514, budget 216,832
-/// against 216,266 (+0.3%). Refuse it and the ratio stays at identity:
-/// 196,263 against 216,266 (−9.2%), and that miss grows with whatever
-/// lands after the last anchor. A PDF at the delivery cap (93,600) is 70%
-/// of the same transcript, is refused, and is the case that walked the
-/// ratio to its 0.5 floor.
-const MAX_MEDIA_SHARE_FOR_SAMPLE: f64 = 0.25;
-
-/// The gate itself, over the two numbers rather than over the manager, so
-/// the bound it is chosen for can be swept.
-///
-/// **The share bounds the inflation only while the media charge is an
-/// OVER-estimate of what the provider bills.** It is: every arm in
-/// `baybo-llm` prices from a fact probed at ingest, and the delivery path
-/// re-derives that same fact from the same bytes and stubs anything its
-/// cap cannot cover, so nothing can reach a provider costing more than
-/// the budget was charged. Break that premise and the gate reads the
-/// under-estimate on both sides at once — a 12000x9000 image charged
-/// 9,288 against a provider 49,536 sat at exactly 25% of a 27,864-token
-/// transcript, was admitted, and every sample read 2.78. Clamped to
-/// `SAMPLE_RATIO_MAX` and fed to an EMA, the ratio walks to 2.0 — and
-/// `TokenCalibration` is ONE process-wide instance cloned into every
-/// `ContextManager`, so unrelated sessions on that model then charge
-/// plain text at 2x and compact early.
-///
-/// **No second clamp on how far one sample may move the ratio.** It would
-/// bound a quantity that is already bounded twice — `SAMPLE_RATIO_MAX`
-/// caps the sample and `EMA_ALPHA` caps the step — and it would not have
-/// stopped the walk above, which came from repeated samples out of one
-/// contaminated session rather than from any single outlier. What made
-/// that walk possible was the broken premise, not the step size, and
-/// tightening the step would only slow convergence on the 1.4–1.5x
-/// provider drift the loop exists to track.
-fn media_share_admits_sample(text: usize, media: usize) -> bool {
-    if media == 0 {
-        return true;
-    }
-    (media as f64) <= MAX_MEDIA_SHARE_FOR_SAMPLE * ((text + media) as f64)
 }
 
 /// Manages a session's context: owns the conversation transcript,
@@ -286,7 +230,6 @@ pub struct ContextManager {
     /// is [`MIN_COMPACTABLE_TOKENS`].
     pub(crate) keep_recent: usize,
     pub(crate) budget: TokenBudget,
-    calibration: Arc<TokenCalibration>,
     pub(crate) skill_registry: Arc<SkillRegistry>,
     /// Channel of the session this manager serves. Gates which skills
     /// are advertised to the model and which `/command`s expand here —
@@ -316,12 +259,15 @@ pub struct ContextManager {
     // Interior-mutable: `record_call_actual` runs from the agent
     // loop's `&self`-only `call_llm` path.
     baseline: RwLock<Option<TokenBaseline>>,
-    /// LLM model id used as the calibration key. Set by
-    /// `maybe_compress` (which the agent loop calls at the top of
-    /// every turn with the current `LlmCompletion::model_info().id`)
-    /// and read by `calibrate` / `record_call_actual`. `None` until
-    /// the first compression check — cold start passes the raw
-    /// tokenizer estimate through unchanged.
+    /// Tokenizer estimate of the tool schemas the next request carries.
+    /// The provider bills them inside `input_tokens`, so an anchor already
+    /// holds them, but no stored message does: a full sweep adds this.
+    /// Set by every gate that is handed the tool list.
+    request_overhead: AtomicUsize,
+    /// LLM model id the baseline was measured against. Set by
+    /// `maybe_compress` (which the agent loop calls at the top of every
+    /// turn with the current `LlmCompletion::model_info().id`); a change
+    /// drops the baseline, which another provider tokenised.
     current_model: RwLock<Option<String>>,
     /// Identity of the session this manager mirrors to in
     /// `session_messages`, so a process bounce / actor respawn can
@@ -460,7 +406,6 @@ pub struct ContextManagerConfig {
     /// `agent.context.max_active_tokens`. `0` leaves the window share as
     /// the only rule; otherwise the tighter of the two decides.
     pub max_active_tokens: usize,
-    pub calibration: Arc<TokenCalibration>,
     pub skill_registry: Arc<SkillRegistry>,
     /// Channel of the session (from the session row). Skills restricted
     /// via `channels:` frontmatter are filtered against it.
@@ -528,7 +473,6 @@ impl ContextManager {
             // `set_active_model_context_window` before any compression
             // check runs.
             budget: TokenBudget::new(0, config.compression_threshold, config.max_active_tokens),
-            calibration: config.calibration,
             skill_registry: config.skill_registry,
             channel: config.channel,
             shape: config.shape,
@@ -537,6 +481,7 @@ impl ContextManager {
             per_message_tokens: Vec::new(),
             called_skills: Vec::new(),
             baseline: RwLock::new(None),
+            request_overhead: AtomicUsize::new(0),
             current_model: RwLock::new(None),
             session_id: config.session_id,
             sessions: config.sessions,
@@ -1455,7 +1400,7 @@ impl ContextManager {
         self.compaction_declined_at_len = None;
     }
 
-    /// Settle calibration + baseline post-response from a main LLM
+    /// Anchor the baseline on the provider's count from a main LLM
     /// call. Anchors against the current transcript length — must be
     /// called before any subsequent mutation; the agent loop honours
     /// this because it sits inside the `with_llm_span` closure that
@@ -1465,9 +1410,8 @@ impl ContextManager {
     /// failure with no usage signal; leaving the prior baseline in
     /// place beats overwriting it with zero.
     ///
-    /// Only call this for *main* LLM calls. Compression calls
-    /// summarise old non-system messages with no tools schema, so
-    /// their `(estimate, actual)` ratio doesn't generalise.
+    /// Only call this for *main* LLM calls: a compression call carries the
+    /// summariser's instruction suffix, not the next request's shape.
     pub fn record_call_actual(&self, actual_input_tokens: usize) {
         if actual_input_tokens == 0 {
             return;
@@ -1479,16 +1423,15 @@ impl ContextManager {
         // the main-turn call records actuals; the compression call (no reminder)
         // never reaches here.
         let actual_messages = actual_input_tokens.saturating_sub(self.transient_tail_raw());
-        if let Some(model_id) = self.current_model.read().as_deref()
-            && self.media_is_small_enough_to_sample()
-        {
-            let raw = self.raw_text_estimate();
-            self.calibration.observe(model_id, raw, actual_messages);
-        }
         *self.baseline.write() = Some(TokenBaseline {
             actual_tokens: actual_messages,
             message_count_at_call: self.messages.len(),
         });
+    }
+
+    #[cfg(test)]
+    fn raw_media_estimate(&self) -> usize {
+        self.per_message_tokens.iter().map(|t| t.media).sum()
     }
 
     fn invalidate_baseline(&self) {
@@ -1506,34 +1449,6 @@ impl ContextManager {
         if switching {
             self.invalidate_baseline();
         }
-    }
-
-    fn raw_text_estimate(&self) -> usize {
-        self.per_message_tokens.iter().map(|t| t.text).sum()
-    }
-
-    fn raw_media_estimate(&self) -> usize {
-        self.per_message_tokens.iter().map(|t| t.media).sum()
-    }
-
-    /// Whether the media ceilings in the transcript are small enough that
-    /// attributing the provider's whole number to text still measures the
-    /// tokenizer rather than the ceiling.
-    ///
-    /// The sample is `(raw_text, actual)` and `actual` covers text AND
-    /// media, so a ceiling inflates the observed ratio by at most
-    /// `media / raw_text` — bounded by
-    /// [`MAX_MEDIA_SHARE_FOR_SAMPLE`]` / (1 - `[`MAX_MEDIA_SHARE_FOR_SAMPLE`]`)`.
-    /// Refusing every media-bearing transcript instead — which is what
-    /// `raw_media_estimate() == 0` did — is not the neutral choice: one
-    /// image in message 1 then suppressed the sample for the life of the
-    /// session and `calibrate` fell back to identity, measured at 1.5x
-    /// provider drift as a budget of 45,256 against a real 65,258 (−31%),
-    /// where the same session with the sample taken reads within a few
-    /// percent. Over-charging compacts early; under-charging overflows the
-    /// window.
-    fn media_is_small_enough_to_sample(&self) -> bool {
-        media_share_admits_sample(self.raw_text_estimate(), self.raw_media_estimate())
     }
 
     /// Append a message to the transcript and update the token
@@ -1670,8 +1585,8 @@ impl ContextManager {
     /// persists and rebuilds on a cold start, not so the model re-reads
     /// it. Charged anyway, one attachment spends up to
     /// [`baybo_llm::IMAGE_TOKEN_CEILING`] of window on bytes no provider
-    /// receives, for as long as the row survives, and the overcharge never
-    /// self-corrects because [`TokenCalibration`] excludes media by design.
+    /// receives, for as long as the row survives — and nothing corrects a
+    /// media price after the fact.
     fn split_tokens(&self, msg: &ChatMessage) -> MessageTokens {
         let priced = self.tokenizer.count_message_media(msg);
         MessageTokens {
@@ -1731,8 +1646,9 @@ impl ContextManager {
     /// bracket the pass with progress events without re-implementing the
     /// gate. Cheap — the token count is a baseline-plus-delta sum, the same
     /// one `maybe_compress` does.
-    pub fn needs_compression(&mut self, model_id: &str) -> bool {
+    pub fn needs_compression(&mut self, model_id: &str, tools: &[ToolDefinitionForLlm]) -> bool {
         self.set_current_model(model_id);
+        self.note_request_tools(tools);
         self.budget.update(self.count_tokens());
         self.budget.needs_compression() && !self.compaction_declined()
     }
@@ -1749,11 +1665,10 @@ impl ContextManager {
     /// Called at the top of every agent-loop iteration before the next
     /// `ChatRequest` is built.
     ///
-    /// `model_id` is the LLM the next main call will hit. It's stored
-    /// as the calibration key for subsequent `count_tokens` /
-    /// `record_call_actual` calls; switching `model_id` invalidates
-    /// the baseline (the prior `actual_tokens` was tokenised by the
-    /// old provider).
+    /// `model_id` is the LLM the next main call will hit; switching it
+    /// invalidates the baseline (the prior `actual_tokens` was tokenised
+    /// by the old provider). `tools` is the schema list that call will
+    /// carry, priced into a full sweep.
     ///
     /// `chat` performs the summarizer request inside a trace span and
     /// records cost against the ledger; the compressor owns parsing. A
@@ -1771,6 +1686,7 @@ impl ContextManager {
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         self.set_current_model(model_id);
+        self.note_request_tools(&tools);
         self.budget.update(self.count_tokens());
         if !self.budget.needs_compression() {
             return Ok(CompressionOutcome::BelowThreshold);
@@ -1798,6 +1714,7 @@ impl ContextManager {
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         self.set_current_model(model_id);
+        self.note_request_tools(&tools);
         self.budget.update(self.count_tokens());
         self.compaction_declined_at_len = None;
         self.run_compression(tools, chat).await
@@ -1863,8 +1780,8 @@ impl ContextManager {
             .iter()
             .map(|m| self.message_budget_tokens(m))
             .collect();
-        let after_tokens = self.calibrate(new_per_message.iter().map(|t| t.text).sum())
-            + new_per_message.iter().map(|t| t.media).sum::<usize>();
+        let after_tokens =
+            self.unanchored_request_tokens(new_per_message.iter().map(|t| t.total()).sum());
 
         if after_tokens >= before_tokens {
             // Don't apply. The transcript and per-message cache stay
@@ -2094,37 +2011,59 @@ impl ContextManager {
     /// Steady-state cost is `O(suffix)`: the bulk of the count is the
     /// provider's authoritative `actual_tokens` from the last main
     /// call, and only the messages appended since are summed from the
-    /// per-message cache. Falls back to a full calibrated sweep on
-    /// cold start, or after compression, or if the message list
-    /// shrank below the anchor.
+    /// per-message cache. Falls back to a full sweep — plus the tool
+    /// schemas, which only an anchor already holds — on cold start, after
+    /// compression, or if the message list shrank below the anchor.
     fn count_tokens(&self) -> usize {
         // The transient rows (task reminder, no-progress observation) ride in
         // the real request but aren't stored messages, so fold their raw count
         // into the estimate (the baseline is kept free of them by
         // `record_call_actual`, so this isn't double counted). Both are pure
         // text — a rendered checklist and a rendered reminder.
-        let reminder = self.transient_tail_raw();
         let snapshot = *self.baseline.read();
-        // Media rides beside the calibrated text rather than through it.
         // Rows before the anchor are already inside `actual_tokens` at the
-        // provider's own price, so only the suffix's ceilings are added.
-        let (anchored, slice) = match snapshot {
-            Some(b) if self.messages.len() >= b.message_count_at_call => (
-                b.actual_tokens,
-                &self.per_message_tokens[b.message_count_at_call..],
-            ),
-            _ => (0, self.per_message_tokens.as_slice()),
-        };
-        let text: usize = slice.iter().map(|t| t.text).sum();
-        let media: usize = slice.iter().map(|t| t.media).sum();
-        anchored + self.calibrate(text + reminder) + media
+        // provider's own price — tool schemas included — so only the suffix
+        // is estimated on top.
+        match snapshot {
+            Some(b) if self.messages.len() >= b.message_count_at_call => {
+                let suffix: usize = self.per_message_tokens[b.message_count_at_call..]
+                    .iter()
+                    .map(|t| t.total())
+                    .sum();
+                b.actual_tokens + self.transient_tail_raw() + suffix
+            }
+            _ => self
+                .unanchored_request_tokens(self.per_message_tokens.iter().map(|t| t.total()).sum()),
+        }
     }
 
-    fn calibrate(&self, raw: usize) -> usize {
-        match self.current_model.read().as_deref() {
-            Some(model_id) => self.calibration.adjust(model_id, raw),
-            None => raw,
-        }
+    /// Record the tool schemas the next request carries, for a full sweep
+    /// to price. Called by every gate that is handed the tool list before
+    /// it counts: a freshly hydrated actor has made no call to learn it
+    /// from, and the provider bills the schemas whether or not a stored
+    /// message holds them.
+    fn note_request_tools(&self, tools: &[ToolDefinitionForLlm]) {
+        let overhead = tools
+            .iter()
+            .map(|t| {
+                crate::tokenizer::tool_definition_tokens(
+                    self.tokenizer.as_ref(),
+                    &t.name,
+                    &t.description,
+                    &t.parameters_schema,
+                )
+            })
+            .sum();
+        self.request_overhead.store(overhead, Ordering::Relaxed);
+    }
+
+    /// What a request built from `messages` tokens of stored rows costs with
+    /// no provider count to stand on: those rows plus what rides every
+    /// request beside them — the tool schemas and the transient tail. A
+    /// compaction candidate is priced this way, so it is held to the same
+    /// number [`Self::count_tokens`] reports once it is the transcript.
+    fn unanchored_request_tokens(&self, messages: usize) -> usize {
+        messages + self.request_overhead.load(Ordering::Relaxed) + self.transient_tail_raw()
     }
 }
 
@@ -2631,7 +2570,9 @@ fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(
 /// the skill entirely rather than ship an empty wrapper.
 ///
 /// Sizing is proportional (`body_chars * cap / full_cost`) with a
-/// 10 % safety margin against per-region BPE-ratio drift, then a
+/// 10 % safety margin against per-region drift — the cut counts chars,
+/// the cost counts bytes and digits, so a multi-byte or digit-dense body
+/// costs more per char than the rest of the rendering — then a
 /// post-render verification: if the truncated block still costs more
 /// than `cap`, return `None`. One pass, no iteration.
 fn render_skill_block_capped(
@@ -2648,8 +2589,8 @@ fn render_skill_block_capped(
     if body_chars == 0 {
         return None;
     }
-    // `* 9 / 10`: 10 % headroom so a body with slightly denser BPE
-    // tokens than the rest of the rendering still lands under `cap`.
+    // `* 9 / 10`: 10 % headroom so a body that costs slightly more per char
+    // than the rest of the rendering still lands under `cap`.
     let target_body_chars = body_chars
         .saturating_mul(cap)
         .saturating_div(full_cost)
@@ -2666,9 +2607,9 @@ fn render_skill_block_capped(
         .collect();
     skill.prompt_template = truncated_body;
     let rendered = render_skill_block(&skill);
-    // BPE ratio can still drift past the 10 % margin in pathological
-    // cases (heavy emoji, code with rare tokens). Bail rather than
-    // ship an over-budget block.
+    // The per-char cost can still drift past the 10 % margin in
+    // pathological cases (a body of emoji or rare scripts). Bail rather
+    // than ship an over-budget block.
     if tokenizer.count_text(&rendered) > cap {
         return None;
     }
@@ -2924,19 +2865,6 @@ mod tests {
         }])
     }
 
-    fn pdf_msg() -> ChatMessage {
-        ChatMessage::agent_context(vec![ContentBlock::File {
-            blob: baybo_model::BlobRef {
-                blob_id: "sha256:doc.tok".into(),
-            },
-            filename: "report.pdf".into(),
-            mime_type: "application/pdf".into(),
-            duration_ms: None,
-            page_count: Some(baybo_llm::MAX_PDF_PAGES),
-            size_bytes: None,
-        }])
-    }
-
     fn make_msg(role: Role, text: &str) -> ChatMessage {
         make_msg_with(role, vec![ContentBlock::Text(text.to_string())])
     }
@@ -3016,7 +2944,6 @@ mod tests {
             keep_recent,
             compression_threshold: threshold,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -3032,33 +2959,6 @@ mod tests {
 
     fn make_ctx(keep_recent: usize, max_tokens: usize, threshold: f64) -> ContextManager {
         make_ctx_with_sessions(test_sessions(), keep_recent, max_tokens, threshold)
-    }
-
-    const MODEL_ID: &str = "calibration-subject";
-
-    fn make_ctx_with_calibration(
-        calibration: Arc<TokenCalibration>,
-        max_tokens: usize,
-    ) -> ContextManager {
-        let mut ctx = ContextManager::from_config(ContextManagerConfig {
-            agent: None,
-            tokenizer: Arc::new(SimpleTokenizer),
-            workspace: test_workspace(),
-            keep_recent: 5,
-            compression_threshold: 0.75,
-            max_active_tokens: 0,
-            calibration,
-            skill_registry: Arc::new(SkillRegistry::new()),
-            channel: baybo_model::ChannelType::owner(),
-            shape: crate::prompts::soul::PromptShape::Chat,
-            session_id: test_session_id(),
-            sessions: test_sessions(),
-            subagent_profile: None,
-            builtin_memory: false,
-            deferred_tool_servers: Vec::new(),
-        });
-        ctx.set_active_model_context_window(max_tokens);
-        ctx
     }
 
     #[test]
@@ -3728,7 +3628,6 @@ mod tests {
             keep_recent: 2,
             compression_threshold: 0.75,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -3805,7 +3704,6 @@ mod tests {
             keep_recent: 2,
             compression_threshold: 0.75,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -3862,7 +3760,6 @@ mod tests {
             keep_recent: 2,
             compression_threshold: 0.75,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -4034,7 +3931,6 @@ mod tests {
             keep_recent: 2,
             compression_threshold: 0.75,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -4124,7 +4020,6 @@ mod tests {
             keep_recent: 2,
             compression_threshold: 0.75,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -4697,7 +4592,6 @@ mod tests {
             keep_recent: 2,
             compression_threshold: 0.75,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -4780,7 +4674,6 @@ mod tests {
             keep_recent: 2,
             compression_threshold: 0.75,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,
@@ -4897,13 +4790,12 @@ mod tests {
             .iter()
             .map(|m| ctx.tokenizer.count_message(m))
             .sum();
-        // No calibration injected → calibrate is identity, full count.
         assert_eq!(ctx.count_tokens(), raw_full);
     }
 
     /// After `record_call_actual`, `count_tokens` returns
     /// `actual + tokenize(suffix)` — only the messages appended since
-    /// the call get BPE-encoded.
+    /// the call are estimated.
     #[tokio::test]
     async fn count_tokens_uses_baseline_plus_delta() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
@@ -4922,6 +4814,78 @@ mod tests {
         let expected_delta =
             ctx.tokenizer.count_message(&new_a) + ctx.tokenizer.count_message(&new_b);
         assert_eq!(ctx.count_tokens(), 5_000 + expected_delta);
+    }
+
+    fn schema_tools(description_len: usize) -> Vec<ToolDefinitionForLlm> {
+        vec![ToolDefinitionForLlm {
+            name: "Read".into(),
+            description: "d".repeat(description_len),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        }]
+    }
+
+    /// The provider bills the tool schemas whether or not a stored message
+    /// holds them. With no count of its own to stand on — a freshly hydrated
+    /// actor, the first check after a compaction — the gate prices the list
+    /// it is handed; an anchor already holds them, so they are not added
+    /// twice; and a changed list replaces the old price.
+    #[tokio::test]
+    async fn the_gate_prices_the_tool_schemas_only_where_no_anchor_holds_them() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "hello")).await.unwrap();
+        let swept = ctx.count_tokens();
+        let tools = schema_tools(4_000);
+        let schemas = crate::tokenizer::tool_definition_tokens(
+            ctx.tokenizer.as_ref(),
+            &tools[0].name,
+            &tools[0].description,
+            &tools[0].parameters_schema,
+        );
+
+        ctx.needs_compression("test-model", &tools);
+        assert_eq!(ctx.budget().current(), swept + schemas);
+
+        ctx.record_call_actual(9_000);
+        ctx.needs_compression("test-model", &tools);
+        assert_eq!(
+            ctx.budget().current(),
+            9_000,
+            "the anchor already holds them"
+        );
+
+        ctx.invalidate_baseline();
+        ctx.needs_compression("test-model", &[]);
+        assert_eq!(
+            ctx.budget().current(),
+            swept,
+            "a dropped tool list is not charged"
+        );
+    }
+
+    /// The savings gate compares the transcript before against the candidate
+    /// after, and the before side carries the request's tool schemas. A
+    /// candidate priced without them cleared it by their whole size: a
+    /// `/compact` under a big tool list replaced three short rows with a
+    /// summary longer than they were, and reported the growth as
+    /// `Compressed`.
+    #[tokio::test]
+    async fn a_compaction_that_saves_nothing_is_declined_under_a_large_tool_list() {
+        let mut ctx = make_ctx(1, 200_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await.unwrap();
+        for i in 0..3 {
+            ctx.append(&make_msg(Role::User, &format!("m{i}")))
+                .await
+                .unwrap();
+        }
+        let outcome = ctx
+            .force_compress("test-model", schema_tools(60_000), ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::NoSavings),
+            "a summary's framing outweighs three short rows: {outcome:?}"
+        );
+        assert_eq!(ctx.messages().len(), 4, "nothing was rewritten");
     }
 
     fn make_task(subject: &str) -> baybo_model::Task {
@@ -5068,282 +5032,6 @@ mod tests {
         // No new messages since the call ⇒ the estimate equals `actual`
         // (reminder counted once, not twice).
         assert_eq!(ctx.count_tokens(), actual);
-    }
-
-    /// Pin (measured): a ceiling big enough to swamp the signal must never
-    /// become a calibration sample. Fed in as the denominator, the ratio
-    /// walks to its 0.5 floor within eight turns and the ceiling stops
-    /// being a ceiling — driving the real `TokenCalibration` over a
-    /// session of 5,000 tokens of chat plus one `.md` (raw 22,529,
-    /// provider actual 5,500) gave ratio 0.8500 at turn 1, 0.5840 at turn
-    /// 5 and 0.5288 at turn 8, charging 9,270 for an attachment the
-    /// provider counts at 17,374. Worse, the deflated ratio then
-    /// under-counted PLAIN text on the same model: a 40,002-token CJK
-    /// transcript came out at 21,154.
-    #[tokio::test]
-    async fn a_dominant_media_ceiling_records_no_calibration_sample() {
-        let calibration = Arc::new(TokenCalibration::new());
-        let mut ctx = make_ctx_with_calibration(Arc::clone(&calibration), 200_000);
-        ctx.set_current_model(MODEL_ID);
-
-        ctx.append(&make_msg(Role::User, &"word ".repeat(400)))
-            .await
-            .unwrap();
-        ctx.append(&pdf_msg()).await.unwrap();
-        for _ in 0..8 {
-            ctx.record_call_actual(600);
-        }
-        assert_eq!(
-            calibration.ratio(MODEL_ID),
-            None,
-            "media poisoned the ratio"
-        );
-        assert_eq!(calibration.sample_count(MODEL_ID), 0);
-    }
-
-    /// The regression this threshold exists for: one image in message 1
-    /// must not switch calibration off for the life of the session.
-    ///
-    /// Measured against the real `TokenCalibration` at a provider drift of
-    /// 1.5x over eight turns, with a 40,001-token tool result landing
-    /// between the last call and the budget read:
-    ///
-    /// | session                | ratio | budget  | provider | error |
-    /// |------------------------|------:|--------:|---------:|------:|
-    /// | text only              | 1.471 | 208,915 |  210,068 | −0.5% |
-    /// | + one image            | 1.514 | 216,832 |  216,266 | +0.3% |
-    /// | + one image, no sample |  none | 196,263 |  216,266 | −9.2% |
-    ///
-    /// Refusing the sample is not the neutral option: everything past the
-    /// last anchor is then charged at identity, and under-charging is what
-    /// overflows the window. The image's own ceiling is 9,288, which is
-    /// 42.6% of the transcript at turn 1 and 19.8% by turn 3 — so the
-    /// first two turns are refused and the remaining six sample, which is
-    /// why the ratio lands slightly above the text-only one (the safe
-    /// side) rather than exactly on it.
-    #[tokio::test]
-    async fn one_image_in_a_long_session_still_calibrates() {
-        const DRIFT: f64 = 1.5;
-        const REAL_IMAGE_TOKENS: usize = 6_192;
-
-        async fn drive(with_image: bool, sampled: bool) -> (Option<f64>, usize, usize) {
-            let calibration = Arc::new(TokenCalibration::new());
-            let mut ctx = make_ctx_with_calibration(Arc::clone(&calibration), 1_000_000);
-            // Leaving the model unset is exactly the counterfactual: no
-            // sample is recorded and `calibrate` falls back to identity.
-            if sampled {
-                ctx.set_current_model(MODEL_ID);
-            }
-            if with_image {
-                ctx.append(&image_msg()).await.unwrap();
-            }
-            for _ in 0..8 {
-                ctx.append(&make_msg(Role::User, &"word ".repeat(10_000)))
-                    .await
-                    .unwrap();
-                let text_actual = (ctx.raw_text_estimate() as f64 * DRIFT).round() as usize;
-                ctx.record_call_actual(
-                    text_actual + if with_image { REAL_IMAGE_TOKENS } else { 0 },
-                );
-            }
-            // A fat tool result lands after the last call, so the budget
-            // has to price it from the ratio rather than from the anchor.
-            ctx.append(&make_msg(Role::Tool, &"word ".repeat(32_000)))
-                .await
-                .unwrap();
-            let provider = (ctx.raw_text_estimate() as f64 * DRIFT).round() as usize
-                + if with_image { REAL_IMAGE_TOKENS } else { 0 };
-            (calibration.ratio(MODEL_ID), ctx.count_tokens(), provider)
-        }
-
-        let (text_ratio, text_budget, text_provider) = drive(false, true).await;
-        let (image_ratio, image_budget, image_provider) = drive(true, true).await;
-        let (refused_ratio, refused_budget, refused_provider) = drive(true, false).await;
-        let err = |b: usize, p: usize| (b as f64 - p as f64) / p as f64 * 100.0;
-        for (label, ratio, budget, provider) in [
-            ("text only     ", text_ratio, text_budget, text_provider),
-            ("+ image       ", image_ratio, image_budget, image_provider),
-            (
-                "+ image, no ✓ ",
-                refused_ratio,
-                refused_budget,
-                refused_provider,
-            ),
-        ] {
-            println!(
-                "{label} ratio {ratio:?} budget {budget} provider {provider} ({:+.1}%)",
-                err(budget, provider)
-            );
-        }
-
-        assert!(image_ratio.is_some(), "one image disabled calibration");
-        // Within the same few percent the text-only session manages.
-        assert!(
-            err(image_budget, image_provider).abs() < 5.0,
-            "budget off by {:+.1}%",
-            err(image_budget, image_provider)
-        );
-        // And the counterfactual is not "slightly worse": every token past
-        // the anchor is charged at identity, so the miss grows with
-        // whatever lands between calls.
-        assert!(
-            err(refused_budget, refused_provider) < -5.0,
-            "counterfactual is {:+.1}%",
-            err(refused_budget, refused_provider)
-        );
-    }
-
-    /// The bound [`MAX_MEDIA_SHARE_FOR_SAMPLE`] is chosen for, swept
-    /// rather than argued: an admitted sample is
-    /// `(true_text + true_media) / raw_text`, so it is inflated by
-    /// `true_media / raw_text`, and the share pins that at a third.
-    ///
-    /// Raising the share without re-deriving the bound fails here, which
-    /// is the point — 0.25 admits at most 33.4% inflation, 0.5 would admit
-    /// 100%.
-    #[test]
-    fn an_admitted_sample_is_inflated_by_at_most_a_third() {
-        const BOUND: f64 = 1.0 / 3.0;
-        for text in [1usize, 500, 27_864, 1_000_000] {
-            // Sweep across the accept boundary from both sides.
-            let edge = (text as f64 * BOUND) as usize;
-            for media in [
-                0,
-                1,
-                edge / 2,
-                edge.saturating_sub(1),
-                edge,
-                edge + 1,
-                edge * 2,
-                text * 4,
-            ] {
-                if !media_share_admits_sample(text, media) {
-                    continue;
-                }
-                assert!(
-                    (media as f64) <= BOUND * (text as f64) + 1.0,
-                    "text {text} admitted media {media}: {:.3}x inflation",
-                    media as f64 / text as f64
-                );
-            }
-        }
-        // Zero media is always admissible — that is the text-only case.
-        assert!(media_share_admits_sample(0, 0));
-        assert!(!media_share_admits_sample(0, 1));
-    }
-
-    /// The premise that bound rests on, driven end to end at a true 1.5x
-    /// text drift with the reviewer's transcript: 27,864 tokens of text
-    /// plus one 12000x9000 image.
-    ///
-    /// Charged at a ceiling nothing enforced — 9,288 against a provider
-    /// 49,536 — the media sat at exactly 25% of the raw estimate, the gate
-    /// admitted it, and every sample read 2.78 and clamped to
-    /// `SAMPLE_RATIO_MAX`. Delivery is now decided per provider, and an
-    /// image only ships where its own biller prices it at or under the
-    /// ceiling — so the ceiling is a true upper bound on what a delivered
-    /// image costs, and the sample lands on the text drift instead.
-    #[tokio::test]
-    async fn an_image_the_delivery_path_refuses_no_longer_walks_the_ratio_to_the_clamp() {
-        const DRIFT: f64 = 1.5;
-        const OVER_CAP: (u32, u32) = (12_000, 9_000);
-        const REAL_TILED_COST: usize = 49_536;
-        /// What Anthropic — which DOES deliver this image — really bills
-        /// it, well under the 9,288 it is charged.
-        const ANTHROPIC_REAL_COST: usize = 2_352;
-
-        async fn drive(image: ChatMessage, provider_media: usize) -> f64 {
-            let calibration = Arc::new(TokenCalibration::new());
-            let mut ctx = make_ctx_with_calibration(Arc::clone(&calibration), 1_000_000);
-            ctx.set_current_model(MODEL_ID);
-            ctx.append(&image).await.unwrap();
-            // Sized so the 9,288 ceiling is exactly the 25% the gate
-            // admits — the boundary the contamination rode in on.
-            ctx.append(&make_msg(Role::User, &"word ".repeat(22_300)))
-                .await
-                .unwrap();
-            for _ in 0..8 {
-                let text_actual = (ctx.raw_text_estimate() as f64 * DRIFT).round() as usize;
-                ctx.record_call_actual(text_actual + provider_media);
-            }
-            calibration.ratio(MODEL_ID).expect("sampled")
-        }
-
-        // Over the cap is charged the CEILING, not the stub: Gemini would
-        // refuse this image, but Anthropic delivers it, so pricing it as a
-        // stub would under-count a block that really ships.
-        let charged = SimpleTokenizer
-            .count_message_media(&sized_image_msg(Some(OVER_CAP.0), Some(OVER_CAP.1)));
-        assert_eq!(
-            charged,
-            baybo_llm::IMAGE_TOKEN_CEILING,
-            "an over-cap image must be charged the ceiling"
-        );
-        assert!(
-            charged >= ANTHROPIC_REAL_COST,
-            "the charge must cover the provider that delivers it"
-        );
-        let honest = drive(
-            sized_image_msg(Some(OVER_CAP.0), Some(OVER_CAP.1)),
-            ANTHROPIC_REAL_COST,
-        )
-        .await;
-        assert!((honest - DRIFT).abs() < 0.1, "ratio drifted to {honest}");
-
-        // The shape the cap removes: the same session with the image
-        // charged a ceiling it does not respect. The gate admits it — the
-        // under-estimate is what it measures — and the EMA walks to the
-        // clamp, which every other session on this model then pays.
-        let contaminated = drive(image_msg(), REAL_TILED_COST).await;
-        assert!(
-            contaminated > 1.9,
-            "the contamination this test guards against did not reproduce: {contaminated}"
-        );
-        assert!(honest < contaminated - 0.3);
-    }
-
-    /// The other half: a text-only transcript on the same model still
-    /// calibrates, so removing media from the loop costs the correction
-    /// nothing where it is actually meaningful.
-    #[tokio::test]
-    async fn a_text_only_turn_still_records_a_sample() {
-        let calibration = Arc::new(TokenCalibration::new());
-        let mut ctx = make_ctx_with_calibration(Arc::clone(&calibration), 100_000);
-        ctx.set_current_model(MODEL_ID);
-
-        ctx.append(&make_msg(Role::User, &"word ".repeat(400)))
-            .await
-            .unwrap();
-        let raw = ctx.raw_text_estimate();
-        for _ in 0..8 {
-            ctx.record_call_actual(raw * 2);
-        }
-        let ratio = calibration.ratio(MODEL_ID).expect("sampled");
-        assert!(ratio > 1.4, "ratio did not track the real drift: {ratio}");
-    }
-
-    /// The ratio scales text and only text. A calibration pushed to its
-    /// floor by an unrelated session must leave a media ceiling standing
-    /// at full height, or the ceiling is not one.
-    #[tokio::test]
-    async fn the_calibration_ratio_never_scales_a_media_ceiling() {
-        let calibration = Arc::new(TokenCalibration::new());
-        for _ in 0..30 {
-            calibration.observe(MODEL_ID, 10_000, 5_000); // clamps at 0.5
-        }
-        let ratio = calibration.ratio(MODEL_ID).expect("sampled");
-        assert!(ratio < 0.55, "{ratio}");
-
-        let mut ctx = make_ctx_with_calibration(Arc::clone(&calibration), 100_000);
-        ctx.set_current_model(MODEL_ID);
-        let empty = ctx.count_tokens();
-        ctx.append(&image_msg()).await.unwrap();
-        assert_eq!(ctx.raw_media_estimate(), MEDIA_CEILING);
-        // Only the row's text envelope is scaled; at the 0.5 floor the old
-        // path would have charged 2,500 for a 5,000-token ceiling.
-        let delta = ctx.count_tokens() - empty;
-        assert!(delta >= MEDIA_CEILING, "ceiling deflated to {delta}");
-        assert!(delta < MEDIA_CEILING + 100, "{delta}");
     }
 
     /// The budget charges media exactly where `baybo_llm::delivers_media`
@@ -5681,7 +5369,6 @@ mod tests {
             keep_recent,
             compression_threshold: threshold,
             max_active_tokens: 0,
-            calibration: Arc::new(TokenCalibration::new()),
             skill_registry: registry,
             channel: baybo_model::ChannelType::owner(),
             shape: crate::prompts::soul::PromptShape::Chat,

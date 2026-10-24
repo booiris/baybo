@@ -237,9 +237,9 @@ export interface ContextSegment {
  * Body of `GET /v1/traces/{session_id}/spans/{span_id}/context`.
  *
  * `reported_input_tokens` is what the provider billed and is exact;
- * the per-segment split is a tiktoken **estimate** (tiktoken is not
- * Anthropic's tokenizer), so the viewer scales the segments onto the
- * reported total rather than presenting them as measured.
+ * the per-segment split is a heuristic **estimate** (no provider's
+ * tokenizer), so the viewer scales the segments onto the reported total
+ * rather than presenting them as measured.
  * `context_window` is null when no configured client serves that model any
  * more — the trace outlives the config.
  */

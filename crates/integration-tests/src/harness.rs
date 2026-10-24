@@ -18,7 +18,7 @@ use baybo_agent::{
     tool_executor::ToolExecutor,
 };
 use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
-use baybo_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer};
+use baybo_context::{ContextManager, ContextManagerConfig, HeuristicTokenizer};
 use baybo_cost::test_support::MemoryCostStore;
 use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
 use baybo_llm::test_support::StubLlm;
@@ -67,7 +67,6 @@ pub struct AgentTestHarness {
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub cost_manager: Arc<CostManager>,
-    pub token_calibration: Arc<baybo_context::TokenCalibration>,
     /// Session manager backing the wired `ContextManager`. Exposed so
     /// tests can pre-seed session messages or summary metadata before
     /// driving the agent loop.
@@ -490,10 +489,7 @@ impl AgentTestHarnessBuilder {
             None,
         ));
 
-        // Tokenizer model id must match the LLM client's so
-        // `TokenCalibration` keys observe and adjust identically.
-        let stub_model_id = wired_llm.model_info().id.clone();
-        let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
+        let tokenizer = Arc::new(HeuristicTokenizer);
         // Non-existent root: nothing under it is read in these tests, so
         // there is no tempdir to clean up.
         let workspace = self.workspace.unwrap_or_else(|| {
@@ -503,7 +499,6 @@ impl AgentTestHarnessBuilder {
         });
         let keep_recent = self.keep_recent.unwrap_or(50);
         let compression_threshold = self.compression_threshold.unwrap_or(0.95);
-        let token_calibration = Arc::new(baybo_context::TokenCalibration::new());
         let soul_text = self
             .soul_prompt
             .unwrap_or_else(|| "You are Baybo, a test assistant.".into());
@@ -533,7 +528,6 @@ impl AgentTestHarnessBuilder {
             // deliberately small stub window; an absolute cap on top would
             // be a second trigger every such test has to reason about.
             max_active_tokens: 0,
-            calibration: Arc::clone(&token_calibration),
             skill_registry: Arc::clone(&skill_registry),
             channel: session.channel.clone(),
             shape: baybo_context::prompts::soul::PromptShape::for_trigger(&session.trigger),
@@ -623,7 +617,6 @@ impl AgentTestHarnessBuilder {
             tool_registry,
             skill_registry,
             cost_manager,
-            token_calibration,
             session_manager,
             task_store,
             cron_store,

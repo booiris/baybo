@@ -26,7 +26,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-tiktoken-rs = { workspace = true }
 # Unified diffs for `prompts::system_prompt_update`.
 similar = { workspace = true }
 parking_lot = { workspace = true }

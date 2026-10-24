@@ -9298,7 +9298,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a tiktoken ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more. */
+            /** @description Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a heuristic ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more. */
             200: {
                 headers: {
                     [name: string]: unknown;

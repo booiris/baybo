@@ -792,9 +792,9 @@ impl AgentLoop {
     /// since the last turn, swap the client, rebuild the billed-chat
     /// factory so in-tool LLM calls bill the new model, and update the
     /// context window so compression gates on the new model's limit.
-    /// The tokenizer is intentionally left as-is — tiktoken is an
-    /// estimate and `TokenCalibration` corrects the drift within a few
-    /// turns. See `docs/config-hot-reload.md`.
+    /// The tokenizer needs no swap: it is a vocabulary-free estimate that
+    /// only prices what the last provider count does not cover. See
+    /// `docs/config-hot-reload.md`.
     fn refresh_active_llm(&mut self) {
         let pool = Arc::clone(&self.llm_pool.read());
         let (client, _name) =
@@ -2899,7 +2899,9 @@ impl AgentLoop {
         let tool_defs = self.session_tool_defs(session);
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
         // report the phase when a pass will actually run.
-        let compacting = self.context_manager.needs_compression(&model_id);
+        let compacting = self
+            .context_manager
+            .needs_compression(&model_id, &tool_defs);
         if compacting {
             self.emit_status(delta_tx, session, StatusPhase::Compacting)
                 .await;

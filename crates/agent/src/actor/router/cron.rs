@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use baybo_context::prompts::cron::{DreamDigestGroup, DreamDigestSession, frame_dream_digest};
 use baybo_context::prompts::soul::{PersonaSources, PromptBudget, PromptShape, assemble_for};
-use baybo_context::tokenizer::TiktokenTokenizer;
+use baybo_context::tokenizer::HeuristicTokenizer;
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
     AgentBinding, AgentFramework, AgentProfileId, BuiltinCronJob, CronExecution, ExecutionOutcome,
@@ -474,7 +474,7 @@ impl Router {
         // A dream fire is a cron session, so it is priced with the preamble a
         // cron session actually runs — see `PromptShape`.
         match assemble_for(&self.workspace, &sources, PromptShape::Chat).await {
-            Ok(prompt) => Some(prompt.budget(&TiktokenTokenizer::for_model(""))),
+            Ok(prompt) => Some(prompt.budget(&HeuristicTokenizer)),
             Err(e) => {
                 warn!(agent_id = %agent, error = %e, "dream: cannot price the identity files; firing without a budget");
                 None

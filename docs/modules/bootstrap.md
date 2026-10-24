@@ -99,7 +99,7 @@ GatewayServer + ChannelServer bound; tokio::select! { admin, channel, router, sh
 
 `tui_cmd::run` instead reads the per-start TUI token from the vault, opens a `WsTransport` against the gateway's admin listener (which co-hosts the `/v1/channel-ws` upgrade; no port-file discovery), and runs the `TuiAdapter` until shutdown — it does **not** build a manager graph of its own.
 
-The actor-spawner closure handed to `Router::from_config` via `RouterConfig::actor_spawner` captures clones of all `Arc`-shared state (LLM pool, tool + skill registries, tool executor, trace and task stores, turn lifecycle, security gateway, tokenizer, trace event stream, token calibration, session manager, subagent registry, workspace paths, supervisor, memory, title sink, plus max-iterations / compression-threshold / keep-recent). Any new actor-level dependency must be added to the capture list in `runtime::wire_router`.
+The actor-spawner closure handed to `Router::from_config` via `RouterConfig::actor_spawner` captures clones of all `Arc`-shared state (LLM pool, tool + skill registries, tool executor, trace and task stores, turn lifecycle, security gateway, tokenizer, trace event stream, session manager, subagent registry, workspace paths, supervisor, memory, title sink, plus max-iterations / compression-threshold / keep-recent). Any new actor-level dependency must be added to the capture list in `runtime::wire_router`.
 
 ## Error handling at boot
 

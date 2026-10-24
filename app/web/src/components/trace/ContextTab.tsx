@@ -8,7 +8,7 @@
  * visible too.
  *
  * The **total is exact** (the provider's own `input_tokens`) and the **split
- * is an estimate** — tiktoken is not Anthropic's tokenizer. The two are kept
+ * is an estimate** — a byte heuristic, no provider's tokenizer. The two are kept
  * visibly apart: the headline is the reported figure, every per-part number
  * carries a `≈`, and the drift against the estimate is stated rather than
  * hidden by silently showing one number in place of the other.
@@ -148,9 +148,10 @@ export function ContextTab({
   const windowSize = context.context_window ?? 0;
   const hasWindow = windowSize > 0;
   const measured = context.reported_input_tokens != null;
-  // Only worth stating when it is big enough to change a reading. tiktoken
-  // runs within ~10% of Anthropic's tokenizer, so a 3% gap is the tool
-  // working, not a discrepancy the reader has to account for.
+  // Only worth stating when it is big enough to change a reading. The byte
+  // heuristic runs within ~10% of what providers bill on most content, so a
+  // 3% gap is the tool working, not a discrepancy the reader has to account
+  // for.
   const drift =
     measured && context.estimated_total_tokens > 0
       ? Math.abs(used - context.estimated_total_tokens) / context.estimated_total_tokens
@@ -358,8 +359,8 @@ export function ContextTab({
 
       <p className="text-[0.72rem] text-ink-soft italic leading-snug">
         {measured
-          ? 'The total is what the provider billed. The split is a tiktoken estimate — accurate enough for proportions, not for accounting.'
-          : 'This call recorded no usage, so both the total and the split are tiktoken estimates.'}
+          ? 'The total is what the provider billed. The split is an estimate — accurate enough for proportions, not for accounting.'
+          : 'This call recorded no usage, so both the total and the split are estimates.'}
         {drift > 0.15 &&
           ` The estimate came to ${context.estimated_total_tokens.toLocaleString()}, ${pct(drift)} off the billed total.`}
       </p>

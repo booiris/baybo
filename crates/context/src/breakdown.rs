@@ -3,20 +3,19 @@
 //! The provider reports one number — the whole prompt. That is enough to bill
 //! a call and useless for the question a reader of the trace actually has:
 //! *what is eating my context?* This splits the recorded input into the parts
-//! it was assembled from, counting each with the same [`TiktokenTokenizer`]
+//! it was assembled from, counting each with the same [`HeuristicTokenizer`]
 //! the live [`ContextManager`](crate::ContextManager) budgets against.
 //!
-//! **The split is an estimate, the total is not.** tiktoken is not Anthropic's
-//! tokenizer (see [`TiktokenTokenizer`]'s note, and `TokenCalibration`, which
-//! exists precisely to correct that drift at runtime), so a consumer should
-//! present the span's recorded `input_tokens` as the total and treat these
-//! numbers as proportions of it.
+//! **The split is an estimate, the total is not.** The heuristic is no
+//! provider's tokenizer (see [`HeuristicTokenizer`]'s note), so a consumer
+//! should present the span's recorded `input_tokens` as the total and treat
+//! these numbers as proportions of it.
 
 use baybo_model::{ChatMessage, ContentBlock, MessageSource, Role};
 use baybo_trace::LlmToolDefinition;
 use serde::{Deserialize, Serialize};
 
-use crate::tokenizer::{TiktokenTokenizer, Tokenizer};
+use crate::tokenizer::{HeuristicTokenizer, Tokenizer};
 
 /// Which part of the assembled context a segment belongs to.
 ///
@@ -164,14 +163,11 @@ fn label_for(part: ContextPart) -> String {
 
 /// Split `messages` (the exact slice the model saw) and `tools` (the set it
 /// was offered) into per-part token estimates.
-///
-/// `model_id` only picks the BPE encoding; it is not a calibration key.
 pub fn context_breakdown(
-    model_id: &str,
     messages: &[ChatMessage],
     tools: &[LlmToolDefinition],
 ) -> ContextBreakdown {
-    let tokenizer = TiktokenTokenizer::for_model(model_id);
+    let tokenizer = HeuristicTokenizer;
     let mut segments = Vec::with_capacity(messages.len() + 1);
 
     if !tools.is_empty() {
@@ -181,10 +177,12 @@ pub fn context_breakdown(
         let tokens: usize = tools
             .iter()
             .map(|t| {
-                let schema = serde_json::to_string(&t.parameters_schema).unwrap_or_default();
-                tokenizer.count_text(&t.name)
-                    + tokenizer.count_text(&t.description)
-                    + tokenizer.count_text(&schema)
+                crate::tokenizer::tool_definition_tokens(
+                    &tokenizer,
+                    &t.name,
+                    &t.description,
+                    &t.parameters_schema,
+                )
             })
             .sum();
         segments.push(ContextSegment {
@@ -288,8 +286,6 @@ mod tests {
     use super::*;
     use baybo_model::{BlobRef, ThinkingContent};
 
-    const MODEL: &str = "claude-sonnet-4-6";
-
     fn text(t: &str) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(t.into())]
     }
@@ -310,9 +306,8 @@ mod tests {
         // The schema is most of a definition's weight; counting name +
         // description alone would report a tool set as near-free and send a
         // reader hunting through their transcript instead.
-        let with_schema = context_breakdown(MODEL, &[], &[tool("bash")]);
+        let with_schema = context_breakdown(&[], &[tool("bash")]);
         let bare = context_breakdown(
-            MODEL,
             &[],
             &[LlmToolDefinition {
                 name: "bash".into(),
@@ -327,7 +322,7 @@ mod tests {
 
     #[test]
     fn no_tools_means_no_tools_segment() {
-        let out = context_breakdown(MODEL, &[ChatMessage::user(text("hi"))], &[]);
+        let out = context_breakdown(&[ChatMessage::user(text("hi"))], &[]);
         assert!(out.segments.iter().all(|s| s.part != ContextPart::Tools));
     }
 
@@ -347,7 +342,7 @@ mod tests {
         for m in &messages {
             assert_eq!(m.role, Role::User, "the premise: all four are user rows");
         }
-        let parts: Vec<ContextPart> = context_breakdown(MODEL, &messages, &[])
+        let parts: Vec<ContextPart> = context_breakdown(&messages, &[])
             .segments
             .iter()
             .map(|s| s.part)
@@ -374,7 +369,7 @@ mod tests {
             meta: None,
         }]);
         assert_eq!(message.role, Role::User, "the premise: it is a user row");
-        let out = context_breakdown(MODEL, &[message], &[]);
+        let out = context_breakdown(&[message], &[]);
         assert_eq!(out.segments[0].part, ContextPart::ToolResult);
     }
 
@@ -389,7 +384,7 @@ mod tests {
             signature: None,
         }]);
         let result = ChatMessage::tool_result("call-1".into(), "output".into());
-        let out = context_breakdown(MODEL, &[call, result], &[]);
+        let out = context_breakdown(&[call, result], &[]);
         let labels: Vec<&str> = out.segments.iter().map(|s| s.label.as_str()).collect();
         assert!(
             labels.contains(&"bash result"),
@@ -415,7 +410,7 @@ mod tests {
                 height: Some(768),
             },
         ]);
-        let out = context_breakdown(MODEL, &[message], &[]);
+        let out = context_breakdown(&[message], &[]);
         let parts: Vec<ContextPart> = out.segments.iter().map(|s| s.part).collect();
         assert_eq!(parts, vec![ContextPart::User, ContextPart::Media]);
         assert!(out.segments.iter().all(|s| s.tokens > 0));
@@ -434,7 +429,7 @@ mod tests {
                 signature: None,
             }],
         }]);
-        let out = context_breakdown(MODEL, &[message], &[]);
+        let out = context_breakdown(&[message], &[]);
         assert_eq!(out.segments[0].part, ContextPart::Assistant);
     }
 
@@ -445,7 +440,7 @@ mod tests {
             ChatMessage::user(text("hi")),
             ChatMessage::assistant(text("hello")),
         ];
-        let out = context_breakdown(MODEL, &messages, &[tool("bash")]);
+        let out = context_breakdown(&messages, &[tool("bash")]);
         let parts: Vec<ContextPart> = out.segments.iter().map(|s| s.part).collect();
         // Tools first: they precede the transcript on the wire.
         assert_eq!(
@@ -465,7 +460,7 @@ mod tests {
 
     #[test]
     fn an_empty_input_breaks_down_to_nothing() {
-        let out = context_breakdown(MODEL, &[], &[]);
+        let out = context_breakdown(&[], &[]);
         assert!(out.segments.is_empty());
         assert_eq!(out.estimated_total_tokens, 0);
     }
