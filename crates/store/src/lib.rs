@@ -47,7 +47,8 @@ pub use project::{
 };
 pub use secret::{SecretStore, StoreIdentity};
 pub use session::{
-    ActiveMessageRow, DreamCandidate, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+    ActiveMessageRow, DreamCandidate, NewTokenAnchor, SessionMessageAppendOutcome, SessionStore,
+    StoredMessage, TokenAnchor,
 };
 pub use session_folder::{SessionFolderRow, SessionFolderStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};

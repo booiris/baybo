@@ -74,11 +74,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use baybo_llm::{ChatRequest, LlmResponse, ToolDefinitionForLlm};
+use baybo_llm::{AudioDelivery, ChatRequest, LlmResponse, ToolDefinitionForLlm};
 use baybo_model::{
     AgentProfileId, ChatMessage, ContentBlock, FileFingerprint, MessageSource, Role, SessionId,
 };
-use baybo_session::{SessionManager, SessionMessageAppendOutcome};
+use baybo_session::{
+    ActiveMessageRow, NewTokenAnchor, SessionManager, SessionMessageAppendOutcome, TokenAnchor,
+};
 use baybo_skills::render::{
     render_skill_block, render_skill_listing, render_skill_reminder, skill_reminder_listing,
 };
@@ -134,6 +136,10 @@ const TRUNCATION_MARKER: &str = "\n…[truncated]";
 struct TokenBaseline {
     actual_tokens: usize,
     message_count_at_call: usize,
+    /// The tool-schema estimate in force when `actual_tokens` was measured,
+    /// which that count already includes: a tool list grown since — an MCP
+    /// server that came back, a new build — is charged only the growth.
+    request_overhead: usize,
 }
 
 /// Identity of the sources a system prompt was assembled from — cheap enough
@@ -210,6 +216,12 @@ impl MessageTokens {
     }
 }
 
+fn message_carries_audio(msg: &ChatMessage) -> bool {
+    msg.content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Audio { .. }))
+}
+
 /// Manages a session's context: owns the conversation transcript,
 /// tracks the token budget, and runs the compaction flow (one live LLM
 /// summary, or nothing at all). See [`compressor`] for the contract.
@@ -264,6 +276,10 @@ pub struct ContextManager {
     /// holds them, but no stored message does: a full sweep adds this.
     /// Set by every gate that is handed the tool list.
     request_overhead: AtomicUsize,
+    /// Whether the bound model is sent audio or only its text stub — what a
+    /// voice note's media price is computed against. Installed with the
+    /// context window by `AgentLoop`; the ceiling until then.
+    audio_delivery: AudioDelivery,
     /// LLM model id the baseline was measured against. Set by
     /// `maybe_compress` (which the agent loop calls at the top of every
     /// turn with the current `LlmCompletion::model_info().id`); a change
@@ -482,6 +498,7 @@ impl ContextManager {
             called_skills: Vec::new(),
             baseline: RwLock::new(None),
             request_overhead: AtomicUsize::new(0),
+            audio_delivery: AudioDelivery::Native,
             current_model: RwLock::new(None),
             session_id: config.session_id,
             sessions: config.sessions,
@@ -510,6 +527,32 @@ impl ContextManager {
     /// budget reflects the provider's hard limit.
     pub fn set_active_model_context_window(&mut self, window: usize) {
         self.budget.set_max_tokens(window);
+    }
+
+    /// Install the active model's [`AudioDelivery`], re-pricing every
+    /// message that carries audio: a model that is never sent audio pays
+    /// only each voice note's stub. Called beside
+    /// [`Self::set_active_model_context_window`] wherever the model changes.
+    pub fn set_active_model_audio_delivery(&mut self, audio: AudioDelivery) {
+        if self.audio_delivery == audio {
+            return;
+        }
+        self.audio_delivery = audio;
+        let baseline = *self.baseline.read();
+        if audio == AudioDelivery::Native
+            && let Some(b) = baseline
+            && self.carries_audio(b.message_count_at_call)
+        {
+            // The anchor priced those voice notes at the stub the provider was
+            // sent; from the next request on they go natively.
+            self.invalidate_baseline();
+        }
+        for index in 0..self.messages.len() {
+            if message_carries_audio(&self.messages[index]) {
+                self.per_message_tokens[index] = self.message_budget_tokens(&self.messages[index]);
+            }
+        }
+        self.budget.update(self.count_tokens());
     }
 
     /// Read-only access to the owned transcript.
@@ -1412,7 +1455,11 @@ impl ContextManager {
     ///
     /// Only call this for *main* LLM calls: a compression call carries the
     /// summariser's instruction suffix, not the next request's shape.
-    pub fn record_call_actual(&self, actual_input_tokens: usize) {
+    ///
+    /// The anchor is also written durably, so an actor rebuilt from the
+    /// store resumes from this number rather than a full re-estimate (see
+    /// [`Self::restore_from_store`]).
+    pub async fn record_call_actual(&self, actual_input_tokens: usize) {
         if actual_input_tokens == 0 {
             return;
         }
@@ -1423,10 +1470,37 @@ impl ContextManager {
         // the main-turn call records actuals; the compression call (no reminder)
         // never reaches here.
         let actual_messages = actual_input_tokens.saturating_sub(self.transient_tail_raw());
+        let model_id = self.current_model.read().clone();
+        let message_count = self.messages.len();
+        let request_overhead = self.request_overhead.load(Ordering::Relaxed);
         *self.baseline.write() = Some(TokenBaseline {
             actual_tokens: actual_messages,
-            message_count_at_call: self.messages.len(),
+            message_count_at_call: message_count,
+            request_overhead,
         });
+        // A window that differs from the durable rows cannot be described by
+        // "the first N rows", so it is not written; a reader would reject it.
+        if let Some(model_id) = model_id
+            && !self.persisted_order_diverged
+            && let Err(e) = self
+                .sessions
+                .record_token_anchor(
+                    &self.session_id,
+                    NewTokenAnchor {
+                        model_id: &model_id,
+                        actual_tokens: actual_messages,
+                        message_count,
+                        request_overhead,
+                    },
+                )
+                .await
+        {
+            warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "failed to persist the token anchor; a rehydrated actor will re-estimate"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -1588,11 +1662,13 @@ impl ContextManager {
     /// receives, for as long as the row survives — and nothing corrects a
     /// media price after the fact.
     fn split_tokens(&self, msg: &ChatMessage) -> MessageTokens {
-        let priced = self.tokenizer.count_message_media(msg);
+        let ceiling = self
+            .tokenizer
+            .count_message_media(msg, AudioDelivery::Native);
         MessageTokens {
-            text: self.tokenizer.count_message(msg).saturating_sub(priced),
+            text: self.tokenizer.count_message(msg).saturating_sub(ceiling),
             media: if baybo_llm::delivers_media(msg.role) {
-                priced
+                self.tokenizer.count_message_media(msg, self.audio_delivery)
             } else {
                 0
             },
@@ -1888,8 +1964,10 @@ impl ContextManager {
         // repaired order is what the loop builds requests from.
         match sessions.load_active_session_message_rows(&session_id).await {
             Ok(rows) if !rows.is_empty() => {
+                let anchor_rows = self.restorable_anchor_len(&rows).await;
                 let messages: Vec<ChatMessage> = rows.into_iter().map(|row| row.message).collect();
                 let original = messages.clone();
+                let mut durable = original.clone();
                 let transcript_repair::ToolPairingRepair {
                     messages: repaired,
                     fills,
@@ -1923,17 +2001,30 @@ impl ContextManager {
                         "hydration: repaired dangling tool_use rows from an interrupted turn"
                     );
                     for fill in &fills {
-                        if let Err(e) = sessions.append_session_message(&session_id, fill).await {
-                            warn!(
+                        match sessions.append_session_message(&session_id, fill).await {
+                            Ok(_) => durable.push(fill.clone()),
+                            Err(e) => warn!(
                                 session_id = %session_id,
                                 error = %e,
                                 "hydration: failed to persist synthetic tool_result fill"
-                            );
+                            ),
                         }
                     }
                 }
                 self.restore_messages(repaired);
-                self.persisted_order_diverged = self.messages != original;
+                // The store now holds the loaded rows followed by every fill it
+                // accepted; the window diverges from it only where repair moved
+                // something, not merely because a fill landed at the tail.
+                self.persisted_order_diverged = self.messages != durable;
+                // An anchor never records which way audio went, so one over
+                // voice notes is trusted only while they are still stubbed —
+                // the provider may have been sent stubs it is now sent whole.
+                if let Some((anchor, len)) = anchor_rows
+                    && self.messages.get(..len) == original.get(..len)
+                    && !(self.audio_delivery == AudioDelivery::Native && self.carries_audio(len))
+                {
+                    self.install_restored_anchor(anchor, len);
+                }
             }
             Ok(_) => {}
             Err(e) => warn!(
@@ -1942,6 +2033,52 @@ impl ContextManager {
                 "failed to load persisted transcript; starting fresh"
             ),
         }
+    }
+
+    /// The persisted [`TokenAnchor`] for this session, paired with how many
+    /// leading rows of `rows` it covers — only when it still describes them
+    /// exactly: the rows written up to its `through_ordinal` are all still
+    /// active and number what it counted. A compaction since supersedes
+    /// them, and a row another writer slipped in changes the count; either
+    /// way the anchor is about a transcript that is gone.
+    async fn restorable_anchor_len(
+        &self,
+        rows: &[ActiveMessageRow],
+    ) -> Option<(TokenAnchor, usize)> {
+        let anchor = match self.sessions.load_token_anchor(&self.session_id).await {
+            Ok(anchor) => anchor?,
+            Err(e) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "failed to load the token anchor; re-estimating the transcript"
+                );
+                return None;
+            }
+        };
+        let covered = rows
+            .iter()
+            .take_while(|row| row.ordinal <= anchor.through_ordinal)
+            .count();
+        (covered == anchor.message_count && covered > 0).then_some((anchor, covered))
+    }
+
+    fn carries_audio(&self, len: usize) -> bool {
+        self.messages.iter().take(len).any(message_carries_audio)
+    }
+
+    /// Resume the budget from a persisted provider count instead of a full
+    /// re-estimate. The anchor's model becomes the current one, so the first
+    /// [`Self::maybe_compress`] for any other model drops it exactly as a
+    /// live model switch would.
+    fn install_restored_anchor(&mut self, anchor: TokenAnchor, len: usize) {
+        *self.current_model.write() = Some(anchor.model_id);
+        *self.baseline.write() = Some(TokenBaseline {
+            actual_tokens: anchor.actual_tokens,
+            message_count_at_call: len,
+            request_overhead: anchor.request_overhead,
+        });
+        self.budget.update(self.count_tokens());
     }
 
     /// Build the `LlmCallInputs` an `LlmCall` trace span should
@@ -2030,7 +2167,11 @@ impl ContextManager {
                     .iter()
                     .map(|t| t.total())
                     .sum();
-                b.actual_tokens + self.transient_tail_raw() + suffix
+                let grown_tools = self
+                    .request_overhead
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(b.request_overhead);
+                b.actual_tokens + grown_tools + self.transient_tail_raw() + suffix
             }
             _ => self
                 .unanchored_request_tokens(self.per_message_tokens.iter().map(|t| t.total()).sum()),
@@ -2824,7 +2965,7 @@ mod tests {
             100
         }
         fn count_message(&self, msg: &ChatMessage) -> usize {
-            let mut tokens = 4 + self.count_message_media(msg);
+            let mut tokens = 4 + self.count_message_media(msg, AudioDelivery::Native);
             for block in &msg.content {
                 match block {
                     ContentBlock::Text(text) => tokens += self.count_text(text),
@@ -2834,12 +2975,12 @@ mod tests {
             }
             tokens
         }
-        fn count_message_media(&self, msg: &ChatMessage) -> usize {
+        fn count_message_media(&self, msg: &ChatMessage, audio: AudioDelivery) -> usize {
             // The real prices, not a stand-in: the share these tests
             // measure has to be the one production computes.
             msg.content
                 .iter()
-                .map(baybo_llm::content_block_tokens)
+                .map(|block| baybo_llm::content_block_tokens(block, audio))
                 .sum()
         }
     }
@@ -4804,7 +4945,7 @@ mod tests {
             .await
             .unwrap();
         ctx.append(&make_msg(Role::User, "old-3")).await.unwrap();
-        ctx.record_call_actual(5_000);
+        ctx.record_call_actual(5_000).await;
 
         let new_a = make_msg(Role::Assistant, "new-a");
         let new_b = make_msg(Role::User, "new-b");
@@ -4845,7 +4986,7 @@ mod tests {
         ctx.needs_compression("test-model", &tools);
         assert_eq!(ctx.budget().current(), swept + schemas);
 
-        ctx.record_call_actual(9_000);
+        ctx.record_call_actual(9_000).await;
         ctx.needs_compression("test-model", &tools);
         assert_eq!(
             ctx.budget().current(),
@@ -4886,6 +5027,314 @@ mod tests {
             "a summary's framing outweighs three short rows: {outcome:?}"
         );
         assert_eq!(ctx.messages().len(), 4, "nothing was rewritten");
+    }
+
+    const MODEL_ID: &str = "anchor-subject";
+
+    /// A transcript of four exchanges anchored at `actual` on
+    /// [`MODEL_ID`], then one more reply appended after the call — the state
+    /// an actor is in when the reaper stops it.
+    async fn anchored_session(
+        sessions: &Arc<baybo_session::SessionManager>,
+        actual: usize,
+    ) -> ChatMessage {
+        let mut live = make_ctx_with_sessions(Arc::clone(sessions), 5, 100_000, 0.75);
+        live.set_current_model(MODEL_ID);
+        for i in 0..4 {
+            live.append(&make_msg(
+                Role::User,
+                &format!("question {i} {}", "x".repeat(400)),
+            ))
+            .await
+            .unwrap();
+            live.append(&make_msg(Role::Assistant, &format!("answer {i}")))
+                .await
+                .unwrap();
+        }
+        live.record_call_actual(actual).await;
+        let reply = make_msg(Role::Assistant, "the reply after the call");
+        live.append(&reply).await.unwrap();
+        reply
+    }
+
+    /// Pin (production, 2026-10-07): an actor the idle reaper stopped came
+    /// back, re-estimated a 146k conversation from scratch at ~1.6x, crossed
+    /// a 256k ceiling and compacted. A rehydrated actor resumes from the
+    /// provider's last number instead.
+    #[tokio::test]
+    async fn a_rehydrated_actor_resumes_from_the_persisted_anchor() {
+        let sessions = test_sessions();
+        let reply = anchored_session(&sessions, 5_000).await;
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+
+        let expected = 5_000 + restored.tokenizer.count_message(&reply);
+        assert_eq!(restored.count_tokens(), expected);
+        assert!(!restored.needs_compression(MODEL_ID, &[]));
+        assert_eq!(
+            restored.budget().current(),
+            expected,
+            "the same model keeps it"
+        );
+    }
+
+    /// The anchor already holds the schemas of the request it measured. A
+    /// tool list that has grown since — an MCP server that came back while
+    /// the actor was reaped, a new build — is charged its growth, not lost.
+    #[tokio::test]
+    async fn a_restored_anchor_charges_a_tool_list_that_grew_since() {
+        let sessions = test_sessions();
+        let reply = anchored_session(&sessions, 5_000).await;
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+        let tools = schema_tools(4_000);
+        let grown = crate::tokenizer::tool_definition_tokens(
+            restored.tokenizer.as_ref(),
+            &tools[0].name,
+            &tools[0].description,
+            &tools[0].parameters_schema,
+        );
+        restored.needs_compression(MODEL_ID, &tools);
+
+        assert_eq!(
+            restored.budget().current(),
+            5_000 + grown + restored.tokenizer.count_message(&reply)
+        );
+    }
+
+    /// A crash mid-tool-batch leaves a dangling call; hydration persists its
+    /// fill at the tail, so the window still IS the durable rows and the
+    /// next call's anchor is written. Reading the fill as a divergence
+    /// stopped every anchor for that actor's whole life.
+    #[tokio::test]
+    async fn a_fill_repaired_at_the_tail_does_not_stop_the_anchor() {
+        let sessions = test_sessions();
+        for msg in [
+            make_msg(Role::User, "question"),
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+                signature: None,
+            }]),
+        ] {
+            sessions
+                .append_session_message(&test_session_id(), &msg)
+                .await
+                .unwrap();
+        }
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+        assert_eq!(restored.messages().len(), 3, "the fill is in the window");
+        restored.set_current_model(MODEL_ID);
+        restored.record_call_actual(5_000).await;
+
+        let anchor = sessions
+            .load_token_anchor(&test_session_id())
+            .await
+            .unwrap()
+            .expect("the anchor is written");
+        assert_eq!(anchor.message_count, 3);
+    }
+
+    #[tokio::test]
+    async fn a_restored_anchor_does_not_survive_a_model_switch() {
+        let sessions = test_sessions();
+        anchored_session(&sessions, 5_000).await;
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+        restored.needs_compression("another-model", &[]);
+
+        let swept: usize = restored
+            .messages()
+            .iter()
+            .map(|m| restored.tokenizer.count_message(m))
+            .sum();
+        assert_eq!(restored.budget().current(), swept);
+    }
+
+    #[tokio::test]
+    async fn an_anchor_from_before_a_compaction_is_not_restored() {
+        let sessions = test_sessions();
+        anchored_session(&sessions, 5_000).await;
+        let summary = make_msg(Role::User, "summary of everything so far");
+        sessions
+            .apply_session_compaction(&test_session_id(), std::slice::from_ref(&summary))
+            .await
+            .unwrap();
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+
+        assert_eq!(restored.messages(), std::slice::from_ref(&summary));
+        assert_eq!(
+            restored.count_tokens(),
+            restored.tokenizer.count_message(&summary)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_that_differs_from_the_durable_rows_writes_no_anchor() {
+        let sessions = test_sessions();
+        let mut ctx = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        ctx.set_current_model(MODEL_ID);
+        ctx.append(&make_msg(Role::User, "hello")).await.unwrap();
+        ctx.persisted_order_diverged = true;
+
+        ctx.record_call_actual(5_000).await;
+        assert_eq!(
+            sessions
+                .load_token_anchor(&test_session_id())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A row another writer put in the store before the call is inside the
+    /// anchor's ordinal range but was never in the window it measured.
+    #[tokio::test]
+    async fn an_anchor_over_rows_its_window_never_held_is_not_restored() {
+        let sessions = test_sessions();
+        let mut live = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        live.set_current_model(MODEL_ID);
+        live.append(&make_msg(Role::User, "hello")).await.unwrap();
+        sessions
+            .append_session_message(&test_session_id(), &make_msg(Role::User, "out of band"))
+            .await
+            .unwrap();
+        live.record_call_actual(5_000).await;
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+        let swept: usize = restored
+            .messages()
+            .iter()
+            .map(|m| restored.tokenizer.count_message(m))
+            .sum();
+        assert_eq!(restored.count_tokens(), swept);
+    }
+
+    /// Repair moved a tool result back beside its call, inside the anchored
+    /// prefix: the window the provider measured is not the one restored.
+    #[tokio::test]
+    async fn an_anchor_over_a_prefix_repair_rewrote_is_not_restored() {
+        let sessions = test_sessions();
+        let call = ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "call-1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({}),
+            signature: None,
+        }]);
+        let displaced = [
+            make_msg(Role::User, "question"),
+            call,
+            make_msg(Role::User, "an interjection that landed first"),
+            ChatMessage::tool_result_with_meta("call-1".into(), "output".into(), None),
+        ];
+        for msg in &displaced {
+            sessions
+                .append_session_message(&test_session_id(), msg)
+                .await
+                .unwrap();
+        }
+        sessions
+            .record_token_anchor(
+                &test_session_id(),
+                NewTokenAnchor {
+                    model_id: MODEL_ID,
+                    actual_tokens: 5_000,
+                    message_count: displaced.len(),
+                    request_overhead: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+        assert_ne!(restored.messages(), &displaced[..], "repair must reorder");
+        let swept: usize = restored
+            .messages()
+            .iter()
+            .map(|m| restored.tokenizer.count_message(m))
+            .sum();
+        assert_eq!(restored.count_tokens(), swept);
+    }
+
+    /// Pin (production, 2026-09): three hour-long m4a recordings on
+    /// gpt-6-astra, which is never sent audio, were charged 57,600 each and
+    /// compacted a 54k conversation.
+    #[tokio::test]
+    async fn a_model_never_sent_audio_prices_a_voice_note_at_its_stub() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        let note = ChatMessage::user(vec![ContentBlock::Audio {
+            blob: baybo_model::BlobRef {
+                blob_id: "sha256:note.tok".into(),
+            },
+            mime_type: "audio/mp4".into(),
+            filename: Some("voice.m4a".into()),
+            duration_ms: None,
+        }]);
+        ctx.append(&note).await.unwrap();
+        let ceiling = ctx.count_tokens();
+        assert!(ceiling > baybo_llm::audio_tokens(None));
+
+        ctx.set_active_model_audio_delivery(AudioDelivery::Stub);
+        let stubbed = ctx.count_tokens();
+        assert!(stubbed < 1_000, "{stubbed}");
+        assert_eq!(ctx.budget().current(), stubbed);
+
+        ctx.set_active_model_audio_delivery(AudioDelivery::Native);
+        assert_eq!(ctx.count_tokens(), ceiling);
+    }
+
+    fn voice_note() -> ChatMessage {
+        ChatMessage::user(vec![ContentBlock::Audio {
+            blob: baybo_model::BlobRef {
+                blob_id: "sha256:note.tok".into(),
+            },
+            mime_type: "audio/mp4".into(),
+            filename: Some("voice.m4a".into()),
+            duration_ms: Some(60_000),
+        }])
+    }
+
+    /// An anchor taken while voice notes went as stubs says nothing about
+    /// what they cost once they are sent whole.
+    #[tokio::test]
+    async fn a_baseline_over_stubbed_audio_is_dropped_when_audio_starts_going_whole() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.set_active_model_audio_delivery(AudioDelivery::Stub);
+        ctx.append(&voice_note()).await.unwrap();
+        ctx.record_call_actual(10).await;
+        assert_eq!(ctx.count_tokens(), 10);
+
+        ctx.set_active_model_audio_delivery(AudioDelivery::Native);
+        assert!(ctx.count_tokens() > baybo_llm::audio_tokens(Some(60_000)));
+    }
+
+    #[tokio::test]
+    async fn an_anchor_over_audio_is_restored_only_while_audio_is_stubbed() {
+        for (audio, restored_anchor) in
+            [(AudioDelivery::Stub, true), (AudioDelivery::Native, false)]
+        {
+            let sessions = test_sessions();
+            let mut live = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+            live.set_active_model_audio_delivery(AudioDelivery::Stub);
+            live.set_current_model(MODEL_ID);
+            live.append(&voice_note()).await.unwrap();
+            live.record_call_actual(10).await;
+
+            let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+            restored.set_active_model_audio_delivery(audio);
+            restored.restore_from_store().await;
+            assert_eq!(restored.count_tokens() == 10, restored_anchor, "{audio:?}");
+        }
     }
 
     fn make_task(subject: &str) -> baybo_model::Task {
@@ -4977,7 +5426,7 @@ mod tests {
         assert!(ctx.task_reminder_raw > 0 && ctx.progress_observation_raw > 0);
 
         let actual = 5_000;
-        ctx.record_call_actual(actual);
+        ctx.record_call_actual(actual).await;
 
         assert_eq!(
             ctx.count_tokens(),
@@ -5027,7 +5476,7 @@ mod tests {
 
         // Provider reported `actual` for a request that included the reminder.
         let actual = 5_000;
-        ctx.record_call_actual(actual);
+        ctx.record_call_actual(actual).await;
 
         // No new messages since the call ⇒ the estimate equals `actual`
         // (reminder counted once, not twice).
@@ -5145,7 +5594,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        ctx.record_call_actual(9_999);
+        ctx.record_call_actual(9_999).await;
 
         // Pre-compression: baseline applies → big number.
         assert_eq!(ctx.count_tokens(), 9_999);
@@ -5185,7 +5634,7 @@ mod tests {
         ctx.append(&make_msg(Role::Assistant, "second"))
             .await
             .unwrap();
-        ctx.record_call_actual(1_000);
+        ctx.record_call_actual(1_000).await;
 
         // Append after baseline: count_tokens uses baseline + cached
         // suffix counts. The expected value is `actual + sum of new

@@ -691,4 +691,8 @@ impl LlmCompletion for GatedChat {
     fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
         self.inner.delivers_image_block(block)
     }
+
+    fn audio_delivery(&self) -> baybo_llm::AudioDelivery {
+        self.inner.audio_delivery()
+    }
 }

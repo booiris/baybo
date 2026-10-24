@@ -169,12 +169,24 @@ impl LlmClientPool {
     /// config, so a span can name a model this process no longer builds a
     /// client for. Callers show what they know instead of guessing a window.
     pub fn context_window_for_model(&self, model_id: &str) -> Option<usize> {
+        self.client_for_model(model_id)
+            .map(|client| client.model_info().context_window)
+    }
+
+    /// Whether the client serving `model_id` sends it audio or only the
+    /// stub — what a span on that model was really sent. `None` when no
+    /// configured client serves the model any more.
+    pub fn audio_delivery_for_model(&self, model_id: &str) -> Option<baybo_llm::AudioDelivery> {
+        self.client_for_model(model_id)
+            .map(|client| client.audio_delivery())
+    }
+
+    fn client_for_model(&self, model_id: &str) -> Option<&Arc<BillableLlm>> {
         self.clients
             .values()
             .chain(self.overrides.values())
             .chain(self.lite.values())
             .find(|client| client.model_info().id == model_id)
-            .map(|client| client.model_info().context_window)
     }
 
     /// Resolve a session's pin to a client. `name` picks the entry (`None` =

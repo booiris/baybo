@@ -351,14 +351,17 @@ async fn get_span_context(
             other => GatewayError::Trace(other.to_string()),
         })?;
 
-    let breakdown = baybo_context::context_breakdown(&input.messages, &input.tools);
     // Snapshot the pool behind its reload lock, and drop the guard before
     // serializing — a hot reload swapping the pool mid-response must not
     // block on this handler.
-    let context_window = {
-        let pool = state.llm_pool.read().clone();
-        pool.context_window_for_model(&input.model_id)
-    };
+    let pool = state.llm_pool.read().clone();
+    let context_window = pool.context_window_for_model(&input.model_id);
+    // A model no client serves any more keeps the native ceiling: the trace
+    // outlives the config, and an over-stated media share is the safe error.
+    let audio = pool
+        .audio_delivery_for_model(&input.model_id)
+        .unwrap_or(baybo_llm::AudioDelivery::Native);
+    let breakdown = baybo_context::context_breakdown(&input.messages, &input.tools, audio);
 
     Ok(Json(json!({
         "span_id": parsed_span.to_string(),

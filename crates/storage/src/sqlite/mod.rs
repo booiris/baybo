@@ -777,6 +777,22 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_session_messages_source_created
                     ON session_messages(source, created_at);
 
+                -- The provider's input-token count for the first
+                -- `message_count` active rows as of `through_ordinal`
+                -- (`baybo_store::TokenAnchor`). One row per session, replaced
+                -- after every main LLM call so a rehydrated actor budgets
+                -- from the provider's number instead of a full re-estimate.
+                -- Derived data: losing a row costs one estimate, nothing more.
+                CREATE TABLE IF NOT EXISTS session_token_anchors (
+                    session_id      TEXT    PRIMARY KEY,
+                    model_id        TEXT    NOT NULL,
+                    actual_tokens   INTEGER NOT NULL,
+                    message_count   INTEGER NOT NULL,
+                    request_overhead INTEGER NOT NULL,
+                    through_ordinal INTEGER NOT NULL,
+                    updated_at      INTEGER NOT NULL
+                );
+
                 -- Identity of the pipeline that produced `message_fts`, so a
                 -- changed segmenter rebuilds instead of leaving half the index
                 -- speaking a different alphabet than the queries. `message_fts`

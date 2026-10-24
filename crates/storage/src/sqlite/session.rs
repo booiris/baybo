@@ -9,8 +9,8 @@ use baybo_model::{
 };
 use baybo_store::StorageError;
 use baybo_store::session::{
-    ActiveMessageRow, DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore,
-    StoredMessage,
+    ActiveMessageRow, DreamCandidate, NewTokenAnchor, Result, SessionMessageAppendOutcome,
+    SessionStore, StoredMessage, TokenAnchor,
 };
 
 pub struct SqliteSessionStore {
@@ -1145,6 +1145,76 @@ impl SessionStore for SqliteSessionStore {
             .await
     }
 
+    async fn record_token_anchor(
+        &self,
+        session_id: &SessionId,
+        anchor: NewTokenAnchor<'_>,
+    ) -> Result<()> {
+        let sid = session_id.as_str().to_string();
+        let model_id = anchor.model_id.to_string();
+        let as_i64 = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let actual_tokens = as_i64(anchor.actual_tokens);
+        let message_count = as_i64(anchor.message_count);
+        let request_overhead = as_i64(anchor.request_overhead);
+        let now = super::time::now_us();
+        self.pool
+            .interact_write("sessions.record_token_anchor", move |conn| {
+                // A session with no rows has nothing to anchor; the SELECT
+                // yields no row and the statement inserts nothing.
+                conn.execute(
+                    "INSERT INTO session_token_anchors \
+                         (session_id, model_id, actual_tokens, message_count, request_overhead, \
+                          through_ordinal, updated_at) \
+                     SELECT ?1, ?2, ?3, ?4, ?5, \
+                            (SELECT MAX(ordinal) FROM session_messages WHERE session_id = ?1), ?6 \
+                      WHERE EXISTS (SELECT 1 FROM session_messages WHERE session_id = ?1) \
+                     ON CONFLICT(session_id) DO UPDATE SET \
+                         model_id = excluded.model_id, \
+                         actual_tokens = excluded.actual_tokens, \
+                         message_count = excluded.message_count, \
+                         request_overhead = excluded.request_overhead, \
+                         through_ordinal = excluded.through_ordinal, \
+                         updated_at = excluded.updated_at",
+                    rusqlite::params![
+                        sid,
+                        model_id,
+                        actual_tokens,
+                        message_count,
+                        request_overhead,
+                        now
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn load_token_anchor(&self, session_id: &SessionId) -> Result<Option<TokenAnchor>> {
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.load_token_anchor", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT model_id, actual_tokens, message_count, request_overhead, \
+                                through_ordinal \
+                           FROM session_token_anchors WHERE session_id = ?1",
+                        rusqlite::params![sid],
+                        |row| {
+                            let count = |i| row.get::<_, i64>(i).map(|n| n.max(0) as usize);
+                            Ok(TokenAnchor {
+                                model_id: row.get(0)?,
+                                actual_tokens: count(1)?,
+                                message_count: count(2)?,
+                                request_overhead: count(3)?,
+                                through_ordinal: row.get(4)?,
+                            })
+                        },
+                    )
+                    .optional()?)
+            })
+            .await
+    }
+
     async fn active_index_of_ordinal(
         &self,
         session_id: &SessionId,
@@ -2018,6 +2088,95 @@ mod tests {
 
     fn text_value(s: &str) -> rusqlite::types::Value {
         rusqlite::types::Value::Text(s.to_string())
+    }
+
+    /// The anchor names the rows that existed when it was written: a later
+    /// row is outside it, a rewrite replaces it, and a session with no rows
+    /// has nothing to anchor.
+    #[tokio::test]
+    async fn token_anchor_is_stamped_with_the_newest_ordinal_and_replaced() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let s = make_root_session("cli-anchor");
+        store.save(&s).await.unwrap();
+
+        store
+            .record_token_anchor(
+                &s.id,
+                NewTokenAnchor {
+                    model_id: "gpt-x",
+                    actual_tokens: 1_234,
+                    message_count: 1,
+                    request_overhead: 7,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.load_token_anchor(&s.id).await.unwrap(), None);
+
+        for text in ["one", "two"] {
+            store
+                .append_session_message(
+                    &s.id,
+                    &ChatMessage::user(vec![baybo_model::ContentBlock::Text(text.into())]),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .record_token_anchor(
+                &s.id,
+                NewTokenAnchor {
+                    model_id: "gpt-x",
+                    actual_tokens: 1_234,
+                    message_count: 2,
+                    request_overhead: 7,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &s.id,
+                &ChatMessage::user(vec![baybo_model::ContentBlock::Text("three".into())]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_token_anchor(&s.id).await.unwrap(),
+            Some(TokenAnchor {
+                model_id: "gpt-x".into(),
+                actual_tokens: 1_234,
+                message_count: 2,
+                request_overhead: 7,
+                through_ordinal: 1,
+            })
+        );
+
+        store
+            .record_token_anchor(
+                &s.id,
+                NewTokenAnchor {
+                    model_id: "gpt-y",
+                    actual_tokens: 9_000,
+                    message_count: 3,
+                    request_overhead: 7,
+                },
+            )
+            .await
+            .unwrap();
+        let replaced = store.load_token_anchor(&s.id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                replaced.model_id.as_str(),
+                replaced.actual_tokens,
+                replaced.through_ordinal
+            ),
+            ("gpt-y", 9_000, 2)
+        );
     }
 
     #[tokio::test]

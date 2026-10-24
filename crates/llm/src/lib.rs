@@ -561,13 +561,28 @@ pub const MAX_AUDIO_SECONDS: u32 = 1_800;
 /// always stubbed.
 pub const MAX_AUDIO_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 
-/// What `baybo-context`'s tokenizer charges one `ContentBlock::Audio`.
+/// Whether the model on the other end of a turn is sent audio at all, or
+/// only ever its text stub — [`LlmClient::audio_delivery`] answers it from
+/// the same gate delivery applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioDelivery {
+    Native,
+    Stub,
+}
+
+/// What `baybo-context`'s tokenizer charges one `ContentBlock::Audio` on a
+/// model that takes audio.
 ///
 /// `duration_ms` is server-probed ([`media_probe::audio_duration_ms`]) at
 /// every ingest point. [`None`] charges the full [`MAX_AUDIO_SECONDS`]
 /// cap, which is a true ceiling for the same reason the PDF one is:
 /// delivery probes the fetched bytes itself and stubs anything longer, or
 /// anything it cannot measure at all.
+///
+/// Over the cap it is clamped to the cap rather than priced as the stub the
+/// way an over-cap PDF is: the stored duration can come off the wire when
+/// the ingest probe reads nothing, and delivery's own probe of the same
+/// bytes may then measure less and send it.
 pub fn audio_tokens(duration_ms: Option<u32>) -> usize {
     let seconds = match duration_ms {
         Some(ms) => ms.div_ceil(MS_PER_SECOND).min(MAX_AUDIO_SECONDS),
@@ -675,12 +690,18 @@ pub const MAX_CONTENT_STUB_TOKENS: usize = multimodal::MAX_CONTENT_STUB_BYTES;
 /// average: `cl100k`'s base vocabulary is the 256 single bytes and every
 /// merge replaces two tokens with one, so a token always covers at least
 /// one input byte.
-pub fn content_block_tokens(block: &baybo_model::ContentBlock) -> usize {
+///
+/// `audio` is the bound model's [`AudioDelivery`]: on a model that is never
+/// sent audio every voice note is its stub, whatever its duration.
+pub fn content_block_tokens(block: &baybo_model::ContentBlock, audio: AudioDelivery) -> usize {
     use baybo_model::ContentBlock;
 
     let delivered = match block {
         ContentBlock::Image { width, height, .. } => image_tokens(*width, *height),
-        ContentBlock::Audio { duration_ms, .. } => audio_tokens(*duration_ms),
+        ContentBlock::Audio { duration_ms, .. } => match audio {
+            AudioDelivery::Native => audio_tokens(*duration_ms),
+            AudioDelivery::Stub => 0,
+        },
         ContentBlock::File {
             filename,
             mime_type,
@@ -1479,6 +1500,12 @@ pub trait LlmCompletion: Send + Sync {
     fn delivers_image_block(&self, _block: &baybo_model::ContentBlock) -> bool {
         false
     }
+    /// Whether this client sends audio or its text stub — see
+    /// [`LlmClient::audio_delivery`]. Defaults to [`AudioDelivery::Stub`] for
+    /// the same reason as [`Self::delivers_image_block`].
+    fn audio_delivery(&self) -> AudioDelivery {
+        AudioDelivery::Stub
+    }
 }
 
 #[async_trait::async_trait]
@@ -1497,6 +1524,9 @@ impl LlmCompletion for LlmClient {
     }
     fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
         LlmClient::delivers_image_block(self, block)
+    }
+    fn audio_delivery(&self) -> AudioDelivery {
+        LlmClient::audio_delivery(self)
     }
 }
 
@@ -1573,6 +1603,18 @@ impl LlmClient {
     pub fn with_blob_fetcher(mut self, fetcher: std::sync::Arc<dyn BlobFetcher>) -> Self {
         self.blob_fetcher = Some(fetcher);
         self
+    }
+
+    /// Whether this client sends audio to the model or only its text stub —
+    /// the gate [`Self::user_content_for_block`] applies, so the budget can
+    /// price a voice note at what delivery will actually send.
+    pub fn audio_delivery(&self) -> AudioDelivery {
+        if self.model_info.supports_vision && self.model.accepts_audio_content(&self.model_info.id)
+        {
+            AudioDelivery::Native
+        } else {
+            AudioDelivery::Stub
+        }
     }
 
     /// Whether `block` is an image this client would deliver as a picture:
@@ -1928,9 +1970,7 @@ impl LlmClient {
                 mime_type,
                 duration_ms,
                 ..
-            } if self.model_info.supports_vision
-                && self.model.accepts_audio_content(&self.model_info.id) =>
-            {
+            } if self.audio_delivery() == AudioDelivery::Native => {
                 let (Some(fetcher), Some(media_type)) = (
                     self.blob_fetcher.as_ref(),
                     parse_audio_media_type(mime_type),
@@ -3518,7 +3558,10 @@ mod document_dispatch_tests {
 
         // The stakes: this is what the budget would charge for a block no
         // provider receives, since a dimensionless image prices at the cap.
-        assert_eq!(content_block_tokens(&image_block()), IMAGE_TOKEN_CEILING);
+        assert_eq!(
+            content_block_tokens(&image_block(), AudioDelivery::Native),
+            IMAGE_TOKEN_CEILING
+        );
     }
 
     /// A format with no pixel grid to read cannot be priced, so it is not
@@ -4034,7 +4077,7 @@ mod media_pricing_tests {
             ("blob.bin", "application/octet-stream"),
         ] {
             let block = file(name, mime, None);
-            let charged = content_block_tokens(&block);
+            let charged = content_block_tokens(&block, AudioDelivery::Native);
             assert_eq!(charged, multimodal::content_block_to_text(&block).len());
             assert!(charged < 100, "{name} charged {charged}");
             assert!(
@@ -4046,7 +4089,7 @@ mod media_pricing_tests {
         // block's own strings are.
         let huge = "𝕏".repeat(100_000);
         let wide = file(&huge, &huge, None);
-        assert!(content_block_tokens(&wide) <= MAX_CONTENT_STUB_TOKENS);
+        assert!(content_block_tokens(&wide, AudioDelivery::Native) <= MAX_CONTENT_STUB_TOKENS);
     }
 
     /// No arm may price below the stub it degrades to on a fetch failure
@@ -4074,13 +4117,16 @@ mod media_pricing_tests {
         ] {
             let stub = multimodal::content_block_to_text(&block).len();
             assert!(
-                content_block_tokens(&block) >= stub,
+                content_block_tokens(&block, AudioDelivery::Native) >= stub,
                 "{block:?} prices below its {stub}-byte stub"
             );
         }
         // Text is not media and is priced by the tokenizer, not here.
         assert_eq!(
-            content_block_tokens(&baybo_model::ContentBlock::Text("hello".into())),
+            content_block_tokens(
+                &baybo_model::ContentBlock::Text("hello".into()),
+                AudioDelivery::Native,
+            ),
             0
         );
     }
@@ -4111,10 +4157,13 @@ mod media_pricing_tests {
         assert_eq!(pdf_document_tokens(Some(5_000)), 0);
         let over = pdf(Some(MAX_PDF_PAGES + 1));
         assert_eq!(
-            content_block_tokens(&over),
+            content_block_tokens(&over, AudioDelivery::Native),
             multimodal::content_block_to_text(&over).len()
         );
-        assert_eq!(content_block_tokens(&pdf(Some(3))), 3 * PDF_TOKENS_PER_PAGE);
+        assert_eq!(
+            content_block_tokens(&pdf(Some(3)), AudioDelivery::Native),
+            3 * PDF_TOKENS_PER_PAGE
+        );
     }
 
     #[test]
@@ -4126,6 +4175,31 @@ mod media_pricing_tests {
             audio_tokens(None),
             MAX_AUDIO_SECONDS as usize * AUDIO_TOKENS_PER_SECOND
         );
+    }
+
+    /// Pin (production, 2026-09): hour-long m4a recordings on a model that
+    /// takes no audio were charged 57,600 each and compacted a 54k
+    /// conversation. Such a model is sent every voice note as its stub.
+    #[test]
+    fn audio_that_delivery_stubs_costs_only_its_stub() {
+        let block = |duration_ms| baybo_model::ContentBlock::Audio {
+            blob: baybo_model::BlobRef {
+                blob_id: "sha256:rec".into(),
+            },
+            mime_type: "audio/mp4".into(),
+            filename: Some("meeting.m4a".into()),
+            duration_ms,
+        };
+        let stub = |b: &baybo_model::ContentBlock| multimodal::content_block_to_text(b).len();
+
+        for duration_ms in [None, Some(60 * MS_PER_SECOND), Some(3_600 * MS_PER_SECOND)] {
+            let note = block(duration_ms);
+            assert_eq!(
+                content_block_tokens(&note, AudioDelivery::Stub),
+                stub(&note)
+            );
+            assert!(content_block_tokens(&note, AudioDelivery::Native) > stub(&note));
+        }
     }
 }
 

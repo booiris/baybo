@@ -10,7 +10,10 @@ use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
 use crate::SessionError;
-use baybo_store::{ActiveMessageRow, SessionMessageAppendOutcome, SessionStore, StoredMessage};
+use baybo_store::{
+    ActiveMessageRow, NewTokenAnchor, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+    TokenAnchor,
+};
 use baybo_store::{SessionFolderRow, SessionFolderStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
@@ -726,6 +729,27 @@ impl SessionManager {
     pub async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
         self.store
             .latest_session_ordinal(session_id)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Durably record the provider's input-token count for the first
+    /// `anchor.message_count` active rows — see [`baybo_store::TokenAnchor`].
+    pub async fn record_token_anchor(
+        &self,
+        session_id: &SessionId,
+        anchor: NewTokenAnchor<'_>,
+    ) -> Result<()> {
+        self.store
+            .record_token_anchor(session_id, anchor)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// The session's last recorded [`TokenAnchor`], if any.
+    pub async fn load_token_anchor(&self, session_id: &SessionId) -> Result<Option<TokenAnchor>> {
+        self.store
+            .load_token_anchor(session_id)
             .await
             .map_err(SessionError::from)
     }

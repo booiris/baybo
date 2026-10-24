@@ -11,6 +11,7 @@
 //! should present the span's recorded `input_tokens` as the total and treat
 //! these numbers as proportions of it.
 
+use baybo_llm::AudioDelivery;
 use baybo_model::{ChatMessage, ContentBlock, MessageSource, Role};
 use baybo_trace::LlmToolDefinition;
 use serde::{Deserialize, Serialize};
@@ -163,9 +164,14 @@ fn label_for(part: ContextPart) -> String {
 
 /// Split `messages` (the exact slice the model saw) and `tools` (the set it
 /// was offered) into per-part token estimates.
+///
+/// `audio` is how the span's model was sent voice notes: priced as the
+/// budget prices them, a model that only ever received the stub shows the
+/// stub, not the native ceiling.
 pub fn context_breakdown(
     messages: &[ChatMessage],
     tools: &[LlmToolDefinition],
+    audio: AudioDelivery,
 ) -> ContextBreakdown {
     let tokenizer = HeuristicTokenizer;
     let mut segments = Vec::with_capacity(messages.len() + 1);
@@ -207,8 +213,12 @@ pub fn context_breakdown(
 
     for (index, message) in messages.iter().enumerate() {
         let part = classify(message);
-        let media = tokenizer.count_message_media(message);
-        let text = tokenizer.count_message(message).saturating_sub(media);
+        // `count_message` folds in the native price, so the text is what is
+        // left after it; the media segment is what this model was sent.
+        let text = tokenizer
+            .count_message(message)
+            .saturating_sub(tokenizer.count_message_media(message, AudioDelivery::Native));
+        let media = tokenizer.count_message_media(message, audio);
         if text > 0 {
             let label = match part {
                 ContextPart::ToolResult => named_tool_result(message, &tool_names),
@@ -306,7 +316,7 @@ mod tests {
         // The schema is most of a definition's weight; counting name +
         // description alone would report a tool set as near-free and send a
         // reader hunting through their transcript instead.
-        let with_schema = context_breakdown(&[], &[tool("bash")]);
+        let with_schema = context_breakdown(&[], &[tool("bash")], AudioDelivery::Native);
         let bare = context_breakdown(
             &[],
             &[LlmToolDefinition {
@@ -314,6 +324,7 @@ mod tests {
                 description: "does a thing".into(),
                 parameters_schema: serde_json::Value::Null,
             }],
+            AudioDelivery::Native,
         );
         assert_eq!(with_schema.segments.len(), 1);
         assert_eq!(with_schema.segments[0].part, ContextPart::Tools);
@@ -322,7 +333,7 @@ mod tests {
 
     #[test]
     fn no_tools_means_no_tools_segment() {
-        let out = context_breakdown(&[ChatMessage::user(text("hi"))], &[]);
+        let out = context_breakdown(&[ChatMessage::user(text("hi"))], &[], AudioDelivery::Native);
         assert!(out.segments.iter().all(|s| s.part != ContextPart::Tools));
     }
 
@@ -342,7 +353,7 @@ mod tests {
         for m in &messages {
             assert_eq!(m.role, Role::User, "the premise: all four are user rows");
         }
-        let parts: Vec<ContextPart> = context_breakdown(&messages, &[])
+        let parts: Vec<ContextPart> = context_breakdown(&messages, &[], AudioDelivery::Native)
             .segments
             .iter()
             .map(|s| s.part)
@@ -369,7 +380,7 @@ mod tests {
             meta: None,
         }]);
         assert_eq!(message.role, Role::User, "the premise: it is a user row");
-        let out = context_breakdown(&[message], &[]);
+        let out = context_breakdown(&[message], &[], AudioDelivery::Native);
         assert_eq!(out.segments[0].part, ContextPart::ToolResult);
     }
 
@@ -384,7 +395,7 @@ mod tests {
             signature: None,
         }]);
         let result = ChatMessage::tool_result("call-1".into(), "output".into());
-        let out = context_breakdown(&[call, result], &[]);
+        let out = context_breakdown(&[call, result], &[], AudioDelivery::Native);
         let labels: Vec<&str> = out.segments.iter().map(|s| s.label.as_str()).collect();
         assert!(
             labels.contains(&"bash result"),
@@ -410,7 +421,7 @@ mod tests {
                 height: Some(768),
             },
         ]);
-        let out = context_breakdown(&[message], &[]);
+        let out = context_breakdown(&[message], &[], AudioDelivery::Native);
         let parts: Vec<ContextPart> = out.segments.iter().map(|s| s.part).collect();
         assert_eq!(parts, vec![ContextPart::User, ContextPart::Media]);
         assert!(out.segments.iter().all(|s| s.tokens > 0));
@@ -429,7 +440,7 @@ mod tests {
                 signature: None,
             }],
         }]);
-        let out = context_breakdown(&[message], &[]);
+        let out = context_breakdown(&[message], &[], AudioDelivery::Native);
         assert_eq!(out.segments[0].part, ContextPart::Assistant);
     }
 
@@ -440,7 +451,7 @@ mod tests {
             ChatMessage::user(text("hi")),
             ChatMessage::assistant(text("hello")),
         ];
-        let out = context_breakdown(&messages, &[tool("bash")]);
+        let out = context_breakdown(&messages, &[tool("bash")], AudioDelivery::Native);
         let parts: Vec<ContextPart> = out.segments.iter().map(|s| s.part).collect();
         // Tools first: they precede the transcript on the wire.
         assert_eq!(
@@ -460,8 +471,32 @@ mod tests {
 
     #[test]
     fn an_empty_input_breaks_down_to_nothing() {
-        let out = context_breakdown(&[], &[]);
+        let out = context_breakdown(&[], &[], AudioDelivery::Native);
         assert!(out.segments.is_empty());
         assert_eq!(out.estimated_total_tokens, 0);
+    }
+
+    /// Priced the way the budget prices it: a voice note on a model that is
+    /// only ever sent its stub shows the stub, not the native ceiling.
+    #[test]
+    fn a_voice_note_is_shown_at_what_the_model_was_sent() {
+        let note = ChatMessage::user(vec![ContentBlock::Audio {
+            blob: baybo_model::BlobRef {
+                blob_id: "sha256:note".into(),
+            },
+            mime_type: "audio/mp4".into(),
+            filename: Some("voice.m4a".into()),
+            duration_ms: None,
+        }]);
+        let media = |audio| {
+            context_breakdown(std::slice::from_ref(&note), &[], audio)
+                .segments
+                .iter()
+                .filter(|s| s.part == ContextPart::Media)
+                .map(|s| s.tokens)
+                .sum::<usize>()
+        };
+        assert!(media(AudioDelivery::Native) >= baybo_llm::audio_tokens(None));
+        assert!(media(AudioDelivery::Stub) < 1_000);
     }
 }

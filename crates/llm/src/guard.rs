@@ -118,6 +118,12 @@ impl BillableLlm {
         self.inner.delivers_image_block(block)
     }
 
+    /// Whether the wrapped client sends audio or its text stub — see
+    /// [`crate::LlmClient::audio_delivery`].
+    pub fn audio_delivery(&self) -> crate::AudioDelivery {
+        self.inner.audio_delivery()
+    }
+
     /// Issue a minimal chat request to verify provider connectivity
     /// and auth. Mirrors the previous `LlmClient::probe()` so the
     /// `baybo llm probe` / `baybo doctor` paths still have a cheap
