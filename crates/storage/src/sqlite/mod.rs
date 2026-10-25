@@ -181,7 +181,33 @@ fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> anyhow:
 /// Keep the migration runner even when the list is empty. A future additive
 /// change belongs both in the table's `CREATE` statement (fresh databases) and
 /// here (databases created from this baseline).
-const ADD_COLUMNS: &[AddColumn] = &[];
+const ADD_COLUMNS: &[AddColumn] = &[
+    AddColumn {
+        table: "sessions",
+        column: "token_anchor_model",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "token_anchor_tokens",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "token_anchor_message_count",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "token_anchor_request_overhead",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "token_anchor_through_ordinal",
+        definition: "INTEGER",
+    },
+];
 
 /// Pool of sqlite connections.
 ///
@@ -659,6 +685,23 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- max-wins) and omitted from save's DO UPDATE like every
                     -- other flat column. See docs/modules/memory-builtin.md.
                     dreamed_through_ordinal INTEGER,
+                    -- The provider's input-token count for the first
+                    -- `token_anchor_message_count` active rows as of
+                    -- `token_anchor_through_ordinal`, under the model and
+                    -- tool-schema estimate it was measured with
+                    -- (`baybo_store::TokenAnchor`). Replaced after every
+                    -- main LLM call by `record_token_anchor` so a rehydrated
+                    -- actor budgets from the provider's number instead of a
+                    -- full re-estimate. Derived data: NULL costs one
+                    -- estimate, nothing more. Flat columns under the same
+                    -- targeted-UPDATE discipline as the cursors above,
+                    -- omitted from save's DO UPDATE, and never read into
+                    -- `Session` -- `load_token_anchor` is their only reader.
+                    token_anchor_model    TEXT,
+                    token_anchor_tokens   INTEGER,
+                    token_anchor_message_count INTEGER,
+                    token_anchor_request_overhead INTEGER,
+                    token_anchor_through_ordinal INTEGER,
                     data                  TEXT NOT NULL,
                     -- The board this session's work belongs to, extracted
                     -- from the trigger rather than stored a second time.
@@ -776,22 +819,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- against a partial index's identical WHERE clause.
                 CREATE INDEX IF NOT EXISTS idx_session_messages_source_created
                     ON session_messages(source, created_at);
-
-                -- The provider's input-token count for the first
-                -- `message_count` active rows as of `through_ordinal`
-                -- (`baybo_store::TokenAnchor`). One row per session, replaced
-                -- after every main LLM call so a rehydrated actor budgets
-                -- from the provider's number instead of a full re-estimate.
-                -- Derived data: losing a row costs one estimate, nothing more.
-                CREATE TABLE IF NOT EXISTS session_token_anchors (
-                    session_id      TEXT    PRIMARY KEY,
-                    model_id        TEXT    NOT NULL,
-                    actual_tokens   INTEGER NOT NULL,
-                    message_count   INTEGER NOT NULL,
-                    request_overhead INTEGER NOT NULL,
-                    through_ordinal INTEGER NOT NULL,
-                    updated_at      INTEGER NOT NULL
-                );
 
                 -- Identity of the pipeline that produced `message_fts`, so a
                 -- changed segmenter rebuilds instead of leaving half the index
