@@ -321,7 +321,7 @@ async fn get_tool_set(
     responses(
         (
             status = 200,
-            description = "Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a tiktoken ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more.",
+            description = "Where one LLM call's input tokens went: `{ model_id, reported_input_tokens, estimated_total_tokens, context_window, segments: [{ part, label, tokens, index }] }`. `reported_input_tokens` is what the provider billed and is exact; the per-segment split is a heuristic ESTIMATE (see docs/modules/context.md), so a client scales the segments onto the reported total rather than presenting them as measured. `context_window` is null when no configured client serves that model any more.",
             body = serde_json::Value,
             content_type = "application/json",
         ),
@@ -351,8 +351,7 @@ async fn get_span_context(
             other => GatewayError::Trace(other.to_string()),
         })?;
 
-    let breakdown =
-        baybo_context::context_breakdown(&input.model_id, &input.messages, &input.tools);
+    let breakdown = baybo_context::context_breakdown(&input.messages, &input.tools);
     // Snapshot the pool behind its reload lock, and drop the guard before
     // serializing — a hot reload swapping the pool mid-response must not
     // block on this handler.

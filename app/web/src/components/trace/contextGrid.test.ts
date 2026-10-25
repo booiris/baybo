@@ -25,7 +25,7 @@ describe('buildContextGrid', () => {
   });
 
   it('scales the estimated split onto the number the provider billed', () => {
-    // The split is a tiktoken estimate and the total is not. Reporting the
+    // The split is an estimate and the total is not. Reporting the
     // estimate as the total would put a number on screen that disagrees with
     // the span's own metadata tab.
     const grid = buildContextGrid(segments, 60_200, null);

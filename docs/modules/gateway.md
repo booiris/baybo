@@ -1097,8 +1097,8 @@ a `ReloadOutcome`. If the gateway was booted without a config path
 `start` builds the full manager graph — `SessionManager`,
 `TurnLifecycle`, `CronScheduler`, `TraceStore`,
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
-`SkillAssessor`, the LLM stack (`llm_client: Arc<BillableLlm>` plus the
-`llm_pool: LlmPoolHandle` it's the default client of), `WorkspacePaths`,
+`SkillAssessor`, the LLM stack (`llm_pool: LlmPoolHandle`, every client in it already
+wrapped in `BillableLlm`), `WorkspacePaths`,
 `LeakDetector`, `ChannelRegistry`, `CostManager`, `DeckManager` (its
 `DeckCard*` agent tools register at build; `gateway_cmd` boots/stops the
 card services — [`deck.md`](./deck.md)) — plus a
@@ -1108,7 +1108,7 @@ lives in `crates/baybo/src/runtime.rs` (the binary crate's `src/`, not under
 
 ```rust
 // crates/baybo/src/runtime.rs
-pub struct ManagerGraph { /* all Arcs; llm_client + llm_pool; channels_registry; … */ }
+pub struct ManagerGraph { /* all Arcs; llm_pool; channels_registry; … */ }
 pub async fn build_managers(
     config: Arc<BayboConfig>,
     config_path: Option<PathBuf>,

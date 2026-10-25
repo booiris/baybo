@@ -234,7 +234,6 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4"
 shell-words = "1"
 brush-parser = "0.4"
-tiktoken-rs = "0.11"
 similar = "2"
 unicode-width = "0.2"
 unicode-normalization = "0.1"
@@ -301,8 +300,7 @@ incremental = false
 # baybo-* crate keeps opt-level 0 and its fast debug build. Deps are compiled
 # once and then executed by 2992 tests, and at -O0 the suite spent its time
 # inside them: bundled sqlite3 (this also flips libsqlite3-sys's cc build to
-# -O2 via OPT_LEVEL), regex NFA construction, the tiktoken BPE table, and the
-# crypto/hash chain. Worth ~4s of a 10.4s run for a one-time dep rebuild.
+# -O2 via OPT_LEVEL), regex NFA construction, and the crypto/hash chain. Worth ~4s of a 10.4s run for a one-time dep rebuild.
 # `debug-assertions`/`overflow-checks` are deliberately left at the profile
 # default so nothing the tests rely on is switched off.
 [profile.dev.package."*"]

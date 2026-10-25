@@ -145,8 +145,9 @@ re-tokenizing a growing transcript every two seconds would make the most
 expensive read the most frequent one.
 
 **The total is exact and the split is not.** The provider bills one number for
-the whole prompt; the per-part figures come from `tiktoken`, which is a ~10%
-approximation off OpenAI models. `buildContextGrid`
+the whole prompt; the per-part figures come from a vocabulary-free byte
+heuristic (see `docs/modules/context.md`), a rough approximation for every
+provider. `buildContextGrid`
 (`components/trace/contextGrid.ts`) therefore uses the segments only for
 proportions and applies them to the recorded `input_tokens`, so the headline
 agrees with the Metadata tab; every per-part number is prefixed `≈`, and a

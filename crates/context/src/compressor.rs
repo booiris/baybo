@@ -438,7 +438,7 @@ impl ContextManager {
             &self.invocable_skill_summaries(),
             self.deferred_tool_notice.as_deref(),
         );
-        let total = self.calibrate(body) + trailer;
+        let total = self.unanchored_request_tokens(body + trailer);
         total < self.budget.current() && total <= self.budget.compression_ceiling()
     }
 }
