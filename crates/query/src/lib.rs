@@ -2136,6 +2136,20 @@ mod tests {
                 .get(id)
                 .and_then(|log| log.iter().map(|m| m.ordinal).max()))
         }
+        async fn record_token_anchor(
+            &self,
+            _id: &SessionId,
+            _anchor: baybo_store::NewTokenAnchor<'_>,
+        ) -> std::result::Result<(), baybo_store::StorageError> {
+            Ok(())
+        }
+        async fn load_token_anchor(
+            &self,
+            _id: &SessionId,
+        ) -> std::result::Result<Option<baybo_store::TokenAnchor>, baybo_store::StorageError>
+        {
+            Ok(None)
+        }
         async fn load_session_messages_with_supersede(
             &self,
             id: &SessionId,

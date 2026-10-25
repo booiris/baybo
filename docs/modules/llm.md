@@ -121,12 +121,12 @@ Every stub slot (`filename`, `mime_type`, `blob_id`) goes through the same 120-c
 
 A media block costs the context window, so this crate owns both the gate and the price and `baybo-context` reads the price off it — one number, two enforcement points that cannot drift.
 
-`content_block_tokens(block)` is the single entry point; it dispatches to the arm below and applies the stub floor.
+`content_block_tokens(block, audio)` is the single entry point; it dispatches to the arm below and applies the stub floor. `audio` is the bound model's `AudioDelivery` — `LlmClient::audio_delivery()`, the same gate the audio arm of delivery applies (`supports_vision` **and** `accepts_audio_content`). On `Stub` an audio block is charged its stub whatever it carries.
 
 | kind | delivered while | charged |
 | --- | --- | --- |
 | native PDF | `1 ≤ pages ≤ MAX_PDF_PAGES` (12) **and** `bytes ≤ 8 MiB` | `pdf_document_tokens(page_count)` = `pages × 7,800` |
-| audio | `seconds ≤ MAX_AUDIO_SECONDS` (1,800) **and** `bytes ≤ 16 MiB` | `audio_tokens(duration_ms)` = `ceil(s) × 32` |
+| audio | the model takes audio (`AudioDelivery::Native`) **and** `seconds ≤ MAX_AUDIO_SECONDS` (1,800) **and** `bytes ≤ 16 MiB` | `audio_tokens(duration_ms)` = `ceil(s) × 32`, clamped to the cap (a stored duration can come off the wire, so over-cap is no guaranteed stub); the stub on `AudioDelivery::Stub` |
 | image | dimensions readable **and** priced `≤ IMAGE_TOKEN_CEILING` (9,288) **by the provider on the other end** **and** `bytes ≤ 5 MiB` | `image_tokens(width, height)` = the dearest of the three providers' tilings |
 | inlined text document | always (no capability needed) | `inlined_document_tokens(filename, mime_type, size_bytes)` = template (85) + the two sanitized slots + escaped body, bounded by `MAX_INLINED_DOCUMENT_BYTES` (17,529) |
 | anything undeliverable | — | the stub the block itself renders, bounded by `MAX_CONTENT_STUB_TOKENS` (1,505) |

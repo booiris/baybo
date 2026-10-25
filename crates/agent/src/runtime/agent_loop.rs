@@ -691,6 +691,7 @@ impl AgentLoop {
         };
         let mut context_manager = context_manager;
         context_manager.set_active_model_context_window(llm_client.model_info().context_window);
+        context_manager.set_active_model_audio_delivery(llm_client.audio_delivery());
 
         Self {
             llm_client,
@@ -820,8 +821,10 @@ impl AgentLoop {
             "rebinding agent loop to the reloaded LLM client for this turn",
         );
         let window = client.model_info().context_window;
+        let audio = client.audio_delivery();
         self.llm_client = client;
         self.context_manager.set_active_model_context_window(window);
+        self.context_manager.set_active_model_audio_delivery(audio);
     }
 
     /// Re-pin which `baybo.json` entry this loop resolves against and
@@ -2168,7 +2171,8 @@ impl AgentLoop {
                 // `append_context_message`, so the transcript at
                 // this point still matches what the provider billed.
                 self.context_manager
-                    .record_call_actual(finalize.input_tokens);
+                    .record_call_actual(finalize.input_tokens)
+                    .await;
 
                 (finalize, value_result)
             },

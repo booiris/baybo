@@ -9,8 +9,8 @@ use baybo_model::{
 };
 use baybo_store::StorageError;
 use baybo_store::session::{
-    ActiveMessageRow, DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore,
-    StoredMessage,
+    ActiveMessageRow, DreamCandidate, NewTokenAnchor, Result, SessionMessageAppendOutcome,
+    SessionStore, StoredMessage, TokenAnchor,
 };
 
 pub struct SqliteSessionStore {
@@ -1145,6 +1145,74 @@ impl SessionStore for SqliteSessionStore {
             .await
     }
 
+    async fn record_token_anchor(
+        &self,
+        session_id: &SessionId,
+        anchor: NewTokenAnchor<'_>,
+    ) -> Result<()> {
+        let sid = session_id.as_str().to_string();
+        let model_id = anchor.model_id.to_string();
+        let as_i64 = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let actual_tokens = as_i64(anchor.actual_tokens);
+        let message_count = as_i64(anchor.message_count);
+        let request_overhead = as_i64(anchor.request_overhead);
+        self.pool
+            .interact_write("sessions.record_token_anchor", move |conn| {
+                // A session with no rows has nothing to anchor: the MAX is
+                // NULL there, and the EXISTS keeps the row's columns untouched
+                // rather than writing an anchor that names no ordinal.
+                conn.execute(
+                    "UPDATE sessions \
+                        SET token_anchor_model = ?2, \
+                            token_anchor_tokens = ?3, \
+                            token_anchor_message_count = ?4, \
+                            token_anchor_request_overhead = ?5, \
+                            token_anchor_through_ordinal = \
+                                (SELECT MAX(ordinal) FROM session_messages WHERE session_id = ?1) \
+                      WHERE id = ?1 \
+                        AND EXISTS (SELECT 1 FROM session_messages WHERE session_id = ?1)",
+                    rusqlite::params![
+                        sid,
+                        model_id,
+                        actual_tokens,
+                        message_count,
+                        request_overhead
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn load_token_anchor(&self, session_id: &SessionId) -> Result<Option<TokenAnchor>> {
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.load_token_anchor", move |conn| {
+                // The five columns are only ever written together, so the
+                // model being NULL means no anchor was recorded.
+                Ok(conn
+                    .query_row(
+                        "SELECT token_anchor_model, token_anchor_tokens, \
+                                token_anchor_message_count, token_anchor_request_overhead, \
+                                token_anchor_through_ordinal \
+                           FROM sessions WHERE id = ?1 AND token_anchor_model IS NOT NULL",
+                        rusqlite::params![sid],
+                        |row| {
+                            let count = |i| row.get::<_, i64>(i).map(|n| n.max(0) as usize);
+                            Ok(TokenAnchor {
+                                model_id: row.get(0)?,
+                                actual_tokens: count(1)?,
+                                message_count: count(2)?,
+                                request_overhead: count(3)?,
+                                through_ordinal: row.get(4)?,
+                            })
+                        },
+                    )
+                    .optional()?)
+            })
+            .await
+    }
+
     async fn active_index_of_ordinal(
         &self,
         session_id: &SessionId,
@@ -2018,6 +2086,161 @@ mod tests {
 
     fn text_value(s: &str) -> rusqlite::types::Value {
         rusqlite::types::Value::Text(s.to_string())
+    }
+
+    /// The anchor names the rows that existed when it was written: a later
+    /// row is outside it, a rewrite replaces it, a session with no rows has
+    /// nothing to anchor, and a full `save` of the session leaves it alone.
+    #[tokio::test]
+    async fn token_anchor_is_stamped_with_the_newest_ordinal_and_replaced() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let s = make_root_session("cli-anchor");
+        store.save(&s).await.unwrap();
+
+        store
+            .record_token_anchor(
+                &s.id,
+                NewTokenAnchor {
+                    model_id: "gpt-x",
+                    actual_tokens: 1_234,
+                    message_count: 1,
+                    request_overhead: 7,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.load_token_anchor(&s.id).await.unwrap(), None);
+
+        for text in ["one", "two"] {
+            store
+                .append_session_message(
+                    &s.id,
+                    &ChatMessage::user(vec![baybo_model::ContentBlock::Text(text.into())]),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .record_token_anchor(
+                &s.id,
+                NewTokenAnchor {
+                    model_id: "gpt-x",
+                    actual_tokens: 1_234,
+                    message_count: 2,
+                    request_overhead: 7,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &s.id,
+                &ChatMessage::user(vec![baybo_model::ContentBlock::Text("three".into())]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_token_anchor(&s.id).await.unwrap(),
+            Some(TokenAnchor {
+                model_id: "gpt-x".into(),
+                actual_tokens: 1_234,
+                message_count: 2,
+                request_overhead: 7,
+                through_ordinal: 1,
+            })
+        );
+
+        store
+            .record_token_anchor(
+                &s.id,
+                NewTokenAnchor {
+                    model_id: "gpt-y",
+                    actual_tokens: 9_000,
+                    message_count: 3,
+                    request_overhead: 7,
+                },
+            )
+            .await
+            .unwrap();
+        let replaced = store.load_token_anchor(&s.id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                replaced.model_id.as_str(),
+                replaced.actual_tokens,
+                replaced.through_ordinal
+            ),
+            ("gpt-y", 9_000, 2)
+        );
+
+        store.save(&s).await.unwrap();
+        assert_eq!(
+            store.load_token_anchor(&s.id).await.unwrap(),
+            Some(replaced)
+        );
+    }
+
+    /// A database from before the anchor columns gets them on the next open,
+    /// and a session that predates them reads as unanchored.
+    #[tokio::test]
+    async fn token_anchor_columns_are_migrated_onto_an_existing_database() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("test.db");
+        let pool = SqlitePool::open(&path).await.unwrap();
+        let store = SqliteSessionStore::new(pool.clone());
+        let s = make_root_session("cli-anchor-migrate");
+        store.save(&s).await.unwrap();
+        pool.interact_write("test.drop_anchor_columns", |conn| {
+            for column in [
+                "token_anchor_model",
+                "token_anchor_tokens",
+                "token_anchor_message_count",
+                "token_anchor_request_overhead",
+                "token_anchor_through_ordinal",
+            ] {
+                conn.execute(&format!("ALTER TABLE sessions DROP COLUMN {column}"), [])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(store);
+        drop(pool);
+
+        let store = SqliteSessionStore::new(SqlitePool::open(&path).await.unwrap());
+        assert_eq!(store.load_token_anchor(&s.id).await.unwrap(), None);
+        store
+            .append_session_message(
+                &s.id,
+                &ChatMessage::user(vec![baybo_model::ContentBlock::Text("one".into())]),
+            )
+            .await
+            .unwrap();
+        store
+            .record_token_anchor(
+                &s.id,
+                NewTokenAnchor {
+                    model_id: "gpt-x",
+                    actual_tokens: 50,
+                    message_count: 1,
+                    request_overhead: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_token_anchor(&s.id).await.unwrap(),
+            Some(TokenAnchor {
+                model_id: "gpt-x".into(),
+                actual_tokens: 50,
+                message_count: 1,
+                request_overhead: 0,
+                through_ordinal: 0,
+            })
+        );
     }
 
     #[tokio::test]

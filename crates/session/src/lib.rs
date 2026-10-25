@@ -14,8 +14,8 @@ mod manager;
 pub mod test_support;
 
 pub use baybo_store::{
-    ActiveMessageRow, SessionFolderRow, SessionFolderStore, SessionMessageAppendOutcome,
-    SessionStore, StoredMessage,
+    ActiveMessageRow, NewTokenAnchor, SessionFolderRow, SessionFolderStore,
+    SessionMessageAppendOutcome, SessionStore, StoredMessage, TokenAnchor,
 };
 pub use error::SessionError;
 pub use manager::SessionManager;

@@ -17,7 +17,8 @@ use parking_lot::Mutex;
 
 use baybo_store::StorageError;
 use baybo_store::session::{
-    DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+    DreamCandidate, NewTokenAnchor, Result, SessionMessageAppendOutcome, SessionStore,
+    StoredMessage, TokenAnchor,
 };
 use baybo_store::session_folder::{SessionFolderRow, SessionFolderStore};
 
@@ -49,6 +50,7 @@ pub struct MemorySessionStore {
     read_cursors: Mutex<HashMap<SessionId, i64>>,
     /// Mirrors the `sessions.dreamed_through_ordinal` flat column.
     dream_cursors: Mutex<HashMap<SessionId, i64>>,
+    token_anchors: Mutex<HashMap<SessionId, TokenAnchor>>,
     /// Fault injection: when set, every `append_session_message` fails. Lets a
     /// test drive the paths that must treat an unpersisted row as a failed
     /// write rather than a silent success — a transcript append is the one
@@ -429,6 +431,31 @@ impl SessionStore for MemorySessionStore {
             .lock()
             .get(session_id)
             .and_then(|log| log.iter().map(|m| m.ordinal as i64).max()))
+    }
+
+    async fn record_token_anchor(
+        &self,
+        session_id: &SessionId,
+        anchor: NewTokenAnchor<'_>,
+    ) -> Result<()> {
+        let Some(through_ordinal) = self.latest_session_ordinal(session_id).await? else {
+            return Ok(());
+        };
+        self.token_anchors.lock().insert(
+            session_id.clone(),
+            TokenAnchor {
+                model_id: anchor.model_id.to_string(),
+                actual_tokens: anchor.actual_tokens,
+                message_count: anchor.message_count,
+                request_overhead: anchor.request_overhead,
+                through_ordinal,
+            },
+        );
+        Ok(())
+    }
+
+    async fn load_token_anchor(&self, session_id: &SessionId) -> Result<Option<TokenAnchor>> {
+        Ok(self.token_anchors.lock().get(session_id).cloned())
     }
 
     async fn load_session_messages_with_supersede(

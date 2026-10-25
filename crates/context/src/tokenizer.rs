@@ -1,3 +1,4 @@
+use baybo_llm::AudioDelivery;
 use baybo_model::{ChatMessage, ContentBlock};
 
 /// Trait for counting tokens in text and multimodal content.
@@ -24,8 +25,12 @@ pub trait Tokenizer: Send + Sync {
     /// deliver media to the provider (`baybo_llm::delivers_media`), while
     /// the text around it is charged on every row.
     ///
+    /// `audio` is the bound model's: [`Self::count_message`] folds in the
+    /// [`AudioDelivery::Native`] price, so subtracting this at that value
+    /// leaves exactly the text.
+    ///
     /// Defaults to zero for tokenizers that have no media pricing.
-    fn count_message_media(&self, _msg: &ChatMessage) -> usize {
+    fn count_message_media(&self, _msg: &ChatMessage, _audio: AudioDelivery) -> usize {
         0
     }
 }
@@ -91,7 +96,7 @@ impl Tokenizer for HeuristicTokenizer {
     }
 
     fn count_message(&self, msg: &ChatMessage) -> usize {
-        let mut tokens = MESSAGE_OVERHEAD + self.count_message_media(msg);
+        let mut tokens = MESSAGE_OVERHEAD + self.count_message_media(msg, AudioDelivery::Native);
         for block in &msg.content {
             tokens += match block {
                 ContentBlock::Text(t) => self.count_text(t.as_str()),
@@ -123,13 +128,13 @@ impl Tokenizer for HeuristicTokenizer {
         tokens
     }
 
-    fn count_message_media(&self, msg: &ChatMessage) -> usize {
+    fn count_message_media(&self, msg: &ChatMessage, audio: AudioDelivery) -> usize {
         // One source of truth: `baybo-llm` owns both what a block is
         // delivered as and the caps that bound each arm, so the price and
         // the delivery decision cannot drift apart.
         msg.content
             .iter()
-            .map(baybo_llm::content_block_tokens)
+            .map(|block| baybo_llm::content_block_tokens(block, audio))
             .sum()
     }
 }
@@ -458,7 +463,7 @@ mod tests {
         ] {
             let msg = ChatMessage::agent_context(vec![block.clone()]);
             assert!(
-                tok.count_message_media(&msg) >= stub_tokens(&block),
+                tok.count_message_media(&msg, AudioDelivery::Native) >= stub_tokens(&block),
                 "{block:?} prices below its stub"
             );
         }
@@ -470,13 +475,13 @@ mod tests {
     fn media_ceilings_are_reported_apart_from_the_text_estimate() {
         let tok = HeuristicTokenizer;
         let text = ChatMessage::agent_context(vec![ContentBlock::Text("hello there".into())]);
-        assert_eq!(tok.count_message_media(&text), 0);
+        assert_eq!(tok.count_message_media(&text, AudioDelivery::Native), 0);
 
         let mixed = ChatMessage::agent_context(vec![
             ContentBlock::Text("hello there".into()),
             pdf_block("application/pdf", Some(2)),
         ]);
-        let media = tok.count_message_media(&mixed);
+        let media = tok.count_message_media(&mixed, AudioDelivery::Native);
         assert_eq!(media, baybo_llm::pdf_document_tokens(Some(2)));
         assert_eq!(tok.count_message(&mixed) - media, tok.count_message(&text));
     }

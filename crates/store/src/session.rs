@@ -77,6 +77,39 @@ pub struct StoredMessage {
     pub message: ChatMessage,
 }
 
+/// The provider's authoritative input-token count for a session's
+/// transcript, as of one main LLM call — the durable copy of the context
+/// manager's in-memory baseline, so a rehydrated actor resumes from the
+/// provider's number instead of re-estimating the whole transcript.
+///
+/// It describes exactly the first `message_count` rows of the active window
+/// as it stood when the transcript's newest ordinal was `through_ordinal`.
+/// Nothing invalidates it on write: a reader re-checks that description
+/// against what it loads and discards an anchor that no longer fits (a
+/// compaction supersedes every row it covers, so a stale one never does).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenAnchor {
+    /// The model whose provider produced `actual_tokens`.
+    pub model_id: String,
+    pub actual_tokens: usize,
+    pub message_count: usize,
+    /// The local estimate of the tool schemas that request carried, which
+    /// `actual_tokens` already includes — so a reader whose tool list has
+    /// grown since charges only the difference.
+    pub request_overhead: usize,
+    pub through_ordinal: i64,
+}
+
+/// What [`SessionStore::record_token_anchor`] is handed: a [`TokenAnchor`]
+/// without the `through_ordinal` the store stamps itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewTokenAnchor<'a> {
+    pub model_id: &'a str,
+    pub actual_tokens: usize,
+    pub message_count: usize,
+    pub request_overhead: usize,
+}
+
 /// Result of appending a transcript row under a durable source-event key.
 /// `Existing` means the same source event already owns a row in this session,
 /// so callers must not mirror another copy into their in-memory transcript.
@@ -412,6 +445,19 @@ pub trait SessionStore: Send + Sync {
     /// messages inline. Returns `None` for a session with no rows
     /// yet.
     async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>>;
+
+    /// Replace the session's [`TokenAnchor`] with one covering the first
+    /// `anchor.message_count` active rows. The store stamps `through_ordinal` with
+    /// the session's current highest ordinal in the same statement, so the
+    /// anchor names exactly the rows that existed when it was written.
+    async fn record_token_anchor(
+        &self,
+        session_id: &SessionId,
+        anchor: NewTokenAnchor<'_>,
+    ) -> Result<()>;
+
+    /// The session's last [`TokenAnchor`], if one was ever recorded.
+    async fn load_token_anchor(&self, session_id: &SessionId) -> Result<Option<TokenAnchor>>;
 
     /// Load every message ever appended to the session in ordinal
     /// order, paired with each row's `superseded_by` marker. Used by
