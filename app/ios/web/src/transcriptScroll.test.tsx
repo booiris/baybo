@@ -119,6 +119,23 @@ function installLayout(): void {
   realRect = Element.prototype.getBoundingClientRect;
   Element.prototype.getBoundingClientRect = function (this: Element): DOMRect {
     const i = rowIndex(this);
+    // The thread's box reports the width it was laid out at, as WebKit's does:
+    // `holdPlaceAcrossWidth` drops a scroll capture taken in the frame the
+    // width changed by comparing it, and at jsdom's constant 0 a frame that
+    // lands after `rewrap` (a loaded runner) captured the rewrapped layout.
+    if (i < 0 && this.classList.contains("chat-log")) {
+      return {
+        top: 0,
+        bottom: 0,
+        height: 0,
+        left: 0,
+        right: logWidth,
+        width: logWidth,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect;
+    }
     if (i < 0) return realRect.call(this);
     const top = i * rowH - scrollTop;
     return {
