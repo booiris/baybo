@@ -306,8 +306,14 @@ the tab bar, backgrounds. The rules that keep this from breaking on a fold:
   inside the safe area and the system adds each side's inset on top; a panel anchored to
   a control reads that control's MEASURED frame (the `+`, the model pill), never a sum of
   paddings.
-- **On a phone it never engages** — every phone is narrower than the band, so
-  `Theme.readingMargin(in:)` is 0 and nothing moves.
+- **On a phone it never engages.** In portrait every phone is narrower than the band.
+  In landscape a phone is WIDER (a Pro Max leaves ~832pt) but compact in height, and
+  the band is for a tall wide window: `Theme.readingCap(verticalSizeClass:)` lifts the
+  cap for a compact height class, and `styles.css` / `deck.css` mirror it with a
+  `max-height: 500px` query (iPhones are ≤440pt tall in landscape, the Duo's inner
+  display 669pt). The webviews never resize with the keyboard, so typing can't cross
+  it. Checked by pixel-diffing master against the branch on iPhone 17 Pro and Pro Max
+  in both orientations.
 
 `readingColumnMargins()` reaches every scroll view below it in the environment, so it
 only goes on a scroller whose rows host none of their own.

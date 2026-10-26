@@ -27,6 +27,11 @@ describe("deck shell stylesheet", () => {
     expect(grid).toMatch(/margin:\s*0 auto/);
   });
 
+  it("lifts the cap on a short window, as a phone in landscape", () => {
+    const short = css.slice(css.indexOf("@media (max-height: 500px)"));
+    expect(short).toMatch(/^@media \(max-height: 500px\) \{\s*:root \{\s*--deck-grid-max-width: none;/);
+  });
+
   it("insets a maximized card's content from both side insets", () => {
     const full = rule(".deck-card.maximized.deck-max-full");
     expect(full).toMatch(/padding-left:\s*env\(safe-area-inset-left\)/);

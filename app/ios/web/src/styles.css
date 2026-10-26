@@ -123,6 +123,17 @@
   text-size-adjust: 100%;
 }
 
+/* A phone in landscape is wider than the band but short, and keeps its full
+   width; the band is for a TALL wide window (iPhone Duo's inner display, 669pt,
+   or a Split View half on it). Mirrors `Theme.readingCap`, which asks UIKit's
+   vertical size class: compact on every iPhone in landscape (≤440pt). The
+   webview never resizes with the keyboard, so typing cannot cross this line. */
+@media (max-height: 500px) {
+  :root {
+    --reading-width: 100%;
+  }
+}
+
 * { box-sizing: border-box; }
 body { margin: 0; }
 

@@ -15,6 +15,13 @@
      Wide/Large for every installed card. */
   --deck-grid-max-width: 640px;
 }
+/* A phone in landscape keeps the full-width grid it always had: the cap is
+   for a TALL wide window, as with the transcript's band (styles.css). */
+@media (max-height: 500px) {
+  :root {
+    --deck-grid-max-width: none;
+  }
+}
 
 html,
 body {

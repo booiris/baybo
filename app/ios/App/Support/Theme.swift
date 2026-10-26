@@ -35,16 +35,24 @@ enum Theme {
     /// is a `min(100%, 720)` band centred with its gutters INSIDE it, and the
     /// native dock and list columns share that band so the two halves line up
     /// across the webview boundary. Chrome and backgrounds stay full-bleed; only
-    /// the column is capped. A phone is always narrower, so it never engages there.
+    /// the column is capped.
     static let readingWidth: CGFloat = 720
+
+    /// The band's cap in a window of this height class. A phone in landscape
+    /// is wider than the band (a Pro Max leaves ~832pt) but compact in height,
+    /// and keeps the full width it always had; the band is for a TALL wide
+    /// window. `web/src/styles.css` mirrors this as a `max-height` query.
+    static func readingCap(verticalSizeClass: UserInterfaceSizeClass?) -> CGFloat {
+        verticalSizeClass == .compact ? .infinity : readingWidth
+    }
     /// The narrow form column (the direct-login form, the pairing confirm) — the
     /// web `.direct-form`'s `max-width: 20rem`.
     static let formWidth: CGFloat = 320
 
     /// The horizontal margin, per side, that centres a `readingWidth` column in a
     /// container `width` wide. Zero whenever the container is the band or narrower.
-    static func readingMargin(in width: CGFloat) -> CGFloat {
-        max(0, (width - readingWidth) / 2)
+    static func readingMargin(in width: CGFloat, cap: CGFloat = readingWidth) -> CGFloat {
+        max(0, (width - cap) / 2)
     }
 
     /// A `List`'s per-side content margins for the band. `width` is the list's
@@ -55,9 +63,9 @@ enum Theme {
     /// the band margin. A plain band margin lost to the outer display's 84pt
     /// trailing column and pushed the band ~42pt right of centre.
     static func readingMargins(
-        width: CGFloat, leading: CGFloat, trailing: CGFloat
+        width: CGFloat, leading: CGFloat, trailing: CGFloat, cap: CGFloat = readingWidth
     ) -> (leading: CGFloat, trailing: CGFloat) {
-        let margin = readingMargin(in: width)
+        let margin = readingMargin(in: width, cap: cap)
         return (leading + margin, trailing + margin)
     }
 
@@ -243,7 +251,7 @@ extension View {
     /// A modifier rather than a size-class branch: a live fold resizes the window
     /// under it, and a swapped view tree would drop its `@State` / `@FocusState`.
     func readingColumn() -> some View {
-        frame(maxWidth: Theme.readingWidth).frame(maxWidth: .infinity)
+        modifier(ReadingColumn())
     }
 
     /// `readingColumn` for a `List`: the content is inset to the band while the
@@ -321,7 +329,18 @@ struct CompactPillButtonStyle: ButtonStyle {
     }
 }
 
+private struct ReadingColumn: ViewModifier {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: Theme.readingCap(verticalSizeClass: verticalSizeClass))
+            .frame(maxWidth: .infinity)
+    }
+}
+
 private struct ReadingColumnMargins: ViewModifier {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     /// The list's width and the horizontal safe-area insets beside it — a
     /// background that ignores them reports them; the list itself would not.
     @State private var span = HorizontalSpan()
@@ -334,7 +353,8 @@ private struct ReadingColumnMargins: ViewModifier {
 
     func body(content: Content) -> some View {
         let margins = Theme.readingMargins(
-            width: span.width, leading: span.leading, trailing: span.trailing)
+            width: span.width, leading: span.leading, trailing: span.trailing,
+            cap: Theme.readingCap(verticalSizeClass: verticalSizeClass))
         content
             .contentMargins(.leading, margins.leading, for: .scrollContent)
             .contentMargins(.trailing, margins.trailing, for: .scrollContent)

@@ -28,6 +28,7 @@ struct SearchScreen: View {
     /// footprint rather than appearing at full width.
     @State private var expanded = false
     @FocusState private var focused: Bool
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     /// The querying half — debounce, staleness, the composition gate. Lives
     /// apart from this view so those rules are testable without a UI host.
     @StateObject private var model = SearchModel()
@@ -128,7 +129,7 @@ struct SearchScreen: View {
         // Opened, the field takes the results' reading band. Collapsed it keeps
         // the full width, so the circle it grows out of still sits where the tab
         // bar's search circle was — at the window's trailing edge, not the band's.
-        .frame(maxWidth: expanded ? Theme.readingWidth : .infinity)
+        .frame(maxWidth: expanded ? Theme.readingCap(verticalSizeClass: verticalSizeClass) : .infinity)
         .frame(maxWidth: .infinity)
         .padding(.bottom, 8)
         .background(Theme.paper)

@@ -44,6 +44,23 @@ struct ReadingWidthTests {
         #expect(margins.trailing == Theme.readingMargin(in: width))
     }
 
+    /// A phone in landscape is wider than the band but compact in height: no
+    /// band, so a Pro Max's ~832pt list keeps the full width it always had.
+    @Test func aPhoneInLandscapeKeepsItsFullWidth() {
+        let cap = Theme.readingCap(verticalSizeClass: .compact)
+        #expect(Theme.readingMargin(in: 832, cap: cap) == 0)
+        let margins = Theme.readingMargins(width: 832, leading: 62, trailing: 62, cap: cap)
+        #expect(margins.leading == 62)
+        #expect(margins.trailing == 62)
+    }
+
+    /// A tall wide window — the Duo's inner display, a Split View half — and
+    /// an unreported class keep the band.
+    @Test(arguments: [UserInterfaceSizeClass.regular, nil])
+    func aTallWindowKeepsTheBand(verticalSizeClass: UserInterfaceSizeClass?) {
+        #expect(Theme.readingCap(verticalSizeClass: verticalSizeClass) == Theme.readingWidth)
+    }
+
     /// A window narrower than the band keeps just its insets.
     @Test func aNarrowWindowKeepsItsInsets() {
         let margins = Theme.readingMargins(width: 382, leading: 0, trailing: 84)
