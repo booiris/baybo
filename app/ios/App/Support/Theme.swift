@@ -29,6 +29,46 @@ enum Theme {
     /// outside-tap dismiss surface.
     static let panelScrim = Color.black.opacity(0.06)
 
+    /// The ONE reading width: the widest a content column grows on a wide window
+    /// (the iPhone Duo's inner display, a Split View half, an iPad). Mirrors the
+    /// transcript's `--reading-width: 720px` in `web/src/styles.css` — the thread
+    /// is a `min(100%, 720)` band centred with its gutters INSIDE it, and the
+    /// native dock and list columns share that band so the two halves line up
+    /// across the webview boundary. Chrome and backgrounds stay full-bleed; only
+    /// the column is capped.
+    static let readingWidth: CGFloat = 720
+
+    /// The band's cap in a window of this height class. A phone in landscape
+    /// is wider than the band (a Pro Max leaves ~832pt) but compact in height,
+    /// and keeps the full width it always had; the band is for a TALL wide
+    /// window. `web/src/styles.css` mirrors this as a `max-height` query.
+    static func readingCap(verticalSizeClass: UserInterfaceSizeClass?) -> CGFloat {
+        verticalSizeClass == .compact ? .infinity : readingWidth
+    }
+    /// The narrow form column (the direct-login form, the pairing confirm) — the
+    /// web `.direct-form`'s `max-width: 20rem`.
+    static let formWidth: CGFloat = 320
+
+    /// The horizontal margin, per side, that centres a `readingWidth` column in a
+    /// container `width` wide. Zero whenever the container is the band or narrower.
+    static func readingMargin(in width: CGFloat, cap: CGFloat = readingWidth) -> CGFloat {
+        max(0, (width - cap) / 2)
+    }
+
+    /// A `List`'s per-side content margins for the band. `width` is the list's
+    /// own frame, which stops at the safe area; `leading` / `trailing` are the
+    /// insets beside it. The list's scroller runs on under those insets and
+    /// measures its margins from ITS edges, taking the larger of a side's inset
+    /// and margin rather than their sum, so each side carries its inset plus
+    /// the band margin. A plain band margin lost to the outer display's 84pt
+    /// trailing column and pushed the band ~42pt right of centre.
+    static func readingMargins(
+        width: CGFloat, leading: CGFloat, trailing: CGFloat, cap: CGFloat = readingWidth
+    ) -> (leading: CGFloat, trailing: CGFloat) {
+        let margin = readingMargin(in: width, cap: cap)
+        return (leading + margin, trailing + margin)
+    }
+
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("Space Mono", size: size).weight(weight)
     }
@@ -205,6 +245,39 @@ extension View {
         }
     }
 
+    /// Caps a plain (non-scrolling) column at `Theme.readingWidth` and centres it
+    /// in whatever width it is offered. Apply it OUTSIDE the column's own gutter
+    /// padding, so the gutters sit inside the band the way the transcript's do.
+    /// A modifier rather than a size-class branch: a live fold resizes the window
+    /// under it, and a swapped view tree would drop its `@State` / `@FocusState`.
+    func readingColumn() -> some View {
+        modifier(ReadingColumn())
+    }
+
+    /// `readingColumn` for a `List`: the content is inset to the band while the
+    /// list itself — its bounce, its indicator, its swipe-to-reveal rows' hit
+    /// region off the column's flanks — stays full width. The margins fold in
+    /// the horizontal safe-area insets (`Theme.readingMargins`), so an
+    /// asymmetric pair (a side rail, Split View) still centres the band in the
+    /// space actually left.
+    ///
+    /// `contentMargins` reaches every scroll view BELOW this one in the
+    /// environment, so put it only on a scroller whose rows host no scroll view
+    /// of their own.
+    func readingColumnMargins() -> some View {
+        modifier(ReadingColumnMargins())
+    }
+
+    /// Ends a list row's separator where the row's content ends, as its leading
+    /// end already starts where the content starts. Left to the list, the
+    /// trailing end sits on the layout margin, which counts a side column's
+    /// inset on top of `readingColumnMargins` (a sum, where the rows take the
+    /// larger of the two), so beside the Duo's 84pt column it stopped 84pt
+    /// short of the content.
+    func separatorSpansContent() -> some View {
+        alignmentGuide(.listRowSeparatorTrailing) { $0[.trailing] }
+    }
+
     /// Web-page parity: tapping empty space blurs the focused field and drops
     /// the keyboard (a WKWebView resigns its input on outside taps; native
     /// SwiftUI does not). A plain tap gesture, so child buttons/fields keep
@@ -253,5 +326,46 @@ struct CompactPillButtonStyle: ButtonStyle {
             .contentShape(Rectangle())
             .opacity(configuration.isPressed ? 0.7 : 1)
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
+    }
+}
+
+private struct ReadingColumn: ViewModifier {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: Theme.readingCap(verticalSizeClass: verticalSizeClass))
+            .frame(maxWidth: .infinity)
+    }
+}
+
+private struct ReadingColumnMargins: ViewModifier {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    /// The list's width and the horizontal safe-area insets beside it — a
+    /// background that ignores them reports them; the list itself would not.
+    @State private var span = HorizontalSpan()
+
+    private struct HorizontalSpan: Equatable {
+        var width: CGFloat = 0
+        var leading: CGFloat = 0
+        var trailing: CGFloat = 0
+    }
+
+    func body(content: Content) -> some View {
+        let margins = Theme.readingMargins(
+            width: span.width, leading: span.leading, trailing: span.trailing,
+            cap: Theme.readingCap(verticalSizeClass: verticalSizeClass))
+        content
+            .contentMargins(.leading, margins.leading, for: .scrollContent)
+            .contentMargins(.trailing, margins.trailing, for: .scrollContent)
+            .background {
+                Color.clear
+                    .ignoresSafeArea(edges: .horizontal)
+                    .onGeometryChange(for: HorizontalSpan.self) { proxy in
+                        HorizontalSpan(
+                            width: proxy.size.width, leading: proxy.safeAreaInsets.leading,
+                            trailing: proxy.safeAreaInsets.trailing)
+                    } action: { span = $0 }
+            }
     }
 }

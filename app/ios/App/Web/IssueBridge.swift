@@ -96,11 +96,8 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink, BottomI
             guard isCurrent(body) else { return }
             store?.setAtTop(body["atTop"] as? Bool ?? true)
         case "issueState":
-            guard isCurrent(body),
-                let scrollTop = (body["scrollTop"] as? NSNumber)?.doubleValue,
-                let folds = body["folds"] as? [String: Bool]
-            else { return }
-            store?.rememberPageState(scrollTop: scrollTop, folds: folds)
+            guard isCurrent(body), let state = IssueStore.PageState(wire: body) else { return }
+            store?.rememberPageState(state)
         case "retryComment":
             guard isCurrent(body) else { return }
             if let clientMsgId = body["clientMsgId"] as? String {
@@ -233,10 +230,7 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink, BottomI
             "bottomInset": store.bottomInset,
         ]
         if let state = store.pageState {
-            payload["restoredState"] = [
-                "scrollTop": state.scrollTop,
-                "folds": state.folds,
-            ]
+            payload["restoredState"] = state.wire
         }
         let json = Self.jsonObject(payload)
         guard let previous, ready, let webView else {
@@ -258,11 +252,10 @@ final class IssueBridge: NSObject, WKScriptMessageHandler, WebMediaSink, BottomI
                 }
                 guard let previous, let json = value as? String, json != "null",
                     let data = json.data(using: .utf8),
-                    let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let scrollTop = (state["scrollTop"] as? NSNumber)?.doubleValue,
-                    let folds = state["folds"] as? [String: Bool]
+                    let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let state = IssueStore.PageState(wire: body)
                 else { return }
-                previous.rememberPageState(scrollTop: scrollTop, folds: folds)
+                previous.rememberPageState(state)
             }
         }
     }

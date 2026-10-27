@@ -13,6 +13,12 @@ import { AttachmentBubble } from "../attachments";
 import { bindNativeTarget, currentConnEpoch } from "../bridge";
 import { MarkdownBody } from "../Markdown";
 import {
+  anchorShift,
+  captureAnchor,
+  holdPlaceAcrossWidth,
+  type ScrollAnchor,
+} from "../resizeAnchor";
+import {
   openIssue,
   openRun,
   pickField,
@@ -41,6 +47,33 @@ import {
   type IssueEvent,
   type IssueRun,
 } from "./types";
+
+/// The attribute a reader's place is held by (`resizeAnchor.ts`): on every
+/// top-level block of the card and on every Activity row — never on an element
+/// that holds another, since the first one on screen wins.
+const ANCHOR_ATTR = "data-anchor";
+
+/// How close to the end still counts as "at the newest activity".
+const AT_BOTTOM_SLACK_PX = 48;
+
+function anchorAt(id: string): Record<string, string> {
+  return { [ANCHOR_ATTR]: id };
+}
+
+function isAtBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_SLACK_PX;
+}
+
+/// The page is its own scroller (not the document), so places are measured
+/// from its top edge.
+function capturePageAnchor(el: HTMLElement): ScrollAnchor | null {
+  return captureAnchor(el, ANCHOR_ATTR, el.getBoundingClientRect().top);
+}
+
+function restorePageAnchor(el: HTMLElement, anchor: ScrollAnchor): void {
+  const shift = anchorShift(el, ANCHOR_ATTR, anchor, el.getBoundingClientRect().top);
+  if (shift !== null) el.scrollTop += shift;
+}
 
 type IssuePageProps = {
   targetId?: string;
@@ -132,7 +165,7 @@ export function IssuePage({
   const reportAtBottom = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    postActivityAtBottom(targetId, el.scrollHeight - el.scrollTop - el.clientHeight < 48);
+    postActivityAtBottom(targetId, isAtBottom(el));
   }, [targetId]);
 
   const reportAtTop = useCallback(() => {
@@ -144,7 +177,12 @@ export function IssuePage({
   const readPageState = useCallback((): IssueViewState | null => {
     const el = scrollRef.current;
     if (!el) return null;
-    return { scrollTop: Math.max(0, el.scrollTop), folds: { ...foldsRef.current } };
+    const anchor = capturePageAnchor(el);
+    return {
+      scrollTop: Math.max(0, el.scrollTop),
+      folds: { ...foldsRef.current },
+      ...(anchor === null ? {} : { anchor: { ...anchor, width: el.clientWidth } }),
+    };
   }, []);
 
   useLayoutEffect(() => provideIssueState(readPageState), [readPageState]);
@@ -190,6 +228,11 @@ export function IssuePage({
     restoredScroll.current = true;
     grabbed.current = true;
     el.scrollTop = Math.max(0, initialState.scrollTop);
+    // Covered at another width: every row above the reader has rewrapped since,
+    // so the saved offset now points at something else. The block they were on
+    // is still the same block.
+    const anchor = initialState.anchor;
+    if (anchor !== undefined && anchor.width !== el.clientWidth) restorePageAnchor(el, anchor);
     reportAtBottom();
     reportAtTop();
     schedulePageState();
@@ -207,6 +250,30 @@ export function IssuePage({
       followingInitialLatest.current = false;
     }
   }, [bottomInset, payload, reportAtBottom, reportAtTop, schedulePageState]);
+
+  // The webview changes WIDTH live on a foldable (closing or opening it, Split
+  // View) and every block rewraps, while `scrollTop` keeps its pixel value — so
+  // a reader in the middle of the card would land somewhere else. At the newest
+  // activity they stay there; otherwise the block they were on is put back
+  // where it sat. Native then hears the new edges, since both may have moved.
+  const hasPage = payload !== null;
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!hasPage || !el) return;
+    return holdPlaceAcrossWidth(
+      el,
+      el,
+      () => ({ atBottom: isAtBottom(el), anchor: capturePageAnchor(el) }),
+      ({ widthChanged, before }) => {
+        if (!widthChanged) return;
+        if (before.atBottom) el.scrollTop = el.scrollHeight;
+        else if (before.anchor !== null) restorePageAnchor(el, before.anchor);
+        reportAtBottom();
+        reportAtTop();
+        schedulePageState();
+      },
+    );
+  }, [hasPage, reportAtBottom, reportAtTop, schedulePageState]);
 
   useEffect(reportAtBottom, [reportAtBottom, payload, landing]);
   useEffect(reportAtTop, [reportAtTop, payload, landing]);
@@ -278,7 +345,7 @@ export function IssuePage({
       <Description issue={issue} />
       <StateBand issue={issue} handle={handle} liveRun={liveRun} />
       {issue.attachments !== undefined && issue.attachments.length > 0 && (
-        <section className="issue-section">
+        <section className="issue-section" {...anchorAt("attachments")}>
           <h2>{t("issue.attachments")}</h2>
           <div className="issue-attachments">
             {issue.attachments.map((a) => (
@@ -347,7 +414,7 @@ function IssueHead({
   }
 
   return (
-    <header className="issue-head">
+    <header className="issue-head" {...anchorAt("head")}>
       <h1 className={cancelled ? "cancelled" : undefined}>{issue.title}</h1>
       <div className="issue-meta">
         {meta.map((item, i) => (
@@ -373,7 +440,7 @@ function StateBand({
   const { t } = useTranslation();
   const assignee = issue.assignee;
   return (
-    <div className="issue-state">
+    <div className="issue-state" {...anchorAt("state")}>
       <div className="issue-chips">
         <button
           type="button"
@@ -422,7 +489,7 @@ function RunRow({ run, who }: { run: IssueRun; who: string }) {
 function Description({ issue }: { issue: IssueDetail }) {
   const { t } = useTranslation();
   return (
-    <section className="issue-section issue-body">
+    <section className="issue-section issue-body" {...anchorAt("description")}>
       {issue.description === "" ? (
         <p className="issue-empty">{t("issue.noDescription")}</p>
       ) : (
@@ -437,7 +504,7 @@ function SubIssues({ issue, children }: { issue: IssueDetail; children: ChildIss
   const progress = issue.sub_issues;
   if (progress === undefined || progress.total === 0) return null;
   return (
-    <section className="issue-section">
+    <section className="issue-section" {...anchorAt("children")}>
       <h2>
         {t("issue.subIssues")}{" "}
         <span className="issue-count">
@@ -478,7 +545,9 @@ function Activity({
   if (folded.length === 0) return null;
   return (
     <section className="issue-section">
-      <h2 className="issue-ruled">{t("issue.activity")}</h2>
+      <h2 className="issue-ruled" {...anchorAt("activity")}>
+        {t("issue.activity")}
+      </h2>
       <ol className="issue-activity">
         {folded.map((item, i) => {
           const key = rowKey(item, i);
@@ -491,6 +560,7 @@ function Activity({
               )}
               <FoldRow
                 item={item}
+                anchor={key}
                 landed={foldHead(item)?.id === landing}
                 who={who}
                 toggled={folds[key]}
@@ -510,12 +580,14 @@ function rowKey(item: Fold, index: number): string {
 
 function FoldRow({
   item,
+  anchor,
   landed,
   who,
   toggled,
   onToggle,
 }: {
   item: Fold;
+  anchor: string;
   landed: boolean;
   who: (id: string) => Person;
   toggled: boolean | undefined;
@@ -529,7 +601,7 @@ function FoldRow({
   const open = toggled ?? landed;
   return (
     <>
-      <li className="issue-fold">
+      <li className="issue-fold" {...anchorAt(anchor)}>
         <button type="button" onClick={() => onToggle(!open)} aria-expanded={open}>
           {t("issue.nEvents", { count: item.events.length })}
           {/* ONE glyph, rotated — the transcript's `.work-chevron`. Two
@@ -552,7 +624,7 @@ function EntryRow({ event, who }: { event: IssueEvent; who: (id: string) => Pers
 
   if (event.body.kind !== "comment") {
     return (
-      <li className="issue-line">
+      <li className="issue-line" {...anchorAt(event.id)}>
         <span className="issue-line-dot" aria-hidden="true" />
         <span className="issue-line-text">
           <span className="issue-line-who">{speaker(event.actor, who, t)}</span>{" "}
@@ -567,7 +639,7 @@ function EntryRow({ event, who }: { event: IssueEvent; who: (id: string) => Pers
   }
 
   return (
-    <li className="issue-entry comment" data-actor={event.actor.kind}>
+    <li className="issue-entry comment" data-actor={event.actor.kind} {...anchorAt(event.id)}>
       <div className="issue-post">
         <div className="issue-said-head">
           <Avatar actor={event.actor} who={who} />

@@ -40,6 +40,24 @@ const REORDER_HOLD_MS = 320;
 /// not a pickup.
 const REORDER_HOLD_TOLERANCE = 10;
 
+/// Pin a lifted tile to an on-screen rect (viewport px), or hand its rect
+/// back to CSS with `null`.
+function pinRect(
+  el: HTMLElement,
+  r: Pick<DOMRect, "left" | "top" | "width" | "height"> | null,
+): void {
+  el.style.left = r ? `${r.left}px` : "";
+  el.style.top = r ? `${r.top}px` : "";
+  el.style.width = r ? `${r.width}px` : "";
+  el.style.height = r ? `${r.height}px` : "";
+}
+
+/// How a live drag ends: a finger `drop` re-resolves the slot from the release
+/// point and glides onto it; an `abort` keeps the slot the placeholder already
+/// holds and settles at once, because the geometry it would glide through is
+/// stale (see `onViewportResize`).
+type DragEnd = "drop" | "abort";
+
 type Tile = {
   card: DeckCard;
   el: HTMLElement;
@@ -85,11 +103,13 @@ export class DeckShell {
   private dragOrigin = { x: 0, y: 0, left: 0, top: 0 };
   private lastPoint = { x: 0, y: 0 };
   private dragRaf = 0;
+  private viewportWidth = window.innerWidth;
 
   constructor(root: HTMLElement) {
     this.grid = document.createElement("div");
     this.grid.className = "deck-grid";
     root.append(this.grid);
+    window.addEventListener("resize", () => this.onViewportResize());
   }
 
   private t(key: string): string {
@@ -508,7 +528,9 @@ export class DeckShell {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
         window.removeEventListener("pointercancel", up);
-        if (started) this.endDrag();
+        // Only end the drag THIS press started — a resize may already have
+        // aborted it while the finger stayed down.
+        if (started && this.dragEl === el && this.dragCardId === cardId) this.endDrag();
       };
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", up);
@@ -534,10 +556,7 @@ export class DeckShell {
       // Lift the tile out of flow at its exact on-screen rect; from here
       // it is positioned by transform alone.
       el.classList.add("deck-dragging-live");
-      el.style.left = `${rect.left}px`;
-      el.style.top = `${rect.top}px`;
-      el.style.width = `${rect.width}px`;
-      el.style.height = `${rect.height}px`;
+      pinRect(el, rect);
       this.applyPlaceholderOrder();
     });
     this.grid.classList.add("has-drag");
@@ -556,31 +575,25 @@ export class DeckShell {
     }
   }
 
-  private endDrag(): void {
+  private endDrag(how: DragEnd = "drop"): void {
     const el = this.dragEl;
     const ph = this.placeholder;
     const cardId = this.dragCardId;
     if (!el || !ph || cardId === null) return;
-    // The last pointer movement may still be waiting on rAF — resolve
-    // the final slot from the actual drop point, not the last frame.
     if (this.dragRaf !== 0) {
       cancelAnimationFrame(this.dragRaf);
       this.dragRaf = 0;
     }
-    const finalTarget = this.dropIndexAt(this.lastPoint.x, this.lastPoint.y);
-    if (finalTarget !== this.placeholderIndex) {
-      this.placeholderIndex = finalTarget;
-      this.flipTiles(() => this.applyPlaceholderOrder());
+    if (how === "drop") {
+      // The last pointer movement may still be waiting on rAF — resolve
+      // the final slot from the actual drop point, not the last frame.
+      const finalTarget = this.dropIndexAt(this.lastPoint.x, this.lastPoint.y);
+      if (finalTarget !== this.placeholderIndex) {
+        this.placeholderIndex = finalTarget;
+        this.flipTiles(() => this.applyPlaceholderOrder());
+      }
     }
     this.dragCardId = null;
-
-    // Ease the lifted tile onto the slot, then settle to pure style: the
-    // tile rejoins the flow via `order` — no DOM move, no reload.
-    const phRect = ph.getBoundingClientRect();
-    const dx = phRect.left - this.dragOrigin.left;
-    const dy = phRect.top - this.dragOrigin.top;
-    el.style.transition = "transform 180ms cubic-bezier(0.2, 0, 0, 1)";
-    el.style.transform = `translate(${dx}px, ${dy}px)`;
 
     const others = this.state.cards
       .filter((c) => c.cardId !== cardId)
@@ -606,10 +619,35 @@ export class DeckShell {
       this.reconcileTiles();
       if (changed) bridge.postLayout(layoutEntries(this.state.cards));
     };
+    if (how === "abort") {
+      settle();
+      return;
+    }
+    // Ease the lifted tile onto the slot, then settle to pure style: the
+    // tile rejoins the flow via `order` — no DOM move, no reload.
+    const phRect = ph.getBoundingClientRect();
+    const dx = phRect.left - this.dragOrigin.left;
+    const dy = phRect.top - this.dragOrigin.top;
+    el.style.transition = "transform 180ms cubic-bezier(0.2, 0, 0, 1)";
+    el.style.transform = `translate(${dx}px, ${dy}px)`;
     el.addEventListener("transitionend", settle);
     // Transitionend can be swallowed (display churn, zero-distance move);
     // the timer is the backstop so a drop can never wedge mid-settle.
     setTimeout(settle, 240);
+  }
+
+  /// The drag engine works in viewport px captured at pickup (`dragOrigin`, the
+  /// lifted tile's pinned rect). A WIDTH change — iPhone Duo folding/unfolding
+  /// mid-press, a Split View resize — reflows the grid under it, so the lifted
+  /// tile would hang offset and the release point would resolve against
+  /// columns that no longer exist. Abort instead: the tile settles into the
+  /// slot its placeholder already showed, and nothing is re-derived from the
+  /// stale pointer. Height-only changes (keyboard, bars) leave columns alone.
+  private onViewportResize(): void {
+    const width = window.innerWidth;
+    if (width === this.viewportWidth) return;
+    this.viewportWidth = width;
+    if (this.dragCardId !== null) this.endDrag("abort");
   }
 
   /// Others keep their relative order (0,1,2,… skipping the dragged
@@ -710,17 +748,13 @@ export class DeckShell {
     el.classList.add("maximized");
 
     // Lift out of flow at the exact on-screen rect, commit that starting
-    // frame, then transition to fill the viewport.
-    el.style.left = `${rect.left}px`;
-    el.style.top = `${rect.top}px`;
-    el.style.width = `${rect.width}px`;
-    el.style.height = `${rect.height}px`;
+    // frame, then transition to the CSS-owned full rect (`.deck-max-full`),
+    // which keeps tracking the viewport and its per-side safe-area insets
+    // through a live resize — inline px could not.
+    pinRect(el, rect);
     void el.offsetWidth;
-    el.classList.add("deck-max-animate");
-    el.style.left = "0px";
-    el.style.top = "0px";
-    el.style.width = "100vw";
-    el.style.height = "100dvh";
+    el.classList.add("deck-max-animate", "deck-max-full");
+    pinRect(el, null);
 
     tile.port?.postMessage({ type: "size", size: "max" });
     bridge.postMaximize(true);
@@ -745,10 +779,8 @@ export class DeckShell {
     const el = tile.el;
     const target = ph.getBoundingClientRect();
     el.classList.add("deck-max-animate");
-    el.style.left = `${target.left}px`;
-    el.style.top = `${target.top}px`;
-    el.style.width = `${target.width}px`;
-    el.style.height = `${target.height}px`;
+    el.classList.remove("deck-max-full");
+    pinRect(el, target);
 
     // State (card size, native header) flips now; only the geometry animates.
     tile.port?.postMessage({ type: "size", size: tile.card.size });
@@ -783,7 +815,7 @@ export class DeckShell {
     this.maximizedCardId = null;
     const tile = this.tiles.get(cardId);
     if (tile) {
-      tile.el.classList.remove("maximized", "deck-max-animate");
+      tile.el.classList.remove("maximized", "deck-max-animate", "deck-max-full");
       tile.el.style.cssText = "";
       tile.port?.postMessage({ type: "size", size: tile.card.size });
     }

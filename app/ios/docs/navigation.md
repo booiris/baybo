@@ -183,6 +183,70 @@ Its one caller today is `ChatScreen`, for the full-screen HTML preview — which
 lives inside the transcript webview, so native owns the gesture and the page
 owns the travel (see [`transcript.md`](transcript.md)).
 
+### The side rail — `App/Support/SideRail.swift`
+
+iPhone Duo's outer display (iOS 27.1) has no top status bar. The window reports
+insets of top 0 and trailing 84: the clock and camera are reserved at the top of
+an 84pt trailing column, and the system tab bar turns into a vertical rail at
+the column's foot. iOS 27.1 moves native toolbar items into that column on its
+own (`toolbarVerticalBehavior`). Every header here is hand-drawn, because the
+shell hides the navigation bar, so the headers do the same move themselves:
+
+- **Detection is geometric, not per-device.** A column is an inset of at least
+  60pt on ONE side, with none on the other. A notched phone in landscape has
+  insets on both sides, so it never qualifies. `SideRail.resolve` is the rule,
+  and `SideRailTests` pins it with the measured outer-display and Split View
+  numbers.
+- **Each SCREEN finds its own column; the window cannot.** The inner display has
+  the same trailing column as the outer one. In Split View each pane's column sits
+  on its OUTER edge: the left pane's tab rail runs down its left side. The left
+  pane's window reports NO side inset at all. Only the pushed screen's
+  `NavigationStackHostingController` carries the 84pt leading column, which the
+  navigation container reserves for its vertical bar. `UIKitNavigationController`
+  itself reads 0.
+  - The root probe therefore publishes only window-level facts: the bar line on
+    each edge (`SideRailLines`).
+  - `.resolvesSideRail()` sits on the NavigationStack's root and on its
+    destination, and resolves each screen's column from that screen's own safe
+    area.
+  - The first cut read `window.safeAreaInsets` and missed the pane's column,
+    leaving 84pt of blank page down its left side.
+- **Items sit on the system's bar line, not the column's middle.**
+  `UIView.LayoutRegion.bar(onEdge:extent:)` answers x≈418 (clock, wifi glyph and
+  tab rail all centre there) and a top of 174 (under the reserved block). The
+  column's middle is x=424, and eyeballing the gap is how a 6pt misalignment
+  shipped to the first screenshot. The query is 27.1-SDK-only, so it sits
+  behind `#if compiler(>=6.4)`: CI builds with Xcode 26.5, and no earlier
+  runtime has a column.
+- **Each header keeps its own controls.** In column mode it drops its circles
+  from the top row and lists them in `.sideRailItems(rail) { … }` instead.
+  Order runs top-down by the bar rule: back first, then persistent controls,
+  then transient ones (the chat's offline alarm is appended LAST, so nothing
+  above it moves). Text pills and titles stay at the top.
+- **The 12pt top lift goes through the ROOT controller's
+  `additionalSafeAreaInsets`, which is how a status bar inset would arrive.**
+  It applies whenever the window has no top inset on a runtime that lays bars
+  down the side, column or not: a Split View pane has no top status bar either,
+  and its headers sat flush against the glass edge. It does not depend on the
+  column, because the column is resolved per screen and the lift has to land
+  before any screen lays out.
+  Every pushed screen, tab and webview (`safe-area-inset-top`) inherits it, so
+  each header and every clearance derived from `barHeight` move together.
+  SwiftUI's `safeAreaPadding` at the root was tried first. It stops at the
+  NavigationStack/TabView containers, which left the headers flush with the
+  glass edge.
+- **The chat header drops its paper veil in column mode**, because only glass
+  (the model pill) is left at the top and no status bar needs washing out.
+  Headers that keep a TEXT title (home wordmark, list titles, the card's `#n`)
+  keep their veil, through `HeaderVeil`: with a bare top
+  (`SideRailLines.bareTop`) it is solid paper over the header and fades out
+  over the 20pt below it. The translucent top of the usual veil exists to
+  wash a status bar out; with none there it only let rows show through the
+  title. With a status bar (a phone, any sheet) the veil is unchanged.
+- Sheets don't use the rail. Their top edge isn't the window's, and their back
+  buttons (`SubagentScreen`, `ProjectRunSheet`, `AgentProfileSheet`) stay in
+  their own bars.
+
 ## Liquid Glass (iOS 26+; deployment target is 18.0)
 
 ### Never call `.glassEffect` raw
@@ -270,10 +334,13 @@ ABOVE it in the same layer; the taps in the overlap go to the panel, which is
 the half `ComposerAttachUITests` and `IssueDockUITests` each pin with an
 `intersects` + `isHittable` pair.
 
-Its column is MEASURED, never hardcoded the way the header's `anchorLeading` can
-be: the `+` reports its own frame (`AttachMenu.report`) and `AttachMenuPanel.box`
-puts the panel's leading edge on it, because the pill's horizontal padding
-animates between 40 at rest and 14 focused. That frame republishes only while
+Its column is MEASURED, never hardcoded: the `+` reports its own frame
+(`AttachMenu.report`) and `AttachMenuPanel.box` puts the panel's leading edge on
+it, because the pill's horizontal padding animates between 40 at rest and 14
+focused, and on a wide window the dock's rows sit in the reading band
+(`Theme.readingWidth`, see [design-system.md](design-system.md)) — so the `+`
+moves in by the band's margin. The header's model panel is measured the same way
+now ([model-picker.md](model-picker.md)). That frame republishes only while
 the panel is UP — it changes on every tick of the focus and keyboard animations,
 the same reason `setComposerTop` publishes nothing at all.
 

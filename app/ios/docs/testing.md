@@ -327,6 +327,21 @@ without touching `app/ios` at all.
 
 ## Headless UI verification
 
+- **Binding a simulator to a real local gateway** (DEBUG): put the URL and token
+  in the launch ENVIRONMENT, and the app logs in exactly as the direct form
+  would. The binding persists, so later launches without them stay bound:
+
+  ```bash
+  SIMCTL_CHILD_BAYBO_DEBUG_DIRECT_URL=http://127.0.0.1:8888 \
+  SIMCTL_CHILD_BAYBO_DEBUG_DIRECT_TOKEN="$(baybo gateway token show --plain)" \
+    xcrun simctl launch --terminate-running-process <UDID> com.baybo.app.dev
+  ```
+
+  `simctl pbcopy` + paste into the form does NOT work while DeviceHub or
+  Simulator is open, because host pasteboard sync overwrites the copy. A bound sim
+  shows real data, so keep it separate from the `baybo-unit` test sim (see
+  above). Its demo-seeded rows get merged away.
+
 - **`-baybo-open-home`** (DEBUG) lands on the tabbed home shell WITHOUT pushing a
   conversation (seeds a few demo list rows), so the menu bar / header / sections
   screenshot headlessly; add **`-baybo-home-tab <agents|projects|chats|settings>`**

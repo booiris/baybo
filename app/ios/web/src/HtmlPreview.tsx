@@ -9,7 +9,9 @@ import {
   HTML_PREVIEW_DRAG_MOVE_EVENT,
   HTML_PREVIEW_MAXIMIZED_CLASS,
   htmlPreviewUrl,
-  previewParking,
+  parkedThreadShift,
+  parkThread,
+  unparkThread,
 } from "./htmlPreviewProtocol";
 
 type Rect = { left: number; top: number; width: number; height: number };
@@ -74,6 +76,18 @@ function rectDistance(a: Rect, b: Rect): number {
     Math.abs(a.width - b.width),
     Math.abs(a.height - b.height),
   );
+}
+
+/// Scroll the thread so the card's slot sits where it did when the preview took
+/// the screen (`previewParking`). Run as a dismissal STARTS, before the slot is
+/// measured as the morph's destination: the box is still covering the screen,
+/// so the move is invisible, and the morph then lands on the card the reader
+/// left rather than on wherever a rewrapped thread carried it.
+function returnToParking(): void {
+  const shift = parkedThreadShift();
+  const el = document.scrollingElement;
+  if (shift === null || !el || Math.abs(shift) < STILL_PX) return;
+  el.scrollTop += shift;
 }
 
 function lerpRect(from: Rect, to: Rect, t: number): Rect {
@@ -250,20 +264,13 @@ export function HtmlPreview({ blobId }: { blobId: string }) {
     root.style.cssText = "";
   }, []);
 
-  // The reader has to come back to exactly the row they left — not to wherever
-  // the scroll lock's clamp put them (`previewParking`).
+  // Parking is taken in `open` and spent in `returnToParking` as the dismissal
+  // starts; by the time the class comes off the thread is already back.
   const applyMaximized = useCallback((next: boolean) => {
     maximizedRef.current = next;
     setMaximizedState(next);
-    if (next) previewParking.scrollY = window.scrollY;
     document.documentElement.classList.toggle(HTML_PREVIEW_MAXIMIZED_CLASS, next);
-    if (!next) {
-      const parked = previewParking.scrollY;
-      previewParking.scrollY = null;
-      if (parked !== null && window.scrollY !== parked) {
-        window.scrollTo({ top: parked, behavior: "instant" });
-      }
-    }
+    if (!next) unparkThread();
   }, []);
 
   const finishClose = useCallback(() => {
@@ -290,6 +297,9 @@ export function HtmlPreview({ blobId }: { blobId: string }) {
       // opaque and still covering the screen, so the header and composer are
       // already in place as it uncovers them.
       postHtmlPreviewMaximized(false);
+      // The thread first, the measurement second: the slot is only where the
+      // morph should land once the card is back where the reader left it.
+      returnToParking();
       const root = rootRef.current;
       // The `<pre>` slot, measured at THIS instant rather than remembered from
       // the expand: rows keep arriving while a preview is up, so the card's home
@@ -342,6 +352,8 @@ export function HtmlPreview({ blobId }: { blobId: string }) {
     window.dispatchEvent(new Event(HTML_PREVIEW_COLLAPSE_EVENT));
     cancelSettle();
     dragRef.current = null;
+    const slot = root.parentElement;
+    if (slot !== null) parkThread(slot);
     const from = measure(root);
     resetStyles();
     // Pin the starting rect while the box is still IN FLOW — no transition is
@@ -372,6 +384,9 @@ export function HtmlPreview({ blobId }: { blobId: string }) {
     if (!maximizedRef.current || closingRef.current || root === null) return;
     cancelSettle();
     root.style.transition = "none";
+    // The swipe uncovers the thread as it travels, so the thread has to be
+    // back in place before the first frame of it — see `returnToParking`.
+    returnToParking();
     const slot = root.parentElement;
     dragRef.current =
       slot === null
@@ -449,6 +464,7 @@ export function HtmlPreview({ blobId }: { blobId: string }) {
       if (!maximizedRef.current) return;
       maximizedRef.current = false;
       closingRef.current = false;
+      unparkThread();
       document.documentElement.classList.remove(HTML_PREVIEW_MAXIMIZED_CLASS);
       postHtmlPreviewMaximized(false);
     },

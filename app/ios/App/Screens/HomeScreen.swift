@@ -254,6 +254,7 @@ struct HomeHeaderView: View {
     var isRefreshing: Bool = false
 
     private static let barHeight: CGFloat = 46
+    @Environment(\.sideRail) private var rail
 
     var body: some View {
         VStack(spacing: 6) {
@@ -269,45 +270,11 @@ struct HomeHeaderView: View {
                             .offset(x: 18)
                     }
 
-                if let onArchived {
+                if rail == nil {
                     HStack {
-                        Menu {
-                            Button(action: onArchived) {
-                                Label(
-                                    Lang.shared.t("list.menuArchived"),
-                                    systemImage: "archivebox")
-                            }
-                            if let onCronJobs {
-                                Button(action: onCronJobs) {
-                                    Label(
-                                        Lang.shared.t("list.menuCronJobs"),
-                                        systemImage: "alarm")
-                                }
-                            }
-                        } label: {
-                            Image(systemName: "line.3.horizontal")
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundStyle(Theme.ink)
-                                .frame(width: 45, height: 45)
-                        }
-                        .glassSurface(interactive: true, in: .circle)
-                        .accessibilityLabel(Text(verbatim: Lang.shared.t("list.menu")))
+                        menuButton
                         Spacer()
-                    }
-                }
-
-                if let onAction {
-                    HStack {
-                        Spacer()
-                        Button(action: onAction) {
-                            Image(systemName: actionIcon)
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundStyle(Theme.ink)
-                                .frame(width: 45, height: 45)
-                        }
-                        .glassSurface(interactive: true, in: .circle)
-                        .accessibilityIdentifier("header-action")
-                        .accessibilityLabel(Text(verbatim: Lang.shared.t(actionLabelKey)))
+                        actionButton
                     }
                 }
             }
@@ -323,13 +290,55 @@ struct HomeHeaderView: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .sideRailItems(rail) {
+            menuButton
+            actionButton
+        }
         .background(alignment: .top) { veil }
     }
 
+    @ViewBuilder private var menuButton: some View {
+        if let onArchived {
+            Menu {
+                Button(action: onArchived) {
+                    Label(
+                        Lang.shared.t("list.menuArchived"),
+                        systemImage: "archivebox")
+                }
+                if let onCronJobs {
+                    Button(action: onCronJobs) {
+                        Label(
+                            Lang.shared.t("list.menuCronJobs"),
+                            systemImage: "alarm")
+                    }
+                }
+            } label: {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 45, height: 45)
+            }
+            .glassSurface(interactive: true, in: .circle)
+            .accessibilityLabel(Text(verbatim: Lang.shared.t("list.menu")))
+        }
+    }
+
+    @ViewBuilder private var actionButton: some View {
+        if let onAction {
+            Button(action: onAction) {
+                Image(systemName: actionIcon)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 45, height: 45)
+            }
+            .glassSurface(interactive: true, in: .circle)
+            .accessibilityIdentifier("header-action")
+            .accessibilityLabel(Text(verbatim: Lang.shared.t(actionLabelKey)))
+        }
+    }
+
     private var veil: some View {
-        LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        HeaderVeil()
     }
 }
 

@@ -33,6 +33,10 @@ identity.
 
 Destructive card actions confirm **NATIVELY** — the shell only reports intent.
 
+The native edit control is a glass circle: a pencil enters edit mode and a
+checkmark finishes it. Its VoiceOver label follows the current action in both
+the header and the side rail.
+
 The empty board is native too. `DeckStore.isEmpty` follows the durable mirror
 and each refetch; while it is true, `DeckScreen` covers the still-warm webview
 with the shared `CreationPrompt`. That gives Deck the same SF Symbol, vertical
@@ -113,3 +117,30 @@ Card size is per-card adaptive. The manifest declares:
 
 Both ride the `DeckCardInfo` / `DeckStore.Card` model, and the shell drives the
 expand with the drag engine's fixed-tile trick (**zero iframe reload**).
+
+## Live resize and safe-area insets (iPhone Duo)
+
+The deck webview is full-bleed (`DeckScreen` ignores the safe area), and on
+iPhone Duo the app is resized LIVE between the outer display (~466pt, compact)
+and the inner one (~951pt, regular), while Split View on the inner display and
+landscape on the outer one give **unequal left/right insets**. So the shell
+never assumes left == right, and nothing it lays out may freeze viewport px:
+
+- **Grid gutters** are `max(var(--deck-gutter), env(safe-area-inset-<side>))`
+  per side.
+- **The grid caps at `--deck-grid-max-width` and centers** on a wide window.
+  Card fragments are written for phone-width tiles and adapt only to the
+  semantic `deck.size`, so a stretched ~460pt Small tile is the failure. It
+  stays 2 columns: the column count is what defines Wide/Large for every
+  installed card, which is a design change, not a layout fix.
+- **A maximized card's expanded rect is CSS** (`.deck-card.maximized.deck-max-full`),
+  not inline px, so it follows a resize without touching the iframe node
+  (moving it reloads the card). The side insets are padding on the paper
+  tile: the sandboxed card can't read the shell's insets, and the tile still
+  covers the grid behind the inset strips. The vertical clearances stay the
+  card base's `--deck-header-clearance` / `--deck-tab-bar-clearance`; the
+  tab bar's placement on Duo is unverified until there is a simulator.
+- **A width change aborts an in-flight drag** (`onViewportResize`): the
+  lifted tile settles at once into the slot its placeholder already showed,
+  and the release point — captured against the old columns — is never used
+  to re-resolve one. Height-only changes (keyboard, bars) don't abort.

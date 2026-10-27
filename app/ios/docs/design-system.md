@@ -122,6 +122,8 @@ source of truth:
   lands ~20% narrower than written (measured: 80ch → 62 chars).
 - `--thread-top-inset: calc(env(safe-area-inset-top) + 58px)` and
   `--thread-bottom-inset: 0px` — see [Layout, safe areas, and the full-bleed webview](#layout-safe-areas-and-the-full-bleed-webview).
+- `--reading-width: 720px` — the ONE reading width, mirrored natively as
+  `Theme.readingWidth` (below). See [The reading band](#the-reading-band).
 
 ### Swift-side mirror (`Theme.swift`)
 
@@ -137,6 +139,9 @@ only — see above), `err` `#D40000` — plus:
 - `Theme.sys(_:weight:)` — the system face (SF Pro), for surfaces that **deliberately** step
   out of the Space Mono chrome. Currently that is the chat list, which reads as a native,
   content-dense list rather than monospaced chrome.
+- `Theme.readingWidth = 720` — the CSS `--reading-width`; see
+  [The reading band](#the-reading-band). `Theme.formWidth = 320` is the narrow form column
+  (direct login, pairing confirm — the web `.direct-form`'s `20rem`).
 
 ## Rules
 
@@ -273,6 +278,52 @@ is **full-bleed** (`viewport-fit=cover` in `web/index.html`) and pads itself ins
 `.chat-log` is a plain growing block (`min-height: 100dvh`, no `overflow`) with
 `justify-content: flex-start` — the document is the single scroller, and threads shorter
 than the screen fill from the TOP down. See [transcript.md](transcript.md) for why.
+
+### The reading band
+
+The app is resized LIVE on a foldable — the iPhone Duo's outer display (~466pt wide,
+compact) and inner one (~951pt, regular width and height), plus a half-width Split View
+window on the inner one with **asymmetric** leading/trailing insets. On a wide window
+content would otherwise stretch edge to edge, so there is one reading width, 720pt, and
+everything that is a column of reading holds to it:
+
+- **Web:** the transcript band is `min(100%, var(--reading-width))`, centred, with the
+  existing gutters INSIDE the band.
+- **Native:** the chat dock's rows (notice line, approval card, staged strip, composer
+  pill) and the project card's dock, the chat list / archived / cron-group rows, the
+  search results and its opened bottom field, and the Settings column. The band includes
+  each surface's own gutter, matching the web.
+
+What stays full-bleed: chrome and grounds — headers and their veils, the composer veil,
+the tab bar, backgrounds. The rules that keep this from breaking on a fold:
+
+- **Modifiers, never a size-class view branch.** `View.readingColumn()` (a capped,
+  centred frame) for a plain column, `View.readingColumnMargins()` (horizontal
+  `contentMargins` measured off the scroller's own width) for a `List` / `ScrollView`, so
+  the scroller — its bounce, indicator and swipe actions — stays full width. An
+  `if sizeClass { A } else { B }` would rebuild `@State` / `@FocusState` mid-fold.
+- **Never assume leading inset == trailing inset.** The scroller's margin is measured
+  inside the safe area and the system adds each side's inset on top; a panel anchored to
+  a control reads that control's MEASURED frame (the `+`, the model pill), never a sum of
+  paddings.
+- **On a phone it never engages.** In portrait every phone is narrower than the band.
+  In landscape a phone is WIDER (a Pro Max leaves ~832pt) but compact in height, and
+  the band is for a tall wide window: `Theme.readingCap(verticalSizeClass:)` lifts the
+  cap for a compact height class, and `styles.css` / `deck.css` mirror it with a
+  `max-height: 500px` query (iPhones are ≤440pt tall in landscape, the Duo's inner
+  display 669pt). The webviews never resize with the keyboard, so typing can't cross
+  it. Checked by pixel-diffing master against the branch on iPhone 17 Pro and Pro Max
+  in both orientations.
+
+`readingColumnMargins()` reaches every scroll view below it in the environment, so it
+only goes on a scroller whose rows host none of their own.
+
+A `List` beside a side column draws its separators short of the row content: rows take
+the LARGER of inset and margin per side, but the separator's trailing end takes their
+SUM. `View.separatorSpansContent()` pins the separator's trailing end to the row's own
+trailing edge; every banded list with separators carries it. On a phone it moves the
+trailing end in by the 8pt the system used to run past the content, so both ends sit
+24pt from the screen edge.
 
 ### Native-app feel
 

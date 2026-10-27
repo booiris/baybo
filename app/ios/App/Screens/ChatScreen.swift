@@ -23,6 +23,14 @@ struct ChatScreen: View {
     /// it is presented in two layers this screen owns; the `+` it blooms from
     /// is measured by the composer rather than fixed.
     @StateObject private var attach = AttachMenu()
+    /// The model pill's frame in `ModelMenuPanel.anchorSpace`, reported by the
+    /// header — the panel's column is measured off it rather than re-derived
+    /// from the header's paddings.
+    @State private var modelPillFrame: CGRect = .zero
+    /// The approval card's detail ceiling for this window's free height
+    /// (`ApprovalCardView.detailCap`). Short windows — a foldable's outer
+    /// display in landscape, any screen with the keyboard up — get a shorter box.
+    @State private var approvalDetailCap = ApprovalCardView.detailCeiling
     /// The header's message index (`MessageIndexSheet`).
     @State private var messageIndexOpen = false
     /// The header's subagent list (`SubagentSheet`).
@@ -68,14 +76,18 @@ struct ChatScreen: View {
             Group {
                 ChatHeaderView(
                     store: store, bridge: bridge, catalog: .shared, menuOpen: $modelMenuOpen,
-                    indexOpen: $messageIndexOpen, subagentsOpen: $subagentsOpen
+                    indexOpen: $messageIndexOpen, subagentsOpen: $subagentsOpen,
+                    onPillFrame: { modelPillFrame = $0 }
                 ) {
                     dismiss()
                 }
 
                 if modelMenuOpen {
-                    ModelMenuPanel(store: store, catalog: .shared, isPresented: $modelMenuOpen)
-                        .zIndex(2)
+                    ModelMenuPanel(
+                        store: store, catalog: .shared, anchor: modelPillFrame,
+                        isPresented: $modelMenuOpen
+                    )
+                    .zIndex(2)
                 }
 
                 // Only the attach panel's SCRIM lands here — the panel itself rides
@@ -91,6 +103,9 @@ struct ChatScreen: View {
             .accessibilityHidden(bridge.htmlPreviewMaximized)
             .animation(Self.chromeFade, value: bridge.htmlPreviewMaximized)
         }
+        // The space the model pill reports its frame in and the model panel
+        // lays itself out in — one container, so the two cannot disagree.
+        .coordinateSpace(.named(ModelMenuPanel.anchorSpace))
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
         // While a full-screen HTML preview covers the conversation it borrows
@@ -114,7 +129,7 @@ struct ChatScreen: View {
         // can render it. Only the CONTENT is assembled here.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             ComposerDock(collapsed: bridge.htmlPreviewMaximized) {
-                ComposerView(store: store, attach: attach)
+                ComposerView(store: store, attach: attach, approvalDetailCap: approvalDetailCap)
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.frame(in: .global).minY
                     } action: { minY in
@@ -138,6 +153,15 @@ struct ChatScreen: View {
             }
             .animation(Self.chromeFade, value: bridge.htmlPreviewMaximized)
 
+        }
+        // Measured OUTSIDE the dock's inset: the whole screen's free height,
+        // keyboard already taken out, and independent of how tall the dock's
+        // own rows are — so the cap cannot feed back into what it is cut from.
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.height
+        } action: { height in
+            let cap = ApprovalCardView.detailCap(available: height)
+            if cap != approvalDetailCap { approvalDetailCap = cap }
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in
@@ -175,6 +199,10 @@ struct ChatScreen: View {
                 messageIndexOpen = false
             }
             .presentationDetents([.fraction(0.55), .large])
+            // On a regular-width window (the foldable's inner display) the
+            // detents give way to a centred form sheet, so size it as one on
+            // purpose rather than inherit whatever `.automatic` picks.
+            .presentationSizing(.form)
             .presentationDragIndicator(.hidden)
             .presentationBackground(Theme.paper)
             .presentationCornerRadius(Theme.radiusModal)
@@ -296,14 +324,18 @@ struct ChatHeaderView: View {
     @Binding var menuOpen: Bool
     @Binding var indexOpen: Bool
     @Binding var subagentsOpen: Bool
+    /// Where the model pill sits, in `ModelMenuPanel.anchorSpace` — the menu
+    /// panel blooms from its leading edge.
+    let onPillFrame: (CGRect) -> Void
     let onBack: () -> Void
+    @Environment(\.sideRail) private var rail
 
     private static let veilPeakAlpha = 0.8
     /// Shared with `ArchivedScreen`, which reuses this header grammar.
     static let barHeight: CGFloat = 46
     /// Solid → clear smoothstep the veil fades through, below its solid
     /// status-bar zone (the composer veil's grammar, mirrored to the top).
-    private static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]
+    static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]
     /// Cap on the pill's LABEL TEXT so a long model id can't outgrow a narrow
     /// screen. Applied to the string, not via `.frame(maxWidth:)` — a frame
     /// cap makes the Menu label greedy (it expands to the cap even for short
@@ -313,50 +345,59 @@ struct ChatHeaderView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            // The glass back circle (logout moved to the chat list's header —
-            // leaving the account lives one level up now). Semibold glyph so
-            // the ink reads as solid black over the bright glass.
-            Button(action: onBack) {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Theme.ink)
-                    .frame(width: 42, height: 42)
+            if rail == nil {
+                BackCircle(label: Lang.shared.t("chat.back"), action: onBack)
             }
-            .glassSurface(interactive: true, in: .circle)
-            .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.back")))
 
             // The model pill renders only once the catalog has entries —
             // before the first successful fetch (and offline) there is
             // nothing to offer, and an unpinned session runs the default
             // whether or not the pill says so.
-            if !catalog.models.isEmpty {
+            if rail == nil, !catalog.models.isEmpty {
                 modelPill
             }
 
             Spacer()
 
-            // Connectivity keeps NO indicator in every healthy state; only a
-            // SUSTAINED outage surfaces (`legDown` — debounced, because the
-            // raw state oscillates through the retry loop), clearing itself
-            // the moment a dial lands.
-            if store.legDown {
-                offlineIcon
-            }
+            if rail == nil {
+                // Connectivity keeps NO indicator in every healthy state; only a
+                // SUSTAINED outage surfaces (`legDown` — debounced, because the
+                // raw state oscillates through the retry loop), clearing itself
+                // the moment a dial lands.
+                if store.legDown {
+                    offlineIcon
+                }
 
-            // BOTH persistent controls come LAST, after the outage branch.
-            // `Spacer()` absorbs every width change, so only the trailing side
-            // holds still; declared inboard of the alarm, either of these would
-            // slide 54pt under the blanket `legDown` animation every time the
-            // network drops. A persistent control must not move — the transient
-            // alarm inserts to their left.
-            if bridge.subagentsPresent {
-                subagentsButton
+                // BOTH persistent controls come LAST, after the outage branch.
+                // `Spacer()` absorbs every width change, so only the trailing side
+                // holds still; declared inboard of the alarm, either of these would
+                // slide 54pt under the blanket `legDown` animation every time the
+                // network drops. A persistent control must not move — the transient
+                // alarm inserts to their left.
+                if bridge.subagentsPresent {
+                    subagentsButton
+                }
+                indexButton
             }
-            indexButton
         }
         .padding(.horizontal, 24)
         .frame(height: Self.barHeight)
         .frame(maxWidth: .infinity)
+        // In a side rail the same rule runs top-down: persistent controls
+        // first, the transient alarm appended under them.
+        .sideRailItems(rail) {
+            BackCircle(label: Lang.shared.t("chat.back"), action: onBack)
+            indexButton
+            if !catalog.models.isEmpty {
+                modelCircle
+            }
+            if bridge.subagentsPresent {
+                subagentsButton
+            }
+            if store.legDown {
+                offlineIcon
+            }
+        }
         // Keep the bar an accessibility CONTAINER. DO NOT delete this as
         // obsolete now that the index button is permanent: what it defends
         // against is the bar being left with ONE focusable child, which SwiftUI
@@ -372,7 +413,11 @@ struct ChatHeaderView: View {
         // permanent index button removes today's trigger; the next conditional
         // child re-arms it.
         .accessibilityElement(children: .contain)
-        .background(alignment: .top) { veil }
+        // With the circles in the rail only glass is left up here, and there is
+        // no status bar above it to wash out.
+        .background(alignment: .top) {
+            if rail == nil { veil }
+        }
         .animation(.easeOut(duration: 0.15), value: store.legDown)
         // On the STACK, not on the button: an `.animation(_:value:)` inside the
         // view being inserted has no previous value to compare, so it would pop
@@ -386,10 +431,7 @@ struct ChatHeaderView: View {
     /// `ChatScreen` overlays under this pill. A pick applies from the
     /// session's NEXT turn (gateway contract), so no confirmation step.
     private var modelPill: some View {
-        Button {
-            Haptics.tap()
-            withAnimation(.easeOut(duration: 0.15)) { menuOpen.toggle() }
-        } label: {
+        modelControl(in: Capsule()) {
             Text(verbatim: modelLabel)
                 .font(Theme.mono(15))
                 .foregroundStyle(Theme.ink)
@@ -397,7 +439,35 @@ struct ChatHeaderView: View {
                 .padding(.horizontal, 16)
                 .frame(height: 42)
         }
-        .glassSurface(interactive: true, in: Capsule())
+    }
+
+    /// The pill's side-rail form: a column is too narrow for the id, so the
+    /// rail carries a glyph and the id lives in the menu's checkmark and the
+    /// accessibility value.
+    private var modelCircle: some View {
+        modelControl(in: Circle()) {
+            Image(systemName: "cpu")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(Theme.ink)
+                .frame(width: 42, height: 42)
+        }
+    }
+
+    private func modelControl<S: Shape, Label: View>(
+        in shape: S, @ViewBuilder label: () -> Label
+    ) -> some View {
+        Button {
+            Haptics.tap()
+            withAnimation(.easeOut(duration: 0.15)) { menuOpen.toggle() }
+        } label: {
+            label()
+        }
+        .glassSurface(interactive: true, in: shape)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named(ModelMenuPanel.anchorSpace))
+        } action: { frame in
+            onPillFrame(frame)
+        }
         .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.model")))
         // The a11y label hides the pill's visible text, so surface it as the
         // element's VALUE — the FULL id, not the ellipsized display string:
@@ -502,9 +572,7 @@ struct ChatHeaderView: View {
     /// itself carries `ignoresSafeArea(.top)`; nesting the flood inside a
     /// `.background` clips it (the parent doesn't ignore the inset).
     private var veil: some View {
-        LinearGradient(stops: Self.veilStops, startPoint: .top, endPoint: .bottom)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        HeaderVeil()
     }
 
     /// Solid through the status bar (~`solidFraction` of the flooded height on

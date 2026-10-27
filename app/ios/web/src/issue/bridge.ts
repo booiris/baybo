@@ -1,4 +1,5 @@
 import { postToNative } from "../bridge";
+import type { ScrollAnchor } from "../resizeAnchor";
 import type { ChildIssue, IssueDetail, IssueEvent, IssueRun } from "./types";
 
 
@@ -8,7 +9,9 @@ export type IssueInit = {
   number: number;
   targetId: string;
   /// Bottom chrome (the dock, plus a ridden keyboard) at first paint, in CSS
-  /// px. Streamed from then on — the webview never resizes.
+  /// px. Streamed from then on — the keyboard never resizes the webview. (A
+  /// foldable closing or opening, or Split View, does; the page holds its
+  /// reader's place through that itself.)
   bottomInset: number;
   restoredState?: IssueViewState;
 };
@@ -16,7 +19,15 @@ export type IssueInit = {
 export type IssueViewState = {
   scrollTop: number;
   folds: Record<string, boolean>;
+  /// The first block on screen, where it sat, and the page width that was read
+  /// at. `scrollTop` is the reader's place only at the width it was taken at: a
+  /// foldable closed or opened while this visit was covered rewraps every row
+  /// above it, so a restore at another width goes by this instead. Absent when
+  /// nothing was on screen, and from a native that does not carry it back.
+  anchor?: IssueScrollAnchor;
 };
+
+export type IssueScrollAnchor = ScrollAnchor & { width: number };
 
 export type IssuePresentation = {
   init: IssueInit;

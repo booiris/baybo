@@ -18,6 +18,10 @@ struct SubagentSheet: View {
     let parentSessionId: String
 
     @ObservedObject private var lang = Lang.shared
+    /// Regular width presents this as a centred form sheet, which has no drag
+    /// to advertise — the grabber hides there (a modifier, so a live fold
+    /// between the two displays doesn't rebuild the sheet's contents).
+    @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var items: [ChatSubagentSummary] = []
     @State private var hasMoreOlder = false
     @State private var loadingOlder = false
@@ -83,6 +87,8 @@ struct SubagentSheet: View {
             .fill(Theme.inkSoft.opacity(0.35))
             .frame(width: 36, height: 4)
             .padding(.vertical, 9)
+            .opacity(sizeClass == .regular ? 0 : 1)
+            .accessibilityHidden(true)
     }
 
     private var titleRow: some View {

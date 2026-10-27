@@ -30,7 +30,7 @@ import {
   type ReadingPosition,
   type UserSentPayload,
 } from "./bridge";
-import { HTML_PREVIEW_MAXIMIZED_CLASS, previewParking } from "./htmlPreviewProtocol";
+import { HTML_PREVIEW_MAXIMIZED_CLASS, parkedThreadShift } from "./htmlPreviewProtocol";
 import {
   AttachmentBubble,
   ImageDimsContext,
@@ -39,6 +39,12 @@ import {
 } from "./attachments";
 import { useLongPress } from "./gestures";
 import { MarkdownBody, StreamingMarkdownBody } from "./Markdown";
+import {
+  anchorShift,
+  captureAnchor,
+  holdPlaceAcrossWidth,
+  type ScrollAnchor,
+} from "./resizeAnchor";
 import { advanceFromLive, advanceFromSync, type CursorState } from "./transcript/cursor";
 import { compactionStatusText, WorkBlockView } from "./WorkBlock";
 import {
@@ -225,6 +231,18 @@ const SCROLL_TOP_THRESHOLD_PX = 64;
 /// `content-visibility` block in styles.css for why a row must be laid out
 /// once before it may be skipped.
 const FRESH_ROW_SELECTOR = ".msg-group:not([data-cv]), .work-ladder:not([data-cv])";
+/// Rows already handed over — whose remembered size goes stale when the
+/// thread's width changes.
+const STAMPED_ROW_SELECTOR = ".msg-group[data-cv], .work-ladder[data-cv]";
+/// How long the thread's width must hold still before the stamped rows are
+/// re-measured. A Split View drag streams a resize per frame, and every pass
+/// lays the whole mounted thread out; one pass at the end is all a reader
+/// scrolling after it can tell apart from many.
+const CV_REFRESH_DEBOUNCE_MS = 250;
+
+/// The attribute every rendered row carries — the handle the reading-place
+/// anchors hold (and the message index jumps to).
+const ROW_ID_ATTR = "data-row-id";
 
 /// How close to the bottom of the chat log (px) still counts as "following" the
 /// newest edge. Within this band incoming rows / stream deltas keep the log
@@ -271,19 +289,29 @@ function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
 }
 
+/// The blocks a long row is held by when it straddles the top edge — one agent
+/// reply can be several screens of paragraphs, and a fold rewraps all of them.
+const ROW_PART_SELECTOR =
+  "p, li, pre, blockquote, h1, h2, h3, h4, h5, h6, tr, figure, .katex-display";
+
 /// The topmost row still on screen, and how far below the viewport's top edge it
-/// sat — what a REPLACE has to put back under a reader parked in history. Every
-/// row carries `data-row-id` for exactly this (and for the message index's
-/// jump), and a REPLACE reuses a surviving row's key, so the handle is still
-/// findable in the rebuilt thread. `null` when no row is on screen to hold onto.
-function captureRowAnchor(): { rowId: string; top: number } | null {
-  for (const el of document.querySelectorAll("[data-row-id]")) {
-    const rect = el.getBoundingClientRect();
-    if (rect.bottom <= 0) continue;
-    const rowId = el.getAttribute("data-row-id");
-    return rowId === null ? null : { rowId, top: rect.top };
-  }
-  return null;
+/// sat — what a REPLACE or a width change has to put back under a reader parked
+/// in history. Every row carries `data-row-id` for exactly this (and for the
+/// message index's jump), and a REPLACE reuses a surviving row's key, so the
+/// handle is still findable in the rebuilt thread. `null` when no row is on
+/// screen to hold onto.
+function captureRowAnchor(): ScrollAnchor | null {
+  return captureAnchor(document, ROW_ID_ATTR, 0, ROW_PART_SELECTOR);
+}
+
+/// Put an anchored row back under the pixel it was captured at. False when the
+/// row is gone, which each caller answers in its own way.
+function restoreRowAnchor(anchor: ScrollAnchor): boolean {
+  const el = scrollEl();
+  const shift = anchorShift(document, ROW_ID_ATTR, anchor, 0, ROW_PART_SELECTOR);
+  if (el === null || shift === null) return false;
+  el.scrollTop += shift;
+  return true;
 }
 
 /// Recognise a `/stop` the way the gateway's parser does (leading `/`, first
@@ -2069,7 +2097,7 @@ export function Transcript({
   // at the newest edge: the row they were on and where it sat. The layout effect
   // below puts it back under the same pixel, and falls back to the newest edge
   // when the rebuild dropped it.
-  const replaceAnchor = useRef<{ rowId: string; top: number } | null>(null);
+  const replaceAnchor = useRef<ScrollAnchor | null>(null);
   // Whether the viewport is pinned to the newest edge (bottom). Maintained by
   // the window scroll listener; new content auto-scrolls only while pinned, so a
   // reader who scrolled up into history isn't yanked back down.
@@ -2239,34 +2267,95 @@ export function Transcript({
     }
   }, [messages, streaming, turnActive]);
 
+  // Hand every newly mounted row over to `content-visibility: auto` two frames
+  // after it was laid out at its real height (styles.css). Snapshot the rows
+  // NOW: one mounting after this pass was scheduled must still get its own two
+  // frames, or it would be skipped before its size was remembered. Passes are
+  // never cancelled on the next commit — a streaming reply commits every frame
+  // and would starve them.
+  // Waits for webfonts first: a row measured in the fallback face would
+  // remember the wrong height and snap again when it scrolls in.
+  const stampFreshRows = useCallback(() => {
+    const fresh = logRef.current?.querySelectorAll<HTMLElement>(FRESH_ROW_SELECTOR);
+    if (!fresh || fresh.length === 0) return;
+    // `fonts` is absent outside a real browser engine (jsdom).
+    const fontsReady: Promise<unknown> = "fonts" in document ? document.fonts.ready : Promise.resolve();
+    void fontsReady.then(() =>
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          for (const row of fresh) row.dataset.cv = "done";
+        }),
+      ),
+    );
+  }, []);
+
+  // A row's remembered size is only true at the width it was laid out at. After
+  // a fold, an unfold or a Split View resize, every offscreen row would scroll
+  // in at its old-width height and snap — the scroll-up shake again, one row at
+  // a time. So once the width has held still, every mounted row renders once
+  // more and is handed back over by the same pass a fresh one gets. Taking the
+  // stamps off reflows rows ABOVE the reader too, so their place is captured
+  // first and put back in the same task, before anything paints.
+  const cvRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(cvRefreshTimer.current), []);
+  const scheduleCvRefresh = useCallback(() => {
+    clearTimeout(cvRefreshTimer.current);
+    cvRefreshTimer.current = setTimeout(() => {
+      const log = logRef.current;
+      const el = scrollEl();
+      if (!log || !el) return;
+      const before = followRef.current ? null : captureRowAnchor();
+      for (const row of log.querySelectorAll<HTMLElement>(STAMPED_ROW_SELECTOR)) {
+        delete row.dataset.cv;
+      }
+      if (!userTouchingRef.current) {
+        if (followRef.current) el.scrollTop = el.scrollHeight;
+        else if (before !== null) restoreRowAnchor(before);
+      }
+      stampFreshRows();
+    }, CV_REFRESH_DEBOUNCE_MS);
+  }, [stampFreshRows]);
+
   // `.chat-log` now grows with its content (min-height, no inner scroll), so a
   // ResizeObserver on it fires on the late async growth the one-shot mount pin
   // races — webfont swap (font-display:swap reflow) and bridge-loaded images —
   // as well as the keyboard padding slide. While pinned, hold the newest edge
   // through all of it (this is what keeps the first keyboard raise from snapping
   // up an un-repinned drift). Pin the DOCUMENT, not the observed box.
+  //
+  // It also fires when the thread's WIDTH changes — a foldable closing or
+  // opening, Split View, a rotation — and every row rewraps. The pin covers a
+  // reader at the newest edge; one parked in history gets the row they were on
+  // put back under the same pixel, from a place captured BEFORE the reflow (see
+  // `holdPlaceAcrossWidth` for why it cannot be read here).
   useEffect(() => {
     const box = logRef.current;
     if (!box) return;
-    const ro = new ResizeObserver(() => {
-      const el = scrollEl();
-      if (!el) return;
-      // A resize that leaves nothing below the fold — an empty/short draft, or
-      // the prewarm 0→full-size grow when a reused draft first paints — clears a
-      // jump button latched by a transient off-edge scroll during that resize:
-      // onScroll is the only recompute of follow/showJump, and a non-scrollable
-      // thread emits no further scroll event to correct it. Nothing to scroll ⇒
-      // always following, button hidden.
-      if (el.scrollHeight - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX) {
-        followRef.current = true;
-        setShowJump(false);
-        return;
-      }
-      if (followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
-    });
-    ro.observe(box);
-    return () => ro.disconnect();
-  }, []);
+    return holdPlaceAcrossWidth(
+      box,
+      window,
+      () => (followRef.current ? null : captureRowAnchor()),
+      ({ widthChanged, before }) => {
+        if (widthChanged) scheduleCvRefresh();
+        const el = scrollEl();
+        if (!el) return;
+        // A resize that leaves nothing below the fold — an empty/short draft, or
+        // the prewarm 0→full-size grow when a reused draft first paints — clears a
+        // jump button latched by a transient off-edge scroll during that resize:
+        // onScroll is the only recompute of follow/showJump, and a non-scrollable
+        // thread emits no further scroll event to correct it. Nothing to scroll ⇒
+        // always following, button hidden.
+        if (el.scrollHeight - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX) {
+          followRef.current = true;
+          setShowJump(false);
+          return;
+        }
+        if (userTouchingRef.current) return;
+        if (followRef.current) el.scrollTop = el.scrollHeight;
+        else if (widthChanged && before !== null) restoreRowAnchor(before);
+      },
+    );
+  }, [scheduleCvRefresh]);
 
   // Track finger-down (on the document — the whole page is the scroller now) so
   // the pin-to-newest writes yield to a drag. Passive — never blocks the scroll.
@@ -2307,28 +2396,11 @@ export function Transcript({
     };
   }, []);
 
-  // Hand every newly mounted row over to `content-visibility: auto` two frames
-  // after it was laid out at its real height (styles.css). Snapshot the rows
-  // NOW: one mounting after this pass was scheduled must still get its own two
-  // frames, or it would be skipped before its size was remembered. Passes are
-  // never cancelled on the next commit — a streaming reply commits every frame
-  // and would starve them.
-  // Waits for webfonts first: a row measured in the fallback face would
-  // remember the wrong height and snap again when it scrolls in. Keyed on
-  // `compactionPoints` too — a divider landing re-keys (remounts) its row.
+  // Every commit can mount rows. Keyed on `compactionPoints` too — a divider
+  // landing re-keys (remounts) its row.
   useEffect(() => {
-    const fresh = logRef.current?.querySelectorAll<HTMLElement>(FRESH_ROW_SELECTOR);
-    if (!fresh || fresh.length === 0) return;
-    // `fonts` is absent outside a real browser engine (jsdom).
-    const fontsReady: Promise<unknown> = "fonts" in document ? document.fonts.ready : Promise.resolve();
-    void fontsReady.then(() =>
-      requestAnimationFrame(() =>
-        requestAnimationFrame(() => {
-          for (const row of fresh) row.dataset.cv = "done";
-        }),
-      ),
-    );
-  }, [messages, compactionPoints]);
+    stampFreshRows();
+  }, [messages, compactionPoints, stampFreshRows]);
 
   // After a scroll-up PREPEND, restore the viewport so the content the user was
   // looking at stays put (the log is `flex-direction: column`, so inserting
@@ -2366,15 +2438,11 @@ export function Transcript({
     const el = scrollEl();
     if (!anchor || !el) return;
     replaceAnchor.current = null;
-    const node = document.querySelector(`[data-row-id="${CSS.escape(anchor.rowId)}"]`);
-    if (node === null) {
-      // The rebuild dropped the row — there is nothing left to hold a position
-      // against, which is the baseline repair path's whole premise. Newest edge.
-      followRef.current = true;
-      el.scrollTop = el.scrollHeight;
-      return;
-    }
-    el.scrollTop += node.getBoundingClientRect().top - anchor.top;
+    if (restoreRowAnchor(anchor)) return;
+    // The rebuild dropped the row — there is nothing left to hold a position
+    // against, which is the baseline repair path's whole premise. Newest edge.
+    followRef.current = true;
+    el.scrollTop = el.scrollHeight;
   }, [messages]);
 
   // ---- work-frame commit coalescing ----------------------------------------
@@ -3812,11 +3880,12 @@ export function Transcript({
   function captureReadingPosition(): ReadingPosition | null {
     if (followRef.current) return null;
     // Under a full-screen preview the scroller is locked and may have clamped
-    // its offset; measure as if it were still where the reader left it.
-    const parked = document.documentElement.classList.contains(HTML_PREVIEW_MAXIMIZED_CLASS)
-      ? previewParking.scrollY
-      : null;
-    const shift = parked === null ? 0 : (scrollEl()?.scrollTop ?? 0) - parked;
+    // its offset, and the thread may have rewrapped under it; measure as if the
+    // preview had already put its card back where the reader left it — which
+    // is what closing it does.
+    const shift = document.documentElement.classList.contains(HTML_PREVIEW_MAXIMIZED_CLASS)
+      ? -(parkedThreadShift() ?? 0)
+      : 0;
     for (const el of document.querySelectorAll("[data-row-id]")) {
       const rect = el.getBoundingClientRect();
       if (rect.bottom + shift <= 0) continue;

@@ -15,6 +15,11 @@ struct ApprovalCardView: View {
     let approval: PendingApproval
     /// How many prompts are waiting behind this one.
     let queued: Int
+    /// Ceiling on the detail box, from `detailCap(available:)` — the HOST
+    /// measures, because only it knows how much screen the dock is riding over.
+    /// Past this the body scrolls: the card must stay a prompt over the
+    /// composer, not a page.
+    let maxDetailHeight: CGFloat
     let onDecide: (ApprovalDecision) -> Void
 
     @ObservedObject private var lang = Lang.shared
@@ -25,9 +30,24 @@ struct ApprovalCardView: View {
     /// become a scroller.
     @State private var detailHeight: CGFloat = 0
 
-    /// Ceiling on the detail box (~9 lines of the 12pt mono). Past this the body
-    /// scrolls: the card must stay a prompt over the composer, not a page.
-    private static let maxDetailHeight: CGFloat = 140
+    /// The tallest the detail box ever gets (~9 lines of the 12pt mono) — what
+    /// a phone in portrait has always shown.
+    static let detailCeiling: CGFloat = 140
+    /// The shortest: still three-odd lines plus the fade, so a scroller reads as
+    /// one even on the shortest window.
+    static let detailFloor: CGFloat = 56
+    /// The share of the host's free height the detail may take between the two.
+    static let detailShare: CGFloat = 0.3
+
+    /// The detail ceiling for a host with `available` points of height. A short
+    /// window — a foldable's outer display in landscape, the inner one with the
+    /// keyboard up, any phone in landscape — would otherwise spend most of what
+    /// is left on a fixed 140pt box and push the pill off the bottom. Unmeasured
+    /// (`0`) is the phone's ceiling, which is what the card drew before.
+    static func detailCap(available: CGFloat) -> CGFloat {
+        guard available > 0 else { return detailCeiling }
+        return min(detailCeiling, max(detailFloor, available * detailShare))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -95,11 +115,11 @@ struct ApprovalCardView: View {
     /// transcript off the screen. Short bodies size naturally; only an
     /// overflowing one turns into a scroller (and wears the fade that says so).
     @ViewBuilder private var detail: some View {
-        let overflows = detailHeight > Self.maxDetailHeight
+        let overflows = detailHeight > maxDetailHeight
         Group {
             if overflows {
                 ScrollView { detailBody }
-                    .frame(height: Self.maxDetailHeight)
+                    .frame(height: maxDetailHeight)
                     // Bottom fade — the same "there is more past this edge" cue
                     // the header and composer veils use. The scroll indicator
                     // only shows up mid-gesture, which is too late to be told

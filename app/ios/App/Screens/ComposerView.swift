@@ -39,13 +39,17 @@ struct ComposerView: View {
     /// and over this dock's own rows, so the screen is what presents it (as an
     /// overlay on the dock). This side reports the anchor and answers the pick.
     @ObservedObject private var attach: AttachMenu
+    /// The approval card's detail ceiling (`ApprovalCardView.detailCap`), off
+    /// the height `ChatScreen` measured.
+    private let approvalDetailCap: CGFloat
     @State private var photoPicks: [PhotosPickerItem] = []
     @FocusState private var focused: Bool
 
-    init(store: ChatStore, attach: AttachMenu) {
+    init(store: ChatStore, attach: AttachMenu, approvalDetailCap: CGFloat) {
         _store = ObservedObject(wrappedValue: store)
         _staging = ObservedObject(wrappedValue: store.staging)
         _attach = ObservedObject(wrappedValue: attach)
+        self.approvalDetailCap = approvalDetailCap
     }
 
     /// `ComposerDraftUITests` addresses the field by this.
@@ -82,7 +86,8 @@ struct ComposerView: View {
             if let approval = store.pendingApprovals.first {
                 ApprovalCardView(
                     approval: approval,
-                    queued: store.pendingApprovals.count - 1
+                    queued: store.pendingApprovals.count - 1,
+                    maxDetailHeight: approvalDetailCap
                 ) { decision in
                     store.resolveApproval(approval, decision: decision)
                 }
@@ -135,6 +140,11 @@ struct ComposerView: View {
                 .padding(.bottom, 6)
             }
         }
+        // The rows share the transcript's reading band; the veil below stays
+        // full width. This view is still the dock's whole content, so the `+`
+        // reports its frame — band offset included — in the same `dockSpace`
+        // the attach panel is laid out in.
+        .readingColumn()
         .padding(.top, 0)
         .padding(.bottom, dockBottomPadding)
         .animation(.easeOut(duration: 0.2), value: store.pendingApprovals.first?.callId)

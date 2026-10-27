@@ -5,7 +5,12 @@ import { I18nextProvider } from "react-i18next";
 import i18n from "./i18n";
 import { Transcript } from "./Transcript";
 import type { ReadingPosition } from "./bridge";
-import { HTML_PREVIEW_MAXIMIZED_CLASS, previewParking } from "./htmlPreviewProtocol";
+import {
+  HTML_PREVIEW_MAXIMIZED_CLASS,
+  parkedThreadShift,
+  parkThread,
+  unparkThread,
+} from "./htmlPreviewProtocol";
 import type { PersistedState, Row, TranscriptRowItem } from "./types";
 
 /// The scroll model, under a fake layout.
@@ -30,6 +35,11 @@ const VIEW = 800;
 const ROW_H = 120;
 
 let scrollTop = 0;
+/// The live row height. A width change is modelled as every row rewrapping to
+/// a new height at once, which is what moves rows under a parked reader.
+let rowH = ROW_H;
+/// The width the ResizeObserver reports for `.chat-log`'s content box.
+let logWidth = 350;
 let roCallbacks: (() => void)[] = [];
 let realRect: typeof Element.prototype.getBoundingClientRect;
 
@@ -47,7 +57,7 @@ function rowIndex(el: Element): number {
 
 function contentHeight(): number {
   const log = logEl();
-  return log === null ? VIEW : Math.max(VIEW, log.children.length * ROW_H);
+  return log === null ? VIEW : Math.max(VIEW, log.children.length * rowH);
 }
 
 function maxScroll(): number {
@@ -71,6 +81,8 @@ function rowAtViewportTop(): string | null {
 
 function installLayout(): void {
   scrollTop = 0;
+  rowH = ROW_H;
+  logWidth = 350;
   // jsdom leaves `scrollingElement` null in its default (quirks) document, which
   // alone makes every scroll op in the component a no-op.
   Object.defineProperty(document, "scrollingElement", {
@@ -102,17 +114,34 @@ function installLayout(): void {
   Element.prototype.scrollIntoView = function (this: Element): void {
     const i = rowIndex(this);
     if (i < 0) return;
-    document.documentElement.scrollTop = i * ROW_H;
+    document.documentElement.scrollTop = i * rowH;
   };
   realRect = Element.prototype.getBoundingClientRect;
   Element.prototype.getBoundingClientRect = function (this: Element): DOMRect {
     const i = rowIndex(this);
+    // The thread's box reports the width it was laid out at, as WebKit's does:
+    // `holdPlaceAcrossWidth` drops a scroll capture taken in the frame the
+    // width changed by comparing it, and at jsdom's constant 0 a frame that
+    // lands after `rewrap` (a loaded runner) captured the rewrapped layout.
+    if (i < 0 && this.classList.contains("chat-log")) {
+      return {
+        top: 0,
+        bottom: 0,
+        height: 0,
+        left: 0,
+        right: logWidth,
+        width: logWidth,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect;
+    }
     if (i < 0) return realRect.call(this);
-    const top = i * ROW_H - scrollTop;
+    const top = i * rowH - scrollTop;
     return {
       top,
-      bottom: top + ROW_H,
-      height: ROW_H,
+      bottom: top + rowH,
+      height: rowH,
       left: 0,
       right: 0,
       width: 0,
@@ -132,8 +161,13 @@ function installObservers(): void {
     "ResizeObserver",
     class {
       cb: () => void;
-      constructor(cb: () => void) {
-        this.cb = cb;
+      constructor(cb: ResizeObserverCallback) {
+        this.cb = () => {
+          cb(
+            [{ contentRect: { width: logWidth } } as ResizeObserverEntry],
+            this as unknown as ResizeObserver,
+          );
+        };
       }
       observe(): void {
         roCallbacks.push(this.cb);
@@ -604,6 +638,65 @@ describe("a REPLACE under a reader parked in history", () => {
 /// which makes its termination the whole risk: `prependOlder` advances the floor
 /// only on a NON-EMPTY page while `hasMoreOlder` can stay true, so "the floor
 /// moved" is not a condition anything may rely on.
+/// A foldable closing or opening (or Split View) resizes the webview live, and
+/// every row rewraps to a new height while `scrollTop` keeps its pixel value.
+describe("a width change", () => {
+  function topOf(rowId: string): number | null {
+    const el = document.querySelector(`[data-row-id="${CSS.escape(rowId)}"]`);
+    return el === null ? null : el.getBoundingClientRect().top;
+  }
+
+  async function rewrap(height: number, width: number): Promise<void> {
+    rowH = height;
+    logWidth = width;
+    await settle();
+  }
+
+  it("keeps a reader parked in history on the row they were reading", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const id = rowAtViewportTop() ?? "";
+    const top = topOf(id);
+
+    await rewrap(200, 700);
+
+    expect(rowAtViewportTop()).toBe(id);
+    expect(topOf(id)).toBe(top);
+  });
+
+  it("holds the row through one resize after another", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const id = rowAtViewportTop() ?? "";
+    const top = topOf(id);
+
+    await rewrap(200, 700);
+    await rewrap(90, 300);
+
+    expect(rowAtViewportTop()).toBe(id);
+    expect(topOf(id)).toBe(top);
+  });
+
+  it("does not move a parked reader when only the height changed", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const at = scrollTop;
+
+    await rewrap(ROW_H, 350);
+
+    expect(scrollTop).toBe(at);
+  });
+
+  it("keeps a reader at the newest edge on it", async () => {
+    await open(60, 999);
+    expect(scrollTop).toBe(maxScroll());
+
+    await rewrap(200, 700);
+
+    expect(scrollTop).toBe(maxScroll());
+  });
+});
+
 describe("jump to a search hit's ordinal", () => {
   function fetches(): number[] {
     return posts()
@@ -885,6 +978,48 @@ describe("scroll-up paging without the jolt", () => {
       frame();
       expect(cv("pm-cv")).toBe("done");
     });
+
+    // A remembered size is only true at the width it was laid out at; after a
+    // fold every offscreen row would scroll in at its old height and snap.
+    it("re-measures every mounted row once a width change has settled", async () => {
+      await open(60, 999);
+      frame();
+      frame();
+      const mounted = rowIds();
+      expect(mounted.every((id) => cv(id) === "done")).toBe(true);
+
+      logWidth = 700;
+      act(() => {
+        for (const cb of [...roCallbacks]) cb();
+      });
+      // Debounced: a Split View drag streams resizes, and each pass lays out
+      // the whole mounted thread.
+      expect(mounted.every((id) => cv(id) === "done")).toBe(true);
+
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 300));
+      });
+      expect(mounted.every((id) => cv(id) === null)).toBe(true);
+
+      frame();
+      frame();
+      expect(mounted.every((id) => cv(id) === "done")).toBe(true);
+    });
+
+    it("leaves the stamps alone when only the height changed", async () => {
+      await open(60, 999);
+      frame();
+      frame();
+      const mounted = rowIds();
+
+      act(() => {
+        for (const cb of [...roCallbacks]) cb();
+      });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 300));
+      });
+      expect(mounted.every((id) => cv(id) === "done")).toBe(true);
+    });
   });
 
   describe("one page per gesture", () => {
@@ -1066,7 +1201,7 @@ describe("a replaced page puts the reader back", () => {
     const expected = capture();
 
     const parkedAt = document.documentElement.scrollTop;
-    previewParking.scrollY = parkedAt;
+    parkThread(document.querySelector(`[data-row-id="${expected?.rowId ?? ""}"]`) as Element);
     document.documentElement.classList.add(HTML_PREVIEW_MAXIMIZED_CLASS);
     try {
       // Clamped short of the top: reaching it would page older rows in and
@@ -1078,7 +1213,32 @@ describe("a replaced page puts the reader back", () => {
       expect(capture()).toEqual(expected);
     } finally {
       document.documentElement.classList.remove(HTML_PREVIEW_MAXIMIZED_CLASS);
-      previewParking.scrollY = null;
+      unparkThread();
+    }
+  });
+
+  // The parking is the card's slot, not a pixel offset: a foldable closing or
+  // opening under the preview rewraps every row, and the same offset would then
+  // point at different content. What is carried is where CLOSING the preview
+  // will put the reader — the card back at its old top.
+  it("measures from where closing the preview will put a rewrapped thread", async () => {
+    await open(60, 999);
+    await scrollTo(20 * ROW_H + 30);
+    const expected = capture();
+    parkThread(document.querySelector(`[data-row-id="${expected?.rowId ?? ""}"]`) as Element);
+    document.documentElement.classList.add(HTML_PREVIEW_MAXIMIZED_CLASS);
+    try {
+      rowH = 200;
+      expect(capture()).toEqual(expected);
+
+      document.documentElement.classList.remove(HTML_PREVIEW_MAXIMIZED_CLASS);
+      await act(async () => {
+        document.documentElement.scrollTop += parkedThreadShift() ?? 0;
+      });
+      expect(capture()).toEqual(expected);
+    } finally {
+      document.documentElement.classList.remove(HTML_PREVIEW_MAXIMIZED_CLASS);
+      unparkThread();
     }
   });
 

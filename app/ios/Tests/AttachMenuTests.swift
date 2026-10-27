@@ -10,9 +10,9 @@ import Testing
 /// Every case works in the DOCK's own coordinate space — the one the `+`
 /// reports its frame in and the one the panel is laid out in — so the dock's
 /// top edge is `y = 0` and the panel's box, floating above it, is negative. The
-/// `+`'s x is what cannot be hardcoded the way the header's can
-/// (`ModelMenuPanel.anchorLeading`): the composer pill's horizontal padding
-/// animates between at-rest and focused. Its Y is measured too, but only as a
+/// `+`'s x is what cannot be hardcoded: the composer pill's horizontal padding
+/// animates between at-rest and focused, and on a wide window the whole row sits
+/// in the reading band. Its Y is measured too, but only as a
 /// witness: the panel's floor is the DOCK's top edge, and these cases are what
 /// hold it there while the `+` sinks under a notice line, an approval card and
 /// a staged strip.

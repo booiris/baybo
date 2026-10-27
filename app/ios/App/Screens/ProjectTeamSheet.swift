@@ -32,6 +32,8 @@ struct ProjectTeamSheet: View {
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
+            // Detents mean nothing to a regular-width form sheet; say what it is.
+            .presentationSizing(.form)
             .presentationBackground(Theme.paper)
         }
         .confirmationDialog(

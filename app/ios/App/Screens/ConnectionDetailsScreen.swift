@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ConnectionDetailsScreen: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.sideRail) private var rail
     @ObservedObject private var lang = Lang.shared
     @ObservedObject private var connection = ConnectionStore.shared
     @StateObject private var diagnostics = ConnectionDiagnosticsStore(client: Baybo.client)
@@ -75,22 +76,21 @@ struct ConnectionDetailsScreen: View {
         ZStack {
             Text(verbatim: lang.t("connection.details"))
                 .font(Theme.mono(16))
-            HStack {
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 18, weight: .semibold))
-                        .frame(width: 42, height: 42)
+            if rail == nil {
+                HStack {
+                    BackCircle(label: lang.t("connection.back")) { dismiss() }
+                        .accessibilityIdentifier("connection.back")
+                    Spacer()
                 }
-                .glassSurface(interactive: true, in: .circle)
-                .accessibilityLabel(Text(verbatim: lang.t("connection.back")))
-                .accessibilityIdentifier("connection.back")
-                Spacer()
             }
         }
         .padding(.horizontal, 24)
         .frame(height: ChatHeaderView.barHeight)
+        .frame(maxWidth: .infinity)
+        .sideRailItems(rail) {
+            BackCircle(label: lang.t("connection.back")) { dismiss() }
+                .accessibilityIdentifier("connection.back")
+        }
         .background(Theme.paper)
     }
 

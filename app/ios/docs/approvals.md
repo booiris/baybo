@@ -18,6 +18,20 @@ derived **natively in `pushFrame`** — NOT mirrored from the webview:
 So a web-held queue could lose the only way to answer a gate that is about to
 deny.
 
+## The detail never truncates — it scrolls, in a box sized to the window
+
+What the call wants to do (the resource lines and the params preview) is **never
+truncated**: a shell line's tail is where the teeth are. A body taller than its box
+becomes a scroller with a bottom fade instead. The box's height is an INPUT,
+`ApprovalCardView(maxDetailHeight:)`, computed by `ApprovalCardView.detailCap(available:)`
+from the free height the HOST measures — `ChatScreen`, and `ProjectIssueScreen` for the
+card dock that shares the view — outside the dock's inset, so it is the screen less the
+keyboard and never depends on the dock's own rows:
+`min(140, max(56, available × 0.3))`. A phone in portrait keeps the 140pt it always had;
+a short window (a foldable's outer display in landscape, the inner display or any phone
+in landscape with the keyboard up) gets a shorter box so the card cannot push the pill
+off the bottom. Unmeasured reads as 140. `ApprovalDetailCapTests` pins the curve.
+
 ## Four inputs, one per way a prompt appears or goes away
 
 - **`approval_requested`** — deduped, because the gate's waker re-fires on the

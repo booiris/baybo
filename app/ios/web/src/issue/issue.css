@@ -28,7 +28,11 @@
   word-break: break-word;
   overflow-wrap: anywhere;
   -webkit-overflow-scrolling: touch;
-  padding: calc(env(safe-area-inset-top, 0px) + 58px) 20px 0;
+  /* The transcript's reading band (styles.css `--reading-width`): the page
+     stays the full-width scroller and only its content is capped. */
+  padding: calc(env(safe-area-inset-top, 0px) + 58px) 0 0;
+  padding-left: calc(var(--reading-band-left) + 20px);
+  padding-right: calc(var(--reading-band-right) + 20px);
   box-sizing: border-box;
   color: var(--color-ink);
   background: var(--color-paper);

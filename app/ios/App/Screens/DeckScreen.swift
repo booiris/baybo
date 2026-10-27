@@ -3,7 +3,7 @@ import SwiftUI
 
 /// The Deck tab (docs/modules/deck.md): a native empty state over the warm,
 /// full-bleed card-grid webview, under the shared wordmark header, with an
-/// edit-mode Done pill and native destructive confirmation.
+/// edit-mode control and native destructive confirmation.
 struct DeckScreen: View {
     @EnvironmentObject private var store: AppStore
     @ObservedObject private var lang = Lang.shared
@@ -17,6 +17,7 @@ struct DeckScreen: View {
 }
 
 private struct DeckContent: View {
+    @Environment(\.sideRail) private var rail
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject var deck: DeckStore
     let host: DeckHost
@@ -40,7 +41,7 @@ private struct DeckContent: View {
             // The header (wordmark + ☰ menu) STAYS on a maximized card — the
             // maximized card fills the area below it and its content scrolls
             // under the header's paper veil, same as the grid. Only the edit
-            // pill is suppressed while maximized (you can't reorder/resize a
+            // button is suppressed while maximized (you can't reorder/resize a
             // card that's expanded); see `header`.
             header
         }
@@ -144,33 +145,45 @@ private struct DeckContent: View {
     private var header: some View {
         HomeHeaderView()
             .overlay(alignment: .leading) {
-                    // The Chats header's ☰ grammar: one glass circle, menu
-                    // entries for the section's secondary surfaces. Deck has
-                    // one — the recycle bin.
-                    Menu {
-                        Button {
-                            appStore.openDeckRecycle()
-                        } label: {
-                            Label(
-                                lang.t("deck.menuRecycle"),
-                                systemImage: "arrow.uturn.backward")
-                        }
-                    } label: {
-                        Image(systemName: "line.3.horizontal")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 45, height: 45)
-                    }
-                    .glassSurface(interactive: true, in: .circle)
-                    .accessibilityLabel(Text(verbatim: lang.t("list.menu")))
-                    .padding(.leading, 20)
+                if rail == nil {
+                    menu.padding(.leading, 20)
                 }
-                .overlay(alignment: .trailing) { trailingControl }
+            }
+            .overlay(alignment: .trailing) {
+                if rail == nil {
+                    trailingControl.padding(.trailing, 20)
+                }
+            }
+            .sideRailItems(rail) {
+                menu
+                trailingControl
+            }
+    }
+
+    /// The Chats header's ☰ grammar: one glass circle, menu entries for the
+    /// section's secondary surfaces. Deck has one — the recycle bin.
+    private var menu: some View {
+        Menu {
+            Button {
+                appStore.openDeckRecycle()
+            } label: {
+                Label(
+                    lang.t("deck.menuRecycle"),
+                    systemImage: "arrow.uturn.backward")
+            }
+        } label: {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(Theme.ink)
+                .frame(width: 45, height: 45)
+        }
+        .glassSurface(interactive: true, in: .circle)
+        .accessibilityLabel(Text(verbatim: lang.t("list.menu")))
     }
 
     /// The header's top-right control. While a card is maximized it is the ✕
     /// that collapses it (the true top-right corner, above the header veil the
-    /// webview can't paint over); otherwise it is the edit pill — the only way
+    /// webview can't paint over); otherwise it is the edit button — the only way
     /// in and out of edit mode (reorder/resize/remove), no long-press entry.
     @ViewBuilder private var trailingControl: some View {
         if deck.maximized {
@@ -183,21 +196,19 @@ private struct DeckContent: View {
                     .frame(width: 45, height: 45)
             }
             .glassSurface(interactive: true, in: .circle)
-            .padding(.trailing, 20)
             .accessibilityLabel(Text(verbatim: lang.t("deck.editDone")))
             .transition(.opacity)
         } else if !deck.isEmpty {
             Button {
                 deck.setEditMode(!deck.editMode)
             } label: {
-                Text(verbatim: lang.t(deck.editMode ? "deck.editDone" : "deck.edit"))
-                    .font(Theme.mono(13))
+                Image(systemName: deck.editMode ? "checkmark" : "pencil")
+                    .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(Theme.ink)
-                    .padding(.horizontal, 14)
-                    .frame(height: 34)
+                    .frame(width: 45, height: 45)
             }
-            .glassSurface(interactive: true, in: .capsule)
-            .padding(.trailing, 20)
+            .glassSurface(interactive: true, in: .circle)
+            .accessibilityLabel(Text(verbatim: lang.t(deck.editMode ? "deck.editDone" : "deck.edit")))
             .transition(.opacity)
         }
     }

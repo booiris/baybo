@@ -5,6 +5,9 @@ struct IssueDock: View {
     @ObservedObject var store: IssueStore
     @ObservedObject var staging: ComposerStaging
     @ObservedObject var attach: AttachMenu
+    /// The approval card's detail ceiling (`ApprovalCardView.detailCap`), off
+    /// the height the hosting screen measured — the chat dock's rule.
+    let approvalDetailCap: CGFloat
     @ObservedObject private var lang = Lang.shared
 
     @State private var photoPicks: [PhotosPickerItem] = []
@@ -43,6 +46,8 @@ struct IssueDock: View {
             mentionRow
             composer
         }
+        // The chat dock's reading band (`ComposerView`); the veil stays full width.
+        .readingColumn()
         .padding(.top, 8)
         .padding(.bottom, dockBottomPadding)
         .background(alignment: .bottom) { veil }
@@ -71,6 +76,7 @@ struct IssueDock: View {
                 paramsPreview: "",
                 accesses: []),
             queued: max(0, store.pendingApprovals.count - 1),
+            maxDetailHeight: approvalDetailCap,
             onDecide: { decision in
                 store.resolveApproval(
                     callId: prompt.callId,

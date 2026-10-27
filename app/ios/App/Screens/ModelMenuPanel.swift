@@ -11,6 +11,9 @@ import SwiftUI
 struct ModelMenuPanel: View {
     @ObservedObject var store: ChatStore
     @ObservedObject var catalog: ModelCatalog
+    /// The model pill's frame in `anchorSpace`, reported by `ChatHeaderView` —
+    /// the panel's leading edge sits on the pill's.
+    let anchor: CGRect
     @Binding var isPresented: Bool
 
     private enum Level: Equatable {
@@ -20,13 +23,60 @@ struct ModelMenuPanel: View {
     }
 
     @State private var level: Level = .entries
+    /// This layer's own frame in `anchorSpace`: the origin the anchor is read
+    /// against, and the height the panel has to fit in — the stretch between the
+    /// status bar and the dock's top edge, keyboard already taken out.
+    @State private var bounds: CGRect = .zero
+    /// Natural height of the current level's rows, measured to decide whether
+    /// the panel has to become a scroller (`ApprovalCardView`'s idiom).
+    @State private var rowsHeight: CGFloat = 0
 
     /// The one width knob. Content-independent on purpose: rows truncate
     /// rather than stretch the panel.
     private static let panelWidth: CGFloat = 232
-    /// The pill's leading edge: bar padding 24 + back circle 42 + spacing 12 —
-    /// the panel blooms from where the pill starts.
-    private static let anchorLeading: CGFloat = 78
+    /// `ChatScreen`'s coordinate space, shared by the pill that reports its
+    /// frame and this panel that lays itself out against it.
+    static let anchorSpace = "baybo.chat.screen"
+    /// The panel's top edge, just under the header bar the pill rides in.
+    static let panelTop: CGFloat = ChatHeaderView.barHeight + 6
+    /// Air between the panel's bottom edge and the dock's top edge.
+    static let bottomClearance: CGFloat = 12
+    /// The shortest a scrolling panel gets: one row, so it never collapses to a
+    /// sliver on an absurdly short window.
+    static let minScrollHeight: CGFloat = 46
+
+    /// How tall the panel may draw, or `nil` when its rows fit as they are. A
+    /// short window — a foldable's outer display in landscape, the inner one or
+    /// any phone in landscape with the keyboard up — has less room under the
+    /// header than a long model list needs, and an uncapped panel ran on behind
+    /// the dock and the keyboard where its last rows could not be reached.
+    /// Unmeasured (`available <= 0`) never scrolls.
+    static func scrollHeight(rows: CGFloat, available: CGFloat) -> CGFloat? {
+        guard available > 0, rows > available else { return nil }
+        return max(minScrollHeight, available)
+    }
+
+    /// The panel's leading inset inside a layer whose frame is `bounds`: on the
+    /// pill's leading edge, held inside the layer so a narrow window can't push
+    /// the panel off its trailing side. Both frames are in `anchorSpace`, so a
+    /// Split View half's asymmetric insets are already in them.
+    static func leadingInset(anchor: CGRect, bounds: CGRect, panelWidth: CGFloat) -> CGFloat {
+        max(0, min(anchor.minX - bounds.minX, bounds.width - panelWidth))
+    }
+
+    /// The panel's top inset inside the layer: just under the header bar, or —
+    /// when the anchor sits lower, a circle in the side rail — level with it.
+    /// A rail anchor lies past the layer's trailing edge, so `leadingInset`
+    /// already clamps the panel flush against the column, beside the circle.
+    static func topInset(anchor: CGRect, bounds: CGRect) -> CGFloat {
+        max(panelTop, anchor.minY - bounds.minY)
+    }
+
+    /// Whether the panel opens beside a side-rail anchor rather than under a
+    /// pill in the bar — which edge it blooms from.
+    static func bloomsFromTrailing(anchor: CGRect, bounds: CGRect) -> Bool {
+        anchor.minX >= bounds.maxX
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -38,13 +88,46 @@ struct ModelMenuPanel: View {
                 .transition(.opacity)
 
             panel
-                .padding(.leading, Self.anchorLeading)
-                .padding(.top, ChatHeaderView.barHeight + 6)
-                .transition(.scale(scale: 0.92, anchor: .topLeading).combined(with: .opacity))
+                .padding(
+                    .leading,
+                    Self.leadingInset(anchor: anchor, bounds: bounds, panelWidth: Self.panelWidth)
+                )
+                .padding(.top, Self.topInset(anchor: anchor, bounds: bounds))
+                .transition(
+                    .scale(
+                        scale: 0.92,
+                        anchor: Self.bloomsFromTrailing(anchor: anchor, bounds: bounds)
+                            ? .topTrailing : .topLeading
+                    ).combined(with: .opacity))
+        }
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named(Self.anchorSpace))
+        } action: { frame in
+            bounds = frame
         }
     }
 
-    private var panel: some View {
+    @ViewBuilder private var panel: some View {
+        let cap = Self.scrollHeight(
+            rows: rowsHeight,
+            available: bounds.height - Self.topInset(anchor: anchor, bounds: bounds)
+                - Self.bottomClearance)
+        Group {
+            if let cap {
+                ScrollView { rows }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .frame(maxHeight: cap)
+            } else {
+                rows
+            }
+        }
+        .frame(width: Self.panelWidth)
+        .glassSurface(
+            in: RoundedRectangle(cornerRadius: Theme.radiusModal),
+            fallback: .regularMaterial, fallbackShadow: true)
+    }
+
+    private var rows: some View {
         VStack(alignment: .leading, spacing: 0) {
             switch level {
             case .entries:
@@ -55,10 +138,7 @@ struct ModelMenuPanel: View {
                 effortRows(entry: entry)
             }
         }
-        .frame(width: Self.panelWidth)
-        .glassSurface(
-            in: RoundedRectangle(cornerRadius: Theme.radiusModal),
-            fallback: .regularMaterial, fallbackShadow: true)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { rowsHeight = $0 }
     }
 
     // MARK: - Levels

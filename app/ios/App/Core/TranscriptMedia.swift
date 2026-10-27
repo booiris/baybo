@@ -172,7 +172,11 @@ final class TranscriptMedia {
     func downloadFile(blobId: String) {
         guard fileDownloads.insert(blobId).inserted else { return }
         pushFileState(blobId: blobId, state: "loading", loaded: 0)
-        Task {
+        // The download task holds `self` until the bytes land — it has to, to
+        // clear `fileDownloads` — so the strong capture is spelled out. The
+        // progress ticks stay weak: they hop to the main actor on their own and
+        // may arrive after the task is done.
+        Task { [self] in
             defer { fileDownloads.remove(blobId) }
             do {
                 _ = try await client.blobDownloadBytes(
