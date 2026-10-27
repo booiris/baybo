@@ -187,7 +187,15 @@ struct RootView: View {
             of: ChatSplit.engages(horizontal: horizontalSizeClass, vertical: verticalSizeClass),
             initial: true
         ) { _, split in
-            if store.splitView != split { store.splitView = split }
+            guard store.splitView != split else { return }
+            // Without animation: docking and undocking re-lay the SAME
+            // conversation, so the stack must not pop or push it. Animated, an
+            // unfold slid the old pushed screen off over the split for ~0.4s —
+            // empty, since the transcript webview had already moved to the
+            // docked pane — and a fold slid it back in.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { store.splitView = split }
         }
         .sheet(isPresented: $store.scanPresented) {
             ScanView()

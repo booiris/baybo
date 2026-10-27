@@ -54,12 +54,19 @@ struct ChatsTabView: View {
             )
             .frame(width: store.splitView ? ChatSplit.sidebarWidth : nil)
             .resolvesSideRail()
+            // The divider is drawn OVER the sidebar's edge, never laid out
+            // beside it: a hairline taking its 1/3pt from the conversation left
+            // the transcript webview a fractional width, which WebKit rounds its
+            // page UP from — a page wider than its view, so it panned sideways.
+            .overlay(alignment: .trailing) {
+                if store.splitView {
+                    Theme.line
+                        .frame(width: 1 / displayScale)
+                        .ignoresSafeArea()
+                }
+            }
 
             if store.splitView {
-                Theme.line
-                    .frame(width: 1 / displayScale)
-                    .ignoresSafeArea()
-
                 detail
                     .frame(maxWidth: .infinity)
                     .resolvesSideRail()
