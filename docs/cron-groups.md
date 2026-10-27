@@ -167,6 +167,14 @@ monochrome **clock glyph** — the user's mental model is *"my morning task"*, n
 > the in-content pinned tint and the custom pull-to-refresh. `DisclosureGroup` nests rows inside one
 > cell, which kills per-row `.swipeActions` outright.
 
+**The split-view sidebar is the exception, and it is web's shape.** On a window regular in both
+size classes (iPhone Duo's inner display) the list is a sidebar beside the docked conversation, and
+there a group is **drawn as a folder that opens in place**, as on the web (still derived, nothing
+stored): closed by default, a caret + the
+alarm glyph + the job's name, its fires drawn as separate indented rows beneath it — still one
+`List` row each, so they keep their swipes and the rule above holds. See `ChatListBuckets.sidebar`
+and [`app/ios/docs/navigation.md`](../app/ios/docs/navigation.md#the-split-view--appscreenschatsplitviewswift).
+
 ### Mark all read
 
 `PUT /v1/chat/sessions/{id}/read` is per-session and takes an ordinal the list client does not have.

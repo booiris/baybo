@@ -243,6 +243,9 @@ was tried and failed, and several name a bug that shipped once already.
   a scanner that tells a busy camera from a denied one, and header controls that move
   into a screen's side column (the side rail, see
   [`docs/navigation.md`](docs/navigation.md#the-side-rail--appsupportsiderailswift)).
+  The inner display turns the Chats tab into a split view — the list beside the
+  docked conversation, as on the web (see
+  [`docs/navigation.md`](docs/navigation.md#the-split-view--appscreenschatsplitviewswift)).
   The outer and inner displays, Split View (either half) and fold/unfold scroll
   anchoring have been checked on the iPhone Duo simulator (iOS 27.1); unfolding still
   drifts the transcript 24–76pt (see [`docs/transcript.md`](docs/transcript.md)).

@@ -14,7 +14,8 @@ contract.
 
 `AppStore` owns a cached `ChatStore` per opened session, LRU-bounded to
 `maxResidentStores` (12): after each activation, the least-recently-used stores beyond
-the cap that are idle (not the pushed session, `chatPath.last`) are evicted via
+the cap that are idle (not in `chatPath` — the pushed session, or the one docked
+beside the list in the split view) are evicted via
 `ChatStore.evict()`, which cancels the store's timers so it can deallocate and calls
 `chat_unsubscribe` to drop just that session's sink.
 

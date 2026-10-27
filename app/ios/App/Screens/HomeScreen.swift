@@ -115,7 +115,10 @@ struct HomeTabView: View {
             // reveal together on pop. Hiding the bar via `.toolbar(.hidden, for:
             // .tabBar)` from an inner stack instead pops it back in abruptly
             // AFTER the transition (the "bar missing then appears" glitch).
-            ChatListScreen(reselectEpoch: chatsReselectEpoch)
+            //
+            // On a wide, tall window the list is a sidebar and the conversation
+            // docks beside it instead (`ChatsTabView`).
+            ChatsTabView(reselectEpoch: chatsReselectEpoch)
         case .settings:
             section { SettingsScreen() }
         case .deck:

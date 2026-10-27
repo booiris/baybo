@@ -204,6 +204,45 @@ final class AppStore: ObservableObject {
         return ids
     }
 
+    /// Whether the Chats tab is a split view — the list beside the open
+    /// conversation — rather than a list that pushes it (`ChatSplit`). Set by
+    /// `RootView` off the window's size classes.
+    ///
+    /// While it is on, every conversation the user opens DOCKS: the path is
+    /// reset to `[.session(id)]` and the Chats tab is selected, wherever the
+    /// open came from. That keeps one rule true — at most one conversation in
+    /// the path, and it is the first route — which is what lets the one shared
+    /// transcript webview stay in one `ChatScreen` at a time.
+    @Published var splitView = false {
+        didSet {
+            guard splitView, !oldValue, dockedSession != nil else { return }
+            // Unfolding over a conversation a search result pushed: it docks
+            // in the Chats tab, so that is the tab to show.
+            homeTab = .chats
+        }
+    }
+
+    /// The conversation docked beside the list, if the split view holds one.
+    var dockedSession: String? {
+        Self.dockedSession(in: chatPath, splitView: splitView)
+    }
+
+    /// What the NavigationStack pushes: the path without the docked
+    /// conversation, which the Chats tab draws in place instead.
+    var stackPath: [ChatRoute] {
+        get { Self.stackPath(chatPath, docked: dockedSession) }
+        set { chatPath = dockedSession.map { [.session($0)] + newValue } ?? newValue }
+    }
+
+    static func dockedSession(in path: [ChatRoute], splitView: Bool) -> String? {
+        guard splitView, case .session(let sessionId) = path.first else { return nil }
+        return sessionId
+    }
+
+    static func stackPath(_ path: [ChatRoute], docked: String?) -> [ChatRoute] {
+        docked == nil ? path : Array(path.dropFirst())
+    }
+
     static func issueVisitIds(_ path: [ChatRoute]) -> Set<UUID> {
         Set(path.compactMap { route in
             guard case .projectIssue(let issue) = route else { return nil }
@@ -1467,8 +1506,11 @@ final class AppStore: ObservableObject {
         // `keepTab` is the one exception: a SEARCH hit's conversation should back
         // out to the results that found it, and since this push covers the whole
         // TabView, leaving the selection alone is all that takes.
-        if !keepTab { homeTab = .chats }
-        if appendToPath {
+        //
+        // The split view docks every conversation in the Chats tab instead, so
+        // there is no push to back out of and the tab follows it (`splitView`).
+        if !keepTab || splitView { homeTab = .chats }
+        if appendToPath && !splitView {
             if chatPath.last != .session(sessionId) {
                 chatPath.append(.session(sessionId))
             }
@@ -1825,8 +1867,10 @@ final class AppStore: ObservableObject {
         issueHostPool.discardIfIdle()
     }
 
+    /// Any conversation in the path is held, not just the top one: a docked
+    /// conversation stays mounted under whatever the stack pushes over it.
     private func isEvictable(_ sessionId: String, _: ChatStore) -> Bool {
-        chatPath.last != .session(sessionId)
+        !Self.sessionIds(chatPath).contains(sessionId)
     }
 
     private func evictStore(_ sessionId: String, _ store: ChatStore) async {

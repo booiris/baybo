@@ -10,6 +10,12 @@ struct ChatListScreen: View {
     /// Every change steps the list down to the next row carrying unread — without
     /// opening it and without marking anything read (`docs/chat-list.md`).
     let reselectEpoch: Int
+    /// The split view's sidebar (`ChatSplit`): one-line rows, and cron groups
+    /// as folders that open in place.
+    var sidebar = false
+    /// The conversation docked beside the sidebar; its row wears the selected
+    /// ground.
+    var selected: String? = nil
 
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var index = SessionIndex.shared
@@ -33,6 +39,9 @@ struct ChatListScreen: View {
     @State private var stepCursor: ChatListItem.ID?
     /// The row wearing the arrival ring, and which tap put it there.
     @State private var arrival: Arrival?
+    /// The sidebar's open cron folders, by job id. Closed by default, as on the
+    /// web: open, a half-hourly job buries every real chat under its fires.
+    @State private var expandedGroups: Set<String> = []
 
     private struct Arrival: Equatable {
         let id: ChatListItem.ID
@@ -104,6 +113,14 @@ struct ChatListScreen: View {
         ChatListBuckets.items(from: index.rows)
     }
 
+    /// What the unread walk steps through, in the order it is drawn.
+    private var walkItems: [ChatListItem] {
+        let items = listItems
+        guard sidebar else { return items }
+        return ChatListBuckets.sidebar(from: items, expanded: expandedGroups)
+            .compactMap(\.walkItem)
+    }
+
     var body: some View {
         let items = listItems
         ZStack(alignment: .top) {
@@ -154,6 +171,18 @@ struct ChatListScreen: View {
                 Task { await refresh() }
             }
         }
+        // The split view's twin of that edge: the list never leaves the screen,
+        // so leaving the docked conversation for another is the moment.
+        .onChange(of: appStore.dockedSession) { old, _ in
+            if old != nil { Task { await refresh() } }
+        }
+        // A docked cron fire opens its folder, so its selected row is on screen.
+        .onChange(of: selected, initial: true) { _, sessionId in
+            guard sidebar, let sessionId,
+                let jobId = ChatListBuckets.group(drawing: sessionId, in: listItems)
+            else { return }
+            expandedGroups.insert(jobId)
+        }
         // The gateway says our list mirror is behind — a `SessionActivity` for a
         // session this device has never listed, or a `Gap` that dropped one. This
         // is the ONLY live path by which a brand-new row (a cron fire, a chat
@@ -195,14 +224,24 @@ struct ChatListScreen: View {
 
     private func list(_ items: [ChatListItem]) -> some View {
         List {
-            ForEach(items) { item in
-                switch item {
-                case .chat(let row): chatRow(row)
-                case .cronGroup(let group): cronGroupRow(group)
+            if sidebar {
+                ForEach(ChatListBuckets.sidebar(from: items, expanded: expandedGroups)) { entry in
+                    sidebarRow(entry)
+                }
+            } else {
+                ForEach(items) { item in
+                    switch item {
+                    case .chat(let row): chatRow(row)
+                    case .cronGroup(let group): cronGroupRow(group)
+                    }
                 }
             }
         }
         .listStyle(.plain)
+        // The sidebar's lines set their own heights; the section labels would
+        // otherwise be padded out to a 44pt row (the plain list's default, which
+        // the phone list keeps).
+        .environment(\.defaultMinListRowHeight, sidebar ? 0 : 44)
         // Rows hold to the reading band on a wide window; the scroller, its
         // pull-to-refresh and the header over it stay full width.
         .readingColumnMargins()
@@ -244,20 +283,28 @@ struct ChatListScreen: View {
     /// An ordinary conversation: tap opens it; trailing swipe archives / deletes,
     /// leading swipe pins, long-press rebuilds the transcript.
     @ViewBuilder private func chatRow(_ row: SessionRow) -> some View {
-        Button {
-            appStore.openSession(row.id)
-        } label: {
-            SessionRowView(row: row, langCode: lang.current.lproj).equatable()
-        }
-        .background { arrivalRing(for: row.id) }
-        // CONSTANT background — the pinned tint lives in the row content
-        // (see SessionRowView), so a pin flip is a pure move, not a
-        // background-config swap that would blank the sliding row.
-        .listRowBackground(Theme.paper)
-        .separatorSpansContent()
-        .listRowSeparatorTint(Theme.line)
-        .listRowInsets(
-            EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset))
+        chatActions(
+            Button {
+                appStore.openSession(row.id)
+            } label: {
+                SessionRowView(row: row, langCode: lang.current.lproj).equatable()
+            }
+            .background { arrivalRing(for: row.id) }
+            // CONSTANT background — the pinned tint lives in the row content
+            // (see SessionRowView), so a pin flip is a pure move, not a
+            // background-config swap that would blank the sliding row.
+            .listRowBackground(Theme.paper)
+            .separatorSpansContent()
+            .listRowSeparatorTint(Theme.line)
+            .listRowInsets(
+                EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset)),
+            row)
+    }
+
+    /// A conversation's verbs, wherever its row is drawn — the phone list or the
+    /// sidebar.
+    private func chatActions(_ content: some View, _ row: SessionRow) -> some View {
+        content
         // Native swipe (real UIKit feel): first action = edge-most =
         // the full-swipe commit (archive). Grey archive, red delete.
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -313,17 +360,24 @@ struct ChatListScreen: View {
     /// other two are not destructive enough to want one — but a fling must not
     /// silently wipe 48 unread markers either.
     @ViewBuilder private func cronGroupRow(_ group: CronGroup) -> some View {
-        Button {
-            appStore.openCronGroup(group.jobId)
-        } label: {
-            CronGroupRowView(group: group, langCode: lang.current.lproj).equatable()
-        }
-        .background { arrivalRing(for: ChatListItem.cronGroup(group).id) }
-        .listRowBackground(Theme.paper)
-        .separatorSpansContent()
-        .listRowSeparatorTint(Theme.line)
-        .listRowInsets(
-            EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset))
+        groupActions(
+            Button {
+                appStore.openCronGroup(group.jobId)
+            } label: {
+                CronGroupRowView(group: group, langCode: lang.current.lproj).equatable()
+            }
+            .background { arrivalRing(for: ChatListItem.cronGroup(group).id) }
+            .listRowBackground(Theme.paper)
+            .separatorSpansContent()
+            .listRowSeparatorTint(Theme.line)
+            .listRowInsets(
+                EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset)),
+            group)
+    }
+
+    /// A cron group's verbs, on its phone row and on its sidebar folder alike.
+    private func groupActions(_ content: some View, _ group: CronGroup) -> some View {
+        content
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             if group.unread > 0 {
                 Button {
@@ -360,6 +414,45 @@ struct ChatListScreen: View {
         Task { @MainActor in
             try? await Task.sleep(for: Self.swipeDismissal)
             appStore.requestCronPin(jobId: group.jobId, pinned: !group.pinned)
+        }
+    }
+
+    /// One sidebar line. A folder's tap opens it in place rather than pushing
+    /// `CronGroupScreen`: the fires are one row each beneath it, with the same
+    /// swipes a conversation has anywhere else.
+    @ViewBuilder private func sidebarRow(_ entry: SidebarEntry) -> some View {
+        switch entry {
+        case .section(let section):
+            SidebarSectionLabel(title: lang.t(section.titleKey))
+                .sidebarLine()
+        case .chat(let row, let nested):
+            chatActions(
+                Button {
+                    appStore.openSession(row.id)
+                } label: {
+                    SidebarChatRow(row: row, nested: nested, selected: row.id == selected)
+                        .equatable()
+                }
+                .background { arrivalRing(for: entry.id) }
+                .sidebarLine(),
+                row)
+        case .cronFolder(let group, let expanded):
+            groupActions(
+                Button {
+                    toggleFolder(group.jobId)
+                } label: {
+                    SidebarFolderRow(group: group, expanded: expanded).equatable()
+                }
+                .background { arrivalRing(for: entry.id) }
+                .sidebarLine(),
+                group)
+        }
+    }
+
+    private func toggleFolder(_ jobId: String) {
+        Haptics.tap()
+        withAnimation(.easeOut(duration: ChatSplit.folderToggle)) {
+            if expandedGroups.remove(jobId) == nil { expandedGroups.insert(jobId) }
         }
     }
 
@@ -430,11 +523,11 @@ struct ChatListScreen: View {
     /// released. The cursor is left untouched so the next tap resumes rather than
     /// skipping a row.
     ///
-    /// `listItems` is re-derived here rather than captured from the body pass, so
+    /// `walkItems` is re-derived here rather than captured from the body pass, so
     /// publish/body ordering cannot hand the walk a stale array.
     private func stepToNextUnread(proxy: ScrollViewProxy, epoch: Int) {
         guard !dragging,
-            let target = ChatListBuckets.nextUnread(after: stepCursor, in: listItems)
+            let target = ChatListBuckets.nextUnread(after: stepCursor, in: walkItems)
         else { return }
         stepCursor = target
         arrival = Arrival(id: target, epoch: epoch)
@@ -460,7 +553,7 @@ struct ChatListScreen: View {
             // wrap onto the only unread row) is `Equatable`-identical, so without
             // it the ring would not remount and the tap would look dropped. Same
             // reason the transcript's jump ring replays off a nonce.
-            ArrivalRing().id(arrival.epoch)
+            ArrivalRing(fitsRow: sidebar).id(arrival.epoch)
         }
     }
 
@@ -535,6 +628,10 @@ struct ChatListScreen: View {
 /// A cell recycled and returned inside the mark's lifetime re-blooms. Accepted: the
 /// ringed row is the one just scrolled to, so it is on screen.
 private struct ArrivalRing: View {
+    /// A sidebar line is its own rounded ground, so the ring traces it exactly
+    /// instead of bleeding out past a gutter.
+    let fitsRow: Bool
+
     @State private var lit = false
     @State private var bloomed = false
 
@@ -553,10 +650,12 @@ private struct ArrivalRing: View {
     static let lifetime: Duration = hold + .milliseconds(Int(fade * 1000))
 
     var body: some View {
-        RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+        RoundedRectangle(
+            cornerRadius: fitsRow ? ChatSplit.rowRadius : Theme.radius, style: .continuous
+        )
             .strokeBorder(Theme.ink, lineWidth: Self.lineWidth)
-            .padding(.horizontal, -(ChatListScreen.rowHInset - Self.edgeInset))
-            .padding(.vertical, Self.verticalInset)
+            .padding(.horizontal, fitsRow ? 0 : -(ChatListScreen.rowHInset - Self.edgeInset))
+            .padding(.vertical, fitsRow ? 0 : Self.verticalInset)
             .opacity(lit ? 1 : 0)
             .scaleEffect(bloomed ? 1 : Self.bloomScale)
             .allowsHitTesting(false)
@@ -587,8 +686,8 @@ struct SessionRowView: View, Equatable {
 
     var body: some View {
         ChatRowBody(
-            headline: headline,
-            headlineIsSet: hasHeadline,
+            headline: Self.headline(row),
+            headlineIsSet: Self.hasHeadline(row),
             preview: row.preview,
             lastActive: row.lastActive,
             unread: row.unread,
@@ -614,12 +713,13 @@ struct SessionRowView: View, Equatable {
 
     /// Bold first line: the title, else a short snippet of the user's last
     /// message, else a quiet placeholder for a session with no user turn yet.
-    private var headline: String {
+    /// Shared with the sidebar's one-line row (`SidebarChatRow`).
+    static func headline(_ row: SessionRow) -> String {
         let named = SessionHeadline.text(title: row.title, userText: row.userText)
         return named.isEmpty ? Lang.shared.t("list.previewPlaceholder") : named
     }
 
-    private var hasHeadline: Bool {
+    static func hasHeadline(_ row: SessionRow) -> Bool {
         !(row.title ?? "").isEmpty || !(row.userText ?? "").isEmpty
     }
 }
@@ -793,51 +893,58 @@ struct ChatRowBody: View {
             Spacer(minLength: 0)
             if approvalPending || unread > 0 {
                 HStack(spacing: 6) {
-                    if approvalPending { approvalMark }
-                    if unread > 0 { unreadBadge }
+                    if approvalPending { ChatRowApprovalMark() }
+                    if unread > 0 { ChatRowUnreadBadge(count: unread) }
                 }
             }
         }
         .fixedSize(horizontal: true, vertical: false)
     }
+}
 
-    /// A conversation waiting on the user's decision.
-    ///
-    /// A LINE glyph, not a filled shape: every filled capsule in this row's
-    /// vocabulary is a COUNT (`unreadBadge`, the ink CTA pill), and a second
-    /// ink capsule beside the first would read as a second number. Ink rather
-    /// than `Theme.err`, because red is the destructive token and
-    /// `ApprovalCardView` already spends it on Deny alone — painting the
-    /// REQUEST in the colour of the refusal collapses the feature's two states
-    /// into one hue.
-    ///
-    /// Static, not breathing. The transcript's blocked step animates to
-    /// separate *waiting* from *executing* among sibling steps, a distinction a
-    /// list row does not have; a repeating animation inside a scrolling `List`
-    /// reads as flicker and makes headless screenshot checks nondeterministic.
-    /// Salience comes from weight instead — full ink against a column whose
-    /// only other resident is 11pt `inkSoft`.
-    private var approvalMark: some View {
+/// A conversation waiting on the user's decision — on a chat-list row, a
+/// sidebar line, or (OR-ed over its fires) a cron group.
+///
+/// A LINE glyph, not a filled shape: every filled capsule in this row's
+/// vocabulary is a COUNT (`ChatRowUnreadBadge`, the ink CTA pill), and a second
+/// ink capsule beside the first would read as a second number. Ink rather
+/// than `Theme.err`, because red is the destructive token and
+/// `ApprovalCardView` already spends it on Deny alone — painting the
+/// REQUEST in the colour of the refusal collapses the feature's two states
+/// into one hue.
+///
+/// Static, not breathing. The transcript's blocked step animates to
+/// separate *waiting* from *executing* among sibling steps, a distinction a
+/// list row does not have; a repeating animation inside a scrolling `List`
+/// reads as flicker and makes headless screenshot checks nondeterministic.
+/// Salience comes from weight instead — full ink against a column whose
+/// only other resident is 11pt `inkSoft`.
+struct ChatRowApprovalMark: View {
+    var body: some View {
         Image(systemName: "hand.raised")
             .font(.system(size: 13, weight: .medium))
             .foregroundStyle(Theme.ink)
             .frame(width: 18, height: 18)
             .accessibilityLabel(Text(Lang.shared.t("list.approvalPending")))
     }
+}
 
-    /// The unread count: an ink capsule with paper digits, matching the ink CTA
-    /// pill (`99+` past the cap). On a group row it is the SUM over the fires
-    /// drawn inside it — never a member that escaped to the pinned block or the
-    /// archived screen, which would make the badge disagree with what the user
-    /// sees on opening the group.
-    private var unreadBadge: some View {
-        Text(verbatim: unread > 99 ? "99+" : String(unread))
+/// The unread count: an ink capsule with paper digits, matching the ink CTA
+/// pill (`99+` past the cap). On a group row it is the SUM over the fires
+/// drawn inside it — never a member that escaped to the pinned block or the
+/// archived screen, which would make the badge disagree with what the user
+/// sees on opening the group.
+struct ChatRowUnreadBadge: View {
+    let count: Int
+
+    var body: some View {
+        Text(verbatim: count > 99 ? "99+" : String(count))
             .font(Theme.sys(11, weight: .medium))
             .foregroundStyle(Theme.paper)
             .padding(.horizontal, 6)
             .frame(minWidth: 18, minHeight: 18)
             .background(Theme.ink, in: Capsule())
-            .accessibilityLabel(Text(verbatim: "\(unread)"))
+            .accessibilityLabel(Text(verbatim: "\(count)"))
     }
 }
 
