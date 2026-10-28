@@ -559,7 +559,7 @@ pub(crate) fn tool_completed_block(
     lines
 }
 
-/// Footer committed when a turn (turn) finishes: a "cooked for <duration>"
+/// Footer committed when a turn (turn) finishes: a "cooked for `<duration>`"
 /// stamp of the wall-clock the turn took.
 pub(crate) fn render_cooked_for_line(elapsed: Duration) -> Vec<Line<'static>> {
     vec![Line::from(Span::styled(

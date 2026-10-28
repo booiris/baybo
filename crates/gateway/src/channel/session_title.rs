@@ -6,8 +6,8 @@
 //! surface can push the change to its live clients. This is that sink for the
 //! channel layer: a channel-wide `SessionUpdated { patch.title }` broadcast —
 //! the same mechanism the pin / hide / folder mutations use (see
-//! `crate::api::admin::chat::broadcast_session_patch`) and a sibling of the
-//! `super::session_pulse::SessionPulse` activity broadcaster.
+//! [`crate::api::admin::chat::broadcast_session_patch`]) and a sibling of the
+//! [`super::session_pulse::SessionPulse`] activity broadcaster.
 //!
 //! Lives here (not in the agent layer) so the agent stays channel-agnostic:
 //! it only knows the narrow trait, and the gateway decides how to fan out.

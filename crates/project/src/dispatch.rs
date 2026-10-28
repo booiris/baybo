@@ -1,7 +1,7 @@
 //! Turning a recorded run into something executable.
 //!
 //! [`ProjectManager`](crate::ProjectManager) writes the ledger row and hands
-//! it to a [`RunDispatch`](crate::RunDispatch); what that dispatcher owes the
+//! it to a [`RunDispatch`]; what that dispatcher owes the
 //! executor is here. See `docs/modules/project.md` for the race a dispatcher
 //! shares with the boot sweep — the checkout is cut before the claim, so two
 //! dispatchers on one row both reach `worktree::ensure`.

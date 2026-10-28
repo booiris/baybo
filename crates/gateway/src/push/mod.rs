@@ -21,7 +21,7 @@
 //! session on `tui` or a Multiplexed channel answers `NotFound`. Pushing those
 //! buzzed a phone about a conversation it could not open — and about work the
 //! user was already watching on the surface that started it. See
-//! `PushDispatcher::is_pushable_session`.
+//! [`PushDispatcher::is_pushable_session`].
 //!
 //! Modeled on `spawn_turn_state_projector`: subscribe synchronously, then a
 //! `select!` loop over the bus with `Lagged`/`Closed` handling (push is
@@ -807,7 +807,7 @@ impl PushDispatcher {
     }
 
     /// Build + sign the `/notify` body and POST it to `notify_url`. Split out of
-    /// [`Self::dispatch_to_device`] so the 404 self-heal path can re-send the same
+    /// [`Self::dispatch_to_target`] so the 404 self-heal path can re-send the same
     /// push (with a fresh, strictly-larger counter) after a forced re-register.
     async fn post_notify(
         &self,

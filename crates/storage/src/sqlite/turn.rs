@@ -21,8 +21,9 @@ const SELECT_COLS: &str = "id, session_id, parent_turn_id, kind, status_kind, \
      created_at, started_at, ended_at, data";
 
 /// `status_kind` values of a turn that has NOT settled — the SQL spelling of
-/// [`TurnStatusKind::needs_recovery`]. Three queries filter on exactly this
-/// set (recover at boot, list a session's live turns, find who is mid-turn
+/// `baybo_turn::TurnStatusKind::needs_recovery`. Three queries filter on
+/// exactly this set (recover at boot, list a session's live turns, find who
+/// is mid-turn
 /// right now), and the same three literals in three places is how they drift
 /// apart; `status_sql_matches_the_enum` pins this against the enum.
 const NON_TERMINAL_STATUS_SQL: &str = "'pending', 'in_progress', 'stuck'";

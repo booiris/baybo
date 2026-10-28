@@ -567,7 +567,7 @@ impl SessionManager {
     /// at `cap` exactly as the chat list clamps its per-row badge.
     ///
     /// This is what the app-icon badge counts. It goes through the same
-    /// `fold_unread` as [`Self::chat_list_scan`] on purpose: the number on
+    /// [`fold_unread`] as [`Self::chat_list_scan`] on purpose: the number on
     /// the icon and the numbers on the rows are the same claim, and two
     /// implementations of it would drift into disagreeing with each other on
     /// the user's home screen.

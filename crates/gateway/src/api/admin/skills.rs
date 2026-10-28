@@ -28,7 +28,7 @@ pub struct SkillInfo {
     pub universal: bool,
 }
 
-/// Query for `list_skills`.
+/// Query for [`list_skills`].
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct ListSkillsQuery {
     /// Whose scope to list. Absent = the default scope, which is the

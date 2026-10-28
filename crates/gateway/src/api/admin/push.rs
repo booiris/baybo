@@ -9,7 +9,7 @@
 //!    client can sign a delegation over it) and whether push is configured.
 //! 2. `POST /v1/push/register` → the client's Ed25519 public key, push target, a
 //!    client-generated preview `push_key`, and the delegation. The gateway
-//!    verifies the delegation and persists the binding (`crate::push::web`).
+//!    verifies the delegation and persists the binding ([`crate::push::web`]).
 //!
 //! The resulting binding is cryptographically identical to a paired device's, so
 //! the dispatcher, the remote host (C), and platform decrypt paths are unchanged. See

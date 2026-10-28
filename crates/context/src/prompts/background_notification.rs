@@ -83,8 +83,9 @@ const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result index="{{index}}" handle="
 /// an "I already answered above" artifact.
 ///
 /// Never persisted: it is applied as a request-time suffix
-/// ([`ContextManager::set_notification_cue`]) only while the transcript tail is
-/// an assistant row, so it is recomputed per request rather than carrying an
+/// ([`ContextManager::set_notification_cue`](crate::ContextManager::set_notification_cue))
+/// only while the transcript tail is an assistant row, so it is recomputed
+/// per request rather than carrying an
 /// attempt number — a persisted, attempt-keyed cue was a no-op on the exact
 /// crash-replay it had to survive (the counter only advances on an observed
 /// failure) and left permanent rows in the append-only log.

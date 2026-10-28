@@ -295,8 +295,10 @@ impl Router {
     /// agent with unconsolidated conversations, in no particular order.
     /// Empty when there is nothing anywhere.
     ///
-    /// Selection is [`SessionStore::dream_candidates`]: an ordinal cursor per
-    /// session, falling back to a time window for one never offered before.
+    /// Selection is
+    /// [`SessionStore::dream_candidates`](baybo_store::SessionStore::dream_candidates):
+    /// an ordinal cursor per session, falling back to a time window for one
+    /// never offered before.
     /// The window's lower bound is [`CronTriggerEvent::previous_fire_at`],
     /// which rides the execution row precisely because the job row's own
     /// `last_triggered_at` has already been advanced to *this* fire by the

@@ -234,7 +234,7 @@ impl CronScheduler {
         Ok(job)
     }
 
-    /// Seed or reconcile the built-in dream job ([`BuiltinCronJob::Dream.id()`]).
+    /// Seed or reconcile the built-in dream job ([`BuiltinCronJob::Dream.id()`](BuiltinCronJob::id)).
     ///
     /// Idempotent, and deliberately asymmetric about who wins:
     ///

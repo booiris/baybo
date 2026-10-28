@@ -17,7 +17,7 @@ pub fn oauth_client_secret(name: &str) -> String {
     format!("mcp.{name}.oauth.client_secret")
 }
 
-/// Single key carrying the JSON-serialized rmcp [`StoredCredentials`]
+/// Single key carrying the JSON-serialized rmcp [`StoredCredentials`](rmcp::transport::auth::StoredCredentials)
 /// (client_id + access_token + refresh_token + granted_scopes +
 /// token_received_at). Replaces the earlier split between
 /// `oauth.access_token` and `oauth.refresh_token` so refresh-on-demand

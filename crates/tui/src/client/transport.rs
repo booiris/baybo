@@ -1,12 +1,12 @@
 //! WebSocket + MessagePack-backed TUI transport.
 //!
 //! Wraps [`WsClient`] and a local [`ApprovalQueue`]. User input is
-//! sent as [`wire::Message`] frames; streaming deltas, final responses,
-//! notices, and approval events flow back as typed [`wire::Frame`]s
+//! sent as [`wire::Message`](baybo_channels::wire::Message) frames; streaming deltas, final responses,
+//! notices, and approval events flow back as typed [`wire::Frame`](baybo_channels::wire::Frame)s
 //! and are mapped onto the TUI's [`TransportEvent`].
 //!
 //! Outbound approvals — driven by the TUI's modal — travel over the
-//! same socket as [`wire::Frame::ResolveApproval`] so the gateway's
+//! same socket as [`wire::Frame::ResolveApproval`](baybo_channels::wire::Frame::ResolveApproval) so the gateway's
 //! per-connection approval gate releases the pending tool call.
 
 use std::net::SocketAddr;

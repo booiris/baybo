@@ -1,4 +1,4 @@
-//! Concrete channel handle stored in [`ChannelRegistry`].
+//! Concrete channel handle stored in [`ChannelRegistry`](crate::ChannelRegistry).
 //!
 //! A `Channel` is a *protocol surface* (telegram, weixin, tui, http,
 //! …) — 1:1 with `ChannelType`. It owns its
@@ -511,7 +511,7 @@ impl<'a> SubscribedView<'a> {
     /// is [`ConnectionNotFoundError`] (the id never `attach`-ed or
     /// was already `detach`-ed) — the previous `WrongKind` variant
     /// is structurally unreachable once you hold a `SubscribedView`,
-    /// and the other [`ChannelError`] variants never originate from
+    /// and the other [`ChannelError`](crate::ChannelError) variants never originate from
     /// this code path. Surfacing only the one real failure mode
     /// keeps `match` arms honest at the call site.
     pub fn subscribe(

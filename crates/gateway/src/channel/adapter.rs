@@ -1,7 +1,7 @@
 //! Per-WebSocket gateway state.
 //!
 //! After the Channel / Connection / Subscription refactor each WS
-//! upgrade produces one [`WsConnection`] that:
+//! upgrade produces one [`Sidecar`] that:
 //!
 //! * Looks up the per-type [`Channel`] in the workspace
 //!   [`ChannelRegistry`] (the registry is populated at gateway boot
@@ -287,7 +287,7 @@ impl Sidecar {
     /// a pending entry matched the call id. The session id is read off
     /// the resolved queue entry — the connection-side frame doesn't
     /// carry one, and dispatching with an empty id on a
-    /// [`ChannelKind::Subscribed`] channel would silently fan out to
+    /// [`ChannelKind::Subscribed`](baybo_channels::ChannelKind::Subscribed) channel would silently fan out to
     /// nobody.
     pub(crate) fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> bool {
         let Some(session_id) = self.channel.resolve_approval(call_id, decision) else {

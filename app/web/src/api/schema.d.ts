@@ -1991,7 +1991,7 @@ export interface components {
             /**
              * @description Preview text drawn from the session's most-recent **displayable**
              *     message regardless of author — the newest user prompt or final
-             *     assistant answer carrying text, truncated to `PREVIEW_MAX_CHARS`.
+             *     assistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].
              *     Telegram-style list clients render this as the row's second line so
              *     the preview follows the conversation (an agent reply shows once it
              *     lands), while [`Self::last_user_text`] stays the user-only label the
@@ -2001,7 +2001,7 @@ export interface components {
             last_message_text?: string | null;
             /**
              * @description Preview text drawn from the session's most-recent user-authored
-             *     message, truncated to `PREVIEW_MAX_CHARS`. The web sidebar
+             *     message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
              *     renders this as the row label so users can scan past
              *     conversations by what they last asked. `None` for sessions
              *     without a user turn yet (a freshly-created row, or one whose
@@ -2021,7 +2021,7 @@ export interface components {
              * Format: int64
              * @description Number of unread assistant replies — final assistant messages persisted
              *     with `ordinal` above this session's read cursor
-             *     (`PUT /v1/chat/sessions/{id}/read`), capped at `UNREAD_COUNT_CAP`
+             *     (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
              *     (the client renders the cap as "N+"). Server-computed, so it is
              *     accurate across a cold restart / a device that missed the live
              *     `SessionActivity` pings. `0` when caught up.

@@ -2,7 +2,7 @@
 //!
 //! Sidecars (Telegram, WeChat, …) don't carry their own slash handler:
 //! whatever the user types reaches the gateway as a normal
-//! [`Frame::Message`]. A handful of commands need server-side state
+//! [`Frame::Message`](baybo_channels::wire::Frame::Message). A handful of commands need server-side state
 //! (the `(channel_type, user_id) → session_id` mapping in particular),
 //! so the gateway intercepts them right after the pairing gate and
 //! before [`ChannelSessionResolver::resolve_or_create`].

@@ -248,7 +248,7 @@ pub struct ContextManager {
     /// a skill whose `channels:` frontmatter excludes this channel is
     /// invisible to the session.
     pub(crate) channel: baybo_model::ChannelType,
-    /// Which preamble [`Self::system_prompt`] opens with; see
+    /// Which preamble [`Self::resolve_system_prompt`] opens with; see
     /// [`crate::prompts::soul::PromptShape`].
     shape: crate::prompts::soul::PromptShape,
     /// Owned conversation transcript — the sole source of truth.

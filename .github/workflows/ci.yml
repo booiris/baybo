@@ -134,6 +134,22 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo clippy --all --benches --tests --examples --all-features --locked -- -D warnings
 
+  rustdoc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
+    # Same reason as `clippy`: `cargo doc` runs the gateway build script.
+    env:
+      BAYBO_SKIP_WEBUI: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        # Master writes the cache, a PR only restores it — see the `on:` note.
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+      # The script is the single spelling of the gate; CLAUDE.md points at it too.
+      - run: scripts/check-rustdoc.sh --locked
+
   test:
     name: cargo test
     runs-on: ubuntu-latest

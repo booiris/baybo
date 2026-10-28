@@ -173,7 +173,7 @@ fn needs_staffing(issue: &IssueRow, spoken_for: &BTreeSet<i64>, held: &BTreeSet<
 /// Which of two ready cards goes first: the more urgent, then the one the
 /// operator put higher in the column.
 ///
-/// The same order [`IssueList`](crate::tools::IssueList) already reads a
+/// The same order [`IssueList`](crate::tools::ISSUE_LIST_TOOL_NAME) already reads a
 /// column in, and that is the point — "what is next in Todo" has one
 /// answer, whether an agent asks for it or the board acts on it.
 ///

@@ -8,7 +8,7 @@
 //! and one whose maximized view could not scroll.
 //!
 //! This runs the card's own script against the card's own first snapshot,
-//! through the real [`sdkCard.js`] the client injects, and answers the one
+//! through the real `sdkCard.js` the client injects ([`CARD_SDK_JS`]), and answers the one
 //! question a JSON schema cannot: **did handing this card its data change
 //! anything it displays?** A card that throws, that reads a field its service
 //! never emits, or that never wires `deck.onData` fails that question

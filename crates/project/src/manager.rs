@@ -211,7 +211,8 @@ pub struct NewTeamMember {
     /// `None` follows the workspace default (baybo). Only the operator's
     /// form sets this; `ProjectAgentCreate` deliberately does not.
     pub framework: Option<AgentFramework>,
-    /// What this teammate runs on. [`LlmPin::unpinned`] follows the
+    /// What this teammate runs on.
+    /// [`LlmPin::unpinned`](baybo_model::LlmPin::unpinned) follows the
     /// deployment's defaults at every level.
     pub llm: baybo_model::LlmPin,
 }
@@ -1222,7 +1223,7 @@ impl ProjectManager {
 
     /// Whether the standing cancel is the operator's. Read failures answer
     /// yes, which leaves their stop where it is — the same direction
-    /// [`block_is_a_question`] fails in, reached from its other side.
+    /// [`Self::block_is_a_question`] fails in, reached from its other side.
     async fn stopped_by_a_person(&self, issue: &IssueRow) -> bool {
         match self.store.list_events(&issue.id).await {
             Ok(events) => crate::driver::cancel_is_a_persons_stop(&events),

@@ -28,7 +28,7 @@ impl PermissionMode {
     /// The one home for the question, because the tools that ask it declare
     /// their resources independently and a second spelling would be a tool
     /// that kept prompting after the operator turned prompting off. It is
-    /// deliberately *not* [`super::bash::permission_skips_os_sandbox`]: that
+    /// deliberately *not* `bash::permission_skips_os_sandbox`: that
     /// one answers which execution route a command takes and folds in the
     /// `bench-bash` build, which has no bearing on whether a file write
     /// needs a human.
