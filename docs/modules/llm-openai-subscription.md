@@ -127,8 +127,11 @@ The setup wizard seeds a lite model only when the actual catalog lists it.
 
 The existing rig-to-Responses conversion handles system instructions, messages,
 images, PDFs, function calls/results, reasoning and prompt cache keys.
-New connections do not send Codex originator, account, experimental or cache
-affinity headers.
+New connections do not send Codex originator, account or experimental headers.
+They do send the cache affinity headers (`session-id`, `thread-id`,
+`x-client-request-id`): the body `prompt_cache_key` alone does not pin a
+conversation to one cache node, and dropping the headers took the hit rate
+from ~95% to ~13%.
 
 Inference succeeds only after a valid `response.completed` event.
 Interrupted streams, `response.failed`, `response.incomplete` and explicit
