@@ -1,5 +1,5 @@
 //! `bench-web` — a standalone, read-only viewer for the on-disk
-//! artifacts the bench harnesses (`bench/swe`, `bench/terminal-bench-*`,
+//! artifacts the bench harnesses (`bench/swe`, `bench/terminal-bench-2.0`,
 //! `bench/memory`) leave under their `results/` and `trace/` dirs.
 //!
 //! It scans the filesystem fresh on every request (completed runs only),

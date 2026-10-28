@@ -1,0 +1,3 @@
+# The bench/ uv workspace venv (rebuilt by `uv sync`); pyproject.toml, uv.lock
+# and .python-version ARE tracked.
+/.venv/

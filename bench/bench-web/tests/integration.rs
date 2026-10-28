@@ -44,18 +44,9 @@ const SWE_NOOP_RUN: &str = r#"{
   "results": [{"instance_id": "repo__pkg-1", "repo": "repo/pkg", "resolved": false, "empty_patch": true}]
 }"#;
 
-const TB1_RUN: &str = r#"{
-  "id": "uuid-1", "results": [{"task_id": "mytask",
-    "trial_name": "mytask.1-of-1.2026-02-02__00-00-00", "is_resolved": true,
-    "failure_mode": "unset", "parser_results": {"tests::a": "passed"}}]
-}"#;
-
-const TB1_META: &str = r#"{"model_name": "deepseek", "dataset_name": "core",
-  "start_time": "2026-02-02T00:00:00Z", "end_time": "2026-02-02T00:05:00Z"}"#;
-
 const TB2_RUN: &str = r#"{
   "id": "2026-03-03__00-00-00", "results": [{"task_id": "t2", "trial_name": "t2__abc",
-    "is_resolved": false, "failure_mode": "unset", "parser_results": {},
+    "is_resolved": false, "failure_mode": "test_failed", "parser_results": {"test_x": "failed"},
     "trace_path": "2026-03-03__00-00-00/t2/t2__abc/agent-logs/trace.json"}]
 }"#;
 
@@ -74,7 +65,7 @@ fn write(path: PathBuf, contents: &str) {
 }
 
 /// Build a synthetic bench root with swe (individual + merged + a
-/// `latest-*` symlink), terminal-bench-1.0, and terminal-bench-2.0.
+/// `latest-*` symlink) and terminal-bench-2.0.
 fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let r = dir.path();
@@ -113,20 +104,6 @@ fn fixture() -> tempfile::TempDir {
         PREDICTIONS,
     );
 
-    // terminal-bench 1.0 (trace path derived from trial_name)
-    write(
-        r.join("terminal-bench-1.0/results/results-2026-02-02__00-00-00.json"),
-        TB1_RUN,
-    );
-    write(
-        r.join("terminal-bench-1.0/runs/2026-02-02__00-00-00/run_metadata.json"),
-        TB1_META,
-    );
-    write(
-        r.join("terminal-bench-1.0/trace/2026-02-02__00-00-00/mytask/mytask.1-of-1.2026-02-02__00-00-00/agent-logs/trace.json"),
-        TRACE_JSON,
-    );
-
     // terminal-bench 2.0 (trace path from the `trace_path` field)
     write(
         r.join("terminal-bench-2.0/results/results-2026-03-03__00-00-00.json"),
@@ -151,10 +128,7 @@ fn scan_lists_all_registered_benches() {
     let d = fixture();
     let benches = adapters::scan_benches(root(&d));
     let ids: Vec<_> = benches.iter().map(|b| b.id.as_str()).collect();
-    assert_eq!(
-        ids,
-        ["swe", "terminal-bench-1.0", "terminal-bench-2.0", "memory"]
-    );
+    assert_eq!(ids, ["swe", "terminal-bench-2.0", "memory"]);
     // memory has no runs in the fixture → empty, not a panic.
     let mem = benches.iter().find(|b| b.id == "memory").unwrap();
     assert_eq!(mem.run_count, 0);
@@ -245,32 +219,6 @@ fn swe_item_resolves_trace_and_patch_artifact() {
 }
 
 #[test]
-fn tb1_derives_trace_path_and_reads_metadata() {
-    let d = fixture();
-    let run = adapters::run_detail(
-        root(&d),
-        "terminal-bench-1.0",
-        "results-2026-02-02__00-00-00",
-    )
-    .expect("run detail");
-    assert_eq!(run.summary.model.as_deref(), Some("deepseek"));
-    assert_eq!(run.summary.duration_ms, Some(300_000));
-    let item = &run.items[0];
-    let trace = item.trace.as_ref().expect("trace derived");
-    assert_eq!(
-        trace.trace,
-        "trace/2026-02-02__00-00-00/mytask/mytask.1-of-1.2026-02-02__00-00-00/agent-logs/trace.json"
-    );
-    match &item.extra {
-        BenchExtra::Tb { parser_results, .. } => {
-            assert_eq!(parser_results.len(), 1);
-            assert_eq!(parser_results[0].status, "passed");
-        }
-        other => panic!("expected tb extra, got {other:?}"),
-    }
-}
-
-#[test]
 fn tb2_uses_trace_path_field() {
     let d = fixture();
     let run = adapters::run_detail(
@@ -288,6 +236,13 @@ fn tb2_uses_trace_path_field() {
     );
     // The terminal-bench harness records no cost.
     assert_eq!(item.cost_micro_usd, None);
+    match &item.extra {
+        BenchExtra::Tb { parser_results, .. } => {
+            assert_eq!(parser_results.len(), 1);
+            assert_eq!(parser_results[0].status, "failed");
+        }
+        other => panic!("expected tb extra, got {other:?}"),
+    }
 }
 
 #[test]
@@ -331,7 +286,7 @@ mod api {
         let (status, body) = get(root(&d), "/api/benches").await;
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v.as_array().unwrap().len(), 4);
+        assert_eq!(v.as_array().unwrap().len(), 3);
     }
 
     #[tokio::test]

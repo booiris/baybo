@@ -6,8 +6,6 @@
 __pycache__/
 *.pyc
 
-# uv-managed virtualenv (the lockfile IS committed for reproducibility).
-/.venv/
 
 # Harbor run output (trials, logs, results) + any local trace/results mirrors,
 # regenerated each run.

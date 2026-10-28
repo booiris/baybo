@@ -1,0 +1,10 @@
+# uv workspace for the bench/ Python harnesses that resolve together. One
+# uv.lock + one .venv here instead of one per bench, so a vulnerable transitive
+# dep is one bump, not one per directory. Virtual root: deps-only, nothing to
+# install. Each member keeps its own pyproject.toml for its direct deps.
+#
+# swe-claude stays a standalone project: litellm[proxy] pins rich<14 while
+# harbor (terminal-bench-2.0) needs rich>=14.
+[tool.uv.workspace]
+members = ["swe", "swe-baseline", "terminal-bench-2.0"]
+exclude = ["swe-claude"]

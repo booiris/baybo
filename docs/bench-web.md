@@ -75,10 +75,7 @@ Each bench has an adapter that reads its result files into one shared
 `BenchExtra` enum (`swe` / `tb` / `memory`), which the UI renders in a
 per-item detail panel. The adapters read the **`arm` / `run_id` / `id`
 fields inside each JSON** rather than trusting filenames (id formats are
-inconsistent — `2026-06-13__15-40-24` vs `swe-20260611-005135`); the one
-exception is TB-1.0, whose in-JSON `id` is a UUID, so its `run_id` is taken
-from the `results-<ts>` filename suffix that keys the trace dirs and
-`run_metadata.json`.
+inconsistent — `2026-06-13__15-40-24` vs `swe-20260611-005135`).
 
 Two lenses per bench:
 
@@ -138,9 +135,9 @@ fields carry `#[ts(type = "number")]` so the TS side is JSON-safe
 - **terminal-bench** records no per-task cost (so `cost_micro_usd` shows
   `—`). Token counts (input/output **and cached**) aren't in the harness
   results either — they're recovered from each task's agent trace by the
-  `run.sh` sync (TB-2.0 also pulls trial timing from Harbor's
-  `result.json`). TB-1.0 run-level model / wall-clock comes from
-  `runs/<ts>/run_metadata.json`.
+  `run.sh` sync, which also pulls trial timing from Harbor's
+  `result.json`. Run-level model / wall-clock aren't recorded, so the run
+  card falls back to the results file's mtime.
 - **Cache tokens**: every bench surfaces `cached_input_tokens` (the
   prompt-cache-hit share of input — often 88–99%). swe/memory read it
   from `baybo cost show`'s summary; TB sums it from the trace. The UI shows
@@ -149,8 +146,7 @@ fields carry `#[ts(type = "number")]` so the TS side is JSON-safe
   at the cheaper rate, so this is a visibility add, not a cost fix.
 - **Trace path resolution** differs per bench: swe
   `trace/<run_id>/agent/<id>.{trace,messages}.json`; tb via the item's
-  `trace_path` field (TB-2.0 individual + both merged) or derived from
-  the `trial_name` timestamp (TB-1.0 individual); memory
+  `trace_path` field; memory
   `trace/<run_id>/<arm>/<session_id>.{trace,messages}.json`.
 - **Traces are never read on a list path.** A single terminal-bench trace
   has hit 166 MB, so per-tool call counts come from the precomputed
@@ -159,8 +155,7 @@ fields carry `#[ts(type = "number")]` so the TS side is JSON-safe
   and the item view lazy-gates the full trace fetch on `TracePaths.bytes`.
   A missing/stale sidecar just means empty tool chips — never an error.
 - **Artifacts**: swe → the instance patch (extracted from the predictions
-  `.jsonl`); TB-2.0 → `verifier/{test-stdout.txt,ctrf.json}`; TB-1.0 →
-  the asciinema `agent.cast` (link only — no in-browser player yet).
+  `.jsonl`); TB-2.0 → `verifier/{test-stdout.txt,ctrf.json}`.
 - **memory** has no runs on disk yet; its adapter is written against
   `bench/memory/src/report.rs` and will light up once a run lands.
 - **Completed runs only.** An in-progress run (no `results-*.json` yet)

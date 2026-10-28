@@ -2,8 +2,7 @@
 import type { ArtifactKind } from "./ArtifactKind";
 
 /**
- * A pointer to a raw side-artifact (a diff, verifier stdout, asciinema
- * cast, …). `path` is relative to the bench dir; the frontend fetches
+ * A pointer to a raw side-artifact (a diff, verifier stdout, …). `path` is relative to the bench dir; the frontend fetches
  * it via the path-validated `/file` endpoint.
  */
 export type ArtifactRef = { label: string, path: string, kind: ArtifactKind, };

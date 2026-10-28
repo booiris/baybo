@@ -61,8 +61,9 @@ sqlite's bundled SQLite requires. Point the bench at a prebuilt binary with
 - **[`uv`](https://docs.astral.sh/uv/)** — manages the Python side. The `swebench`
   stack (used to export the dataset + image keys via `swe_export.py`, build
   images via `prepare_images`, and grade via `run_evaluation`) lives in a
-  **persistent uv venv** declared by `bench/swe/pyproject.toml`. `uv sync`
-  provisions a pinned CPython + deps into `bench/swe/.venv` (built once, reused);
+  **persistent uv venv** declared by `bench/swe/pyproject.toml`, a member of the
+  `bench/` uv workspace (`bench/pyproject.toml` + `bench/uv.lock`). `uv sync`
+  provisions a pinned CPython + deps into the shared `bench/.venv` (built once, reused);
   `run.sh` does it for you. Never `pip install` into the system Python —
   in fact the system interpreter may be too new for the `swebench` stack, which
   is exactly why uv pins one. (Set `PYTHON=…` to use your own interpreter instead.)
@@ -119,11 +120,11 @@ DRY_RUN=1 ARMS="noop oracle agent" bench/swe/run.sh
 ```
 
 Or drive the pieces directly. The Python steps go through the uv venv — `uv sync`
-once, then run via `bench/swe/.venv/bin/python` (or `uv run`); pass that same
+once, then run via `bench/.venv/bin/python` (or `uv run`); pass that same
 interpreter to the grader with `--python-bin`:
 
 ```bash
-uv sync --project bench/swe            # build the persistent .venv once
+uv sync --all-packages --project bench/swe   # build the persistent bench/.venv once
 
 # 1. export instances + image keys
 uv run --project bench/swe python bench/swe/swe_export.py \
@@ -133,15 +134,15 @@ uv run --project bench/swe python bench/swe/swe_export.py \
 # 2. floor / ceiling — no baybo, no key (grader runs via the uv venv):
 cargo run -p baybo-bench-swe --bin run -- --arm oracle \
     --instances-json bench/swe/bench-out/instances.json --results-dir bench/swe/results \
-    --python-bin bench/swe/.venv/bin/python
+    --python-bin bench/.venv/bin/python
 cargo run -p baybo-bench-swe --bin run -- --arm noop \
     --instances-json bench/swe/bench-out/instances.json --results-dir bench/swe/results \
-    --python-bin bench/swe/.venv/bin/python
+    --python-bin bench/.venv/bin/python
 
 # 3. the agent (after prepare_images + a musl baybo build):
 cargo run -p baybo-bench-swe --bin run -- --arm agent \
     --instances-json bench/swe/bench-out/instances.json --results-dir bench/swe/results \
-    --python-bin bench/swe/.venv/bin/python \
+    --python-bin bench/.venv/bin/python \
     --baybo-bin target/x86_64-unknown-linux-musl/release/baybo \
     --model deepseek/deepseek-v4-flash   # <provider>/<model>; key read from $BAYBO_API_KEY
     # Other providers: --model openai/gpt-4o, --model anthropic/claude-3-5-sonnet, …

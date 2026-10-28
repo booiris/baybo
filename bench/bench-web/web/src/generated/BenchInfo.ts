@@ -8,7 +8,7 @@ import type { StandingArm } from "./StandingArm";
 export type BenchInfo = { 
 /**
  * Directory name under the bench root and the URL path segment
- * (`swe`, `terminal-bench-1.0`, `terminal-bench-2.0`, `memory`).
+ * (`swe`, `terminal-bench-2.0`, `memory`).
  */
 id: string, 
 /**

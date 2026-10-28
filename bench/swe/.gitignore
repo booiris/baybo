@@ -12,6 +12,3 @@
 /.env
 # Python bytecode from swe_export.py.
 __pycache__/
-# uv-managed virtualenv (persistent, rebuilt by `uv sync`); the lockfile + the
-# pinned-version files (uv.lock, pyproject.toml, .python-version) ARE tracked.
-/.venv/

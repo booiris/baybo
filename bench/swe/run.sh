@@ -44,7 +44,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${PROMPT_TIMEOUT:=1800}"                     # per-instance baybo prompt ceiling (s)
 : "${BAYBO_MODEL:=deepseek/deepseek-v4-flash}"  # agent LLM as <provider>/<model>
 : "${BAYBO_BASE_URL:=}"                         # empty => provider default endpoint
-: "${PYTHON:=}"                                # empty => the uv-managed bench/swe/.venv
+: "${PYTHON:=}"                                # empty => the uv-managed bench/.venv
 : "${DOCKER:=docker}"
 : "${MUSL_TARGET:=x86_64-unknown-linux-musl}"
 : "${BAYBO_BIN:=}"                              # agent arm; empty => build static musl here
@@ -77,16 +77,18 @@ for arm in $ARMS; do
 done
 want_agent=0; for a in $ARMS; do [ "$a" = agent ] && want_agent=1; done
 
-# Python: a persistent uv-managed venv (bench/swe/.venv, pinned CPython + swebench)
-# unless PYTHON is overridden to your own interpreter. `uv sync` is a fast no-op
-# after the first run, so the env is built once and reused.
+# Python: the persistent bench/ uv workspace venv (bench/.venv, pinned CPython +
+# swebench) unless PYTHON is overridden to your own interpreter. `uv sync` is a
+# fast no-op after the first run, so the env is built once and reused.
+# --all-packages: the venv is shared with the other workspace benches, and a
+# member-only sync would uninstall their deps.
 if [ -z "$PYTHON" ]; then
   command -v uv >/dev/null 2>&1 || {
     echo "uv is required to manage the Python env (https://docs.astral.sh/uv/), \
 or set PYTHON to an interpreter that has swebench" >&2; exit 1; }
-  echo ">> syncing uv python env (bench/swe/.venv)"
-  uv sync --project "$BENCH_DIR"
-  PYTHON="$BENCH_DIR/.venv/bin/python"
+  echo ">> syncing uv python env (bench/.venv)"
+  uv sync --all-packages --project "$BENCH_DIR"
+  PYTHON="$BENCH_DIR/../.venv/bin/python"
 fi
 if ! "$PYTHON" -c "import swebench" >/dev/null 2>&1; then
   echo "swebench not importable via '$PYTHON' (uv sync failed, or a PYTHON override lacks it)" >&2

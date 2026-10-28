@@ -16,7 +16,7 @@ bench-readonly-memory = ["baybo-memory/bench-readonly-memory"]
 # identity-repo `git init` (baybo-workspace) so a bench container needs no `git`
 # on PATH. Distinct from the `permission = free` config (which only drops
 # the OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
-# prod build. For bench/swe + bench/terminal-bench-1.0.
+# prod build. For bench/swe + bench/terminal-bench-2.0.
 bench-bash = ["baybo-tools/bench-bash", "baybo-workspace/bench-bash"]
 
 [dependencies]

@@ -1,12 +1,12 @@
 ---
 name: new-bench
-description: Scaffold a new benchmark under bench/ for measuring the real Baybo agent, following the shared conventions of bench/swe, bench/memory, bench/terminal-bench-1.0, and bench/terminal-bench-2.0. Use when the user wants to add a benchmark, eval, or leaderboard harness for baybo.
+description: Scaffold a new benchmark under bench/ for measuring the real Baybo agent, following the shared conventions of bench/swe, bench/memory, and bench/terminal-bench-2.0. Use when the user wants to add a benchmark, eval, or leaderboard harness for baybo.
 argument-hint: "[what the bench measures, e.g. 'GAIA web-agent tasks']"
 ---
 
 # Add a new Baybo benchmark
 
-You are scaffolding a new benchmark under `bench/<name>/`. Baybo already has four,
+You are scaffolding a new benchmark under `bench/<name>/`. Baybo already has three,
 and they share a deliberate skeleton — **reuse it; do not reinvent it.** This skill
 captures the cross-cutting decisions and invariants so a new bench is faithful,
 safe-to-merge, and consistent with the others on day one.
@@ -17,7 +17,6 @@ safe-to-merge, and consistent with the others on day one.
 | --- | --- | --- | --- | --- |
 | `bench/swe` | self-hosted Rust harness | **`docker run` per item**, `baybo prompt` inside each official eval image | official `swebench` Python harness (shelled out) | `bench-bash` feature + `sandbox.mode=none` · static musl |
 | `bench/memory` | self-hosted Rust harness | **`baybo gateway` once per arm**, concurrent `baybo prompt` over it | LLM-as-judge (`deepseek`) + deterministic F1 | `bench-readonly-memory` (Cargo feature) |
-| `bench/terminal-bench-1.0` | **adapter into an external official harness** (legacy `tb` CLI; no Rust crate, no fork) | `baybo prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
 | `bench/terminal-bench-2.0` | **adapter into an external official harness** (Harbor framework; no Rust crate, no fork) | `baybo prompt` via a `BaseInstalledAgent` (`upload_file`s musl + `baybo.json`) inside Harbor's task container | Harbor's own per-trial verifier (pytest → CTRF/`reward.txt`) | `bench-bash` feature + `sandbox.mode=none` · static musl |
 
 `reference.md` (next to this file) holds the copy-paste boilerplate: the
@@ -62,7 +61,7 @@ valid framings, or there's a cost/scope tradeoff only the user can weigh.
 
 ## Invariants (the extracted commonality — keep all of them)
 
-These hold across all four benches. A new bench that drops one is wrong.
+These hold across all three benches. A new bench that drops one is wrong.
 
 1. **Arms = `noop` (floor) + `oracle` (ceiling) + the real arm(s).** `noop` and
    `oracle` need **no baybo build and no API key**, so they validate the entire
@@ -130,9 +129,13 @@ These hold across all four benches. A new bench that drops one is wrong.
 
 9. **Conventions:** `[lib] doctest = false` + `publish = false` in the crate
    `Cargo.toml`; all deps `{ workspace = true }` (add the crate to the root
-   `[workspace.dependencies]` + `members`); Python tooling is **uv-managed** (own
-   `pyproject.toml` + `.python-version`, commit `uv.lock`, gitignore `.venv/` —
-   never `pip install` into the system interpreter). **Output dirs — all
+   `[workspace.dependencies]` + `members`); Python tooling is **uv-managed** as a
+   member of the `bench/` uv workspace (own `pyproject.toml`, added to
+   `members` in `bench/pyproject.toml`; the lock, `.python-version` and `.venv`
+   are the shared ones in `bench/` — never `pip install` into the system
+   interpreter). Only a bench whose deps conflict with the workspace gets its own
+   `uv.lock` + `.python-version` (and goes in the workspace `exclude`), like
+   `bench/swe-claude`. **Output dirs — all
    gitignored, one job each:** `results/` = the final report JSON *only*; `runs/` =
    the run environment + working byproducts (the baybo workspaces, the grader's
    intermediates + harness logs); `bench-out/` = prepared inputs (dataset /
@@ -194,7 +197,7 @@ bench/<name>/
   README.md           # measures-what + faithfulness; arms table; the build feature + why; usage; caveats
   run-bench.sh        # one-command driver: .env autoload → config block → preflight → dry-run → build → arms loop → jq table
   .env.example        # the API key (BAYBO_API_KEY) + optional BAYBO_MODEL/BAYBO_BASE_URL overrides
-  .gitignore          # /bench-out/ /results/ /runs/ /trace/ /.env  (+ __pycache__/, /.venv/)
+  .gitignore          # /bench-out/ /results/ /runs/ /trace/ /.env  (+ __pycache__/)
   results/ runs/ bench-out/ trace/   # generated (gitignored): report · run env+artifacts · inputs · transcripts
   src/
     lib.rs            # PURE IR + helpers + unit tests, no heavy deps:
@@ -205,19 +208,20 @@ bench/<name>/
     judge.rs + llm.rs # (if LLM-judge) judge prompt + a minimal OpenAI-compatible ChatClient
     bin/run.rs        # one arm per invocation: select items → run real arm → grade → join → aggregate → write results JSON
     bin/ingest.rs     # (only if a populate-then-query bench, like memory) couples to run.rs via a manifest
-  # if it needs Python (dataset export or an official grader):
-  pyproject.toml  .python-version  uv.lock  <export>.py
+  # if it needs Python (dataset export or an official grader) — a bench/ uv workspace member:
+  pyproject.toml  <export>.py
 ```
 
 **Adapter shape (clone `terminal`)** — no Rust crate, not a workspace member:
-`tb_adapter/<agent>.py` (subclass the harness's installed-agent base, copy in the
-musl binary + a rendered `baybo.json`, run `baybo prompt --json -y`),
-`<setup>.sh.j2` (install binary, mint key, ensure `git`+`ca-certificates`),
+`<harness>_adapter/<agent>.py` (subclass the harness's installed-agent base; its
+install step uploads the musl binary + a rendered `baybo.json`, installs the binary,
+mints the key and ensures `ca-certificates`; its run step runs
+`baybo prompt --json -y`),
 `run.sh` (build the musl binary if missing, load `.env`, run the harness's
 `run --agent-import-path …`, then surface its `results.json` from `runs/<ts>/`
 into `results/` so the report sits where the other benches' does), `pyproject.toml`
-(uv, pin to the harness's Python range). See `bench/terminal-bench-1.0/` (legacy
-`tb` CLI, over tmux) and `bench/terminal-bench-2.0/` (Harbor, `BaseInstalledAgent`).
+(uv workspace member, pin to the harness's Python range). See `bench/terminal-bench-2.0/` (Harbor,
+`BaseInstalledAgent`).
 
 ---
 
@@ -263,6 +267,6 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
 - [ ] Scope keys are `{bench}-{run_id}-{arm}-conv{N}`.
 - [ ] API key by name only — never in argv or written to disk.
 - [ ] `Cargo.toml`: `publish=false`, `[lib] doctest=false`, workspace deps, "NOT a CI target" header; `lib.rs` has unit tests and no heavy deps.
-- [ ] gitignore `bench-out/ results/ trace/ .env` (+ workspaces/.venv); Python (if any) is uv-managed with committed `uv.lock`.
+- [ ] gitignore `bench-out/ results/ trace/ .env` (+ workspaces); Python (if any) is a `bench/` uv workspace member, `bench/uv.lock` re-locked and committed.
 - [ ] `run-bench.sh` (.env autoload, dry-run, jq floor→real→ceiling table) + `README.md` (arms table, the feature + why, caveats).
 - [ ] `cargo fmt`/`clippy --all --tests` clean, `cargo test` green, repo `CLAUDE.md` style followed.

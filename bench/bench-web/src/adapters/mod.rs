@@ -29,11 +29,6 @@ pub const BENCHES: &[BenchSpec] = &[
         kind: BenchKind::Swe,
     },
     BenchSpec {
-        id: "terminal-bench-1.0",
-        label: "Terminal-Bench 1.0",
-        kind: BenchKind::Tb,
-    },
-    BenchSpec {
         id: "terminal-bench-2.0",
         label: "Terminal-Bench 2.0 (Harbor)",
         kind: BenchKind::Tb,
@@ -221,8 +216,7 @@ fn parse_file(
     match spec.id {
         "swe" => swe::parse(path, &bench_dir, run_key, started),
         "memory" => memory::parse(path, &bench_dir, run_key, started),
-        "terminal-bench-1.0" => tb::parse(path, &bench_dir, run_key, started, tb::Version::One),
-        "terminal-bench-2.0" => tb::parse(path, &bench_dir, run_key, started, tb::Version::Two),
+        "terminal-bench-2.0" => tb::parse(path, &bench_dir, run_key, started),
         other => anyhow::bail!("no adapter for bench `{other}`"),
     }
 }

@@ -11,6 +11,3 @@
 # Local secrets / overrides.
 /.env
 __pycache__/
-# uv-managed virtualenv (rebuilt by `uv sync`); uv.lock + pyproject.toml +
-# .python-version ARE tracked.
-/.venv/

@@ -1,6 +1,7 @@
 # Persistent, uv-managed Python environment for the SWE-bench harness tooling
-# (the `swebench` grader/image-builder + `swe_export.py`). `uv sync` provisions a
-# pinned CPython and a reused on-disk `.venv` here, independent of whatever
+# (the `swebench` grader/image-builder + `swe_export.py`). A member of the bench/
+# uv workspace (../pyproject.toml): `uv sync` provisions a pinned CPython and the
+# reused on-disk `bench/.venv`, independent of whatever
 # `python3` the host ships — never `pip install` into the system interpreter.
 # This is a deps-only env (`package = false`), not an installable package.
 [project]
