@@ -1,6 +1,6 @@
 import { act, fireEvent, render } from "@testing-library/react";
 import { I18nextProvider } from "react-i18next";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import i18n from "../i18n";
 import type { IssuePayload } from "./bridge";
@@ -86,7 +86,7 @@ function rule(): HTMLElement | null {
   return document.querySelector("[data-unread-rule]");
 }
 
-let scrolled: ReturnType<typeof vi.fn>;
+let scrolled: Mock<(options?: ScrollToOptions) => void>;
 const originalScrollHeight = Object.getOwnPropertyDescriptor(
   HTMLElement.prototype,
   "scrollHeight",
@@ -98,8 +98,8 @@ const originalClientHeight = Object.getOwnPropertyDescriptor(
 const originalScrollTo = HTMLElement.prototype.scrollTo;
 
 beforeEach(() => {
-  scrolled = vi.fn();
-  HTMLElement.prototype.scrollTo = scrolled;
+  scrolled = vi.fn<(options?: ScrollToOptions) => void>();
+  HTMLElement.prototype.scrollTo = scrolled as HTMLElement["scrollTo"];
   Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
     configurable: true,
     get: () => 900,

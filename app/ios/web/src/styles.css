@@ -483,7 +483,7 @@ button {
 /* Markdown body — monochrome soft-line rendering of the web chat's element
    set (GFM: code, tables, quotes, lists, links). */
 /* Inline math is an atomic, unbreakable box (KaTeX sets `white-space: nowrap` on
-   `.katex .base`), immune to the prose's `overflow-wrap: anywhere`. A long
+   `.katex .katex-base`), immune to the prose's `overflow-wrap: anywhere`. A long
    inline expression would otherwise widen the message and scroll the whole
    transcript sideways (the one hard layout rule). Clip horizontal overflow at
    the reading edge — such math belongs in a `$$` display block, which has its
@@ -1069,7 +1069,7 @@ html.html-preview-maximized body {
 
 /* Math (remark-math + rehype-katex -> KaTeX). KaTeX draws in `currentColor`, so
    it inherits the ink for free (no dark-mode fork; this app is light-only). It
-   sets `white-space: nowrap` on `.katex .base`, so the prose's
+   sets `white-space: nowrap` on `.katex .katex-base`, so the prose's
    `overflow-wrap: anywhere` can't shatter an expression mid-token. Nudge the
    size down a hair from KaTeX's 1.21em default — that reads oversized against
    the narrow phone reading band. */

@@ -67,7 +67,7 @@
   font-size: 15px;
   line-height: 1.7;
   /* Inline math is an atomic, unbreakable box (KaTeX sets `white-space: nowrap`
-     on `.katex .base`), immune to the bubble's `overflow-wrap: anywhere`. A long
+     on `.katex .katex-base`), immune to the bubble's `overflow-wrap: anywhere`. A long
      inline expression would otherwise widen the bubble past the reading band.
      Clip at the bubble's edge — such math belongs in a `$$` display block, which
      gets its own scroller below. `clip` keeps vertical overflow visible and

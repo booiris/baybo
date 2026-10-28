@@ -452,9 +452,13 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here or in the iOS jobs: action-setup reads the root
+      # package.json `packageManager` pin, and refuses to run when a `version:`
+      # input differs from it, even `9` against `pnpm@9.13.2`. That pin is also
+      # what keeps Dependabot on pnpm 9. Without it Dependabot runs its own
+      # pnpm 11+, which ignores the package.json `pnpm.overrides` field and
+      # drops the lockfile's `overrides:` block.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -533,8 +537,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -631,8 +633,6 @@ jobs:
           target: aarch64-apple-ios-sim
           cache-workspaces: app/ios
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 24
