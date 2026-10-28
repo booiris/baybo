@@ -121,6 +121,54 @@ included), so the bar reveals together with the pop transition.
 `.toolbar(.hidden, for: .tabBar)`** — that reappears the bar abruptly AFTER the
 pop, the "bar missing then pops in" glitch.
 
+### The split view — `App/Screens/ChatSplitView.swift`
+
+On a window that is wide AND tall (both size classes regular — iPhone Duo's inner
+display) the Chats tab is the web chat's shape: the list as a 260pt sidebar
+(`ChatSplit.sidebarWidth`, the web's) and the open conversation docked beside it, with a
+quiet placeholder when none is open. Everything else — phones in either
+orientation (a Pro Max in landscape is regular width but compact height), the
+Duo's outer display, a Split View half — keeps the push.
+
+- **The path stays the one source of truth.** A docked conversation is still
+  `chatPath = [.session(id)]`; `AppStore.dockedSession` reads it off the FIRST
+  route while `splitView` is on, and the NavigationStack is bound to
+  `stackPath` — the path without it — so nothing pushes. Every rule keyed on the
+  path (leaving a conversation, audio stop, eviction, the resume recycle) runs
+  unchanged.
+- **While split, every open docks.** `activateSession` resets the path to
+  `[.session(id)]` and selects Chats wherever the open came from — the archived
+  list, a cron group, a search hit (`keepTab` has nothing to keep: there is no
+  push to back out of). That keeps at most ONE conversation in the path, which is
+  what the one shared transcript webview needs: `TranscriptWebView` reparents the
+  webview into whichever `ChatScreen` mounted last, and a docked screen left
+  under a pushed one would come back without it.
+- **Folding and unfolding move the conversation, not the reader.** Unfold over a
+  pushed conversation and it docks; fold and it is pushed again. The list is one
+  tree in both shapes (`ChatsTabView`), so its scroll position survives, and the
+  chat is rebuilt around the same warm host — the same-session `retarget` path.
+- **Eviction holds every conversation in the path**, not just the top route: a
+  docked conversation stays mounted under a screen pushed from another tab.
+- **The docked chat has no back circle** (`ChatScreen(docked:)`). Each pane
+  resolves its own side rail, so on the inner display the chat's circles move
+  into the system column on its trailing edge and the list keeps its own.
+- **The sidebar is the web sidebar's layout, in this app's palette.**
+  `ChatListScreen(sidebar:)` draws `ChatListBuckets.sidebar` — a Pinned block,
+  the cron groups as **folders** (`SidebarFolderRow`: caret, alarm glyph, the
+  job's name in mono), then the other conversations, each under a small mono
+  label. A line is one title (`SidebarChatRow`) plus the two marks that are
+  state, the approval hand and the unread count; preview and time stay on the
+  phone row. No separators, and no pinned tint — the block label says it.
+- **A folder opens in place**, closed by default as on the web, and a docked
+  fire opens its folder. Its fires are separate `List` rows, never a
+  `DisclosureGroup`, so they keep every swipe a conversation has; the folder
+  keeps the group row's swipes. The phone list keeps the pushed
+  `CronGroupScreen` ([cron-groups.md](../../../docs/cron-groups.md#ios)). The
+  unread walk sees a closed folder, or an open one's fires — never both.
+- The docked conversation's line wears `ChatSplit.selectedRowTint`, the one wash
+  deeper than the pinned ground ([design-system.md](design-system.md#borders)).
+  The web paints its active row coral; this palette has no hue for chrome.
+
 ### Session creation and tab routing
 
 No session is minted at launch or login; the compose button — the Chats header's

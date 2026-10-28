@@ -37,9 +37,10 @@ struct ProjectsScreen: View {
             guard tab == .projects else { return }
             Task { await projects.refreshRoot() }
         }
-        // Returning from a board: the path emptying is the edge that means
-        // "this screen is frontmost again".
-        .onChange(of: appStore.chatPath.isEmpty) { _, empty in
+        // Returning from a board: the stack emptying is the edge that means
+        // "this screen is frontmost again". The STACK, not the path: a split
+        // view's docked conversation stays in the path under every push.
+        .onChange(of: appStore.stackPath.isEmpty) { _, empty in
             guard empty, appStore.homeTab == .projects else { return }
             Task { await projects.refreshRoot() }
         }

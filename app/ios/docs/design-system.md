@@ -202,7 +202,9 @@ transcript's `.jump-ring`) — deliberate line elements, not incidental hairline
 is why they sit above the 1px ceiling. It has to be an edge: a monochrome WASH is
 unavailable for a row-level transient state, because every one this palette can reach
 (`ink` at 0.035–0.05, `surface` #FAFAFA) is within ~9/255 of `pinnedRowTint` #F1F1F1
-and would vanish on a pinned row, while anything darker reads as a SELECTED cell.
+and would vanish on a pinned row, while anything darker reads as a SELECTED cell —
+which is what the split view's docked row is given (`ChatSplit.selectedRowTint`, #E6E6E6;
+see [navigation.md](navigation.md#the-split-view--appscreenschatsplitviewswift)).
 Hue is not an option either: red is the destructive token, and a filled ink capsule in
 a chat row already means a COUNT.
 

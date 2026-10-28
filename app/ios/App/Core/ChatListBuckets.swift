@@ -200,3 +200,92 @@ enum ChatListBuckets {
         return nil
     }
 }
+
+/// One line of the split view's sidebar (`ChatSplit`): the web sidebar's shape,
+/// where a cron group is a FOLDER that opens in place instead of a row that
+/// pushes a screen.
+///
+/// Every line is still its own `List` row, never a `DisclosureGroup` — a
+/// disclosure nests its children inside one cell, which kills their per-row
+/// swipe actions (`docs/cron-groups.md`).
+enum SidebarEntry: Identifiable, Equatable {
+    case section(SidebarSection)
+    /// `nested`: drawn inside an open cron folder.
+    case chat(SessionRow, nested: Bool)
+    case cronFolder(CronGroup, expanded: Bool)
+
+    /// The same ids the list's rows carry (`ChatListItem.id`), so the unread
+    /// walk's cursor and `scrollTo` address a row identically in both shapes.
+    var id: String {
+        switch self {
+        case .section(let section): "section:\(section.rawValue)"
+        case .chat(let row, _): ChatListItem.chat(row).id
+        case .cronFolder(let group, _): ChatListItem.cronGroup(group).id
+        }
+    }
+
+    /// What the unread walk can land on. An OPEN folder hands its count to the
+    /// fires drawn under it, or one tap would land on the folder and the next on
+    /// the fire it was counting.
+    var walkItem: ChatListItem? {
+        switch self {
+        case .section: nil
+        case .chat(let row, _): .chat(row)
+        case .cronFolder(let group, let expanded): expanded ? nil : .cronGroup(group)
+        }
+    }
+}
+
+/// The sidebar's blocks, in the web sidebar's order: Pinned, then the cron
+/// folders where web keeps its folders, then every other conversation.
+enum SidebarSection: String {
+    case pinned, scheduled, chats
+
+    var titleKey: String { "split.\(rawValue)" }
+}
+
+extension ChatListBuckets {
+    /// The sidebar's lines, from the list's own items, so a row lands in the same
+    /// bucket in both shapes (`items(from:)` owns every rule about that).
+    ///
+    /// A pinned GROUP stays in the folder block, at its head, as on the web: the
+    /// Pinned block holds conversations. `items` already sorts pinned first, so
+    /// filtering keeps that order. The trailing block's label only renders when
+    /// a block above it does — alone, it would be labelling the whole list.
+    static func sidebar(from items: [ChatListItem], expanded: Set<String>) -> [SidebarEntry] {
+        var pinned: [SidebarEntry] = []
+        var folders: [SidebarEntry] = []
+        var chats: [SidebarEntry] = []
+        for item in items {
+            switch item {
+            case .chat(let row) where row.pinned:
+                pinned.append(.chat(row, nested: false))
+            case .chat(let row):
+                chats.append(.chat(row, nested: false))
+            case .cronGroup(let group):
+                let open = expanded.contains(group.jobId)
+                folders.append(.cronFolder(group, expanded: open))
+                if open { folders += group.members.map { .chat($0, nested: true) } }
+            }
+        }
+
+        var entries: [SidebarEntry] = []
+        if !pinned.isEmpty { entries += [.section(.pinned)] + pinned }
+        if !folders.isEmpty { entries += [.section(.scheduled)] + folders }
+        if !chats.isEmpty {
+            if !entries.isEmpty { entries.append(.section(.chats)) }
+            entries += chats
+        }
+        return entries
+    }
+
+    /// The cron group that draws `sessionId`, if any — the folder the sidebar
+    /// opens so the docked conversation's row is on screen, as web expands the
+    /// active chat's group.
+    static func group(drawing sessionId: String, in items: [ChatListItem]) -> String? {
+        for case .cronGroup(let group) in items where group.memberIds.contains(sessionId) {
+            return group.jobId
+        }
+        return nil
+    }
+}

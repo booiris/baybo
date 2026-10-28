@@ -11,6 +11,9 @@ struct ChatScreen: View {
     @ObservedObject private var bridge: TranscriptBridge
     private let host: TranscriptHost
     private let webView: WKWebView
+    /// Docked beside the list in the split view (`ChatSplit`) rather than
+    /// pushed: there is nothing to go back to, so the header has no back.
+    private let docked: Bool
     /// Only for the one-shot search jump (`takePendingJump`) — the conversation
     /// itself is driven by `store`.
     @EnvironmentObject private var appStore: AppStore
@@ -50,11 +53,12 @@ struct ChatScreen: View {
     /// if the two drift, it just stops crossing cleanly.
     private static let chromeFade = Animation.easeInOut(duration: 0.26)
 
-    init(host: TranscriptHost, store: ChatStore) {
+    init(host: TranscriptHost, store: ChatStore, docked: Bool = false) {
         _store = ObservedObject(wrappedValue: store)
         _bridge = ObservedObject(wrappedValue: host.bridge)
         self.host = host
         webView = host.webView
+        self.docked = docked
     }
 
     var body: some View {
@@ -77,10 +81,9 @@ struct ChatScreen: View {
                 ChatHeaderView(
                     store: store, bridge: bridge, catalog: .shared, menuOpen: $modelMenuOpen,
                     indexOpen: $messageIndexOpen, subagentsOpen: $subagentsOpen,
-                    onPillFrame: { modelPillFrame = $0 }
-                ) {
-                    dismiss()
-                }
+                    onPillFrame: { modelPillFrame = $0 },
+                    onBack: docked ? nil : { dismiss() }
+                )
 
                 if modelMenuOpen {
                     ModelMenuPanel(
@@ -327,7 +330,8 @@ struct ChatHeaderView: View {
     /// Where the model pill sits, in `ModelMenuPanel.anchorSpace` — the menu
     /// panel blooms from its leading edge.
     let onPillFrame: (CGRect) -> Void
-    let onBack: () -> Void
+    /// Nil for a conversation docked beside the list: no back circle.
+    let onBack: (() -> Void)?
     @Environment(\.sideRail) private var rail
 
     private static let veilPeakAlpha = 0.8
@@ -345,7 +349,7 @@ struct ChatHeaderView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            if rail == nil {
+            if rail == nil, let onBack {
                 BackCircle(label: Lang.shared.t("chat.back"), action: onBack)
             }
 
@@ -386,7 +390,9 @@ struct ChatHeaderView: View {
         // In a side rail the same rule runs top-down: persistent controls
         // first, the transient alarm appended under them.
         .sideRailItems(rail) {
-            BackCircle(label: Lang.shared.t("chat.back"), action: onBack)
+            if let onBack {
+                BackCircle(label: Lang.shared.t("chat.back"), action: onBack)
+            }
             indexButton
             if !catalog.models.isEmpty {
                 modelCircle
