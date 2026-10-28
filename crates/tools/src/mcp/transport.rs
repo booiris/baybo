@@ -57,10 +57,16 @@ pub async fn connect(
 
 /// Build a `reqwest::Client` for an HTTP MCP transport, honoring the optional
 /// egress proxy.
+///
+/// Redirects are disabled: reqwest strips only `Authorization` / `Cookie` /
+/// `Proxy-Authorization` on a cross-origin hop, so a followed redirect would
+/// replay the `--header` bag (`X-API-Key`, …) to the redirect target
+/// (GHSA-9g45-5xwm-f3wc). rmcp's own default client makes the same choice.
 fn proxied_http_client(
     proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<reqwest::Client> {
-    baybo_security::http::client(proxy)
+    baybo_security::http::client_builder(proxy)
+        .and_then(|b| b.redirect(reqwest::redirect::Policy::none()).build())
         .map_err(|e| McpError::Transport(format!("build proxied http client: {e}")))
 }
 
@@ -453,5 +459,91 @@ mod tests {
         assert!(serde_json::from_str::<SidecarLogLine>("Listening on stdio").is_err());
         // A JSON value of the wrong shape (no level/msg) also falls back.
         assert!(serde_json::from_str::<SidecarLogLine>(r#"{"foo":1}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn http_client_does_not_replay_custom_headers_to_redirect_target() {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE, header::LOCATION};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, PingRequest, RequestId};
+        use rmcp::transport::streamable_http_client::StreamableHttpClient;
+
+        const API_KEY_HEADER: &str = "x-api-key";
+        const API_KEY_VALUE: &str = "secret";
+
+        type Seen = Arc<parking_lot::Mutex<Option<String>>>;
+
+        fn record(headers: &HeaderMap, seen: &Seen) {
+            if let Some(v) = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok()) {
+                *seen.lock() = Some(v.to_owned());
+            }
+        }
+
+        let target_seen: Seen = Arc::default();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let target_app = axum::Router::new()
+            .route(
+                "/capture",
+                post(|State(seen): State<Seen>, headers: HeaderMap| async move {
+                    record(&headers, &seen);
+                    (
+                        StatusCode::OK,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+                    )
+                }),
+            )
+            .with_state(Arc::clone(&target_seen));
+        let target_server = tokio::spawn(async move { axum::serve(target, target_app).await });
+
+        let origin_seen: Seen = Arc::default();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let location = format!("http://{target_addr}/capture");
+        let origin_app = axum::Router::new()
+            .route(
+                "/mcp",
+                post(
+                    move |State(seen): State<Seen>, headers: HeaderMap| async move {
+                        record(&headers, &seen);
+                        (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)]).into_response()
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&origin_seen));
+        let origin_server = tokio::spawn(async move { axum::serve(origin, origin_app).await });
+
+        let custom_headers = HashMap::from([(
+            HeaderName::from_static(API_KEY_HEADER),
+            HeaderValue::from_static(API_KEY_VALUE),
+        )]);
+        let message = ClientJsonRpcMessage::request(
+            ClientRequest::PingRequest(PingRequest::default()),
+            RequestId::Number(1),
+        );
+
+        let result = proxied_http_client(None)
+            .unwrap()
+            .post_message(
+                Arc::<str>::from(format!("http://{origin_addr}/mcp")),
+                message,
+                None,
+                None,
+                custom_headers,
+            )
+            .await;
+
+        assert!(
+            target_seen.lock().is_none(),
+            "custom headers must not reach the redirect target"
+        );
+        assert_eq!(origin_seen.lock().as_deref(), Some(API_KEY_VALUE));
+        assert!(result.is_err(), "redirect must not be followed: {result:?}");
+
+        origin_server.abort();
+        target_server.abort();
     }
 }
