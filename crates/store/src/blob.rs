@@ -106,8 +106,8 @@ pub trait BlobStore: Send + Sync {
         uploader_identity: Option<&str>,
     ) -> Result<BlobRef>;
 
-    /// Streaming variant of [`put`]. Pulls chunks from `stream`, hashes
-    /// them on the fly, and writes to a per-attempt temp file before
+    /// Streaming variant of [`put`](BlobStore::put). Pulls chunks from
+    /// `stream`, hashes them on the fly, and writes to a per-attempt temp file before
     /// renaming to the content-addressed final path. `max_bytes` is
     /// enforced incrementally — the first chunk that pushes the running
     /// total past the cap returns [`StorageError::TooLarge`] without
@@ -136,9 +136,10 @@ pub trait BlobStore: Send + Sync {
     /// downloads — e.g. the relay blob leg's `BlobPull{offset}`).
     ///
     /// **Token gate (security-critical):** the offset path MUST enforce
-    /// the same `read_token` check as [`open`]/[`stat`] — never resolve a
-    /// caller-supplied id by its bare hex digest. The default upholds this
-    /// by going through [`open`] (which `stat`s first) and discarding
+    /// the same `read_token` check as [`open`](BlobStore::open)/[`stat`](BlobStore::stat)
+    /// — never resolve a caller-supplied id by its bare hex digest. The
+    /// default upholds this by going through [`open`](BlobStore::open)
+    /// (which `stat`s first) and discarding
     /// `offset` bytes; a backend with seekable storage should override to
     /// seek natively, but only after re-`stat`ing. `offset` past the
     /// blob's length yields an empty reader.
@@ -172,8 +173,9 @@ pub trait BlobStore: Send + Sync {
     /// (the in-memory fake, and any future remote store), which callers
     /// must treat as "not available here", never as "not found".
     ///
-    /// **Token gate (security-critical), same rule as [`open_at`]:** an
-    /// implementation MUST resolve through [`stat`] and never by deriving
+    /// **Token gate (security-critical), same rule as
+    /// [`open_at`](BlobStore::open_at):** an implementation MUST resolve
+    /// through [`stat`](BlobStore::stat) and never by deriving
     /// the path from the bare hex digest. The payload is content-addressed,
     /// so the digest alone names the file — which is exactly why deriving
     /// from it would hand out a blob to a caller holding no read capability

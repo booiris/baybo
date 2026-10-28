@@ -42,7 +42,7 @@ impl ToolRegistry {
 
     /// Register every default builtin tool. `WebFetch`'s prompt-driven
     /// extraction reads its LLM handle from per-call
-    /// [`crate::ToolContext::llm`], so no LLM client is threaded here;
+    /// [`crate::ToolContext::lite_llm`], so no LLM client is threaded here;
     /// the agent layer binds the handle when it materialises each
     /// tool-call's context. `workspace_paths` is forwarded to `Edit`
     /// so its approval-gate bypass for `personas/` writes can bind to

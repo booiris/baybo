@@ -1,6 +1,6 @@
 //! Per-WebSocket transport handle attached to a [`Channel`](crate::Channel).
 //!
-//! A [`Connection`] is the *transport instance*; a [`Channel`] is the
+//! A [`Connection`] is the *transport instance*; a [`Channel`](crate::Channel) is the
 //! *protocol surface*. N connections per channel. Connections come and
 //! go (open WS, close WS); channels are pinned for the lifetime of the
 //! gateway process.

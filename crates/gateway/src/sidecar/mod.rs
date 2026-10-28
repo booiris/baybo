@@ -6,7 +6,7 @@
 //! [`baybo_process::HostTool`]) — no JS runtime is shipped
 //! inside the gateway binary. At boot the gateway materialises every
 //! embedded bundle to the user's cache directory (once per bundle
-//! hash) and hands [`ChannelSpawner`] a `Command` so every sidecar
+//! hash) and hands [`ChannelSpawner`](crate::spawn::ChannelSpawner) a `Command` so every sidecar
 //! runs as a supervised subprocess.
 //!
 //! Layout on disk (`$XDG_CACHE_HOME/baybo/` or `~/.cache/baybo/`):
@@ -20,7 +20,7 @@
 //! touching the old ones — intentional: a crashed or downgraded
 //! install can still fall back to whatever was there before.
 //!
-//! [`SidecarSupervisor`] wraps [`ChannelSpawner`] with a restart loop
+//! [`SidecarSupervisor`] wraps [`ChannelSpawner`](crate::spawn::ChannelSpawner) with a restart loop
 //! per channel type, backoff-capped, driven by the shared shutdown
 //! signal.
 

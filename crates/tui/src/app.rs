@@ -149,7 +149,7 @@ pub(crate) struct AppState {
     pub(crate) history_cursor: Option<usize>,
     /// Raw delta bytes of the in-flight agent response that have not yet been
     /// handed to [`AppState::markdown`]. Each `AppEvent::StreamDelta` appends,
-    /// and [`drain_complete_stream_lines`] pops every `\n`-terminated line,
+    /// and [`AppState::drain_complete_stream_lines`] pops every `\n`-terminated line,
     /// leaving the trailing partial. **Nothing renders this buffer** — the live
     /// region has no streaming section, so text appears only once a markdown
     /// block closes and commits. The final `AppEvent::Outgoing` flushes the
@@ -172,15 +172,15 @@ pub(crate) struct AppState {
     /// When the current turn became active. Drives the animated
     /// "working" indicator and its elapsed-seconds readout in the live
     /// region; `None` whenever no turn we initiated is in flight. Set by
-    /// [`note_response_pending`], cleared by [`note_response_received`]
+    /// [`AppState::note_response_pending`], cleared by [`AppState::note_response_received`]
     /// when the last outstanding response lands — or by
-    /// [`reset_working`] when `/stop` cancels the turn (which sends no
+    /// [`AppState::reset_working`] when `/stop` cancels the turn (which sends no
     /// final response to clear it).
     pub(crate) working_since: Option<Instant>,
     /// Tools that have started but not yet completed. The start line commits
     /// to scrollback immediately; the matching `ToolCompleted` (by `call_id`)
     /// removes the entry before committing the result summary. Cleared at turn
-    /// end / on `/stop` via [`clear_stream`].
+    /// end / on `/stop` via [`AppState::clear_stream`].
     pub(crate) running_tools: Vec<RunningTool>,
     /// Animation counter advanced once per working-indicator tick; the dot's
     /// pulse colour is `frame % WORKING_PULSE.len()`. A redraw-driven colour
@@ -211,7 +211,7 @@ pub(crate) struct AppState {
     /// for the test harness — production always wires this up.
     pub(crate) approval: Option<ApprovalQueue>,
     /// Plain (non-slash) messages submitted while a turn is in flight.
-    /// Unlike [`outgoing_queue`], these are dispatched to the agent
+    /// Unlike [`AppState::outgoing_queue`], these are dispatched to the agent
     /// **immediately** (mid-turn steering — the agent folds them in once
     /// its current tool batch finishes) and only their *display* is
     /// deferred: each shows as a `↳` line under the working indicator
@@ -226,11 +226,11 @@ pub(crate) struct AppState {
     /// (see the run loop), so a `/skills` or unknown-skill slash runs
     /// *after* the current turn rather than spawning a concurrent turn
     /// that would interleave in scrollback. Plain messages no longer use
-    /// this path; they steer via [`pending_interjections`].
+    /// this path; they steer via [`AppState::pending_interjections`].
     pub(crate) outgoing_queue: VecDeque<String>,
     /// User messages that have been dispatched to the agent but whose
     /// `AppEvent::Outgoing` reply hasn't arrived yet. Tracked separately
-    /// from [`streaming`] / [`pending_approval`] because there's a race
+    /// from [`AppState::streaming`] / [`AppState::pending_approval`] because there's a race
     /// window between dispatch and the first `StreamDelta`: without
     /// this counter, a second submission inside that window would be
     /// dispatched concurrently and the two responses would interleave.
@@ -240,7 +240,7 @@ pub(crate) struct AppState {
     /// terminal's scrollback. Rebuilt as a side effect of replay; cleared on
     /// `/clear` / `/new` / Ctrl-L. See [`TranscriptBlock`].
     transcript: VecDeque<TranscriptBlock>,
-    /// Running line total of [`transcript`], maintained so eviction past
+    /// Running line total of [`AppState::transcript`], maintained so eviction past
     /// [`TRANSCRIPT_MAX_LINES`] doesn't have to re-sum the whole deque.
     transcript_lines: usize,
 }
@@ -295,7 +295,7 @@ impl AppState {
     /// Bump the outstanding-response counter — call right before
     /// dispatching a turn-initiating user message to the agent. The
     /// counter stays elevated through the inevitable streaming phase and
-    /// is cleared by [`note_response_received`] when `AppEvent::Outgoing`
+    /// is cleared by [`AppState::note_response_received`] when `AppEvent::Outgoing`
     /// lands. Also arms the "working" clock on the leading edge (0 → 1)
     /// so the animated indicator and its elapsed readout start ticking.
     pub(crate) fn note_response_pending(&mut self) {
@@ -341,7 +341,7 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    /// Record a tool as started (in flight) until [`take_running_tool`]
+    /// Record a tool as started (in flight) until [`AppState::take_running_tool`]
     /// removes it on completion. The working zone renders it as a live
     /// `● tool(label)` row meanwhile; its scrollback block is deferred to
     /// completion. See [`RunningTool`].
@@ -409,7 +409,7 @@ impl AppState {
     /// Park a plain message as a mid-turn steer: it has already been
     /// dispatched to the agent, and this only tracks the line shown under
     /// the working indicator until the running tool batch drains and
-    /// commits it to scrollback. See [`pending_interjections`].
+    /// commits it to scrollback. See [`AppState::pending_interjections`].
     pub(crate) fn queue_interjection(&mut self, text: String) {
         self.pending_interjections.push_back(text);
     }
@@ -655,7 +655,7 @@ impl AppState {
 
     /// Clear the streaming buffer + reset the "first line committed" flag,
     /// any open tool-run bracket, and any in-flight tool entries. Called
-    /// after `Outgoing` finalises the response (and by [`reset_working`] on
+    /// after `Outgoing` finalises the response (and by [`AppState::reset_working`] on
     /// `/stop`) so the next answer starts clean.
     pub(crate) fn clear_stream(&mut self) {
         self.streaming = None;

@@ -520,7 +520,7 @@ pub struct ApprovalCard {
 
 /// Frame envelope. Tagged on the `kind` field so the receive side
 /// never has to guess. Encoded with
-/// [`rmp_serde::to_vec_named`](rmp_serde::to_vec_named) so field names
+/// [`rmp_serde::to_vec_named`] so field names
 /// round-trip — makes it trivial to hand-write a TypeScript decoder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -823,7 +823,7 @@ pub enum Frame {
     /// Client → server: persist one submitted input line to the
     /// server-side history store. Used by the built-in TUI to get
     /// zsh-style history without the client holding any encryption key
-    /// itself — the gateway's [`baybo_security::SecretVault`] is the
+    /// itself — the gateway's `baybo_security::SecretVault` is the
     /// single writer. Fire-and-forget; the server does not ack
     /// per-append.
     HistoryAppend {
@@ -973,7 +973,7 @@ pub enum Frame {
         /// The issue the change is about, when it is about one. A detail
         /// page ignores anything for another number.
         ///
-        /// `u32` for the same reason as [`DeckCardData::seq`]: keeps
+        /// `u32` for the same reason as `seq` on [`Frame::DeckCardData`]: keeps
         /// `bigint` out of the generated TS contract.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-export", ts(optional))]

@@ -19,7 +19,7 @@
 //! rebuilt from the persisted transcript by [`ReadTracker::rebuild_from_messages`]:
 //! every anchoring tool's result row ([`crate::READ_TRACKER_ANCHORING_TOOLS`] —
 //! `Read` for what it saw, `Edit`/`Write` for what they wrote) carries the
-//! [`FileFingerprint`] it left here in its [`ToolResultMeta`] (persisted with the
+//! [`FileFingerprint`] it left here in its [`ToolResultMeta`](baybo_model::ToolResultMeta) (persisted with the
 //! transcript but never sent to the LLM), so the anchors are recovered on
 //! hydration. `Edit`/`Write` matter as much as `Read` there: restoring only the
 //! read that preceded an edit puts back the *pre-write* fingerprint, which reads

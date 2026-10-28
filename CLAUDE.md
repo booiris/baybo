@@ -16,6 +16,7 @@ Session rows and their conversation transcripts are **user-facing core data**. T
 ```bash
 cargo fmt                                                       # format
 cargo clippy --all --benches --tests --examples --all-features  # lint (zero warnings)
+scripts/check-rustdoc.sh                                        # rustdoc gate (zero warnings — CI runs this too)
 cargo nextest run --workspace                                   # unit tests (fast runner — CI uses this)
 cargo test --workspace                                          # unit tests (no nextest; also runs doctests, which are disabled)
 RUST_LOG=baybo=debug cargo run                                   # run with logging
@@ -32,6 +33,8 @@ scripts/check-ts-bindings.sh                                    # ts-rs regen CI
 **Python tooling uses `uv` with a persistent project venv — never bare `pip` or the system interpreter.** Project-side Python (currently the `bench/` harnesses — `bench/swe`, `bench/swe-baseline`, `bench/swe-claude`, and the two `bench/terminal-bench-*` dirs) declares its deps in a `pyproject.toml`; `uv sync` materialises a reused on-disk `.venv` **and** provisions a pinned CPython, so the env is built once, reproducible, and independent of whatever `python3` the host ships (the system one is often too new for a given stack — e.g. `swebench`). Run through it — `uv run --project <dir> python …`, or point a tool at `<dir>/.venv/bin/python`. Commit `pyproject.toml` / `uv.lock` / `.python-version`; gitignore `.venv/`. Add a new Python tool the same way (its own `pyproject.toml` + `uv sync`), not with a global `pip install`.
 
 **Zero warnings means zero — including test files.** `--tests` is part of the clippy invocation above on purpose. Don't dismiss a warning as "pre-existing" or "only in a test"; if `cargo clippy` lights it up, fix it as part of the change.
+
+**Rustdoc is a gate too.** `scripts/check-rustdoc.sh` documents every library crate with private items included and denies rustdoc warnings: an intra-doc link that does not resolve, an unclosed HTML tag, a redundant explicit link target, an ambiguous name. Neither `cargo build` nor `clippy` runs rustdoc, so these only show up there and in the CI `rustdoc` job. Fix a broken link by pointing it at the item that exists now — full path when it lives in another crate (``[`SessionEvent`](baybo_channels::SessionEvent)``), ``mod@`` / ``macro@`` when a name is ambiguous — not by stripping the brackets: a link that stopped resolving usually means the sentence around it is stale, so re-read it and name what the code does today. Drop the link only when the target is genuinely gone or `#[cfg(test)]`-only. Private items are documented on purpose (these docs are for maintainers), which is why `rustdoc::private_intra_doc_links` is the one lint the script allows — linking a public doc to a `pub(crate)` item is fine. Angle-bracket placeholders such as `<provider>` must sit inside backticks or rustdoc reads them as HTML.
 
 Test layout, `test-support` feature gating, and the shared fixture inventory are in [`docs/testing.md`](docs/testing.md). Read it before adding tests that cross crate boundaries.
 

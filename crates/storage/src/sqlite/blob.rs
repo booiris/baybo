@@ -205,8 +205,9 @@ fn now_unix() -> i64 {
 /// MIME type isn't in the table — anything we don't recognise lands
 /// without a suffix rather than guessing wrong.
 ///
-/// **Frozen persistence format, not a lookup table.** [`blob_path`]
-/// names a payload `<sha256><ext>`, so adding, removing or retargeting a
+/// **Frozen persistence format, not a lookup table.**
+/// [`blob_path`](SqliteBlobStore::blob_path) names a payload
+/// `<sha256><ext>`, so adding, removing or retargeting a
 /// single entry renames the path of every blob already written under that
 /// MIME and orphans its bytes — an edit here is a data migration, and
 /// `delete` unlinking a payload a live row still resolved to is how that

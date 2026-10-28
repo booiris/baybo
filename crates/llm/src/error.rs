@@ -95,9 +95,10 @@ impl LlmError {
 
 /// Map an HTTP status code from a provider to the appropriate
 /// `LlmError` variant. The `message` is the formatted text the caller
-/// wants to surface (typically `"<provider> <method>: status <code>:
-/// <body>"`); this helper just chooses the variant based on the
-/// retry / classification semantics of the status.
+/// wants to surface (typically
+/// `"<provider> <method>: status <code>: <body>"`); this helper just
+/// chooses the variant based on the retry / classification semantics of
+/// the status.
 pub(crate) fn status_to_error(status: u16, message: String) -> LlmError {
     match status {
         408 => LlmError::Transient(message),

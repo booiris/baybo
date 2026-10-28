@@ -2,7 +2,7 @@
 //!
 //! Matches Claude Code's WebFetch tool shape: `{ url, prompt? }`. The
 //! side-LLM extraction path fires when ALL three hold: a `prompt` is
-//! supplied, [`ToolContext::llm`] is populated (the agent layer binds
+//! supplied, [`ToolContext::lite_llm`](crate::ToolContext::lite_llm) is populated (the agent layer binds
 //! a per-call [`BilledChat`] handle to the running
 //! `(user, session, turn, span)` so cost lands in `cost_records`
 //! against the WebFetch tool span), AND the extracted text is at

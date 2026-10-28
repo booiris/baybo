@@ -44,7 +44,7 @@ use crate::relay::{
 };
 
 /// Mean backoff between control-connection (re)dials. The actual wait is
-/// jittered around this (see [`reconnect_delay`]).
+/// jittered around this (see [`ControlTiming::reconnect_delay`]).
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Multiplicative jitter applied to [`RECONNECT_BACKOFF`]: the wait is the base

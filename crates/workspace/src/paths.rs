@@ -358,8 +358,8 @@ pub fn absolutise_target(p: &Path) -> PathBuf {
 /// the project checkout rather than polluting the real user home;
 /// resolving against `current_dir` at call time keeps the result
 /// absolute so the path stays valid no matter which cwd a later
-/// subprocess inherits (see also [`BayboConfig::validate`], which
-/// rejects relative `workspace.path`).
+/// subprocess inherits (see also `BayboConfig::validate` in
+/// `baybo-config`, which rejects relative `workspace.path`).
 ///
 /// Falls back to `/.baybo` in the (unreachable in practice) case
 /// where neither `current_dir()` nor `home_dir()` resolves — an

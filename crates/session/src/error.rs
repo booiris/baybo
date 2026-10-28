@@ -2,8 +2,7 @@ use thiserror::Error;
 
 /// Errors surfaced by the session subsystem — covers both
 /// [`SessionManager`](crate::SessionManager) orchestration and the
-/// underlying [`SessionStore`](crate::SessionStore) /
-/// [`SessionSummaryStore`](crate::SessionSummaryStore) persistence
+/// underlying [`SessionStore`](crate::SessionStore) persistence
 /// boundary.
 ///
 /// Storage-layer failures collapse into [`SessionError::Storage`] —

@@ -10,8 +10,8 @@
 //!
 //! * [`WsClient`] — private WS + MessagePack client against
 //!   `/v1/channel-ws` (PSK-authenticated).
-//! * [`WsTransport`] — [`TuiTransport`](crate::transport::TuiTransport)
-//!   driven by the channel WS.
+//! * [`WsTransport`] — the TUI transport driven by the channel WS,
+//!   surfacing [`crate::transport::TransportEvent`]s to the run loop.
 //! * [`TuiSlashHandler`] — slash commands that the WS surface can
 //!   satisfy (`/clear`, `/quit`, dashboard shortcuts); other slashes
 //!   pass through to the agent. Tool approvals are handled by the

@@ -366,7 +366,7 @@ pub enum WorkStepKind {
 /// matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
 /// a `Message` (user / final-assistant bubble) or a `Work` (reconstructed
 /// collapsed work block for a tool-using turn — see
-/// [`reconstruct_transcript`]).
+/// `reconstruct_transcript_with_attachments`).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTranscriptItem {
     /// Stable row id, unique within the session and identical on every
@@ -3073,7 +3073,7 @@ async fn check_scoped_chat_sessions(
     Ok(sids)
 }
 
-/// Push a [`Frame::SessionUpdated`] patch to every open chat client on
+/// Push a [`Frame::SessionUpdated`](baybo_channels::wire::Frame::SessionUpdated) patch to every open chat client on
 /// `channel` — the `owner` pool, so a web tab and a phone on the session both
 /// receive it. The patch carries the truth (no refetch round-trip); see the
 /// variant's doc comment for receiver-side merge rules. No-op when the channel
@@ -3179,7 +3179,7 @@ fn last_user_preview(
 /// list's second-line preview. Walks the tail window (from the grouped
 /// chat-list scan) newest-first and returns the first row that renders as a
 /// message BUBBLE, applying the same visibility rules as
-/// [`reconstruct_transcript`] so the preview never surfaces
+/// [`reconstruct_transcript_with_attachments`] so the preview never surfaces
 /// something the transcript itself hides: only a real user turn
 /// ([`ChatMessage::from_user`]) or a tool-free final assistant answer counts —
 /// agent-injected user rows (cron / recalled-memory framing), work-block

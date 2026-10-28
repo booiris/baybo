@@ -2137,7 +2137,7 @@ export interface components {
          *     matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
          *     a `Message` (user / final-assistant bubble) or a `Work` (reconstructed
          *     collapsed work block for a tool-using turn — see
-         *     [`reconstruct_transcript`]).
+         *     `reconstruct_transcript_with_attachments`).
          */
         ChatTranscriptItem: {
             /**

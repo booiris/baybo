@@ -62,7 +62,7 @@ struct UploadResponse {
 }
 
 /// JSON returned when the pairing gate refuses an upload. The
-/// `code` is the same one [`Frame::Notice`] would carry on the WS
+/// `code` is the same one [`Frame::Notice`](baybo_channels::wire::Frame::Notice) would carry on the WS
 /// path, so the SDK can surface a single user-facing prompt instead
 /// of inventing two flavors of "pairing required".
 #[derive(Debug, Serialize)]

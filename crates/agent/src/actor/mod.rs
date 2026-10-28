@@ -1,7 +1,7 @@
 //! Actor model + supervision: one `AgentActor` per session, supervised
 //! by [`AgentSupervisor`](crate::actor::supervisor::AgentSupervisor),
 //! routed to by [`Router`](crate::actor::router::Router), and
-//! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
+//! checkpointed via [`DurableActorState`].
 
 mod background_notification;
 pub mod mailbox;
@@ -260,7 +260,7 @@ fn is_coalescable_user_input(msg: &AgentMessage) -> bool {
 }
 
 /// Adapts the actor's mailbox into an
-/// [`InterjectionSource`](crate::runtime::agent_loop::InterjectionSource) for
+/// [`InterjectionSource`] for
 /// the running agent loop: drains the leading run of **non-slash** `UserInput`s
 /// queued mid-turn, leaving a queued slash command / `BackgroundJobFinished` /
 /// `ActorStop` in place for the actor's normal dispatch. `try_recv_if` stops at

@@ -930,7 +930,7 @@ async fn run_foreground_job(
 /// oneshot (so the parent's tool call returns now), register it with the
 /// supervisor (pinning the parent against the idle reaper), and return the
 /// handle the caller uses to escort the eventual terminal. Mirrors
-/// [`Router::ack_background_dispatch`] but runs from the detached wait
+/// [`ActorSubagentSpawner::ack_background_dispatch`] but runs from the detached wait
 /// task, so it takes cloned `supervisor` / `session_manager` handles
 /// instead of `&self`.
 #[allow(clippy::too_many_arguments)]

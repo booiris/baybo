@@ -2,7 +2,7 @@
 //!
 //! The data lives here because `baybo-config` is the canonical
 //! aggregator for `baybo.json` shape; the *builder* that turns this
-//! into an [`baybo_tools::mcp::EmbeddedMcpProfile`] lives in
+//! into an `baybo_tools::mcp::EmbeddedMcpProfile` lives in
 //! `baybo_tools::mcp::profile::browser` (alongside the MCP machinery
 //! that consumes it). The gateway boot path unpacks the config fields
 //! and hands them to `browser_mcp_profile` — keeping `baybo-config`

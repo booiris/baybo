@@ -5,7 +5,7 @@
 //!
 //! The Claude Code reference also defines tools that depend on larger
 //! subsystems not yet landed in Baybo (agent teams, worktrees, LSP, background
-//! monitors, MCP client, etc.). Stubs for those live in [`todo`] and are not
+//! monitors, MCP client, etc.). Stubs for those live in [`todo`](mod@todo) and are not
 //! registered by [`default_tools`] — a follow-up will wire them in as each
 //! backing subsystem arrives.
 //!
@@ -77,7 +77,7 @@ pub use write::WriteTool;
 /// manifest against the runtime trust policy before executing.
 ///
 /// `WebFetch`'s prompt-driven extraction now reads its LLM handle from
-/// the per-call [`crate::ToolContext::llm`] slot that the agent layer
+/// the per-call [`crate::ToolContext::lite_llm`] slot that the agent layer
 /// binds at tool-call time, so no LLM client needs to be threaded
 /// through this factory.
 ///

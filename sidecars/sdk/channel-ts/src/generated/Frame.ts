@@ -14,7 +14,7 @@ import type { WireWorkStep } from "./WireWorkStep";
 /**
  * Frame envelope. Tagged on the `kind` field so the receive side
  * never has to guess. Encoded with
- * [`rmp_serde::to_vec_named`](rmp_serde::to_vec_named) so field names
+ * [`rmp_serde::to_vec_named`] so field names
  * round-trip — makes it trivial to hand-write a TypeScript decoder.
  */
 export type Frame = { "kind": "register", token: string, channel_type: string, } | { "kind": "register_ack", ok: boolean, reason: string | null, } | { "kind": "subscribe", session_id: string, } | { "kind": "unsubscribe", session_id: string, } | { "kind": "subscribe_state", session_id: string, 
@@ -97,7 +97,7 @@ seq: number, payload: string, } | { "kind": "deck_changed" } | { "kind": "projec
  * The issue the change is about, when it is about one. A detail
  * page ignores anything for another number.
  *
- * `u32` for the same reason as [`DeckCardData::seq`]: keeps
+ * `u32` for the same reason as `seq` on [`Frame::DeckCardData`]: keeps
  * `bigint` out of the generated TS contract.
  */
 issue_number?: number, } | { "kind": "ping" } | { "kind": "pong" };

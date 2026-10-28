@@ -35,7 +35,7 @@ pub struct StagedDevice {
 
 /// How long a minted pairing slot stays valid. 15 minutes — long enough to walk
 /// to the phone and scan, short enough that a stale slot doesn't linger. With no
-/// background sweeper the slot simply ages out of [`claim_slot`] and dies with
+/// background sweeper the slot simply ages out of [`DevicePairingService::claim_slot`] and dies with
 /// the process.
 const SLOT_TTL_SECONDS: i64 = 900;
 

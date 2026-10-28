@@ -8592,7 +8592,7 @@
       },
       "ChatTranscriptItem": {
         "type": "object",
-        "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher. Two shapes ride this struct, discriminated by [`Self::kind`]:\na `Message` (user / final-assistant bubble) or a `Work` (reconstructed\ncollapsed work block for a tool-using turn — see\n[`reconstruct_transcript`]).",
+        "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher. Two shapes ride this struct, discriminated by [`Self::kind`]:\na `Message` (user / final-assistant bubble) or a `Work` (reconstructed\ncollapsed work block for a tool-using turn — see\n`reconstruct_transcript_with_attachments`).",
         "required": [
           "id",
           "kind",

@@ -675,8 +675,9 @@ pub fn inlined_document_tokens(filename: &str, mime_type: &str, size_bytes: Opti
 /// 96,320 against a real 4,500.
 pub const MAX_CONTENT_STUB_TOKENS: usize = multimodal::MAX_CONTENT_STUB_BYTES;
 
-/// What `baybo-context`'s tokenizer charges one [`ContentBlock`], and the
-/// single place the stub floor is applied.
+/// What `baybo-context`'s tokenizer charges one
+/// [`ContentBlock`](baybo_model::ContentBlock), and the single place the
+/// stub floor is applied.
 ///
 /// Every media arm degrades to a `[image: …]`-style text stub — a fetch
 /// failure, an over-cap payload, a provider that will not take the kind —
@@ -899,7 +900,8 @@ pub struct ModelInfo {
 /// Per-token pricing information for a model.
 ///
 /// All rates are micro-USD per **1M tokens** (so $3.00 / MTok →
-/// `MicroUsd::from_micros(3_000_000)`). Use [`MicroUsd::cost_for_tokens`]
+/// `MicroUsd::from_micros(3_000_000)`). Use
+/// [`MicroUsd::cost_for_tokens`](baybo_model::MicroUsd::cost_for_tokens)
 /// to apply these to a token count — that path keeps everything in
 /// integer math, no float drift.
 ///
@@ -1579,7 +1581,7 @@ impl LlmClient {
     }
 
     /// Carry the entry's configured reasoning effort. Set once, centrally,
-    /// for every provider — see [`LlmRegistry::build_client`].
+    /// for every provider — see [`LlmProviderRegistry::build_client`].
     ///
     /// Fails when the operator picked a rung this provider's dialect cannot
     /// express, so a level that would never reach the wire is caught at

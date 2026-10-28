@@ -26,7 +26,7 @@ pub enum ContentBlock {
         /// 9,288.
         ///
         /// **Server-derived, never client-declared**, from
-        /// [`baybo_llm::media_probe::image_dimensions`] — a header parse,
+        /// `baybo_llm::media_probe::image_dimensions` — a header parse,
         /// not a decode. `None` for a vector image, a raster format the
         /// probe cannot read, or a row persisted before the fields existed;
         /// the budget then charges the delivery cap, which the delivery
@@ -68,7 +68,7 @@ pub enum ContentBlock {
         ///
         /// **Server-derived, never client-declared.** Set by whoever ingests
         /// the blob, from the bytes, via
-        /// [`baybo_llm::media_probe::pdf_page_count`]. `None` when the file
+        /// `baybo_llm::media_probe::pdf_page_count`. `None` when the file
         /// is not a PDF, when it did not parse, or for rows persisted before
         /// the field existed — the budget then charges the delivery cap
         /// rather than guessing.
@@ -100,7 +100,7 @@ pub enum ContentBlock {
         signature: Option<String>,
     },
     /// The result of a tool invocation, keyed back to the originating
-    /// [`ToolUse`] via `tool_use_id`.
+    /// [`ToolUse`](ContentBlock::ToolUse) via `tool_use_id`.
     ToolResult {
         tool_use_id: String,
         content: String,
@@ -459,7 +459,7 @@ pub enum MessageSource {
     /// [`MessageSource::SkillListing`]. Hidden from chat surfaces.
     DeferredToolListing,
     /// The errand a parent agent handed a spawned subagent — the child
-    /// session's opening prompt. Agent-authored (so NOT [`Self::from_user`]:
+    /// session's opening prompt. Agent-authored (so NOT [`ChatMessage::from_user`]:
     /// no echo, no outbox, no idempotency key), but tracked distinctly because
     /// it is the one agent-injected row a chat surface SHOULD render: the
     /// child's transcript opens with the instruction it was given, exactly as

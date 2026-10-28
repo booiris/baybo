@@ -32,7 +32,7 @@ pub const TUI_CLIENT_LABEL: &str = "tui";
 
 /// Prefix for tokens minted to embedded tool sidecars (the browser
 /// MCP server today). The auth middleware recognises any label
-/// starting with this prefix as [`crate::AuthedClient::Tool`], which
+/// starting with this prefix as [`AuthedClient::Tool`](crate::auth::AuthedClient::Tool), which
 /// bypasses pairing on `/v1/blobs` (tool sidecars are session-scoped
 /// like the TUI, not per-bot/per-user) and is rejected from the
 /// channel-WS handshake (tool sidecars don't register channels).

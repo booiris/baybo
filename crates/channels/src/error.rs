@@ -9,7 +9,7 @@ pub enum ChannelError {
     Config(String),
 
     /// Couldn't reach the channel transport at all (e.g. no gateway
-    /// process listening on the UDS). Distinguished from [`Config`] so
+    /// process listening on the UDS). Distinguished from [`Config`](ChannelError::Config) so
     /// callers can tell "nothing on the other end" from "handshake
     /// failed on a live endpoint" — the auto-spawn gateway path in the
     /// TUI only fires on this variant.
@@ -17,10 +17,10 @@ pub enum ChannelError {
     NotReachable(String),
 
     /// The endpoint answered and refused our credential (HTTP 401/403 on
-    /// the upgrade). Split from [`NotReachable`] (nothing listening) and
-    /// [`Config`] (live endpoint, malformed handshake) so the CLI can say
+    /// the upgrade). Split from [`NotReachable`](ChannelError::NotReachable) (nothing listening) and
+    /// [`Config`](ChannelError::Config) (live endpoint, malformed handshake) so the CLI can say
     /// "running but rejected our token" instead of "no gateway" — and so
-    /// the TUI's auto-spawn path, which is gated on [`NotReachable`],
+    /// the TUI's auto-spawn path, which is gated on [`NotReachable`](ChannelError::NotReachable),
     /// never fires because a live gateway turned us away.
     #[error("channel endpoint rejected our credential: {0}")]
     Unauthorized(String),

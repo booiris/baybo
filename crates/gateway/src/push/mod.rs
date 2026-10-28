@@ -807,7 +807,7 @@ impl PushDispatcher {
     }
 
     /// Build + sign the `/notify` body and POST it to `notify_url`. Split out of
-    /// [`Self::dispatch_to_device`] so the 404 self-heal path can re-send the same
+    /// [`Self::dispatch_to_target`] so the 404 self-heal path can re-send the same
     /// push (with a fresh, strictly-larger counter) after a forced re-register.
     async fn post_notify(
         &self,

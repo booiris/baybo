@@ -1,4 +1,4 @@
-//! Turning a **stored blob** into the [`ContentBlock`] a model is handed,
+//! Turning a **stored blob** into the [`ContentBlock`](baybo_model::ContentBlock) a model is handed,
 //! with every price input read off the bytes rather than off whoever
 //! uploaded them.
 //!

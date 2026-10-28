@@ -3,7 +3,7 @@
 //! Loads, validates, and exposes typed configuration for the Baybo runtime.
 //! The top-level [`BayboConfig`] is deserialized from JSON and passed to the
 //! consumer (usually `main.rs` or `baybo-agent`), which maps each section into
-//! the corresponding domain type (e.g., [`LlmConfig`] → `baybo_llm::LlmProviderConfig`).
+//! the corresponding domain type (e.g., [`LlmEntry`] → `baybo_llm::LlmProviderConfig`).
 //!
 //! ```no_run
 //! use baybo_config::BayboConfig;

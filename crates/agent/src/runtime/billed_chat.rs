@@ -1,6 +1,6 @@
 //! Tool-facing billed-chat adapter.
 //!
-//! [`BoundBilledLlm`](baybo_llm::BoundBilledLlm) is the billing
+//! [`BoundBilledLlm`] is the billing
 //! chokepoint — it runs gate → call → record and returns the *raw*
 //! provider response. [`BilledChatRunner`] is the agent-side decorator a
 //! tool's `ctx.lite_llm` resolves to: on top of a bound call it adds the
