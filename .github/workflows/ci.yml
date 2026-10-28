@@ -262,7 +262,7 @@ jobs:
           # it: install.sh only has something to install once a release exists,
           # and .github/workflows/release.yml is dispatch-only.
           # deploy/docker/Dockerfile is in here because release-build.sh reads
-          # the node/bun/pnpm pins out of it — an edit that moves those ARG
+          # the node/bun pins out of it — an edit that moves those ARG
           # lines would otherwise only surface 25 minutes into a release build.
           if changed '^(install\.sh|scripts/(release-build|test-install)\.sh|\.github/workflows/release\.yml|deploy/docker/Dockerfile)$'; then
             echo "install=true" >> "$GITHUB_OUTPUT"
@@ -428,9 +428,10 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
       - run: shellcheck -s sh install.sh
       - run: shellcheck scripts/release-build.sh scripts/test-install.sh
-      # The release build reads its node/bun/pnpm pins out of
-      # deploy/docker/Dockerfile so the container and the tarball cannot drift
-      # apart. This proves that lookup still resolves.
+      # The release build reads its node/bun pins out of
+      # deploy/docker/Dockerfile (and pnpm's from package.json, as the
+      # Dockerfile does) so the container and the tarball cannot drift apart.
+      # This proves that lookup still resolves.
       - run: scripts/release-build.sh --print-pins
       - run: scripts/test-install.sh
 
@@ -459,6 +460,21 @@ jobs:
       # pnpm 11+, which ignores the package.json `pnpm.overrides` field and
       # drops the lockfile's `overrides:` block.
       - uses: pnpm/action-setup@v4
+      # That root pin is the one home of the pnpm version: the Dockerfile and
+      # scripts/release-build.sh read it too. app/ios/web is a separate pnpm
+      # project and needs its own copy for Dependabot, so prove the copy matches
+      # and that the release build still resolves the pin. Here rather than in
+      # ios-web / install-script because both are path-filtered and a bump of
+      # the root package.json alone would never run them.
+      - name: pnpm pin is single-sourced
+        run: |
+          root="$(node -p "require('./package.json').packageManager")"
+          ios="$(node -p "require('./app/ios/web/package.json').packageManager")"
+          if [ "$root" != "$ios" ]; then
+            echo "[!] packageManager drift: package.json has '$root', app/ios/web/package.json has '$ios'."
+            exit 1
+          fi
+          scripts/release-build.sh --print-pins
       - uses: actions/setup-node@v4
         with:
           node-version: 24
