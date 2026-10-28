@@ -357,11 +357,11 @@ impl OpenAiSubscriptionCompletionModel {
         let url = self.endpoint(bundle, RESPONSES_PATH);
 
         debug!(url = %url, "POST openai-subscription Responses");
-        let mut request = self.authed_request(reqwest::Method::POST, &url, bundle);
+        let mut request = self
+            .authed_request(reqwest::Method::POST, &url, bundle)
+            .headers(affinity.clone());
         if bundle.connection.is_none() {
-            request = request
-                .header("OpenAI-Beta", "responses=experimental")
-                .headers(affinity.clone());
+            request = request.header("OpenAI-Beta", "responses=experimental");
         }
         request
             .header("Accept", "text/event-stream")

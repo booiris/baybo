@@ -66,6 +66,28 @@ async fn sharing_requests_use_public_responses_and_no_codex_headers() {
 }
 
 #[tokio::test]
+async fn sharing_requests_keep_cache_affinity_headers() {
+    let sse = "event: response.completed\ndata: {\"response\":{}}\n\n";
+    let (origin, captured) = spawn_capturing_endpoint(sse, "text/event-stream").await;
+    let (model, _) = sharing_model(&origin, true).await;
+    let extras = crate::ProviderCallExtras {
+        prompt_cache_key: Some("session-7"),
+        ..Default::default()
+    };
+    let mut stream = model.stream(empty_request(), extras).await.unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    let request = captured.await.unwrap();
+    for name in AFFINITY_HEADERS {
+        assert!(
+            request.contains(&format!("\r\n{name}: session-7\r\n")),
+            "{name} missing: {request}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn missing_plan_permission_blocks_requests_before_network_io() {
     let (model, bundle) = sharing_model("http://127.0.0.1:1", false).await;
     assert!(matches!(
