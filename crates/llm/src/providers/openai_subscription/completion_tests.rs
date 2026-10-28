@@ -1,6 +1,6 @@
 use super::tests::{empty_request, spawn_capturing_endpoint};
 use super::*;
-use crate::providers::openai_subscription::token_bundle::ChatGptConnection;
+use crate::providers::openai_subscription::token_bundle::sharing_connection;
 use baybo_security::test_support::MemorySecretStore;
 use baybo_security::{EncryptionKey, SecretVault};
 
@@ -21,20 +21,15 @@ async fn sharing_model(
         BackgroundRefresh::Disabled,
     );
     let now = chrono::Utc::now().timestamp();
+    let mut connection = sharing_connection();
+    if !enabled {
+        connection.scopes.clear();
+    }
     let bundle = OAuthTokenBundle {
-        connection: Some(ChatGptConnection {
-            client_id: "oaiapp_test".into(),
-            subject: "user".into(),
-            scopes: if enabled {
-                vec![crate::providers::openai_subscription::oauth::SHARING_SCOPE.into()]
-            } else {
-                Vec::new()
-            },
-        }),
+        connection,
         access_token: "access".into(),
         refresh_token: "refresh".into(),
         id_token: "id".into(),
-        account_id: Some("old-account-header-must-not-leak".into()),
         expires_at: now + 3600,
         obtained_at: now,
     };

@@ -110,23 +110,15 @@ impl RefreshTrigger {
     }
 }
 
-/// Server-clock freshness ordering. `expires_at` is the access token's
-/// `exp` claim, so it survives clock skew between processes sharing one
-/// vault file; `obtained_at` only breaks same-second ties.
+/// Mint-time freshness ordering. `expires_at` is derived from the minting
+/// process's clock plus `expires_in`, so it carries no more authority than
+/// `obtained_at` and only breaks same-second ties. A bundle for a different
+/// connection (a re-login) wins on mint time alone, whatever its expiry.
 fn is_at_least_as_fresh(candidate: &OAuthTokenBundle, baseline: &OAuthTokenBundle) -> bool {
-    match (&candidate.connection, &baseline.connection) {
-        (Some(_), None) => return true,
-        (None, Some(_)) => return false,
-        (Some(connection), Some(previous)) if connection != previous => {
-            return candidate.obtained_at >= baseline.obtained_at;
-        }
-        (Some(_), Some(_)) => {
-            return (candidate.obtained_at, candidate.expires_at)
-                >= (baseline.obtained_at, baseline.expires_at);
-        }
-        (None, None) => {}
+    if candidate.connection != baseline.connection {
+        return candidate.obtained_at >= baseline.obtained_at;
     }
-    (candidate.expires_at, candidate.obtained_at) >= (baseline.expires_at, baseline.obtained_at)
+    (candidate.obtained_at, candidate.expires_at) >= (baseline.obtained_at, baseline.expires_at)
 }
 
 /// Install a vault-sourced bundle, never regressing the cache to an older
@@ -656,17 +648,17 @@ async fn save_with_retries(
 
 #[cfg(test)]
 mod tests {
+    use super::super::token_bundle::sharing_connection;
     use super::*;
     use baybo_security::test_support::MemorySecretStore;
     use baybo_security::{EncryptionKey, SecretVault};
 
     fn sample_bundle(now: i64, expires_at: i64) -> OAuthTokenBundle {
         OAuthTokenBundle {
-            connection: None,
+            connection: sharing_connection(),
             access_token: "a".into(),
             refresh_token: "r".into(),
             id_token: "i".into(),
-            account_id: None,
             expires_at,
             obtained_at: now,
         }
@@ -679,11 +671,10 @@ mod tests {
         expires_at: i64,
     ) -> OAuthTokenBundle {
         OAuthTokenBundle {
-            connection: None,
+            connection: sharing_connection(),
             access_token: access.into(),
             refresh_token: refresh_token.into(),
             id_token: "id".into(),
-            account_id: None,
             expires_at,
             obtained_at: now,
         }
@@ -1099,14 +1090,18 @@ mod tests {
     }
 
     #[test]
-    fn is_at_least_as_fresh_orders_by_exp_then_obtained_at() {
-        let older = bundle_with("a", "r", 100, 1_000);
-        let newer_exp = bundle_with("a", "r", 100, 2_000);
-        let same_exp_later_obtained = bundle_with("a", "r", 200, 1_000);
-        assert!(is_at_least_as_fresh(&newer_exp, &older));
-        assert!(!is_at_least_as_fresh(&older, &newer_exp));
-        assert!(is_at_least_as_fresh(&same_exp_later_obtained, &older));
+    fn is_at_least_as_fresh_orders_by_obtained_at_then_exp() {
+        let older = bundle_with("a", "r", 100, 2_000);
+        let later_obtained = bundle_with("a", "r", 200, 1_000);
+        let same_obtained_longer_exp = bundle_with("a", "r", 100, 3_000);
+        assert!(is_at_least_as_fresh(&later_obtained, &older));
+        assert!(!is_at_least_as_fresh(&older, &later_obtained));
+        assert!(is_at_least_as_fresh(&same_obtained_longer_exp, &older));
+        assert!(!is_at_least_as_fresh(&older, &same_obtained_longer_exp));
         assert!(is_at_least_as_fresh(&older, &older));
+        let mut relogin = bundle_with("b", "r2", 100, 1_000);
+        relogin.connection.client_id = "oaiapp_other".into();
+        assert!(is_at_least_as_fresh(&relogin, &same_obtained_longer_exp));
     }
 
     /// A dirty cache entry is the ONLY copy of a rotated token. Refilling
@@ -1143,20 +1138,12 @@ mod tests {
 /// the rotation and vault-clearing branches at all.
 #[cfg(test)]
 mod cross_process_tests {
+    use super::super::token_bundle::sharing_connection;
     use super::*;
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use baybo_security::{EncryptionKey, SecretVault};
     use baybo_storage::sqlite::{SqlitePool, SqliteSecretStore};
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    fn fake_jwt(payload: &serde_json::Value) -> String {
-        let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
-        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        let signature = URL_SAFE_NO_PAD.encode(b"fake");
-        format!("{header}.{payload_b64}.{signature}")
-    }
 
     /// Minimal stub of the OAuth token endpoint. Counts requests, and hands
     /// every caller the SAME rotated bundle — so a second real refresh is
@@ -1183,17 +1170,11 @@ mod cross_process_tests {
                 // Drain what the client sent; we do not need to parse it.
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf).await;
-                let id_token = fake_jwt(&serde_json::json!({
-                    "https://api.openai.com/auth": { "chatgpt_account_id": "acc-1" }
-                }));
-                let access = fake_jwt(&serde_json::json!({
-                    "exp": chrono::Utc::now().timestamp() + 7200,
-                    "marker": rotated_access,
-                }));
                 let body = serde_json::json!({
-                    "access_token": access,
+                    "access_token": rotated_access,
                     "refresh_token": rotated_refresh,
-                    "id_token": id_token,
+                    "expires_in": 7200,
+                    "token_type": "Bearer",
                 })
                 .to_string();
                 let response = format!(
@@ -1234,11 +1215,10 @@ mod cross_process_tests {
 
     fn stale(now: i64) -> OAuthTokenBundle {
         OAuthTokenBundle {
-            connection: None,
+            connection: sharing_connection(),
             access_token: "stale-at".into(),
             refresh_token: "stale-rt".into(),
             id_token: "id".into(),
-            account_id: None,
             expires_at: now + 10, // inside every margin ⇒ wants a refresh
             obtained_at: now,
         }
@@ -1310,11 +1290,10 @@ mod cross_process_tests {
         let coord = Arc::new(RefreshCoordinator::new(store.clone(), direct_client()));
         // A rotation that never reached disk: the cache is its only copy.
         let dirty = OAuthTokenBundle {
-            connection: None,
+            connection: sharing_connection(),
             access_token: "dirty-at".into(),
             refresh_token: "dirty-rt".into(),
             id_token: "id".into(),
-            account_id: None,
             expires_at: now + 7200,
             obtained_at: now,
         };

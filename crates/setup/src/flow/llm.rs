@@ -355,9 +355,10 @@ Complete sign-in within 5 minutes; Ctrl+C cancels.
     bundle
         .require_sharing()
         .map_err(|e| SetupError::Llm(e.to_string()))?;
-    if let Some(connection) = &bundle.connection {
-        eprintln!("Baybo application client ID: {}", connection.client_id);
-    }
+    eprintln!(
+        "Baybo application client ID: {}",
+        bundle.connection.client_id
+    );
     eprintln!(
         "signed in as {} (plan: {})\ntoken stored at vault://{}\nManage usage: {MANAGE_USAGE_URL}",
         bundle.email().unwrap_or_else(|| "<unknown>".into()),

@@ -8,8 +8,8 @@ pub(crate) mod openai_responses;
 pub(crate) mod opencode;
 pub(crate) mod rig_providers;
 
-// Public: the subscription provider's OAuth surface (PKCE / device-code
-// flows, vault token store) is consumed by `baybo-cli` for the OAuth
+// Public: the subscription provider's OAuth surface (browser PKCE login,
+// vault token store) is consumed by `baybo-cli` for the OAuth
 // branch of `baybo llm add` / `baybo llm edit` / `baybo llm remove`, so
 // the module needs to be reachable as
 // `baybo_llm::providers::openai_subscription`.
@@ -54,7 +54,7 @@ pub fn factory_defaults_for(provider: &str) -> FactoryDefaults {
     let supports_vision = match provider {
         "openai" | "anthropic" | "gemini" => true,
         "minimax" | "deepseek" => false,
-        // Codex Responses models advertise image input in the live
+        // Subscription Responses models advertise image input in the live
         // catalog, and the subscription converter emits `input_image`.
         openai_subscription::PROVIDER_NAME => true,
         _ => false,

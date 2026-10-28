@@ -1,4 +1,4 @@
-//! Responses API client driven by a Baybo OAuth bearer, with legacy Codex routing.
+//! Responses API client driven by a Baybo OAuth bearer.
 //! Endpoint: `<base_url>/responses`. See
 //! `docs/modules/llm-openai-subscription.md` for design rationale.
 
@@ -19,8 +19,6 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use super::MANAGE_USAGE_URL;
-use super::catalog;
-use super::legacy_oauth::LEGACY_ORIGINATOR;
 use super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
 use super::token_bundle::OAuthTokenBundle;
 use super::token_store::VaultTokenStore;
@@ -28,8 +26,10 @@ use crate::tool_name::{sanitize_tool_name, unsanitize_tool_name};
 use crate::{DOCUMENT_FILENAME_PARAM, LlmError, LlmStream, StreamEvent, TokenUsage, ToolCallInfo};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const LEGACY_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const RESPONSES_PATH: &str = "/responses";
+const MODELS_PATH: &str = "/models";
+const VISIBILITY_FIELD: &str = "visibility";
+const VISIBILITY_LIST: &str = "list";
 // The endpoint 400s on any field it doesn't know, and it knows neither
 // `prompt_cache_retention` nor `prompt_cache_options`: cache lifetime is
 // not ours to set.
@@ -63,7 +63,7 @@ pub struct OpenAiSubscriptionCompletionModel {
     /// family's default when they picked nothing. `None` = reasoning off.
     /// Resolved once at construction so every request body shares it.
     reasoning_effort: Option<String>,
-    /// Request transport for `<base_url>/codex/*`. NOT the refresh client —
+    /// Request transport for `<base_url>/*`. NOT the refresh client —
     /// refresh lives on the coordinator and targets the OAuth issuer.
     http: reqwest::Client,
     /// Shared per-credential refresh state. Every client built from the
@@ -83,9 +83,7 @@ impl OpenAiSubscriptionCompletionModel {
         http: reqwest::Client,
         background: BackgroundRefresh,
     ) -> Self {
-        let base_url = base_url
-            .filter(|url| url.trim_end_matches('/') != LEGACY_BASE_URL)
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let reasoning_effort = super::reasoning::resolve_effort(&model, reasoning_effort);
         Self {
             model,
@@ -96,21 +94,8 @@ impl OpenAiSubscriptionCompletionModel {
         }
     }
 
-    fn endpoint(&self, bundle: &OAuthTokenBundle, path: &str) -> String {
-        if bundle.connection.is_none() {
-            let base = if self.base_url_is_default() {
-                LEGACY_BASE_URL
-            } else {
-                &self.base_url
-            };
-            format!("{}/codex{path}", base.trim_end_matches('/'))
-        } else {
-            format!("{}{path}", self.base_url.trim_end_matches('/'))
-        }
-    }
-
-    pub fn base_url_is_default(&self) -> bool {
-        self.base_url == DEFAULT_BASE_URL
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
     pub fn base_url(&self) -> &str {
@@ -217,7 +202,7 @@ impl OpenAiSubscriptionCompletionModel {
             .unwrap_or_else(|| super::reasoning::NONE.to_string())
     }
 
-    /// Open a streaming connection to `<base_url>/codex/responses` with
+    /// Open a streaming connection to `<base_url>/responses` with
     /// pre-flight + reactive (401-once) refresh handling.
     pub(crate) async fn stream(
         &self,
@@ -246,7 +231,7 @@ impl OpenAiSubscriptionCompletionModel {
         let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             warn!(
                 event = "openai_subscription_unauthorized",
-                "Codex returned 401 — refreshing token and retrying once"
+                "Responses returned 401 — refreshing token and retrying once"
             );
             let refreshed = self
                 .refresh
@@ -271,16 +256,11 @@ impl OpenAiSubscriptionCompletionModel {
         Ok(self.adapt_response(response, extras.prompt_cache_key))
     }
 
-    /// Discover the account's visible models; only legacy credentials use the static supplement.
+    /// Discover the account's visible models, in server order.
     pub async fn list_remote_models(&self) -> crate::Result<Vec<crate::LiveModelInfo>> {
         let bundle = self.refresh.ensure_fresh_bundle().await?;
-        if bundle.connection.is_some() {
-            bundle.require_sharing()?;
-        }
-        let mut url = self.endpoint(&bundle, "/models");
-        if bundle.connection.is_none() {
-            url.push_str(&format!("?client_version={}", env!("CARGO_PKG_VERSION")));
-        }
+        bundle.require_sharing()?;
+        let url = self.endpoint(MODELS_PATH);
 
         let resp = self.send_models_get(&url, &bundle).await?;
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -294,20 +274,16 @@ impl OpenAiSubscriptionCompletionModel {
             let body = resp.text().await.unwrap_or_default();
             return Err(crate::status_to_error(
                 status.as_u16(),
-                format!("openai-subscription: GET /codex/models returned {status}: {body}"),
+                format!("openai-subscription: GET {MODELS_PATH} returned {status}: {body}"),
             ));
         }
-        let models = parse_models_response(resp).await?;
-        if bundle.connection.is_some() {
-            Ok(models
-                .into_iter()
-                .filter(|model| {
-                    model.extras.get("visibility").and_then(Value::as_str) == Some("list")
-                })
-                .collect())
-        } else {
-            Ok(catalog::supplement(models))
-        }
+        Ok(parse_models_response(resp)
+            .await?
+            .into_iter()
+            .filter(|model| {
+                model.extras.get(VISIBILITY_FIELD).and_then(Value::as_str) == Some(VISIBILITY_LIST)
+            })
+            .collect())
     }
 
     async fn send_models_get(
@@ -318,31 +294,20 @@ impl OpenAiSubscriptionCompletionModel {
         self.authed_request(reqwest::Method::GET, url, bundle)
             .send()
             .await
-            .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: GET /codex/models"))
+            .map_err(|e| {
+                crate::reqwest_to_error(e, format!("openai-subscription: GET {MODELS_PATH}"))
+            })
     }
 
-    /// Apply the bearer + originator + (optional) account-id headers
-    /// shared by every authenticated request. Returns a `RequestBuilder`
-    /// the caller chains `.json()` / `.send()` onto.
     fn authed_request(
         &self,
         method: reqwest::Method,
         url: &str,
         bundle: &OAuthTokenBundle,
     ) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
+        self.http
             .request(method, url)
-            .bearer_auth(&bundle.access_token);
-        if bundle.connection.is_none() {
-            req = req.header("originator", LEGACY_ORIGINATOR);
-        }
-        if bundle.connection.is_none()
-            && let Some(account_id) = &bundle.account_id
-        {
-            req = req.header("ChatGPT-Account-Id", account_id);
-        }
-        req
+            .bearer_auth(&bundle.access_token)
     }
 
     async fn send(
@@ -351,19 +316,12 @@ impl OpenAiSubscriptionCompletionModel {
         body: &Value,
         affinity: &HeaderMap,
     ) -> crate::Result<reqwest::Response> {
-        if bundle.connection.is_some() {
-            bundle.require_sharing()?;
-        }
-        let url = self.endpoint(bundle, RESPONSES_PATH);
+        bundle.require_sharing()?;
+        let url = self.endpoint(RESPONSES_PATH);
 
         debug!(url = %url, "POST openai-subscription Responses");
-        let mut request = self
-            .authed_request(reqwest::Method::POST, &url, bundle)
-            .headers(affinity.clone());
-        if bundle.connection.is_none() {
-            request = request.header("OpenAI-Beta", "responses=experimental");
-        }
-        request
+        self.authed_request(reqwest::Method::POST, &url, bundle)
+            .headers(affinity.clone())
             .header("Accept", "text/event-stream")
             .json(body)
             .send()
@@ -422,7 +380,7 @@ fn affinity_headers(cache_key: Option<&str>) -> HeaderMap {
     headers
 }
 
-/// The plan's quota is spent, not a throttle to back off from. Codex sends
+/// The plan's quota is spent, not a throttle to back off from. The server sends
 /// it as a 429 with a typed body, which is the only thing that separates the
 /// two: `Some(resets_in)` when the body says so, `None` for any other
 /// rejection. Keyed on the body's `type` and never on the status, so an
@@ -450,7 +408,7 @@ fn quota_exhausted(body: &str) -> Option<Option<std::time::Duration>> {
     )
 }
 
-/// rig `CompletionRequest` → Codex Responses API JSON body. Returns
+/// rig `CompletionRequest` → Responses API JSON body. Returns
 /// `Value` so tests can inspect the shape without mocking HTTP.
 ///
 /// `extras.effort` is the operator's already-resolved effort
@@ -484,16 +442,16 @@ pub(crate) fn build_responses_body(
         })
         .collect();
 
-    // The Codex Responses API rejects requests without `instructions`
-    // ("400: Instructions are required") even when the caller hasn't
-    // set a system message — `baybo llm probe` is the canonical example.
-    // Always supply at least a minimal placeholder.
+    // Always send `instructions`, even when the caller set no system
+    // message (`baybo llm probe` is the canonical example): a minimal
+    // placeholder is harmless, and an empty field has been refused with
+    // "400: Instructions are required".
     let instructions = request
         .preamble
         .clone()
         .unwrap_or_else(|| "You are a helpful assistant.".to_string());
     // store=false: we manage conversation state ourselves; don't ask
-    // the server to retain it (matches the Codex CLI posture).
+    // the server to retain it.
     let tool_choice = match request.tool_choice {
         Some(rig::message::ToolChoice::None) => TOOL_CHOICE_NONE,
         _ => TOOL_CHOICE_AUTO,
@@ -533,7 +491,7 @@ pub(crate) fn build_responses_body(
             "openai-subscription: reasoning disabled (effort = None)"
         );
     }
-    // `temperature` is not part of the Codex Responses parameter set —
+    // `temperature` is not part of the subscription Responses parameter set —
     // server returns 400 "Unsupported parameter: temperature" if we
     // forward it. Reasoning models pin sampling internally; the
     // request shape simply doesn't expose a knob.
@@ -545,13 +503,13 @@ async fn parse_models_response(
 ) -> crate::Result<Vec<crate::LiveModelInfo>> {
     let body: Value = resp.json().await.map_err(|e| {
         LlmError::Decode(format!(
-            "openai-subscription: /codex/models response parse: {e}"
+            "openai-subscription: {MODELS_PATH} response parse: {e}"
         ))
     })?;
     project_models_body(body)
 }
 
-/// Project Codex's `{ "models": [...] }` into `Vec<LiveModelInfo>`. Each
+/// Project the catalog's `{ "models": [...] }` into `Vec<LiveModelInfo>`. Each
 /// raw entry is stashed verbatim into `extras` so operators with --json
 /// can see fields baybo doesn't surface.
 fn project_models_body(mut body: Value) -> crate::Result<Vec<crate::LiveModelInfo>> {
@@ -559,7 +517,7 @@ fn project_models_body(mut body: Value) -> crate::Result<Vec<crate::LiveModelInf
         Some(Value::Array(arr)) => arr,
         _ => {
             return Err(LlmError::Decode(format!(
-                "openai-subscription: /codex/models missing `models` array; body: {body}"
+                "openai-subscription: {MODELS_PATH} missing `models` array; body: {body}"
             )));
         }
     };
@@ -595,7 +553,7 @@ fn project_models_body(mut body: Value) -> crate::Result<Vec<crate::LiveModelInf
                 arr.iter()
                     .any(|m| m.as_str() == Some("image") || m.as_str() == Some("Image"))
             });
-        // All Codex-served models are tool-capable; `supports_parallel_tool_calls`
+        // All subscription-served models are tool-capable; `supports_parallel_tool_calls`
         // is a different question and shouldn't be conflated.
         let supports_tools = Some(true);
         out.push(crate::LiveModelInfo {
@@ -708,7 +666,7 @@ fn convert_message(message: &Message) -> Result<Vec<Value>, String> {
             }
         }
         // System messages normally flow through `preamble` -> `instructions`.
-        // Codex Responses API has no system-role item; emit as user text so
+        // The Responses API input has no system-role item here; emit as user text so
         // a stray System variant isn't silently dropped.
         Message::System { content } => {
             out.push(json!({
@@ -820,7 +778,7 @@ fn build_reasoning_block(
         }
     }
     if !reasoning_buf.is_empty() && !saw_item_summary {
-        // Codex reasoning deltas are summary-style (no signature payload).
+        // Reasoning deltas are summary-style (no signature payload).
         content.insert(0, ReasoningContent::Summary(reasoning_buf));
     }
     if content.is_empty() {
@@ -844,7 +802,7 @@ fn tool_result_to_text(tr: &completion::message::ToolResult) -> String {
 }
 
 /// SSE → flat `Stream<Result<StreamEvent>>`. Drops unknown event types;
-/// Codex frequently adds new ones and we'd rather skip them than fail.
+/// the server frequently adds new ones and we'd rather skip them than fail.
 fn parse_sse_stream(
     response: reqwest::Response,
     cache_key: Option<String>,
@@ -1011,7 +969,7 @@ fn translate_event(
                 out.push(Ok(StreamEvent::Reasoning(delta.to_owned())));
             }
         }
-        // Tool / function call assembly. Codex emits an `added` event with
+        // Tool / function call assembly. The server emits an `added` event with
         // the call's name + id, then a stream of `arguments.delta`s, then a
         // `done`/`completed` event.
         "response.output_item.added" => {
@@ -1157,7 +1115,7 @@ fn translate_event(
                 .or_else(|| payload.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("openai-subscription: server-side stream error");
-            // Mid-stream `response.error` / `error` events from Codex
+            // Mid-stream `response.error` / `error` events from the server
             // are typically transport / overload signals (the request
             // was accepted at the HTTP layer but the upstream model
             // run failed). Mark Transient so the caller's retry path
@@ -1167,7 +1125,7 @@ fn translate_event(
         }
         other => {
             // Unknown event type — drop the payload but log the
-            // type at debug so operators can spot when Codex
+            // type at debug so operators can spot when the server
             // introduces a shape we don't parse yet (the reasoning
             // family in particular has gone through several
             // rename rounds).
@@ -1318,15 +1276,6 @@ mod tests {
         }
     }
 
-    /// Serves one completed response and hands back the request head it got.
-    async fn spawn_capturing_responses_endpoint() -> (String, tokio::sync::oneshot::Receiver<String>)
-    {
-        spawn_capturing_endpoint(
-            "event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
-            "text/event-stream",
-        ).await
-    }
-
     pub(super) async fn spawn_capturing_endpoint(
         body: &str,
         content_type: &str,
@@ -1356,55 +1305,6 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
         });
         (origin, rx)
-    }
-
-    #[tokio::test]
-    async fn stream_puts_the_cache_key_on_the_wire_as_affinity_headers() {
-        use baybo_security::test_support::MemorySecretStore;
-        use baybo_security::{EncryptionKey, SecretVault};
-
-        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
-        let store = VaultTokenStore::new(Arc::new(SecretVault::new(
-            key,
-            Arc::new(MemorySecretStore::new()),
-        )));
-        let now = chrono::Utc::now().timestamp();
-        store
-            .save(&OAuthTokenBundle {
-                connection: None,
-                access_token: "at".into(),
-                refresh_token: "rt".into(),
-                id_token: "id".into(),
-                account_id: None,
-                expires_at: now + 7200,
-                obtained_at: now,
-            })
-            .await
-            .unwrap();
-        let (origin, head) = spawn_capturing_responses_endpoint().await;
-        let model = OpenAiSubscriptionCompletionModel::new(
-            "gpt-5".into(),
-            Some(origin),
-            None,
-            store,
-            reqwest::Client::builder().no_proxy().build().unwrap(),
-            BackgroundRefresh::Disabled,
-        );
-        let extras = crate::ProviderCallExtras {
-            prompt_cache_key: Some("session-7"),
-            ..Default::default()
-        };
-
-        let mut stream = model.stream(empty_request(), extras).await.unwrap();
-        while stream.next().await.is_some() {}
-
-        let head = head.await.unwrap();
-        for name in AFFINITY_HEADERS {
-            assert!(
-                head.contains(&format!("\r\n{name}: session-7\r\n")),
-                "{name} missing: {head}"
-            );
-        }
     }
 
     #[test]
@@ -1544,8 +1444,8 @@ mod tests {
         assert_eq!(body["instructions"], "be terse");
     }
 
-    /// Regression: the Codex Responses API rejects requests without
-    /// `instructions` (400 "Instructions are required"). `baybo llm
+    /// Regression: requests without `instructions` have been refused
+    /// (400 "Instructions are required"). `baybo llm
     /// probe` builds a request with no preamble, so the body builder
     /// must inject a placeholder when the caller didn't provide one.
     #[test]
@@ -1559,12 +1459,12 @@ mod tests {
         assert!(!instructions.is_empty());
     }
 
-    /// Regression: Codex Responses returns 400 "Unsupported parameter:
+    /// Regression: the Responses endpoint returns 400 "Unsupported parameter:
     /// temperature" when the field is forwarded. The reasoning models
     /// pin sampling server-side; we drop the field even when the
     /// caller (e.g. `baybo llm probe`) sets one.
     #[test]
-    fn body_drops_temperature_for_codex_responses() {
+    fn body_drops_temperature_for_responses() {
         let mut req = empty_request();
         req.temperature = Some(0.0);
         let body = build_responses_body("gpt-5", Default::default(), &req).unwrap();
@@ -1605,7 +1505,7 @@ mod tests {
         );
     }
 
-    /// Regression: Codex Responses requires `tools[].name` to match
+    /// Regression: the Responses API requires `tools[].name` to match
     /// `^[a-zA-Z0-9_-]+$`. Baybo's MCP-prefixed names (`browser/foo`)
     /// must be encoded on the way out and decoded on the way back.
     #[test]
@@ -1616,7 +1516,7 @@ mod tests {
             sanitized
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-            "sanitized name must satisfy Codex regex: {sanitized}",
+            "sanitized name must satisfy the tool-name regex: {sanitized}",
         );
         assert_eq!(unsanitize_tool_name(&sanitized), original);
     }
@@ -1799,7 +1699,7 @@ mod tests {
 
     #[test]
     fn translate_event_splits_cache_reads_from_cache_writes() {
-        // Shape taken verbatim from a live `POST /codex/responses`.
+        // Shape of a `response.completed` usage block from `POST /responses`.
         let mut calls = HashMap::new();
         let out = translate_event(
             &mut calls,
@@ -1907,7 +1807,7 @@ mod tests {
 
     #[test]
     fn build_reasoning_block_drops_deltas_the_finalised_item_repeats() {
-        // Codex streams `reasoning_summary_text.delta` and then repeats the
+        // The server streams `reasoning_summary_text.delta` and then repeats the
         // same prose in `output_item.done`'s `summary[]`. Keeping both
         // surfaced the summary twice ("**Title**\n**Title**") in the trace
         // and echoed it twice back to the provider.
@@ -1932,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn project_models_body_lifts_codex_fields_into_live_model_info() {
+    fn project_models_body_lifts_catalog_fields_into_live_model_info() {
         let body = serde_json::json!({
             "models": [
                 {
@@ -1973,7 +1873,7 @@ mod tests {
         // max_context_window fallback when context_window is absent.
         assert_eq!(entries[1].context_window, Some(128_000));
         assert_eq!(entries[1].supports_vision, Some(false));
-        // Tool-capability is constant for Codex-served models.
+        // Tool-capability is constant for subscription-served models.
         assert_eq!(entries[1].supports_tools, Some(true));
     }
 

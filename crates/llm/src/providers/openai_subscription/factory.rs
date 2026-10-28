@@ -8,11 +8,11 @@ use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, LlmError, ModelInfo, ModelPricing};
 
 /// Hosts where the ChatGPT subscription bearer is allowed to land. Match
-/// is suffix-based (`chatgpt.com` covers `api.chatgpt.com` etc.). A
+/// is suffix-based (a listed host also covers its subdomains). A
 /// non-default `base_url` outside the list is rejected at factory time
 /// so a malicious baybo.json can't exfiltrate the OAuth bearer to an
 /// attacker host on the next chat call.
-const ALLOWED_HOST_SUFFIXES: &[&str] = &["api.openai.com", "chatgpt.com", "auth.openai.com"];
+const ALLOWED_HOST_SUFFIXES: &[&str] = &["api.openai.com", "auth.openai.com"];
 
 /// Env-var escape hatch for non-OpenAI hosts. Env rather than baybo.json
 /// so flipping a credential-leak guard requires an explicit shell action.
@@ -27,7 +27,7 @@ fn validate_base_url(base_url: Option<&str>) -> crate::Result<()> {
             "openai-subscription: base_url is not a valid URL ({e}): {url_str}"
         ))
     })?;
-    // Scheme check runs before the host check so `http://chatgpt.com`
+    // Scheme check runs before the host check so `http://api.openai.com`
     // (allowlisted host, plaintext transport) is rejected. The unsafe
     // override only widens the host allowlist, never the scheme.
     if parsed.scheme() != "https" {
@@ -252,13 +252,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_base_url_accepts_default_chatgpt_host() {
-        assert!(validate_base_url(Some("https://chatgpt.com/backend-api")).is_ok());
+    fn validate_base_url_accepts_default_host() {
+        assert!(validate_base_url(Some(super::super::DEFAULT_BASE_URL)).is_ok());
     }
 
     #[test]
-    fn validate_base_url_accepts_chatgpt_subdomain() {
-        assert!(validate_base_url(Some("https://api.chatgpt.com/backend-api")).is_ok());
+    fn validate_base_url_accepts_openai_subdomain() {
+        assert!(validate_base_url(Some("https://eu.api.openai.com/v1")).is_ok());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_chatgpt_host() {
+        let err = validate_base_url(Some("https://chatgpt.com/backend-api"))
+            .expect_err("the ChatGPT backend is not a token-sharing endpoint");
+        assert!(matches!(err, LlmError::Config(_)));
     }
 
     #[test]
@@ -280,10 +287,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_base_url_rejects_chatgpt_lookalike() {
+    fn validate_base_url_rejects_openai_lookalike() {
         // Suffix check requires exact host match or leading dot — bare
-        // ".com.attacker.example" suffix doesn't qualify as chatgpt.com.
-        let err = validate_base_url(Some("https://chatgpt.com.attacker.example"))
+        // ".com.attacker.example" suffix doesn't qualify as api.openai.com.
+        let err = validate_base_url(Some("https://api.openai.com.attacker.example"))
             .expect_err("lookalike hosts must be rejected");
         assert!(matches!(err, LlmError::Config(_)));
     }
@@ -300,7 +307,7 @@ mod tests {
 
     #[test]
     fn validate_base_url_rejects_http_with_allowlisted_host() {
-        let err = validate_base_url(Some("http://chatgpt.com/backend-api"))
+        let err = validate_base_url(Some("http://api.openai.com/v1"))
             .expect_err("http:// must be rejected even on allowlisted host");
         match err {
             LlmError::Config(msg) => {
@@ -313,14 +320,14 @@ mod tests {
 
     #[test]
     fn validate_base_url_rejects_http_with_allowlisted_subdomain() {
-        let err = validate_base_url(Some("http://api.chatgpt.com/backend-api"))
+        let err = validate_base_url(Some("http://eu.api.openai.com/v1"))
             .expect_err("http:// on subdomain must also be rejected");
         assert!(matches!(err, LlmError::Config(_)));
     }
 
     #[test]
     fn validate_base_url_rejects_non_http_scheme() {
-        let err = validate_base_url(Some("ftp://chatgpt.com/backend-api"))
+        let err = validate_base_url(Some("ftp://api.openai.com/v1"))
             .expect_err("non-http(s) schemes must be rejected");
         assert!(matches!(err, LlmError::Config(_)));
     }
