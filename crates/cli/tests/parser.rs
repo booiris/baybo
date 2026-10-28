@@ -570,6 +570,102 @@ fn session_history_accepts_supersede_flags() {
 }
 
 #[test]
+fn session_search_requires_a_query() {
+    assert!(Cli::try_parse_from(["baybo", "session", "search"]).is_err());
+}
+
+#[test]
+fn session_search_joins_words_and_defaults_scope() {
+    let cli = parse(&["session", "search", "数据库", "迁移"]);
+    let Some(Commands::Session {
+        cmd: SessionCmd::Search(args),
+    }) = cli.command
+    else {
+        panic!("expected session search");
+    };
+    assert_eq!(args.query, ["数据库", "迁移"]);
+    assert!(args.channel.is_none());
+    assert!(args.session.is_none());
+    assert!(!args.include_hidden);
+    assert!(!args.include_archived);
+    assert!(!args.include_cron_workspaces);
+    assert!(!args.all);
+    assert_eq!(args.limit, baybo_session::search::DEFAULT_SEARCH_LIMIT);
+    assert_eq!(
+        args.per_session,
+        baybo_session::search::MAX_HITS_PER_SESSION
+    );
+    assert_eq!(args.scan, baybo_session::search::SEARCH_SCAN_LIMIT);
+}
+
+#[test]
+fn session_search_accepts_scope_and_limit_flags() {
+    let cli = parse(&[
+        "session",
+        "search",
+        "deploy",
+        "script",
+        "--channel",
+        "owner",
+        "--session",
+        "s1",
+        "--include-hidden",
+        "--include-archived",
+        "--include-cron-workspaces",
+        "--all",
+        "-n",
+        "5",
+        "--per-session",
+        "1",
+        "--scan",
+        "1000",
+    ]);
+    let Some(Commands::Session {
+        cmd: SessionCmd::Search(args),
+    }) = cli.command
+    else {
+        panic!("expected session search");
+    };
+    assert_eq!(args.query, ["deploy", "script"]);
+    assert_eq!(args.channel.as_deref(), Some("owner"));
+    assert_eq!(args.session.as_deref(), Some("s1"));
+    assert!(args.include_hidden && args.include_archived && args.include_cron_workspaces);
+    assert!(args.all);
+    assert_eq!(args.limit, 5);
+    assert_eq!(args.per_session, 1);
+    assert_eq!(args.scan, 1000);
+}
+
+#[test]
+fn session_search_rejects_out_of_range_limits() {
+    let over_max = (baybo_session::search::MAX_SEARCH_LIMIT + 1).to_string();
+    for argv in [
+        vec!["baybo", "session", "search", "x", "-n", "0"],
+        vec!["baybo", "session", "search", "x", "-n", &over_max],
+        vec!["baybo", "session", "search", "x", "--per-session", "0"],
+        vec!["baybo", "session", "search", "x", "--scan", "0"],
+    ] {
+        assert!(
+            Cli::try_parse_from(&argv).is_err(),
+            "{argv:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn session_search_dash_word_needs_the_separator() {
+    assert!(Cli::try_parse_from(["baybo", "session", "search", "-v"]).is_err());
+    let cli = parse(&["session", "search", "--", "-v"]);
+    let Some(Commands::Session {
+        cmd: SessionCmd::Search(args),
+    }) = cli.command
+    else {
+        panic!("expected session search");
+    };
+    assert_eq!(args.query, ["-v"]);
+}
+
+#[test]
 fn session_kill_is_no_longer_a_subcommand() {
     assert!(Cli::try_parse_from(["baybo", "session", "kill", "sid"]).is_err());
 }

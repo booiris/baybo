@@ -1,7 +1,7 @@
 ---
 name: baybo-cli
 version: 0.1.0
-description: "Inspect the running Baybo instance — sessions, turns, traces, cron, costs, config, channels, MCP servers, gateway and sidecar logs — by invoking the `baybo` CLI through the Bash tool. Use whenever the user asks about Baybo's own state (what's running, what failed, what spent money, what was said) instead of answering from memory."
+description: "Inspect the running Baybo instance — sessions, turns, traces, cron, costs, config, channels, MCP servers, gateway and sidecar logs — by invoking the `baybo` CLI through the Bash tool. Use whenever the user asks about Baybo's own state (what's running, what failed, what spent money, what was said and where) instead of answering from memory."
 user-invocable: false
 disable-model-invocation: false
 allowed-tools:
@@ -44,6 +44,7 @@ The conversation you are answering inside right now is
 takes `<id>` and the user is asking about "this session" / "the
 current chat" / "now" — e.g. `{{BAYBO_BIN}} session show {{session_id}}`,
 `{{BAYBO_BIN}} session history {{session_id}}`,
+`{{BAYBO_BIN}} session search <words> --session {{session_id}}`,
 `{{BAYBO_BIN}} cost show --session {{session_id}}`. Only swap in a
 different id if the user names one explicitly.
 
@@ -59,6 +60,8 @@ absolute path to the running binary, baked in at boot time.
 | "What's the metadata for session X?" | `{{BAYBO_BIN}} session show <id>` |
 | "What did the user/agent say?" | `{{BAYBO_BIN}} session history <id>` |
 | "What got dropped by compaction?" | `{{BAYBO_BIN}} session history <id> --include-superseded` (or `--superseded-only`) |
+| "Where did we talk about X? / which session mentioned X?" | `{{BAYBO_BIN}} session search <words…>` (grouped by session, best match first; `--all` also reaches hidden, archived and cron-workspace sessions) |
+| "Did this chat mention X?" | `{{BAYBO_BIN}} session search <words…> --session <id>` |
 | "What LLM calls / tool calls happened?" | `{{BAYBO_BIN}} session export <id>` (full JSON tree) |
 | "Which turns are in-flight / failed?" | `{{BAYBO_BIN}} turn list [--status in-progress \| failed \| stuck]` |
 | "What's the state of turn X?" | `{{BAYBO_BIN}} turn show <id>` |
@@ -106,7 +109,10 @@ absolute path to the running binary, baked in at boot time.
   tools you already have.
 - Inferring state from one command when another is more direct.
   Prefer `{{BAYBO_BIN}} cost show --session <id>` over piping
-  `session export` through `jq`.
+  `session export` through `jq`, and `{{BAYBO_BIN}} session search
+  <words…>` over grepping `session history` dumps session by session.
+  A hit prints `#<ordinal>`; read the whole row with
+  `{{BAYBO_BIN}} session history <id> --include-superseded --json`.
 
 ## When in doubt
 
