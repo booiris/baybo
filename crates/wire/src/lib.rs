@@ -973,7 +973,7 @@ pub enum Frame {
         /// The issue the change is about, when it is about one. A detail
         /// page ignores anything for another number.
         ///
-        /// `u32` for the same reason as [`DeckCardData::seq`](Frame::DeckCardData::seq): keeps
+        /// `u32` for the same reason as `seq` on [`Frame::DeckCardData`]: keeps
         /// `bigint` out of the generated TS contract.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-export", ts(optional))]
