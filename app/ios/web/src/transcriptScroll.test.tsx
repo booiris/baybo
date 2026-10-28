@@ -288,8 +288,12 @@ beforeEach(() => {
   vi.spyOn(console, "log").mockImplementation(() => {});
 });
 
+// Vitest 4's `vi.spyOn` hands back the existing spy when the method is already
+// one, so without a restore `posts()` would read every earlier test's bridge
+// traffic too.
 afterEach(() => {
   Element.prototype.getBoundingClientRect = realRect;
+  vi.restoreAllMocks();
 });
 
 describe("scroll-up paging holds the viewport", () => {

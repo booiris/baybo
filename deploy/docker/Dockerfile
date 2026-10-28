@@ -9,8 +9,6 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
-ARG PNPM_VERSION=9.13.2
-
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential \
@@ -25,7 +23,12 @@ RUN apt-get update \
 COPY --from=node /usr/local/ /usr/local/
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 
-RUN npm install --global "pnpm@${PNPM_VERSION}"
+# pnpm's one pin is the root package.json `packageManager` field, which CI's
+# pnpm/action-setup and Dependabot read too. Copied alone so this layer stays
+# cached across source edits.
+COPY package.json /tmp/pnpm-pin/package.json
+RUN npm install --global "$(node -p "require('/tmp/pnpm-pin/package.json').packageManager.split('+')[0]")" \
+    && rm -rf /tmp/pnpm-pin
 
 WORKDIR /src
 COPY . .

@@ -23,7 +23,7 @@ cd "$REPO_ROOT"
 
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
 
-# The JS toolchain pins live in deploy/docker/Dockerfile and are read from it, so
+# The node/bun pins live in deploy/docker/Dockerfile and are read from it, so
 # the shipped container and the shipped tarball cannot drift onto different
 # versions of the thing that bakes the dashboard and the sidecars in. The Rust
 # pin is not here because rust-toolchain.toml is already its one home — rustup
@@ -38,9 +38,22 @@ dockerfile_arg() {
     printf '%s\n' "$value"
 }
 
+# pnpm is the exception: its one pin is the root package.json `packageManager`
+# field, because CI's pnpm/action-setup and Dependabot read it from there and
+# the Dockerfile installs from it too.
+package_manager_pnpm() {
+    local value
+    value="$(sed -n 's/^ *"packageManager": *"pnpm@\([^"+]*\).*$/\1/p' package.json | head -n1)"
+    if [ -z "$value" ]; then
+        echo 'release-build: "packageManager": "pnpm@<version>" not found in package.json' >&2
+        exit 1
+    fi
+    printf '%s\n' "$value"
+}
+
 NODE_VERSION="$(dockerfile_arg NODE_VERSION)"
 BUN_VERSION="$(dockerfile_arg BUN_VERSION)"
-PNPM_VERSION="$(dockerfile_arg PNPM_VERSION)"
+PNPM_VERSION="$(package_manager_pnpm)"
 
 # Resolving the pins is the one thing here that can break from an edit to a
 # FILE THIS SCRIPT DOES NOT OWN, and it would break at release time, 25 minutes
