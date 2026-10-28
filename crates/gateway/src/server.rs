@@ -157,11 +157,11 @@ pub struct AdminState {
     pub cron_scheduler: Arc<CronScheduler>,
     pub trace_store: Arc<dyn TraceStore>,
     pub cost_store: Arc<dyn baybo_cost::CostStore>,
-    /// Full-text search over transcript prose (`docs/search.md`). A direct
-    /// store rather than a `QueryApi` method: `QueryApi` composes the analytics
-    /// surface (session / turn / span / cost), and search shares none of its
-    /// error shape or its callers.
-    pub message_search: Arc<dyn baybo_store::MessageSearchStore>,
+    /// Grouped full-text search over transcript prose (`docs/search.md`). A
+    /// domain verb rather than a `QueryApi` method: `QueryApi` composes the
+    /// analytics surface (session / turn / span / cost), and search shares
+    /// none of its error shape or its callers.
+    pub session_search: Arc<baybo_session::search::SessionSearch>,
     /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
     /// query-shaped endpoint don't allocate one per request.
     pub query_api: Arc<baybo_query::QueryApi>,
@@ -232,7 +232,10 @@ impl AdminState {
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
             trace_store: Arc::clone(&deps.stores.trace),
             cost_store: Arc::clone(&deps.stores.cost),
-            message_search: Arc::clone(&deps.stores.message_search),
+            session_search: Arc::new(baybo_session::search::SessionSearch::new(
+                Arc::clone(&deps.stores.message_search),
+                Arc::clone(&deps.stores.session),
+            )),
             query_api,
             skill_registry: Arc::clone(&deps.skill_registry),
             tool_registry: Arc::clone(&deps.tool_registry),

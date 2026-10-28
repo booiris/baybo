@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Baybo operator CLI.
 ///
@@ -155,7 +155,8 @@ pub enum Commands {
     /// metadata + (when wired) execution-trace counts, `history <id>`
     /// for the conversation transcript (with
     /// `--include-superseded` / `--superseded-only` to surface
-    /// compaction-dropped turns), and `export <id> [--out]` for the
+    /// compaction-dropped turns), `search <query…>` for full-text
+    /// search over transcripts, and `export <id> [--out]` for the
     /// full LLM/tool call tree as JSON.
     #[command(hide = true)]
     Session {
@@ -776,6 +777,72 @@ pub enum SessionCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Full-text search over transcript prose, grouped by session, best
+    /// match first (`docs/search.md`). Reaches every channel `session list`
+    /// shows — bot channels and subagent runs included — but, like the chat
+    /// UI, skips hidden, archived and cron-workspace sessions until asked
+    /// (`--include-*` / `--all`). Words are AND-ed and matched literally:
+    /// FTS5 operators are inert, Latin words of three or more letters are
+    /// prefix-widened, Han text is substring-matched. Each hit prints
+    /// `#<ordinal>`, the `ordinal` of the row `history <id>
+    /// --include-superseded` returns.
+    Search(SessionSearchArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionSearchArgs {
+    /// Query words; several are AND-ed (`deploy script` finds rows holding
+    /// both). Put `--` before a word that starts with `-`.
+    #[arg(required = true, num_args = 1.., value_name = "QUERY")]
+    pub query: Vec<String>,
+    /// Restrict to one channel (`owner`, `tui`, `telegram`, `subagent`, …).
+    /// Default: every channel.
+    #[arg(long, value_name = "CHANNEL")]
+    pub channel: Option<String>,
+    /// Restrict to one session id. Composes with the other filters: a
+    /// hidden session still needs `--include-hidden`.
+    #[arg(long, value_name = "SESSION_ID")]
+    pub session: Option<String>,
+    /// Reach sessions the user hid from their chat list.
+    #[arg(long)]
+    pub include_hidden: bool,
+    /// Reach archived sessions.
+    #[arg(long)]
+    pub include_archived: bool,
+    /// Reach cron fire sessions that are not conversations of their own
+    /// (one-shot workspaces, pre-conversation historical fires).
+    #[arg(long)]
+    pub include_cron_workspaces: bool,
+    /// Shorthand for all three `--include-*` flags: the whole index.
+    #[arg(long)]
+    pub all: bool,
+    /// Maximum sessions to print (not messages).
+    #[arg(
+        long,
+        short = 'n',
+        value_name = "N",
+        default_value_t = baybo_session::search::DEFAULT_SEARCH_LIMIT,
+        value_parser = clap::builder::RangedI64ValueParser::<usize>::new()
+            .range(1..=baybo_session::search::MAX_SEARCH_LIMIT as i64)
+    )]
+    pub limit: usize,
+    /// Hits shown per session; the per-session total is still counted.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = baybo_session::search::MAX_HITS_PER_SESSION,
+        value_parser = clap::builder::RangedI64ValueParser::<usize>::new().range(1..)
+    )]
+    pub per_session: usize,
+    /// Raw index rows scanned before grouping. Raise it when the result
+    /// says the scan window filled.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = baybo_session::search::SEARCH_SCAN_LIMIT,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub scan: u32,
 }
 
 #[derive(Debug, Subcommand)]

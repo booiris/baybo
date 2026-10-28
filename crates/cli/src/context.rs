@@ -9,6 +9,7 @@ use baybo_llm::BillableLlm;
 use baybo_pairing::DevicePairingService;
 use baybo_query::QueryApi;
 use baybo_security::{LeakDetector, SecretVault};
+use baybo_session::search::SessionSearch;
 use baybo_skills::SkillRegistry;
 use baybo_skills_assessor::SkillAssessor;
 use baybo_store::{ChannelBotStore, ChannelPairingStore};
@@ -55,6 +56,9 @@ pub struct CommandContext {
     pub llm: Option<Arc<BillableLlm>>,
     pub workspace: Arc<WorkspacePaths>,
     pub session: Option<Arc<SessionManager>>,
+    /// Grouped transcript search for `baybo session search`. Wired beside
+    /// `session` under `needs_query_graph`; `None` in argv-light boots.
+    pub session_search: Option<Arc<SessionSearch>>,
     pub turn: Option<Arc<TurnLifecycle>>,
     pub cron: Option<Arc<CronScheduler>>,
     pub trace: Option<Arc<dyn TraceStore>>,
@@ -129,6 +133,7 @@ pub struct ContextBuilder {
     llm: Option<Arc<BillableLlm>>,
     workspace: Option<Arc<WorkspacePaths>>,
     session: Option<Arc<SessionManager>>,
+    session_search: Option<Arc<SessionSearch>>,
     turn: Option<Arc<TurnLifecycle>>,
     cron: Option<Arc<CronScheduler>>,
     trace: Option<Arc<dyn TraceStore>>,
@@ -153,6 +158,7 @@ impl ContextBuilder {
             llm: None,
             workspace: None,
             session: None,
+            session_search: None,
             turn: None,
             cron: None,
             trace: None,
@@ -199,6 +205,11 @@ impl ContextBuilder {
 
     pub fn session(mut self, session: Arc<SessionManager>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    pub fn session_search(mut self, search: Arc<SessionSearch>) -> Self {
+        self.session_search = Some(search);
         self
     }
 
@@ -284,6 +295,7 @@ impl ContextBuilder {
                 .workspace
                 .unwrap_or_else(|| Arc::new(WorkspacePaths::new(PathBuf::from(".")))),
             session: self.session,
+            session_search: self.session_search,
             turn: self.turn,
             cron: self.cron,
             trace: self.trace,

@@ -6,3 +6,5 @@ mod device_status;
 mod mcp_e2e;
 #[path = "parser.rs"]
 mod parser;
+#[path = "session_search.rs"]
+mod session_search;

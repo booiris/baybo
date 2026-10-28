@@ -4,11 +4,13 @@
 //! `Lineage`, `TriggerSource`) live in `baybo-model`; the `SessionStore`
 //! trait and its `ActiveMessageRow` / `StoredMessage` row types live in
 //! `baybo-store` (the ports
-//! crate). This crate owns the `SessionManager` business-logic facade;
-//! `baybo-storage` provides the sqlite implementations of both stores.
+//! crate). This crate owns the `SessionManager` business-logic facade and
+//! the grouped transcript search service `search::SessionSearch`;
+//! `baybo-storage` provides the sqlite implementations of the stores.
 
 mod error;
 mod manager;
+pub mod search;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

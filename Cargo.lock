@@ -338,6 +338,7 @@ dependencies = [
  "baybo-sandbox",
  "baybo-search",
  "baybo-security",
+ "baybo-session",
  "baybo-setup",
  "baybo-skills",
  "baybo-skills-assessor",

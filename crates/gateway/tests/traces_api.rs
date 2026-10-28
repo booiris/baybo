@@ -50,7 +50,10 @@ async fn build_router_with_lifecycle() -> (
         cron_scheduler: std::sync::Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
-        message_search: tg.deps.stores.message_search.clone(),
+        session_search: std::sync::Arc::new(baybo_session::search::SessionSearch::new(
+            tg.deps.stores.message_search.clone(),
+            tg.deps.stores.session.clone(),
+        )),
         query_api: std::sync::Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             std::sync::Arc::clone(&tg.deps.turn_lifecycle),

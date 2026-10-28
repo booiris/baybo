@@ -54,6 +54,14 @@ use baybo_model::{
     TriggerSource, User,
 };
 use baybo_session::SessionError;
+use baybo_session::search::{
+    DEFAULT_SEARCH_LIMIT, MAX_HITS_PER_SESSION, SEARCH_SCAN_LIMIT, SearchLimits,
+    SessionSearchGroup, SessionSearchHit,
+};
+// Doc-only: `SearchMessagesQuery::limit` links to it, and that doc text is
+// generated into `docs/openapi.json`, so the link cannot carry a path.
+#[cfg(doc)]
+use baybo_session::search::MAX_SEARCH_LIMIT;
 use baybo_store::SearchScope;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -138,28 +146,6 @@ pub struct SearchMessagesQuery {
     /// [`DEFAULT_SEARCH_LIMIT`], clamped to [`MAX_SEARCH_LIMIT`].
     pub limit: Option<usize>,
 }
-
-/// Enough conversations to fill a results panel without scrolling into a second
-/// page.
-pub const DEFAULT_SEARCH_LIMIT: usize = 20;
-pub const MAX_SEARCH_LIMIT: usize = 50;
-
-/// Raw hits pulled from the index before grouping.
-///
-/// Grouping has to happen over a window wider than the response, or one chatty
-/// conversation buries every other. Measured on real data, `codex` matches 47
-/// times across 17 conversations — but a flat top-30 covers only 7 of them,
-/// because a single conversation takes 15 of the 30 slots. Client-side grouping
-/// cannot fix that: the other 10 conversations were never sent.
-///
-/// Scanning wide is nearly free. Query cost tracks the number of MATCHES, not
-/// the limit — `ORDER BY bm25` scores every hit before it drops any — so this
-/// bounds the rows carried back through the trait, not the work sqlite does.
-const SEARCH_SCAN_LIMIT: usize = 300;
-
-/// Excerpts shown per conversation. Past a few, a result card stops being
-/// glanceable and the conversation is better opened than previewed.
-const MAX_HITS_PER_SESSION: usize = 3;
 
 /// One matching message inside a [`ChatSearchGroup`].
 #[derive(Debug, Serialize, ToSchema)]
@@ -977,88 +963,45 @@ async fn search_messages(
         // Policy, not a knob: this route answers "find a conversation I can
         // open", and a cron workspace is precisely the session that cannot be
         // opened — `/v1/chat/sessions` drops it and the attach path 404s it. No
-        // query param exposes this; an operator view that wants fire transcripts
-        // is a different product with a different scope, and turning it on is a
+        // query param exposes this; the operator view that turns it on is
+        // `baybo session search --include-cron-workspaces`, and doing so is a
         // query-side change with no reindex.
         include_cron_workspaces: false,
     };
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_SEARCH_LIMIT)
-        .min(MAX_SEARCH_LIMIT);
-    let hits = state
-        .message_search
-        .search_messages(&query.q, &scope, SEARCH_SCAN_LIMIT as u32)
+    let limits = SearchLimits {
+        sessions: query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+        hits_per_session: MAX_HITS_PER_SESSION,
+        scan: SEARCH_SCAN_LIMIT,
+    };
+    let results = state
+        .session_search
+        .search(&query.q, &scope, limits)
         .await
         .map_err(|e| GatewayError::Internal(format!("search messages: {e}")))?;
-    let truncated = hits.len() == SEARCH_SCAN_LIMIT;
+    let groups = results.groups.into_iter().map(chat_search_group).collect();
+    Ok(Json(ChatSearchResults {
+        groups,
+        truncated: results.truncated,
+    }))
+}
 
-    // Hits arrive sorted by bm25, so first-seen order IS relevance order: a
-    // conversation ranks by its best hit, which falls out of pushing each hit
-    // onto its group in arrival order. Nothing re-sorts.
-    let mut order: Vec<String> = Vec::new();
-    let mut grouped: std::collections::HashMap<String, ChatSearchGroup> =
-        std::collections::HashMap::new();
-    for hit in hits {
-        let sid = hit.session_id.as_str().to_owned();
-        let group = grouped.entry(sid.clone()).or_insert_with(|| {
-            order.push(sid.clone());
-            ChatSearchGroup {
-                session_id: sid,
-                session_title: None,
-                hits: Vec::new(),
-                total_hits: 0,
-            }
-        });
-        group.total_hits += 1;
-        // Count every match but carry only the best few: `total_hits` is what
-        // lets a client say "and 12 more" without a second call.
-        if group.hits.len() == MAX_HITS_PER_SESSION {
-            continue;
-        }
-        let text = hit
-            .message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        group.hits.push(ChatSearchHit {
-            ordinal: hit.ordinal,
-            role: hit.message.role.as_str().to_owned(),
-            text,
-            created_at: hit.created_at,
-            superseded_by: hit.superseded_by,
-        });
+fn chat_search_group(group: SessionSearchGroup) -> ChatSearchGroup {
+    ChatSearchGroup {
+        session_id: group.session_id.to_string(),
+        session_title: group.title,
+        hits: group.hits.into_iter().map(chat_search_hit).collect(),
+        total_hits: group.total_hits,
     }
+}
 
-    // Titles are fetched AFTER the cut, so the scan window's width costs no
-    // extra lookups — and in one grouped flat-column query instead of a
-    // point lookup per result conversation. A title batch this build cannot
-    // load is a missing subtitle, not a failed search: degrade to empty
-    // rather than 500 the whole result set.
-    let cut: Vec<String> = order.into_iter().take(limit).collect();
-    let title_ids: Vec<SessionId> = cut
-        .iter()
-        .map(|sid| SessionId::from(sid.as_str()))
-        .collect();
-    let mut titles = state
-        .session_manager
-        .session_titles(&title_ids)
-        .await
-        .unwrap_or_default();
-    let mut groups = Vec::with_capacity(cut.len());
-    for sid in cut {
-        let Some(mut group) = grouped.remove(&sid) else {
-            continue;
-        };
-        group.session_title = titles.remove(&SessionId::from(sid.as_str())).flatten();
-        groups.push(group);
+fn chat_search_hit(hit: SessionSearchHit) -> ChatSearchHit {
+    ChatSearchHit {
+        ordinal: hit.ordinal,
+        role: hit.role.as_str().to_owned(),
+        text: hit.text,
+        created_at: hit.created_at,
+        superseded_by: hit.superseded_by,
     }
-    Ok(Json(ChatSearchResults { groups, truncated }))
 }
 
 #[utoipa::path(

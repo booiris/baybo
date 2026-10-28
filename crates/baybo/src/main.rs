@@ -252,6 +252,10 @@ async fn main() -> anyhow::Result<()> {
                 stores.session.clone(),
                 stores.session_folder.clone(),
             )))
+            .session_search(Arc::new(baybo_session::search::SessionSearch::new(
+                stores.message_search.clone(),
+                stores.session.clone(),
+            )))
             .turn(Arc::new(baybo_turn::TurnLifecycle::new(
                 stores.turn.clone(),
             )))

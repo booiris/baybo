@@ -320,6 +320,21 @@ join exists to keep findable. `a_row_with_no_session_survives_the_cron_predicate
 
 This is query-side: **it does not bump `SEGMENTER_FINGERPRINT` and triggers no rebuild.**
 
+### Callers
+
+Both callers go through `baybo_session::search::SessionSearch`, which owns the scan window, the
+grouping-by-session rule and the title batch, so neither surface re-implements them:
+
+- `GET /v1/chat/search` pins `channel = owner`, every flag false, and never exposes
+  `include_cron_workspaces`. It answers "find a conversation I can open".
+- `baybo session search` defaults to `channel = None` — the same universe `baybo session list`
+  renders, bot channels and subagent runs included — with the same three flags false, and exposes
+  all of them (`--include-hidden` / `--include-archived` / `--include-cron-workspaces`, or `--all`)
+  plus `--scan`, because a `truncated` result with no widening knob is a dead end at a shell.
+
+**The CLI's channel default is an operator choice and must not be copied into a user-facing
+surface**: a chat client that searched every channel would return rows it cannot open.
+
 ### The prefix `*`
 
 Chinese needs no stemming (`数据库` has no plural), and unigram phrases give it substring semantics.

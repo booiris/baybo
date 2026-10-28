@@ -72,6 +72,7 @@ impl CliSlashHandler {
             llm: self.ctx.llm.clone(),
             workspace: self.ctx.workspace.clone(),
             session: self.ctx.session.clone(),
+            session_search: self.ctx.session_search.clone(),
             turn: self.ctx.turn.clone(),
             cron: self.ctx.cron.clone(),
             trace: self.ctx.trace.clone(),
@@ -337,6 +338,7 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
             SessionCmd::List
             | SessionCmd::Show { .. }
             | SessionCmd::History { .. }
+            | SessionCmd::Search(_)
             | SessionCmd::Export { .. } => Ok(()),
         },
         Commands::Turn { cmd } => match cmd {
@@ -666,6 +668,23 @@ mod tests {
         assert!(
             slash_admissible(&Commands::Session {
                 cmd: SessionCmd::List
+            })
+            .is_ok()
+        );
+        assert!(
+            slash_admissible(&Commands::Session {
+                cmd: SessionCmd::Search(crate::cli::SessionSearchArgs {
+                    query: vec!["x".into()],
+                    channel: None,
+                    session: None,
+                    include_hidden: false,
+                    include_archived: false,
+                    include_cron_workspaces: false,
+                    all: false,
+                    limit: baybo_session::search::DEFAULT_SEARCH_LIMIT,
+                    per_session: baybo_session::search::MAX_HITS_PER_SESSION,
+                    scan: baybo_session::search::SEARCH_SCAN_LIMIT,
+                })
             })
             .is_ok()
         );

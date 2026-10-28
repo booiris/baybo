@@ -56,6 +56,10 @@ pub struct MemorySessionStore {
     /// write rather than a silent success — a transcript append is the one
     /// store call several delivery guarantees rest on.
     fail_appends: std::sync::atomic::AtomicBool,
+    /// Fault injection: when set, `session_titles` fails. Drives the callers
+    /// that must treat a missing title batch as a missing subtitle rather
+    /// than a failed read.
+    fail_titles: std::sync::atomic::AtomicBool,
 }
 
 impl MemorySessionStore {
@@ -66,6 +70,12 @@ impl MemorySessionStore {
     /// Make every subsequent transcript append fail.
     pub fn fail_appends(&self, fail: bool) {
         self.fail_appends
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make every subsequent `session_titles` batch fail.
+    pub fn fail_titles(&self, fail: bool) {
+        self.fail_titles
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -649,6 +659,11 @@ impl SessionStore for MemorySessionStore {
         &self,
         session_ids: &[SessionId],
     ) -> Result<Vec<(SessionId, Option<String>)>> {
+        if self.fail_titles.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StorageError::Internal(anyhow::anyhow!(
+                "injected session_titles failure"
+            )));
+        }
         let data = self.data.lock();
         Ok(session_ids
             .iter()

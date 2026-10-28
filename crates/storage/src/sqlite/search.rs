@@ -369,11 +369,16 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // predicate NULL — dropping exactly the rows the LEFT JOIN exists
                 // to keep findable.
                 //
-                // `compaction_inserted = 0` on the join: a compaction re-inserts
-                // the recent slice it keeps as fresh rows and indexes those too,
-                // so without it every kept message answers a search twice — once
-                // as the real turn, once as the machinery's copy. Same predicate
-                // the display reads use, for the same reason.
+                // `compaction_inserted = 0` INSIDE the window: a compaction
+                // re-inserts the recent slice it keeps as fresh rows and indexes
+                // those too, so without it every kept message answers a search
+                // twice — once as the real turn, once as the machinery's copy.
+                // Same predicate the display reads use, for the same reason. It
+                // is a primary-key probe, not a content decode, so it is cheap
+                // to apply before the LIMIT — and it has to be: a copy that is
+                // dropped after the LIMIT still spent a window slot, so the
+                // caller's `hits.len() == limit` test for "the window filled"
+                // would read false while real rows had been cut off.
                 let mut stmt = conn.prepare(
                     "SELECT f.session_id, f.ordinal, f.channel, m.role, m.content, m.source, \
                             m.platform_msg_id, m.created_at, m.superseded_by, f.score \
@@ -389,12 +394,15 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                            AND (?5 OR COALESCE(s.archived, 0) = 0) \
                            AND (?6 OR NOT (COALESCE(s.trigger_kind, '') = 'cron' \
                                 AND COALESCE(json_extract(s.data, '$.trigger.conversation'), 0) = 0)) \
+                           AND EXISTS (SELECT 1 FROM session_messages r \
+                                        WHERE r.session_id = x.session_id \
+                                          AND r.ordinal = x.ordinal \
+                                          AND r.compaction_inserted = 0) \
                          ORDER BY score \
                          LIMIT ?7 \
                      ) f \
                      JOIN session_messages_read m \
                        ON m.session_id = f.session_id AND m.ordinal = f.ordinal \
-                      AND m.compaction_inserted = 0 \
                      ORDER BY f.score",
                 )?;
                 let params = rusqlite::params![
@@ -1160,6 +1168,58 @@ mod tests {
             hits[0].superseded_by,
             Some(1),
             "and the hit is the real turn, not the copy"
+        );
+    }
+
+    /// A compaction copy must not spend a window slot: with the predicate on
+    /// the outer join, a heavily matching compacted conversation fills the
+    /// window with rows the join then drops, and a lower-ranked conversation
+    /// is cut off while the row count says the window never filled.
+    #[tokio::test]
+    async fn compaction_copies_do_not_spend_scan_window_slots() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let sessions = super::super::SqliteSessionStore::new(pool.clone());
+        let compacted = SessionId::from("compacted".to_string());
+        let kept: Vec<ChatMessage> = ["独一无二", "独一无二 again"]
+            .iter()
+            .map(|t| ChatMessage::user(vec![ContentBlock::Text((*t).into())]))
+            .collect();
+        for message in &kept {
+            sessions
+                .append_session_message(&compacted, message)
+                .await
+                .unwrap();
+        }
+        sessions
+            .apply_session_compaction(&compacted, &kept)
+            .await
+            .unwrap();
+        let other = SessionId::from("other".to_string());
+        sessions
+            .append_session_message(
+                &other,
+                &ChatMessage::user(vec![ContentBlock::Text(
+                    "一句很长的话，里面藏着独一无二这个词，所以它的排名会靠后一些".into(),
+                )]),
+            )
+            .await
+            .unwrap();
+
+        let hits = SqliteMessageSearchStore::new(pool)
+            .search_messages("独一无二", &SearchScope::default(), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            3,
+            "three real rows match and the window holds three"
+        );
+        assert!(
+            hits.iter().any(|h| h.session_id == other),
+            "the lower-ranked conversation must not be displaced by compaction copies"
         );
     }
 
