@@ -125,7 +125,7 @@ tracing-subscriber = { version = "0.3", features = [
     "registry",
 ] }
 tracing-appender = "0.2"
-jsonwebtoken = { version = "9" }
+jsonwebtoken = { version = "10" }
 aws-lc-rs = "1"
 uuid = { version = "1", features = ["v4"] }
 ulid = { version = "1", features = ["serde"] }
