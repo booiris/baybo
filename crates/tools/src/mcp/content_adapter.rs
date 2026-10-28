@@ -24,7 +24,7 @@ use std::sync::Arc;
 use base64::Engine;
 use baybo_model::BlobRef;
 use baybo_store::BlobStore;
-use rmcp::model::{Annotated, RawContent};
+use rmcp::model::ContentBlock;
 
 use crate::{ToolError, ToolOutput};
 
@@ -45,7 +45,7 @@ const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 /// `is_error` discriminator from `CallToolResult` decides whether the
 /// final variant is `Error` or one of the success variants.
 pub async fn adapt_call_result(
-    parts: &[Annotated<RawContent>],
+    parts: &[ContentBlock],
     is_error: bool,
     blob_store: Option<&Arc<dyn BlobStore>>,
 ) -> crate::Result<ToolOutput> {
@@ -53,9 +53,9 @@ pub async fn adapt_call_result(
     let mut images: Vec<baybo_model::ContentBlock> = Vec::new();
 
     for part in parts {
-        match &part.raw {
-            RawContent::Text(t) => text_parts.push(t.text.clone()),
-            RawContent::Image(img) => {
+        match part {
+            ContentBlock::Text(t) => text_parts.push(t.text.clone()),
+            ContentBlock::Image(img) => {
                 let blob_store = blob_store.ok_or_else(|| {
                     ToolError::Execution(
                         "MCP server returned image content but no blob store is wired \
@@ -66,9 +66,9 @@ pub async fn adapt_call_result(
                 let block = decode_image(&img.data, &img.mime_type, blob_store).await?;
                 images.push(block);
             }
-            RawContent::Audio(_) => text_parts.push("[audio content elided]".into()),
-            RawContent::Resource(_) => text_parts.push("[resource content elided]".into()),
-            RawContent::ResourceLink(link) => match parse_baybo_blob_uri(&link.uri) {
+            ContentBlock::Audio(_) => text_parts.push("[audio content elided]".into()),
+            ContentBlock::Resource(_) => text_parts.push("[resource content elided]".into()),
+            ContentBlock::ResourceLink(link) => match parse_baybo_blob_uri(&link.uri) {
                 Some(blob_id) => {
                     let mime = link
                         .mime_type
@@ -89,6 +89,9 @@ pub async fn adapt_call_result(
                     text_parts.push(format!("[external resource link elided: {}]", link.uri));
                 }
             },
+            // `ContentBlock` is `#[non_exhaustive]`; a block type added by a
+            // future spec revision elides like Audio/Resource until a consumer exists.
+            _ => text_parts.push("[unsupported content elided]".into()),
         }
     }
 
@@ -174,27 +177,14 @@ async fn decode_image(
 mod tests {
     use super::*;
     use baybo_storage::test_support::MemoryBlobStore;
-    use rmcp::model::{Annotated, RawImageContent, RawResource, RawTextContent};
+    use rmcp::model::{ImageContent, Resource, TextContent};
 
-    fn text(s: &str) -> Annotated<RawContent> {
-        Annotated {
-            raw: RawContent::Text(RawTextContent {
-                text: s.into(),
-                meta: None,
-            }),
-            annotations: None,
-        }
+    fn text(s: &str) -> ContentBlock {
+        ContentBlock::Text(TextContent::new(s))
     }
 
-    fn image(b64: &str, mime: &str) -> Annotated<RawContent> {
-        Annotated {
-            raw: RawContent::Image(RawImageContent {
-                data: b64.into(),
-                mime_type: mime.into(),
-                meta: None,
-            }),
-            annotations: None,
-        }
+    fn image(b64: &str, mime: &str) -> ContentBlock {
+        ContentBlock::Image(ImageContent::new(b64, mime))
     }
 
     #[tokio::test]
@@ -264,20 +254,12 @@ mod tests {
         }
     }
 
-    fn resource_link(uri: &str, mime: Option<&str>) -> Annotated<RawContent> {
-        Annotated {
-            raw: RawContent::ResourceLink(RawResource {
-                uri: uri.into(),
-                name: "x".into(),
-                title: None,
-                description: None,
-                mime_type: mime.map(str::to_owned),
-                size: None,
-                icons: None,
-                meta: None,
-            }),
-            annotations: None,
-        }
+    fn resource_link(uri: &str, mime: Option<&str>) -> ContentBlock {
+        let link = Resource::new(uri, "x");
+        ContentBlock::ResourceLink(match mime {
+            Some(m) => link.with_mime_type(m),
+            None => link,
+        })
     }
 
     #[test]
