@@ -23,7 +23,7 @@
 //! Lifecycle:
 //! * `<workspace>/state/channel.port` is written `0o600` after bind
 //!   succeeds and removed on graceful + abnormal exit via a Drop
-//!   guard on [`PortFileGuard`].
+//!   guard on `PortFileGuard`.
 //! * Graceful shutdown is driven by the shared [`ShutdownSignal`] —
 //!   once the signal fires the accept loop exits and in-flight
 //!   requests drain up to the configured grace period.

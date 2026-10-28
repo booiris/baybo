@@ -8408,14 +8408,14 @@
               "string",
               "null"
             ],
-            "description": "Preview text drawn from the session's most-recent **displayable**\nmessage regardless of author — the newest user prompt or final\nassistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].\nTelegram-style list clients render this as the row's second line so\nthe preview follows the conversation (an agent reply shows once it\nlands), while [`Self::last_user_text`] stays the user-only label the\nweb sidebar uses. `None` when the scanned tail holds only tool /\nmedia rows or the session has no turn yet."
+            "description": "Preview text drawn from the session's most-recent **displayable**\nmessage regardless of author — the newest user prompt or final\nassistant answer carrying text, truncated to `PREVIEW_MAX_CHARS`.\nTelegram-style list clients render this as the row's second line so\nthe preview follows the conversation (an agent reply shows once it\nlands), while [`Self::last_user_text`] stays the user-only label the\nweb sidebar uses. `None` when the scanned tail holds only tool /\nmedia rows or the session has no turn yet."
           },
           "last_user_text": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Preview text drawn from the session's most-recent user-authored\nmessage, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar\nrenders this as the row label so users can scan past\nconversations by what they last asked. `None` for sessions\nwithout a user turn yet (a freshly-created row, or one whose\ntranscript holds only system/tool rows)."
+            "description": "Preview text drawn from the session's most-recent user-authored\nmessage, truncated to `PREVIEW_MAX_CHARS`. The web sidebar\nrenders this as the row label so users can scan past\nconversations by what they last asked. `None` for sessions\nwithout a user turn yet (a freshly-created row, or one whose\ntranscript holds only system/tool rows)."
           },
           "pinned": {
             "type": "boolean",
@@ -8434,7 +8434,7 @@
           "unread_count": {
             "type": "integer",
             "format": "int64",
-            "description": "Number of unread assistant replies — final assistant messages persisted\nwith `ordinal` above this session's read cursor\n(`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]\n(the client renders the cap as \"N+\"). Server-computed, so it is\naccurate across a cold restart / a device that missed the live\n`SessionActivity` pings. `0` when caught up."
+            "description": "Number of unread assistant replies — final assistant messages persisted\nwith `ordinal` above this session's read cursor\n(`PUT /v1/chat/sessions/{id}/read`), capped at `UNREAD_COUNT_CAP`\n(the client renders the cap as \"N+\"). Server-computed, so it is\naccurate across a cold restart / a device that missed the live\n`SessionActivity` pings. `0` when caught up."
           }
         }
       },
@@ -8592,7 +8592,7 @@
       },
       "ChatTranscriptItem": {
         "type": "object",
-        "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher. Two shapes ride this struct, discriminated by [`Self::kind`]:\na `Message` (user / final-assistant bubble) or a `Work` (reconstructed\ncollapsed work block for a tool-using turn — see\n[`reconstruct_transcript`]).",
+        "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher. Two shapes ride this struct, discriminated by [`Self::kind`]:\na `Message` (user / final-assistant bubble) or a `Work` (reconstructed\ncollapsed work block for a tool-using turn — see\n`reconstruct_transcript_with_attachments`).",
         "required": [
           "id",
           "kind",

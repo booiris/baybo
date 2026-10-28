@@ -8,7 +8,7 @@
 //! messages with the agent. The only sidecar client is the TypeScript
 //! package under `sidecars/sdk/channel-ts/`; the built-in TUI has its own
 //! private Rust WS client. Each accepted connection spawns a
-//! per-connection [`adapter::Sidecar`] that plugs into the workspace
+//! per-connection `adapter::Sidecar` that plugs into the workspace
 //! [`baybo_channels::ChannelRegistry`] and tears itself down on
 //! disconnect.
 //!

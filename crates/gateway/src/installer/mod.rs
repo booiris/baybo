@@ -369,7 +369,7 @@ const SERVICE_PATH_SYSTEM_DIRS: &[&str] = &[
 ///
 /// Derived from *need*, not from inheritance: walk the installing
 /// process's `PATH` in order and keep only the dirs that actually hold
-/// one of [`SERVICE_PATH_TOOLS`], then append the system bin dirs. A
+/// one of `SERVICE_PATH_TOOLS`, then append the system bin dirs. A
 /// real operator `PATH` is 20+ entries of toolchain shims, SDK dirs and
 /// editor-server paths carrying an embedded commit hash — snapshotting
 /// it whole would bake in entries that are stale by the next upgrade,

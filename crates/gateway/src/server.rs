@@ -198,7 +198,7 @@ pub struct AdminState {
 /// State shared with channel-TCP handlers. Cheap to clone.
 ///
 /// After the HTTP+SSE surface was retired, all live chat traffic flows
-/// through the WS endpoint and its [`WsChannelState`](crate::channel::WsChannelState).
+/// through the WS endpoint and its [`WsChannelState`].
 /// `ChannelState` stays around so non-WS channel-listener handlers
 /// (`/healthz` is the only one at the moment) have a place to grow.
 #[derive(Clone)]

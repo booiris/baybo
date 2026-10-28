@@ -195,7 +195,7 @@ impl RelayDialer {
     /// The production dialer: the operator's `proxy` block when set, else the
     /// ambient `HTTPS_PROXY` / `ALL_PROXY` (see [`ProxySettings::from_env`]),
     /// else direct. Never fails — a build error is kept and returned by
-    /// [`Self::ready`] and every [`Self::dial`], so a broken proxy setting
+    /// [`Self::ready`] and every `Self::dial`, so a broken proxy setting
     /// disables the relay without stopping the rest of the gateway.
     pub fn new(configured: Option<ProxySettings>) -> Self {
         let proxy = configured.or_else(|| ProxySettings::from_env(|k| std::env::var(k).ok()));

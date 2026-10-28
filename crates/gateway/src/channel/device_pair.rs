@@ -44,8 +44,8 @@ use baybo_security::SecretVault;
 
 use crate::device::load_or_create_static_keypair;
 
-/// The dependencies the pairing handshake ([`drive`]) needs, built by the
-/// operator's `baybo device pair` from CLI deps. Carried explicitly so [`drive`]
+/// The dependencies the pairing handshake (`drive`) needs, built by the
+/// operator's `baybo device pair` from CLI deps. Carried explicitly so `drive`
 /// can run over the relay host leg (see [`super::relay_pair::host_pairing_leg`])
 /// without a full gateway.
 #[derive(Clone)]

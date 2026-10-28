@@ -53,7 +53,7 @@ impl TuiHistoryStore {
 
     /// Append one submitted line. Consecutive duplicates are collapsed
     /// so mashing Enter on the same prompt doesn't flood the ring, and
-    /// the ring is capped at [`TUI_HISTORY_CAP`] so the encrypted blob
+    /// the ring is capped at `TUI_HISTORY_CAP` so the encrypted blob
     /// stays bounded.
     pub async fn append(&self, entry: &str) -> anyhow::Result<()> {
         let _guard = self.write_lock.lock().await;

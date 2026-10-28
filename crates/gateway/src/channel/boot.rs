@@ -9,10 +9,10 @@
 //!
 //! Each channel is born with its own per-channel [`ChannelApprovalGate`].
 //! The gate's waker closes over a `Weak<Channel>` and dispatches a
-//! [`SessionEvent::ApprovalRequested`] into the channel's fan-out path
+//! [`SessionEvent::ApprovalRequested`](baybo_channels::SessionEvent::ApprovalRequested) into the channel's fan-out path
 //! so every subscriber to the call's session sees the prompt; the
 //! first `ResolveApproval` wins and the channel publishes
-//! [`SessionEvent::ApprovalResolved`] to dismiss it elsewhere.
+//! [`SessionEvent::ApprovalResolved`](baybo_channels::SessionEvent::ApprovalResolved) to dismiss it elsewhere.
 
 use std::sync::Arc;
 use std::time::Duration;
