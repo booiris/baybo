@@ -66,7 +66,9 @@ pub fn is_sensitive_path(path: &Path) -> bool {
         .replace('\\', "/")
         .to_ascii_lowercase();
 
-    if let Some(filename) = resolved.file_name().and_then(|f| f.to_str()) {
+    // Lossy, not `to_str`: a non-UTF-8 byte elsewhere in the name must
+    // not exempt `secret\xff.pem` from the extension checks.
+    if let Some(filename) = resolved.file_name().map(|f| f.to_string_lossy()) {
         let filename_lower = filename.to_ascii_lowercase();
 
         // `.env`, `.env.local`, `.env.production` → sensitive.
@@ -131,6 +133,15 @@ mod tests {
         assert!(!is_sensitive_path(Path::new("/app/.env.example")));
         assert!(!is_sensitive_path(Path::new("/app/.env.sample")));
         assert!(!is_sensitive_path(Path::new("/app/.env.template")));
+    }
+
+    #[test]
+    fn non_utf8_filenames_still_get_the_filename_checks() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = |bytes: &[u8]| Path::new(std::ffi::OsStr::from_bytes(bytes)).to_path_buf();
+        assert!(is_sensitive_path(&path(b"/opt/certs/k\xff.pem")));
+        assert!(is_sensitive_path(&path(b"/app/.env.\xff")));
+        assert!(!is_sensitive_path(&path(b"/app/notes-\xff.txt")));
     }
 
     #[test]

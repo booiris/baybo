@@ -163,7 +163,7 @@ async fn run_glob(
     // tail keeps the most recent matches; `--hidden` + `--no-ignore`
     // mirror a plain filesystem walk (dotfiles included, .gitignore not
     // applied); `--null` delimits paths unambiguously.
-    let cap = rg::capture(process_manager, ctx, rg::MAX_STDOUT_BYTES, |cmd| {
+    let cap = rg::capture(process_manager, ctx, rg::CappedBuffer::default(), |cmd| {
         cmd.current_dir(&p.path)
             .arg("--files")
             .arg("--hidden")
@@ -179,13 +179,13 @@ async fn run_glob(
     // unreadable entry hit mid-traversal (partial stdout). Surface the
     // former; keep the partial listing for the latter, matching the old
     // filesystem walk that silently skipped unreadable entries.
-    if cap.code >= 2 && cap.stdout.is_empty() {
+    if cap.failed() && cap.stdout.bytes.is_empty() {
         return Err(cap.into_error());
     }
 
     // rg prints paths relative to its CWD (the search root); restore the
     // absolute paths callers expect.
-    let mut paths: Vec<String> = rg::iter_null_paths(&cap.stdout)
+    let mut paths: Vec<String> = rg::iter_null_paths(&cap.stdout.bytes)
         .map(|rel| p.path.join(rel).to_string_lossy().into_owned())
         .collect();
     if paths.is_empty() {
