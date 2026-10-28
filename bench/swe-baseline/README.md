@@ -26,8 +26,9 @@ budget, default 250), `AGENT_RESULTS` (baybo results JSON to compare against).
   `results/results-baseline-<run_id>.json` (+ a `latest-baseline.json` link) and
   prints the baybo-vs-baseline comparison.
 
-Scratch (`runs/`, `results/`, `mini-config/`, `.venv/`) is gitignored; the uv
-lockfile + `pyproject.toml` + `.python-version` are tracked.
+Scratch (`runs/`, `results/`, `mini-config/`) is gitignored. The Python env is a
+member of the `bench/` uv workspace: `pyproject.toml` here, the shared
+`bench/uv.lock` + `bench/.python-version` tracked, the venv at `bench/.venv`.
 
 ## Reading the conversations + comparing arms
 

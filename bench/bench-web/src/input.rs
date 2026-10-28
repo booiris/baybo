@@ -139,12 +139,10 @@ pub struct MemoryItem {
     pub source_run: Option<String>,
 }
 
-// ── terminal-bench 1.0 + 2.0 (results-<ts>.json / merged.json) ────────
+// ── terminal-bench 2.0 (results-<ts>.json / merged.json) ──────────────
 //
-// One struct covers both: 2.0 (Harbor) adds `reward` + `trace_path` and
-// drops the per-phase timestamps; 1.0 adds the timestamps + token
-// totals + `recording_path` and omits `trace_path` on individual runs.
-// `merged.json` (both versions) adds `source_run` + `trace_path`.
+// Written by `bench/terminal-bench-2.0/run.sh` (individual runs) and
+// `consolidate.sh` (`merged.json`, which adds `source_run`).
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TbRun {
@@ -167,10 +165,8 @@ pub struct TbItem {
     pub failure_mode: String,
     #[serde(default)]
     pub parser_results: BTreeMap<String, String>,
-    #[serde(default)]
-    pub recording_path: Option<String>,
-    /// Present on 2.0 individual runs and on both versions' merged.json;
-    /// relative to the bench's `trace/` dir.
+    /// Relative to the bench's `trace/` dir; absent when the trial left
+    /// no agent trace.
     #[serde(default)]
     pub trace_path: Option<String>,
     #[serde(default)]
@@ -185,18 +181,4 @@ pub struct TbItem {
     pub trial_ended_at: Option<String>,
     #[serde(default)]
     pub source_run: Option<String>,
-}
-
-/// terminal-bench 1.0 `runs/<ts>/run_metadata.json` — the model / dataset
-/// / wall-clock the results file itself doesn't carry.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TbRunMetadata {
-    #[serde(default)]
-    pub model_name: Option<String>,
-    #[serde(default)]
-    pub dataset_name: Option<String>,
-    #[serde(default)]
-    pub start_time: Option<String>,
-    #[serde(default)]
-    pub end_time: Option<String>,
 }

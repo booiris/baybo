@@ -77,9 +77,8 @@ it. The sidecar half of that build script stays lenient (empty assets +
 
 ## Bench environment (`bench-bash` + `permission = free`)
 
-The in-container benches (`bench/swe`, `bench/terminal-bench-1.0`,
-`bench/terminal-bench-2.0`) run the real agent *inside* each task's disposable
-container. Two mechanisms adapt baybo to that:
+The in-container benches (`bench/swe`, `bench/terminal-bench-2.0`) run the
+real agent *inside* each task's disposable container. Two mechanisms adapt baybo to that:
 
 - **Build with `--features bench-bash`** — compiles the bench-only agent prompt
   framing (raw host exec, no work-dir jail, no uv shim, no approval gate). The

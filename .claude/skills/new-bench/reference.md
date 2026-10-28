@@ -73,18 +73,14 @@ files to `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json`:
 - **In-container (swe):** run them **inside the container before reap** (the session
   DB dies with it) — clone `bench/swe/src/agent.rs::{export_trace, write_session_dump}`;
   the `run` bin threads `--trace-dir` (+ `--no-trace`) into `RunOpts.trace_dir`.
-- **External-harness adapter (terminal), two flavors.** *Terminal-Bench 1.0* runs
-  on the legacy `tb` CLI: `bench/terminal-bench-1.0/tb_adapter` (`AbstractInstalledAgent`) —
-  in `perform_task`, after the prompt, use the container handle directly
-  (`session.container.exec_run([...])`, no copy-out) and mirror the harness's
-  per-task `runs/` path into `trace/`; see `…::_export_trace`. *Terminal-Bench 2.0*
-  runs on the **Harbor** framework (`harbor run -d terminal-bench/terminal-bench-2`):
+- **External-harness adapter (terminal).** *Terminal-Bench 2.0* runs on the
+  **Harbor** framework (`harbor run -d terminal-bench/terminal-bench-2`):
   `bench/terminal-bench-2.0/harbor_adapter` is a `BaseInstalledAgent` — `install()`
   `environment.upload_file`s the musl binary + a rendered `baybo.json` + mints the
   key (→ chown to the agent user), `run()` runs `baybo prompt` and exports the trace
   into Harbor's per-trial `/logs/agent` dir (which Harbor mounts to
-  `runs/<ts>/<trial>/agent/`, sibling to `verifier/`). Same `baybo.json`
-  (`sandbox.mode=none`) + provider/key handling as 1.0; only the harness API differs.
+  `runs/<ts>/<trial>/agent/`, sibling to `verifier/`); `run.sh` then mirrors that
+  into the bench-wide `trace/` + `results/` layout.
 
 **Clone these parsers verbatim** (stable, unit-tested) instead of rewriting:
 `bench/swe/src/agent.rs` → `prompt_output_error`, `parse_cost_summary`, the
@@ -122,7 +118,7 @@ and write one of these. Key is referenced **by file**, API key **by env-var name
 - Add `"base_url"` to the llm entry only when set (omit → provider default).
 - An in-process-only run (no gateway) that still fails config validation for a
   missing `gateway` block: add a dummy `"gateway": {"bind_address":"127.0.0.1","port":<any>}`
-  (see `bench/terminal-bench-1.0`); it never binds.
+  (see `bench/terminal-bench-2.0/harbor_adapter`); it never binds.
 
 **Gateway (many prompts over one process):** same, but replace `sandbox` with
 ```json
@@ -285,8 +281,7 @@ with `#[cfg(feature = "bench-<cap>")]` so it isn't compiled otherwise.
 /runs/          # run env + working artifacts: workspaces / grader intermediates / harness logs
 /trace/         # per-run transcripts + call-tree traces (regenerated; full convos)
 /.env           # local secrets
-__pycache__/    # if there's Python tooling
-/.venv/         # uv-managed venv (uv.lock / pyproject.toml / .python-version ARE tracked)
+__pycache__/    # if there's Python tooling (the venv is the shared bench/.venv, ignored in bench/.gitignore)
 ```
 
 **`.env.example` — canonical model-under-test vars.** Every bench's real arm needs
@@ -306,7 +301,7 @@ bench generates the config, so it fixes `api_key_env: "BAYBO_API_KEY"` in the
 is an internal constant, not a user choice. The user only supplies the *value*; to
 reuse a key already in another var, set `BAYBO_API_KEY=$DEEPSEEK_API_KEY` in `.env`
 (it's shell-sourced, so it expands). This holds even for an external-harness adapter:
-`bench/terminal-bench-1.0` drives Terminal-Bench yet still uses the bare `BAYBO_API_KEY` /
+`bench/terminal-bench-2.0` drives Terminal-Bench yet still uses the bare `BAYBO_API_KEY` /
 `BAYBO_MODEL` / `BAYBO_BASE_URL` (+ `BAYBO_BIN` for the binary) — no sub-namespace,
 since nothing else owns `BAYBO_*`.
 
@@ -331,8 +326,9 @@ BAYBO_MODEL=     # deepseek/deepseek-v4-flash  (<provider>/<model>)
 BAYBO_BASE_URL=  # provider's built-in endpoint  (set for a proxy / gateway)
 ```
 
-**`pyproject.toml` + `.python-version`** (only if the bench needs Python — a
-dataset export or an official grader). Deps-only env:
+**`pyproject.toml`** (only if the bench needs Python — a dataset export or an
+official grader). Deps-only, and a member of the `bench/` uv workspace: add the
+dir to `members` in `bench/pyproject.toml`, then `uv lock` in `bench/`:
 ```toml
 [project]
 name = "baybo-bench-<name>-pytools"
@@ -344,8 +340,13 @@ dependencies = [ "<the-official-harness-or-dataset-lib>" ]
 [tool.uv]
 package = false
 ```
-`.python-version` → e.g. `3.12`. Run via `uv run --project bench/<name> python …`
-or `bench/<name>/.venv/bin/python`; `uv sync` builds the reused `.venv` once.
+The Python version comes from the shared `bench/.python-version`. Sync with
+`uv sync --all-packages --project bench/<name>` (a member-only sync is exact and
+strips the other benches' deps from the shared venv), then run via
+`uv run --project bench/<name> python …` or `bench/.venv/bin/python`. If the
+bench's deps conflict with the workspace, add it to the workspace `exclude`
+and give it its own `uv.lock` + `.python-version` + `/.venv/` ignore, like
+`bench/swe-claude`.
 
 ---
 

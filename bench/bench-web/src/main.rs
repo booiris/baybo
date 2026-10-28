@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
     about = "Read-only web viewer for baybo bench results + agent traces"
 )]
 struct Args {
-    /// Root directory holding the per-bench dirs (swe, terminal-bench-*,
+    /// Root directory holding the per-bench dirs (swe, terminal-bench-2.0,
     /// memory). Defaults to ./bench.
     #[arg(long, default_value = "bench")]
     root: PathBuf,

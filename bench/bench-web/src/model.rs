@@ -30,7 +30,7 @@ pub enum BenchKind {
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../web/src/generated/"))]
 pub struct BenchInfo {
     /// Directory name under the bench root and the URL path segment
-    /// (`swe`, `terminal-bench-1.0`, `terminal-bench-2.0`, `memory`).
+    /// (`swe`, `terminal-bench-2.0`, `memory`).
     pub id: String,
     /// Human display label.
     pub label: String,
@@ -218,8 +218,7 @@ pub struct ParserResult {
     pub status: String,
 }
 
-/// A pointer to a raw side-artifact (a diff, verifier stdout, asciinema
-/// cast, …). `path` is relative to the bench dir; the frontend fetches
+/// A pointer to a raw side-artifact (a diff, verifier stdout, …). `path` is relative to the bench dir; the frontend fetches
 /// it via the path-validated `/file` endpoint.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(TS))]

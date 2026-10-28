@@ -5,13 +5,12 @@ leaderboard-comparable way, graded by the task's own verifier. The container
 *is* the sandbox, so baybo runs with `permission = free`; with the
 bench-bash build, Bash executes commands directly — no bwrap, no work-dir jail.
 Mirrors Harbor's bundled
-installed agents (see harbor/agents/installed/codex.py); the baybo.json schema +
-install steps are ported verbatim from the tb/1.0 adapter
-(bench/terminal-bench-1.0/tb_adapter/baybo_agent.py).
+installed agents (see harbor/agents/installed/codex.py).
 
-Run via Harbor's --agent-import-path (no fork). From bench/terminal-bench-2.0/:
+Run via Harbor's --agent-import-path (no fork). From bench/terminal-bench-2.0/
+(the import path only resolves with this dir on PYTHONPATH):
 
-    uv run harbor run \\
+    PYTHONPATH=. uv run harbor run \\
         -d terminal-bench/terminal-bench-2 \\
         --agent-import-path harbor_adapter.baybo_agent:BayboAgent \\
         -m deepseek/deepseek-v4-flash

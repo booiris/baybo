@@ -109,7 +109,7 @@ pub async fn grade(cfg: &GraderConfig, predictions: &Predictions) -> Result<Grad
     }
 
     // The harness runs in `runs_dir` (so its report lands there). A relative
-    // interpreter path (e.g. `bench/swe/.venv/bin/python`) would otherwise
+    // interpreter path (e.g. `bench/.venv/bin/python`) would otherwise
     // resolve against that cwd and vanish — make it absolute first. Join the
     // process cwd rather than canonicalizing: a venv's `python` is a symlink to
     // the base interpreter, and following it would lose the venv's site-packages

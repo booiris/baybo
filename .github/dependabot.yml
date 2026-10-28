@@ -1,0 +1,51 @@
+# Security updates only: `open-pull-requests-limit: 0` turns version updates
+# off for each ecosystem, and the `applies-to: security-updates` group folds
+# every security bump in a directory into one PR instead of one PR per package.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directories:
+      - "/bench"            # uv workspace: swe, swe-baseline, terminal-bench-2.0
+      - "/bench/swe-claude" # standalone: conflicts with the workspace on rich
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      bench-python-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directories:
+      - "/"            # root pnpm workspace: app/web, sidecars, bench-web
+      - "/app/ios/web"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories:
+      - "/"
+      - "/app/ios"
+      - "/remote-host"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]

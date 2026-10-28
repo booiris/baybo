@@ -51,8 +51,10 @@ export MSWEA_DOCKER_EXECUTABLE="$DOCKER"
 
 command -v uv >/dev/null || { echo "uv required (https://docs.astral.sh/uv/)" >&2; exit 1; }
 mkdir -p "$RUNS_DIR/$RUN_ID" "$RESULTS_DIR" "$MSWEA_GLOBAL_CONFIG_DIR"
-echo ">> uv sync (mini-swe-agent + swebench)"; uv sync --project "$BENCH_DIR" >/dev/null
-PY="$BENCH_DIR/.venv/bin/python"
+# --all-packages: bench/.venv is shared with the other bench/ uv workspace
+# members, and a member-only sync would uninstall their deps.
+echo ">> uv sync (mini-swe-agent + swebench)"; uv sync --all-packages --project "$BENCH_DIR" >/dev/null
+PY="$BENCH_DIR/../.venv/bin/python"
 
 # Config overrides for mini. `-c` REPLACES the default set, so the builtin
 # swebench.yaml must be re-listed first.

@@ -11,8 +11,7 @@ Codex, …) are run.
 TB 2.0 moved off the `terminal-bench` PyPI package onto the
 [Harbor](https://www.harborframework.com) framework. There is no
 `terminal-bench-core` 2.0 dataset for the old CLI — the 2.0 task set lives in the
-Harbor dataset **`terminal-bench/terminal-bench-2`** (89 tasks). The legacy `tb`
-adapter is the sibling [`../terminal-bench-1.0/`](../terminal-bench-1.0/).
+Harbor dataset **`terminal-bench/terminal-bench-2`** (89 tasks).
 
 [`harbor_adapter/baybo_agent.py`](harbor_adapter/baybo_agent.py) is a thin subclass
 of Harbor's `harbor.agents.installed.base.BaseInstalledAgent`, modeled on the
@@ -20,12 +19,14 @@ bundled `codex.py`. No fork of Harbor — it's used via `--agent-import-path`.
 
 ## Why a static **musl** binary + `--features bench-bash`
 
-Same rationale as 1.0. baybo normally wraps every shell command in an OS sandbox
-(bwrap/docker); inside a task container there is no bwrap and the container already
-*is* the isolation boundary, so the binary is built `--features bench-bash` (Bash
-runs raw — no OS sandbox, no work-dir jail, no uv shim) and the rendered
-`baybo.json` sets `permission = free`. A **static musl** build runs in any task
-container regardless of glibc:
+baybo normally wraps every shell command in an OS sandbox (bwrap/docker); inside a
+task container there is no bwrap and the container already *is* the isolation
+boundary, so the binary is built `--features bench-bash` (the off-by-default bench
+profile: Bash runs raw — no OS sandbox, no work-dir jail, no uv shim, cwd inherited
+from the container's WORKDIR) and the rendered `baybo.json` also sets
+`permission = free`. The feature is what lifts the uv shim + work jail; `free`
+alone would keep them. A **static musl** build runs in any task container
+regardless of glibc:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl     # one-time (+ musl-tools)
@@ -33,10 +34,15 @@ cargo build --release --target x86_64-unknown-linux-musl --features bench-bash -
 # -> target/x86_64-unknown-linux-musl/release/baybo
 ```
 
+If the musl build is awkward on your host (e.g. the bundled SQLite), a glibc
+release binary (pointed at via `BAYBO_BIN`) also works when the task container's
+glibc is compatible — musl is just the safe default.
+
 ## Run
 
-The Python env is uv-managed (`pyproject.toml` + `uv.lock` pin Harbor + Python
-≥3.12). [`run.sh`](run.sh) builds the binary if missing, loads `.env`, runs Harbor,
+The Python env is uv-managed: `pyproject.toml` pins Harbor + Python ≥3.12, and
+this dir is a member of the `bench/` uv workspace (shared `bench/uv.lock` +
+`bench/.venv`). [`run.sh`](run.sh) builds the binary if missing, loads `.env`, runs Harbor,
 and mirrors each trial's outcome into `trace/` + `results/`:
 
 ```bash
@@ -140,7 +146,7 @@ this link isn't viable for them.
 - **Image-pull is the dominant cost** on a constrained network (~2 MB/s mirrors).
   Pre-pull the task images before a full run so a slow pull doesn't eat each task's
   `build_timeout`; the bench's verifier bootstrap (curl/uv/pytest) fits the
-  generous TB 2.0 verifier timeout, so unlike 1.0 no base-image pre-bake is needed.
+  generous TB 2.0 verifier timeout, so no base-image pre-bake is needed.
 - Pick a capable model — weak tool-callers tank scores independent of the plumbing.
 - The provider key is exported into the container's env for the run; it is never
   written to `baybo.json` (only the env-var *name* is).

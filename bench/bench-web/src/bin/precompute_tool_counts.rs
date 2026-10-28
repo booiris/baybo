@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
     about = "Write <trace>.tools.json sidecars (per-tool call counts) for the bench viewer"
 )]
 struct Args {
-    /// Bench root holding the per-bench dirs (swe, terminal-bench-*,
+    /// Bench root holding the per-bench dirs (swe, terminal-bench-2.0,
     /// memory). Defaults to ./bench.
     #[arg(long, default_value = "bench")]
     root: PathBuf,

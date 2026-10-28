@@ -37,7 +37,7 @@ cd "$here"
 
 # Harbor writes every trial under runs/<ts>/<trial>/ (agent/{trace,messages}.json +
 # verifier/reward.txt + a per-trial result.json). Mirror that into the trace/ +
-# results/ convention the other benches use (swe, terminal-bench-1.0) so the score
+# results/ convention the other benches use (e.g. swe) so the score
 # and call-tree are discoverable without spelunking into <trial>/agent/ and
 # verifier/reward.txt. The full Harbor output stays under runs/.
 mkdir -p runs results trace
@@ -163,7 +163,9 @@ monitor_pid=$!
 
 # Defaults; anything in "$@" (e.g. -i / -l / -n) is appended.
 set +e
-uv run harbor run \
+# harbor's --agent-import-path is a plain import_module: nothing puts this dir on
+# sys.path (older litellm did it as an import side effect), so put it there.
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" uv run harbor run \
   --dataset terminal-bench/terminal-bench-2 \
   --agent-import-path harbor_adapter.baybo_agent:BayboAgent \
   --model "${BAYBO_MODEL:-deepseek/deepseek-v4-flash}" \

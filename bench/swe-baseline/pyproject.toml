@@ -1,7 +1,8 @@
 # Persistent, uv-managed Python environment for the SWE-bench **baseline**:
 # the official minimal agent `mini-swe-agent` (SWE-agent/mini-swe-agent) +
-# the official `swebench` grader. `uv sync` provisions a pinned CPython and a
-# reused on-disk `.venv` here — never `pip install` into the system interpreter.
+# the official `swebench` grader. A member of the bench/ uv workspace
+# (../pyproject.toml): `uv sync` provisions a pinned CPython and the reused
+# on-disk `bench/.venv` — never `pip install` into the system interpreter.
 # Deps-only env (`package = false`), not an installable package.
 [project]
 name = "baybo-bench-swe-baseline-pytools"
