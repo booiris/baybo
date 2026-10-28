@@ -1237,8 +1237,8 @@ pub(crate) enum AnyCompletionModel {
     Llamafile(llamafile::CompletionModel),
     Hyperbolic(hyperbolic::CompletionModel),
     HuggingFace(huggingface::completion::CompletionModel),
-    /// ChatGPT/Codex OAuth subscription path. Doesn't go through rig — the
-    /// Codex Responses API uses a different request shape and needs custom
+    /// Sign in with ChatGPT subscription path. Doesn't go through rig — the
+    /// public Responses API uses a different request shape and needs custom
     /// auth + 401-refresh handling. See `providers::openai_subscription`.
     OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionCompletionModel),
 }
@@ -1335,10 +1335,10 @@ impl AnyCompletionModel {
     /// request carrying `requested` — `None` for providers that apply only
     /// what they are handed.
     ///
-    /// Codex is the one that answers for itself: it bakes the entry's level
-    /// in at construction and substitutes a model-family default when none
-    /// was configured, so an unconfigured entry there still runs at a real
-    /// level and must bill as one.
+    /// `openai-subscription` is the one that answers for itself: it bakes
+    /// the entry's level in at construction and substitutes a model-family
+    /// default when none was configured, so an unconfigured entry there still
+    /// runs at a real level and must bill as one.
     fn self_resolved_effort(&self, requested: Option<&str>) -> Option<String> {
         match self {
             Self::OpenAiSubscription(m) => Some(m.effective_effort_label(requested)),

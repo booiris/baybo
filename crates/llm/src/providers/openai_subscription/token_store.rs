@@ -7,10 +7,12 @@ use baybo_store::StoreIdentity;
 
 use super::VAULT_KEY_TOKENS;
 use super::oauth::Registration;
-const HOST_KEY: &str = "llm.openai-subscription.host";
-const REGISTRATION_KEY: &str = "llm.openai-subscription.registration";
 use super::token_bundle::OAuthTokenBundle;
 use crate::{LlmError, Result};
+
+const HOST_KEY: &str = "llm.openai-subscription.host";
+const REGISTRATION_KEY: &str = "llm.openai-subscription.registration";
+const UNREADABLE_CREDENTIAL: &str = r#"openai-subscription: the stored ChatGPT credential could not be decoded — run `baybo llm edit` and pick `OAuth login (re-authenticate)`"#;
 
 /// Identity of the credential a [`VaultTokenStore`] reads and writes: which
 /// secret store, which entry inside it. Two stores with equal keys are two
@@ -111,11 +113,30 @@ impl VaultTokenStore {
             .map_err(|e| LlmError::Config(format!("ChatGPT registration write: {e}")))
     }
 
+    /// The active credential. An entry that no longer decodes as a bundle is
+    /// an auth error asking for a new sign-in, never `None`: a missing login
+    /// and an unusable one need different fixes.
     pub async fn load(&self) -> Result<Option<OAuthTokenBundle>> {
-        self.vault
-            .get_typed::<OAuthTokenBundle>(VAULT_KEY_TOKENS)
-            .await
-            .map_err(|e| LlmError::Config(format!("openai-subscription: vault read failed: {e}")))
+        self.load_decoded()
+            .await?
+            .transpose()
+            // Only the category: serde's message can quote the token itself.
+            .map_err(|e| LlmError::Auth(format!("{UNREADABLE_CREDENTIAL} ({:?})", e.classify())))
+    }
+
+    /// The credential a new sign-in is about to replace; one that no longer
+    /// decodes has nothing worth keeping, so it reads as absent.
+    pub(super) async fn load_replaceable(&self) -> Result<Option<OAuthTokenBundle>> {
+        Ok(self.load_decoded().await?.and_then(|decoded| decoded.ok()))
+    }
+
+    // Not `get_typed`: it folds a decode failure into a storage error, and
+    // these callers need the two apart.
+    async fn load_decoded(&self) -> Result<Option<serde_json::Result<OAuthTokenBundle>>> {
+        let secret = self.vault.get_secret(VAULT_KEY_TOKENS).await.map_err(|e| {
+            LlmError::Config(format!("openai-subscription: vault read failed: {e}"))
+        })?;
+        Ok(secret.map(|secret| serde_json::from_slice(secret.as_bytes())))
     }
 
     pub async fn save(&self, bundle: &OAuthTokenBundle) -> Result<()> {
@@ -146,6 +167,7 @@ impl VaultTokenStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::token_bundle::sharing_connection;
     use super::*;
     use baybo_security::EncryptionKey;
     use baybo_security::test_support::MemorySecretStore;
@@ -163,18 +185,21 @@ mod tests {
         assert!(store.load().await.unwrap().is_none());
     }
 
+    fn bundle(access_token: &str, expires_at: i64) -> OAuthTokenBundle {
+        OAuthTokenBundle {
+            connection: sharing_connection(),
+            access_token: access_token.into(),
+            refresh_token: format!("{access_token}-refresh"),
+            id_token: "it".into(),
+            expires_at,
+            obtained_at: 500,
+        }
+    }
+
     #[tokio::test]
     async fn save_then_load_round_trip() {
         let store = make_store();
-        let bundle = OAuthTokenBundle {
-            connection: None,
-            access_token: "at".into(),
-            refresh_token: "rt".into(),
-            id_token: "it".into(),
-            account_id: Some("acc-1".into()),
-            expires_at: 1000,
-            obtained_at: 500,
-        };
+        let bundle = bundle("at", 1000);
         store.save(&bundle).await.unwrap();
         let loaded = store.load().await.unwrap().unwrap();
         assert_eq!(loaded, bundle);
@@ -183,16 +208,7 @@ mod tests {
     #[tokio::test]
     async fn clear_removes_entry() {
         let store = make_store();
-        let bundle = OAuthTokenBundle {
-            connection: None,
-            access_token: "x".into(),
-            refresh_token: "x".into(),
-            id_token: "x".into(),
-            account_id: None,
-            expires_at: 0,
-            obtained_at: 0,
-        };
-        store.save(&bundle).await.unwrap();
+        store.save(&bundle("x", 0)).await.unwrap();
         store.clear().await.unwrap();
         assert!(store.load().await.unwrap().is_none());
     }
@@ -215,32 +231,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_bundles_without_connection_remain_readable() {
-        let legacy = serde_json::json!({
-            "access_token": "a", "refresh_token": "r", "id_token": "i",
-            "account_id": null, "expires_at": 1000, "obtained_at": 500
-        });
-        let bundle: OAuthTokenBundle = serde_json::from_value(legacy).unwrap();
-        assert!(bundle.connection.is_none());
-        let store = make_store();
-        store.save(&bundle).await.unwrap();
-        assert_eq!(store.load().await.unwrap(), Some(bundle));
-    }
-    #[tokio::test]
-    async fn login_replaces_a_cached_legacy_bundle_even_with_a_shorter_expiry() {
+    async fn an_undecodable_credential_asks_for_sign_in_and_yields_to_a_new_one() {
         use super::super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
-        use super::super::token_bundle::ChatGptConnection;
+        let store = make_store();
+        let malformed = serde_json::json!({ "not": "a token bundle" });
+        store
+            .vault
+            .store_typed(VAULT_KEY_TOKENS, &malformed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(store.load().await, Err(LlmError::Auth(msg)) if msg.contains("baybo llm edit"))
+        );
+        assert_eq!(store.load_replaceable().await.unwrap(), None);
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let coordinator =
+            RefreshCoordinator::shared(store.clone(), http.clone(), BackgroundRefresh::Disabled);
+        assert!(matches!(
+            coordinator.ensure_fresh_bundle().await,
+            Err(LlmError::Auth(_))
+        ));
+        let now = chrono::Utc::now().timestamp();
+        let new = bundle("new", now + 3600);
+        store.save_login(&new, &http).await.unwrap();
+        assert_eq!(*coordinator.ensure_fresh_bundle().await.unwrap(), new);
+    }
+
+    #[tokio::test]
+    async fn login_replaces_a_cached_bundle_even_with_a_shorter_expiry() {
+        use super::super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
         let store = make_store();
         let now = chrono::Utc::now().timestamp();
-        let old = OAuthTokenBundle {
-            connection: None,
-            access_token: "old".into(),
-            refresh_token: "old-refresh".into(),
-            id_token: "old-id".into(),
-            account_id: None,
-            expires_at: now + 7200,
-            obtained_at: now,
-        };
+        let old = bundle("old", now + 7200);
         store.save(&old).await.unwrap();
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let coordinator =
@@ -253,14 +275,8 @@ mod tests {
                 .access_token,
             "old"
         );
-        let mut new = old.clone();
-        new.connection = Some(ChatGptConnection {
-            client_id: "oaiapp_test".into(),
-            subject: "user".into(),
-            scopes: vec![super::super::oauth::SHARING_SCOPE.into()],
-        });
-        new.access_token = "new".into();
-        new.expires_at = now + 3600;
+        let mut new = bundle("new", now + 3600);
+        new.connection.client_id = "oaiapp_other".into();
         store.save_login(&new, &http).await.unwrap();
         assert_eq!(*coordinator.ensure_fresh_bundle().await.unwrap(), new);
     }

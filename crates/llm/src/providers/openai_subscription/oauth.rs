@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use url::Url;
 
-use super::legacy_oauth;
 use super::token_bundle::{ChatGptConnection, OAuthTokenBundle};
 use super::token_store::VaultTokenStore;
 use crate::{LlmError, Result};
@@ -341,14 +340,11 @@ pub async fn pkce_login_with_callback(
     store: &VaultTokenStore,
 ) -> Result<OAuthTokenBundle> {
     let host = store.host_id().await?;
-    let previous = store.load().await?;
-    let registration = match previous
-        .as_ref()
-        .and_then(|bundle| bundle.connection.as_ref())
-    {
-        Some(connection) => Some(Registration {
-            client_id: connection.client_id.clone(),
-            subject: Some(connection.subject.clone()),
+    let previous = store.load_replaceable().await?;
+    let registration = match &previous {
+        Some(bundle) => Some(Registration {
+            client_id: bundle.connection.client_id.clone(),
+            subject: Some(bundle.connection.subject.clone()),
         }),
         None => store.registration().await?,
     };
@@ -372,9 +368,7 @@ pub async fn pkce_login_with_callback(
     };
     let port = listener.local_addr().map_err(auth_error)?.port();
     let redirect = format!("http://127.0.0.1:{port}/auth/callback");
-    let request_consent = previous
-        .as_ref()
-        .is_some_and(|b| b.connection.is_some() && !b.sharing_enabled());
+    let request_consent = previous.as_ref().is_some_and(|b| !b.sharing_enabled());
     let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
     let callback = present_url(
         &authorize_url(
@@ -458,7 +452,7 @@ pub async fn pkce_login_with_callback(
     store
         .save_registration(&Registration {
             client_id: retained.client_id,
-            subject: bundle.connection.as_ref().map(|c| c.subject.clone()),
+            subject: Some(bundle.connection.subject.clone()),
         })
         .await?;
     store.save_login(&bundle, http).await?;
@@ -474,8 +468,7 @@ fn bundle_from_tokens(
     let scopes: Vec<String> = match tokens.scope {
         Some(scope) => scope.split_whitespace().map(str::to_owned).collect(),
         None => previous
-            .and_then(|b| b.connection.as_ref())
-            .map(|c| c.scopes.clone())
+            .map(|b| b.connection.scopes.clone())
             .unwrap_or_default(),
     };
     let sharing = scopes.iter().any(|scope| scope == SHARING_SCOPE);
@@ -495,18 +488,17 @@ fn bundle_from_tokens(
         return Err(auth_error("missing refresh token"));
     }
     Ok(OAuthTokenBundle {
-        connection: Some(ChatGptConnection {
+        connection: ChatGptConnection {
             client_id,
             subject,
             scopes,
-        }),
+        },
         access_token: tokens.access_token,
         refresh_token,
         id_token: tokens
             .id_token
             .or_else(|| previous.map(|b| b.id_token.clone()))
             .ok_or_else(|| auth_error("missing ID token"))?,
-        account_id: None,
         expires_at: chrono::Utc::now()
             .timestamp()
             .saturating_add(tokens.expires_in),
@@ -538,9 +530,7 @@ pub(super) async fn refresh_at(
     bundle: &OAuthTokenBundle,
     http: &reqwest::Client,
 ) -> std::result::Result<OAuthTokenBundle, RefreshError> {
-    let Some(connection) = &bundle.connection else {
-        return legacy_oauth::refresh_at(issuer, &bundle.refresh_token, http).await;
-    };
+    let connection = &bundle.connection;
     let response = http
         .post(format!("{issuer}{TOKEN_PATH}"))
         .header("User-Agent", USER_AGENT)
@@ -593,9 +583,7 @@ pub async fn revoke(bundle: &OAuthTokenBundle, http: &reqwest::Client) -> io::Re
     if bundle.refresh_token.is_empty() {
         return Ok(());
     }
-    let Some(connection) = &bundle.connection else {
-        return legacy_oauth::revoke(&bundle.refresh_token, http).await;
-    };
+    let connection = &bundle.connection;
     let config = discovery(http).await.map_err(io::Error::other)?;
     http.post(config.revocation_endpoint)
         .header("User-Agent", USER_AGENT)
@@ -940,8 +928,6 @@ mod tests {
             url::form_urlencoded::parse(form.as_bytes()).collect();
         assert_eq!(pairs.get("client_id").unwrap(), "oaiapp_test");
         assert_eq!(pairs.get("resource").unwrap(), RESOURCE);
-        assert!(!request.contains(legacy_oauth::LEGACY_CLIENT_ID));
-        assert!(!request.to_lowercase().contains("originator:"));
     }
 
     #[tokio::test]

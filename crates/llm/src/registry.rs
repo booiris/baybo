@@ -42,7 +42,7 @@ pub struct LlmProviderConfig {
     /// independently optional — unset fields keep the factory default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<LlmPricingOverride>,
-    /// Reasoning effort for Codex Responses (`openai-subscription`).
+    /// Reasoning effort for the Responses API (`openai-subscription`).
     /// One of `none`/`minimal`/`low`/`medium`/`high`/`xhigh`. `None`
     /// = provider default. Other providers ignore the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,7 +151,7 @@ pub trait LlmProviderFactory: Send + Sync {
     /// for providers that don't expose a discovery endpoint or aren't
     /// worth implementing one for. Returns empty for providers that don't
     /// route through OpenRouter. Providers with real catalog endpoints
-    /// (currently `openai-subscription` against `<base>/codex/models`)
+    /// (currently `openai-subscription` against `<base>/models`)
     /// override this to return rich metadata.
     async fn live_models(&self, _config: &LlmProviderConfig) -> crate::Result<Vec<LiveModelInfo>> {
         Ok(
@@ -189,8 +189,8 @@ pub struct LiveModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_tools: Option<bool>,
     /// Catch-all for provider-specific metadata that doesn't fit the
-    /// common shape (Codex returns ~25 fields per model — most are
-    /// uninteresting to baybo but kept here for operators who care).
+    /// common shape (`openai-subscription` returns ~25 fields per model —
+    /// most are uninteresting to baybo but kept here for operators who care).
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub extras: serde_json::Value,
 }
@@ -223,7 +223,7 @@ impl LlmProviderRegistry {
         let mut registry = Self::new();
         // First on purpose: the picker renders this order, only ~12 of the
         // rows fit on screen at once, and this is the one provider that
-        // needs no API key — an operator with a ChatGPT/Codex plan and
+        // needs no API key — an operator with a ChatGPT plan and
         // nothing else should not have to scroll past the key-gated
         // providers to find the one they can actually use.
         registry.register(OpenAiSubscriptionProviderFactory);

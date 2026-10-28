@@ -114,7 +114,7 @@ A failed remote revoke is reported to the user.
 
 ## Inference and model discovery
 
-New connections use:
+Requests use:
 
 - `GET https://api.openai.com/v1/models`
 - `POST https://api.openai.com/v1/responses`
@@ -122,13 +122,12 @@ New connections use:
 - `store=false`, `stream=true`
 
 Discovery preserves server order and only exposes rows with
-`visibility=list`. It never adds the legacy static model supplement.
-The setup wizard seeds a lite model only when the actual catalog lists it.
+`visibility=list`; Baybo adds no models of its own. The setup wizard seeds a
+lite model (`LITE_MODEL`) only when the actual catalog lists it.
 
 The existing rig-to-Responses conversion handles system instructions, messages,
 images, PDFs, function calls/results, reasoning and prompt cache keys.
-New connections do not send Codex originator, account or experimental headers.
-They do send the cache affinity headers (`session-id`, `thread-id`,
+Requests send the cache affinity headers (`session-id`, `thread-id`,
 `x-client-request-id`): the body `prompt_cache_key` alone does not pin a
 conversation to one cache node, and dropping the headers took the hit rate
 from ~95% to ~13%.
@@ -140,25 +139,18 @@ errors surface failures. Both LF and CRLF SSE framing are supported.
 `subscription_sharing_usage_unavailable` remains transient.
 Usage errors link to [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
 
-Bearer destination validation adds `api.openai.com` to the existing OpenAI
-allowlist and still requires HTTPS. The existing environment-only
-`BAYBO_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL` override remains for deliberate
-custom endpoints.
+Every request goes to `<base_url><path>`; the default base URL is
+`https://api.openai.com/v1`. Bearer destination validation allows only
+`api.openai.com` and `auth.openai.com` (and their subdomains) over HTTPS. The
+environment-only `BAYBO_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL` override remains
+for deliberate custom endpoints.
 
-## Legacy migration
+## Undecodable credentials
 
-A token bundle without `connection` is an existing Codex credential.
-It continues to use the legacy backend, refresh client ID and headers.
-Compatibility is isolated in `legacy_oauth.rs`; no new login uses that client.
-
-The public default base URL is now `https://api.openai.com/v1`.
-An explicitly configured former default is normalized so routing follows the
-credential: legacy tokens use the old backend, new tokens use the public API.
-Other custom endpoints retain their configured destination.
-
-Run `baybo llm edit` and select `OAuth login (re-authenticate)` to migrate.
-The user must authorize Baybo in the browser; existing CLI tokens are never
-relabeled as a Baybo connection.
+A stored credential that no longer decodes as a bundle is an `LlmError::Auth`
+asking for a new sign-in — never "not signed in", never a retry loop. Sign-in
+treats the undecodable entry as absent and overwrites it. Fix it with
+`baybo llm edit` → `OAuth login (re-authenticate)`.
 
 ## CLI and module boundaries
 
@@ -173,12 +165,10 @@ present the authorization URL and render diagnostics. OAuth persists a validated
 | Module | Responsibility |
 | --- | --- |
 | `oauth.rs` | Dynamic registration, callback, verified identity, refresh and revocation |
-| `legacy_oauth.rs` | Refresh/revoke for pre-migration credentials |
-| `token_bundle.rs` | Durable credential shape, permission gate, legacy display parsing |
-| `token_store.rs` | Vault persistence and credential identity |
+| `token_bundle.rs` | Durable credential shape, permission gate, ID-token display claims |
+| `token_store.rs` | Vault persistence, undecodable-credential handling and credential identity |
 | `refresh_coordinator.rs` | Shared cache and process/peer refresh coordination |
-| `completion_model.rs` | Responses conversion, routes, model catalog, SSE |
-| `catalog.rs` | Legacy catalog supplement and optional lite-model seed |
+| `completion_model.rs` | Responses conversion, model discovery, SSE |
 | `factory.rs` | Provider construction and bearer destination policy |
 
 ## Verification
@@ -187,7 +177,8 @@ Tests cover dynamic and returning authorization parameters, callback state and
 client binding, ID token signature/issuer/audience/expiry/nonce checks,
 opaque access-token expiry, granted scopes, refresh rotation and error
 classification, public model/Responses requests, permission enforcement,
-terminal streaming events, and retained legacy refresh coordination.
+terminal streaming events, cross-process refresh coordination, and the
+re-authentication error for an undecodable stored credential.
 
 Identity validation tests generate an ephemeral RSA key and matching JWKS in
 memory. No test private key is stored in the repository.

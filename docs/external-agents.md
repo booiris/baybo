@@ -14,7 +14,7 @@ in-process baybo `AgentActor`. Two are registered today:
 > Not to be confused with the **`openai-subscription` LLM provider**
 > ([`modules/llm-openai-subscription.md`](modules/llm-openai-subscription.md)),
 > which bills against the same ChatGPT plan but is not an external agent: it
-> needs no `codex` binary, speaks the Codex Responses API in-process, and is
+> needs no `codex` binary, speaks the public Responses API in-process, and is
 > configured as an `llm[]` entry rather than under `external_agents.codex`.
 
 Both let an baybo subagent's task be handled by the external

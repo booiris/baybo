@@ -1,6 +1,6 @@
-//! Reasoning-effort allow-list per Codex model family + resolver.
+//! Reasoning-effort allow-list per model family + resolver.
 //!
-//! Codex Responses accepts a `reasoning.effort` field but each model
+//! The Responses API accepts a `reasoning.effort` field but each model
 //! family advertises its own legal subset (e.g. `gpt-5-pro` only takes
 //! `high`, `gpt-5.2+` adds `xhigh`, `gpt-codex` doesn't accept `none`
 //! or `minimal`). Source of truth is openclaw's
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(resolved("gpt-5-pro", Some("NONE")), None);
     }
 
-    /// Absent ≠ off: omitting the field disables reasoning in the Codex
+    /// Absent ≠ off: omitting the field disables reasoning in the request
     /// body, so an unconfigured entry has to send the family default.
     #[test]
     fn an_unset_effort_falls_back_to_the_family_default() {

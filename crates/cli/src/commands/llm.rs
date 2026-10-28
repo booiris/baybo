@@ -399,8 +399,13 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
                 changed.push("model");
             }
         } else if picked.starts_with("base_url ") {
-            let current = working.base_url.as_deref().unwrap_or("");
-            let typed = prompt_with_default("Base URL (empty = use provider default)", current)?;
+            // No prefill: with the current value as the default, an empty
+            // answer would keep it, and the base URL could never be cleared.
+            let current = working.base_url.as_deref().unwrap_or("provider default");
+            let typed = prompt_with_default(
+                &format!("Base URL (current: {current}; empty = use provider default)"),
+                "",
+            )?;
             let new_base = if typed.trim().is_empty() {
                 None
             } else {
