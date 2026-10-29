@@ -125,7 +125,9 @@ tracing-subscriber = { version = "0.3", features = [
     "registry",
 ] }
 tracing-appender = "0.2"
-jsonwebtoken = { version = "9" }
+# v10 requires picking a crypto backend; aws_lc_rs matches the rustls provider
+# already in the tree (and remote-host's APNs signer).
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 aws-lc-rs = "1"
 uuid = { version = "1", features = ["v4"] }
 ulid = { version = "1", features = ["serde"] }
