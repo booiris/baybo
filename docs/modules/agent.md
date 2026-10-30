@@ -267,6 +267,51 @@ The streaming twin of the dangling-use guard is
 `salvage_partial_blocks`, which drops streamed-but-undispatched `ToolUse` on
 mid-stream cancel so the dangling row is never persisted in the first place.
 
+A `ToolUse` parked on a human ask is the one dangling id hydration leaves
+alone: the spawner hands every `ContextManager` a `PendingToolCalls` port
+(`runtime::asks::UnappliedAsks`, over `HumanAskManager::unapplied_tool_use_ids`,
+read from the ledger), and `repair_tool_pairing` neither fills nor quarantines
+those ids, so the real result can land adjacent later.
+
+### Unapplied asks: the turn prelude and the Resume door
+
+Every door that appends to a transcript first calls
+`AgentActor::settle_unapplied_asks()` (`actor/asks.rs`): `handle_user_input`,
+`handle_merged_user_turn`, `dispatch_issue_run` (before `append_issue_brief`),
+`dispatch_cron_prompt` (before `append_cron_fire`), the background-notification
+delivery (before `append_background_notification_prompt_once`, on both the
+fresh and the retry stage), `/compact` (before `compact_now`) and
+`publish_cron_notification` (an assistant row after a dangling `tool_use`
+wedges the transcript just as a user row does). When the ledger has no
+unapplied ask for the session it returns without opening a turn; otherwise it
+runs a `TurnInput::Resume` turn through `AgentLoop::run_settlement_turn`, whose
+whole body is `AgentLoop::settle_unapplied_asks(…, SettleMode::SettleOnly, …)`
+(`runtime/agent_loop/settle.rs`). The settlement asks
+`HumanAskManager::settle_unapplied` and appends one result per `Settled`,
+through the same `append_executed_tool` post-processing the batch uses: a
+`ToolError::Denied` with `refusal_reason(Abandoned | Answered | Policy)` and
+`ToolResultMeta { approval: Some(Deny) }` for a refused approval, the
+`baybo_human_ask::result` envelope for a question, and for an approved call
+`mark_applied` **first**, then a re-execution under a fresh `LlmIteration`
+step with `ToolExecutor::execute(…, PreExecuteGate::PreDecided(decision))`, so
+the gate is not asked again (`ApproveAlways` still seeds the grants). The
+`resumed_turn_id` is the session's newest turn created no later than the ask.
+
+`RouterResumeSink` (`runtime::asks`) is the manager's `ResumeSink`: it sends
+`RouterInbound::ResumeAsk` on the router's intake (created in
+`build_managers` and carried on `ManagerGraph` for `wire_router` to take), and
+answers `resumes_on_answer = false` for issue sessions. The router routes it
+like `route_one_to_actor`, through `resolve_spawn_pins`, as
+`AgentMessage::ResumeAsk { ask_id }` at `Trigger` priority.
+`handle_resume_ask` returns when the row is already applied (a door got there
+first) or not resolved; otherwise it runs `run_agent_loop(TurnInput::Resume)`,
+whose `run_inner` settles with `SettleMode::Continue` before the first LLM
+iteration, and sends the reply with `send_user_reply`.
+
+The idle reaper skips a session `LivePendingAsks::has_live_pending_ask`
+reports (`AgentSupervisor::new` takes the manager as that probe), so an answer
+hours later still takes the live path.
+
 ### Router's upstream responsibilities
 
 Before a message enters an actor, Router completes: session identification/creation, user-level rate limiting, quota check via `CostManager::check`, select/create target `AgentActor`.

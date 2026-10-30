@@ -66,14 +66,21 @@ pub struct AgentSupervisor {
     actors: Arc<DashMap<SessionId, ActorHandle>>,
     response_tx: mpsc::Sender<AgentOutput>,
     in_flight_background_subagents: Arc<DashMap<SessionId, HashMap<SessionId, InFlightJob>>>,
+    /// The reaper keeps an actor whose turn is parked on an ask warm, so an
+    /// answer hours later takes the live path.
+    live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
 }
 
 impl AgentSupervisor {
-    pub fn new(response_tx: mpsc::Sender<AgentOutput>) -> Self {
+    pub fn new(
+        response_tx: mpsc::Sender<AgentOutput>,
+        live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
+    ) -> Self {
         Self {
             actors: Arc::new(DashMap::new()),
             response_tx,
             in_flight_background_subagents: Arc::new(DashMap::new()),
+            live_asks,
         }
     }
 
@@ -424,6 +431,10 @@ impl AgentSupervisor {
                 );
                 continue;
             }
+            if self.live_asks.has_live_pending_ask(&session_id) {
+                debug!(%session_id, "idle reaper: skipping a session parked on an ask");
+                continue;
+            }
             let Some(sender) = self.actors.get(&session_id).map(|e| e.sender.clone()) else {
                 continue;
             };
@@ -646,7 +657,10 @@ mod tests {
 
     fn make_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
-        AgentSupervisor::new(tx)
+        AgentSupervisor::new(
+            tx,
+            std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+        )
     }
 
     #[test]
@@ -848,6 +862,57 @@ mod tests {
         assert!(matches!(idle_rx.try_recv(), Ok(AgentMessage::ActorStop)));
         // The fresh actor received nothing.
         assert!(fresh_rx.try_recv().is_err());
+    }
+
+    /// A probe that reports one session as parked on a live ask.
+    struct ParkedOn(SessionId);
+
+    impl baybo_human_ask::LivePendingAsks for ParkedOn {
+        fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
+            *session_id == self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn reap_idle_keeps_an_actor_parked_on_a_live_ask() {
+        use chrono::Utc;
+
+        let session_store = Arc::new(MemorySessionStore::new());
+        let folder_store = Arc::new(MemorySessionFolderStore::new());
+        let sessions = SessionManager::new(session_store.clone(), folder_store);
+        let user = User {
+            id: "u-1".to_string(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        let mut parked = sessions
+            .create_session(user.clone(), ChannelType::tui())
+            .await
+            .unwrap();
+        parked.last_active = Utc::now() - Duration::seconds(120);
+        session_store.save(&parked).await.unwrap();
+        let mut idle = sessions
+            .create_session(user, ChannelType::tui())
+            .await
+            .unwrap();
+        idle.last_active = Utc::now() - Duration::seconds(120);
+        session_store.save(&idle).await.unwrap();
+
+        let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
+        let supervisor = AgentSupervisor::new(tx, Arc::new(ParkedOn(parked.id.clone())));
+        let (parked_tx, mut parked_rx) = mailbox::channel(8);
+        let (idle_tx, mut idle_rx) = mailbox::channel(8);
+        supervisor
+            .register_if_absent(parked.id.clone(), parked_tx)
+            .expect("first insert");
+        supervisor
+            .register_if_absent(idle.id.clone(), idle_tx)
+            .expect("first insert");
+
+        let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
+        assert_eq!(reaped, 1);
+        assert!(parked_rx.try_recv().is_err(), "the parked actor stays warm");
+        assert!(matches!(idle_rx.try_recv(), Ok(AgentMessage::ActorStop)));
     }
 
     #[test]

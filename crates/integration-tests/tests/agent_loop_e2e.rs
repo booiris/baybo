@@ -1771,7 +1771,10 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
     let (response_tx, _response_rx) = tokio::sync::mpsc::channel(8);
-    let supervisor = AgentSupervisor::new(response_tx);
+    let supervisor = AgentSupervisor::new(
+        response_tx,
+        std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+    );
     supervisor
         .register_if_absent(session_id.clone(), harness.mailbox.clone())
         .expect("harness actor is registered once");

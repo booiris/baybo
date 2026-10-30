@@ -229,6 +229,12 @@ pub struct ManagerGraph {
     /// The verbs over the ask ledger. Every actor's loop gets it as its
     /// `TurnAsks` port.
     pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
+    /// The router's intake. Created in [`build_managers`] because the ask
+    /// manager's Resume door sends on it; channel transports get clones.
+    pub router_incoming_tx: mpsc::Sender<RouterInbound>,
+    /// The intake's receiver, a one-shot like `cron_trigger_rx` —
+    /// [`wire_router`] consumes it.
+    pub router_incoming_rx: Option<mpsc::Receiver<RouterInbound>>,
 
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
@@ -351,13 +357,11 @@ pub async fn build_managers(
     // `ask_queues` so the boot reload and the install meet on one queue.
     let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
     let ask_queues = baybo_human_ask::AskQueues::new();
-    let human_asks = Arc::new(baybo_human_ask::HumanAskManager::from_config(
-        baybo_human_ask::HumanAskManagerConfig {
-            core: Arc::clone(&ask_core),
-            queues: ask_queues.clone(),
-            resume_sink: Arc::new(NoResumeDoor),
-        },
-    ));
+    // The router's intake is created here rather than in `wire_router`, so
+    // the ask manager can hold the Resume door (a sender on it) as a
+    // required field; `wire_router` takes the receiver off the graph.
+    let (router_incoming_tx, router_incoming_rx) =
+        mpsc::channel::<RouterInbound>(config.channels.message_buffer_size);
     // Eagerly install every enabled channel from config so connections
     // can attach to a pre-existing slot rather than racing on lazy
     // first-connect creation. See docs/modules/channels-protocol-refactor.md.
@@ -533,6 +537,30 @@ pub async fn build_managers(
         Arc::clone(&turn_lifecycle),
     )
     .await;
+
+    let human_asks = Arc::new(baybo_human_ask::HumanAskManager::from_config(
+        baybo_human_ask::HumanAskManagerConfig {
+            core: Arc::clone(&ask_core),
+            queues: ask_queues.clone(),
+            resume_sink: Arc::new(baybo_agent::runtime::asks::RouterResumeSink::new(
+                router_incoming_tx.clone(),
+                Arc::clone(&session_manager),
+            )),
+        },
+    ));
+    // Best-effort, like the skill-job recovery: put the ledger's pending asks
+    // back on their queues and re-drive the answered ones. Resume requests
+    // wait in the router's intake until the router runs.
+    match human_asks.reload_pending().await {
+        Ok(report) => info!(
+            requeued = report.requeued,
+            resumed = report.resumed,
+            abandoned = report.abandoned,
+            applied = report.applied,
+            "reloaded unapplied human asks"
+        ),
+        Err(e) => tracing::warn!(error = %e, "failed to reload unapplied human asks"),
+    }
 
     // CostTracker has been retired in favour of a process-wide
     // --- cron scheduler (built before ToolExecutor so its tools register
@@ -934,30 +962,10 @@ pub async fn build_managers(
         ask_core,
         ask_queues,
         human_asks,
+        router_incoming_tx,
+        router_incoming_rx: Some(router_incoming_rx),
         subagent_dispatch_limiter,
     })
-}
-
-/// Interim resume sink until the chat Resume door (`RouterInbound::ResumeAsk`)
-/// exists: an answer to a dead ask is recorded on the ledger and nothing is
-/// requested, exactly as for an issue session.
-// TODO(human-ask): replace with the baybo-agent sink over the router inbound
-// channel when the Resume door lands.
-struct NoResumeDoor;
-
-#[async_trait::async_trait]
-impl baybo_human_ask::ResumeSink for NoResumeDoor {
-    async fn resumes_on_answer(&self, _session: &baybo_model::SessionId) -> bool {
-        false
-    }
-
-    fn request_resume(&self, req: baybo_model::human_ask::ResumeRequest) {
-        tracing::warn!(
-            session_id = %req.session_id,
-            ask_id = %req.ask_id,
-            "no resume door wired; the answer waits for the session's next turn"
-        );
-    }
 }
 
 /// Router + channel handles a chat loop needs to drive.
@@ -996,10 +1004,14 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let keep_recent = graph.config.agent.context.keep_recent;
     let builtin_memory = graph.config.memory.builtin.enabled;
 
-    let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
+    let incoming_tx = graph.router_incoming_tx.clone();
+    let incoming_rx = graph
+        .router_incoming_rx
+        .take()
+        .expect("wire_router called twice; router_incoming_rx already consumed");
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
-    let supervisor = AgentSupervisor::new(response_tx);
+    let supervisor = AgentSupervisor::new(response_tx, graph.human_asks.clone());
     // Hand the now-built supervisor to the background-turn manager so its
     // escorts can route completion notifications back to parent sessions.
     let _ = graph.bg_supervisor_slot.set(supervisor.clone());
@@ -1050,6 +1062,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         // nothing billed).
         let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
         let turn_asks: Arc<dyn baybo_agent::runtime::asks::TurnAsks> = graph.human_asks.clone();
+        let pending_tool_calls: Arc<dyn baybo_context::PendingToolCalls> = Arc::new(
+            baybo_agent::runtime::asks::UnappliedAsks(Arc::clone(&graph.human_asks)),
+        );
         // Shared across every actor: the title pass notifies this sink once it
         // has persisted a generated title, and it fans a `SessionUpdated` patch
         // out to every Subscribed channel so the owning surface updates live.
@@ -1116,6 +1131,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             workspace_paths_arc.root(),
                             &session.trigger,
                         ),
+                        pending_tool_calls: Arc::clone(&pending_tool_calls),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),

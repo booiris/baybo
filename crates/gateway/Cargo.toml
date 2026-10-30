@@ -28,7 +28,11 @@ macos = []
 # test fixtures can construct `BillableLlm::passthrough`, and the protocol's
 # test address policy, so a `baybo` built with it (the netns matrix's
 # gateway) treats the matrix's documentation ranges as public.
-test-support = ["baybo-llm/test-support", "remote-host-protocol/test-support"]
+test-support = [
+    "baybo-llm/test-support",
+    "remote-host-protocol/test-support",
+    "baybo-human-ask/test-support",
+]
 
 [dependencies]
 baybo-process = { workspace = true }

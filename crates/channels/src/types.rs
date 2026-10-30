@@ -49,6 +49,10 @@ pub enum RouterInbound {
     // size of an `IncomingMessage` (matches `AgentMessage::UserInput`).
     One(Box<IncomingMessage>),
     Batch(Vec<IncomingMessage>),
+    /// A human answered an ask whose tool future is gone: open a Resume turn
+    /// on the session so the answer lands. Not a channel message — the
+    /// ask manager's resume sink sends it.
+    ResumeAsk(baybo_model::human_ask::ResumeRequest),
 }
 
 /// Outgoing message to be sent back through a channel adapter.

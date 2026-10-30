@@ -574,6 +574,7 @@ async fn settle_unapplied_handles_every_row_state() {
             Settled::Apply {
                 ask_id: id("answered"),
                 tool_call_id: "use-answered".into(),
+                kind: AskKind::Approval,
                 resolution: APPROVE,
             },
         ]
@@ -680,6 +681,7 @@ async fn settle_unapplied_returns_apply_when_a_resolve_wins_the_claim() {
         vec![Settled::Apply {
             ask_id: id("a"),
             tool_call_id: "use-a".into(),
+            kind: AskKind::Approval,
             resolution: APPROVE,
         }]
     );

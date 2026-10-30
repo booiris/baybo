@@ -356,7 +356,7 @@ without a back-edge to the manager.
 | `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim) | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A row whose `channel` has no queue still gets the claim, with a `warn!`. |
 | `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on what it abandoned — its caller appends the result next — and returns `ToolCallAbandon::{NoAsk, Abandoned, Answered}`; `Answered` (a claim lost, or a row already resolved) means append nothing. |
 | `policy_deny(request)` | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
-| `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied` (the caller appends next); resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for rows it abandoned and `Settled::Apply { ask_id, tool_call_id, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
+| `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied` (the caller appends next); resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for rows it abandoned and `Settled::Apply { ask_id, tool_call_id, kind, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
 | `mark_applied(ask_id)` | `applied_at` (claim) | — |
 | `reload_pending()` | `Abandoned` for non-resumable pending rows; `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. |
 
@@ -1078,7 +1078,7 @@ pub struct PolicyDenyGate { core: Arc<AskCore> }                    // impl Appr
 pub struct HumanAskManager;                     // from_config(HumanAskManagerConfig { core, queues: AskQueues, resume_sink: Arc<dyn ResumeSink> })
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
                                                 //        unapplied_tool_use_ids, has_live_pending_ask (LivePendingAsks impl)
-pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, resolution } }
+pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, kind, resolution } }
 pub enum ToolCallAbandon { NoAsk, Abandoned, Answered }   // abandon_for_tool_call's answer to the loop
 pub struct ReloadReport { requeued, resumed, abandoned, applied }
 #[async_trait] pub trait ResumeSink {
@@ -1129,16 +1129,41 @@ Where the code differs from the sketch above, and why:
   `TriggerSource`. One port, no extra config field, no schema change.
 - **Interim wiring.** Until the gateway's resolve doors move onto
   `HumanAskManager`, `Channel::resolve_approval` still resolves through the
-  queue alone (no ledger claim). `build_managers` already constructs the
-  `HumanAskManager` (on `ManagerGraph.human_asks`) because the loop needs its
-  verbs, but until the Resume door lands its `ResumeSink` is a placeholder
-  (`NoResumeDoor` in `crates/baybo/src/runtime.rs`) whose
-  `resumes_on_answer` is `false` — an answered dead ask is recorded and
-  applied by the next settlement, as for an issue session.
+  queue alone (no ledger claim). `build_managers` creates the router intake
+  next to `AskCore`/`AskQueues`, builds the `HumanAskManager` right after
+  `recover_orphaned_traces_and_turns` (it needs the `SessionManager` for the
+  sink's issue check) with `baybo_agent::runtime::asks::RouterResumeSink` as
+  its `ResumeSink`, and calls `reload_pending` there (best-effort, logged).
+  `AskPushRelay` does not move yet, so a reload's `Raised` edges reach no push
+  relay until the gateway stage moves it ahead of the manager.
+- **The settlement.** `TurnAsks` grew `unapplied`, `settle_unapplied`,
+  `mark_applied` and `get` (the manager gained the public
+  `unapplied_for_session` to answer the first). The approval re-execution
+  passes `PreExecuteGate::PreDecided(decision)` to `ToolExecutor::execute`
+  (`PreExecuteGate::Ask` everywhere else) and runs under a fresh
+  `StepKind::LlmIteration` step that carries the tool span but no `LlmCall`
+  span — no new step kind, so no trace-viewer mirror changes. A settle-only
+  Resume turn completes with `TurnOutput::Structured { "settled_asks": n }`
+  (no reply ordinal, so no push). `resumed_turn_id` is derived as the
+  session's newest turn created no later than the ask (the row carries no
+  turn id); a session with no turns at all is logged and skipped. A
+  settlement error fails the door (the door's own append does not happen);
+  the background-notification door logs and retries on its timer. The
+  `AskUser` result envelope for `Answered` / `Declined` / an abandoned
+  question lives in `baybo_human_ask::result`, so PR 2's tool reuses it.
+  `Settled::Apply` carries the row's `kind` as well: a dead ask abandoned by
+  a verb (card close, `abandon`) is resolved-not-applied, and its
+  `Abandoned` resolution alone cannot say whether the refusal is an approval
+  denial or a declined question.
+- **One more door.** `publish_cron_notification` (a one-shot cron result
+  delivered into its origin conversation, or a fire's own outcome row) also
+  runs the prelude: it appends an assistant row, which after a dangling
+  `tool_use` wedges the transcript just as a user row does.
 - **The loop's port.** The agent loop does not hold `Arc<HumanAskManager>`:
   `AgentLoopConfig.asks` is `Arc<dyn baybo_agent::runtime::asks::TurnAsks>`,
-  a narrow port implemented for `HumanAskManager` in `baybo-agent`. Today it
-  carries `abandon_for_tool_call` only; on a store error it answers `NoAsk`
+  a narrow port implemented for `HumanAskManager` in `baybo-agent`. It carries
+  `abandon_for_tool_call` and the settlement verbs listed above. On a store
+  error `abandon_for_tool_call` answers `NoAsk`
   (the result is appended, so the session's next LLM call is not wedged by a
   dangling `tool_use`). The cancelled-batch path decides per call from
   `ExecutedTool.abandoned` (the call's last ask resolved `Abandoned`, read

@@ -12,6 +12,7 @@ pub mod gate;
 pub mod manager;
 pub mod ports;
 pub mod queue;
+pub mod result;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

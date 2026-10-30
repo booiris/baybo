@@ -34,9 +34,12 @@ use crate::runtime::progress_observer::{
     should_fire_observer,
 };
 use crate::runtime::scope::TurnSpec;
-use crate::runtime::tool_executor::{ExecutedTool, ToolExecutor};
+use crate::runtime::tool_executor::{ExecutedTool, PreExecuteGate, ToolExecutor};
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
+
+mod settle;
+pub use settle::SettleMode;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
 /// for a placeholder to complete. If a chunk ends with an open `[{` but no
@@ -1030,6 +1033,20 @@ impl AgentLoop {
         // folded into the final assistant row so it persists. Dropped on any
         // non-`Final` exit: attachments are durable only when the turn is.
         let mut turn_attachments: Vec<ContentBlock> = Vec::new();
+        // A Resume turn applies the answered ask first, so the first LLM
+        // call starts from `assistant(tool_use) + tool_result`.
+        if turn_kind == TurnInputKind::Resume {
+            self.settle_unapplied_asks(
+                session,
+                span_recorder,
+                turn_id,
+                &tokens,
+                delta_tx.as_ref(),
+                SettleMode::Continue,
+                &mut turn_attachments,
+            )
+            .await?;
+        }
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -1569,6 +1586,7 @@ impl AgentLoop {
                             read_tracker,
                             notify_silence,
                             via_invoke,
+                            PreExecuteGate::Ask,
                         )
                         .await
                 }
@@ -1638,177 +1656,20 @@ impl AgentLoop {
                 self.context_manager.append(&tool_msg).await?;
                 continue;
             };
-            let (status, raw_summary) = tool_completion_summary(&executed);
-            let call_approval = executed.approval;
-            self.emit_tool_completed(
-                delta_tx,
+            self.append_executed_tool(
                 session,
-                tool_call.id.clone(),
-                status,
-                raw_summary,
-                call_approval,
+                delta_tx,
+                turn_id,
+                &tool_call.id,
+                dispatch,
+                executed,
+                turn_attachments,
+                &mut llm_visible_images,
             )
-            .await;
-
-            // Count a grouped subagent spawn into its barrier cohort so the
-            // turn-end seal knows the member total. Only a *successful
-            // dispatch* counts — a router-side failure (unregistered backend,
-            // closed channel, …) comes back as `Ok("[subagent failed: …]")`
-            // with no escorted result to ever arrive, so `is_ok()` is too
-            // broad: counting it would stall the cohort until its group
-            // timeout. A real dispatch returns the ack with its `bg-…` handle.
-            let dispatched = matches!(
-                &executed.output,
-                Ok(ToolOutput::Text(t))
-                    if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
-            );
-            if dispatch.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
-                && dispatched
-                && let Some(group) = dispatch
-                    .arguments
-                    .get("group")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            {
-                // Namespace the cohort by this turn's `turn_id` so reusing a
-                // group name in a later turn opens a fresh cohort rather than
-                // extending the prior (still-sealed, still-draining) one. The
-                // spawner stamps the escorted member's `group` through the
-                // same helper, so routing back into the cohort agrees.
-                session
-                    .state
-                    .background_notifications
-                    .register_group_member(turn_id, group);
-            }
-
-            let raw_result_text = match &executed.output {
-                Ok(ToolOutput::Text(s)) => s.clone(),
-                Ok(ToolOutput::Json(v)) => {
-                    serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
-                }
-                // Media a tool produced for the *user* (e.g. `AttachFile`) is
-                // hoisted onto the turn's final assistant row; the LLM sees
-                // only the text result. `MultiModalText`'s images are for the
-                // LLM's own next turn: accumulated here and appended as one
-                // follow-up user-role message after the tool-result loop, so
-                // provider tool_use/tool_result adjacency stays intact.
-                Ok(ToolOutput::WithAttachments { text, attachments }) => {
-                    extend_unique_attachments(turn_attachments, attachments);
-                    text.clone()
-                }
-                Ok(ToolOutput::MultiModalText { text, llm_images }) => {
-                    push_bounded_images(&mut llm_visible_images, llm_images.iter().cloned());
-                    text.clone()
-                }
-                Ok(ToolOutput::Error(msg)) => format!("{TOOL_RESULT_ERROR_PREFIX} {msg}"),
-                Err(e) => {
-                    if let Some(baybo_tools::ToolError::Denied { reason, .. }) =
-                        e.downcast_ref::<baybo_tools::ToolError>()
-                    {
-                        format!(
-                            "{TOOL_DENIED_PREFIX}{}{TOOL_DENIED_INFIX}{reason}. \
-                             Do NOT retry this tool call. Either use an alternative \
-                             approach or inform the user that the operation was skipped.",
-                            dispatch.name
-                        )
-                    } else {
-                        format!("{TOOL_RESULT_ERROR_PREFIX} {e}")
-                    }
-                }
-            };
-
-            // Cap size before wrapping so the truncation notice lands inside
-            // the `<tool_output>` envelope. The scan/format split keeps the
-            // injection detector in `baybo-security` while the cap + spill +
-            // envelope framing live in `baybo-context`; the loop bridges the
-            // two by feeding the scan's rule names into the wrapper.
-            let capped = self.context_manager.cap_tool_output(raw_result_text).await;
-            let warnings = self.security_gateway.detect_injection(&capped);
-            let warning_rules: Vec<&str> = warnings.iter().map(|w| w.rule_name.as_str()).collect();
-            let wrapped = baybo_model::wrap_tool_output(&dispatch.name, &capped, &warning_rules);
-
-            // Append tool result to context with the tool_use_id so the
-            // LLM can correlate results with their originating calls. The
-            // meta rides the persisted row but is never sent to the LLM: a
-            // tool that anchored the read-before-write tracker stamps the
-            // fingerprint it left there (so hydration can rebuild it; `get`
-            // returns `None` for a failed/virtual read), and any call that
-            // raised an approval prompt stamps the decision (so reloads can
-            // label the work step). Both `None` collapses to a plain
-            // `tool_result`.
-            //
-            // `Edit`/`Write` and not just `Read`: both re-anchor the tracker to
-            // what they wrote, and stamping only `Read` meant hydration restored
-            // the *pre-edit* fingerprint — so the first write after a restart
-            // was rejected as stale against the model's own edit.
-            let read_fingerprint = baybo_tools::READ_TRACKER_ANCHORING_TOOLS
-                .contains(&dispatch.name.as_str())
-                .then(|| {
-                    dispatch
-                        .arguments
-                        .get(baybo_tools::TOOL_FILE_PATH_ARG)
-                        .and_then(|v| v.as_str())
-                        .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
-                })
-                .flatten();
-            // What this call LEFT on disk, and only when it really wrote. The
-            // tracker is the source rather than a fresh `stat` because
-            // `Edit`/`Write` re-anchor it from inside the tool, the instant
-            // after their own write — a stat from out here would race any
-            // concurrent writer and could stamp someone else's bytes as ours.
-            // A successful write's anchor lands in `committed`, and
-            // `begin_response` already drained `pending`, so `get` returns the
-            // post-write value and not a read staged earlier in this response.
-            let write_fingerprint = (baybo_tools::FILE_WRITING_TOOLS
-                .contains(&dispatch.name.as_str())
-                && tool_call_succeeded(&executed.output))
-            .then(|| {
-                dispatch
-                    .arguments
-                    .get(baybo_tools::TOOL_FILE_PATH_ARG)
-                    .and_then(|v| v.as_str())
-                    .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
-            })
-            .flatten();
-            // File calls retain their transitions; every other tool retains
-            // only its current consecutive error signature. Both detectors
-            // report through the same per-turn monitor.
-            if let Some(verdict) =
-                self.progress_monitor
-                    .record(&dispatch.name, &dispatch.arguments, &executed.output)
-            {
-                self.note_no_progress(&verdict);
-            }
-            let meta = (read_fingerprint.is_some()
-                || write_fingerprint.is_some()
-                || call_approval.is_some())
-            .then_some(baybo_model::ToolResultMeta {
-                read_fingerprint,
-                write_fingerprint,
-                approval: call_approval,
-            });
-            let tool_msg = ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta);
-            self.context_manager.append(&tool_msg).await?;
+            .await?;
         }
 
-        // Images a tool returned for the model (`MultiModalText`, e.g. a
-        // browser screenshot) ride ONE follow-up user-role row appended
-        // after every tool_result, so the next request's vision path
-        // (`user_content_for_block`) picks them up without breaking the
-        // provider's tool_use/tool_result adjacency validation.
-        // `agent_context` = user role / agent source, so the row is never
-        // mistaken for a genuine user prompt.
-        if !llm_visible_images.is_empty() {
-            let mut content: Vec<ContentBlock> = Vec::with_capacity(llm_visible_images.len() + 1);
-            content.push(ContentBlock::Text(
-                "[image attachment(s) returned by the tool call(s) above]".to_string(),
-            ));
-            content.append(&mut llm_visible_images);
-            self.context_manager
-                .append(&ChatMessage::agent_context(content))
-                .await?;
-        }
+        self.append_llm_visible_images(llm_visible_images).await?;
 
         // Completed calls keep their approval grants even when the batch is cancelled.
         session.state.approved_resources = approved.lock().clone();
@@ -1822,6 +1683,199 @@ impl AgentLoop {
             .iter()
             .any(|dc| baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&dc.name.as_str()));
         Ok(IterationOutcome::Continue { task_mutated })
+    }
+
+    /// Emit one finished call's `tool_completed` event and append its result
+    /// row: the post-processing every executed call goes through, whether the
+    /// batch ran it or a settlement re-executed it. Media for the user lands
+    /// in `turn_attachments`; images for the model collect in
+    /// `llm_visible_images` for one follow-up row after every result.
+    #[allow(clippy::too_many_arguments)]
+    async fn append_executed_tool(
+        &mut self,
+        session: &mut Session,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        turn_id: TurnId,
+        tool_use_id: &str,
+        dispatch: &DispatchedToolCall,
+        executed: ExecutedTool,
+        turn_attachments: &mut Vec<ContentBlock>,
+        llm_visible_images: &mut Vec<ContentBlock>,
+    ) -> anyhow::Result<()> {
+        let (status, raw_summary) = tool_completion_summary(&executed);
+        let call_approval = executed.approval;
+        self.emit_tool_completed(
+            delta_tx,
+            session,
+            tool_use_id.to_string(),
+            status,
+            raw_summary,
+            call_approval,
+        )
+        .await;
+
+        // Count a grouped subagent spawn into its barrier cohort so the
+        // turn-end seal knows the member total. Only a *successful
+        // dispatch* counts — a router-side failure (unregistered backend,
+        // closed channel, …) comes back as `Ok("[subagent failed: …]")`
+        // with no escorted result to ever arrive, so `is_ok()` is too
+        // broad: counting it would stall the cohort until its group
+        // timeout. A real dispatch returns the ack with its `bg-…` handle.
+        let dispatched = matches!(
+            &executed.output,
+            Ok(ToolOutput::Text(t))
+                if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
+        );
+        if dispatch.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
+            && dispatched
+            && let Some(group) = dispatch
+                .arguments
+                .get("group")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            // Namespace the cohort by this turn's `turn_id` so reusing a
+            // group name in a later turn opens a fresh cohort rather than
+            // extending the prior (still-sealed, still-draining) one. The
+            // spawner stamps the escorted member's `group` through the
+            // same helper, so routing back into the cohort agrees.
+            session
+                .state
+                .background_notifications
+                .register_group_member(turn_id, group);
+        }
+
+        let raw_result_text = match &executed.output {
+            Ok(ToolOutput::Text(s)) => s.clone(),
+            Ok(ToolOutput::Json(v)) => serde_json::to_string(v).unwrap_or_else(|_| v.to_string()),
+            // Media a tool produced for the *user* (e.g. `AttachFile`) is
+            // hoisted onto the turn's final assistant row; the LLM sees
+            // only the text result. `MultiModalText`'s images are for the
+            // LLM's own next turn: accumulated here and appended as one
+            // follow-up user-role message after the tool-result loop, so
+            // provider tool_use/tool_result adjacency stays intact.
+            Ok(ToolOutput::WithAttachments { text, attachments }) => {
+                extend_unique_attachments(turn_attachments, attachments);
+                text.clone()
+            }
+            Ok(ToolOutput::MultiModalText { text, llm_images }) => {
+                push_bounded_images(llm_visible_images, llm_images.iter().cloned());
+                text.clone()
+            }
+            Ok(ToolOutput::Error(msg)) => format!("{TOOL_RESULT_ERROR_PREFIX} {msg}"),
+            Err(e) => {
+                if let Some(baybo_tools::ToolError::Denied { reason, .. }) =
+                    e.downcast_ref::<baybo_tools::ToolError>()
+                {
+                    format!(
+                        "{TOOL_DENIED_PREFIX}{}{TOOL_DENIED_INFIX}{reason}. \
+                         Do NOT retry this tool call. Either use an alternative \
+                         approach or inform the user that the operation was skipped.",
+                        dispatch.name
+                    )
+                } else {
+                    format!("{TOOL_RESULT_ERROR_PREFIX} {e}")
+                }
+            }
+        };
+
+        // Cap size before wrapping so the truncation notice lands inside
+        // the `<tool_output>` envelope. The scan/format split keeps the
+        // injection detector in `baybo-security` while the cap + spill +
+        // envelope framing live in `baybo-context`; the loop bridges the
+        // two by feeding the scan's rule names into the wrapper.
+        let capped = self.context_manager.cap_tool_output(raw_result_text).await;
+        let warnings = self.security_gateway.detect_injection(&capped);
+        let warning_rules: Vec<&str> = warnings.iter().map(|w| w.rule_name.as_str()).collect();
+        let wrapped = baybo_model::wrap_tool_output(&dispatch.name, &capped, &warning_rules);
+
+        // Append tool result to context with the tool_use_id so the
+        // LLM can correlate results with their originating calls. The
+        // meta rides the persisted row but is never sent to the LLM: a
+        // tool that anchored the read-before-write tracker stamps the
+        // fingerprint it left there (so hydration can rebuild it; `get`
+        // returns `None` for a failed/virtual read), and any call that
+        // raised an approval prompt stamps the decision (so reloads can
+        // label the work step). Both `None` collapses to a plain
+        // `tool_result`.
+        //
+        // `Edit`/`Write` and not just `Read`: both re-anchor the tracker to
+        // what they wrote, and stamping only `Read` meant hydration restored
+        // the *pre-edit* fingerprint — so the first write after a restart
+        // was rejected as stale against the model's own edit.
+        let read_fingerprint = baybo_tools::READ_TRACKER_ANCHORING_TOOLS
+            .contains(&dispatch.name.as_str())
+            .then(|| {
+                dispatch
+                    .arguments
+                    .get(baybo_tools::TOOL_FILE_PATH_ARG)
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
+            })
+            .flatten();
+        // What this call LEFT on disk, and only when it really wrote. The
+        // tracker is the source rather than a fresh `stat` because
+        // `Edit`/`Write` re-anchor it from inside the tool, the instant
+        // after their own write — a stat from out here would race any
+        // concurrent writer and could stamp someone else's bytes as ours.
+        // A successful write's anchor lands in `committed`, and
+        // `begin_response` already drained `pending`, so `get` returns the
+        // post-write value and not a read staged earlier in this response.
+        let write_fingerprint = (baybo_tools::FILE_WRITING_TOOLS.contains(&dispatch.name.as_str())
+            && tool_call_succeeded(&executed.output))
+        .then(|| {
+            dispatch
+                .arguments
+                .get(baybo_tools::TOOL_FILE_PATH_ARG)
+                .and_then(|v| v.as_str())
+                .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
+        })
+        .flatten();
+        // File calls retain their transitions; every other tool retains
+        // only its current consecutive error signature. Both detectors
+        // report through the same per-turn monitor.
+        if let Some(verdict) =
+            self.progress_monitor
+                .record(&dispatch.name, &dispatch.arguments, &executed.output)
+        {
+            self.note_no_progress(&verdict);
+        }
+        let meta =
+            (read_fingerprint.is_some() || write_fingerprint.is_some() || call_approval.is_some())
+                .then_some(baybo_model::ToolResultMeta {
+                    read_fingerprint,
+                    write_fingerprint,
+                    approval: call_approval,
+                });
+        let tool_msg = ChatMessage::tool_result_with_meta(tool_use_id.to_string(), wrapped, meta);
+        self.context_manager.append(&tool_msg).await?;
+        Ok(())
+    }
+
+    /// Images a tool returned for the model (`MultiModalText`, e.g. a
+    /// browser screenshot) ride ONE follow-up user-role row appended
+    /// after every tool_result, so the next request's vision path
+    /// (`user_content_for_block`) picks them up without breaking the
+    /// provider's tool_use/tool_result adjacency validation.
+    /// `agent_context` = user role / agent source, so the row is never
+    /// mistaken for a genuine user prompt.
+    async fn append_llm_visible_images(
+        &mut self,
+        mut llm_visible_images: Vec<ContentBlock>,
+    ) -> anyhow::Result<()> {
+        if llm_visible_images.is_empty() {
+            return Ok(());
+        }
+        let mut content: Vec<ContentBlock> = Vec::with_capacity(llm_visible_images.len() + 1);
+        content.push(ContentBlock::Text(
+            "[image attachment(s) returned by the tool call(s) above]".to_string(),
+        ));
+        content.append(&mut llm_visible_images);
+        self.context_manager
+            .append(&ChatMessage::agent_context(content))
+            .await?;
+        Ok(())
     }
 
     /// Mount the no-progress observation for the next request and log the

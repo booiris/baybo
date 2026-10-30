@@ -6,6 +6,10 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+# `NoPendingToolCalls`: a `PendingToolCalls` port with no ask ledger behind it.
+test-support = []
+
 [dependencies]
 baybo-model = { workspace = true }
 baybo-llm = { workspace = true }

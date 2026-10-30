@@ -125,3 +125,12 @@ impl HumanAskStore for MemoryHumanAskStore {
             .collect())
     }
 }
+
+/// A reaper probe that never sees a parked ask.
+pub struct NoLivePendingAsks;
+
+impl crate::ports::LivePendingAsks for NoLivePendingAsks {
+    fn has_live_pending_ask(&self, _session_id: &SessionId) -> bool {
+        false
+    }
+}

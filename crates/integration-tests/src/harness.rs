@@ -28,10 +28,13 @@ use baybo_human_ask::{
 };
 use baybo_llm::test_support::StubLlm;
 use baybo_llm::{LlmCompletion, ModelPricing};
-use baybo_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
+use baybo_model::{
+    ChannelType, ChatMessage, ContentBlock, LlmEntryName, MessageMetadata, Session, User,
+};
 use baybo_security::test_support::MemorySecretStore;
 use baybo_security::{LeakDetector, SecretVault};
 use baybo_skills::SkillRegistry;
+use baybo_store::HumanAskRow;
 use baybo_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, TraceEventStream, TraceStore};
@@ -241,6 +244,10 @@ pub struct AgentTestHarnessBuilder {
     /// Defaults to `false`: the gate map stays empty and every ask is
     /// denied by `AutoDenyGate`, so tests that do not answer asks never park.
     channel_ask_gate: bool,
+    /// Transcript rows and ask-ledger rows present before the actor spawns,
+    /// as a restart leaves them: the actor hydrates over both.
+    seed_transcript: Vec<ChatMessage>,
+    seed_asks: Vec<HumanAskRow>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -263,6 +270,8 @@ impl Default for AgentTestHarnessBuilder {
             model_supports_vision: false,
             title_sink: None,
             channel_ask_gate: false,
+            seed_transcript: Vec::new(),
+            seed_asks: Vec::new(),
         }
     }
 }
@@ -273,6 +282,19 @@ impl AgentTestHarnessBuilder {
     /// [`AgentTestHarness::human_asks`].
     pub fn with_channel_ask_gate(mut self) -> Self {
         self.channel_ask_gate = true;
+        self
+    }
+
+    /// Persist `messages` on the session's transcript before the actor
+    /// spawns, so its hydration sees them.
+    pub fn with_seed_transcript(mut self, messages: Vec<ChatMessage>) -> Self {
+        self.seed_transcript = messages;
+        self
+    }
+
+    /// Put `row` on the ask ledger before the actor spawns.
+    pub fn with_seed_ask(mut self, row: HumanAskRow) -> Self {
+        self.seed_asks.push(row);
         self
     }
 
@@ -487,6 +509,9 @@ impl AgentTestHarnessBuilder {
         let skill_registry = Arc::new(SkillRegistry::new());
         let approval_gates = Arc::new(ApprovalGateMap::new());
         let ask_store = MemoryHumanAskStore::new();
+        for row in self.seed_asks {
+            ask_store.insert(row);
+        }
         let ask_core = Arc::new(AskCore::new(ask_store.clone()));
         let ask_queues = AskQueues::new();
         let human_asks = Arc::new(HumanAskManager::from_config(HumanAskManagerConfig {
@@ -509,6 +534,7 @@ impl AgentTestHarnessBuilder {
         // shape so the transcript-read intercept's cross-session lookup finds
         // the row instead of returning NotFound.
         memory_session_store.seed_session(&session);
+        memory_session_store.seed_messages(&session.id, &self.seed_transcript);
         let session_store =
             Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>;
         let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
@@ -584,6 +610,9 @@ impl AgentTestHarnessBuilder {
             subagent_profile: Some((subagent_registry, "harness".to_string())),
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(baybo_agent::runtime::asks::UnappliedAsks(Arc::clone(
+                &human_asks,
+            ))),
         });
 
         let guarded_llm =

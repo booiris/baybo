@@ -1744,7 +1744,10 @@ mod foreground_turn_tests {
 
     fn test_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
-        AgentSupervisor::new(tx)
+        AgentSupervisor::new(
+            tx,
+            std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+        )
     }
 
     fn test_session_manager() -> Arc<SessionManager> {

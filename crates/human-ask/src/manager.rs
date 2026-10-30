@@ -39,6 +39,7 @@ pub enum Settled {
     Apply {
         ask_id: AskId,
         tool_call_id: String,
+        kind: AskKind,
         resolution: AskResolution,
     },
 }
@@ -282,6 +283,11 @@ impl HumanAskManager {
             .collect())
     }
 
+    /// The session's asks not yet applied to its transcript, live or dead.
+    pub async fn unapplied_for_session(&self, session_id: &SessionId) -> Result<Vec<HumanAskRow>> {
+        self.unapplied(session_id).await
+    }
+
     pub fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
         self.queues
             .all()
@@ -348,6 +354,7 @@ impl HumanAskManager {
         Ok(Some(Settled::Apply {
             ask_id: row.ask_id,
             tool_call_id: row.tool_call_id,
+            kind: row.kind,
             resolution,
         }))
     }
