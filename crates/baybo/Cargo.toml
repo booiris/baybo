@@ -38,6 +38,7 @@ baybo-session = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-deck = { workspace = true }
 baybo-project = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-janitor = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-store = { workspace = true }

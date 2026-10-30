@@ -1599,6 +1599,8 @@ fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
     baybo_gateway::channel::boot::install_channels(
         &tg.deps.channel_registry,
         &tg.deps.config.channels,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
     )
     .expect("install the owner channel");
     baybo_gateway::channel::boot::install_timeline_approval_gate(
@@ -1670,16 +1672,20 @@ async fn park_through(
         let session = session.clone();
         let call_id = call_id.to_owned();
         async move {
-            gate.request(baybo_tools::ApprovalRequest {
-                call_id,
-                tool_call_id: String::new(),
-                session_id: session,
-                user_id: "owner".to_owned(),
-                tool: "Bash".to_owned(),
-                accesses: Vec::new(),
-                params_preview: "{}".to_owned(),
-                description: None,
-            })
+            gate.request(
+                baybo_tools::ApprovalRequest {
+                    call_id,
+                    tool_call_id: String::new(),
+                    session_id: session,
+                    user_id: "owner".to_owned(),
+                    tool: "Bash".to_owned(),
+                    accesses: Vec::new(),
+                    params_preview: "{}".to_owned(),
+                    description: None,
+                },
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
             .await
         }
     });
@@ -1742,6 +1748,20 @@ async fn a_prompt_from_a_chat_session_cannot_be_answered_from_a_card() {
     open_issue(&router, &p, "unrelated").await;
 
     let session = baybo_model::SessionId::new();
+    // The ask ledger keys on the session row.
+    tg.deps
+        .session_manager
+        .get_or_create(
+            &session,
+            baybo_model::User {
+                id: "owner".into(),
+                name: None,
+                channel: baybo_model::ChannelType::owner(),
+            },
+            baybo_model::ChannelType::owner(),
+        )
+        .await
+        .expect("persist the chat session");
     let _blocked = park_approval(&tg, &session, "c-chat").await;
     assert!(
         issue_events(&router, &p, 1)

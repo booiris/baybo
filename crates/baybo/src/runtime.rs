@@ -221,6 +221,12 @@ pub struct ManagerGraph {
     /// Approval wrapper retained so shutdown can close parked card prompts.
     pub timeline_approvals: Option<Arc<baybo_project::TimelineApprovalGate>>,
 
+    /// The ask ledger + observers the channel gates share. Rides the graph
+    /// to `GatewayDeps` for the lazy channel install.
+    pub ask_core: Arc<baybo_human_ask::AskCore>,
+    /// One ask queue per channel; the lazy install fetches from it too.
+    pub ask_queues: baybo_human_ask::AskQueues,
+
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
     /// observability surface also reads its snapshot. Constructed in
@@ -331,15 +337,26 @@ pub async fn build_managers(
     };
     let workspace = Arc::new(workspace_paths.clone());
     let channels_registry = Arc::new(ChannelRegistry::new());
-    // Eagerly install every enabled channel from config so connections
-    // can attach to a pre-existing slot rather than racing on lazy
-    // first-connect creation. See docs/modules/channels-protocol-refactor.md.
-    baybo_gateway::channel::boot::install_channels(&channels_registry, &config.channels)?;
 
     // --- storage + domain managers. `stores` is kept whole: every Arc
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
     // itself stays intact for the graph + downstream consumers.
     let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
+
+    // The one read of the ask ledger: every channel's gate and the ask
+    // manager share this core, and every channel fetches its queue from
+    // `ask_queues` so the boot reload and the install meet on one queue.
+    let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
+    let ask_queues = baybo_human_ask::AskQueues::new();
+    // Eagerly install every enabled channel from config so connections
+    // can attach to a pre-existing slot rather than racing on lazy
+    // first-connect creation. See docs/modules/channels-protocol-refactor.md.
+    baybo_gateway::channel::boot::install_channels(
+        &channels_registry,
+        &config.channels,
+        &ask_core,
+        &ask_queues,
+    )?;
 
     // Browser tools are not registered as builtins — they arrive
     // dynamically when the embedded browser MCP server connects via
@@ -903,6 +920,8 @@ pub async fn build_managers(
         subagent_spawner_slot,
         actor_parent_token,
         timeline_approvals,
+        ask_core,
+        ask_queues,
         subagent_dispatch_limiter,
     })
 }

@@ -59,6 +59,7 @@ baybo-skills = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-store = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-trace = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 
@@ -126,6 +127,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 baybo-gateway = { workspace = true, features = ["test-support"] }
+baybo-human-ask = { workspace = true, features = ["test-support"] }
+baybo-tools = { workspace = true, features = ["test-support"] }
 # `media_probe::fixture`: the ingest probes must be proven against PDFs and
 # containers that really parse.
 baybo-llm = { workspace = true, features = ["test-support"] }

@@ -234,7 +234,13 @@ async fn connect_register_with_channel_token(
 async fn tui_channel_token_attaches_over_the_admin_listener() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let shutdown = tg.shutdown.clone();
     let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
@@ -269,7 +275,13 @@ async fn tui_channel_token_attaches_over_the_admin_listener() {
 async fn admin_listener_rejects_unknown_and_non_tui_channel_tokens() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let shutdown = tg.shutdown.clone();
     let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
@@ -313,7 +325,13 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
     // Eagerly install the http channel — production wires this from
     // ChannelsConfig at boot via `baybo_gateway::channel::boot`.
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let shutdown = tg.shutdown.clone();
@@ -386,7 +404,13 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
 async fn device_auth_registers_on_the_owner_channel() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let shutdown = tg.shutdown.clone();
     let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
@@ -442,7 +466,13 @@ async fn device_auth_registers_on_the_owner_channel() {
 async fn subscribe_hydrates_durable_task_list_snapshot() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     // Seed a session with one durable task.
     let user = User {
@@ -521,7 +551,13 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
 async fn subscribe_hydrates_turn_state_snapshot() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let user = User {
         id: WEB_OPERATOR_USER_ID.into(),
@@ -617,7 +653,13 @@ async fn subscribe_hydrates_turn_state_snapshot() {
 async fn two_subscribers_to_same_session_both_receive_dispatch() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let shutdown = tg.shutdown.clone();
@@ -691,7 +733,13 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
 async fn unsubscribed_session_does_not_receive_dispatch() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let shutdown = tg.shutdown.clone();
@@ -774,7 +822,13 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     // polling.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let shutdown = tg.shutdown.clone();
@@ -856,7 +910,13 @@ async fn renaming_a_conversation_reaches_a_tab_that_never_opened_it() {
     // conversation list (subscribed to nothing) sees the new title, which is
     // also what would catch a future swap to the all-channels title sink.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default()).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &ChannelsConfig::default(),
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let shutdown = tg.shutdown.clone();
     let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
@@ -932,11 +992,17 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
     // session, but the client that needs to know which chat to open is the one
     // parked on its conversation list, subscribed to nothing at all.
     //
-    // And the clear must survive the case with no resolution event: a gate
-    // nobody answers self-denies silently, so the queue's own drop path is
-    // what retires the mark.
+    // And the clear must survive the case with no resolution event: an ask
+    // abandoned without an answer broadcasts no `ApprovalResolved`, so the
+    // queue's own edge is what retires the mark.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default()).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &ChannelsConfig::default(),
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let shutdown = tg.shutdown.clone();
@@ -952,6 +1018,20 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
         .get(&ChannelType::owner())
         .expect("owner channel");
     let gate = channel.approval_gate().expect("owner channel has a gate");
+    // The ask ledger keys on the session row.
+    tg.deps
+        .session_manager
+        .get_or_create(
+            &"sess-blocked".into(),
+            baybo_model::User {
+                id: "owner".into(),
+                name: None,
+                channel: ChannelType::owner(),
+            },
+            ChannelType::owner(),
+        )
+        .await
+        .expect("persist the session");
     let req = baybo_tools::ApprovalRequest {
         call_id: "prompt-1".into(),
         tool_call_id: String::new(),
@@ -962,7 +1042,14 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
         params_preview: String::new(),
         description: None,
     };
-    let parked = tokio::spawn(async move { gate.request(req).await });
+    let parked = tokio::spawn(async move {
+        gate.request(
+            req,
+            baybo_tools::AskSite::for_test(),
+            baybo_tools::AskCancel::never(),
+        )
+        .await
+    });
 
     let frame = recv_frame(&mut bystander, Duration::from_secs(2))
         .await
@@ -1011,7 +1098,13 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // streaming events like AnswerDelta deliberately don't pulse).
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let shutdown = tg.shutdown.clone();
@@ -1119,7 +1212,13 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
     // inbound and the agent doesn't pay for two turns.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let shutdown = tg.shutdown.clone();
     let mut incoming_rx = tg.incoming_rx;
@@ -1218,7 +1317,13 @@ async fn messages_batch_reaches_router_as_one_ordered_intake() {
     // actor's coalescing window.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let shutdown = tg.shutdown.clone();
     let mut incoming_rx = tg.incoming_rx;
@@ -1306,7 +1411,13 @@ async fn subscribe_sends_one_state_bundle_and_replays_no_history() {
     // newest persisted ordinal.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let session_manager = Arc::clone(&tg.deps.session_manager);
     let user = User {
@@ -1382,7 +1493,13 @@ async fn device_auth_subscribes_to_a_web_created_session() {
     // created and is accepted with a normal `SubscribeState` bundle.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let session_manager = Arc::clone(&tg.deps.session_manager);
     let user = User {
@@ -1448,7 +1565,13 @@ async fn subscribe_to_a_non_pool_session_is_rejected() {
     // scope gates still enforce for everything outside `owner`.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let session_manager = Arc::clone(&tg.deps.session_manager);
     let user = User {
@@ -1525,7 +1648,13 @@ async fn a_message_for_an_unsubscribed_session_is_nacked_with_a_notice() {
     // "not subscribed; dropping" warn at the outbox's 10s retry cadence).
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &cfg,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
 
     let shutdown = tg.shutdown.clone();
     let mut incoming_rx = tg.incoming_rx;

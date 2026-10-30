@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use baybo_model::{ApprovalDecision, ApprovalResolution, ProjectId, SessionId};
 use baybo_store::SessionStore;
 use baybo_store::project::{IssueActor, IssueEventBody};
-use baybo_tools::{ApprovalGate, ApprovalOutcome, ApprovalRequest};
+use baybo_tools::{ApprovalGate, ApprovalOutcome, ApprovalRequest, AskCancel, AskSite};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
@@ -176,9 +176,14 @@ impl TimelineApprovalGate {
 
 #[async_trait]
 impl ApprovalGate for TimelineApprovalGate {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
+    async fn request(
+        &self,
+        req: ApprovalRequest,
+        site: AskSite,
+        ask_cancel: AskCancel,
+    ) -> ApprovalOutcome {
         let Some((project, number, actor)) = self.asker(&req.session_id).await else {
-            return self.inner.request(req).await;
+            return self.inner.request(req, site, ask_cancel).await;
         };
         let call_id = req.call_id.clone();
         // Which run is parked. The dedupe guard keeps at most one run per
@@ -229,7 +234,7 @@ impl ApprovalGate for TimelineApprovalGate {
         let outcome = tokio::select! {
             biased;
             _ = cancelled => ApprovalOutcome::abandoned(),
-            outcome = self.inner.request(req) => outcome,
+            outcome = self.inner.request(req, site, ask_cancel) => outcome,
         };
 
         // A closer that won the claim also overrides any raced approval.

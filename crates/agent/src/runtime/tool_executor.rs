@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
 #[cfg(test)]
 use baybo_model::TrustLevel;
+use baybo_model::human_ask::AskPhase;
 use baybo_model::{
     ContentBlock, InheritedToolContext, ParallelGroup, SessionId, SpanId, TurnId, User,
 };
@@ -14,9 +15,9 @@ use baybo_model::{
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalHandle, ApprovalOutcome,
-    ApprovalRequest, ApprovedResource, AutoDenyGate, ExecSandbox, ReadTracker, ResourceAccess,
-    ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry,
-    VirtualReadResolver, approval::preview_params, refusal_reason,
+    ApprovalRequest, ApprovedResource, AskCancel, AskSite, AutoDenyGate, ExecSandbox, ParkGauge,
+    ReadTracker, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolRegistry, TurnTokens, VirtualReadResolver, approval::preview_params, refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
@@ -115,9 +116,8 @@ const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
 /// Headroom added to the per-tool outer timeout so a slow user
 /// approval (handled mid-execution via [`baybo_tools::ApprovalHandle`])
 /// cannot kill the tool while it is legitimately blocked on a modal.
-/// Tracks the channel gate's own `APPROVAL_TIMEOUT` in
-/// `crates/gateway/src/channel/adapter.rs`; if you change one, change
-/// the other.
+// TODO(human-ask stage 4): replaced by a deadline that pauses on the call's
+// `ParkGauge` plus a seconds-scale handoff grace; gates no longer time out.
 const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 
 /// Cap on the failure-reason string we copy out of a `ToolOutput::Error`
@@ -716,6 +716,16 @@ impl ToolExecutor {
         // the cancel-aware close-on-Err path.
         let cancel_for_close = cancel_token.clone();
         let cancel_for_gate = cancel_token.clone();
+        // TODO(human-ask stage 4): thread the real `TurnTokens` from
+        // `run_agent_loop` (actor token distinct from the turn token). Until
+        // then both fields are the turn token, so a cancelled gate reads its
+        // origin as `Ancestor` and stays parked; the executor's own race on
+        // `cancel_for_gate` below is what still answers `/stop`.
+        let ask_cancel = AskCancel::new(TurnTokens {
+            turn: cancel_token.clone(),
+            actor: cancel_token.clone(),
+        });
+        let park_gauge = ParkGauge::new();
 
         // The call's approval decision, written from inside the span body and
         // read back after it — including on the paths where the body returns
@@ -829,23 +839,26 @@ impl ToolExecutor {
                         }));
                     }
                     let gate = self.gate_map.get(&user.channel, session_id);
-                    let request = gate.request(ApprovalRequest {
-                        call_id: Uuid::new_v4().to_string(),
-                        tool_call_id: tool_use_id.clone(),
-                        session_id: session_id.clone(),
-                        user_id: user.id.clone(),
-                        tool: tool_name_owned.clone(),
-                        accesses: uncovered.clone(),
-                        params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
-                        description: call_label.clone(),
-                    });
-                    // A prompt parks the turn for up to the gate's timeout, so
-                    // it MUST answer to `/stop` — otherwise cancelling a turn
-                    // that is waiting on the user hangs until the gate denies
-                    // itself minutes later, and the client keeps showing a card
-                    // for a turn that is already unwinding. Dropping the request
-                    // future also unqueues it (the gate's RAII cleanup), so the
-                    // prompt disappears everywhere rather than lingering.
+                    let request = gate.request(
+                        ApprovalRequest {
+                            call_id: Uuid::new_v4().to_string(),
+                            tool_call_id: tool_use_id.clone(),
+                            session_id: session_id.clone(),
+                            user_id: user.id.clone(),
+                            tool: tool_name_owned.clone(),
+                            accesses: uncovered.clone(),
+                            params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                            description: call_label.clone(),
+                        },
+                        AskSite {
+                            channel: user.channel.clone(),
+                            phase: AskPhase::BeforeExecute,
+                        },
+                        ask_cancel.clone(),
+                    );
+                    // A prompt parks the turn until someone answers, so it
+                    // MUST answer to `/stop`. Dropping the request future
+                    // orphans the ask on its queue.
                     let outcome = tokio::select! {
                         outcome = request => outcome,
                         // Cancellation abandons the unanswered prompt.
@@ -966,6 +979,8 @@ impl ToolExecutor {
                     approval_gate,
                     Arc::clone(approved_resources),
                     tool_use_id.clone(),
+                    park_gauge.clone(),
+                    ask_cancel.clone(),
                 );
                 let approval_probe = approval.clone();
 
@@ -2252,7 +2267,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl baybo_tools::ApprovalGate for FixedOutcomeGate {
-        async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+        async fn request(
+            &self,
+            _req: ApprovalRequest,
+            _site: AskSite,
+            _cancel: AskCancel,
+        ) -> ApprovalOutcome {
             self.0
         }
     }
@@ -2263,7 +2283,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl baybo_tools::ApprovalGate for CountingApproveGate {
-        async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+        async fn request(
+            &self,
+            _req: ApprovalRequest,
+            _site: AskSite,
+            _cancel: AskCancel,
+        ) -> ApprovalOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ApprovalOutcome::answered(ApprovalDecision::Approve)
         }
@@ -2726,9 +2751,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_timed_out_gate_is_not_reported_to_the_model_as_a_human_no() {
-        let msg = gated_call_error(ApprovalOutcome::timed_out()).await;
-        assert!(msg.contains("expired"), "got {msg}");
+    async fn an_abandoned_gate_is_not_reported_to_the_model_as_a_human_no() {
+        let msg = gated_call_error(ApprovalOutcome::abandoned()).await;
+        assert!(msg.contains("torn down"), "got {msg}");
         assert!(!msg.contains("said no"), "got {msg}");
         assert!(!msg.contains("user denied approval"), "got {msg}");
     }

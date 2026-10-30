@@ -7,30 +7,26 @@
 //! processes, telegram bot subprocesses) but the channel sits there
 //! waiting for them.
 //!
-//! Each channel is born with its own per-channel [`ChannelApprovalGate`].
-//! The gate's waker closes over a `Weak<Channel>` and dispatches a
+//! Each channel is born with its own [`ChannelAskGate`] over the channel's
+//! [`AskQueue`], fetched from the shared [`AskQueues`] so a queue the boot
+//! reload already filled is the one the channel attaches to. The gate's
+//! waker closes over a `Weak<Channel>` and dispatches a
 //! [`SessionEvent::ApprovalRequested`](baybo_channels::SessionEvent::ApprovalRequested) into the channel's fan-out path
 //! so every subscriber to the call's session sees the prompt; the
 //! first `ResolveApproval` wins and the channel publishes
 //! [`SessionEvent::ApprovalResolved`](baybo_channels::SessionEvent::ApprovalResolved) to dismiss it elsewhere.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use baybo_channels::{
-    ApprovalSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult,
-};
+use baybo_channels::{AskSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult};
 use baybo_config::ChannelsConfig;
+use baybo_human_ask::{AskCore, AskQueue, AskQueues, ChannelAskGate, PendingAsk, Waker};
 use baybo_model::{ChannelType, SessionId};
 use baybo_project::{ProjectManager, TimelineApprovalGate};
 use baybo_store::SessionStore;
-use baybo_tools::{ApprovalGate, ApprovalQueue, ApprovalRequest, ChannelApprovalGate};
+use baybo_tools::ApprovalGate;
 
 use super::session_pulse::SessionPulse;
-
-/// Matches the previous per-Sidecar value so operator muscle memory
-/// around approval timing carries over.
-pub(crate) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Built-in mapping from `channel_type` to [`ChannelKind`]. Compile-
 /// time constant because it follows from the channel's protocol
@@ -57,18 +53,20 @@ fn kind_for(channel_type: &ChannelType) -> ChannelKind {
 pub fn install_channels(
     registry: &Arc<ChannelRegistry>,
     config: &ChannelsConfig,
+    core: &Arc<AskCore>,
+    queues: &AskQueues,
 ) -> ChannelResult<()> {
     if config.cli.enabled {
-        install_channel(registry, ChannelType::tui())?;
+        install_channel(registry, ChannelType::tui(), core, queues)?;
     }
     if config.telegram.as_ref().is_some_and(|c| c.enabled) {
-        install_channel(registry, ChannelType::telegram())?;
+        install_channel(registry, ChannelType::telegram(), core, queues)?;
     }
     if config.discord.as_ref().is_some_and(|c| c.enabled) {
-        install_channel(registry, ChannelType::discord())?;
+        install_channel(registry, ChannelType::discord(), core, queues)?;
     }
     if config.weixin.as_ref().is_some_and(|c| c.enabled) {
-        install_channel(registry, ChannelType::weixin())?;
+        install_channel(registry, ChannelType::weixin(), core, queues)?;
     }
     // The single owner chat channel serves both the web dashboard and the
     // mobile app (both register as `owner`; see `docs/modules/channels.md`),
@@ -76,7 +74,7 @@ pub fn install_channels(
     // + in-flight buffer. Always installed — it has no operator-facing knobs,
     // and the device-auth gate (an approved `auth_token`) is what admits a
     // device connection.
-    install_channel(registry, ChannelType::owner())?;
+    install_channel(registry, ChannelType::owner(), core, queues)?;
     Ok(())
 }
 
@@ -118,9 +116,12 @@ pub fn install_timeline_approval_gate(
 pub(crate) fn install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: ChannelType,
+    core: &Arc<AskCore>,
+    queues: &AskQueues,
 ) -> ChannelResult<()> {
     let kind = kind_for(&channel_type);
-    let channel = build_channel(channel_type.clone(), kind);
+    let queue = queues.get_or_create(&channel_type);
+    let channel = build_channel(channel_type.clone(), kind, queue, Arc::clone(core));
     let wants_pulse = channel_type == ChannelType::owner();
     registry.install(channel)?;
     if wants_pulse
@@ -132,11 +133,15 @@ pub(crate) fn install_channel(
     Ok(())
 }
 
-/// Build a `Channel` with a per-channel approval gate whose waker
-/// fan-outs `ApprovalRequested` through the channel itself. Returns
-/// an `Arc<Channel>` ready to install.
-pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc<Channel> {
-    let queue = ApprovalQueue::new();
+/// Build a `Channel` with an ask gate over `queue` whose waker fan-outs
+/// `ApprovalRequested` through the channel itself. Returns an `Arc<Channel>`
+/// ready to install.
+pub(crate) fn build_channel(
+    channel_type: ChannelType,
+    kind: ChannelKind,
+    queue: AskQueue,
+    core: Arc<AskCore>,
+) -> Arc<Channel> {
     // The gate's waker needs access to the channel for fan-out, but
     // the channel hasn't been constructed yet. Hand the closure a
     // `Weak<Channel>` slot we patch in once the Arc exists.
@@ -146,11 +151,12 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
     // Broadcast the entry the gate woke us FOR. Reading it back off the queue
     // instead (say, the tail) is a lost-prompt race: the queue is per-CHANNEL,
     // so two sessions blocking at once interleave push/wake and one of them
-    // would be announced twice while the other was never announced at all —
-    // and nothing re-announces it, so that turn silently denies itself when the
-    // gate times out.
-    let waker: Arc<dyn Fn(ApprovalRequest) + Send + Sync> = Arc::new(move |entry| {
+    // would be announced twice while the other was never announced at all.
+    let waker: Waker = Arc::new(move |ask: PendingAsk| {
         let Some(channel) = weak_for_waker.lock().upgrade() else {
+            return;
+        };
+        let Some(entry) = ask.approval().cloned() else {
             return;
         };
         channel.dispatch_approval_requested(
@@ -172,9 +178,9 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
     //   the call's session, so a client parked on its conversation list —
     //   the one that needs to know which chat to open — never sees it.
     // - The waker fires on the way IN and has no counterpart on the way out.
-    //   A gate that nobody answers self-denies after `APPROVAL_TIMEOUT` and
-    //   broadcasts nothing at all, so a mark retired by `ApprovalResolved`
-    //   alone would stick forever on exactly the turns that went unanswered.
+    //   An ask abandoned by `/stop` or a card close broadcasts no
+    //   `ApprovalResolved`, so a mark retired by that event alone would stick
+    //   forever on exactly the asks that went unanswered.
     //
     // The queue publishes both edges (see `PendingWatcher`), in mutation order
     // and with no lock of its own held. It still runs INLINE on whichever
@@ -199,12 +205,12 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
         );
     }));
 
-    let gate: Arc<dyn ApprovalGate> = Arc::new(ChannelApprovalGate::new(
-        queue.clone(),
-        waker,
-        APPROVAL_TIMEOUT,
-    ));
-    let approvals = ApprovalSurface { gate, queue };
+    let approval_gate: Arc<dyn ApprovalGate> =
+        Arc::new(ChannelAskGate::new(queue.clone(), waker, core));
+    let approvals = AskSurface {
+        approval_gate,
+        queue,
+    };
     let channel = Arc::new(Channel::new(channel_type, kind, Some(approvals)));
     *weak_slot.lock() = Arc::downgrade(&channel);
     channel
@@ -222,16 +228,49 @@ pub(crate) fn broadcast_approval_resolved(
     channel.dispatch_approval_resolved(call_id, session_id, decision);
 }
 
+/// An ask core over an in-memory ledger, for unit tests that install
+/// channels without a sqlite store.
+#[cfg(test)]
+pub(crate) fn test_ask_core() -> Arc<AskCore> {
+    Arc::new(AskCore::new(
+        baybo_human_ask::test_support::MemoryHumanAskStore::new(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn core() -> Arc<AskCore> {
+        test_ask_core()
+    }
 
     #[test]
     fn install_defaults_creates_tui_channel() {
         let cfg = ChannelsConfig::default(); // cli.enabled = true
         let reg = Arc::new(ChannelRegistry::new());
-        install_channels(&reg, &cfg).expect("install");
+        install_channels(&reg, &cfg, &core(), &AskQueues::new()).expect("install");
         assert!(reg.get(&ChannelType::tui()).is_some());
+    }
+
+    #[test]
+    fn install_attaches_to_the_queue_a_reload_already_created() {
+        let queues = AskQueues::new();
+        let preloaded = queues.get_or_create(&ChannelType::owner());
+        let reg = Arc::new(ChannelRegistry::new());
+        install_channels(&reg, &ChannelsConfig::default(), &core(), &queues).expect("install");
+        preloaded.enqueue_mirror(baybo_tools::ApprovalRequest {
+            call_id: "c1".into(),
+            tool_call_id: "use-1".into(),
+            session_id: "s1".into(),
+            user_id: "u".into(),
+            tool: "Bash".into(),
+            accesses: vec![],
+            params_preview: "{}".into(),
+            description: None,
+        });
+        let owner = reg.get(&ChannelType::owner()).expect("owner");
+        assert_eq!(owner.pending_approvals(&"s1".into()).len(), 1);
     }
 
     #[test]
@@ -246,7 +285,12 @@ mod tests {
 
     #[test]
     fn build_channel_attaches_approval_gate() {
-        let ch = build_channel(ChannelType::owner(), ChannelKind::Subscribed);
+        let ch = build_channel(
+            ChannelType::owner(),
+            ChannelKind::Subscribed,
+            AskQueue::new(),
+            core(),
+        );
         assert!(ch.approval_gate().is_some());
     }
 }

@@ -179,8 +179,13 @@ pub(crate) async fn run_content_session<Si: BinarySink, So: BinarySource>(
     // shared inbound loop so `Subscribe` catch-up, live fan-out, and inbound
     // `Message` routing all work exactly as they do for the TUI / web chat.
     let channel_type = ChannelType::owner();
-    let channel = super::adapter::resolve_or_install_channel(&state.registry, &channel_type)
-        .map_err(|e| format!("resolve device channel: {e}"))?;
+    let channel = super::adapter::resolve_or_install_channel(
+        &state.registry,
+        &channel_type,
+        &state.ask_core,
+        &state.ask_queues,
+    )
+    .map_err(|e| format!("resolve device channel: {e}"))?;
 
     let sidecar = Sidecar::build(
         channel_type.clone(),
@@ -572,8 +577,13 @@ mod tests {
             .await
             .expect("seed approved device row");
         // Device connections pool into the shared `owner` channel.
-        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::owner())
-            .expect("install owner channel");
+        crate::channel::boot::install_channel(
+            &tg.deps.channel_registry,
+            ChannelType::owner(),
+            &tg.deps.ask_core,
+            &tg.deps.ask_queues,
+        )
+        .expect("install owner channel");
         let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
             .await
             .expect("gateway static key");

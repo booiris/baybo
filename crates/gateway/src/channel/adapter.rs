@@ -193,6 +193,8 @@ impl Drop for LegTeardown {
 pub(crate) fn resolve_or_install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: &ChannelType,
+    core: &Arc<baybo_human_ask::AskCore>,
+    queues: &baybo_human_ask::AskQueues,
 ) -> Result<Arc<Channel>, ChannelError> {
     if let Some(ch) = registry.get(channel_type) {
         return Ok(ch);
@@ -200,7 +202,7 @@ pub(crate) fn resolve_or_install_channel(
     // Miss: lazily install an out-of-tree sidecar channel (the `owner`/`tui`/
     // bot channels are all installed at boot, so this only fires for a custom
     // `baybo.json` channel on its first connection).
-    super::boot::install_channel(registry, channel_type.clone())?;
+    super::boot::install_channel(registry, channel_type.clone(), core, queues)?;
     registry.get(channel_type).ok_or_else(|| {
         ChannelError::Config(format!("channel '{channel_type}' missing after install"))
     })
@@ -728,11 +730,22 @@ mod tests {
     #[test]
     fn resolve_returns_pre_installed_channel() {
         let registry = Arc::new(ChannelRegistry::new());
-        super::super::boot::install_channel(&registry, ChannelType::owner()).expect("install");
+        super::super::boot::install_channel(
+            &registry,
+            ChannelType::owner(),
+            &super::super::boot::test_ask_core(),
+            &baybo_human_ask::AskQueues::new(),
+        )
+        .expect("install");
         let before = registry.get(&ChannelType::owner()).expect("pre-installed");
 
-        let resolved =
-            resolve_or_install_channel(&registry, &ChannelType::owner()).expect("resolve");
+        let resolved = resolve_or_install_channel(
+            &registry,
+            &ChannelType::owner(),
+            &super::super::boot::test_ask_core(),
+            &baybo_human_ask::AskQueues::new(),
+        )
+        .expect("resolve");
         assert!(
             Arc::ptr_eq(&before, &resolved),
             "resolve must return the shared owner Arc for a pooled type, not a freshly-installed sibling",
@@ -749,7 +762,13 @@ mod tests {
         let ct = ChannelType::from("custom-out-of-tree");
         assert!(registry.get(&ct).is_none(), "fixture must start empty");
 
-        let resolved = resolve_or_install_channel(&registry, &ct).expect("lazy install");
+        let resolved = resolve_or_install_channel(
+            &registry,
+            &ct,
+            &super::super::boot::test_ask_core(),
+            &baybo_human_ask::AskQueues::new(),
+        )
+        .expect("lazy install");
         assert_eq!(resolved.channel_type().as_str(), "custom-out-of-tree");
         assert!(
             registry.get(&ct).is_some(),
@@ -791,7 +810,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_sidecar_detaches_it_and_kills_its_pump() {
         let registry = Arc::new(ChannelRegistry::new());
-        super::super::boot::install_channel(&registry, ChannelType::owner()).expect("install");
+        super::super::boot::install_channel(
+            &registry,
+            ChannelType::owner(),
+            &super::super::boot::test_ask_core(),
+            &baybo_human_ask::AskQueues::new(),
+        )
+        .expect("install");
         let channel = registry.get(&ChannelType::owner()).expect("channel");
         let sink_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
 

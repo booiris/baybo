@@ -99,7 +99,8 @@ pub enum ApprovalResolution {
     /// rows written before this distinction existed read as answered.
     #[default]
     Answered,
-    /// Nobody answered within the gate's window; denied by default.
+    /// Historical: gates used to deny themselves after a fixed window.
+    /// Nothing produces this any more; it stays so old span events decode.
     TimedOut,
     /// The prompt went away undecided — its turn was cancelled or its
     /// process shut down. Denied by default.

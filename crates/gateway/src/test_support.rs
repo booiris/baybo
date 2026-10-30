@@ -250,7 +250,10 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         baybo_project::no_stopper(),
     ));
 
+    let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
     let deps = GatewayDeps {
+        ask_core,
+        ask_queues: baybo_human_ask::AskQueues::new(),
         config,
         config_path: None,
         inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),

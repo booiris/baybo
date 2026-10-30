@@ -1,6 +1,6 @@
 //! WebSocket + MessagePack-backed TUI transport.
 //!
-//! Wraps [`WsClient`] and a local [`ApprovalQueue`]. User input is
+//! Wraps [`WsClient`] and a local [`AskQueue`]. User input is
 //! sent as [`wire::Message`](baybo_channels::wire::Message) frames; streaming deltas, final responses,
 //! notices, and approval events flow back as typed [`wire::Frame`](baybo_channels::wire::Frame)s
 //! and are mapped onto the TUI's [`TransportEvent`].
@@ -14,8 +14,10 @@ use std::sync::Arc;
 
 use baybo_channels::wire::{Frame, Message as WireMessage};
 use baybo_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
+use baybo_human_ask::AskQueue;
+use baybo_model::human_ask::AskResolution;
 use baybo_model::{ChannelType, ContentBlock, SessionId};
-use baybo_tools::{ApprovalQueue, ApprovalRequest};
+use baybo_tools::ApprovalRequest;
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -40,7 +42,7 @@ const HTTP_FORBIDDEN: u16 = 403;
 /// process — the TUI multiplexes all sessions over it.
 pub struct WsTransport {
     client: Arc<WsClient>,
-    approval_queue: ApprovalQueue,
+    approval_queue: AskQueue,
     // Hold subscribe()'s pump handles so a second subscribe on a new
     // session doesn't race the previous one on the shared source.
     subscribe_lock: Arc<Mutex<()>>,
@@ -90,12 +92,17 @@ impl WsTransport {
         })?;
         let client = Arc::new(client);
 
-        let approval_queue = ApprovalQueue::new();
+        let approval_queue = AskQueue::new();
         // Local resolver: echo the modal's decision back to the gateway
         // as a ResolveApproval frame so the tool gate releases
         // server-side.
         let client_for_resolver: Arc<WsClient> = Arc::clone(&client);
-        approval_queue.set_resolver(Arc::new(move |call_id, decision| {
+        approval_queue.set_resolver(Arc::new(move |ask_id, resolution| {
+            // The TUI only mirrors approval cards.
+            let AskResolution::Approval(decision) = resolution else {
+                return;
+            };
+            let call_id = ask_id.into_inner();
             let client = Arc::clone(&client_for_resolver);
             tokio::spawn(async move {
                 let frame = Frame::ResolveApproval {
@@ -242,7 +249,7 @@ impl WsTransport {
     /// Shared approval queue. The TUI renders pending entries from it
     /// and the modal resolver echoes decisions back as
     /// [`Frame::ResolveApproval`].
-    pub fn approval_queue(&self) -> ApprovalQueue {
+    pub fn approval_queue(&self) -> AskQueue {
         self.approval_queue.clone()
     }
 
@@ -269,11 +276,7 @@ impl WsTransport {
     }
 }
 
-fn map_frame(
-    frame: Frame,
-    target_session: &SessionId,
-    queue: &ApprovalQueue,
-) -> Option<TransportEvent> {
+fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Option<TransportEvent> {
     match frame {
         Frame::AnswerDelta {
             session_id, text, ..
@@ -510,7 +513,7 @@ mod tests {
 
     #[test]
     fn map_frame_forwards_delta_for_pinned_session() {
-        let queue = ApprovalQueue::new();
+        let queue = AskQueue::new();
         let target = sid("alpha");
         let frame = Frame::AnswerDelta {
             session_id: target.clone(),
@@ -529,7 +532,7 @@ mod tests {
         // more Deltas for the old session id before our Unsubscribe
         // reaches it; the pump's filter must drop them rather than
         // leak old-session output into the new transcript.
-        let queue = ApprovalQueue::new();
+        let queue = AskQueue::new();
         let target = sid("beta");
         let frame = Frame::AnswerDelta {
             session_id: sid("alpha"),
@@ -545,7 +548,7 @@ mod tests {
         // (including the `/new`-driven re-subscribe). Input history is
         // global to the TUI process, so the resend carries nothing the
         // pump cares about — it must be dropped, not warned about.
-        let queue = ApprovalQueue::new();
+        let queue = AskQueue::new();
         let target = sid("alpha");
         let frame = Frame::HistorySnapshot {
             session_id: target.clone(),
@@ -556,7 +559,7 @@ mod tests {
 
     #[test]
     fn map_frame_forwards_tool_lifecycle_for_pinned_session() {
-        let queue = ApprovalQueue::new();
+        let queue = AskQueue::new();
         let target = sid("alpha");
         match map_frame(
             Frame::ToolStarted {
@@ -610,7 +613,7 @@ mod tests {
         // The TUI renders an animated working indicator instead of the
         // reasoning trace, so a Reasoning frame is dropped unconditionally
         // — including one addressed to the pinned session.
-        let queue = ApprovalQueue::new();
+        let queue = AskQueue::new();
         let target = sid("alpha");
         let frame = Frame::Reasoning {
             session_id: target.clone(),
@@ -625,7 +628,7 @@ mod tests {
         // Subscribed-kind channels echo inbound to every subscriber —
         // including the sender. The TUI already rendered its own
         // prompt locally, so the echo must not duplicate the row.
-        let queue = ApprovalQueue::new();
+        let queue = AskQueue::new();
         let target = sid("alpha");
         let echo = Frame::Message(WireMessage {
             content: "hi".into(),

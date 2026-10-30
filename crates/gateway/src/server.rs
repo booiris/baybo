@@ -145,6 +145,11 @@ pub struct GatewayDeps {
     /// Dials the relay's control connection and data legs through the egress
     /// proxy with system trust roots.
     pub relay_dialer: crate::relay::dial::RelayDialer,
+    /// The ask ledger + observers every channel's gate writes through. Held
+    /// here for the lazy channel install on a sidecar's first connection.
+    pub ask_core: Arc<baybo_human_ask::AskCore>,
+    /// One ask queue per channel, shared with the boot reload.
+    pub ask_queues: baybo_human_ask::AskQueues,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.

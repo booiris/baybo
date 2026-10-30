@@ -1,0 +1,31 @@
+[package]
+name = "baybo-human-ask"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# Exposes the in-memory `MemoryHumanAskStore` fixture to downstream crates'
+# tests. Enable via
+# `baybo-human-ask = { workspace = true, features = ["test-support"] }` in a
+# dev-dependency. Not enabled by default; production builds never see it.
+test-support = []
+
+[dependencies]
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
+baybo-tools = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+baybo-tools = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }

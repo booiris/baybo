@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::SessionId;
 use crate::approval::{ApprovalDecision, ApprovalRequest};
 
+/// Name of the tool that raises question asks.
+pub const ASK_USER_TOOL_NAME: &str = "AskUser";
+
 /// Identity of one ask. A UUID v4 when minted here; an ask raised through the
 /// approval path reuses the [`ApprovalRequest::call_id`] it was raised with.
 /// One tool call can raise several asks, so this — not the `tool_call_id` —

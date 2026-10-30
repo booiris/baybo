@@ -1,8 +1,7 @@
 //! Approval-gate push relay.
 //!
-//! A tool call that trips the approval gate parks for
-//! [`APPROVAL_TIMEOUT`](crate::channel::boot::APPROVAL_TIMEOUT) and then
-//! **denies itself**. Nothing on the [`TurnLifecycle`](baybo_turn::TurnLifecycle)
+//! A tool call that trips the approval gate parks until somebody answers it.
+//! Nothing on the [`TurnLifecycle`](baybo_turn::TurnLifecycle)
 //! bus fires while it waits — that bus only speaks in completed turns — so the
 //! dispatcher's existing subscription cannot see the one moment the user's
 //! attention is load-bearing. This relay is the second source feeding
@@ -25,8 +24,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use baybo_channels::Channel;
+use baybo_human_ask::PendingEdge;
 use baybo_model::SessionId;
-use baybo_tools::PendingEdge;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
@@ -138,7 +137,7 @@ impl ApprovalPushRelay {
         edge: &PendingEdge,
         channel: &Weak<Channel>,
     ) {
-        let PendingEdge::Raised { call_id, tool } = edge else {
+        let PendingEdge::Raised { ask_id, tool, .. } = edge else {
             // Somebody decided → they are present, and the next prompt in this
             // conversation earns a fresh interruption. Nobody came → keep the
             // timestamp and remember why.
@@ -180,7 +179,7 @@ impl ApprovalPushRelay {
 
         let push = ApprovalPush {
             session_id: session_id.clone(),
-            call_id: call_id.clone(),
+            call_id: ask_id.to_string(),
             tool: tool.clone(),
             channel: channel.clone(),
         };
@@ -219,7 +218,8 @@ mod tests {
 
     fn raised(call_id: &str, tool: &str) -> PendingEdge {
         PendingEdge::Raised {
-            call_id: call_id.into(),
+            ask_id: call_id.parse().expect("ask id"),
+            kind: baybo_model::human_ask::AskKind::Approval,
             tool: tool.into(),
         }
     }

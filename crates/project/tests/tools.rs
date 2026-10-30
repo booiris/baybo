@@ -786,7 +786,12 @@ mod approvals {
 
     #[async_trait::async_trait]
     impl ApprovalGate for FixedGate {
-        async fn request(&self, req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
+        async fn request(
+            &self,
+            req: ApprovalRequest,
+            _site: baybo_tools::AskSite,
+            _cancel: baybo_tools::AskCancel,
+        ) -> baybo_tools::ApprovalOutcome {
             self.asked.lock().push(req.call_id);
             baybo_tools::ApprovalOutcome::answered(self.decision)
         }
@@ -915,7 +920,14 @@ mod approvals {
 
         let session =
             issue_session(&store, &project.id, issue.number, issue.id.clone(), &lead).await;
-        let decision = gate.request(request(&session, "c1")).await.decision;
+        let decision = gate
+            .request(
+                request(&session, "c1"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+            .decision;
 
         assert_eq!(decision, ApprovalDecision::Deny);
         assert_eq!(*asked.lock(), vec!["c1".to_owned()]);
@@ -964,7 +976,12 @@ mod approvals {
 
     #[async_trait::async_trait]
     impl ApprovalGate for ParkedGate {
-        async fn request(&self, _req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
+        async fn request(
+            &self,
+            _req: ApprovalRequest,
+            _site: baybo_tools::AskSite,
+            _cancel: baybo_tools::AskCancel,
+        ) -> baybo_tools::ApprovalOutcome {
             std::future::pending().await
         }
     }
@@ -1032,7 +1049,14 @@ mod approvals {
 
         let parked = tokio::spawn({
             let req = request(&session, "c7");
-            async move { gate.request(req).await }
+            async move {
+                gate.request(
+                    req,
+                    baybo_tools::AskSite::for_test(),
+                    baybo_tools::AskCancel::never(),
+                )
+                .await
+            }
         });
         let requested = |timeline: &[baybo_store::project::IssueEventRow]| {
             timeline.iter().any(|e| {
@@ -1111,7 +1135,11 @@ mod approvals {
         );
 
         let decision = gate
-            .request(request(&SessionId::from("not-an-issue".to_owned()), "c9"))
+            .request(
+                request(&SessionId::from("not-an-issue".to_owned()), "c9"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
             .await
             .decision;
         assert_eq!(decision, ApprovalDecision::Approve);

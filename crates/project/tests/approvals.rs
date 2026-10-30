@@ -22,7 +22,12 @@ struct ParkedGate;
 
 #[async_trait]
 impl ApprovalGate for ParkedGate {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+    async fn request(
+        &self,
+        _req: ApprovalRequest,
+        _site: baybo_tools::AskSite,
+        _cancel: baybo_tools::AskCancel,
+    ) -> ApprovalOutcome {
         let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
         let _ = rx.await;
         unreachable!("the parked gate is never released")
@@ -33,7 +38,12 @@ struct FixedGate(ApprovalOutcome);
 
 #[async_trait]
 impl ApprovalGate for FixedGate {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+    async fn request(
+        &self,
+        _req: ApprovalRequest,
+        _site: baybo_tools::AskSite,
+        _cancel: baybo_tools::AskCancel,
+    ) -> ApprovalOutcome {
         self.0
     }
 }
@@ -278,7 +288,14 @@ async fn a_shutdown_closes_a_prompt_that_is_still_parked() {
     let parked = tokio::spawn({
         let gate = Arc::clone(&gate);
         let session_id = session_id.clone();
-        async move { gate.request(request(&session_id, "call-1")).await }
+        async move {
+            gate.request(
+                request(&session_id, "call-1"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+        }
     });
     let call_id = wait_for_announcement(&f, number).await;
 
@@ -306,7 +323,14 @@ async fn a_prompt_is_resolved_exactly_once() {
     let parked = tokio::spawn({
         let gate = Arc::clone(&gate);
         let session_id = session_id.clone();
-        async move { gate.request(request(&session_id, "call-1")).await }
+        async move {
+            gate.request(
+                request(&session_id, "call-1"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+        }
     });
     wait_for_announcement(&f, number).await;
     gate.close_open_prompts().await;
@@ -331,7 +355,13 @@ async fn an_answered_prompt_records_the_real_outcome() {
         ApprovalDecision::Approve,
     ))));
 
-    let outcome = gate.request(request(&session_id, "call-1")).await;
+    let outcome = gate
+        .request(
+            request(&session_id, "call-1"),
+            baybo_tools::AskSite::for_test(),
+            baybo_tools::AskCancel::never(),
+        )
+        .await;
     assert_eq!(
         outcome,
         ApprovalOutcome::answered(ApprovalDecision::Approve)
@@ -355,7 +385,14 @@ async fn a_settling_run_takes_its_own_parked_prompt_with_it() {
     let parked = tokio::spawn({
         let gate = Arc::clone(&_gate);
         let session_id = session_id.clone();
-        async move { gate.request(request(&session_id, "call-1")).await }
+        async move {
+            gate.request(
+                request(&session_id, "call-1"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+        }
     });
     let call_id = wait_for_announcement(&f, number).await;
 
@@ -396,7 +433,12 @@ struct ApprovesWhenReleased(parking_lot::Mutex<Option<oneshot::Receiver<()>>>);
 
 #[async_trait]
 impl ApprovalGate for ApprovesWhenReleased {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+    async fn request(
+        &self,
+        _req: ApprovalRequest,
+        _site: baybo_tools::AskSite,
+        _cancel: baybo_tools::AskCancel,
+    ) -> ApprovalOutcome {
         let released = self.0.lock().take().expect("one request");
         let _ = released.await;
         ApprovalOutcome::answered(ApprovalDecision::Approve)
@@ -415,7 +457,14 @@ async fn an_approval_that_races_the_closer_never_reaches_the_tool() {
     let asked = tokio::spawn({
         let gate = Arc::clone(&gate);
         let session_id = session_id.clone();
-        async move { gate.request(request(&session_id, "call-1")).await }
+        async move {
+            gate.request(
+                request(&session_id, "call-1"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+        }
     });
     wait_for_announcement(&f, number).await;
 
@@ -451,11 +500,25 @@ async fn close_card_prompts_only_touches_its_own_card() {
 
     let a = tokio::spawn({
         let gate = Arc::clone(&gate);
-        async move { gate.request(request(&first_session, "call-a")).await }
+        async move {
+            gate.request(
+                request(&first_session, "call-a"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+        }
     });
     let b = tokio::spawn({
         let gate = Arc::clone(&gate);
-        async move { gate.request(request(&second_session, "call-b")).await }
+        async move {
+            gate.request(
+                request(&second_session, "call-b"),
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+        }
     });
     wait_for_announcement(&f, first).await;
     wait_for_announcement(&f, second).await;
@@ -509,7 +572,12 @@ async fn a_prompt_is_named_for_the_run_that_raised_it_not_the_cards_assignee() {
     let gate = f.gate(Arc::new(FixedGate(ApprovalOutcome::answered(
         ApprovalDecision::Deny,
     ))));
-    gate.request(request(&session, "call-1")).await;
+    gate.request(
+        request(&session, "call-1"),
+        baybo_tools::AskSite::for_test(),
+        baybo_tools::AskCancel::never(),
+    )
+    .await;
 
     let actor = f
         .manager

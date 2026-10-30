@@ -41,7 +41,7 @@ pub enum TransportEvent {
     /// Out-of-band notice surfaced by the agent.
     Notice { level: NoticeLevel, text: String },
     /// A new tool-call approval was queued on the shared
-    /// [`baybo_tools::ApprovalQueue`]; the loop should refresh the
+    /// [`baybo_human_ask::AskQueue`]; the loop should refresh the
     /// approval UI.
     ApprovalRequested,
     /// An approval was resolved remotely (by another client); the loop

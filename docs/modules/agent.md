@@ -304,7 +304,7 @@ Per-tool `max_timeout()`:
 | OpenViking memory store | 120s | `OpenVikingTimeouts::store_max` (default) in `memory/src/backends/openviking.rs` |
 | Subagent (in-process) | `TOOL_WAIT_BACKSTOP` = 30 days | `subagent/src/tool.rs` — effectively unbounded; the real bound is the caller's cancel / turn lineage |
 
-**Approval gate** — `APPROVAL_TIMEOUT` = 300s (`gateway/src/channel/boot.rs`). How long a tool-approval prompt waits for the user before timing out; the executor's `APPROVAL_HEADROOM` tracks it.
+**Approval gate** — no timeout: a tool-approval prompt waits until a human answers it or the turn is cancelled (`docs/modules/human-ask.md`). The executor's `APPROVAL_HEADROOM` (300 s) still pads the outer tool deadline until the pausable deadline replaces it.
 
 **Progress observer** (`runtime/progress_observer.rs`) — out-of-band status emitter for long UserChat turns:
 

@@ -90,7 +90,12 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     // instead of dropping the socket silently — a silent close
     // leaves channel-sdk-shaped clients in their reconnect ladder
     // with no operator-visible reason for the rejection.
-    let channel = match super::adapter::resolve_or_install_channel(&state.registry, &channel_type) {
+    let channel = match super::adapter::resolve_or_install_channel(
+        &state.registry,
+        &channel_type,
+        &state.ask_core,
+        &state.ask_queues,
+    ) {
         Ok(ch) => ch,
         Err(err) => {
             let reason = format!("channel resolve failed: {err}");

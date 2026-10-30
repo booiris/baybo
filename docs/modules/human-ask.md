@@ -1,6 +1,8 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **design, pre-implementation.** This document is the spec the three
+> Status: **PR 1 in progress** — `baybo-human-ask` (queue, core, gates,
+> manager), the ledger and the `tools::ask` ports exist; see
+> [Implementation notes](#implementation-notes-pr-1). This document is the spec the three
 > PRs described in [PR plan](#pr-plan) are built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
 > items will not.
@@ -351,10 +353,10 @@ without a back-edge to the manager.
 
 | Verb | Persists | Then |
 | --- | --- | --- |
-| `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim) | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead, non-Issue session: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows. A row whose `channel` has no queue still gets the claim, with a `warn!`. |
-| `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, drop the oneshot (a live waiter sees `abandoned()`). |
+| `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim) | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A row whose `channel` has no queue still gets the claim, with a `warn!`. |
+| `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on what it abandoned — its caller appends the result next — and returns `ToolCallAbandon::{NoAsk, Abandoned, Answered}`; `Answered` (a claim lost, or a row already resolved) means append nothing. |
 | `policy_deny(request)` | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
-| `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim); resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for rows it abandoned and `Settled::Apply { ask_id, tool_call_id, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
+| `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied` (the caller appends next); resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for rows it abandoned and `Settled::Apply { ask_id, tool_call_id, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
 | `mark_applied(ask_id)` | `applied_at` (claim) | — |
 | `reload_pending()` | `Abandoned` for non-resumable pending rows; `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. |
 
@@ -365,7 +367,7 @@ stays pending. This is what makes a parked ask survive an actor panic
 (`recover_panicked_actor_session` cancels the turn; the ask is still on the
 queue, dead, and the Resume door spawns a fresh actor when it is answered)
 and a process shutdown (next section). A non-resumable entry is removed by
-`orphan` with an `Abandoned` edge (it is useless without its tool future),
+`orphan` with an `Abandoned` edge and an `AskClosed(Abandoned)` event (it is useless without its tool future),
 but Drop cannot write the row; `reload_pending` and `settle_unapplied`
 reconcile it.
 
@@ -1051,8 +1053,9 @@ pub struct HumanAskRow { ask_id, session_id, channel: ChannelType, tool_call_id:
 pub struct TurnTokens { pub turn: CancellationToken, pub actor: CancellationToken }
 pub enum CancelOrigin { Turn, Ancestor }        // CancelOrigin::of(&TurnTokens)
 pub struct AskCancel { pub tokens: TurnTokens }
-pub struct ParkGauge(Arc<AtomicUsize>);
-#[async_trait] pub trait ApprovalGate { async fn request(&self, req: ApprovalRequest, cancel: AskCancel) -> ApprovalOutcome; }
+pub struct AskSite { pub channel: ChannelType, pub phase: AskPhase }   // which queue the row reloads into; which phase raised it
+pub struct ParkGauge(Arc<AtomicUsize>);         // park() -> ParkGuard (RAII decrement)
+#[async_trait] pub trait ApprovalGate { async fn request(&self, req: ApprovalRequest, site: AskSite, cancel: AskCancel) -> ApprovalOutcome; }
 #[async_trait] pub trait QuestionGate { async fn ask(&self, req: QuestionAsk, cancel: AskCancel) -> AskResolution; }
 pub struct QuestionHandle { gate: Arc<dyn QuestionGate>, tool_call_id: String, park: ParkGauge, cancel: AskCancel, last: Arc<Mutex<Option<AskResolution>>> }
 // ToolContext gains `question: Option<QuestionHandle>`; `None` ⇒ fail-closed (declined). ApprovalHandle gains `park` + `cancel`.
@@ -1063,18 +1066,25 @@ TurnInputKind::Resume; TurnInput::Resume { resumed_turn_id: TurnId, ask_id: AskI
 TurnInputKind::is_attended(self) -> bool; TurnInputKind::is_user_facing(self) -> bool
 
 // baybo_human_ask
-pub struct AskQueue;                            // was baybo_tools::ApprovalQueue; entries PendingAsk { ask_id, session_id, tool_call_id, kind, phase, request: AskRequest, responder: Option<oneshot::Sender<AskResolution>> }
+pub struct AskQueue;                            // was baybo_tools::ApprovalQueue; entries pair a data-only, Clone PendingAsk { ask_id, session_id, tool_call_id, kind, phase, request: AskRequest }
+                                                // with a private responder: Option<oneshot::Sender<AskResolution>> (None = dead or mirror)
 pub struct AskQueues;                           // Arc<parking_lot::Mutex<HashMap<ChannelType, AskQueue>>>; get_or_create(&ChannelType) -> AskQueue (a few ops per boot/connect — no DashMap)
 pub enum PendingEdge { Raised { ask_id, kind, tool }, Answered, Abandoned }
 pub enum AskEvent { Raised, Resolved(AskResolution) }               // observer events (async, from verbs)
-pub enum AskQueueEvent { AskRaised(PendingAsk), AskClosed { session_id, ask_id, kind, outcome } }  // sync queue watchers (frame dispatch)
+pub enum AskQueueEvent { AskRaised(PendingAsk), AskClosed { session_id, ask_id, kind, outcome: AskResolution } }  // sync queue watchers (frame dispatch)
 pub struct AskCore { store: Arc<dyn HumanAskStore>, observers: parking_lot::RwLock<Vec<Arc<dyn AskObserver>>> }  // add_observer(&self, ..) — runs after the gates already share the core
-pub struct ChannelAskGate { queue: AskQueue, waker, core: Arc<AskCore> }   // impl ApprovalGate + QuestionGate; stamps applied_at after the oneshot yields
+pub struct ChannelAskGate { queue: AskQueue, waker: Arc<dyn Fn(PendingAsk)>, core: Arc<AskCore> }   // impl ApprovalGate (+ QuestionGate in PR 2); stamps applied_at after the oneshot yields
 pub struct PolicyDenyGate { core: Arc<AskCore> }                    // impl ApprovalGate
 pub struct HumanAskManager;                     // from_config(HumanAskManagerConfig { core, queues: AskQueues, resume_sink: Arc<dyn ResumeSink> })
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
                                                 //        unapplied_tool_use_ids, has_live_pending_ask (LivePendingAsks impl)
-pub trait ResumeSink { fn request_resume(&self, req: ResumeRequest); }
+pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, resolution } }
+pub enum ToolCallAbandon { NoAsk, Abandoned, Answered }   // abandon_for_tool_call's answer to the loop
+pub struct ReloadReport { requeued, resumed, abandoned, applied }
+#[async_trait] pub trait ResumeSink {
+    async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
+    fn request_resume(&self, req: ResumeRequest);
+}
 pub trait LivePendingAsks { fn has_live_pending_ask(&self, session: &SessionId) -> bool; }
 #[async_trait] pub trait AskObserver { async fn on_event(&self, ask: &HumanAskRow, event: AskEvent); }
 pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>;
@@ -1086,7 +1096,8 @@ struct UnappliedAsks(Arc<HumanAskManager>);     // impl baybo_context::PendingTo
 ```
 
 `ApprovalSurface` on `Channel` becomes
-`AskSurface { approval_gate: Arc<dyn ApprovalGate>, question_gate: Arc<dyn QuestionGate>, queue: AskQueue }`;
+`AskSurface { approval_gate: Arc<dyn ApprovalGate>, question_gate: Arc<dyn QuestionGate>, queue: AskQueue }`
+(PR 1 ships `{ approval_gate, queue }`; `question_gate` joins in PR 2);
 `Channel::pending_approvals / pending_approval_sessions / resolve_approval /
 dispatch_approval_*` get kind-aware siblings.
 
@@ -1095,10 +1106,34 @@ cards. Its approval-typed surface survives as wrappers on the re-typed queue,
 importing from `baybo_human_ask`: `enqueue_mirror(ApprovalRequest)`
 (synthesizes `PendingAsk { ask_id: call_id, kind: Approval, phase: BeforeExecute, responder: None }`),
 `peek_head_approval() -> Option<ApprovalRequest>` (projects
-`AskRequest::Approval`, `None` for another kind), `resolve_head(ApprovalDecision)`
+`AskRequest::Approval`, `None` for another kind), `list_approvals()`,
+`resolve_head(ApprovalDecision)`
 (wraps into `AskResolution::Approval`), `set_resolver` with
 `ResolveFn = Fn(AskId, AskResolution)` (the TUI resolver matches
 `Approval(d)` and ignores other variants), `drop_call`, `new`.
+
+### Implementation notes (PR 1)
+
+Where the code differs from the sketch above, and why:
+
+- **`AskSite`.** The ledger row needs the channel (which queue a pending row
+  reloads into) and the phase (resumability), and neither is on
+  `ApprovalRequest`. Rather than widen the payload, every gate call carries
+  `AskSite { channel, phase }`: the executor passes `BeforeExecute` and the
+  session user's channel; `ApprovalHandle` passes `DuringExecute` and the
+  requesting user's channel. `PolicyDenyGate` needs the channel too, since it
+  is built once and serves every channel.
+- **Issue sessions and the resume sink.** The manager learns whether a session
+  resumes through the chat Resume door from the `ResumeSink` port itself
+  (`resumes_on_answer`), implemented in `baybo-agent` over the session's
+  `TriggerSource`. One port, no extra config field, no schema change.
+- **Interim wiring.** Until the gateway's resolve doors move onto
+  `HumanAskManager`, `Channel::resolve_approval` still resolves through the
+  queue alone (no ledger claim), and until `run_agent_loop` threads
+  `TurnTokens`, the executor passes the single turn token as both `turn` and
+  `actor` and keeps its own race on that token to answer `/stop`.
+- `ASK_USER_TOOL_NAME` already lives in `baybo_model::human_ask`, because
+  `PendingEdge::Raised.tool` names it for question asks.
 
 ## Control flows
 

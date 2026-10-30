@@ -20,7 +20,7 @@ talks only to that sink.
 Core responsibilities:
 
 - Define the concrete [`Channel`] handle (`channel_type`,
-  [`ChannelKind`], optional [`ApprovalSurface`]), the [`Connection`]
+  [`ChannelKind`], optional [`AskSurface`]), the [`Connection`]
   transport instance, and the [`ConnectionSink`] trait the transport
   implements.
 - Define the kind-typed [`SubscribedView`] that gates operations like
@@ -59,7 +59,7 @@ lifecycle (open / close / drop) into the channel itself.
 pub struct Channel {
     channel_type: ChannelType,
     kind: ChannelKind,
-    approvals: Option<ApprovalSurface>,
+    approvals: Option<AskSurface>,
     connections: DashMap<ConnectionId, Arc<Connection>>,
     // Only consulted on Subscribed channels:
     subscriptions: DashMap<SessionId, DashSet<ConnectionId>>,
@@ -72,7 +72,7 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub fn new(channel_type: ChannelType, kind: ChannelKind, approvals: Option<ApprovalSurface>) -> Self;
+    pub fn new(channel_type: ChannelType, kind: ChannelKind, approvals: Option<AskSurface>) -> Self;
 
     // Kind-agnostic dispatch surface — agent + tool path calls.
     pub fn dispatch_agent(&self, output: AgentOutput);
@@ -176,7 +176,7 @@ methods on `Channel`:
 | Method                          | Origin                                       | Event constructed              |
 | ------------------------------- | -------------------------------------------- | ------------------------------ |
 | `dispatch_agent(output)`        | Agent router (per-turn assistant output)     | `SessionEvent::Agent(_)`       |
-| `dispatch_approval_requested(…)`| `ChannelApprovalGate` waker, when a tool call blocks | `SessionEvent::ApprovalRequested {..}` |
+| `dispatch_approval_requested(…)`| `ChannelAskGate` waker, when a tool call blocks | `SessionEvent::ApprovalRequested {..}` |
 | `dispatch_approval_resolved(…)` | Connection sent `Frame::ResolveApproval` first; the resolver fans out so concurrent UIs drop the prompt | `SessionEvent::ApprovalResolved {..}` |
 
 Plus one Subscribed-exclusive method on the view:
@@ -598,6 +598,6 @@ deliberately.
 | ---------- | ----------------------------------------------------------------------------------------------------------------- |
 | `model`    | Provides `ContentBlock`, `ChannelType`, `SessionId`, `ResourceAccess`, `User`                      |
 | `agent`    | Router owns the registry and calls `Channel::dispatch_agent` (and the approval-dispatch helpers) by `ChannelType` |
-| `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `ApprovalQueue` backs `ApprovalSurface`       |
+| `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `human-ask`'s `AskQueue` backs `AskSurface` |
 | `gateway`  | Hosts the in-tree transports (`/v1/channel-ws` and the paired-device Noise relay leg); installs channels at boot from config and lazily on any uninstalled type's first connect, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |
 | `security` | Inbound user messages go to `SecurityGateway` first after entering the system                                     |

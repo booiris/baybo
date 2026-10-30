@@ -292,21 +292,26 @@ running against a peer that is gone.
 
 ### Tool approval over the sidecar WS
 
-Each `Channel` is born at boot with its own `ChannelApprovalGate` +
-`ApprovalQueue` (the `ApprovalSurface` on
+Each `Channel` is born at boot with its own `baybo_human_ask::ChannelAskGate`
+over the channel's `AskQueue` (the `AskSurface` on
 `crates/channels/src/channel.rs`), built in `src/channel/boot.rs::
-build_channel`. When a tool call hits the gate the entry is pushed on
-the queue and the waker dispatches a `SessionEvent::ApprovalRequested`
+build_channel`. `install_channels` / `install_channel` / `build_channel` take
+the shared `Arc<AskCore>` + `AskQueues` and **fetch** the channel's queue via
+`queues.get_or_create(channel_type)`, so a queue the boot reload already filled
+is the one the channel attaches to; the lazy install of an out-of-tree channel
+(`resolve_or_install_channel`) reads both off `WsChannelState`, which copies
+them from `GatewayDeps`. When a tool call hits the gate the ask is written to
+the `human_asks` ledger, pushed on the queue, and the waker dispatches a
+`SessionEvent::ApprovalRequested`
 through the channel's fan-out so every subscriber of the call's session
 sees it. The client echoes a `ResolveApproval { call_id, decision }`
 frame; the inbound loop calls `Sidecar::resolve_approval`, which
 delegates to `Channel::resolve_approval` — that pops the matching queue
 entry, reads the `session_id` off it, and broadcasts
 `SessionEvent::ApprovalResolved` to every subscriber so all frontends
-drop the prompt. The 5-minute timeout (`APPROVAL_TIMEOUT = 300s` in
-`channel/boot.rs`) mirrors the TUI's original budget — long enough for a
-human, short enough that forgotten prompts don't pin tool executors
-forever.
+drop the prompt. There is no timeout: an ask waits until a human answers
+it, the turn is stopped, or the process exits (see
+[`human-ask.md`](human-ask.md)).
 
 Approvals resolve through the **channel-level** gate (`ApprovalGateMap`
 keyed by `ChannelType`), with a second **session-level** tier
@@ -1225,7 +1230,7 @@ crates/gateway/
 │   │   ├── adapter.rs       #   Sidecar — SessionEvent→Frame translator + outbound pump; attaches to Channel
 │   │   ├── api_tunnel.rs    #   gateway responder for E2E API-tunnel relay legs
 │   │   ├── blobs.rs         #   POST /v1/blobs + GET /v1/blobs/{id}
-│   │   ├── boot.rs          #   install_channels / build_channel; APPROVAL_TIMEOUT=300s; per-channel gate
+│   │   ├── boot.rs          #   install_channels / build_channel; per-channel ChannelAskGate over AskQueues
 │   │   ├── bot_reconciler.rs#   reconciles StartBot/StopBot rosters to Multiplexed sidecars
 │   │   ├── carrier/         #   a relay binding's direct carriers (the binding scope's CarrierRuntime):
 │   │   │                    #   runtime (offers, stop, the per-process certificate + offer gate),

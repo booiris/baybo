@@ -33,8 +33,11 @@ use baybo_channels::{
     SessionEvent,
 };
 use baybo_config::BayboConfig;
+use baybo_human_ask::AskQueue;
 use baybo_model::{ChannelType, ContentBlock, MessageMetadata, SessionId, User};
-use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest, AutoDenyGate};
+use baybo_tools::{
+    ApprovalDecision, ApprovalGate, ApprovalRequest, AskCancel, AskSite, AutoDenyGate,
+};
 use baybo_tui::{TransportEvent, TransportEventStream};
 use chrono::Utc;
 use futures::StreamExt;
@@ -193,7 +196,7 @@ async fn run_via_gateway(
 }
 
 async fn consume_ws_turn(
-    approvals: &ApprovalQueue,
+    approvals: &AskQueue,
     events: &mut TransportEventStream,
     decision: ApprovalDecision,
     json: bool,
@@ -208,8 +211,11 @@ async fn consume_ws_turn(
             }
             TransportEvent::ApprovalRequested => {
                 // No human to decide; resolve over the wire so the turn
-                // never stalls on the gateway's approval-gate timeout.
-                let tool = approvals.peek_head().map(|r| r.tool).unwrap_or_default();
+                // never parks on the gateway's approval gate.
+                let tool = approvals
+                    .peek_head_approval()
+                    .map(|r| r.tool)
+                    .unwrap_or_default();
                 approvals.resolve_head(decision);
                 note_approval(decision, &tool);
             }
@@ -388,7 +394,12 @@ struct AutoApproveGate;
 
 #[async_trait::async_trait]
 impl ApprovalGate for AutoApproveGate {
-    async fn request(&self, _req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
+    async fn request(
+        &self,
+        _req: ApprovalRequest,
+        _site: AskSite,
+        _cancel: AskCancel,
+    ) -> baybo_tools::ApprovalOutcome {
         baybo_tools::ApprovalOutcome::policy(ApprovalDecision::Approve)
     }
 }
@@ -572,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_final_message_is_canonical_answer() {
-        let q = ApprovalQueue::new();
+        let q = AskQueue::new();
         let mut s = ws_stream(vec![
             TransportEvent::StreamDelta("hel".into()),
             TransportEvent::StreamDelta("lo".into()),
@@ -586,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_response_without_deltas_is_returned() {
-        let q = ApprovalQueue::new();
+        let q = AskQueue::new();
         let mut s = ws_stream(vec![TransportEvent::Response(text_blocks("only final"))]);
         let out = consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
             .await
@@ -596,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_deltas_without_final_response_fall_back() {
-        let q = ApprovalQueue::new();
+        let q = AskQueue::new();
         let mut s = ws_stream(vec![TransportEvent::StreamDelta("partial".into())]);
         let out = consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
             .await
@@ -606,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_empty_turn_errors() {
-        let q = ApprovalQueue::new();
+        let q = AskQueue::new();
         let mut s = ws_stream(vec![]);
         assert!(
             consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
@@ -617,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_approval_is_auto_resolved_from_queue() {
-        let q = ApprovalQueue::new();
+        let q = AskQueue::new();
         q.enqueue_mirror(ApprovalRequest {
             tool_call_id: String::new(),
             call_id: "c1".into(),

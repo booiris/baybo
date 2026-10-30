@@ -750,6 +750,8 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         relay_dialer: baybo_gateway::relay::dial::RelayDialer::new(boot::proxy_settings(
             &graph.config,
         )),
+        ask_core: Arc::clone(&graph.ask_core),
+        ask_queues: graph.ask_queues.clone(),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

@@ -105,7 +105,13 @@ async fn a_chat_session_can_be_created_bound_to_an_agent() {
 async fn chat_api_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -236,7 +242,13 @@ async fn chat_api_round_trip() {
 async fn chat_rename_round_trips_and_validates() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -309,7 +321,13 @@ async fn chat_rename_round_trips_and_validates() {
 async fn chat_archive_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -388,7 +406,13 @@ async fn chat_archive_round_trip() {
 async fn chat_create_accepts_client_supplied_session_id() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -461,7 +485,13 @@ async fn seed_tool_turn_session(
 async fn chat_list_last_message_text_follows_latest_reply() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -496,7 +526,13 @@ async fn chat_list_last_message_text_follows_latest_reply() {
 async fn chat_list_last_message_text_skips_mid_turn_narration() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -549,7 +585,13 @@ async fn chat_list_last_message_text_skips_mid_turn_narration() {
 async fn chat_list_last_message_text_strips_cancelled_marker() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -592,7 +634,13 @@ async fn chat_list_last_message_text_strips_cancelled_marker() {
 async fn chat_sync_difference_is_full_fidelity_with_coverage_watermark() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -656,7 +704,13 @@ async fn chat_sync_watermark_covers_invisible_tail() {
     // re-scans the invisible tail forever.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -703,7 +757,13 @@ async fn chat_sync_watermark_covers_invisible_tail() {
 async fn chat_sync_baseline_and_rebase_replace_with_newest_page() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -753,7 +813,13 @@ async fn chat_sync_baseline_and_rebase_replace_with_newest_page() {
 async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -799,7 +865,13 @@ async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
 async fn chat_message_point_lookup_probes_durability() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -835,7 +907,13 @@ async fn chat_message_point_lookup_probes_durability() {
 async fn chat_list_unread_count_reflects_read_cursor() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -915,8 +993,13 @@ async fn chat_list_unread_count_reflects_read_cursor() {
 #[tokio::test]
 async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default())
-        .expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &ChannelsConfig::default(),
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
 
@@ -957,7 +1040,14 @@ async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
         params_preview: String::new(),
         description: None,
     };
-    let parked = tokio::spawn(async move { gate.request(req).await });
+    let parked = tokio::spawn(async move {
+        gate.request(
+            req,
+            baybo_tools::AskSite::for_test(),
+            baybo_tools::AskCancel::never(),
+        )
+        .await
+    });
     // The gate pushes onto the queue before it awaits, but the spawn has to be
     // polled at least once for that to have happened.
     while channel.pending_approval_sessions().is_empty() {
@@ -991,7 +1081,13 @@ async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
 async fn chat_list_returns_every_owner_session_for_a_device_caller() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let device_session = tg
         .deps
@@ -1089,7 +1185,13 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     // A cron job created from an iOS chat carries that session's channel, so
     // its fires are minted on `device` (see `Router::handle_cron_trigger`).
@@ -1171,7 +1273,13 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let operator = User {
         id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
@@ -1271,7 +1379,13 @@ async fn a_pre_snapshot_fire_whose_job_is_gone_has_no_group_label() {
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let operator = User {
         id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
@@ -1318,7 +1432,13 @@ async fn a_pre_snapshot_fire_whose_job_is_gone_has_no_group_label() {
 async fn marking_a_batch_read_clears_every_named_session() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let router = build_router(build_admin_state(&tg));
     let mut ids = Vec::new();
@@ -1383,7 +1503,13 @@ async fn marking_a_batch_read_clears_every_named_session() {
 async fn hiding_a_batch_removes_every_named_session_from_the_list() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let router = build_router(build_admin_state(&tg));
     let mut ids = Vec::new();
@@ -1451,7 +1577,13 @@ async fn hiding_a_batch_removes_every_named_session_from_the_list() {
 async fn admin_device_header_creates_and_lists_device_sessions() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let router = build_admin_router_for_tests(&tg.deps);
     let device_key = device_proto::delegation::generate_signing_key();
@@ -1586,7 +1718,13 @@ async fn device_push_token_api_persists_registration() {
 async fn approved_device_token_with_header_creates_device_session() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let device_key = device_proto::delegation::generate_signing_key();
     let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
@@ -1774,7 +1912,13 @@ async fn authed_device_request(
 async fn set_session_model_validates_persists_and_clears() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -1911,7 +2055,13 @@ async fn set_session_model_refuses_a_card_run_session() {
 async fn list_sessions_exposes_last_user_text_preview() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -2107,7 +2257,10 @@ async fn chat_visibility_distinguishes_recurring_private_cron_and_issue_sessions
 fn owner_pool_channel_kind_is_subscribed() {
     let reg = Arc::new(baybo_channels::ChannelRegistry::new());
     let cfg = ChannelsConfig::default();
-    boot::install_channels(&reg, &cfg).expect("install");
+    let core = Arc::new(baybo_human_ask::AskCore::new(
+        baybo_human_ask::test_support::MemoryHumanAskStore::new(),
+    ));
+    boot::install_channels(&reg, &cfg, &core, &baybo_human_ask::AskQueues::new()).expect("install");
     let ch = reg
         .get(&baybo_model::ChannelType::owner())
         .expect("owner pool channel exists");
@@ -2225,7 +2378,13 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let operator = User {
         id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
@@ -2345,7 +2504,13 @@ async fn a_cron_pin_reaches_across_the_owner_pool_but_not_outside_it() {
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &http_config,
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install channels");
 
     let device_key = device_proto::delegation::generate_signing_key();
     let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
