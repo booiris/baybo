@@ -477,10 +477,13 @@ fn memory_recall_query(input: &TurnInput) -> Option<Vec<ContentBlock>> {
         // and prior work on the same repository is exactly the context
         // that keeps a second run from repeating the first.
         TurnInput::IssueRun { brief, .. } => Some(brief.clone()),
+        // A resume continues a turn that already recalled; its "input" is an
+        // answer to an ask, not a fresh user instruction.
         TurnInput::Compact
         | TurnInput::Spawned { .. }
         | TurnInput::SubagentNotification { .. }
-        | TurnInput::CronNotification { .. } => None,
+        | TurnInput::CronNotification { .. }
+        | TurnInput::Resume { .. } => None,
     }
 }
 
@@ -1025,6 +1028,8 @@ impl AgentLoop {
         notify_silence: Option<baybo_tools::NotifySilence>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
+        // Title generation stays `UserChat`-only: a `Resume` turn's session
+        // already has its opening message titled.
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
         let background_eligible =
             crate::runtime::background_jobs::background_eligible(session, turn_kind);

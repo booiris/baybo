@@ -624,12 +624,14 @@ the same shape `drive_background_notification_turn` already starts from.
 `TurnInputKind::Resume` is a chat turn (`is_chat_turn` true, `/stop` cancels
 it, `TurnState` shows it), attended, `memory_recall_query → None`, no title
 pass (the session has one), failure notices user-facing (one helper,
-`TurnInputKind::is_user_facing`, replaces the two `UserChat` matches at
-`actor/mod.rs:606` and `agent_loop.rs:1028`), included in the push dispatcher's
+`TurnInputKind::is_user_facing`, replaces the `UserChat` match at
+`actor/mod.rs:606`; the `UserChat` match at `agent_loop.rs:1028` gates only the
+title pass and stays `UserChat`-only), included in the push dispatcher's
 kind filter (`push/mod.rs:516`) — the user answered and may have walked away.
 `parent_turn_id = None`; the link is in the payload. Exhaustive matches to
-extend: `input_kind()`, `dto.rs:615-624`, `web_trace_types_sync.rs:312-320`
-with `app/web/src/types/trace.ts:403-419`.
+extend: `input_kind()`, `turn/src/store.rs` (`turns.kind` = `"resume"`),
+`query/src/lib.rs` `turn_input_text` (no title text), `dto.rs:615-624`,
+`web_trace_types_sync.rs:312-320` with `app/web/src/types/trace.ts:403-419`.
 
 A `ResumeAsk` can be lost in flight without a crash: the reaper's
 `ActorStop` is served while the registry entry is still occupied

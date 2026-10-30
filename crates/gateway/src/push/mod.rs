@@ -501,7 +501,8 @@ impl PushDispatcher {
     /// True iff this terminal event might buzz a phone: a successfully-
     /// completed turn whose reply a user is meant to read.
     ///
-    /// Three kinds qualify — a real user turn, and both halves of the cron
+    /// Four kinds qualify — a real user turn, its continuation after the user
+    /// answered an ask (they may have walked away), and both halves of the cron
     /// story: a **recurring** fire, whose session is a conversation the user
     /// reads the result in, and the **delivery** of a one-shot's result into
     /// the conversation that scheduled it. A recurring fire is only confirmed
@@ -513,7 +514,10 @@ impl PushDispatcher {
         matches!(ev.phase, TurnPhase::Completed { .. })
             && matches!(
                 ev.kind,
-                TurnInputKind::UserChat | TurnInputKind::Cron | TurnInputKind::CronNotification
+                TurnInputKind::UserChat
+                    | TurnInputKind::Resume
+                    | TurnInputKind::Cron
+                    | TurnInputKind::CronNotification
             )
     }
 
@@ -1269,11 +1273,12 @@ mod tests {
 
     #[test]
     fn dispatches_only_completed_turns_a_user_is_meant_to_read() {
-        // The three buzzing cases: a real user turn, a cron fire (confirmed to
+        // The buzzing cases: a real user turn (or its resume), a cron fire (confirmed to
         // be a conversation once the session is loaded), and the delivery of a
         // one-shot fire's result into the conversation that scheduled it.
         for kind in [
             TurnInputKind::UserChat,
+            TurnInputKind::Resume,
             TurnInputKind::Cron,
             TurnInputKind::CronNotification,
         ] {

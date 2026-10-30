@@ -603,7 +603,7 @@ impl AgentActor {
         // reconstructed from persistent session metadata on later turns.
         inherited_context: Option<baybo_model::InheritedToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
-        let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
+        let is_user_turn = turn_input.input_kind().is_user_facing();
         // Kept so the error path below can tell a user `/stop` (token
         // tripped via the turn cancel) apart from a genuine failure.
         let turn_token = self.volatile.actor_token.child_token();

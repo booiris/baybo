@@ -11996,7 +11996,8 @@
           "compact",
           "spawned",
           "subagent_notification",
-          "issue_run"
+          "issue_run",
+          "resume"
         ]
       },
       "TurnOrigin": {
