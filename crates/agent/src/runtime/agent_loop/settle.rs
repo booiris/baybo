@@ -147,6 +147,17 @@ impl AgentLoop {
                 }
                 continue;
             };
+            if self.has_tool_result(&tool_call_id) {
+                warn!(
+                    session_id = %session.id,
+                    tool_use_id = %tool_call_id,
+                    "settling an ask whose call already has a result; appending nothing"
+                );
+                if let Some(ask_id) = &ask_id {
+                    self.asks.mark_applied(ask_id).await?;
+                }
+                continue;
+            }
             let executed = match (&resolution, kind) {
                 (
                     AskResolution::Approval(
@@ -246,6 +257,18 @@ impl AgentLoop {
             llm_visible_images,
         )
         .await
+    }
+
+    /// Whether the live window already answers `tool_use` `id` — a cancel
+    /// fill that raced the ask's own write-ahead row, say.
+    fn has_tool_result(&self, id: &str) -> bool {
+        self.context_manager
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+            })
     }
 
     /// The `tool_use` block `id` on the live window, resolved through the

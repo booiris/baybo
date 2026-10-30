@@ -1283,10 +1283,10 @@ impl AgentLoop {
 
     /// Whether the loop may append a result for a call that never finished
     /// or whose ask came back abandoned. On an ancestor cancel nothing is
-    /// appended. Otherwise the call's asks are claimed `Abandoned` first, so
-    /// "row abandoned iff a result is on the transcript" holds; a lost claim
-    /// (the ask was answered in the same instant) appends nothing and leaves
-    /// the answer to the next settlement.
+    /// appended. Otherwise the call's asks are claimed `Abandoned` and
+    /// stamped applied first — an answer that landed in the same instant
+    /// included, since its tool future is gone — so the appended result is
+    /// the only one the call ever gets.
     async fn claim_interrupted_call(
         &self,
         session: &Session,
@@ -1296,12 +1296,10 @@ impl AgentLoop {
         if origin == Some(CancelOrigin::Ancestor) {
             return false;
         }
-        !matches!(
-            self.asks
-                .abandon_for_tool_call(&session.id, tool_use_id)
-                .await,
-            baybo_human_ask::ToolCallAbandon::Answered
-        )
+        self.asks
+            .abandon_for_tool_call(&session.id, tool_use_id)
+            .await;
+        true
     }
 
     /// One iteration of the agentic loop, scoped to a single

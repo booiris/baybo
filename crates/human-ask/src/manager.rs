@@ -44,16 +44,14 @@ pub enum Settled {
     },
 }
 
-/// What [`HumanAskManager::abandon_for_tool_call`] found for one call.
+/// Whether [`HumanAskManager::reload_pending`] re-drives answered asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolCallAbandon {
-    /// The call has no unapplied ask; append its result as usual.
-    NoAsk,
-    /// Its asks were abandoned and stamped applied; append the denial.
-    Abandoned,
-    /// One of its asks was answered first; append nothing and let the next
-    /// settlement apply the answer.
-    Answered,
+pub enum ReloadScope {
+    /// The gateway: answered resumable asks go to the resume sink.
+    ResumeAnswered,
+    /// A one-shot process that tears down after its own turn: answered asks
+    /// are left for the gateway's next boot or the session's next turn.
+    LeaveAnswered,
 }
 
 /// Counts from one [`HumanAskManager::reload_pending`] pass, for the boot log.
@@ -154,43 +152,41 @@ impl HumanAskManager {
     }
 
     /// The turn-cancel claim for one tool call, made by whoever is about to
-    /// append that call's result, immediately before the append. Abandoned
-    /// asks are stamped applied here because the caller's append is what
-    /// consumes them.
+    /// append that call's result, immediately before the append. Its tool
+    /// future is gone, so no answer to it can be applied any more: pending
+    /// asks are claimed `Abandoned`, and every unapplied ask of the call —
+    /// one answered in the same instant included — is stamped applied,
+    /// because the caller's append is what consumes it. Returns whether the
+    /// call had any unapplied ask.
     pub async fn abandon_for_tool_call(
         &self,
         session_id: &SessionId,
         tool_call_id: &str,
-    ) -> Result<ToolCallAbandon> {
+    ) -> Result<bool> {
         let rows: Vec<HumanAskRow> = self
             .unapplied(session_id)
             .await?
             .into_iter()
             .filter(|row| row.tool_call_id == tool_call_id)
             .collect();
-        if rows.is_empty() {
-            return Ok(ToolCallAbandon::NoAsk);
-        }
-        let mut answered = false;
+        let found = !rows.is_empty();
         for mut row in rows {
-            if row.is_pending() && self.abandon_row(&mut row).await? {
-                self.core.mark_applied(&row.ask_id).await?;
-            } else {
-                answered = true;
+            if row.is_pending() {
+                self.abandon_row(&mut row).await?;
             }
+            self.core.mark_applied(&row.ask_id).await?;
         }
-        Ok(if answered {
-            ToolCallAbandon::Answered
-        } else {
-            ToolCallAbandon::Abandoned
-        })
+        Ok(found)
     }
 
     /// Settle a session's unapplied asks before a turn builds on its
-    /// transcript. Pending dead asks are abandoned (and stamped applied);
-    /// resolved resumable ones come back as [`Settled::Apply`]; resolved
-    /// non-resumable ones are stamped applied and reported as nothing. A live
-    /// ask cannot exist here — it is logged and left alone.
+    /// transcript. Pending dead asks are abandoned (and stamped applied) and
+    /// come back as [`Settled::Abandoned`] when resumable; a non-resumable
+    /// one's call already has a result (the loop's cancel fill, or
+    /// hydration's crash fill), so it is reported as nothing. Resolved
+    /// resumable ones come back as [`Settled::Apply`]; resolved
+    /// non-resumable ones are stamped applied and reported as nothing. A
+    /// live ask cannot exist here — it is logged and left alone.
     pub async fn settle_unapplied(&self, session_id: &SessionId) -> Result<Vec<Settled>> {
         let mut settled = Vec::new();
         for mut row in self.unapplied(session_id).await? {
@@ -204,6 +200,9 @@ impl HumanAskManager {
                 }
                 if self.abandon_row(&mut row).await? {
                     self.core.mark_applied(&row.ask_id).await?;
+                    if !resumable(row.kind, row.phase) {
+                        continue;
+                    }
                     settled.push(Settled::Abandoned {
                         tool_call_id: row.tool_call_id,
                         kind: row.kind,
@@ -228,11 +227,13 @@ impl HumanAskManager {
     }
 
     /// Boot: rebuild the queues from the ledger. Pending resumable asks are
-    /// re-enqueued as dead entries (publishing `Raised`); resolved resumable
-    /// ones are handed to the resume sink without being shown again;
-    /// non-resumable ones are abandoned or stamped applied. Publishes queue
-    /// edges only — never observer events. Idempotent.
-    pub async fn reload_pending(&self) -> Result<ReloadReport> {
+    /// re-enqueued as dead entries (publishing `Raised`, but no observer
+    /// `Raised` — the ask was already announced); resolved resumable ones are
+    /// handed to the resume sink without being shown again, unless `scope`
+    /// is [`ReloadScope::LeaveAnswered`]; pending non-resumable ones are
+    /// abandoned (observers see that resolution) and resolved ones stamped
+    /// applied. Idempotent.
+    pub async fn reload_pending(&self, scope: ReloadScope) -> Result<ReloadReport> {
         let mut report = ReloadReport::default();
         for row in self.core.store().list_unapplied().await? {
             let resumable = resumable(row.kind, row.phase);
@@ -245,18 +246,14 @@ impl HumanAskManager {
                     }
                 }
                 (true, false) => {
-                    let now = Utc::now();
-                    let store = self.core.store();
-                    if store
-                        .resolve(&row.ask_id, &AskResolution::Abandoned, now)
-                        .await?
-                    {
+                    let mut row = row;
+                    if self.abandon_row(&mut row).await? {
                         report.abandoned += 1;
                     }
-                    store.mark_applied(&row.ask_id, now).await?;
+                    self.core.mark_applied(&row.ask_id).await?;
                 }
                 (false, true) => {
-                    if self.request_resume(&row).await {
+                    if scope == ReloadScope::ResumeAnswered && self.request_resume(&row).await {
                         report.resumed += 1;
                     }
                 }

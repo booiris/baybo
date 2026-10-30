@@ -90,8 +90,10 @@ impl Channel {
     pub fn has_subscribers(&self, session_id: &SessionId) -> bool;
     pub fn connection_count(&self) -> usize;
     pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
+    pub fn pending_approval_sessions(&self) -> HashSet<SessionId>;
+    pub fn ask_queue(&self) -> Option<&AskQueue>;
     pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<StampedEvent>;
-    pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId>;
+    // No resolve method: asks resolve through `HumanAskManager::resolve`.
 
     // Kind narrowing — see `SubscribedView` below.
     pub fn as_subscribed(&self) -> Option<SubscribedView<'_>>;
@@ -170,14 +172,15 @@ Add one when there's a real method to put on it.
 
 ## Dispatch Surface
 
-External callers reach the channel through three kind-agnostic
+External callers reach the channel through four kind-agnostic
 methods on `Channel`:
 
 | Method                          | Origin                                       | Event constructed              |
 | ------------------------------- | -------------------------------------------- | ------------------------------ |
 | `dispatch_agent(output)`        | Agent router (per-turn assistant output)     | `SessionEvent::Agent(_)`       |
-| `dispatch_approval_requested(…)`| `ChannelAskGate` waker, when a tool call blocks | `SessionEvent::ApprovalRequested {..}` |
-| `dispatch_approval_resolved(…)` | Connection sent `Frame::ResolveApproval` first; the resolver fans out so concurrent UIs drop the prompt | `SessionEvent::ApprovalResolved {..}` |
+| `dispatch_approval_requested(…)`| The queue's `AskRaised` watcher (installed in `build_channel`), when a tool call parks on an approval | `SessionEvent::ApprovalRequested {..}` |
+| `dispatch_approval_resolved(…)` | The queue's `AskClosed` watcher, when a human decided an approval (via `HumanAskManager::resolve`) | `SessionEvent::ApprovalResolved {..}` |
+| `dispatch_ask_resolved(…)`      | The queue's `AskClosed` watcher, on every close — answered or abandoned — so concurrent UIs drop the card | `SessionEvent::AskResolved {..}` |
 
 Plus one Subscribed-exclusive method on the view:
 

@@ -36,7 +36,9 @@ impl ChannelAskGate {
     ///
     /// On a turn cancel the arm returns at once without awaiting anything:
     /// the loop drops the tool future the moment this yields `Pending`, so a
-    /// write started there would be torn. On an ancestor cancel (process
+    /// write started there would be torn. The write-ahead insert itself can
+    /// outlive a dropped future and commit after the loop's cancel fill; the
+    /// settlement skips a call that already has a result. On an ancestor cancel (process
     /// shutdown) it never returns, leaving the ask pending for the next
     /// process.
     async fn park(&self, row: HumanAskRow, cancel: AskCancel) -> Option<AskResolution> {

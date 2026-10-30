@@ -160,7 +160,7 @@ async fn a_turn_cancel_abandons_the_parked_ask_and_appends_the_denial() {
     );
     let results = results_for_call(&harness).await;
     assert_eq!(results.len(), 1, "exactly one result: {results:?}");
-    assert!(results[0].contains("torn down"), "{results:?}");
+    assert!(results[0].contains("withdrawn"), "{results:?}");
     assert_eq!(completed_for_call(&outputs), 1);
     assert!(
         harness
@@ -175,12 +175,13 @@ async fn a_turn_cancel_abandons_the_parked_ask_and_appends_the_denial() {
         .expect("actor stops");
 }
 
+/// The answer is claimed in the same instant the user stops the turn, so the
+/// waiter never sees it. `/stop` wins: the tool future is gone, so the loop's
+/// fill is the call's one result and the answer is consumed with it.
 #[tokio::test]
-async fn a_turn_cancel_that_loses_the_claim_to_an_answer_appends_nothing() {
+async fn a_turn_cancel_racing_an_answer_still_appends_exactly_one_result() {
     let (mut harness, runs, row) = parked_turn().await;
 
-    // The answer is claimed on the ledger in the same instant the user
-    // stops the turn: the waiter never sees it.
     let now = chrono::Utc::now();
     assert!(
         harness
@@ -201,15 +202,11 @@ async fn a_turn_cancel_that_loses_the_claim_to_an_answer_appends_nothing() {
         after.resolution,
         Some(AskResolution::Approval(ApprovalDecision::Approve))
     );
-    assert!(
-        after.applied_at.is_none(),
-        "the answer waits for the next settlement"
-    );
-    assert!(
-        results_for_call(&harness).await.is_empty(),
-        "a lost claim appends nothing"
-    );
-    assert_eq!(completed_for_call(&outputs), 0);
+    assert!(after.applied_at.is_some(), "consumed by the loop's fill");
+    let results = results_for_call(&harness).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("withdrawn"), "{results:?}");
+    assert_eq!(completed_for_call(&outputs), 1);
     assert_eq!(runs.load(Ordering::SeqCst), 0);
 
     tokio::time::timeout(PARK_TIMEOUT, harness.shutdown())

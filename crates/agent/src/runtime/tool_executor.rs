@@ -2942,7 +2942,7 @@ mod tests {
     async fn an_abandoned_gate_is_not_reported_to_the_model_as_a_human_no() {
         let (msg, abandoned) = gated_call_error(ApprovalOutcome::abandoned()).await;
         assert!(abandoned, "the loop must claim the ask before appending");
-        assert!(msg.contains("torn down"), "got {msg}");
+        assert!(msg.contains("withdrawn"), "got {msg}");
         assert!(!msg.contains("said no"), "got {msg}");
         assert!(!msg.contains("user denied approval"), "got {msg}");
     }

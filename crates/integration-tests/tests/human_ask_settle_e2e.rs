@@ -281,7 +281,7 @@ async fn a_new_message_abandons_a_dead_pending_ask_before_the_user_row() {
     assert_eq!(row.resolution, Some(AskResolution::Abandoned));
     assert!(row.applied_at.is_some());
     let result = adjacent_result(&harness).await;
-    assert!(result.contains("torn down"), "{result}");
+    assert!(result.contains("withdrawn"), "{result}");
     assert!(
         !result.contains("interrupted by a crash"),
         "hydration must not fill a parked call: {result}"
@@ -444,7 +444,7 @@ async fn a_batch_of_messages_settles_first() {
         .expect("send batch");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    assert!(adjacent_result(&harness).await.contains("torn down"));
+    assert!(adjacent_result(&harness).await.contains("withdrawn"));
     assert_paired(&harness.stub_llm.captured_requests()[0]);
     stop(harness).await;
 }
@@ -466,7 +466,7 @@ async fn a_cron_fire_settles_before_its_prompt() {
         .expect("send cron");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    assert!(adjacent_result(&harness).await.contains("torn down"));
+    assert!(adjacent_result(&harness).await.contains("withdrawn"));
     assert_paired(&harness.stub_llm.captured_requests()[0]);
     stop(harness).await;
 }
@@ -525,7 +525,7 @@ async fn compact_settles_before_the_summariser_reads_the_transcript() {
     harness.send_text("/compact").await.expect("send");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    assert!(adjacent_result(&harness).await.contains("torn down"));
+    assert!(adjacent_result(&harness).await.contains("withdrawn"));
     assert_eq!(resume_turns(&harness).await, 1);
     stop(harness).await;
 }
@@ -638,7 +638,7 @@ async fn a_background_notification_settles_before_its_prompt() {
         .expect("inject BackgroundJobFinished");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    assert!(adjacent_result(&harness).await.contains("torn down"));
+    assert!(adjacent_result(&harness).await.contains("withdrawn"));
     let requests = harness.stub_llm.captured_requests();
     assert_eq!(requests.len(), 1, "the notification turn ran");
     assert_paired(&requests[0]);

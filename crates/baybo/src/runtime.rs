@@ -282,6 +282,10 @@ pub async fn build_managers(
     // empty `Vec` for non-gateway paths) so the manager-graph layer
     // stays free of per-tool-domain wiring (browser blob upload, etc).
     embedded_mcp_servers: Vec<EmbeddedMcpServer>,
+    // Whether the boot reload re-drives answered asks. Only the gateway
+    // does: a one-shot process would run other sessions' Resume turns and
+    // then cut them off at its own teardown.
+    ask_reload: baybo_human_ask::ReloadScope,
 ) -> anyhow::Result<ManagerGraph> {
     // Shared, hot-swappable Bash permission mode. A `permission` config reload
     // swaps it live (see `reload.rs`); the handle is held by both the tool
@@ -711,10 +715,10 @@ pub async fn build_managers(
         stores.session.clone(),
     );
     // Best-effort, like the skill-job recovery: put the ledger's pending asks
-    // back on their queues (the push relay sees their edges) and re-drive
-    // the answered ones. Resume requests wait in the router's intake until
-    // the router runs.
-    match human_asks.reload_pending().await {
+    // back on their queues (the push relay sees their edges) and, per
+    // `ask_reload`, re-drive the answered ones. Resume requests wait in the
+    // router's intake until the router runs.
+    match human_asks.reload_pending(ask_reload).await {
         Ok(report) => info!(
             requeued = report.requeued,
             resumed = report.resumed,
@@ -1004,11 +1008,13 @@ pub struct RouterRunHandle {
     pub supervisor: AgentSupervisor,
 }
 
+const WIRE_ROUTER_TWICE: &str = "wire_router called twice; its one-shot receivers are consumed";
+
 /// Build the [`Router`] and wire a per-session actor spawner against
 /// the graph. The returned handle already has cron triggers attached —
 /// every cron-enqueued session reaches the router regardless of entry
 /// point.
-pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
+pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHandle> {
     let buffer = graph.config.channels.message_buffer_size;
 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(HeuristicTokenizer);
@@ -1023,7 +1029,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let incoming_rx = graph
         .router_incoming_rx
         .take()
-        .expect("wire_router called twice; router_incoming_rx already consumed");
+        .ok_or_else(|| anyhow::anyhow!(WIRE_ROUTER_TWICE))?;
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
     let supervisor = AgentSupervisor::new(response_tx, graph.human_asks.clone());
@@ -1196,11 +1202,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     // `take` the cron rx eagerly — a caller who forgot to plumb it would
     // silently drop every cron-fired turn. Calling `wire_router` twice
-    // panics here loudly rather than silently handing out a dummy receiver.
+    // fails here loudly rather than silently handing out a dummy receiver.
     let cron_trigger_rx = graph
         .cron_trigger_rx
         .take()
-        .expect("wire_router called twice; cron_trigger_rx already consumed");
+        .ok_or_else(|| anyhow::anyhow!(WIRE_ROUTER_TWICE))?;
 
     // Idle actor reaper: shuts down registered actors whose sessions
     // have been idle. Hydration on the next user message rebuilds the
@@ -1289,13 +1295,13 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         inbound_dedup: Arc::clone(&graph.inbound_dedup),
     });
 
-    RouterRunHandle {
+    Ok(RouterRunHandle {
         router,
         incoming_tx,
         incoming_rx,
         response_rx,
         supervisor: supervisor_for_gateway,
-    }
+    })
 }
 
 /// Wire SIGINT / SIGTERM (Unix) or Ctrl-C (non-Unix) into the provided

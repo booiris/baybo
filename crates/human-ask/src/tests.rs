@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{AskCore, AskEvent};
 use crate::error::HumanAskError;
 use crate::gate::{ChannelAskGate, PolicyDenyGate};
-use crate::manager::{HumanAskManager, HumanAskManagerConfig, Settled, ToolCallAbandon};
+use crate::manager::{HumanAskManager, HumanAskManagerConfig, ReloadScope, Settled};
 use crate::ports::{AskObserver, ResumeSink};
 use crate::queue::{AskQueue, AskQueueEvent, AskQueues, PendingEdge};
 use crate::test_support::MemoryHumanAskStore;
@@ -297,7 +297,10 @@ async fn a_question_resolution_does_not_fit_an_approval() {
 async fn resolving_a_dead_ask_removes_it_and_requests_a_resume() {
     let h = harness();
     h.store.insert(row("a", "s1", AskPhase::BeforeExecute));
-    h.manager.reload_pending().await.expect("reload");
+    h.manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload");
     assert_eq!(h.queue.liveness(&id("a")), Some(false));
     h.edges.lock().clear();
 
@@ -330,7 +333,10 @@ async fn resolving_a_dead_ask_in_an_issue_session_requests_nothing() {
     let h = harness();
     h.store
         .insert(row("a", ISSUE_SESSION, AskPhase::BeforeExecute));
-    h.manager.reload_pending().await.expect("reload");
+    h.manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload");
     h.manager.resolve(&id("a"), APPROVE).await.expect("resolve");
     assert!(h.sink.requests.lock().is_empty());
     assert_eq!(
@@ -352,12 +358,12 @@ async fn turn_cancel_returns_abandoned_and_leaves_the_row_pending() {
     assert_eq!(h.queue.liveness(&id("a")), Some(false), "orphaned, dead");
 
     // The loop's claim, made before it appends the denial.
-    assert_eq!(
+    assert!(
         h.manager
             .abandon_for_tool_call(&"s1".into(), "use-a")
             .await
             .expect("claim"),
-        ToolCallAbandon::Abandoned
+        "the call had an ask"
     );
     let stored = h.store.row(&id("a")).expect("row");
     assert_eq!(stored.resolution, Some(AskResolution::Abandoned));
@@ -371,24 +377,64 @@ async fn turn_cancel_returns_abandoned_and_leaves_the_row_pending() {
 }
 
 #[tokio::test]
-async fn abandon_for_tool_call_reports_an_answer_that_won_the_race() {
+async fn abandon_for_tool_call_consumes_an_answer_that_won_the_race() {
     let h = harness();
     h.store
         .insert(resolved(row("a", "s1", AskPhase::BeforeExecute), APPROVE));
-    assert_eq!(
+    h.store
+        .insert(resolved(row("b", "s1", AskPhase::DuringExecute), APPROVE));
+    for call in ["use-a", "use-b"] {
+        assert!(
+            h.manager
+                .abandon_for_tool_call(&"s1".into(), call)
+                .await
+                .expect("claim"),
+            "the loop appends the cancel fill for {call}"
+        );
+    }
+    for ask in ["a", "b"] {
+        let stored = h.store.row(&id(ask)).expect("row");
+        assert_eq!(stored.resolution, Some(APPROVE), "the answer stands");
+        assert!(stored.applied_at.is_some(), "consumed by the fill");
+    }
+    assert!(
+        h.manager
+            .settle_unapplied(&"s1".into())
+            .await
+            .expect("settle")
+            .is_empty(),
+        "nothing left for a second result"
+    );
+    assert!(
+        !h.manager
+            .abandon_for_tool_call(&"s1".into(), "use-other")
+            .await
+            .expect("claim")
+    );
+}
+
+#[tokio::test]
+async fn a_mid_run_answer_racing_stop_still_gets_one_result() {
+    let h = harness();
+    let t = tokens();
+    let task = park(&h, "a", "s1", AskPhase::DuringExecute, t.clone()).await;
+    t.turn.cancel();
+    assert_eq!(task.await.expect("join"), ApprovalOutcome::abandoned());
+    assert!(
+        h.queue.is_empty(),
+        "a non-resumable orphan leaves the queue"
+    );
+    // The answer lands between the gate dropping and the loop's claim.
+    h.manager.resolve(&id("a"), APPROVE).await.expect("resolve");
+    assert!(h.sink.requests.lock().is_empty());
+    assert!(
         h.manager
             .abandon_for_tool_call(&"s1".into(), "use-a")
             .await
             .expect("claim"),
-        ToolCallAbandon::Answered
+        "the loop appends the cancel fill"
     );
-    assert_eq!(
-        h.manager
-            .abandon_for_tool_call(&"s1".into(), "use-other")
-            .await
-            .expect("claim"),
-        ToolCallAbandon::NoAsk
-    );
+    assert!(h.store.row(&id("a")).expect("row").applied_at.is_some());
 }
 
 #[tokio::test]
@@ -419,7 +465,10 @@ async fn a_live_waiter_sees_abandon() {
 async fn abandon_for_session_takes_live_and_dead_asks() {
     let h = harness();
     h.store.insert(row("dead", "s1", AskPhase::BeforeExecute));
-    h.manager.reload_pending().await.expect("reload");
+    h.manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload");
     let live = park(&h, "live", "s1", AskPhase::BeforeExecute, tokens()).await;
     assert!(h.manager.has_live_pending_ask(&"s1".into()));
     assert_eq!(
@@ -472,7 +521,11 @@ async fn reload_requeues_pending_resumable_rows_per_channel() {
     sidecar.channel = ChannelType::from("custom");
     h.store.insert(sidecar);
 
-    let report = h.manager.reload_pending().await.expect("reload");
+    let report = h
+        .manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload");
     assert_eq!(report.requeued, 4);
     assert_eq!(h.queue.len(), 3);
     let raised: Vec<SessionId> = h
@@ -494,7 +547,11 @@ async fn reload_requeues_pending_resumable_rows_per_channel() {
     assert!(custom.contains(&id("x")));
     assert!(h.observer.seen.lock().is_empty(), "reload notifies nobody");
 
-    let again = h.manager.reload_pending().await.expect("reload twice");
+    let again = h
+        .manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload twice");
     assert_eq!(again.requeued, 0, "idempotent");
     assert_eq!(h.queue.len(), 3);
 }
@@ -508,7 +565,11 @@ async fn reload_resumes_resolved_rows_without_showing_them() {
         row("b", ISSUE_SESSION, AskPhase::BeforeExecute),
         APPROVE,
     ));
-    let report = h.manager.reload_pending().await.expect("reload");
+    let report = h
+        .manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload");
     assert_eq!(report.resumed, 1);
     assert!(h.queue.is_empty(), "not re-shown");
     assert!(h.edges.lock().is_empty(), "no Raised, so no push");
@@ -522,21 +583,56 @@ async fn reload_resumes_resolved_rows_without_showing_them() {
 }
 
 #[tokio::test]
+async fn a_one_shot_reload_leaves_answered_asks_alone() {
+    let h = harness();
+    h.store
+        .insert(resolved(row("a", "s1", AskPhase::BeforeExecute), APPROVE));
+    h.store.insert(row("p", "s1", AskPhase::BeforeExecute));
+    let report = h
+        .manager
+        .reload_pending(ReloadScope::LeaveAnswered)
+        .await
+        .expect("reload");
+    assert_eq!((report.resumed, report.requeued), (0, 1));
+    assert!(h.sink.requests.lock().is_empty());
+    assert!(h.store.row(&id("a")).expect("row").applied_at.is_none());
+}
+
+#[tokio::test]
 async fn reload_reconciles_non_resumable_rows() {
     let h = harness();
     h.store.insert(row("p", "s1", AskPhase::DuringExecute));
     h.store
         .insert(resolved(row("r", "s1", AskPhase::DuringExecute), APPROVE));
-    let report = h.manager.reload_pending().await.expect("reload");
+    let report = h
+        .manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload");
     assert_eq!((report.abandoned, report.applied), (1, 1));
     let p = h.store.row(&id("p")).expect("row");
     assert_eq!(p.resolution, Some(AskResolution::Abandoned));
     assert!(p.applied_at.is_some());
     assert!(h.store.row(&id("r")).expect("row").applied_at.is_some());
     assert!(h.queue.is_empty());
-    assert!(h.observer.seen.lock().is_empty());
+    let events: Vec<(AskId, AskEvent)> = h
+        .observer
+        .seen
+        .lock()
+        .iter()
+        .map(|(id, e, _, _)| (id.clone(), e.clone()))
+        .collect();
+    assert_eq!(
+        events,
+        vec![(id("p"), AskEvent::Resolved(AskResolution::Abandoned))],
+        "the board hears the abandon; nothing is re-raised"
+    );
 
-    let again = h.manager.reload_pending().await.expect("again");
+    let again = h
+        .manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("again");
     assert_eq!(again, Default::default(), "idempotent");
 }
 
@@ -552,12 +648,18 @@ async fn settle_unapplied_handles_every_row_state() {
         row("midrun", "s1", AskPhase::DuringExecute),
         APPROVE,
     ));
-    h.manager.reload_pending().await.expect("reload");
+    h.manager
+        .reload_pending(ReloadScope::ResumeAnswered)
+        .await
+        .expect("reload");
     // `midrun` was stamped applied by the reload; seed a fresh one.
     h.store.insert(resolved(
         row("midrun2", "s1", AskPhase::DuringExecute),
         APPROVE,
     ));
+    // Pending, non-resumable, its waiter gone (an unwound actor): hydration
+    // already filled its call.
+    h.store.insert(row("orphan", "s1", AskPhase::DuringExecute));
     h.sink.requests.lock().clear();
 
     let settled = h
@@ -581,6 +683,9 @@ async fn settle_unapplied_handles_every_row_state() {
         ]
     );
     assert!(h.store.row(&id("dead")).expect("row").applied_at.is_some());
+    let orphan = h.store.row(&id("orphan")).expect("row");
+    assert_eq!(orphan.resolution, Some(AskResolution::Abandoned));
+    assert!(orphan.applied_at.is_some(), "reconciled, nothing appended");
     assert!(
         h.store
             .row(&id("midrun2"))

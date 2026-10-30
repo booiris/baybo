@@ -138,7 +138,7 @@ async fn boot(
     before_reload(&harness);
     harness
         .human_asks
-        .reload_pending()
+        .reload_pending(baybo_human_ask::ReloadScope::ResumeAnswered)
         .await
         .expect("reload pending asks");
     Node {
@@ -419,7 +419,7 @@ async fn a_new_message_after_a_restart_abandons_the_dead_ask_first() {
     let after = row(&node.harness, &ask_id).await;
     assert_eq!(after.resolution, Some(AskResolution::Abandoned));
     assert!(after.applied_at.is_some());
-    assert!(adjacent_result(&node.harness).await.contains("torn down"));
+    assert!(adjacent_result(&node.harness).await.contains("withdrawn"));
     assert!(replied(&outputs, "ok"), "{outputs:#?}");
     assert_eq!(runs.load(Ordering::SeqCst), 0);
     assert_eq!(node.harness.strict_rejections.load(Ordering::SeqCst), 0);
@@ -431,6 +431,46 @@ async fn a_new_message_after_a_restart_abandons_the_dead_ask_first() {
         )),
         "AskResolved goes out so open tabs drop the card"
     );
+    stop(node).await;
+}
+
+/// A `/stop` that dropped the gate mid-insert: the loop found no ask and
+/// appended its cancel fill, then the write-ahead row committed pending. The
+/// next settlement must not answer the call a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settlement_never_answers_a_call_twice() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join(DB_FILE);
+    let session = owner_session(TriggerSource::User);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let ask_id = raise_then_shut_down(&db, &session, &runs).await;
+    {
+        let store = Store::open(&db).await.expect("open the database");
+        store
+            .session
+            .append_session_message(
+                &session.id,
+                &ChatMessage::tool_result_with_meta(
+                    CALL_ID.to_string(),
+                    "cancelled".to_string(),
+                    None,
+                ),
+            )
+            .await
+            .expect("append the cancel fill");
+    }
+
+    let mut node = boot(&db, &session, &runs, true, |_| {}).await;
+    reply(&node.harness, "ok");
+    node.harness.send_text("never mind").await.expect("send");
+    let outputs = node.harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let after = row(&node.harness, &ask_id).await;
+    assert_eq!(after.resolution, Some(AskResolution::Abandoned));
+    assert!(after.applied_at.is_some());
+    assert_eq!(adjacent_result(&node.harness).await, "cancelled");
+    assert!(replied(&outputs, "ok"), "{outputs:#?}");
+    assert_eq!(node.harness.strict_rejections.load(Ordering::SeqCst), 0);
     stop(node).await;
 }
 
@@ -577,7 +617,7 @@ async fn a_requeued_issue_run_re_asks_live_when_nobody_answered() {
     .expect("the run re-asks live");
     let abandoned = row(&node.harness, &ask_id).await;
     assert_eq!(abandoned.resolution, Some(AskResolution::Abandoned));
-    assert!(adjacent_result(&node.harness).await.contains("torn down"));
+    assert!(adjacent_result(&node.harness).await.contains("withdrawn"));
 
     node.harness
         .human_asks

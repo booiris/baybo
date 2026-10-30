@@ -544,9 +544,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         shutdown.clone(),
         Arc::clone(&leak_detector),
         embedded_mcp_servers,
+        baybo_human_ask::ReloadScope::ResumeAnswered,
     )
     .await?;
-    let run_handle = runtime::wire_router(&mut graph).await;
+    let run_handle = runtime::wire_router(&mut graph).await?;
 
     // WS-backed sidecars register themselves from the route task when a
     // client connects; nothing to pre-register here.

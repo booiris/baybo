@@ -1145,7 +1145,11 @@ mod tests {
             resolution: None,
             applied_at: None,
         });
-        let report = asks.manager.reload_pending().await.expect("reload");
+        let report = asks
+            .manager
+            .reload_pending(baybo_human_ask::ReloadScope::ResumeAnswered)
+            .await
+            .expect("reload");
         assert_eq!(report.requeued, 1);
 
         let registry = Arc::new(ChannelRegistry::new());

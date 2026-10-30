@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_channels::RouterInbound;
-use baybo_human_ask::{HumanAskManager, ResumeSink, Settled, ToolCallAbandon};
+use baybo_human_ask::{HumanAskManager, ResumeSink, Settled};
 use baybo_model::human_ask::{AskId, ResumeRequest};
 use baybo_model::{SessionId, TriggerSource};
 use baybo_store::HumanAskRow;
@@ -18,15 +18,11 @@ use crate::SessionManager;
 /// What a turn may do to its session's asks.
 #[async_trait]
 pub trait TurnAsks: Send + Sync {
-    /// Claim `Abandoned` for the unapplied asks a cancelled call raised, right
-    /// before the loop appends that call's result. A store failure answers
-    /// [`ToolCallAbandon::NoAsk`]: the result is appended anyway, because a
-    /// dangling `tool_use` would wedge the session's next LLM call.
-    async fn abandon_for_tool_call(
-        &self,
-        session: &SessionId,
-        tool_use_id: &str,
-    ) -> ToolCallAbandon;
+    /// Claim `Abandoned` for the unapplied asks a cancelled call raised, and
+    /// stamp them applied, right before the loop appends that call's result.
+    /// The loop appends whatever this finds; a store failure is only logged,
+    /// because a dangling `tool_use` would wedge the session's next LLM call.
+    async fn abandon_for_tool_call(&self, session: &SessionId, tool_use_id: &str);
 
     /// The session's asks not yet applied to its transcript.
     async fn unapplied(&self, session: &SessionId) -> anyhow::Result<Vec<HumanAskRow>>;
@@ -43,22 +39,14 @@ pub trait TurnAsks: Send + Sync {
 
 #[async_trait]
 impl TurnAsks for HumanAskManager {
-    async fn abandon_for_tool_call(
-        &self,
-        session: &SessionId,
-        tool_use_id: &str,
-    ) -> ToolCallAbandon {
-        match HumanAskManager::abandon_for_tool_call(self, session, tool_use_id).await {
-            Ok(claim) => claim,
-            Err(e) => {
-                warn!(
-                    session_id = %session,
-                    tool_use_id,
-                    error = %e,
-                    "could not abandon the asks of a cancelled tool call; appending its result"
-                );
-                ToolCallAbandon::NoAsk
-            }
+    async fn abandon_for_tool_call(&self, session: &SessionId, tool_use_id: &str) {
+        if let Err(e) = HumanAskManager::abandon_for_tool_call(self, session, tool_use_id).await {
+            warn!(
+                session_id = %session,
+                tool_use_id,
+                error = %e,
+                "could not abandon the asks of a cancelled tool call; appending its result"
+            );
         }
     }
 

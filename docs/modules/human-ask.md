@@ -309,8 +309,11 @@ sync queue-watcher drain. The project crate records
 `TriggerSource::Issue` sessions (the `attempt` it needs comes from
 `list_runs` at `Raised` time; a `Resolved` after a restart carries none,
 which the store's `attempt: Option<i64>` already allows) and drops its own
-open-ledger. Boot reload publishes queue edges only, never observer events,
-so a restart does not append a duplicate `approval_requested` timeline row.
+open-ledger. Boot reload never publishes an observer `Raised`, so a restart
+does not append a duplicate `approval_requested` timeline row; a pending
+non-resumable ask the reload abandons does publish `Resolved(Abandoned)`, so
+the card's open prompt is closed rather than left with live buttons that
+would only 404.
 
 The card-close cancel (`close_card_prompts`, keyed by `(project, number)`
 and reached from `settle_run` and `stop_live_run` through the existing
@@ -357,11 +360,11 @@ without a back-edge to the manager.
 | Verb | Persists | Then |
 | --- | --- | --- |
 | `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim) | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A row whose `channel` has no queue still gets the claim, with a `warn!`. |
-| `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on what it abandoned — its caller appends the result next — and returns `ToolCallAbandon::{NoAsk, Abandoned, Answered}`; `Answered` (a claim lost, or a row already resolved) means append nothing. |
-| `policy_deny(request)` | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
-| `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied` (the caller appends next); resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for rows it abandoned and `Settled::Apply { ask_id, tool_call_id, kind, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
+| `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on **every** unapplied ask of the call — what it abandoned, and an answer that won the claim in the same instant — because its tool future is gone and its caller's append is the only result the call will get; it returns whether the call had any unapplied ask, and the caller appends either way. |
+| `PolicyDenyGate::request` (the gate, not a manager verb) | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
+| `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied`; resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for **resumable** rows it abandoned (the caller appends next; a pending non-resumable row's call was already filled — by the loop's cancel claim or by hydration — so it is reconciled and reported as nothing) and `Settled::Apply { ask_id, tool_call_id, kind, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
 | `mark_applied(ask_id)` | `applied_at` (claim) | — |
-| `reload_pending()` | `Abandoned` for non-resumable pending rows; `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. |
+| `reload_pending(scope: ReloadScope)` | `Abandoned` for non-resumable pending rows (observers see `Resolved(Abandoned)`); `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; under `ReloadScope::ResumeAnswered` (the gateway) request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. `ReloadScope::LeaveAnswered` (`baybo prompt`) leaves them for the gateway's next boot or the session's next turn. |
 
 A dropped waiter is **not** a resolution. `QueueCleanup::drop` (today:
 `drop_call` → `Abandoned` edge) becomes `queue.orphan(ask_id)`: a resumable
@@ -431,11 +434,12 @@ So the origin decision moves into the gate race, and the plumbing is new:
   result (the `Denied` an abandoned gate returned, or the cancelled fill for
   a call that never finished), it claims
   `manager.abandon_for_tool_call(session, tool_use_id)`. The claim and the
-  append are one sequential step in one task, so "row abandoned iff a result
-  is on the transcript" holds; a claim that loses (the ask was answered in
-  the same instant) means the result the loop is about to append is the
-  wrong one — it skips the append and lets the next prelude apply the real
-  answer. On `Ancestor` the path **emits nothing and appends nothing** — no
+  append are one sequential step in one task. The claim also stamps applied
+  an answer that landed in the same instant (through either resolve door,
+  or after the gate's oneshot fired but before its own applied stamp
+  committed): the tool future that would have consumed it is gone, so the
+  loop's append is the call's one result and nothing can apply the answer
+  later. `/stop` wins that race. On `Ancestor` the path **emits nothing and appends nothing** — no
   `tool_completed { error, "cancelled" }` events, no fills, for any
   unfinished call. The transcript is left exactly as a crash would leave it,
   and the next hydration heals the siblings with the ordinary "interrupted"
@@ -506,7 +510,7 @@ order the code can actually have:
    — the same `AskQueues` the channels fetch from; the manager never holds
    the registry or a `Channel`. **`baybo_project::install_ask_bridge`** runs
    right after, once `ProjectManager` (`:640`) exists.
-7. **`manager.reload_pending()`** — best-effort like
+7. **`manager.reload_pending(scope)`** — best-effort like
    `skill_assessor.recover_pending_jobs` (`:479`): log counts, never block
    boot. After it, the in-memory queue is the read model again and
    `SubscribeState.pending_*`, `ChatSessionSummary.awaiting_human`,
@@ -537,10 +541,12 @@ runs and leaves the dangling `tool_use` row as the tail so the eventual real
 manager type.
 
 `baybo prompt` boots the same graph under the workspace lock (gateway not
-running). The reload is side-effect-free apart from the in-memory push and
-the non-resumable reconciliation, both of which the gateway would do
-identically at its next boot; it builds no relay, so the push stream is
-dropped unread (`observe` treats a closed stream as a no-op).
+running), passing `ReloadScope::LeaveAnswered` to `build_managers`: it
+requests no Resume turns — it would run other sessions' turns and cut them
+off at its own teardown — so the reload is side-effect-free apart from the
+in-memory push and the non-resumable reconciliation, both of which the
+gateway would do identically at its next boot; it builds no relay, so the
+push stream is dropped unread (`observe` treats a closed stream as a no-op).
 
 #### The turn prelude: one home for unapplied asks
 
@@ -1082,7 +1088,7 @@ pub struct HumanAskManager;                     // from_config(HumanAskManagerCo
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
                                                 //        unapplied_tool_use_ids, has_live_pending_ask (LivePendingAsks impl)
 pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, kind, resolution } }
-pub enum ToolCallAbandon { NoAsk, Abandoned, Answered }   // abandon_for_tool_call's answer to the loop
+pub enum ReloadScope { ResumeAnswered, LeaveAnswered }   // reload_pending: gateway vs one-shot `baybo prompt`
 pub struct ReloadReport { requeued, resumed, abandoned, applied }
 #[async_trait] pub trait ResumeSink {
     async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
@@ -1200,8 +1206,9 @@ Where the code differs from the sketch above, and why:
 - **The loop's port.** The agent loop does not hold `Arc<HumanAskManager>`:
   `AgentLoopConfig.asks` is `Arc<dyn baybo_agent::runtime::asks::TurnAsks>`,
   a narrow port implemented for `HumanAskManager` in `baybo-agent`. It carries
-  `abandon_for_tool_call` and the settlement verbs listed above. On a store
-  error `abandon_for_tool_call` answers `NoAsk`
+  `abandon_for_tool_call` and the settlement verbs listed above. The port's
+  `abandon_for_tool_call` returns nothing: the loop appends after it
+  whatever it found, and a store error is only logged
   (the result is appended, so the session's next LLM call is not wedged by a
   dangling `tool_use`). The cancelled-batch path decides per call from
   `ExecutedTool.abandoned` (the call's last ask resolved `Abandoned`, read
@@ -1210,9 +1217,15 @@ Where the code differs from the sketch above, and why:
   back abandoned — not only when the batch select observed the cancel, since
   a gate can return `abandoned()` and the call finish before the loop's
   select sees the token.
-- A call skipped because its claim lost (`Answered`) or because the cancel
-  is `Ancestor` gets neither the append nor the `tool_completed` event; the
-  step's completion arrives with the result the next settlement appends.
+- A call skipped because the cancel is `Ancestor` gets neither the append
+  nor the `tool_completed` event; the step's completion arrives with the
+  result the next settlement (or hydration) appends.
+- **Duplicate-result guard.** The gate's write-ahead insert is not
+  cancel-safe: a `/stop` that drops the tool future mid-`create` lets the
+  insert commit (it runs on `spawn_blocking`) after the loop's claim read
+  nothing and appended the cancelled fill. The settlement therefore appends
+  nothing for a call whose `tool_result` is already on the live window; it
+  only stamps the ask applied.
 - **`PausableDeadline`** polls the `ParkGauge` every 250 ms
   (`PARK_POLL_INTERVAL`); `TOOL_DEADLINE_GRACE` is 15 s.
 - `ASK_USER_TOOL_NAME` already lives in `baybo_model::human_ask`, because
@@ -1446,7 +1459,8 @@ Unit (other crates):
   violation → error result for the ask, siblings executed; `Ancestor` cancel
   while parked → no `Denied` result, no span event, nothing appended, entry
   dead, row pending; `Turn` cancel → the loop's claim lands before the
-  result append, and a losing claim appends nothing; the settlement applies
+  result append, and an answer racing it is consumed by the one fill; a call
+  that already has a result gets nothing more; the settlement applies
   each `Settled` variant with one adjacent result, under a `SettleOnly` turn
   from every door (user, merged, issue brief, cron fire, notification,
   `/compact`) and under `Continue` from the Resume door; `mark_applied`

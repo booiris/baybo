@@ -152,9 +152,9 @@ abandoned — the transcript is left as a crash would leave it, the ask row
 stays pending, and hydration repairs the siblings. On `Turn` (`/stop`, board
 stop, operator cancel), before appending such a call's result it claims
 `TurnAsks::abandon_for_tool_call(session, tool_use_id)` (a narrow port over
-`HumanAskManager`, an `AgentLoopConfig` field); a claim that loses because the
-ask was answered in the same instant appends nothing and leaves the answer to
-the next settlement. `ExecutedTool.abandoned` marks a call whose last ask was
+`HumanAskManager`, an `AgentLoopConfig` field), which also stamps applied an
+answer that landed in the same instant — the tool future is gone, so the
+loop's append is the call's one result. `ExecutedTool.abandoned` marks a call whose last ask was
 torn down undecided.
 
 Parallel tool calls within a turn each go through the gate independently; the gate implementation is responsible for its own serialization (TUI queues and shows one inline prompt at a time).

@@ -71,7 +71,7 @@ impl ApprovalOutcome {
 }
 
 const REFUSAL_ANSWERED: &str = r#"a human saw this prompt and said no"#;
-const REFUSAL_ABANDONED: &str = r#"this prompt was torn down before anyone decided it — the turn was cancelled, or the process is shutting down"#;
+const REFUSAL_ABANDONED: &str = r#"this prompt was withdrawn before anyone decided it — the turn was stopped, or the user moved on without answering"#;
 const REFUSAL_POLICY: &str = r#"a standing policy denied this without asking anyone, because this session has no approval surface — every prompt here will be denied the same way"#;
 
 /// Explain the denial source without trailing punctuation.
