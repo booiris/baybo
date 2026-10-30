@@ -24,7 +24,6 @@ use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
 use baybo_human_ask::test_support::MemoryHumanAskStore;
 use baybo_human_ask::{
     AskCore, AskQueues, ChannelAskGate, HumanAskManager, HumanAskManagerConfig, PolicyDenyGate,
-    ResumeSink,
 };
 use baybo_llm::test_support::StubLlm;
 use baybo_llm::{LlmCompletion, ModelPricing};
@@ -517,14 +516,13 @@ impl AgentTestHarnessBuilder {
         let human_asks = Arc::new(HumanAskManager::from_config(HumanAskManagerConfig {
             core: Arc::clone(&ask_core),
             queues: ask_queues.clone(),
-            resume_sink: Arc::new(NoResume),
+            resume_sink: Arc::new(baybo_human_ask::test_support::NoResume),
         }));
         if self.channel_ask_gate {
             approval_gates.insert(
                 session.channel.clone(),
                 Arc::new(ChannelAskGate::new(
                     ask_queues.get_or_create(&session.channel),
-                    Arc::new(|_| {}),
                     Arc::clone(&ask_core),
                 )),
             );
@@ -723,18 +721,6 @@ fn share_turn_store(arc: &Arc<MemoryTurnStore>) -> Arc<dyn baybo_turn::TurnStore
 
 fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn baybo_cost::CostStore> {
     arc.clone()
-}
-
-/// The harness has no router, so an answer to a dead ask resumes nothing.
-struct NoResume;
-
-#[async_trait::async_trait]
-impl ResumeSink for NoResume {
-    async fn resumes_on_answer(&self, _session: &baybo_model::SessionId) -> bool {
-        false
-    }
-
-    fn request_resume(&self, _req: baybo_model::human_ask::ResumeRequest) {}
 }
 
 // Avoid unused-import lints when callers don't reference these types.

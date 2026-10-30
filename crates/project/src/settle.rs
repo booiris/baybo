@@ -52,10 +52,11 @@ pub(crate) async fn settle_run(
     )
     .await;
     // Preserve timeline order: run settlement precedes prompt abandonment.
-    if let Some(prompts) = prompts {
-        prompts
-            .close_card_prompts(&run.project_id, run.number)
-            .await;
+    // A run that never reached a session raised no asks.
+    if let Some(prompts) = prompts
+        && let Some(session_id) = run.session_id.as_ref()
+    {
+        prompts.close_run_prompts(session_id).await;
     }
     Ok(true)
 }

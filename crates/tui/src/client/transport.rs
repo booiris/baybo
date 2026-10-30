@@ -359,6 +359,14 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
+        // Kind-agnostic close: the only signal that retires an approval
+        // another client abandoned (`/stop`, a card close), now that nothing
+        // self-denies. A no-op when `ApprovalResolved` already dropped it.
+        // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
+        Frame::AskResolved { ask_id, .. } => {
+            let _ = queue.drop_call(&ask_id);
+            None
+        }
         Frame::Reasoning { .. } => {
             // The TUI surfaces an animated "working" indicator instead of
             // the model's reasoning trace, so reasoning frames are dropped

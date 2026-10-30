@@ -13,30 +13,25 @@ use tokio::sync::oneshot;
 use crate::core::{AskCore, AskEvent};
 use crate::queue::{AskQueue, PendingAsk};
 
-/// Wakes the channel for the ask it was raised FOR. It must not re-read the
-/// queue to find one: the queue is per channel, so two sessions asking at
-/// once race, and a waker that took the tail would announce one ask twice
-/// and the other never.
-pub type Waker = Arc<dyn Fn(PendingAsk) + Send + Sync>;
-
-/// A channel's gate: persist the ask, enqueue it, wake the channel, wait for
-/// a verb to resolve it. No timeout.
+/// A channel's gate: persist the ask, enqueue it, wait for a verb to resolve
+/// it. No timeout. Clients learn of the ask from the queue's
+/// [`AskQueueEvent::AskRaised`](crate::AskQueueEvent::AskRaised), which the
+/// channel's ask watcher turns into a frame.
 pub struct ChannelAskGate {
     queue: AskQueue,
-    waker: Waker,
     core: Arc<AskCore>,
 }
 
 impl ChannelAskGate {
-    pub fn new(queue: AskQueue, waker: Waker, core: Arc<AskCore>) -> Self {
-        Self { queue, waker, core }
+    pub fn new(queue: AskQueue, core: Arc<AskCore>) -> Self {
+        Self { queue, core }
     }
 
     pub fn queue(&self) -> &AskQueue {
         &self.queue
     }
 
-    /// Persist, enqueue, wake and wait. `None` when the row could not be
+    /// Persist, enqueue and wait. `None` when the row could not be
     /// written — nothing was shown, so there is nothing to wait for.
     ///
     /// On a turn cancel the arm returns at once without awaiting anything:
@@ -58,12 +53,11 @@ impl ChannelAskGate {
 
         let ask = PendingAsk::from_row(&row);
         let (tx, rx) = oneshot::channel();
-        self.queue.push_live(ask.clone(), tx);
+        self.queue.push_live(ask, tx);
         let _orphan = OrphanOnDrop {
             queue: self.queue.clone(),
             ask_id: row.ask_id.clone(),
         };
-        (self.waker)(ask);
 
         tokio::select! {
             biased;

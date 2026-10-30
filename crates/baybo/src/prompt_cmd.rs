@@ -253,6 +253,9 @@ async fn run_in_process(
         Vec::new(),
     )
     .await?;
+    // No push task runs here: drop the ask push stream so the relay sees a
+    // closed channel (a no-op) rather than filling a queue nobody drains.
+    drop(graph.ask_push_stream.take());
 
     // Override the channel's interactive approval gate with a session-
     // scoped auto gate. Session-level wins over the type-level gate

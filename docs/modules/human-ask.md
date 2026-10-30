@@ -1,7 +1,8 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
 > Status: **PR 1 in progress** — `baybo-human-ask` (queue, core, gates,
-> manager), the ledger and the `tools::ask` ports exist; see
+> manager), the ledger, the `tools::ask` ports, the agent live/restart paths,
+> the gateway doors, frames and boot order, and the project bridge exist; see
 > [Implementation notes](#implementation-notes-pr-1). This document is the spec the three
 > PRs described in [PR plan](#pr-plan) are built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
@@ -1073,7 +1074,7 @@ pub enum PendingEdge { Raised { ask_id, kind, tool }, Answered, Abandoned }
 pub enum AskEvent { Raised, Resolved(AskResolution) }               // observer events (async, from verbs)
 pub enum AskQueueEvent { AskRaised(PendingAsk), AskClosed { session_id, ask_id, kind, outcome: AskResolution } }  // sync queue watchers (frame dispatch)
 pub struct AskCore { store: Arc<dyn HumanAskStore>, observers: parking_lot::RwLock<Vec<Arc<dyn AskObserver>>> }  // add_observer(&self, ..) — runs after the gates already share the core
-pub struct ChannelAskGate { queue: AskQueue, waker: Arc<dyn Fn(PendingAsk)>, core: Arc<AskCore> }   // impl ApprovalGate (+ QuestionGate in PR 2); stamps applied_at after the oneshot yields
+pub struct ChannelAskGate { queue: AskQueue, core: Arc<AskCore> }   // impl ApprovalGate (+ QuestionGate in PR 2); stamps applied_at after the oneshot yields; no waker — frames come from the queue's AskRaised watcher
 pub struct PolicyDenyGate { core: Arc<AskCore> }                    // impl ApprovalGate
 pub struct HumanAskManager;                     // from_config(HumanAskManagerConfig { core, queues: AskQueues, resume_sink: Arc<dyn ResumeSink> })
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
@@ -1127,15 +1128,50 @@ Where the code differs from the sketch above, and why:
   resumes through the chat Resume door from the `ResumeSink` port itself
   (`resumes_on_answer`), implemented in `baybo-agent` over the session's
   `TriggerSource`. One port, no extra config field, no schema change.
-- **Interim wiring.** Until the gateway's resolve doors move onto
-  `HumanAskManager`, `Channel::resolve_approval` still resolves through the
-  queue alone (no ledger claim). `build_managers` creates the router intake
-  next to `AskCore`/`AskQueues`, builds the `HumanAskManager` right after
-  `recover_orphaned_traces_and_turns` (it needs the `SessionManager` for the
-  sink's issue check) with `baybo_agent::runtime::asks::RouterResumeSink` as
-  its `ResumeSink`, and calls `reload_pending` there (best-effort, logged).
-  `AskPushRelay` does not move yet, so a reload's `Raised` edges reach no push
-  relay until the gateway stage moves it ahead of the manager.
+- **Boot wiring.** `build_managers` follows the [Restart survival](#restart-survival)
+  order: store → `recover_orphaned_traces_and_turns` (which needs the
+  `SessionManager` and `TurnLifecycle`, built just before it) → `AskCore`,
+  `AskQueues` and the router intake → `install_channels` → `AskPushRelay`
+  installed on `owner` → `HumanAskManager` (with
+  `baybo_agent::runtime::asks::RouterResumeSink`) → … → `ProjectManager` →
+  `baybo_project::install_ask_bridge` → `reload_pending` (best-effort,
+  logged) → `ToolExecutor`. `ManagerGraph` carries the relay's stream only,
+  as `ask_push_stream: Option<AskPushStream>` (the relay itself lives on in
+  its watcher closure); `gateway_cmd` takes it for `push::spawn`, which takes
+  an `Option` and disables the arm on `None`, and `baybo prompt` drops it.
+- **No waker.** `ChannelAskGate::new(queue, core)` takes no waker: the
+  gateway's `AskRaised` watcher is the one dispatch home for the raise, as
+  `AskClosed` is for the close, so a reload's dead asks are announced by the
+  same code as live ones.
+- **Re-announcing to a late sidecar.** At watcher-install time no connection
+  is attached yet (the lazy install runs before the sidecar attaches), so a
+  re-announce there would reach nobody. Instead, a multiplexed sidecar is
+  sent every pending approval on its channel's queue right after it
+  registers (`route.rs::announce_pending_asks`), to that connection only.
+- **The resolve doors.** `Channel` has no resolve method any more. The
+  `ResolveApproval` arm checks the ask is on the connection's own channel
+  queue (least privilege: a TUI connection cannot answer an owner ask) and
+  calls `HumanAskManager::resolve`; the queue watchers dispatch
+  `ApprovalResolved` + `AskResolved`. The board's
+  `POST …/approvals/{call_id}` reads the ledger row and answers only a
+  pending `Approval` row whose session's trigger is that issue, mapping
+  `AskClosed` / `NotFound` to 404.
+- **The card bridge.** `CardPromptCloser`'s one method is
+  `close_run_prompts(&SessionId)`, called by `settle_run` with the run's
+  `session_id` (skipped for a run that never reached a session).
+  `TimelineAskObserver` records nothing for `PolicyDenied` (the card never
+  showed the prompt) or for question payloads.
+- **`AskOutcomeKind`.** `From<&AskResolution>`: `Approval(_)` and
+  `Answered(_)` → `answered`, `Declined` and `PolicyDenied` → `declined`
+  (a policy denial never enters a queue, so never actually reaches the
+  wire), `Abandoned` → `abandoned`.
+- **Push titles.** `AskPush` carries the ask's `kind`; `ask_push_text`
+  picks `APPROVAL_TITLE` + the tool-name body or `QUESTION_TITLE` + the fixed
+  "Open the conversation to answer". The pre-POST recheck is
+  `channel.ask_queue().contains(ask_id)`.
+- **iOS.** The app's issue bridge (`IssueWire.swift`) also sends
+  `awaiting_human` (from the REST twin) so the iOS web transcript's
+  `IssueDetail` type stays pinned both ways to `IssueDto`.
 - **The settlement.** `TurnAsks` grew `unapplied`, `settle_unapplied`,
   `mark_applied` and `get` (the manager gained the public
   `unapplied_for_session` to answer the first). The approval re-execution

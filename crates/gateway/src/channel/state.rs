@@ -132,6 +132,8 @@ pub struct WsChannelState {
     /// What a lazily installed channel builds its ask gate from.
     pub ask_core: Arc<baybo_human_ask::AskCore>,
     pub ask_queues: baybo_human_ask::AskQueues,
+    /// The resolve door for `ResolveApproval`.
+    pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
 }
 
 impl WsChannelState {
@@ -174,6 +176,7 @@ impl WsChannelState {
             relay_dialer: deps.relay_dialer.clone(),
             ask_core: Arc::clone(&deps.ask_core),
             ask_queues: deps.ask_queues.clone(),
+            human_asks: Arc::clone(&deps.human_asks),
         }
     }
 }

@@ -1,15 +1,16 @@
-//! Approval-gate push relay.
+//! Ask push relay.
 //!
-//! A tool call that trips the approval gate parks until somebody answers it.
+//! A tool call parked on an ask — an approval, or (from PR 2) a question —
+//! waits until somebody answers it.
 //! Nothing on the [`TurnLifecycle`](baybo_turn::TurnLifecycle)
 //! bus fires while it waits — that bus only speaks in completed turns — so the
 //! dispatcher's existing subscription cannot see the one moment the user's
 //! attention is load-bearing. This relay is the second source feeding
 //! [`PushDispatcher`](super::PushDispatcher).
 //!
-//! It hangs off the approval queue's per-session
-//! [`PendingEdge`] stream rather than the gate's waker, which buys two things
-//! the waker cannot: the edge is already deduplicated (a second prompt on an
+//! It hangs off the ask queue's per-session
+//! [`PendingEdge`] stream rather than the per-ask events, which buys two things
+//! a per-ask hook cannot: the edge is already deduplicated (a second prompt on an
 //! already-waiting conversation is silent), and the queue distinguishes a
 //! prompt somebody *answered* from one that was simply *abandoned* — the
 //! difference between "the user is here, interrupt them again" and "nobody
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant};
 use baybo_channels::Channel;
 use baybo_human_ask::PendingEdge;
 use baybo_model::SessionId;
+use baybo_model::human_ask::{AskId, AskKind};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
@@ -37,11 +39,10 @@ const APPROVAL_PUSH_QUEUE: usize = 64;
 /// How long to stay quiet about a conversation whose last approval prompt
 /// nobody answered.
 ///
-/// A denied call does not end the turn: the agent is told not to retry that
-/// tool and commonly reaches for an alternative that is *also* gated. Left
-/// alone, an unattended overnight run announces itself once per gate timeout —
-/// roughly twelve times an hour, all night. Backing off after an abandoned
-/// prompt bounds that at two an hour, while a conversation the user actually
+/// An abandoned prompt (`/stop`, a card close, the user moving on) does not
+/// end the conversation: the agent commonly reaches for an alternative that is
+/// *also* gated. Backing off after an abandoned prompt bounds the
+/// re-announcements at two an hour, while a conversation the user actually
 /// answers resets to zero and interrupts again immediately.
 const RENAG_AFTER_ABANDONED: Duration = Duration::from_secs(30 * 60);
 
@@ -50,14 +51,18 @@ const RENAG_AFTER_ABANDONED: Duration = Duration::from_secs(30 * 60);
 /// locked phone renders, and it has to read as something to act on.
 pub(crate) const APPROVAL_TITLE: &str = "Baybo needs approval";
 
-/// One buzz-worthy approval prompt, handed to the push dispatcher.
-pub struct ApprovalPush {
+/// The title of a question push.
+pub(crate) const QUESTION_TITLE: &str = "Baybo has a question";
+
+/// One buzz-worthy pending ask, handed to the push dispatcher.
+pub struct AskPush {
     pub(crate) session_id: SessionId,
-    /// The prompt's own id — rechecked against the live queue immediately
+    /// The ask's own id — rechecked against the pending set immediately
     /// before the POST, because everything between here and there (store
     /// reads, vault reads, two TLS round-trips) is time in which someone at a
     /// desk can answer it.
-    pub(crate) call_id: String,
+    pub(crate) ask_id: AskId,
+    pub(crate) kind: AskKind,
     /// Tool name, and deliberately nothing else. See [`approval_push_body`].
     pub(crate) tool: String,
     /// The channel the prompt is parked on, for that recheck. `Weak` so a
@@ -82,11 +87,23 @@ pub(crate) fn approval_push_body(tool: &str) -> String {
     format!("{tool} is waiting for your approval")
 }
 
-/// Receiving half, drained by the push task's `select!` loop.
-pub struct ApprovalPushStream(mpsc::Receiver<ApprovalPush>);
+/// The title and body of a push for `push`. A question's body carries no
+/// model-authored text: the questions are the model's words, and a lock
+/// screen is no place for them.
+pub(crate) fn ask_push_text(push: &AskPush) -> (&'static str, String) {
+    match push.kind {
+        AskKind::Approval => (APPROVAL_TITLE, approval_push_body(&push.tool)),
+        AskKind::Question => (QUESTION_TITLE, QUESTION_BODY.to_owned()),
+    }
+}
 
-impl ApprovalPushStream {
-    pub async fn recv(&mut self) -> Option<ApprovalPush> {
+const QUESTION_BODY: &str = "Open the conversation to answer";
+
+/// Receiving half, drained by the push task's `select!` loop.
+pub struct AskPushStream(mpsc::Receiver<AskPush>);
+
+impl AskPushStream {
+    pub async fn recv(&mut self) -> Option<AskPush> {
         self.0.recv().await
     }
 }
@@ -99,25 +116,25 @@ struct SessionNag {
     abandoned: bool,
 }
 
-/// Watches approval-queue edges and forwards the ones worth a notification.
-pub struct ApprovalPushRelay {
-    tx: mpsc::Sender<ApprovalPush>,
+/// Watches ask-queue edges and forwards the ones worth a notification.
+pub struct AskPushRelay {
+    tx: mpsc::Sender<AskPush>,
     nag: DashMap<SessionId, SessionNag>,
 }
 
-impl ApprovalPushRelay {
-    pub fn new() -> (Arc<Self>, ApprovalPushStream) {
+impl AskPushRelay {
+    pub fn new() -> (Arc<Self>, AskPushStream) {
         let (tx, rx) = mpsc::channel(APPROVAL_PUSH_QUEUE);
         (
             Arc::new(Self {
                 tx,
                 nag: DashMap::new(),
             }),
-            ApprovalPushStream(rx),
+            AskPushStream(rx),
         )
     }
 
-    /// Attach to `channel`'s approval queue. Call once, on the channel whose
+    /// Attach to `channel`'s ask queue. Call once, on the channel whose
     /// clients can actually answer a prompt — a push that deep-links into a
     /// conversation whose gate lives on some other channel's queue would open
     /// a chat with no card in it.
@@ -137,7 +154,7 @@ impl ApprovalPushRelay {
         edge: &PendingEdge,
         channel: &Weak<Channel>,
     ) {
-        let PendingEdge::Raised { ask_id, tool, .. } = edge else {
+        let PendingEdge::Raised { ask_id, kind, tool } = edge else {
             // Somebody decided → they are present, and the next prompt in this
             // conversation earns a fresh interruption. Nobody came → keep the
             // timestamp and remember why.
@@ -177,9 +194,10 @@ impl ApprovalPushRelay {
             return;
         }
 
-        let push = ApprovalPush {
+        let push = AskPush {
             session_id: session_id.clone(),
-            call_id: ask_id.to_string(),
+            ask_id: ask_id.clone(),
+            kind: *kind,
             tool: tool.clone(),
             channel: channel.clone(),
         };
@@ -219,7 +237,7 @@ mod tests {
     fn raised(call_id: &str, tool: &str) -> PendingEdge {
         PendingEdge::Raised {
             ask_id: call_id.parse().expect("ask id"),
-            kind: baybo_model::human_ask::AskKind::Approval,
+            kind: AskKind::Approval,
             tool: tool.into(),
         }
     }
@@ -245,12 +263,35 @@ mod tests {
     }
 
     #[test]
+    fn the_title_follows_the_ask_kind() {
+        let mut push = AskPush {
+            session_id: SessionId::from("s1"),
+            ask_id: "c1".parse().expect("ask id"),
+            kind: AskKind::Approval,
+            tool: "Bash".into(),
+            channel: detached(),
+        };
+        assert_eq!(
+            ask_push_text(&push),
+            (
+                APPROVAL_TITLE,
+                "Bash is waiting for your approval".to_owned()
+            )
+        );
+        push.kind = AskKind::Question;
+        assert_eq!(
+            ask_push_text(&push),
+            (QUESTION_TITLE, QUESTION_BODY.to_owned())
+        );
+    }
+
+    #[test]
     fn a_raise_pushes_and_carries_the_prompt_identity() {
-        let (relay, mut stream) = ApprovalPushRelay::new();
+        let (relay, mut stream) = AskPushRelay::new();
         relay.observe(&SessionId::from("s1"), &raised("c1", "Bash"), &detached());
         let push = stream.0.try_recv().expect("a push was queued");
         assert_eq!(push.session_id, SessionId::from("s1"));
-        assert_eq!(push.call_id, "c1");
+        assert_eq!(push.ask_id.as_str(), "c1");
         assert_eq!(push.tool, "Bash");
     }
 
@@ -259,21 +300,21 @@ mod tests {
         // The sequential shape: gated tools are Exclusive, so an approval-heavy
         // turn prompts one at a time. Each prompt the user answers is a real
         // block on the turn, and must buzz.
-        let (relay, mut stream) = ApprovalPushRelay::new();
+        let (relay, mut stream) = AskPushRelay::new();
         let s = SessionId::from("s1");
         relay.observe(&s, &raised("c1", "Bash"), &detached());
         relay.observe(&s, &PendingEdge::Answered, &detached());
         relay.observe(&s, &raised("c2", "Write"), &detached());
-        assert_eq!(stream.0.try_recv().expect("first").call_id, "c1");
-        assert_eq!(stream.0.try_recv().expect("second").call_id, "c2");
+        assert_eq!(stream.0.try_recv().expect("first").ask_id.as_str(), "c1");
+        assert_eq!(stream.0.try_recv().expect("second").ask_id.as_str(), "c2");
     }
 
     #[test]
     fn an_abandoned_prompt_silences_the_conversation_for_a_while() {
-        // The unattended shape: nobody answered, the gate self-denied, and the
-        // agent reached for another gated approach. Re-announcing every cycle
+        // The walked-away shape: nobody answered, the ask was abandoned, and
+        // the agent reached for another gated approach. Re-announcing every cycle
         // is what turns one blocked turn into an all-night stream.
-        let (relay, mut stream) = ApprovalPushRelay::new();
+        let (relay, mut stream) = AskPushRelay::new();
         let s = SessionId::from("s1");
         relay.observe(&s, &raised("c1", "Bash"), &detached());
         assert!(stream.0.try_recv().is_ok());
@@ -294,7 +335,7 @@ mod tests {
 
     #[test]
     fn the_quiet_period_expires() {
-        let (relay, mut stream) = ApprovalPushRelay::new();
+        let (relay, mut stream) = AskPushRelay::new();
         let s = SessionId::from("s1");
         relay.observe(&s, &raised("c1", "Bash"), &detached());
         assert!(stream.0.try_recv().is_ok());
@@ -304,12 +345,15 @@ mod tests {
             nag.last_push = Instant::now() - RENAG_AFTER_ABANDONED - Duration::from_secs(1);
         }
         relay.observe(&s, &raised("c2", "Write"), &detached());
-        assert_eq!(stream.0.try_recv().expect("re-nag allowed").call_id, "c2");
+        assert_eq!(
+            stream.0.try_recv().expect("re-nag allowed").ask_id.as_str(),
+            "c2"
+        );
     }
 
     #[test]
     fn a_full_queue_drops_rather_than_blocking() {
-        let (relay, _stream) = ApprovalPushRelay::new();
+        let (relay, _stream) = AskPushRelay::new();
         // Distinct sessions so the nag policy never suppresses; only capacity
         // can stop these. The watcher runs under the gate's lock — it must
         // return no matter what.

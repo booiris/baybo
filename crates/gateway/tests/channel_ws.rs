@@ -873,7 +873,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
                 archived: Some(false),
                 folder_id: None,
                 title: None,
-                approval_pending: None,
+                awaiting_human: None,
             },
         );
 
@@ -1057,15 +1057,19 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
     match frame {
         Frame::SessionUpdated { session_id, patch } => {
             assert_eq!(session_id, "sess-blocked");
-            assert_eq!(patch.approval_pending, Some(true));
+            assert_eq!(patch.awaiting_human, Some(true));
         }
         other => panic!("expected SessionUpdated, got {other:?}"),
     }
 
-    assert_eq!(
-        channel.resolve_approval("prompt-1", baybo_tools::ApprovalDecision::Deny),
-        Some(baybo_model::SessionId::from("sess-blocked"))
-    );
+    tg.deps
+        .human_asks
+        .resolve(
+            &"prompt-1".parse().expect("ask id"),
+            baybo_model::human_ask::AskResolution::Approval(baybo_tools::ApprovalDecision::Deny),
+        )
+        .await
+        .expect("resolve through the ledger");
     assert_eq!(
         parked.await.expect("gate task"),
         baybo_tools::ApprovalOutcome::answered(baybo_tools::ApprovalDecision::Deny)
@@ -1077,7 +1081,7 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
     match frame {
         Frame::SessionUpdated { session_id, patch } => {
             assert_eq!(session_id, "sess-blocked");
-            assert_eq!(patch.approval_pending, Some(false));
+            assert_eq!(patch.awaiting_human, Some(false));
         }
         other => panic!("expected SessionUpdated, got {other:?}"),
     }
@@ -1717,6 +1721,143 @@ async fn a_message_for_an_unsubscribed_session_is_nacked_with_a_notice() {
             .is_err(),
         "the dropped message must never reach the router",
     );
+
+    drop(client);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+/// A client answering a card goes through the ask manager: the decision is
+/// claimed in the ledger, the parked call gets it, and every subscriber —
+/// including the one that answered — receives `ApprovalResolved` followed by
+/// the kind-agnostic `AskResolved`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_approval_frame_answers_through_the_ledger() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &ChannelsConfig::default(),
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install");
+    let session = tg
+        .deps
+        .session_manager
+        .create_session(
+            User {
+                id: WEB_OPERATOR_USER_ID.into(),
+                name: None,
+                channel: ChannelType::owner(),
+            },
+            ChannelType::owner(),
+        )
+        .await
+        .expect("create session");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
+        .await
+        .expect("WS handshake");
+    send_frame(
+        &mut client,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+        },
+    )
+    .await
+    .expect("send Subscribe");
+    expect_idle_subscribe_state(&mut client, session.id.as_str()).await;
+
+    let gate = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner channel")
+        .approval_gate()
+        .expect("gate");
+    let req = baybo_tools::ApprovalRequest {
+        call_id: "prompt-ws".into(),
+        tool_call_id: "use-ws".into(),
+        session_id: session.id.clone(),
+        user_id: WEB_OPERATOR_USER_ID.into(),
+        tool: "Bash".into(),
+        accesses: vec![],
+        params_preview: "{}".into(),
+        description: None,
+    };
+    let parked = tokio::spawn(async move {
+        gate.request(
+            req,
+            baybo_tools::AskSite::for_test(),
+            baybo_tools::AskCancel::never(),
+        )
+        .await
+    });
+
+    let mut saw_request = false;
+    while !saw_request {
+        match recv_frame_skip_activity(&mut client, Duration::from_secs(2))
+            .await
+            .expect("the raise")
+        {
+            Frame::ApprovalRequested { call_id, .. } => {
+                assert_eq!(call_id, "prompt-ws");
+                saw_request = true;
+            }
+            Frame::SessionUpdated { .. } => {}
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+    }
+
+    send_frame(
+        &mut client,
+        Frame::ResolveApproval {
+            call_id: "prompt-ws".into(),
+            decision: baybo_tools::ApprovalDecision::Approve,
+        },
+    )
+    .await
+    .expect("send ResolveApproval");
+    assert_eq!(
+        parked.await.expect("gate task"),
+        baybo_tools::ApprovalOutcome::answered(baybo_tools::ApprovalDecision::Approve)
+    );
+
+    let mut closes = Vec::new();
+    while closes.len() < 2 {
+        match recv_frame_skip_activity(&mut client, Duration::from_secs(2))
+            .await
+            .expect("the close")
+        {
+            Frame::SessionUpdated { .. } => {}
+            other => closes.push(other),
+        }
+    }
+    assert_eq!(
+        closes,
+        vec![
+            Frame::ApprovalResolved {
+                call_id: "prompt-ws".into(),
+                decision: baybo_tools::ApprovalDecision::Approve,
+            },
+            Frame::AskResolved {
+                ask_id: "prompt-ws".into(),
+                outcome: wire::AskOutcomeKind::Answered,
+            },
+        ]
+    );
+    let row = tg
+        .deps
+        .human_asks
+        .get(&"prompt-ws".parse().expect("ask id"))
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(row.resolved_at.is_some(), "the decision is in the ledger");
 
     drop(client);
     shutdown.trigger();

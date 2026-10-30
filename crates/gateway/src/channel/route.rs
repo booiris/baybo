@@ -19,6 +19,7 @@ use baybo_channels::wire::{
     TurnSnapshot, WireAttachment,
 };
 use baybo_channels::{ChannelKind, IncomingMessage, Message as AgentMessage, RouterInbound};
+use baybo_model::human_ask::{AskId, AskResolution};
 use baybo_model::{BlobRef, ChannelType, ContentBlock, MessageMetadata, SessionId, User};
 use baybo_store::BlobStore;
 use chrono::Utc;
@@ -158,6 +159,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         }
         let sent = push_live_bots(&state, &channel_type, &sidecar).await;
         state.bot_reconciler.seed(channel_type.clone(), sent);
+        announce_pending_asks(&sidecar).await;
     }
 
     run_inbound_loop(
@@ -186,6 +188,62 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         duration_ms = attached_at.elapsed().as_millis() as u64,
         "channel-ws client disconnected"
     );
+}
+
+/// A multiplexed channel has no `SubscribeState` catch-up, so a sidecar that
+/// connects after an ask was raised — the boot reload's dead asks, or a raise
+/// during a reconnect — is told about every pending approval on its queue.
+async fn announce_pending_asks(sidecar: &Sidecar) {
+    let Some(queue) = sidecar.channel.ask_queue() else {
+        return;
+    };
+    for req in queue.list_approvals() {
+        let frame = Frame::ApprovalRequested {
+            call_id: req.call_id,
+            tool_call_id: Some(req.tool_call_id),
+            session_id: req.session_id,
+            user_id: req.user_id,
+            tool: req.tool,
+            accesses: req.accesses,
+            params_preview: req.params_preview,
+            description: req.description,
+        };
+        if let Err(e) = sidecar.send_frame(frame).await {
+            tracing::warn!(error = %e, "re-announce a pending approval failed");
+            return;
+        }
+    }
+}
+
+/// A client answered an approval card. Scoped to this connection's channel:
+/// only an ask on its own queue (live, or dead after a restart) is answerable
+/// from here. The manager claims the decision in the ledger first; the queue
+/// watchers then dispatch `ApprovalResolved` + `AskResolved` to every client.
+async fn resolve_approval(
+    state: &WsChannelState,
+    sidecar: &Sidecar,
+    call_id: &str,
+    decision: baybo_tools::ApprovalDecision,
+) {
+    let Ok(ask_id) = call_id.parse::<AskId>() else {
+        tracing::debug!(%call_id, "ResolveApproval with an empty call_id; ignored");
+        return;
+    };
+    if !sidecar
+        .channel
+        .ask_queue()
+        .is_some_and(|queue| queue.contains(&ask_id))
+    {
+        tracing::debug!(%call_id, "ResolveApproval for an ask not pending here; ignored");
+        return;
+    }
+    if let Err(e) = state
+        .human_asks
+        .resolve(&ask_id, AskResolution::Approval(decision))
+        .await
+    {
+        tracing::debug!(%call_id, error = %e, "ResolveApproval not applied");
+    }
 }
 
 async fn receive_register(
@@ -524,21 +582,7 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                 }
             }
             Frame::ResolveApproval { call_id, decision } => {
-                // The connection-side frame doesn't carry the
-                // `session_id`; the queue entry does, and
-                // `Sidecar::resolve_approval` reads it off the
-                // removed entry so the follow-up broadcast
-                // targets the right subscribers (a Subscribed
-                // channel's `dispatch_event` keys on
-                // `session_id`; an empty placeholder would
-                // dispatch to nobody).
-                let resolved = sidecar.resolve_approval(&call_id, decision);
-                if !resolved {
-                    tracing::debug!(
-                        call_id = %call_id,
-                        "ResolveApproval for unknown call_id; ignored"
-                    );
-                }
+                resolve_approval(state, sidecar, &call_id, decision).await;
             }
             Frame::HistoryAppend { session_id, entry } => {
                 if channel_type.as_str() != ChannelType::TUI {

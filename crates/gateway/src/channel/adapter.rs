@@ -29,7 +29,6 @@ use baybo_channels::{
 };
 use baybo_model::{ChannelType, ContentBlock};
 use baybo_store::BlobStore;
-use baybo_tools::ApprovalDecision;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -283,27 +282,6 @@ impl Sidecar {
         self.connection.id()
     }
 
-    /// Resolve a pending approval and broadcast `ApprovalResolved` to
-    /// every subscriber of the call's session. Called from the inbound
-    /// loop when the client sends `ResolveApproval`. Returns `true` if
-    /// a pending entry matched the call id. The session id is read off
-    /// the resolved queue entry — the connection-side frame doesn't
-    /// carry one, and dispatching with an empty id on a
-    /// [`ChannelKind::Subscribed`](baybo_channels::ChannelKind::Subscribed) channel would silently fan out to
-    /// nobody.
-    pub(crate) fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> bool {
-        let Some(session_id) = self.channel.resolve_approval(call_id, decision) else {
-            return false;
-        };
-        super::boot::broadcast_approval_resolved(
-            &self.channel,
-            call_id.to_owned(),
-            session_id,
-            decision,
-        );
-        true
-    }
-
     /// Wind the leg down gracefully: detach from the channel, release the
     /// outbound sender so [`pump_loop`] runs out of frames and exits on its own,
     /// and await that exit (so its `close` reaches the wire). The abrupt
@@ -436,6 +414,12 @@ async fn session_event_to_frame(
         SessionEvent::ApprovalResolved {
             call_id, decision, ..
         } => Frame::ApprovalResolved { call_id, decision },
+        SessionEvent::AskResolved {
+            ask_id, outcome, ..
+        } => Frame::AskResolved {
+            ask_id: ask_id.to_string(),
+            outcome,
+        },
     }
 }
 
@@ -845,6 +829,26 @@ mod tests {
         assert!(
             sink_dropped.load(std::sync::atomic::Ordering::SeqCst),
             "the outbound pump must die with the leg, releasing the socket"
+        );
+    }
+
+    /// `AskResolved` is session-less on the wire: the session only keyed
+    /// delivery.
+    #[tokio::test]
+    async fn ask_resolved_drops_its_session_on_the_wire() {
+        let event = baybo_channels::SessionEvent::AskResolved {
+            session_id: "s1".into(),
+            ask_id: "c1".parse().expect("ask id"),
+            outcome: baybo_channels::wire::AskOutcomeKind::Abandoned,
+        };
+        let blobs = MemoryBlobStore::new();
+        let frame = super::session_event_to_frame(event, &ChannelType::owner(), &blobs).await;
+        assert_eq!(
+            frame,
+            Frame::AskResolved {
+                ask_id: "c1".into(),
+                outcome: baybo_channels::wire::AskOutcomeKind::Abandoned,
+            }
         );
     }
 

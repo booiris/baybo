@@ -1517,7 +1517,7 @@ async fn an_archived_board_does_not_answer_the_prompts_it_left_parked() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(card["approval_pending"], json!(false));
+    assert_eq!(card["awaiting_human"], json!(false));
 
     post(
         &router,
@@ -1550,7 +1550,7 @@ async fn a_card_says_when_a_run_on_it_is_waiting_for_an_answer() {
 
     let listed = get(&router, &format!("/v1/projects/{p}/issues"), StatusCode::OK).await;
     for card in listed["items"].as_array().expect("items") {
-        assert_eq!(card["approval_pending"], json!(false));
+        assert_eq!(card["awaiting_human"], json!(false));
     }
 
     let session = issue_session(&tg, &p, 1).await;
@@ -1561,7 +1561,7 @@ async fn a_card_says_when_a_run_on_it_is_waiting_for_an_answer() {
         .as_array()
         .expect("items")
         .iter()
-        .filter(|card| card["approval_pending"] == json!(true))
+        .filter(|card| card["awaiting_human"] == json!(true))
         .map(|card| card["number"].as_i64().expect("number"))
         .collect();
     assert_eq!(
@@ -1575,7 +1575,7 @@ async fn a_card_says_when_a_run_on_it_is_waiting_for_an_answer() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(card["approval_pending"], json!(true));
+    assert_eq!(card["awaiting_human"], json!(true));
 
     post(
         &router,
@@ -1592,7 +1592,7 @@ async fn a_card_says_when_a_run_on_it_is_waiting_for_an_answer() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(card["approval_pending"], json!(false));
+    assert_eq!(card["awaiting_human"], json!(false));
 }
 
 fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
@@ -1603,11 +1603,6 @@ fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
         &tg.deps.ask_queues,
     )
     .expect("install the owner channel");
-    baybo_gateway::channel::boot::install_timeline_approval_gate(
-        &tg.deps.channel_registry,
-        std::sync::Arc::clone(&tg.deps.project_manager),
-        tg.deps.session_manager.store(),
-    );
 }
 
 async fn issue_session(
@@ -1707,18 +1702,18 @@ async fn answering_a_prompt_does_not_depend_on_its_timeline_entry() {
     open_issue(&router, &p, "still blocked").await;
     let session = issue_session(&tg, &p, 1).await;
 
-    let channel = tg
-        .deps
-        .channel_registry
-        .get(&baybo_model::ChannelType::owner())
-        .expect("owner channel");
-    let blocked = park_through(
-        &tg,
-        channel.approval_gate().expect("approval gate"),
-        &session,
-        "c-unwritten",
-    )
-    .await;
+    // A gate over the same ledger and queue but with no timeline observer:
+    // the shape of a card whose `approval_requested` write was lost.
+    let unobserved: std::sync::Arc<dyn baybo_tools::ApprovalGate> =
+        std::sync::Arc::new(baybo_human_ask::ChannelAskGate::new(
+            tg.deps
+                .ask_queues
+                .get_or_create(&baybo_model::ChannelType::owner()),
+            std::sync::Arc::new(baybo_human_ask::AskCore::new(
+                tg.deps.stores.human_ask.clone(),
+            )),
+        ));
+    let blocked = park_through(&tg, unobserved, &session, "c-unwritten").await;
     assert!(
         issue_events(&router, &p, 1)
             .await

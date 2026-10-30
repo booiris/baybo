@@ -19,7 +19,7 @@ pub mod test_support;
 
 pub use crate::core::{AskCore, AskEvent};
 pub use error::{HumanAskError, Result};
-pub use gate::{ChannelAskGate, PolicyDenyGate, Waker};
+pub use gate::{ChannelAskGate, PolicyDenyGate};
 pub use manager::{HumanAskManager, HumanAskManagerConfig, ReloadReport, Settled, ToolCallAbandon};
 pub use ports::{AskObserver, LivePendingAsks, ResumeSink};
 pub use queue::{

@@ -21,7 +21,7 @@ use crate::error::HumanAskError;
 use crate::gate::{ChannelAskGate, PolicyDenyGate};
 use crate::manager::{HumanAskManager, HumanAskManagerConfig, Settled, ToolCallAbandon};
 use crate::ports::{AskObserver, ResumeSink};
-use crate::queue::{AskQueue, AskQueues, PendingEdge};
+use crate::queue::{AskQueue, AskQueueEvent, AskQueues, PendingEdge};
 use crate::test_support::MemoryHumanAskStore;
 
 const ISSUE_SESSION: &str = "issue-session";
@@ -91,11 +91,12 @@ fn harness() -> Harness {
     }));
     let woken = Arc::new(Mutex::new(Vec::new()));
     let woken_sink = Arc::clone(&woken);
-    let gate = Arc::new(ChannelAskGate::new(
-        queue.clone(),
-        Arc::new(move |ask| woken_sink.lock().push(ask.ask_id)),
-        Arc::clone(&core),
-    ));
+    queue.add_ask_watcher(Arc::new(move |event| {
+        if let AskQueueEvent::AskRaised(ask) = event {
+            woken_sink.lock().push(ask.ask_id);
+        }
+    }));
+    let gate = Arc::new(ChannelAskGate::new(queue.clone(), Arc::clone(&core)));
     let sink = Arc::new(RecordingSink::default());
     let manager = Arc::new(HumanAskManager::from_config(HumanAskManagerConfig {
         core: Arc::clone(&core),
@@ -713,7 +714,7 @@ async fn observers_hear_every_verb() {
 }
 
 #[tokio::test]
-async fn the_waker_is_handed_the_ask_it_was_woken_for() {
+async fn each_raise_is_announced_with_its_own_ask() {
     let h = harness();
     let a = park(&h, "a", "s1", AskPhase::BeforeExecute, tokens()).await;
     let b = park(&h, "b", "s2", AskPhase::BeforeExecute, tokens()).await;

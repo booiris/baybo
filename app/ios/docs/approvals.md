@@ -103,13 +103,18 @@ asked — everything a timeline entry has). They are genuinely different planes,
 not two spellings of one, and `ApprovalCardView` is shared by taking the chat's
 shape as its input.
 
-The live queue is the truth on both sides. On the board that matters more,
-because the pending set is *replayed from history*: a gateway restart drops
-every parked prompt without writing a resolution, and a timed-out prompt
-self-denies the same way — so an entry can name a prompt nothing is waiting
-for, which is why answering one tolerates a 404 and reads it as "already
-closed". The card's `approval_pending` flag comes off the live queue rather
-than the timeline for exactly that reason.
+The server's pending set is the truth on both sides. On the board that matters
+more, because the pending set is *replayed from history*. Prompts no longer
+time out and survive a gateway restart (the gateway re-queues them from its
+ask ledger), but a prompt can still close without a decision — a `/stop`, a
+settled run, the user moving on — so an entry can name a prompt nothing is
+waiting for, which is why answering one tolerates a 404 and reads it as
+"already closed". The card's `approval_pending` flag (the gateway's REST twin
+of `awaiting_human`, until PR 3 of the human-ask rollout moves the app onto
+the new name) comes off the gateway's ask queue rather than the timeline for
+exactly that reason. The chat list's `SessionUpdated` patch key is already
+`awaiting_human`, so the patch-driven list mark on an installed phone is dark
+until PR 3; the REST twin keeps the cold-start mark and the board working.
 
 ## Related
 

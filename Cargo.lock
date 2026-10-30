@@ -939,6 +939,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "baybo-human-ask",
  "baybo-model",
  "baybo-session",
  "baybo-storage",
@@ -7179,6 +7180,7 @@ dependencies = [
  "chrono",
  "rmp-serde",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "ts-rs",
 ]

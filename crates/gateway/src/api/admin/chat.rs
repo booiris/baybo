@@ -837,15 +837,21 @@ pub struct ChatSessionSummary {
     /// Auto-generated conversation title, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// True while a tool call in this session is parked on the approval gate,
-    /// waiting for the user to approve or deny it. The client marks the row so
-    /// the user knows which conversation to open; the prompt itself is only
-    /// answerable inside the conversation.
+    /// True while an ask of any kind in this session is waiting on the user
+    /// — a tool approval, or a question. The client marks the row so the user
+    /// knows which conversation to open; the ask itself is only answerable
+    /// inside the conversation.
     ///
-    /// Derived from live in-memory gate state, never the store: a parked turn
-    /// dies with the gateway process, so reading `false` after a restart is
-    /// correct rather than stale. Absent when false.
+    /// Read from the in-memory ask queues, which the boot reload refills from
+    /// the ask ledger, so a pending ask keeps its mark across a restart.
+    /// Absent when false.
     #[serde(default, skip_serializing_if = "is_false")]
+    pub awaiting_human: bool,
+    /// Deprecated twin of `awaiting_human`, always the same value. Kept for
+    /// clients that predate the rename; removed in PR 3 of the human-ask
+    /// rollout (`docs/modules/human-ask.md`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[schema(deprecated)]
     pub approval_pending: bool,
 }
 
@@ -925,9 +931,9 @@ async fn create_session(
             // uncategorized.
             folder_id: None,
             title: None,
-            // A session that has never run a turn cannot be parked on the
-            // approval gate; the queue publishes its own edges from there on.
-            approval_pending: None,
+            // A session that has never run a turn cannot have a pending ask;
+            // the queue publishes its own edges from there on.
+            awaiting_human: None,
         },
     );
     Ok(Json(ChatSessionCreated {
@@ -1089,6 +1095,7 @@ async fn list_sessions(
                 last_message_text,
                 folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
                 unread_count: unread as i64,
+                awaiting_human: waiting_on_approval.contains(&s.id),
                 approval_pending: waiting_on_approval.contains(&s.id),
                 title: s.title.clone(),
             }
@@ -2422,10 +2429,10 @@ async fn unhide_session(
                 id: f.as_str().to_owned(),
             }),
             title: session.title.clone(),
-            // Absent = no change. A prompt parked while the row was hidden
+            // Absent = no change. An ask raised while the row was hidden
             // keeps its mark from the queue's own edge; the re-added row picks
             // it up on the next list merge.
-            approval_pending: None,
+            awaiting_human: None,
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)

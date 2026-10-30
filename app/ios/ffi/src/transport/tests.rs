@@ -258,7 +258,7 @@ async fn an_approval_mark_for_a_never_opened_session_still_reaches_the_list() {
         .dispatch(Frame::SessionUpdated {
             session_id: "unopened".into(),
             patch: wire::SessionPatch {
-                approval_pending: Some(true),
+                awaiting_human: Some(true),
                 ..Default::default()
             },
         })
@@ -281,7 +281,7 @@ async fn an_approval_clear_rides_the_same_tee() {
         .dispatch(Frame::SessionUpdated {
             session_id: "s1".into(),
             patch: wire::SessionPatch {
-                approval_pending: Some(false),
+                awaiting_human: Some(false),
                 ..Default::default()
             },
         })
@@ -306,7 +306,7 @@ async fn a_patch_carrying_a_title_and_an_approval_flag_fires_both_hops() {
             session_id: "s1".into(),
             patch: wire::SessionPatch {
                 title: Some("Reset password flow".into()),
-                approval_pending: Some(true),
+                awaiting_human: Some(true),
                 ..Default::default()
             },
         })
@@ -317,7 +317,7 @@ async fn a_patch_carrying_a_title_and_an_approval_flag_fires_both_hops() {
 }
 
 /// A pin / archive / hide patch carries neither field and must stay silent
-/// on both — an absent `approval_pending` means "no change", never `false`.
+/// on both — an absent `awaiting_human` means "no change", never `false`.
 #[tokio::test]
 async fn a_patch_without_the_approval_field_changes_nothing() {
     let (fixture, _sinks) = Fixture::new(&[]);

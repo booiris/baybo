@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use baybo_human_ask::{AskQueue, PendingWatcher};
-use baybo_model::human_ask::{AskId, AskResolution};
+use baybo_model::human_ask::AskId;
 use baybo_model::{ChannelType, ResourceAccess, SessionId};
 use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use chrono::{DateTime, Utc};
@@ -237,21 +237,6 @@ impl Channel {
         }
     }
 
-    /// Resolve a pending approval by `call_id`. Returns the matched
-    /// entry's `session_id` so the caller can follow up with
-    /// [`Channel::dispatch_approval_resolved`] targeting the right
-    /// subscriber set — the connection-side `ResolveApproval` frame
-    /// doesn't carry `session_id` itself. `None` when no queue entry
-    /// matched (or the channel has no approval surface).
-    pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId> {
-        let approvals = self.approvals.as_ref()?;
-        let ask_id: AskId = call_id.parse().ok()?;
-        approvals
-            .queue
-            .resolve(&ask_id, AskResolution::Approval(decision))
-            .map(|removed| removed.ask.session_id)
-    }
-
     /// This channel's ask queue, when it has an ask surface.
     pub fn ask_queue(&self) -> Option<&AskQueue> {
         self.approvals.as_ref().map(|a| &a.queue)
@@ -333,8 +318,7 @@ impl Channel {
     }
 
     /// Publish an `ApprovalResolved` event so concurrent UIs drop the
-    /// prompt. Caller must have already resolved the queue entry via
-    /// [`Channel::resolve_approval`].
+    /// prompt. Called by the ask watcher once the queue entry is gone.
     pub fn dispatch_approval_resolved(
         &self,
         call_id: String,
@@ -345,6 +329,21 @@ impl Channel {
             call_id,
             session_id,
             decision,
+        });
+    }
+
+    /// Publish an `AskResolved` event: an ask of any kind left the queue,
+    /// answered or not, so every client showing it drops the card.
+    pub fn dispatch_ask_resolved(
+        &self,
+        session_id: SessionId,
+        ask_id: AskId,
+        outcome: wire::AskOutcomeKind,
+    ) {
+        self.dispatch_event(SessionEvent::AskResolved {
+            session_id,
+            ask_id,
+            outcome,
         });
     }
 
@@ -372,7 +371,8 @@ impl Channel {
     /// Internal event fan-out — the raw broadcast/subscription
     /// machinery. External callers go through [`Self::dispatch_agent`]
     /// / [`Self::dispatch_approval_requested`] /
-    /// [`Self::dispatch_approval_resolved`] (kind-agnostic) or
+    /// [`Self::dispatch_approval_resolved`] / [`Self::dispatch_ask_resolved`]
+    /// (kind-agnostic) or
     /// through [`SubscribedView::echo_inbound`]
     /// (Subscribed-exclusive). Non-blocking. Drops the event for any
     /// connection whose outbound queue is full and nudges that

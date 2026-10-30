@@ -302,10 +302,22 @@ gates registered later are visible immediately without re-plumbing.
 `ChannelRegistry::install` populates only the type-level tier of the gate
 map; the map itself is two-tier — a session-level `(ChannelType,
 SessionId)` entry (used by the one-shot `baybo prompt` path) wins over the
-channel-type gate, and lookup fails closed to `AutoDenyGate`. Concurrent
-TUI / web tabs subscribed to the same session still resolve approvals
-through the same per-channel gate, and the channel fans out
-`ApprovalResolved` so the loser tabs drop their prompt card.
+channel-type gate, and lookup fails closed to `AutoDenyGate`.
+
+Each channel's gate is a `baybo_human_ask::ChannelAskGate` over the
+channel's `AskQueue` (fetched from the shared `AskQueues`, so a queue the
+boot reload already filled is the one the channel attaches to); the
+channel's `AskSurface` bundles the two. The gate writes the ask to the
+`human_asks` ledger before enqueueing it and never times out. Frames are
+dispatched by queue watchers the gateway installs in `build_channel`, not by
+the gate: `AskRaised` → `SessionEvent::ApprovalRequested`, and every
+`AskClosed` → `SessionEvent::AskResolved { session_id, ask_id, outcome }`
+plus `SessionEvent::ApprovalResolved` when a human decided an approval. So
+concurrent TUI / web tabs drop their card on any close — answered by one of
+them, or abandoned by `/stop`, a card close or the user moving on. A
+`ResolveApproval` frame resolves through `HumanAskManager::resolve` (ledger
+claim first), never through the queue directly; `Channel` has no resolve
+method. See [`human-ask.md`](human-ask.md).
 
 ### The owner channel (`owner` — web + mobile, one channel)
 

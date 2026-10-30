@@ -52,7 +52,7 @@ every door leads through it.
 | `budget.rs` | `Headroom` and the UTC-day window a daily ceiling measures |
 | `timeline.rs` | `diff_events` — an edit reduced to the entries worth writing, including title and description edits |
 | `worktree.rs` | The per-issue git worktree: create, branch, resolve the commit identity, merge, reclaim |
-| `approvals.rs` | `TimelineApprovalGate` — a run's approval prompts, on the card |
+| `asks.rs` | `install_ask_bridge` — a run's approval prompts on the card (`TimelineAskObserver`) and closed with the run (`AskCloser`) |
 | `events.rs` | The `ProjectEvents` push port (the gateway implements it) |
 | `stopper.rs` | The `IssueRunStopper` port — interrupt the turn under a live run — and the `TurnLifecycle` adapter a real assembly hands it |
 | `tools/` | The seven board tools an agent working a project can call |
@@ -1824,10 +1824,33 @@ resolved server-side rather than against the live roster.
 
 ### Approvals
 
-`TimelineApprovalGate` wraps the channel's type-level approval gate and writes
-what it sees onto the issue's timeline — `ApprovalRequested` before the prompt
-is answered, `ApprovalResolved` after, including on the gate's own
-deny-on-timeout. Installed once over the channel, not per run.
+Approvals are asks in the `human_asks` ledger
+([`human-ask.md`](human-ask.md)); this crate observes them and closes a
+settled run's leftovers, and owns neither the gate nor the prompt's state.
+`baybo_project::install_ask_bridge(core, project, asks, sessions)` wires both
+halves once at boot, after the ask manager and the `ProjectManager` exist:
+
+- `TimelineAskObserver` — an `AskObserver` on the shared `AskCore`. For an
+  approval raised from a `TriggerSource::Issue` session it records
+  `ApprovalRequested` on `AskEvent::Raised` (with the `attempt` of the
+  issue's unsettled run, read from `list_runs` at that moment) and
+  `ApprovalResolved` on `AskEvent::Resolved` — `Answered` with the human's
+  decision, or `Abandoned` / `Deny`. A policy denial is never on the card and
+  records nothing. Observers run from the ask verbs only, never on boot
+  reload, so a restart does not write a duplicate `approval_requested` row;
+  a `Resolved` after a restart simply finds no unsettled-run attempt to
+  carry, which `attempt: Option<i64>` allows. It holds the board as a
+  `Weak<ProjectManager>`: `ProjectManager → closer → HumanAskManager →
+  AskCore → observers` would otherwise be a strong cycle.
+- `AskCloser` — the `CardPromptCloser` the board holds. Its one method,
+  `close_run_prompts(session_id)`, calls
+  `HumanAskManager::abandon_for_session` for the settled run's session: live
+  and dead asks alike, each claimed in the ledger, so a parked tool sees
+  `Abandoned` and the observer records the close.
+
+The gate map holds each channel's own gate; there is no wrapper, so the card
+sees every resolution door — the chat card, the board's endpoint, a `/stop`,
+a card close — because they all go through the manager's verbs.
 
 **The prompt is named for the session that raised it, never for the card.**
 `asker` reads the actor off `SessionState::agent_id`, which the router writes
@@ -1838,71 +1861,44 @@ coordination run executes as the board's `@lead` by construction
 every prompt a Review, Stalled, Blocked or Triage run raised was announced under
 the assignee's name. The binding is also the only one of the two that cannot
 drift — the assignee moves under a live run every time somebody is handed the
-card, while a write-once binding answers for the whole session. It costs one
-fewer store read as well: the session was already loaded to find the card.
+card, while a write-once binding answers for the whole session.
 
-**Three closers, one claim.** The gate keeps an in-memory ledger of the prompts
-this process has announced and not yet resolved. Taking an entry out of it *is*
-the claim on writing that prompt's resolution, so exactly one of three closers
-can write a given `call_id` and the timeline can neither dangle nor
-double-close:
+**One claim, in the ledger.** Every exit from a pending ask is a manager verb
+that claims the row first, so exactly one resolution is written per ask and
+the timeline can neither dangle nor double-close. A human's *Allow* that
+races the closer loses the claim (`AskClosed`) and never reaches the tool.
 
-1. the gate's own return, when the inner gate answers (or denies itself on
-   timeout);
-2. `CardPromptCloser::close_card_prompts`, the port the run-settle path holds so
-   a run that stops being able to answer a prompt takes the prompt with it;
-3. `TimelineApprovalGate::close_open_prompts`, called from
-   `ManagerGraph::shutdown` **before** the actor cancel cascade.
+**The closer is a chokepoint.** `settle::settle_run` calls `close_run_prompts`
+right after the `RunSettled` entry — inside the settle itself rather than at
+its call sites, because a prompt outlives its run whenever a caller forgets.
+A run that never reached a session (`session_id: None`) raised no asks and is
+skipped. The dispatcher's own settle passes `None` — a run whose checkout
+never opened reached no tool and raised no prompt.
 
-That ordering is load-bearing. A per-request `Drop` guard still exists and still
-covers an ordinary turn cancel, where the runtime is live and its spawned write
-lands — but `Drop` cannot await, so on a runtime already past its task drain the
-write is simply lost. That is how one `rm -rf` prompt on issue #3 sat in the
-ledger with an `approval_requested` row and no resolution under it from the day
-it was raised. Reversing the two statements in `shutdown` re-creates exactly
-that path.
-
-Closer 2 is a **chokepoint**, and in two senses. `settle::settle_run` calls
-`close_card_prompts` right after the `RunSettled` entry — inside the settle
-itself rather than at its three call sites, because a prompt outlives its run
-whenever a caller forgets, and the run is what was going to answer it. And the
-board is *handed* the closer by `TimelineApprovalGate::new` rather than being
-wired to it by whoever installs the gate: a port somebody has to remember to
-connect is one this crate already shipped once with no callers at all. The
-dispatcher's own settle passes `None` — a run whose checkout never opened
-reached no tool and raised no prompt.
-
-**Closing a prompt ends the request, not just the record.** Each ledger entry
-carries the `oneshot::Sender` that un-parks the wrapped gate's own call, so
-taking the entry drops it, and the wrapper — selecting on that receiver against
-`inner.request` — drops the inner future, which is what takes the prompt off
-the channel's queue (its `QueueCleanup` guard). The claim then arbitrates the
-**answer** as well as the ledger line: a request whose entry somebody else took
-returns `abandoned` whatever the inner gate says. A write-only closer left the
-human able to press Allow afterwards, and the tool ran against a card recording
-that nobody had allowed it.
-
-Pending-ness is **derived**, never stored: a request with no matching resolution
-on the same `call_id` is still open. A `pending` flag would be a second copy of a
-fact the timeline already carries, and the two would eventually disagree. The
-claim ledger is not that flag — it is in-memory process state about what *this
-process* announced, and it says nothing after a restart.
+**Shutdown is not a close.** A process going down leaves its parked asks
+pending in the ledger (nothing awaits a close at shutdown any more); the next
+boot re-queues them, and `resume_unsettled_runs` re-dispatches the run into
+the same session, whose turn prelude applies an answer given meanwhile or
+abandons a still-pending ask so the model asks again, live, on the card.
+Answering a dead ask in an issue session therefore requests no chat Resume
+turn.
 
 `ApprovalResolved` carries the resolution as well as the decision, because a
-human's "no", an expired window, an abandoned prompt and a standing policy are
-four different facts that arrive as one `Deny`.
+human's "no", an abandoned prompt and a standing policy are different facts
+that arrive as one `Deny`. (`TimedOut` survives only so old rows decode;
+nothing times out any more.)
 
-Nothing in this crate derives it, though — the two readers each derive it from
-what they can see. The board's attention badge counts the channel's **live
-approval queue**, passed into `attention()` because this crate must not know
-about channels and because the queue is the only thing that knows a prompt has
-already timed out. A card's "answer this" list is derived from the **timeline**
-in the client (`pendingApprovals` in
-`app/web/src/pages/projects/timelineModel.ts`), which is where the call ids are;
-it is a view rather than an authority, since the resolve endpoint answers from
-the queue and can refuse a prompt the timeline still lists.
+Pending-ness is read, not stored, here: the board's attention badge and a
+card's `awaiting_human` bit count the channel's **ask queue**, passed into
+`attention()` because this crate must not know about channels; after a
+restart the boot reload has refilled the queue from the ledger. A card's
+"answer this" list is derived from the **timeline** in the client
+(`pendingApprovals` in `app/web/src/pages/projects/timelineModel.ts`), which
+is where the call ids are; it is a view rather than an authority, since the
+resolve endpoint answers from the ledger (a pending `Approval` row raised by
+this issue's session) and can refuse a prompt the timeline still lists.
 
-A prompt from an ordinary session passes straight through — the trigger lookup
+A prompt from an ordinary session stays off every card — the trigger lookup
 says it belongs to no issue.
 
 ### Attention: three signals, and the one that was thrown out

@@ -1926,14 +1926,10 @@ export interface components {
         };
         ChatSessionSummary: {
             /**
-             * @description True while a tool call in this session is parked on the approval gate,
-             *     waiting for the user to approve or deny it. The client marks the row so
-             *     the user knows which conversation to open; the prompt itself is only
-             *     answerable inside the conversation.
-             *
-             *     Derived from live in-memory gate state, never the store: a parked turn
-             *     dies with the gateway process, so reading `false` after a restart is
-             *     correct rather than stale. Absent when false.
+             * @deprecated
+             * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
+             *     clients that predate the rename; removed in PR 3 of the human-ask
+             *     rollout (`docs/modules/human-ask.md`).
              */
             approval_pending?: boolean;
             /**
@@ -1943,6 +1939,17 @@ export interface components {
              *     row; set via `PUT /v1/chat/sessions/{id}/archive`.
              */
             archived: boolean;
+            /**
+             * @description True while an ask of any kind in this session is waiting on the user
+             *     — a tool approval, or a question. The client marks the row so the user
+             *     knows which conversation to open; the ask itself is only answerable
+             *     inside the conversation.
+             *
+             *     Read from the in-memory ask queues, which the boot reload refills from
+             *     the ask ledger, so a pending ask keeps its mark across a restart.
+             *     Absent when false.
+             */
+            awaiting_human?: boolean;
             /** Format: date-time */
             created_at: string;
             /**
@@ -2700,12 +2707,22 @@ export interface components {
             filename?: string | null;
         };
         IssueDto: {
-            /** @description True only while this card has an answerable prompt in the live queue. */
+            /**
+             * @deprecated
+             * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
+             *     clients that predate the rename; removed in PR 3 of the human-ask
+             *     rollout (`docs/modules/human-ask.md`).
+             */
             approval_pending: boolean;
             /** @description The agent on it, if any. In Progress always has one. */
             assignee?: string | null;
             /** @description Files hung on the description. */
             attachments?: components["schemas"]["IssueAttachmentDto"][];
+            /**
+             * @description True only while this card has an answerable ask in the queue — live,
+             *     or reloaded from the ask ledger after a restart.
+             */
+            awaiting_human: boolean;
             /**
              * @description Why work stopped. A badge on the card — blocked work stays in
              *     whichever column it was in.
@@ -8030,12 +8047,22 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
-                            /** @description True only while this card has an answerable prompt in the live queue. */
+                            /**
+                             * @deprecated
+                             * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
+                             *     clients that predate the rename; removed in PR 3 of the human-ask
+                             *     rollout (`docs/modules/human-ask.md`).
+                             */
                             approval_pending: boolean;
                             /** @description The agent on it, if any. In Progress always has one. */
                             assignee?: string | null;
                             /** @description Files hung on the description. */
                             attachments?: components["schemas"]["IssueAttachmentDto"][];
+                            /**
+                             * @description True only while this card has an answerable ask in the queue — live,
+                             *     or reloaded from the ask ledger after a restart.
+                             */
+                            awaiting_human: boolean;
                             /**
                              * @description Why work stopped. A badge on the card — blocked work stays in
                              *     whichever column it was in.

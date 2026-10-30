@@ -1007,16 +1007,20 @@ async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
     let bystander = seed_tool_turn_session(&tg, &router).await;
 
     let flag_of = |list: &Value, session_id: &str| -> bool {
-        list["items"]
+        let row = list["items"]
             .as_array()
             .expect("items")
             .iter()
             .find(|i| i["session_id"] == json!(session_id))
-            .expect("session in list")
-            .get("approval_pending")
-            .and_then(Value::as_bool)
-            // Absent is the wire's "false" — the field is skipped when unset.
-            .unwrap_or(false)
+            .expect("session in list");
+        // Absent is the wire's "false" — the field is skipped when unset.
+        let read = |key: &str| row.get(key).and_then(Value::as_bool).unwrap_or(false);
+        assert_eq!(
+            read("awaiting_human"),
+            read("approval_pending"),
+            "the deprecated twin carries the same value"
+        );
+        read("awaiting_human")
     };
 
     let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
@@ -1062,10 +1066,14 @@ async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
     );
 
     // Answering it retires the mark.
-    assert_eq!(
-        channel.resolve_approval("prompt-1", baybo_tools::ApprovalDecision::Approve),
-        Some(SessionId::from(blocked.as_str()))
-    );
+    tg.deps
+        .human_asks
+        .resolve(
+            &"prompt-1".parse().expect("ask id"),
+            baybo_model::human_ask::AskResolution::Approval(baybo_tools::ApprovalDecision::Approve),
+        )
+        .await
+        .expect("resolve through the ledger");
     assert_eq!(
         parked.await.expect("gate task"),
         baybo_tools::ApprovalOutcome::answered(baybo_tools::ApprovalDecision::Approve)
