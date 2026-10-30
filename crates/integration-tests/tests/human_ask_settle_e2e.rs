@@ -481,7 +481,14 @@ async fn an_issue_run_settles_before_its_brief() {
         Some(AskResolution::Approval(ApprovalDecision::Approve)),
     )
     .await;
-    reply(&harness, "ok");
+    // An issue run is nobody's live chat: its LLM call does not stream.
+    harness.stub_llm.push_response(LlmResponse {
+        content: "ok".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
     harness
         .mailbox
         .send(AgentMessage::IssueRun {

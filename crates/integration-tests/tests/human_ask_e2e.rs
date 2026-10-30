@@ -244,3 +244,129 @@ async fn shutdown_leaves_the_parked_ask_pending_and_the_tool_use_dangling() {
         .await
         .expect("actor stops");
 }
+
+/// Queue the model's gated call and its follow-up reply on both the
+/// streaming and the non-streaming queue: whichever an unattended turn uses,
+/// it gets the call first and the reply second.
+fn script_gated_call(harness: &AgentTestHarness) {
+    let call = ToolCallInfo {
+        id: CALL_ID.to_string(),
+        name: GATED_TOOL.to_string(),
+        arguments: json!({}),
+        signature: None,
+    };
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(call.clone())]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("done".to_string())]);
+    for (content, tool_calls) in [
+        (String::new(), vec![call]),
+        ("done".to_string(), Vec::new()),
+    ] {
+        harness.stub_llm.push_response(baybo_llm::LlmResponse {
+            content,
+            content_blocks: Vec::new(),
+            tool_calls,
+            usage: baybo_llm::TokenUsage::default(),
+            thinking: None,
+        });
+    }
+}
+
+/// An unattended turn hitting a gate: an applied `PolicyDenied` row, no
+/// queue entry (so no frame and no push), and a denial on the transcript.
+async fn assert_policy_denied(
+    mut harness: AgentTestHarness,
+    raised: Arc<AtomicUsize>,
+    runs: Arc<AtomicUsize>,
+) {
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let rows = harness.ask_store.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].resolution, Some(AskResolution::PolicyDenied));
+    assert!(rows[0].applied_at.is_some());
+    assert_eq!(raised.load(Ordering::SeqCst), 0, "nothing enters a queue");
+    assert!(
+        harness
+            .ask_queues
+            .get_or_create(&harness.session.channel)
+            .is_empty()
+    );
+    assert_eq!(results_for_call(&harness).await.len(), 1);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(PARK_TIMEOUT, harness.shutdown())
+        .await
+        .expect("actor stops");
+}
+
+fn unattended_harness() -> (AgentTestHarness, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let harness = AgentTestHarness::builder()
+        .with_tool(
+            Arc::new(GatedWrite {
+                runs: Arc::clone(&runs),
+            }),
+            manifest(),
+        )
+        .with_channel_ask_gate()
+        .build();
+    let raised = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&raised);
+    harness
+        .ask_queues
+        .get_or_create(&harness.session.channel)
+        .add_ask_watcher(Arc::new(move |event| {
+            if matches!(event, baybo_human_ask::AskQueueEvent::AskRaised(_)) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    script_gated_call(&harness);
+    (harness, raised, runs)
+}
+
+#[tokio::test]
+async fn a_cron_fire_hitting_a_gate_is_policy_denied() {
+    let (harness, raised, runs) = unattended_harness();
+    harness
+        .mailbox
+        .send(baybo_agent::actor::AgentMessage::CronTrigger {
+            job_id: "job-1".to_string(),
+            title: "job".to_string(),
+            prompt: "write it".to_string(),
+            delivery: baybo_agent::actor::CronDelivery::Channel,
+            builtin: None,
+        })
+        .await
+        .expect("send cron");
+    assert_policy_denied(harness, raised, runs).await;
+}
+
+#[tokio::test]
+async fn a_subagent_hitting_a_gate_is_policy_denied() {
+    let (harness, raised, runs) = unattended_harness();
+    let message = baybo_channels::IncomingMessage {
+        message: baybo_channels::Message {
+            id: "spawn".to_string(),
+            session_id: harness.session.id.clone(),
+            channel: harness.session.channel.clone(),
+            sender: harness.session.user.clone(),
+            content: vec![ContentBlock::Text("write it".to_string())],
+            timestamp: chrono::Utc::now(),
+            reply_to: None,
+            metadata: Default::default(),
+        },
+        platform_msg_id: String::new(),
+        bot_id: String::new(),
+    };
+    harness
+        .mailbox
+        .send(baybo_agent::actor::AgentMessage::SubagentSpawned {
+            initial_message: Box::new(message),
+            parent_turn_id: baybo_model::TurnId::new(),
+        })
+        .await
+        .expect("send spawn");
+    assert_policy_denied(harness, raised, runs).await;
+}

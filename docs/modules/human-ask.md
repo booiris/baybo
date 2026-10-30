@@ -1,9 +1,11 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **PR 1 in progress** — `baybo-human-ask` (queue, core, gates,
-> manager), the ledger, the `tools::ask` ports, the agent live/restart paths,
-> the gateway doors, frames and boot order, and the project bridge exist; see
-> [Implementation notes](#implementation-notes-pr-1). This document is the spec the three
+> Status: **PR 1 implemented; PR 2/3 pending** — `baybo-human-ask` (queue,
+> core, gates, manager), the ledger, the `tools::ask` ports, the agent
+> live/restart paths, the gateway doors, frames and boot order, the project
+> bridge and the integration suites exist; see
+> [Implementation notes](#implementation-notes-pr-1). `AskUser` + web (PR 2)
+> and iOS (PR 3) are not started. This document is the spec the three
 > PRs described in [PR plan](#pr-plan) are built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
 > items will not.
@@ -1215,6 +1217,30 @@ Where the code differs from the sketch above, and why:
   (`PARK_POLL_INTERVAL`); `TOOL_DEADLINE_GRACE` is 15 s.
 - `ASK_USER_TOOL_NAME` already lives in `baybo_model::human_ask`, because
   `PendingEdge::Raised.tool` names it for question asks.
+- **Integration coverage.** `crates/integration-tests/tests/human_ask_restart_e2e.rs`
+  runs the restart cases over one sqlite file with the `AgentTestHarness`
+  (`with_store`, `with_resume_door`, `with_strict_tool_pairing`), plus the
+  gateway's real owner `Channel` (`boot::install_channels`) and
+  `AskPushRelay` over the harness's queues, installed before
+  `reload_pending` as `build_managers` orders them. Where the plan names a
+  wire surface, the test asserts the source that surface reads:
+  `Channel::pending_approvals` (the `SubscribeState` cards),
+  `Channel::pending_approval_sessions` (REST `awaiting_human`), the
+  `AskPushStream`, and the queue's `AskClosed` event (what the gateway
+  watcher turns into `AskResolved`; the frame mapping is covered by
+  `crates/gateway/tests/channel_ws.rs`). The router is replaced by a
+  forwarder from `RouterResumeSink`'s `ResumeAsk` into the actor mailbox.
+  The question half of the restart case waits for PR 2. The issue-run case
+  asserts the approved call runs once and the run's own LLM call sees the
+  settled result; `finish_run` is the router's `IssueRunWaiter`, which the
+  harness does not host, so "called once" is not asserted there. The lazy
+  channel cases are unit tests next to `resolve_or_install_channel`
+  (`crates/gateway/src/channel/adapter.rs`): the WS route to a sidecar
+  needs the loopback sidecar listener the gateway test fixture does not
+  build. `/stop` vs shutdown, the unattended `PolicyDenied` cases and the
+  per-door settlement run over the in-memory ledger in `human_ask_e2e.rs`
+  and `human_ask_settle_e2e.rs`. An issue run's LLM calls do not stream, so
+  its scripted replies go on the stub's non-streaming queue.
 
 ## Control flows
 

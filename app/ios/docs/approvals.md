@@ -3,8 +3,8 @@
 *The native tool-approval card and the pending-prompt queue behind it: `app/ios/App/Core/ChatApprovals.swift`, `ChatStore.approvalObserveFrame`, and `app/ios/App/Screens/ApprovalCardView.swift`.*
 
 A tool call whose declared resources aren't already granted blocks on the
-gateway's approval gate, which fans out `approval_requested` and **denies itself
-after 5 minutes** if nobody answers.
+gateway's approval gate, which fans out `approval_requested` and waits for an
+answer with **no timeout**; the prompt survives a gateway restart.
 
 ## Why the card is native
 

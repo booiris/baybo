@@ -769,6 +769,7 @@ dependencies = [
  "baybo-agent",
  "baybo-channels",
  "baybo-cli",
+ "baybo-config",
  "baybo-context",
  "baybo-cost",
  "baybo-cron",
