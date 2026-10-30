@@ -125,23 +125,37 @@ See [trace.md](trace.md#toolcall-output-storage).
 
 `ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. The map is populated automatically when channels register — `ChannelRegistry::register` reads `Channel::approval_gate()` and inserts the returned `Arc<dyn ApprovalGate>` keyed by the channel's `ChannelType`, and evicts it on `unregister`. For every call:
 
-1. Resolve the gate for the session's channel via `gate_map.get(user.channel)`.
+1. Pick the gate once per call. The loop computes `attended = turn_kind.is_attended()` once per turn in `run_inner` (beside `background_eligible`) and hands it to `ToolExecutor::execute`; tools never see it. Attended → `gate_map.get(user.channel, session)`. Unattended (`Cron`, `CronNotification`, `Spawned`) → the executor's required `policy_deny: Arc<dyn ApprovalGate>`, a `baybo_human_ask::PolicyDenyGate` built once in `build_managers`. The same gate serves the pre-execute check and the call's `ApprovalHandle`, so a mid-execution ask in an unattended turn is denied the same way.
 2. Compute `ResourceAccess` list via the tool's `accessed_resources(params)`.
 3. Filter out entries covered by the snapshot of `SessionState::approved_resources` passed in from `AgentLoop`.
-4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. The gate returns an `ApprovalOutcome`, not a bare decision; on `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return) whose `reason` is worded from `baybo_tools::refusal_reason(outcome.resolution)`. That distinction is the point: a 300 s window nobody answered, a prompt torn down by a cancel, and a standing policy are not a human refusal, and reporting them to the model as one teaches it to re-argue with somebody who was never there. A cancel that fires while the prompt is still up records `Abandoned` — nobody decided anything — rather than being written down as a decision.
+4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. The gate returns an `ApprovalOutcome`, not a bare decision; on `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return) whose `reason` is worded from `baybo_tools::refusal_reason(outcome.resolution)`. That distinction is the point: a prompt torn down by a cancel and a standing policy are not a human refusal, and reporting them to the model as one teaches it to re-argue with somebody who was never there. Gates never time out. The executor does not race the gate against the cancel token: the gate races its own `AskCancel` (the call's `TurnTokens`) and returns `abandoned()` on a turn cancel, stays parked on an ancestor cancel (see "Cancelled batches" below). An approval that lands after the turn was cancelled is still refused by a post-approve re-check of the token.
 5. On `ApproveAlways`, the executor de-dupes and pushes the newly-approved accesses directly into the shared `Mutex<Vec<ApprovedResource>>` passed by `AgentLoop`. After all tool calls complete, `AgentLoop` flushes the contents back into `session.state.approved_resources`, which persists through session save/restore because the types live in `baybo-model`.
 
-5. The router starts a cron fire with an `InheritedToolContext` — a field-less
-   marker that no operator is attached to this execution lineage. Any
-   approval-gated access left uncovered by session approvals is denied
-   immediately; the channel gate is never called. When that execution invokes
-   `spawn_subagent`, `ToolContext::inherited_context` carries the marker
-   through `SubagentParentContext` and `AgentMessage::SubagentSpawned`, so
-   every in-process descendant is equally unattended. Cron is only one
-   producer of this generic execution context; consumers do not infer it from
-   `TriggerSource::Cron`. The marker never seeds or mutates
-   `SessionState::approved_resources`; a later independent user reply or child
-   resume therefore uses ordinary approval.
+5. Unattended turns are policy-denied: `PolicyDenyGate` writes a `human_asks`
+   row already resolved `PolicyDenied` and applied (no queue entry, no frame,
+   no wait) and returns `ApprovalOutcome::policy(Deny)`, so the model reads
+   `refusal_reason(Policy)` and the ledger records why the call failed.
+   Attendedness is a property of the turn's kind, not of the session or an
+   inherited marker: a cron fire's turn is `Cron`, every in-process subagent
+   turn is `Spawned`, and a later user reply in the same session is
+   `UserChat` and prompts as usual. Nothing here seeds
+   `SessionState::approved_resources`. The one deny that is not ledgered is
+   `ApprovalGateMap`'s `AutoDenyGate` fallback for a channel with no
+   registered gate.
+
+**Cancelled batches.** `run_agent_loop` passes `TurnTokens { turn, actor }`
+through `AgentLoop::run` → `run_inner` → `run_iteration`; each call gets a
+child of the turn token plus the actor token. After the batch the loop reads
+`CancelOrigin::of(tokens)` once. On `Ancestor` (process shutdown) it appends
+and emits nothing for a call that never finished or whose ask came back
+abandoned — the transcript is left as a crash would leave it, the ask row
+stays pending, and hydration repairs the siblings. On `Turn` (`/stop`, board
+stop, operator cancel), before appending such a call's result it claims
+`TurnAsks::abandon_for_tool_call(session, tool_use_id)` (a narrow port over
+`HumanAskManager`, an `AgentLoopConfig` field); a claim that loses because the
+ask was answered in the same instant appends nothing and leaves the answer to
+the next settlement. `ExecutedTool.abandoned` marks a call whose last ask was
+torn down undecided.
 
 Parallel tool calls within a turn each go through the gate independently; the gate implementation is responsible for its own serialization (TUI queues and shows one inline prompt at a time).
 
@@ -287,7 +301,7 @@ Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 3 
 **Tool execution** (`runtime/tool_executor.rs`) — two nested deadlines:
 
 - *Inner* = the tool's own `max_timeout()`, written into `ToolContext::timeout`.
-- *Outer* = `ToolContext::timeout + APPROVAL_HEADROOM` (300s), enforced by `tokio::time::timeout`. The headroom mirrors the approval gate's wait window so a tool blocked on a user-approval prompt isn't killed before the user can answer.
+- *Outer* = `ToolContext::timeout + TOOL_DEADLINE_GRACE` (15 s), enforced by a `PausableDeadline` that accrues time only while the call's `ParkGauge` reads zero. `ApprovalHandle` holds the gauge while a mid-execution prompt waits, so a tool parked on a human is never killed; the grace is handoff slack (Bash detaching a timed-out command), not approval time.
 
 Per-tool `max_timeout()`:
 
@@ -304,7 +318,7 @@ Per-tool `max_timeout()`:
 | OpenViking memory store | 120s | `OpenVikingTimeouts::store_max` (default) in `memory/src/backends/openviking.rs` |
 | Subagent (in-process) | `TOOL_WAIT_BACKSTOP` = 30 days | `subagent/src/tool.rs` — effectively unbounded; the real bound is the caller's cancel / turn lineage |
 
-**Approval gate** — no timeout: a tool-approval prompt waits until a human answers it or the turn is cancelled (`docs/modules/human-ask.md`). The executor's `APPROVAL_HEADROOM` (300 s) still pads the outer tool deadline until the pausable deadline replaces it.
+**Approval gate** — no timeout: a tool-approval prompt waits until a human answers it or the turn is cancelled (`docs/modules/human-ask.md`); the outer tool deadline pauses while it waits.
 
 **Progress observer** (`runtime/progress_observer.rs`) — out-of-band status emitter for long UserChat turns:
 

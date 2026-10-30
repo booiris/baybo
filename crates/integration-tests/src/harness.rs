@@ -21,6 +21,11 @@ use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
 use baybo_context::{ContextManager, ContextManagerConfig, HeuristicTokenizer};
 use baybo_cost::test_support::MemoryCostStore;
 use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
+use baybo_human_ask::test_support::MemoryHumanAskStore;
+use baybo_human_ask::{
+    AskCore, AskQueues, ChannelAskGate, HumanAskManager, HumanAskManagerConfig, PolicyDenyGate,
+    ResumeSink,
+};
 use baybo_llm::test_support::StubLlm;
 use baybo_llm::{LlmCompletion, ModelPricing};
 use baybo_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
@@ -83,6 +88,17 @@ pub struct AgentTestHarness {
     /// result to this session. Exposed so a test can seed an execution and
     /// assert the delivery resolved it.
     pub cron_store: Arc<baybo_cron::test_support::InMemoryCronStore>,
+    /// The ask ledger behind the loop's `TurnAsks` port and, with
+    /// [`AgentTestHarnessBuilder::with_channel_ask_gate`], the session
+    /// channel's gate.
+    pub ask_store: Arc<MemoryHumanAskStore>,
+    /// The ask queues the channel gate parks on.
+    pub ask_queues: AskQueues,
+    /// The verbs over `ask_store` (resolve, abandon, …).
+    pub human_asks: Arc<HumanAskManager>,
+    /// Parent of the actor's token. Cancelling it is what process shutdown
+    /// does: every turn the actor runs reads the cancel as `Ancestor`.
+    pub actor_parent_token: tokio_util::sync::CancellationToken,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -221,6 +237,10 @@ pub struct AgentTestHarnessBuilder {
     /// off: with one stub serving every call, a title `chat()` would take
     /// the reply a test queued for a compaction or a request count.
     title_sink: Option<Arc<dyn baybo_agent::SessionTitleSink>>,
+    /// Install the production `ChannelAskGate` for the session's channel.
+    /// Defaults to `false`: the gate map stays empty and every ask is
+    /// denied by `AutoDenyGate`, so tests that do not answer asks never park.
+    channel_ask_gate: bool,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -242,11 +262,20 @@ impl Default for AgentTestHarnessBuilder {
             chat_gate: None,
             model_supports_vision: false,
             title_sink: None,
+            channel_ask_gate: false,
         }
     }
 }
 
 impl AgentTestHarnessBuilder {
+    /// Route the session channel's asks through a real `ChannelAskGate` over
+    /// the harness's ledger, so an ask parks until a test resolves it via
+    /// [`AgentTestHarness::human_asks`].
+    pub fn with_channel_ask_gate(mut self) -> Self {
+        self.channel_ask_gate = true;
+        self
+    }
+
     pub fn session(mut self, session: Session) -> Self {
         self.session = Some(session);
         self
@@ -457,6 +486,24 @@ impl AgentTestHarnessBuilder {
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
         let approval_gates = Arc::new(ApprovalGateMap::new());
+        let ask_store = MemoryHumanAskStore::new();
+        let ask_core = Arc::new(AskCore::new(ask_store.clone()));
+        let ask_queues = AskQueues::new();
+        let human_asks = Arc::new(HumanAskManager::from_config(HumanAskManagerConfig {
+            core: Arc::clone(&ask_core),
+            queues: ask_queues.clone(),
+            resume_sink: Arc::new(NoResume),
+        }));
+        if self.channel_ask_gate {
+            approval_gates.insert(
+                session.channel.clone(),
+                Arc::new(ChannelAskGate::new(
+                    ask_queues.get_or_create(&session.channel),
+                    Arc::new(|_| {}),
+                    Arc::clone(&ask_core),
+                )),
+            );
+        }
         let memory_session_store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
         // Mirror production's "session row exists before the actor spawns"
         // shape so the transcript-read intercept's cross-session lookup finds
@@ -487,6 +534,7 @@ impl AgentTestHarnessBuilder {
             None,
             None,
             None,
+            Arc::new(PolicyDenyGate::new(Arc::clone(&ask_core))),
         ));
 
         let tokenizer = Arc::new(HeuristicTokenizer);
@@ -571,6 +619,7 @@ impl AgentTestHarnessBuilder {
             memory: self.memory,
             task_store: task_store.clone(),
             title_sink: self.title_sink,
+            asks: human_asks.clone(),
         });
         let (mailbox_tx, mailbox_rx) = baybo_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
@@ -621,6 +670,10 @@ impl AgentTestHarnessBuilder {
             task_store,
             cron_store,
             memory_session_store,
+            ask_store,
+            ask_queues,
+            human_asks,
+            actor_parent_token,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),
@@ -641,6 +694,18 @@ fn share_turn_store(arc: &Arc<MemoryTurnStore>) -> Arc<dyn baybo_turn::TurnStore
 
 fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn baybo_cost::CostStore> {
     arc.clone()
+}
+
+/// The harness has no router, so an answer to a dead ask resumes nothing.
+struct NoResume;
+
+#[async_trait::async_trait]
+impl ResumeSink for NoResume {
+    async fn resumes_on_answer(&self, _session: &baybo_model::SessionId) -> bool {
+        false
+    }
+
+    fn request_resume(&self, _req: baybo_model::human_ask::ResumeRequest) {}
 }
 
 // Avoid unused-import lints when callers don't reference these types.

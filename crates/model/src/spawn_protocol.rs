@@ -16,9 +16,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    ContentBlock, InheritedToolContext, ModelTier, SessionId, SpanId, SubagentBackend, TurnId,
-};
+use crate::{ContentBlock, ModelTier, SessionId, SpanId, SubagentBackend, TurnId};
 
 /// Tool name the LLM emits to spawn a subagent.
 pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
@@ -172,11 +170,6 @@ pub struct SubagentParentContext {
     /// the turn half. `false` makes a foreground spawn block until terminal
     /// and downgrades an explicit `background: true` to a blocking run.
     pub background_eligible: bool,
-    /// Unattended-lineage marker inherited from the dispatching execution.
-    /// Its presence keeps delegated work in the same no-approval-prompts
-    /// regime as the dispatcher. The actor-backed Baybo spawner forwards it
-    /// unchanged; external backends do not run through Baybo's `ToolExecutor`.
-    pub inherited_context: Option<InheritedToolContext>,
 }
 
 #[derive(Debug, Clone)]

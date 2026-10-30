@@ -57,8 +57,8 @@ still keys off the live registry, per call, in `ToolExecutor::execute`:
 - **Trust** — `manifest.validate_auto_execution()`.
 - **Channel** — `manifest.allows_channel()`.
 - **Trigger scope** — `Tool::trigger_scope().allows_trigger()`.
-- **Unattended lineages** — an execution carrying `InheritedToolContext`
-  denies any uncovered approval-gated access without prompting. Vacuous for
+- **Unattended turns** — a cron or subagent turn (`TurnInputKind::is_attended`
+  false) denies any uncovered approval-gated access without prompting. Vacuous for
   MCP tools while their access list is empty: unattended MCP calls run
   exactly as attended ones do.
 - **Secret placeholders** — arguments are revealed only inside the executor,

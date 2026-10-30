@@ -1129,9 +1129,29 @@ Where the code differs from the sketch above, and why:
   `TriggerSource`. One port, no extra config field, no schema change.
 - **Interim wiring.** Until the gateway's resolve doors move onto
   `HumanAskManager`, `Channel::resolve_approval` still resolves through the
-  queue alone (no ledger claim), and until `run_agent_loop` threads
-  `TurnTokens`, the executor passes the single turn token as both `turn` and
-  `actor` and keeps its own race on that token to answer `/stop`.
+  queue alone (no ledger claim). `build_managers` already constructs the
+  `HumanAskManager` (on `ManagerGraph.human_asks`) because the loop needs its
+  verbs, but until the Resume door lands its `ResumeSink` is a placeholder
+  (`NoResumeDoor` in `crates/baybo/src/runtime.rs`) whose
+  `resumes_on_answer` is `false` — an answered dead ask is recorded and
+  applied by the next settlement, as for an issue session.
+- **The loop's port.** The agent loop does not hold `Arc<HumanAskManager>`:
+  `AgentLoopConfig.asks` is `Arc<dyn baybo_agent::runtime::asks::TurnAsks>`,
+  a narrow port implemented for `HumanAskManager` in `baybo-agent`. Today it
+  carries `abandon_for_tool_call` only; on a store error it answers `NoAsk`
+  (the result is appended, so the session's next LLM call is not wedged by a
+  dangling `tool_use`). The cancelled-batch path decides per call from
+  `ExecutedTool.abandoned` (the call's last ask resolved `Abandoned`, read
+  from the new `ApprovalHandle::last_outcome`) or a missing result, and
+  claims for such a call whenever the turn token tripped or the call came
+  back abandoned — not only when the batch select observed the cancel, since
+  a gate can return `abandoned()` and the call finish before the loop's
+  select sees the token.
+- A call skipped because its claim lost (`Answered`) or because the cancel
+  is `Ancestor` gets neither the append nor the `tool_completed` event; the
+  step's completion arrives with the result the next settlement appends.
+- **`PausableDeadline`** polls the `ParkGauge` every 250 ms
+  (`PARK_POLL_INTERVAL`); `TOOL_DEADLINE_GRACE` is 15 s.
 - `ASK_USER_TOOL_NAME` already lives in `baybo_model::human_ask`, because
   `PendingEdge::Raised.tool` names it for question asks.
 

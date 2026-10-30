@@ -8,15 +8,18 @@ use baybo_llm::{
 };
 use baybo_memory::{Memory, MemoryContext, MemoryScope};
 use baybo_model::{
-    ChatMessage, ContentBlock, InheritedToolContext, LlmEntryName, MessageSource,
-    TOOL_DENIED_INFIX, TOOL_DENIED_PREFIX, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TurnId,
+    ChatMessage, ContentBlock, LlmEntryName, MessageSource, TOOL_DENIED_INFIX, TOOL_DENIED_PREFIX,
+    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TurnId,
 };
 use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use baybo_model::{ControlEventKind, Session};
-use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
+use baybo_tools::{
+    ApprovalDecision, CancelOrigin, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry,
+    TurnTokens,
+};
 use baybo_trace::{
     CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle,
     StepKind,
@@ -580,6 +583,9 @@ pub struct AgentLoop {
     /// ordinary work when the user asked for it between turns, and only
     /// becomes churn inside a single turn.
     progress_monitor: TurnProgressMonitor,
+    /// The session's asks, for the cancelled-batch path: a turn cancel claims
+    /// `Abandoned` on a call's asks before appending its result.
+    asks: Arc<dyn crate::runtime::asks::TurnAsks>,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -612,6 +618,8 @@ pub struct AgentLoopConfig {
     pub task_store: Arc<dyn baybo_store::TaskStore>,
     /// Live-title broadcaster. `None` disables title generation.
     pub title_sink: Option<Arc<dyn crate::runtime::title::SessionTitleSink>>,
+    /// Port onto the human-ask ledger (see [`AgentLoop::asks`]).
+    pub asks: Arc<dyn crate::runtime::asks::TurnAsks>,
 }
 
 /// Task-reminder throttle (mirrors Claude Code's `TODO_REMINDER_CONFIG`): the
@@ -683,6 +691,7 @@ impl AgentLoop {
             memory,
             task_store,
             title_sink,
+            asks,
         } = config;
         let (llm_client, lite_client) = {
             let pool = llm_pool.read();
@@ -719,6 +728,7 @@ impl AgentLoop {
             title_sink,
             read_tracker: ReadTracker::default(),
             progress_monitor: TurnProgressMonitor::default(),
+            asks,
         }
     }
 
@@ -849,6 +859,9 @@ impl AgentLoop {
         self.refresh_active_llm();
     }
 
+    /// Run one turn. `tokens.turn` is this turn's cancel token;
+    /// `tokens.actor` is the actor's, which a parked ask reads to tell a turn
+    /// cancel from process shutdown.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,
@@ -858,73 +871,12 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         parent_turn_id: Option<TurnId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        cancel_token: CancellationToken,
+        tokens: TurnTokens,
         interjections: Option<&mut dyn InterjectionSource>,
         // A recurring cron fire hands its tools a silence handle here so
         // `report_nothing` can suppress the fire's notification. `None` for
         // every other turn (see `AgentActor::dispatch_cron_prompt`).
         notify_silence: Option<baybo_tools::NotifySilence>,
-    ) -> anyhow::Result<OutgoingMessage> {
-        self.run_with_optional_inherited_context(
-            session,
-            turn_input,
-            turn_lifecycle,
-            span_recorder,
-            parent_turn_id,
-            delta_tx,
-            cancel_token,
-            interjections,
-            notify_silence,
-            None,
-        )
-        .await
-    }
-
-    /// Run a turn with transient tool authority inherited from its dispatching
-    /// execution. The context follows in-process delegation, but is never
-    /// reconstructed from persistent session state on an independent turn.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_with_inherited_context(
-        &mut self,
-        session: &mut Session,
-        turn_input: TurnInput,
-        turn_lifecycle: &Arc<TurnLifecycle>,
-        span_recorder: &Arc<SpanRecorder>,
-        parent_turn_id: Option<TurnId>,
-        delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        cancel_token: CancellationToken,
-        interjections: Option<&mut dyn InterjectionSource>,
-        notify_silence: Option<baybo_tools::NotifySilence>,
-        inherited_context: InheritedToolContext,
-    ) -> anyhow::Result<OutgoingMessage> {
-        self.run_with_optional_inherited_context(
-            session,
-            turn_input,
-            turn_lifecycle,
-            span_recorder,
-            parent_turn_id,
-            delta_tx,
-            cancel_token,
-            interjections,
-            notify_silence,
-            Some(inherited_context),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_with_optional_inherited_context(
-        &mut self,
-        session: &mut Session,
-        turn_input: TurnInput,
-        turn_lifecycle: &Arc<TurnLifecycle>,
-        span_recorder: &Arc<SpanRecorder>,
-        parent_turn_id: Option<TurnId>,
-        delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        cancel_token: CancellationToken,
-        interjections: Option<&mut dyn InterjectionSource>,
-        notify_silence: Option<baybo_tools::NotifySilence>,
-        inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
         // Memory recall query (and write eligibility) for this turn — `None`
@@ -954,7 +906,7 @@ impl AgentLoop {
         // through `with_turn`'s `T` and fire only once it has returned Ok.
         let (outgoing, pending_write) = crate::runtime::scope::with_turn(
             turn_lifecycle,
-            cancel_token.clone(),
+            tokens.turn.clone(),
             spec,
             |turn_id| async move {
                 let (outgoing, pending) = self
@@ -963,12 +915,11 @@ impl AgentLoop {
                         span_recorder,
                         turn_id,
                         delta_tx,
-                        cancel_token,
+                        tokens,
                         interjections,
                         memory_query,
                         turn_kind,
                         notify_silence.clone(),
-                        inherited_context.clone(),
                     )
                     .await?;
                 let output = if notify_silence.as_ref().is_some_and(|s| s.requested()) {
@@ -1021,18 +972,19 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         turn_id: TurnId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        cancel_token: CancellationToken,
+        tokens: TurnTokens,
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
         turn_kind: TurnInputKind,
         notify_silence: Option<baybo_tools::NotifySilence>,
-        inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
+        let cancel_token = tokens.turn.clone();
         // Title generation stays `UserChat`-only: a `Resume` turn's session
         // already has its opening message titled.
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
         let background_eligible =
             crate::runtime::background_jobs::background_eligible(session, turn_kind);
+        let attended = turn_kind.is_attended();
         self.context_manager.ensure_seeded().await?;
         // Churn and repeated failure are within-turn properties. Editing a
         // file back to how it was is exactly what "undo that" means when the
@@ -1211,11 +1163,11 @@ impl AgentLoop {
                         iterations,
                         iter_delta_tx,
                         notifier.clone(),
-                        &cancel_token,
+                        &tokens,
                         &mut turn_attachments,
                         background_eligible,
+                        attended,
                         notify_silence.clone(),
-                        inherited_context.clone(),
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
@@ -1312,6 +1264,29 @@ impl AgentLoop {
         e
     }
 
+    /// Whether the loop may append a result for a call that never finished
+    /// or whose ask came back abandoned. On an ancestor cancel nothing is
+    /// appended. Otherwise the call's asks are claimed `Abandoned` first, so
+    /// "row abandoned iff a result is on the transcript" holds; a lost claim
+    /// (the ask was answered in the same instant) appends nothing and leaves
+    /// the answer to the next settlement.
+    async fn claim_interrupted_call(
+        &self,
+        session: &Session,
+        tool_use_id: &str,
+        origin: Option<CancelOrigin>,
+    ) -> bool {
+        if origin == Some(CancelOrigin::Ancestor) {
+            return false;
+        }
+        !matches!(
+            self.asks
+                .abandon_for_tool_call(&session.id, tool_use_id)
+                .await,
+            baybo_human_ask::ToolCallAbandon::Answered
+        )
+    }
+
     /// One iteration of the agentic loop, scoped to a single
     /// `LlmIteration` step (opened by [`crate::runtime::scope::with_step`] in
     /// the caller). Calls the LLM, then executes the response's tool
@@ -1334,14 +1309,17 @@ impl AgentLoop {
         iterations: usize,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
-        cancel_token: &CancellationToken,
+        tokens: &TurnTokens,
         turn_attachments: &mut Vec<ContentBlock>,
         // Whether this turn may create background work — computed once per
         // turn in `run_inner`.
         background_eligible: bool,
+        // Whether a human can answer this turn's asks — computed once per
+        // turn in `run_inner`.
+        attended: bool,
         notify_silence: Option<baybo_tools::NotifySilence>,
-        inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<IterationOutcome> {
+        let cancel_token = &tokens.turn;
         let (response, llm_span_id) = match self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
             .await
@@ -1520,7 +1498,6 @@ impl AgentLoop {
         }
         let read_tracker_for_calls = self.read_tracker.clone();
         let notify_silence_for_calls = notify_silence.clone();
-        let inherited_context_for_calls = inherited_context.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response
             .tool_calls
@@ -1529,7 +1506,6 @@ impl AgentLoop {
             .map(|(tc, dispatch)| {
                 let executor = Arc::clone(&executor);
                 let notify_silence = notify_silence_for_calls.clone();
-                let inherited_context = inherited_context_for_calls.clone();
                 let session_id = session_id_for_calls.clone();
                 let session_trigger = session_trigger_for_calls.clone();
                 let agent_id = agent_for_calls.clone();
@@ -1537,7 +1513,10 @@ impl AgentLoop {
                 let approved = Arc::clone(&approved);
                 let recorder = Arc::clone(&recorder_for_calls);
                 let step = step_for_calls.clone();
-                let cancel = cancel_token.child_token();
+                let tokens = TurnTokens {
+                    turn: cancel_token.child_token(),
+                    actor: tokens.actor.clone(),
+                };
                 let notifier = notifier_for_calls.clone();
                 let bind_source = Arc::clone(&llm_for_calls);
                 let tool_name = dispatch.name.clone();
@@ -1582,13 +1561,13 @@ impl AgentLoop {
                             tool_use_id,
                             None,
                             Some(turn_id),
-                            cancel,
+                            tokens,
                             notifier,
                             Some(&bind_source),
                             background_eligible,
+                            attended,
                             read_tracker,
                             notify_silence,
-                            inherited_context,
                             via_invoke,
                         )
                         .await
@@ -1614,6 +1593,12 @@ impl AgentLoop {
             }
         };
         drop(pending);
+        // Read once, after the batch: a turn cancel (`/stop`) settles the
+        // calls it interrupted; an ancestor cancel (shutdown) leaves them
+        // exactly as a crash would, so a parked ask survives the restart.
+        let cancel_origin = cancel_token
+            .is_cancelled()
+            .then(|| CancelOrigin::of(tokens));
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
@@ -1624,6 +1609,14 @@ impl AgentLoop {
             .zip(&dispatch_calls)
             .zip(tool_results)
         {
+            let interrupted = executed.as_ref().is_none_or(|e| e.abandoned);
+            if interrupted
+                && !self
+                    .claim_interrupted_call(session, &tool_call.id, cancel_origin)
+                    .await
+            {
+                continue;
+            }
             // Every persisted tool use needs a result in the live context window.
             let Some(executed) = executed else {
                 self.emit_tool_completed(
@@ -3784,7 +3777,11 @@ mod tool_completion_summary_tests {
         output: anyhow::Result<ToolOutput>,
         approval: Option<ApprovalDecision>,
     ) -> ExecutedTool {
-        ExecutedTool { output, approval }
+        ExecutedTool {
+            output,
+            approval,
+            abandoned: false,
+        }
     }
 
     #[test]

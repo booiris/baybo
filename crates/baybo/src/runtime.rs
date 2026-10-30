@@ -226,6 +226,9 @@ pub struct ManagerGraph {
     pub ask_core: Arc<baybo_human_ask::AskCore>,
     /// One ask queue per channel; the lazy install fetches from it too.
     pub ask_queues: baybo_human_ask::AskQueues,
+    /// The verbs over the ask ledger. Every actor's loop gets it as its
+    /// `TurnAsks` port.
+    pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
 
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
@@ -348,6 +351,13 @@ pub async fn build_managers(
     // `ask_queues` so the boot reload and the install meet on one queue.
     let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
     let ask_queues = baybo_human_ask::AskQueues::new();
+    let human_asks = Arc::new(baybo_human_ask::HumanAskManager::from_config(
+        baybo_human_ask::HumanAskManagerConfig {
+            core: Arc::clone(&ask_core),
+            queues: ask_queues.clone(),
+            resume_sink: Arc::new(NoResumeDoor),
+        },
+    ));
     // Eagerly install every enabled channel from config so connections
     // can attach to a pre-existing slot rather than racing on lazy
     // first-connect creation. See docs/modules/channels-protocol-refactor.md.
@@ -854,6 +864,7 @@ pub async fn build_managers(
             projects: Arc::clone(&project_manager) as Arc<dyn baybo_project::ProjectRepo>,
             agents: stores.agent_profile.clone(),
         }),
+        Arc::new(baybo_human_ask::PolicyDenyGate::new(Arc::clone(&ask_core))),
     ));
 
     // --- per-actor parent token. The spawner factory derives each
@@ -922,8 +933,31 @@ pub async fn build_managers(
         timeline_approvals,
         ask_core,
         ask_queues,
+        human_asks,
         subagent_dispatch_limiter,
     })
+}
+
+/// Interim resume sink until the chat Resume door (`RouterInbound::ResumeAsk`)
+/// exists: an answer to a dead ask is recorded on the ledger and nothing is
+/// requested, exactly as for an issue session.
+// TODO(human-ask): replace with the baybo-agent sink over the router inbound
+// channel when the Resume door lands.
+struct NoResumeDoor;
+
+#[async_trait::async_trait]
+impl baybo_human_ask::ResumeSink for NoResumeDoor {
+    async fn resumes_on_answer(&self, _session: &baybo_model::SessionId) -> bool {
+        false
+    }
+
+    fn request_resume(&self, req: baybo_model::human_ask::ResumeRequest) {
+        tracing::warn!(
+            session_id = %req.session_id,
+            ask_id = %req.ask_id,
+            "no resume door wired; the answer waits for the session's next turn"
+        );
+    }
 }
 
 /// Router + channel handles a chat loop needs to drive.
@@ -1015,6 +1049,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         // below; `None` keeps the no-op path (every memory hook skipped,
         // nothing billed).
         let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
+        let turn_asks: Arc<dyn baybo_agent::runtime::asks::TurnAsks> = graph.human_asks.clone();
         // Shared across every actor: the title pass notifies this sink once it
         // has persisted a generated title, and it fans a `SessionUpdated` patch
         // out to every Subscribed channel so the owning surface updates live.
@@ -1088,6 +1123,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     memory: memory.clone(),
                     task_store: task_store.clone(),
                     title_sink: title_sink.clone(),
+                    asks: Arc::clone(&turn_asks),
                 });
 
                 let span_recorder = Arc::new(SpanRecorder::new(

@@ -250,9 +250,10 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   [`todo/mcp-tool-approval.md`](../todo/mcp-tool-approval.md)), so MCP calls
   never prompt.
 
-- **Unattended lineages** — a cron/subagent lineage carries the field-less
-  `InheritedToolContext` marker; any approval-gated resource access is denied
-  there without a prompt (nobody can answer one). Since MCP tools declare no
+- **Unattended turns** — cron fires and subagent turns are unattended by
+  turn kind (`TurnInputKind::is_attended`); the executor sends their asks to
+  `PolicyDenyGate`, so any approval-gated resource access is denied without a
+  prompt (nobody can answer one). Since MCP tools declare no
   such accesses, they run in cron/subagent sessions exactly as in chat. See
   [`cron.md`](cron.md).
 
@@ -451,7 +452,7 @@ The detailed design is in [`../permission.md`](../permission.md).
 
 ### Per-tool timeout ceiling
 
-Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer cancel deadline (`+ APPROVAL_HEADROOM`). There is no `baybo.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
+Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer deadline (`+ TOOL_DEADLINE_GRACE`, paused while the call is parked on an ask). There is no `baybo.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
 
 Current overrides:
 

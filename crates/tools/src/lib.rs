@@ -19,10 +19,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use baybo_model::ChannelType;
 use baybo_model::human_ask::AskPhase;
-use baybo_model::{
-    AgentHandle, AgentProfileId, InheritedToolContext, SessionId, SpanId, TriggerSource, TurnId,
-    User,
-};
+use baybo_model::{AgentHandle, AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -422,12 +419,6 @@ pub struct ToolContext {
     /// for the interactive agent loop**; argv-mode / test call sites leave it
     /// `None`, which disables the contract. See [`ReadTracker`].
     pub read_tracker: Option<ReadTracker>,
-    /// Transient tool authority inherited by this execution. `Some`, including
-    /// `Some(default())`, makes the executor fail closed instead of prompting,
-    /// and `spawn_subagent` forwards it unchanged to in-process children. It
-    /// is not persistent session state, so a later independent turn receives
-    /// `None`.
-    pub inherited_context: Option<InheritedToolContext>,
     /// Whether this call may **create** background work: a `Bash` command
     /// that converts to background on timeout, or a subagent that converts
     /// (or is dispatched) instead of blocking. Decided per turn by the agent
@@ -511,7 +502,6 @@ impl ToolContext {
             secrets: None,
             virtual_reads: None,
             read_tracker: None,
-            inherited_context: None,
             // Inert on its own — nothing backgrounds until a test also wires
             // `background_jobs`, so defaulting to eligible keeps a fixture
             // that wires the sink meaning what it says.
@@ -654,10 +644,10 @@ pub struct ApprovalHandle {
     /// `tool_use_id` of the call this handle serves, stamped onto every
     /// [`ApprovalRequest`] so clients can badge the right work step.
     tool_call_id: String,
-    /// Last decision an ACTUAL prompt returned (cache short-circuits never
+    /// Last outcome an ACTUAL prompt returned (cache short-circuits never
     /// record). Shared across clones so the executor reads back what
     /// mid-execution prompts decided after the tool returns.
-    last_decision: Arc<parking_lot::Mutex<Option<ApprovalDecision>>>,
+    last_outcome: Arc<parking_lot::Mutex<Option<ApprovalOutcome>>>,
     park: ParkGauge,
     cancel: AskCancel,
 }
@@ -674,7 +664,7 @@ impl ApprovalHandle {
             gate,
             approved_cache,
             tool_call_id,
-            last_decision: Arc::new(parking_lot::Mutex::new(None)),
+            last_outcome: Arc::new(parking_lot::Mutex::new(None)),
             park,
             cancel,
         }
@@ -691,7 +681,7 @@ impl ApprovalHandle {
             let _parked = self.park.park();
             self.gate.request(req, site, self.cancel.clone()).await
         };
-        *self.last_decision.lock() = Some(outcome.decision);
+        *self.last_outcome.lock() = Some(outcome);
         outcome
     }
 
@@ -699,7 +689,13 @@ impl ApprovalHandle {
     /// raised — `None` when everything was covered by cache. The executor
     /// stamps this into the persisted [`baybo_model::ToolResultMeta`].
     pub fn last_decision(&self) -> Option<ApprovalDecision> {
-        *self.last_decision.lock()
+        self.last_outcome().map(|outcome| outcome.decision)
+    }
+
+    /// The full outcome behind [`Self::last_decision`], including how it was
+    /// reached (a torn-down prompt reads [`ApprovalResolution::Abandoned`]).
+    pub fn last_outcome(&self) -> Option<ApprovalOutcome> {
+        *self.last_outcome.lock()
     }
 
     /// Forward a request to the gate WITHOUT consulting the session
