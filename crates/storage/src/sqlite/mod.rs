@@ -7,6 +7,7 @@ mod cost;
 mod cron;
 mod deck;
 mod device;
+mod human_ask;
 mod payload;
 mod project;
 mod search;
@@ -28,6 +29,7 @@ pub use cost::SqliteCostStore;
 pub use cron::SqliteCronStore;
 pub use deck::SqliteDeckCardStore;
 pub use device::SqliteDeviceStore;
+pub use human_ask::SqliteHumanAskStore;
 pub use project::SqliteProjectStore;
 pub use search::SqliteMessageSearchStore;
 pub use secret::SqliteSecretStore;
@@ -880,6 +882,36 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_tasks_session
                     ON session_tasks(session_id);
+
+                -- The human-ask ledger: every prompt handed to a human
+                -- (tool approvals, AskUser questions), written before it is
+                -- shown. Rows are NEVER deleted — resolved rows are the audit
+                -- trail. pending = resolved_at IS NULL; resolved = decided,
+                -- applied_at IS NULL; applied = a turn consumed it.
+                CREATE TABLE IF NOT EXISTS human_asks (
+                    ask_id        TEXT PRIMARY KEY,
+                    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    -- ChannelType; which queue a pending row reloads into.
+                    channel       TEXT NOT NULL,
+                    -- The LLM tool_use id the ask blocks (not unique).
+                    tool_call_id  TEXT NOT NULL,
+                    -- AskKind::as_str(): 'approval' | 'question'.
+                    kind          TEXT NOT NULL,
+                    -- AskPhase::as_str(): 'before_execute' | 'during_execute'.
+                    phase         TEXT NOT NULL,
+                    -- AskRequest JSON.
+                    request       TEXT NOT NULL,
+                    -- Unix µs.
+                    created_at    INTEGER NOT NULL,
+                    -- NULL = pending.
+                    resolved_at   INTEGER,
+                    -- AskResolution JSON, NULL while pending.
+                    resolution    TEXT,
+                    -- NULL until a turn consumed the resolution.
+                    applied_at    INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_human_asks_unapplied
+                    ON human_asks(session_id, created_at) WHERE applied_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,

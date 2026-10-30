@@ -795,7 +795,7 @@ mod approvals {
     fn request(session: &SessionId, call_id: &str) -> ApprovalRequest {
         ApprovalRequest {
             call_id: call_id.to_owned(),
-            tool_call_id: None,
+            tool_call_id: String::new(),
             session_id: session.clone(),
             user_id: "owner".to_owned(),
             tool: "Bash".to_owned(),

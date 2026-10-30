@@ -29,49 +29,16 @@ use async_trait::async_trait;
 use baybo_model::{ChannelType, SessionId};
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub use baybo_model::approval::{
-    ApprovalDecision, ApprovalResolution, ApprovedResource, HostPattern, ResourceAccess,
+    ApprovalDecision, ApprovalRequest, ApprovalResolution, ApprovedResource, HostPattern,
+    ResourceAccess,
 };
 
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
-
-/// A pending approval request forwarded to the gate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalRequest {
-    pub call_id: String,
-    /// `call_id` of the tool call this prompt blocks — the LLM `tool_use_id`
-    /// that `ToolStarted`/`ToolCompleted` events carry, NOT this request's own
-    /// `call_id` (a fresh UUID per prompt; one call can prompt more than once).
-    /// Lets clients badge the exact work step that is waiting. `None` for a
-    /// prompt raised outside a tool-call context.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    /// Session the tool call runs under. Lets HTTP clients (e.g. the
-    /// gateway-backed TUI) render approvals alongside the session they belong to.
-    pub session_id: SessionId,
-    /// Baybo user id the tool call is running on behalf of. Sidecars
-    /// that route prompts by platform user (Telegram chat, Discord DM)
-    /// use this instead of reverse-mapping from `session_id`. Empty
-    /// string when no user context applies.
-    #[serde(default)]
-    pub user_id: String,
-    pub tool: String,
-    pub accesses: Vec<ResourceAccess>,
-    /// Short truncated JSON preview of the parameters, for UI display only.
-    pub params_preview: String,
-    /// Caller-supplied label produced by [`crate::Tool::call_label`]
-    /// (e.g. Bash's `description` parameter). Channel-side approval
-    /// UIs can render this above the JSON preview. Wire-compatible
-    /// with older sidecars: missing on input deserializes to `None`,
-    /// `None` is omitted on serialize.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
 
 /// What came back from a gate, and *how*. The decision alone is what the
 /// executor acts on; the resolution is what the ledgers downstream (the
@@ -746,7 +713,7 @@ mod tests {
         let gate = AutoDenyGate;
         let out = gate
             .request(ApprovalRequest {
-                tool_call_id: None,
+                tool_call_id: String::new(),
                 call_id: "x".into(),
                 session_id: "s".into(),
                 user_id: "u".into(),
@@ -778,7 +745,7 @@ mod tests {
         ));
 
         let req = |call_id: &str| ApprovalRequest {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             call_id: call_id.into(),
             session_id: "s".into(),
             user_id: "u".into(),
@@ -860,7 +827,7 @@ mod tests {
         );
 
         let req = ApprovalRequest {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             call_id: "c1".into(),
             session_id: "s".into(),
             user_id: "u".into(),
@@ -918,7 +885,7 @@ mod tests {
             ChannelApprovalGate::new(queue.clone(), Arc::new(|_| {}), Duration::from_secs(60));
 
         let req = ApprovalRequest {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             call_id: "stale".into(),
             session_id: "s".into(),
             user_id: "u".into(),
@@ -957,7 +924,7 @@ mod tests {
             ChannelApprovalGate::new(queue.clone(), Arc::new(|_| {}), Duration::from_secs(60));
 
         let req = ApprovalRequest {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             call_id: "live".into(),
             session_id: "s".into(),
             user_id: "u".into(),
@@ -1003,7 +970,7 @@ mod tests {
 
     fn mirror_req(call_id: &str, session_id: &str) -> ApprovalRequest {
         ApprovalRequest {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             call_id: call_id.into(),
             session_id: session_id.into(),
             user_id: "u".into(),

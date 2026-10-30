@@ -831,7 +831,7 @@ impl ToolExecutor {
                     let gate = self.gate_map.get(&user.channel, session_id);
                     let request = gate.request(ApprovalRequest {
                         call_id: Uuid::new_v4().to_string(),
-                        tool_call_id: Some(tool_use_id.clone()),
+                        tool_call_id: tool_use_id.clone(),
                         session_id: session_id.clone(),
                         user_id: user.id.clone(),
                         tool: tool_name_owned.clone(),
@@ -965,7 +965,7 @@ impl ToolExecutor {
                 let approval = ApprovalHandle::new(
                     approval_gate,
                     Arc::clone(approved_resources),
-                    Some(tool_use_id.clone()),
+                    tool_use_id.clone(),
                 );
                 let approval_probe = approval.clone();
 

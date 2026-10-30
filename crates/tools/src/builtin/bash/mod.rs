@@ -3557,7 +3557,7 @@ mod tests {
     ) -> ToolContext {
         let mut ctx = ctx_with(sandbox);
         let cache: Arc<Mutex<Vec<ApprovedResource>>> = Arc::new(Mutex::new(Vec::new()));
-        ctx.approval = Some(ApprovalHandle::new(gate, cache, None));
+        ctx.approval = Some(ApprovalHandle::new(gate, cache, String::new()));
         ctx
     }
 
@@ -4830,7 +4830,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(vec![ApprovedResource::ExecCommand {
             command: command.to_string(),
         }]));
-        ctx.approval = Some(ApprovalHandle::new(gate.clone(), cache, None));
+        ctx.approval = Some(ApprovalHandle::new(gate.clone(), cache, String::new()));
 
         let out = BashTool::for_test()
             .execute(

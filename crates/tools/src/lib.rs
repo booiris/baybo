@@ -646,9 +646,8 @@ pub struct ApprovalHandle {
     /// pre-execute prompts use a single source of truth.
     approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
     /// `tool_use_id` of the call this handle serves, stamped onto every
-    /// [`ApprovalRequest`] so clients can badge the right work step. `None`
-    /// for handles built outside a tool-call context (tests).
-    tool_call_id: Option<String>,
+    /// [`ApprovalRequest`] so clients can badge the right work step.
+    tool_call_id: String,
     /// Last decision an ACTUAL prompt returned (cache short-circuits never
     /// record). Shared across clones so the executor reads back what
     /// mid-execution prompts decided after the tool returns.
@@ -659,7 +658,7 @@ impl ApprovalHandle {
     pub fn new(
         gate: Arc<dyn ApprovalGate>,
         approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
-        tool_call_id: Option<String>,
+        tool_call_id: String,
     ) -> Self {
         Self {
             gate,
@@ -1209,11 +1208,7 @@ mod approval_handle_tests {
     #[async_trait]
     impl ApprovalGate for FixedGate {
         async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
-            assert_eq!(
-                req.tool_call_id.as_deref(),
-                Some("use-1"),
-                "prompt carries the tool call id"
-            );
+            assert_eq!(req.tool_call_id, "use-1", "prompt carries the tool call id");
             ApprovalOutcome::answered(self.0)
         }
     }
@@ -1222,7 +1217,7 @@ mod approval_handle_tests {
         ApprovalHandle::new(
             Arc::new(FixedGate(decision)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
-            Some("use-1".into()),
+            "use-1".into(),
         )
     }
 
@@ -1287,7 +1282,7 @@ mod approval_handle_tests {
         let h = ApprovalHandle::new(
             Arc::new(FixedGate(ApprovalDecision::Deny)),
             cache,
-            Some("use-1".into()),
+            "use-1".into(),
         );
         let out = h
             .request(

@@ -342,7 +342,7 @@ fn map_frame(
             debug!(call_id, tool, "approval added from gateway");
             queue.enqueue_mirror(ApprovalRequest {
                 call_id,
-                tool_call_id,
+                tool_call_id: tool_call_id.unwrap_or_default(),
                 session_id,
                 user_id,
                 tool,
@@ -392,7 +392,7 @@ fn map_frame(
                 queue.drop_call(&card.call_id);
                 queue.enqueue_mirror(ApprovalRequest {
                     call_id: card.call_id,
-                    tool_call_id: card.tool_call_id,
+                    tool_call_id: card.tool_call_id.unwrap_or_default(),
                     session_id: session_id.clone(),
                     user_id: card.user_id,
                     tool: card.tool,

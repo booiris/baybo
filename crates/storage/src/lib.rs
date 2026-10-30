@@ -9,9 +9,9 @@ pub mod test_support;
 // import them from `baybo_store` directly, not via this adapter.
 use baybo_store::{
     AgentProfileStore, BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore,
-    CostStore, CronStore, DeckCardStore, DeviceStore, MessageSearchStore, ProjectStore,
-    SecretStore, SessionFolderStore, SessionStore, SkillRiskStore, TaskStore, TraceStore,
-    TurnStore,
+    CostStore, CronStore, DeckCardStore, DeviceStore, HumanAskStore, MessageSearchStore,
+    ProjectStore, SecretStore, SessionFolderStore, SessionStore, SkillRiskStore, TaskStore,
+    TraceStore, TurnStore,
 };
 
 /// Bundles all store implementations into a single container
@@ -41,6 +41,7 @@ pub struct Store {
     pub deck: std::sync::Arc<dyn DeckCardStore>,
     pub project: std::sync::Arc<dyn ProjectStore>,
     pub blob: std::sync::Arc<dyn BlobStore>,
+    pub human_ask: std::sync::Arc<dyn HumanAskStore>,
 }
 
 impl Store {
@@ -95,6 +96,7 @@ impl Store {
             deck: std::sync::Arc::new(sqlite::SqliteDeckCardStore::new(pool.clone())),
             project: std::sync::Arc::new(sqlite::SqliteProjectStore::new(pool.clone())),
             blob: std::sync::Arc::new(blob),
+            human_ask: std::sync::Arc::new(sqlite::SqliteHumanAskStore::new(pool.clone())),
         })
     }
 }

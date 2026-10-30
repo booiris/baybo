@@ -155,7 +155,7 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
         };
         channel.dispatch_approval_requested(
             entry.call_id,
-            entry.tool_call_id,
+            Some(entry.tool_call_id),
             entry.session_id,
             entry.user_id,
             entry.tool,

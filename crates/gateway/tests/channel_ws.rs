@@ -954,7 +954,7 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
     let gate = channel.approval_gate().expect("owner channel has a gate");
     let req = baybo_tools::ApprovalRequest {
         call_id: "prompt-1".into(),
-        tool_call_id: None,
+        tool_call_id: String::new(),
         session_id: "sess-blocked".into(),
         user_id: String::new(),
         tool: "Bash".into(),

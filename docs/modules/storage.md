@@ -11,7 +11,7 @@ Its job is:
   `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
   `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
   `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`, `ProjectStore`,
-  `DeckCardStore`) via sqlite
+  `DeckCardStore`, `HumanAskStore`) via sqlite
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
@@ -86,6 +86,7 @@ sqlite/device.rs          → impl DeviceStore                          (trait +
 sqlite/agent_profile.rs   → impl AgentProfileStore                    (trait + AgentProfileRow / AgentProfileUpdate from baybo-store)
 sqlite/project.rs         → impl ProjectStore                         (trait + ProjectRow / IssueRow / IssueRunRow / IssueEventRow and their update/new types from baybo-store)
 sqlite/deck.rs            → impl DeckCardStore                        (trait + DeckCardRow / DeckSnapshotRow / DeckLayoutEntry / DeckSize from baybo-store; deck_cards + latest-N-pruned deck_snapshots)
+sqlite/human_ask.rs       → impl HumanAskStore                      (trait + HumanAskRow from baybo-store; payload/resolution JSON typed by baybo_model::human_ask; rows never deleted)
 ```
 
 Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one. One table is deliberately outside it: the FTS5 index `message_fts` is owned by `sqlite/search.rs`, which drops and recreates it from `search::rebuild_if_stale` whenever the segmenter fingerprint changes, because `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table that already exists. It is therefore the one table whose DDL is not `IF NOT EXISTS` and not in `mod.rs`; only its fingerprint row's table, `search_meta`, is (see [`search.md`](../search.md)).
@@ -242,6 +243,35 @@ a row whose stored `status` is unrecognized (written by a future variant) rather
 than failing the whole call, mirroring the session-blob skip discipline. Task
 rows themselves carry no unread/acknowledged state.
 
+### Human-ask ledger: the `human_asks` table
+
+Every prompt the agent hands to a human — a tool approval today, an `AskUser`
+question later — is a `human_asks` row written **before** it is shown, served
+by `SqliteHumanAskStore` over the `HumanAskStore` trait (see
+[`human-ask.md`](human-ask.md)). Columns: `ask_id` (primary key),
+`session_id`, `channel` (the queue a pending row reloads into after a
+restart), `tool_call_id` (the blocked `tool_use`; not unique), `kind` and
+`phase` (`AskKind` / `AskPhase::as_str()`), `request` (`AskRequest` JSON),
+and three µs timestamps plus the `resolution` JSON. A row is *pending* while
+`resolved_at` is NULL, *resolved* once decided, *applied* once a turn
+consumed the decision; the partial index `idx_human_asks_unapplied` on
+`(session_id, created_at) WHERE applied_at IS NULL` serves the
+`list_unapplied*` reads.
+
+`create` is `INSERT … ON CONFLICT(ask_id) DO NOTHING`; `resolve` and
+`mark_applied` are single-statement claim `UPDATE`s guarded by
+`resolved_at IS NULL` / `applied_at IS NULL` and return whether this caller
+won, so a BUSY re-run is idempotent and two claimers have exactly one winner.
+Reads decode the raw columns outside sqlite and skip (with a `warn!`) a row
+whose kind, phase or JSON this build cannot read.
+
+**Rows are never deleted.** There is no `HumanAskStore::delete` and no janitor
+sweep: resolved rows are the audit ledger of who answered what, when, and how.
+`session_id REFERENCES sessions(id) ON DELETE CASCADE` is enforced (the
+bundled sqlite builds with foreign keys on), so a row needs its session row to
+exist first; sessions themselves are never deleted, so the cascade does not
+fire in practice.
+
 ### Single backend: sqlite
 
 All store implementations are rusqlite over a file-backed SQLite database, and there is no separate in-memory backend. `Store::open(path)` opens (or creates) that file (creating parent directories if missing). There is **one** way to open a pool and tests use it too — a temp-dir path — rather than a test-only in-memory mode: a store with no on-disk home reports `StoreIdentity::Ephemeral`, which tells cross-process coordination there is no peer to synchronise with, and that is a silent footgun to leave reachable from production code. rusqlite is synchronous, so a `SqlitePool` handle is how async callers reach it at all; the mechanics of that — eight connections, one checked out exclusively per closure on a `spawn_blocking` thread, and what that makes load-bearing — are above under *One connection per in-flight operation*.
@@ -361,7 +391,7 @@ complete at insertion and store 1.
 
 For tables that are deletable, deletion is a plain `DELETE FROM` except for
 the cases below: no generic tombstone convention, no implicit revival
-semantics. Sessions are not in this category. The one cadence-driven retention
+semantics. Sessions are not in this category, and neither is `human_asks`, which is never deleted (see above). The one cadence-driven retention
 sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow
 rows), which issues the same `DELETE FROM` against rows past their retention
 horizon. Blobs are **not** swept on a TTL; there is no

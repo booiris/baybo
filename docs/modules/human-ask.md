@@ -163,8 +163,11 @@ CREATE INDEX IF NOT EXISTS idx_human_asks_unapplied
     ON human_asks(session_id, created_at) WHERE applied_at IS NULL;
 ```
 
-- `REFERENCES … ON DELETE CASCADE` is documentary: `PRAGMA foreign_keys` is
-  never enabled (`sqlite/mod.rs:528`) and sessions are never deleted.
+- `REFERENCES … ON DELETE CASCADE` is **enforced**, not documentary: the
+  bundled sqlite (`rusqlite` `bundled`) builds with foreign keys on, so
+  `create` fails for a `session_id` with no `sessions` row — the ask's session
+  must be persisted first. Sessions are never deleted, so the cascade never
+  fires in practice.
 - **No `delete` on `HumanAskStore`, no janitor sweep.** Resolved rows are the
   audit trail ("Governable: selection and execution are auditable"). The
   transcript's `tool_result` is the authoritative answer; the row adds who

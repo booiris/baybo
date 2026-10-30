@@ -619,7 +619,7 @@ mod tests {
     async fn ws_approval_is_auto_resolved_from_queue() {
         let q = ApprovalQueue::new();
         q.enqueue_mirror(ApprovalRequest {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             call_id: "c1".into(),
             session_id: SessionId::from("s1"),
             user_id: String::new(),
