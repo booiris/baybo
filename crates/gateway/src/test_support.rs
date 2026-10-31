@@ -222,7 +222,10 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     // takes its persist-directly branch) and the response channel is
     // never driven. A throwaway sender satisfies the constructor.
     let (agent_output_tx, _agent_output_rx) = mpsc::channel(1);
-    let supervisor = baybo_agent::supervisor::AgentSupervisor::new(agent_output_tx);
+    let supervisor = baybo_agent::supervisor::AgentSupervisor::new(
+        agent_output_tx,
+        std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+    );
 
     let deck_manager = baybo_deck::DeckManager::from_config(baybo_deck::DeckManagerConfig {
         store: stores.deck.clone(),
@@ -250,7 +253,26 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         baybo_project::no_stopper(),
     ));
 
+    let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
+    let ask_queues = baybo_human_ask::AskQueues::new();
+    // No router here, so an answer to a dead ask resumes nothing.
+    let human_asks = Arc::new(baybo_human_ask::HumanAskManager::from_config(
+        baybo_human_ask::HumanAskManagerConfig {
+            core: Arc::clone(&ask_core),
+            queues: ask_queues.clone(),
+            resume_sink: Arc::new(baybo_human_ask::test_support::NoResume),
+        },
+    ));
+    baybo_project::install_ask_bridge(
+        &ask_core,
+        &project_manager,
+        Arc::clone(&human_asks),
+        stores.session.clone(),
+    );
     let deps = GatewayDeps {
+        ask_core,
+        ask_queues,
+        human_asks,
         config,
         config_path: None,
         inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),

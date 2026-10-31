@@ -292,21 +292,38 @@ running against a peer that is gone.
 
 ### Tool approval over the sidecar WS
 
-Each `Channel` is born at boot with its own `ChannelApprovalGate` +
-`ApprovalQueue` (the `ApprovalSurface` on
+Each `Channel` is born at boot with its own `baybo_human_ask::ChannelAskGate`
+over the channel's `AskQueue` (the `AskSurface` on
 `crates/channels/src/channel.rs`), built in `src/channel/boot.rs::
-build_channel`. When a tool call hits the gate the entry is pushed on
-the queue and the waker dispatches a `SessionEvent::ApprovalRequested`
-through the channel's fan-out so every subscriber of the call's session
-sees it. The client echoes a `ResolveApproval { call_id, decision }`
-frame; the inbound loop calls `Sidecar::resolve_approval`, which
-delegates to `Channel::resolve_approval` — that pops the matching queue
-entry, reads the `session_id` off it, and broadcasts
-`SessionEvent::ApprovalResolved` to every subscriber so all frontends
-drop the prompt. The 5-minute timeout (`APPROVAL_TIMEOUT = 300s` in
-`channel/boot.rs`) mirrors the TUI's original budget — long enough for a
-human, short enough that forgotten prompts don't pin tool executors
-forever.
+build_channel`. `install_channels` / `install_channel` / `build_channel` take
+the shared `Arc<AskCore>` + `AskQueues` and **fetch** the channel's queue via
+`queues.get_or_create(channel_type)`, so a queue the boot reload already filled
+is the one the channel attaches to; the lazy install of an out-of-tree channel
+(`resolve_or_install_channel`) reads both off `WsChannelState`, which copies
+them from `GatewayDeps`. When a tool call hits the gate the ask is written to
+the `human_asks` ledger and pushed on the queue. Frames come from the queue
+watchers `build_channel` installs, not from the gate: `AskRaised` dispatches
+`SessionEvent::ApprovalRequested` through the channel's fan-out so every
+subscriber of the call's session sees it; every `AskClosed` dispatches
+`SessionEvent::AskResolved` (→ `Frame::AskResolved`), plus
+`SessionEvent::ApprovalResolved` when a human decided an approval, so all
+frontends drop the card however it closed. A per-session pending-edge watcher
+broadcasts the `SessionPatch.awaiting_human` list mark. The client echoes a
+`ResolveApproval { call_id, decision }` frame; the inbound loop checks the ask
+is on this connection's channel queue and calls `HumanAskManager::resolve`,
+which claims the decision in the ledger first and then removes the entry
+(the watchers do the broadcast). There is no timeout: an ask waits until a
+human answers it or a verb abandons it (`/stop`, a card close, a new message
+past a dead ask); a process exit leaves it pending for the next boot, whose
+reload re-queues it (see [`human-ask.md`](human-ask.md)). The board's
+`POST /projects/{id}/issues/{n}/approvals/{call_id}` resolves through the
+same verb, for a pending `Approval` row raised by that issue's session.
+
+The ask push relay (`push/ask.rs`, `AskPushRelay`) is built in
+`build_managers` and installed on the `owner` channel before the boot
+reload, so a re-queued dead ask pushes once for a session nobody has open;
+`gateway_cmd` takes its stream off `ManagerGraph.ask_push_stream` when it
+spawns the push task.
 
 Approvals resolve through the **channel-level** gate (`ApprovalGateMap`
 keyed by `ChannelType`), with a second **session-level** tier
@@ -317,7 +334,9 @@ approval.rs`). Because the gate lives on the long-lived channel rather
 than on a connection, a sidecar reconnecting does not lose pending
 approvals — a resubscribe re-delivers the full card set in the
 `SubscribeState` bundle's `pending_approvals` half (see the
-`Frame::Subscribe` handler).
+`Frame::Subscribe` handler), and a multiplexed sidecar, which has no
+`SubscribeState`, is re-sent every pending approval on its queue right after
+it registers.
 
 ### Gateway owns its own DTOs — utoipa stays in the gateway
 
@@ -1014,7 +1033,16 @@ The full frame set (see `crates/wire/src/lib.rs`):
   See [`docs/turn-progress-events.md`](../turn-progress-events.md).
 - **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
   client), `ResolveApproval` (client → server); the on-subscribe
-  authoritative set rides `SubscribeState.pending_approvals`.
+  authoritative set rides `SubscribeState.pending_approvals`. Approvals
+  never time out and survive a restart (the boot reload re-queues them from
+  the `human_asks` ledger). `AskResolved { ask_id, outcome }` (server →
+  client, session-less, `outcome` ∈ `answered | declined | abandoned`) is
+  sent on every close of any ask kind — the only frame that retires an
+  approval nobody decided. `ResolveApproval` resolves through
+  `HumanAskManager::resolve`, and only for an ask on the connection's own
+  channel queue. A multiplexed sidecar is re-sent every pending approval on
+  its channel's queue right after it registers, since it has no
+  `SubscribeState` catch-up. See [`human-ask.md`](human-ask.md).
 - **TUI history:** `HistorySnapshot { session_id, entries }`,
   `HistoryAppend { session_id, entry }`.
 - **Bot multiplexing (Multiplexed channels):** `StartBot`, `StopBot`
@@ -1022,9 +1050,10 @@ The full frame set (see `crates/wire/src/lib.rs`):
   (server → client).
 - **Chat session signalling (the `owner` subscribed channel):** `SessionUpdated
   { session_id, patch }` (the `SessionPatch` carries Create/Hide/Unhide
-  plus `pinned`, `archived`, `folder_id`, `title` and `approval_pending`
-  changes; an absent field means "unchanged", so `title` can be replaced
-  but never cleared), `SessionActivity { session_id,
+  plus `pinned`, `archived`, `folder_id`, `title` and `awaiting_human`
+  changes — `awaiting_human` is the per-session "an ask of any kind is
+  pending" mark, renamed from `approval_pending`; an absent field means
+  "unchanged", so `title` can be replaced but never cleared), `SessionActivity { session_id,
   source, at }`, `FoldersChanged { folders }` (a full folder-tree snapshot
   re-broadcast after any folder mutation).
 - **Deck (server → client, the `owner` subscribed channel):**
@@ -1225,7 +1254,7 @@ crates/gateway/
 │   │   ├── adapter.rs       #   Sidecar — SessionEvent→Frame translator + outbound pump; attaches to Channel
 │   │   ├── api_tunnel.rs    #   gateway responder for E2E API-tunnel relay legs
 │   │   ├── blobs.rs         #   POST /v1/blobs + GET /v1/blobs/{id}
-│   │   ├── boot.rs          #   install_channels / build_channel; APPROVAL_TIMEOUT=300s; per-channel gate
+│   │   ├── boot.rs          #   install_channels / build_channel; per-channel ChannelAskGate over AskQueues
 │   │   ├── bot_reconciler.rs#   reconciles StartBot/StopBot rosters to Multiplexed sidecars
 │   │   ├── carrier/         #   a relay binding's direct carriers (the binding scope's CarrierRuntime):
 │   │   │                    #   runtime (offers, stop, the per-process certificate + offer gate),

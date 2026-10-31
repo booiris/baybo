@@ -250,9 +250,10 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   [`todo/mcp-tool-approval.md`](../todo/mcp-tool-approval.md)), so MCP calls
   never prompt.
 
-- **Unattended lineages** — a cron/subagent lineage carries the field-less
-  `InheritedToolContext` marker; any approval-gated resource access is denied
-  there without a prompt (nobody can answer one). Since MCP tools declare no
+- **Unattended turns** — cron fires and subagent turns are unattended by
+  turn kind (`TurnInputKind::is_attended`); the executor sends their asks to
+  `PolicyDenyGate`, so any approval-gated resource access is denied without a
+  prompt (nobody can answer one). Since MCP tools declare no
   such accesses, they run in cron/subagent sessions exactly as in chat. See
   [`cron.md`](cron.md).
 
@@ -391,13 +392,13 @@ This is a deliberate departure from "concrete HTTP hosts are gated by approval" 
 
 Cross-host redirects are still rejected inside the redirect policy (with a "re-issue WebFetch on the new URL" error) so a host change is always visible in the call trace, not silently followed inside `reqwest`. Per-hop SSRF re-validation runs on every redirect target regardless.
 
-`ChannelApprovalGate` + `ApprovalQueue` (`crates/tools/src/approval.rs`) extract the common queue-and-oneshot pattern so each channel only supplies a sync waker callback (e.g. `|| event_tx.try_send(WakeUp)`). The queue exposes `peek_head` / `resolve_head` / `len` so the channel's event loop can render and dismiss inline prompts without touching oneshot internals.
+This crate holds the approval **ports** only. The channel-backed gate and its queue live in `baybo-human-ask` (see [`human-ask.md`](human-ask.md)): `ChannelAskGate` writes the ask to the `human_asks` ledger, enqueues it on the channel's `AskQueue`, wakes the channel, and waits with no timeout; `PolicyDenyGate` records an unattended denial. `ApprovalGate::request(req, site, cancel)` takes an `AskSite { channel, phase }` (which queue the ask belongs to, and whether it was raised before or during execution) and an `AskCancel` carrying the turn's `TurnTokens { turn, actor }`. `CancelOrigin::of(&tokens)` — `Ancestor` iff the actor token tripped — is the one place a gate decides whether a cancel abandons the ask (`Turn`) or leaves it pending for the next process (`Ancestor`). `ApprovalHandle::new(gate, cache, tool_call_id, park, cancel)` raises every mid-execution prompt as a `DuringExecute` ask on the requesting user's channel and holds the call's `ParkGauge` while it waits, so the executor's deadline can tell a parked call from a slow one.
 
 #### Why a refusal is never just "denied"
 
-A gate returns `ApprovalOutcome { decision, resolution }`, and `ApprovalHandle::request` / `request_uncached` hand the whole thing back rather than only the decision. The decision alone cannot carry the difference: a human's "no", a window that expired with nobody looking, a prompt torn down by a cancel, and a standing policy that never asked anyone all arrive as `ApprovalDecision::Deny`.
+A gate returns `ApprovalOutcome { decision, resolution }`, and `ApprovalHandle::request` / `request_uncached` hand the whole thing back rather than only the decision. The decision alone cannot carry the difference: a human's "no", a prompt torn down by a cancel, and a standing policy that never asked anyone all arrive as `ApprovalDecision::Deny`.
 
-Every refusal a tool or the executor reports to the model is therefore worded from `refusal_reason(resolution)` — the single home for that prose, in `crates/tools/src/approval.rs`. Telling the model a person refused when nobody looked is how it learns to argue with somebody who was never there, and in this repo's ledger the common case by far is the 300 s timeout, not a human. The consumers are the executor's pre-execution gate and the skills env-var gate. A cache hit resolves as `Policy` for the same reason — a standing rule decided it, nobody was asked.
+Every refusal a tool or the executor reports to the model is therefore worded from `refusal_reason(resolution)` — the single home for that prose, in `crates/tools/src/approval.rs`. Telling the model a person refused when nobody looked is how it learns to argue with somebody who was never there. Gates no longer time out; `ApprovalResolution::TimedOut` survives only so old span events decode, and is worded like an abandoned prompt. The consumers are the executor's pre-execution gate and the skills env-var gate. A cache hit resolves as `Policy` for the same reason — a standing rule decided it, nobody was asked.
 
 `ApprovalGateMap` keeps two `DashMap`s — `type_level: DashMap<ChannelType, Arc<dyn ApprovalGate>>` for sidecar registrations and `session_level: DashMap<(ChannelType, SessionId), Arc<dyn ApprovalGate>>` for session-scoped clients. `get(channel, session_id)` tries the session-level entry first and falls back to the type-level gate, returning `AutoDenyGate` when neither is present. `ChannelRegistry` populates entries at `register()` time and evicts on `unregister()`; `ToolExecutor` reads per-call. Both sides hold an `Arc` to the same map, so gates registered after `ToolExecutor` construction are visible immediately. Adding a new channel with approval support requires only wiring an `Arc<dyn ApprovalGate>` into the `Channel` at construction time — no changes to `ToolExecutor` or bootstrap code.
 
@@ -451,7 +452,7 @@ The detailed design is in [`../permission.md`](../permission.md).
 
 ### Per-tool timeout ceiling
 
-Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer cancel deadline (`+ APPROVAL_HEADROOM`). There is no `baybo.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
+Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer deadline (`+ TOOL_DEADLINE_GRACE`, paused while the call is parked on an ask). There is no `baybo.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
 
 Current overrides:
 
@@ -501,7 +502,7 @@ Both previews are bounded by `SPAN_EVENT_TEXT_MAX_BYTES`. They used to carry the
 
 - Depends on `baybo-llm`, `baybo-model`, `baybo-security`, `baybo-storage`, `baybo-workspace`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
 - Does not install third-party artifacts
-- Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
+- Defines the `ApprovalGate` trait and the ask ports (`tools::ask`) but never implements the user-facing UX — the per-channel gate is `baybo_human_ask::ChannelAskGate` over an `AskQueue`, built by the gateway's channel install, and the TUI renders the resulting prompts inline in its scrollback. Never depends on `baybo-human-ask`.
 
 ## Collaboration
 

@@ -411,7 +411,13 @@ pub struct IssueDto {
     /// shows it, because a failure that leaves the card looking untouched
     /// is a badge pointing at something the operator cannot find.
     pub last_run_failed: bool,
-    /// True only while this card has an answerable prompt in the live queue.
+    /// True only while this card has an answerable ask in the queue — live,
+    /// or reloaded from the ask ledger after a restart.
+    pub awaiting_human: bool,
+    /// Deprecated twin of `awaiting_human`, always the same value. Kept for
+    /// clients that predate the rename; removed in PR 3 of the human-ask
+    /// rollout (`docs/modules/human-ask.md`).
+    #[schema(deprecated)]
     pub approval_pending: bool,
     /// An agent filed this card, rather than the operator. The board's own
     /// work breakdown, and the same fact `RunTrigger::Grooming` turns on —
@@ -448,7 +454,7 @@ impl IssueDto {
         board: &BoardCards,
         awaiting_approval: &std::collections::HashSet<baybo_model::IssueId>,
     ) -> Self {
-        let approval_pending = awaiting_approval.contains(&row.id);
+        let awaiting_human = awaiting_approval.contains(&row.id);
         let signals = board.signals(&row.id);
         let number_of = |id: &baybo_model::IssueId| {
             board
@@ -479,7 +485,8 @@ impl IssueDto {
             unread: signals.unread as i64,
             last_run_failed: signals.last_run_failed,
             opened_by_agent: board.opened_by_agent(row.number),
-            approval_pending,
+            awaiting_human,
+            approval_pending: awaiting_human,
             ..Self::from(row)
         }
     }
@@ -515,6 +522,7 @@ impl From<IssueRow> for IssueDto {
             unread: 0,
             last_run_failed: false,
             opened_by_agent: false,
+            awaiting_human: false,
             approval_pending: false,
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
@@ -1715,18 +1723,6 @@ pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecisionDto,
 }
 
-fn parked_approval_session(
-    channel: &baybo_channels::Channel,
-    call_id: &str,
-) -> Option<baybo_model::SessionId> {
-    channel.pending_approval_sessions().into_iter().find(|s| {
-        channel
-            .pending_approvals(s)
-            .iter()
-            .any(|req| req.call_id == call_id)
-    })
-}
-
 #[utoipa::path(
     post,
     path = "/projects/{project_id}/issues/{number}/approvals/{call_id}",
@@ -1755,37 +1751,47 @@ async fn resolve_approval(
         .approvable_issue(&id, number)
         .await
         .map_err(project_err)?;
-    let channel = state
-        .channel_registry
-        .get(&baybo_model::ChannelType::owner())
-        .ok_or_else(|| GatewayError::NotFound("the owner channel".to_owned()))?;
-    let raised_here = match parked_approval_session(&channel, &call_id) {
-        Some(session) => state
-            .session_manager
-            .get(&session)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|session| {
-                session
-                    .trigger
-                    .issue()
-                    .map(|(_, issue_id, _)| *issue_id == issue.id)
-            })
-            .unwrap_or(false),
-        None => false,
-    };
-    let decision: baybo_model::ApprovalDecision = req.decision.into();
-    let Some(session_id) = raised_here
-        .then(|| channel.resolve_approval(&call_id, decision))
+    let not_waiting = || GatewayError::NotFound(format!("no approval waiting on call {call_id}"));
+    let ask_id: baybo_model::human_ask::AskId = call_id.parse().map_err(|_| not_waiting())?;
+    let row = state
+        .human_asks
+        .get(&ask_id)
+        .await
+        .map_err(|e| GatewayError::Internal(e.to_string()))?
+        .filter(|row| row.kind == baybo_model::human_ask::AskKind::Approval && row.is_pending())
+        .ok_or_else(not_waiting)?;
+    let raised_here = state
+        .session_manager
+        .get(&row.session_id)
+        .await
+        .ok()
         .flatten()
-    else {
-        return Err(GatewayError::NotFound(format!(
-            "no approval waiting on call {call_id}"
-        )));
-    };
-    channel.dispatch_approval_resolved(call_id, session_id, decision);
-    Ok(StatusCode::NO_CONTENT)
+        .and_then(|session| {
+            session
+                .trigger
+                .issue()
+                .map(|(_, issue_id, _)| *issue_id == issue.id)
+        })
+        .unwrap_or(false);
+    if !raised_here {
+        return Err(not_waiting());
+    }
+    let decision: baybo_model::ApprovalDecision = req.decision.into();
+    match state
+        .human_asks
+        .resolve(
+            &ask_id,
+            baybo_model::human_ask::AskResolution::Approval(decision),
+        )
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(
+            baybo_human_ask::HumanAskError::AskClosed { .. }
+            | baybo_human_ask::HumanAskError::NotFound { .. },
+        ) => Err(not_waiting()),
+        Err(e) => Err(GatewayError::Internal(e.to_string())),
+    }
 }
 
 /// One board with something waiting on the operator.

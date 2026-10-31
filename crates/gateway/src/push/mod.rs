@@ -27,7 +27,7 @@
 //! `select!` loop over the bus with `Lagged`/`Closed` handling (push is
 //! best-effort, so a lag just drops that buzz).
 
-pub mod approval;
+pub mod ask;
 pub(crate) mod badge;
 pub(crate) mod web;
 
@@ -62,7 +62,7 @@ const PREVIEW_READ_LIMIT: usize = 4;
 
 /// Title of a completed-turn push. Unchanged from before approval pushes
 /// existed, which is why it is spelled out beside
-/// [`approval::APPROVAL_TITLE`] rather than shared with it.
+/// [`ask::APPROVAL_TITLE`] rather than shared with it.
 const REPLY_TITLE: &str = "Baybo";
 
 /// How long a computed badge total stays good enough to reuse. See
@@ -501,7 +501,8 @@ impl PushDispatcher {
     /// True iff this terminal event might buzz a phone: a successfully-
     /// completed turn whose reply a user is meant to read.
     ///
-    /// Three kinds qualify — a real user turn, and both halves of the cron
+    /// Four kinds qualify — a real user turn, its continuation after the user
+    /// answered an ask (they may have walked away), and both halves of the cron
     /// story: a **recurring** fire, whose session is a conversation the user
     /// reads the result in, and the **delivery** of a one-shot's result into
     /// the conversation that scheduled it. A recurring fire is only confirmed
@@ -513,7 +514,10 @@ impl PushDispatcher {
         matches!(ev.phase, TurnPhase::Completed { .. })
             && matches!(
                 ev.kind,
-                TurnInputKind::UserChat | TurnInputKind::Cron | TurnInputKind::CronNotification
+                TurnInputKind::UserChat
+                    | TurnInputKind::Resume
+                    | TurnInputKind::Cron
+                    | TurnInputKind::CronNotification
             )
     }
 
@@ -668,10 +672,10 @@ impl PushDispatcher {
         }
     }
 
-    /// Dispatch on a tool call parking at the approval gate — the second push
-    /// source, fed by [`approval::ApprovalPushRelay`] rather than the turn
-    /// lifecycle bus (nothing terminal has happened; that is the point).
-    pub async fn dispatch_approval(&self, push: &approval::ApprovalPush) {
+    /// Dispatch on a tool call parking on an ask — the second push source,
+    /// fed by [`ask::AskPushRelay`] rather than the turn lifecycle bus
+    /// (nothing terminal has happened; that is the point).
+    pub async fn dispatch_ask(&self, push: &ask::AskPush) {
         let session = match self.session_manager.get(&push.session_id).await {
             Ok(Some(session)) => session,
             Ok(None) => {
@@ -717,28 +721,28 @@ impl PushDispatcher {
             return;
         };
         if !channel
-            .pending_approvals(&push.session_id)
-            .iter()
-            .any(|req| req.call_id == push.call_id)
+            .ask_queue()
+            .is_some_and(|queue| queue.contains(&push.ask_id))
         {
             tracing::debug!(
                 session = %push.session_id,
-                call_id = %push.call_id,
-                "push: approval prompt was resolved before its push went out; dropping"
+                ask_id = %push.ask_id,
+                "push: ask was resolved before its push went out; dropping"
             );
             return;
         }
-        let body = approval::approval_push_body(&push.tool);
+        let (title, body) = ask::ask_push_text(push);
         self.fan_out(&push.session_id, || {
             let session_id = push.session_id.clone();
             async move {
-                // An approval prompt is not an unread message, so this carries
-                // the CURRENT total rather than bumping it: the prompt expires
-                // silently with no server-side signal to decrement, and a badge
-                // that counted it would strand a digit on the icon forever. Its
-                // urgency rides the alert, which is louder than a digit anyway.
+                // A pending ask is not an unread message, so this carries the
+                // CURRENT total rather than bumping it: an ask can be
+                // abandoned with no server-side signal to decrement, and a
+                // badge that counted it would strand a digit on the icon
+                // forever. Its urgency rides the alert, which is louder than a
+                // digit anyway.
                 let badge = self.badge_total().await;
-                preview_json(approval::APPROVAL_TITLE, &body, &session_id, badge)
+                preview_json(title, &body, &session_id, badge)
             }
         })
         .await;
@@ -1155,31 +1159,38 @@ fn retain_routable_targets(targets: &mut Vec<PushTarget>) {
     }
 }
 
+async fn recv_ask(asks: &mut Option<ask::AskPushStream>) -> Option<ask::AskPush> {
+    match asks {
+        Some(stream) => stream.recv().await,
+        None => None,
+    }
+}
+
 /// Subscribe to the lifecycle bus and dispatch pushes until `shutdown` fires.
 /// Subscribe happens before the spawn returns so no post-subscribe event slips
 /// through unobserved.
 pub fn spawn<F>(
     dispatcher: Arc<PushDispatcher>,
     turn_lifecycle: Arc<TurnLifecycle>,
-    mut approvals: approval::ApprovalPushStream,
+    mut asks: Option<ask::AskPushStream>,
     shutdown: F,
 ) -> JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let mut events = turn_lifecycle.subscribe_lifecycle_events();
-    // A closed approval stream disables its arm rather than ending the task:
-    // completed-turn pushes are a separate, independently-useful feature and
-    // must survive the approval relay going away.
-    let mut approvals_open = true;
+    // A missing or closed ask stream disables its arm rather than ending the
+    // task: completed-turn pushes are a separate, independently-useful
+    // feature and must survive the ask relay going away.
+    let mut asks_open = asks.is_some();
     tokio::spawn(async move {
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
-                recv = approvals.recv(), if approvals_open => match recv {
-                    Some(push) => dispatcher.dispatch_approval(&push).await,
-                    None => approvals_open = false,
+                recv = recv_ask(&mut asks), if asks_open => match recv {
+                    Some(push) => dispatcher.dispatch_ask(&push).await,
+                    None => asks_open = false,
                 },
                 recv = events.recv() => match recv {
                     Ok(ev) => {
@@ -1269,11 +1280,12 @@ mod tests {
 
     #[test]
     fn dispatches_only_completed_turns_a_user_is_meant_to_read() {
-        // The three buzzing cases: a real user turn, a cron fire (confirmed to
+        // The buzzing cases: a real user turn (or its resume), a cron fire (confirmed to
         // be a conversation once the session is loaded), and the delivery of a
         // one-shot fire's result into the conversation that scheduled it.
         for kind in [
             TurnInputKind::UserChat,
+            TurnInputKind::Resume,
             TurnInputKind::Cron,
             TurnInputKind::CronNotification,
         ] {
@@ -1396,8 +1408,8 @@ mod tests {
             serde_json::from_str(&reply_preview_json(Some("hi"), &session, None)).unwrap();
         assert_eq!(reply["title"], REPLY_TITLE);
         let approval: serde_json::Value = serde_json::from_str(&preview_json(
-            approval::APPROVAL_TITLE,
-            &approval::approval_push_body("Bash"),
+            ask::APPROVAL_TITLE,
+            &ask::approval_push_body("Bash"),
             &session,
             None,
         ))

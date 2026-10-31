@@ -26,6 +26,7 @@ members = [
     "crates/skills-assessor",
     "crates/subagent",
     "crates/task",
+    "crates/human-ask",
     "crates/cron",
     "crates/deck",
     "crates/project",
@@ -89,6 +90,7 @@ baybo-skills = { path = "crates/skills" }
 baybo-skills-assessor = { path = "crates/skills-assessor" }
 baybo-subagent = { path = "crates/subagent" }
 baybo-task = { path = "crates/task" }
+baybo-human-ask = { path = "crates/human-ask" }
 baybo-cron = { path = "crates/cron" }
 baybo-deck = { path = "crates/deck" }
 baybo-project = { path = "crates/project" }

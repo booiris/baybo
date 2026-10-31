@@ -371,7 +371,7 @@ jobs:
             .
             remote-host
             app/ios
-      - run: sudo apt-get update -qq && sudo apt-get install -y lld sqlite3 iproute2 iptables
+      - run: sudo apt-get update -qq && sudo apt-get install -y lld sqlite3 iproute2 iptables jq
       # The loss cell's netem qdisc; the runner kernel ships it as a module.
       - run: sudo modprobe sch_netem
       - run: scripts/netns-matrix.sh

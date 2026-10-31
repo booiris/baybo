@@ -181,7 +181,7 @@ pub async fn recover_orphaned_traces_and_turns(
 /// Cancelling a non-chat turn publishes a terminal lifecycle event like any
 /// other, and that is harmless: the TurnState projector recomputes from the
 /// chat-turn set (finding the session idle, which it is), and the push
-/// dispatcher only fires for `UserChat`.
+/// dispatcher only fires for user-facing kinds.
 ///
 /// `TurnLifecycle::cancel_at` publishes the terminal lifecycle event, so
 /// the TurnState projector remains the only producer of the web chat's

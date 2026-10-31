@@ -1771,7 +1771,10 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
     let (response_tx, _response_rx) = tokio::sync::mpsc::channel(8);
-    let supervisor = AgentSupervisor::new(response_tx);
+    let supervisor = AgentSupervisor::new(
+        response_tx,
+        std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+    );
     supervisor
         .register_if_absent(session_id.clone(), harness.mailbox.clone())
         .expect("harness actor is registered once");
@@ -3340,6 +3343,9 @@ async fn unattended_child_runs_zero_access_mcp_ungated_but_still_denies_uncovere
             }),
             manifest(GATED_TOOL, vec![baybo_tools::ToolCapability::WriteFile]),
         )
+        // A gate that would park the call forever: a `Spawned` turn must
+        // never reach it.
+        .with_channel_ask_gate()
         .build();
 
     let child_session_id = harness.session.id.clone();
@@ -3379,7 +3385,6 @@ async fn unattended_child_runs_zero_access_mcp_ungated_but_still_denies_uncovere
         .send(AgentMessage::SubagentSpawned {
             initial_message: Box::new(child_message("spawn-zero-access")),
             parent_turn_id: baybo_model::TurnId::default(),
-            inherited_context: Some(baybo_model::InheritedToolContext),
         })
         .await
         .expect("child turn accepted");
@@ -3396,7 +3401,6 @@ async fn unattended_child_runs_zero_access_mcp_ungated_but_still_denies_uncovere
         .send(AgentMessage::SubagentSpawned {
             initial_message: Box::new(child_message("spawn-gated")),
             parent_turn_id: baybo_model::TurnId::default(),
-            inherited_context: Some(baybo_model::InheritedToolContext),
         })
         .await
         .expect("gated child turn accepted");
@@ -3406,22 +3410,35 @@ async fn unattended_child_runs_zero_access_mcp_ungated_but_still_denies_uncovere
         0,
         "an uncovered approval-gated access is still denied in an unattended child"
     );
+    let rows = harness.ask_store.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].tool_call_id, "call-unattended-gated");
+    assert_eq!(
+        rows[0].resolution,
+        Some(baybo_model::human_ask::AskResolution::PolicyDenied),
+        "the denial is ledgered as policy"
+    );
+    assert!(
+        harness
+            .ask_queues
+            .get_or_create(&harness.session.channel)
+            .is_empty()
+    );
 
-    queue_turn(&harness, "ordinary-resume", ZERO_ACCESS_TOOL);
+    queue_turn(&harness, "second-spawn", ZERO_ACCESS_TOOL);
     harness
         .mailbox
         .send(AgentMessage::SubagentSpawned {
-            initial_message: Box::new(child_message("spawn-ordinary")),
+            initial_message: Box::new(child_message("spawn-second")),
             parent_turn_id: baybo_model::TurnId::default(),
-            inherited_context: None,
         })
         .await
-        .expect("ordinary resumed child turn accepted");
+        .expect("second child turn accepted");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
         zero_access_calls.load(Ordering::SeqCst),
         2,
-        "an independently resumed child runs with ordinary approval"
+        "a later child turn runs the zero-access tool again"
     );
 
     let stored = harness

@@ -105,11 +105,13 @@ holds *this* fire's stamp by the time anything downstream reads it.
 
 ## Fires run unattended
 
-A fire's turn — and every in-process descendant it spawns — runs unattended,
-carried by the field-less `InheritedToolContext` marker (see
-[`agent.md`](agent.md)'s approval-gate wiring for the mechanism). Any tool call
-with an approval-gated access not already covered by session approvals is
-denied immediately instead of parking on a prompt nobody can answer. MCP tools
+A fire's turn (`TurnInputKind::Cron`, and `CronNotification`) — and every
+in-process descendant it spawns (`Spawned`) — is unattended by its turn kind
+(`TurnInputKind::is_attended`; see [`agent.md`](agent.md)'s approval-gate
+wiring). Any tool call with an approval-gated access not already covered by
+session approvals is denied by `PolicyDenyGate` instead of parking on a prompt
+nobody can answer, and the denial is recorded as a `PolicyDenied` row in the
+`human_asks` ledger ([`human-ask.md`](human-ask.md)). MCP tools
 declare no approval-gated accesses (the interim rule in
 [`todo/mcp-tool-approval.md`](../todo/mcp-tool-approval.md)), so they are
 usable in fires exactly as in chat. Nothing about a fire ever seeds

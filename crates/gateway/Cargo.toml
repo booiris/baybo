@@ -28,7 +28,11 @@ macos = []
 # test fixtures can construct `BillableLlm::passthrough`, and the protocol's
 # test address policy, so a `baybo` built with it (the netns matrix's
 # gateway) treats the matrix's documentation ranges as public.
-test-support = ["baybo-llm/test-support", "remote-host-protocol/test-support"]
+test-support = [
+    "baybo-llm/test-support",
+    "remote-host-protocol/test-support",
+    "baybo-human-ask/test-support",
+]
 
 [dependencies]
 baybo-process = { workspace = true }
@@ -59,6 +63,7 @@ baybo-skills = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-store = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-trace = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 
@@ -126,6 +131,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 baybo-gateway = { workspace = true, features = ["test-support"] }
+baybo-human-ask = { workspace = true, features = ["test-support"] }
+baybo-tools = { workspace = true, features = ["test-support"] }
 # `media_probe::fixture`: the ingest probes must be proven against PDFs and
 # containers that really parse.
 baybo-llm = { workspace = true, features = ["test-support"] }

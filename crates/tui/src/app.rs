@@ -18,7 +18,8 @@ use baybo_model::SessionId;
 use ratatui::text::Line;
 use ratatui::widgets::TableState;
 
-use baybo_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
+use baybo_human_ask::AskQueue;
+use baybo_tools::{ApprovalDecision, ResourceAccess};
 
 use crate::markdown::MarkdownStream;
 
@@ -194,7 +195,7 @@ pub(crate) struct AppState {
     /// never doubling up, never missing one.
     pub(crate) last_row_blank: bool,
     /// Active inline approval prompt. At most one is live at a time; further
-    /// queued requests stay on [`ApprovalQueue`] until the head is resolved.
+    /// queued requests stay on [`AskQueue`] until the head is resolved.
     pub(crate) pending_approval: Option<ApprovalChatEntry>,
     /// Full list of slash commands for completion; sourced once at startup
     /// from `SlashHandler::commands()`.
@@ -209,7 +210,7 @@ pub(crate) struct AppState {
     /// Shared pending-approval queue. Cloned into the event loop so key
     /// handlers can drain entries. `None` means approval gating is disabled
     /// for the test harness — production always wires this up.
-    pub(crate) approval: Option<ApprovalQueue>,
+    pub(crate) approval: Option<AskQueue>,
     /// Plain (non-slash) messages submitted while a turn is in flight.
     /// Unlike [`AppState::outgoing_queue`], these are dispatched to the agent
     /// **immediately** (mid-turn steering — the agent folds them in once
@@ -453,7 +454,7 @@ impl AppState {
         self.outgoing_queue.clear();
     }
 
-    pub(crate) fn with_approval(mut self, shared: ApprovalQueue) -> Self {
+    pub(crate) fn with_approval(mut self, shared: AskQueue) -> Self {
         self.approval = Some(shared);
         self
     }
@@ -514,7 +515,7 @@ impl AppState {
 
         if let Some(queue) = self.approval.as_ref() {
             queue.resolve_head(decision);
-            if let Some(req) = queue.peek_head() {
+            if let Some(req) = queue.peek_head_approval() {
                 self.pending_approval = Some(ApprovalChatEntry {
                     call_id: req.call_id,
                     tool: req.tool,

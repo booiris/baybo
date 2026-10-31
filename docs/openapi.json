@@ -5332,6 +5332,7 @@
                           "stage",
                           "unread",
                           "last_run_failed",
+                          "awaiting_human",
                           "approval_pending",
                           "opened_by_agent",
                           "created_at_ms",
@@ -5340,7 +5341,8 @@
                         "properties": {
                           "approval_pending": {
                             "type": "boolean",
-                            "description": "True only while this card has an answerable prompt in the live queue."
+                            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in PR 3 of the human-ask\nrollout (`docs/modules/human-ask.md`).",
+                            "deprecated": true
                           },
                           "assignee": {
                             "type": [
@@ -5355,6 +5357,10 @@
                               "$ref": "#/components/schemas/IssueAttachmentDto"
                             },
                             "description": "Files hung on the description."
+                          },
+                          "awaiting_human": {
+                            "type": "boolean",
+                            "description": "True only while this card has an answerable ask in the queue — live,\nor reloaded from the ask ledger after a restart."
                           },
                           "blocked_reason": {
                             "type": [
@@ -8360,11 +8366,16 @@
         "properties": {
           "approval_pending": {
             "type": "boolean",
-            "description": "True while a tool call in this session is parked on the approval gate,\nwaiting for the user to approve or deny it. The client marks the row so\nthe user knows which conversation to open; the prompt itself is only\nanswerable inside the conversation.\n\nDerived from live in-memory gate state, never the store: a parked turn\ndies with the gateway process, so reading `false` after a restart is\ncorrect rather than stale. Absent when false."
+            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in PR 3 of the human-ask\nrollout (`docs/modules/human-ask.md`).",
+            "deprecated": true
           },
           "archived": {
             "type": "boolean",
             "description": "True when the user has archived this session. Always emitted —\nthe list never filters on it, so clients with an archived view\ngroup rows themselves and clients without one keep showing every\nrow; set via `PUT /v1/chat/sessions/{id}/archive`."
+          },
+          "awaiting_human": {
+            "type": "boolean",
+            "description": "True while an ask of any kind in this session is waiting on the user\n— a tool approval, or a question. The client marks the row so the user\nknows which conversation to open; the ask itself is only answerable\ninside the conversation.\n\nRead from the in-memory ask queues, which the boot reload refills from\nthe ask ledger, so a pending ask keeps its mark across a restart.\nAbsent when false."
           },
           "created_at": {
             "type": "string",
@@ -9573,6 +9584,7 @@
           "stage",
           "unread",
           "last_run_failed",
+          "awaiting_human",
           "approval_pending",
           "opened_by_agent",
           "created_at_ms",
@@ -9581,7 +9593,8 @@
         "properties": {
           "approval_pending": {
             "type": "boolean",
-            "description": "True only while this card has an answerable prompt in the live queue."
+            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in PR 3 of the human-ask\nrollout (`docs/modules/human-ask.md`).",
+            "deprecated": true
           },
           "assignee": {
             "type": [
@@ -9596,6 +9609,10 @@
               "$ref": "#/components/schemas/IssueAttachmentDto"
             },
             "description": "Files hung on the description."
+          },
+          "awaiting_human": {
+            "type": "boolean",
+            "description": "True only while this card has an answerable ask in the queue — live,\nor reloaded from the ask ledger after a restart."
           },
           "blocked_reason": {
             "type": [
@@ -11996,7 +12013,8 @@
           "compact",
           "spawned",
           "subagent_notification",
-          "issue_run"
+          "issue_run",
+          "resume"
         ]
       },
       "TurnOrigin": {

@@ -43,6 +43,8 @@ export type IssueDetail = {
   sub_issues?: SubIssueProgress;
   unread: number;
   last_run_failed: boolean;
+  awaiting_human: boolean;
+  /// Deprecated twin of `awaiting_human`; removed in PR 3.
   approval_pending: boolean;
   opened_by_agent: boolean;
   cancelled_at_ms?: number;

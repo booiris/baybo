@@ -629,11 +629,12 @@ Dispatch triggers — there are **two**, and only the first is a turn ending:
 4. The `Completed { reply_ordinal }` event identifies the persisted assistant
    reply row. If there is no ordinal, A does not push.
 
-**A tool call parking on the approval gate.** Nothing reaches the lifecycle bus
+**A tool call parking on an ask.** Nothing reaches the lifecycle bus
 while a prompt waits — the turn has not ended, and never will unless the user
-answers — yet this is the one push whose value expires: the gate denies itself
-after `APPROVAL_TIMEOUT` (300 s). The relay
-(`crates/gateway/src/push/approval.rs`) therefore watches the approval queue's
+answers. Asks never time out and survive a restart, so the relay is built in
+`build_managers` ahead of the boot reload, and a dead ask re-queued at boot
+pushes once for a session with no subscriber. The relay
+(`crates/gateway/src/push/ask.rs`, `AskPushRelay`) therefore watches the ask queue's
 per-session edges directly, on the `owner` channel only (a prompt parked on the
 TUI's or Telegram's queue is one the app could not answer even after opening
 the conversation the push routed it to).
@@ -648,12 +649,13 @@ signal:
    prompt (web and mobile share the `owner` channel).
 2. **The session is already marked waiting.** The edge is raised once per
    blocked stretch, not once per prompt.
-3. **A 30-minute quiet period after an abandoned prompt.** A denied call does
-   not end the turn; the agent commonly reaches for an alternative that is also
-   gated. Unattended, that announces itself once per gate timeout — about twelve
-   times an hour, all night. A prompt someone actually *answers* clears the
-   quiet period, so an attended conversation still interrupts immediately.
-4. **A liveness recheck immediately before the POST.** Store reads, vault reads
+3. **A 30-minute quiet period after an abandoned prompt.** An abandoned ask
+   (`/stop`, a card close, the user moving on) does not end the conversation;
+   the agent commonly reaches for an alternative that is also gated. A prompt
+   someone actually *answers* clears the quiet period, so an attended
+   conversation still interrupts immediately.
+4. **A pending recheck immediately before the POST** against the channel's ask
+   queue (any kind). Store reads, vault reads
    and two TLS round-trips separate the trigger from delivery; a prompt resolved
    inside that window must not buzz a phone whose tap would open a conversation
    with no card in it.
@@ -687,7 +689,9 @@ Preview construction:
 
    An approval push differs only in `title` (`"Baybo needs approval"`, the one
    line a locked phone renders under "Show Previews: When Unlocked") and `body`
-   (`"<Tool> is waiting for your approval"`). **The body never carries the
+   (`"<Tool> is waiting for your approval"`). A question push (PR 2's
+   `AskUser`) uses `"Baybo has a question"` and the fixed body `"Open the
+   conversation to answer"` — no model-authored text. **The body never carries the
    call's arguments.** `params_preview` is unredacted JSON that can hold a
    credential from a command line, and a lock screen is a shoulder-surfing
    surface a WebSocket is not; the card inside the conversation is what is

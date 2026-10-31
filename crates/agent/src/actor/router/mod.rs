@@ -397,6 +397,9 @@ impl Router {
                                 error!(error = %e, "failed to handle incoming batch");
                             }
                         }
+                        RouterInbound::ResumeAsk(req) => {
+                            self.handle_resume_ask(req).await;
+                        }
                     }
                 }
                 Some(output) = response_rx.recv() => {

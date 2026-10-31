@@ -196,7 +196,6 @@ impl ActorSubagentSpawner {
             span_id: parent_span_id,
             cancel_token: parent_actor_token,
             background_eligible,
-            inherited_context,
             ..
         } = parent_ctx;
         let fan_out_root = request.fan_out_root.clone();
@@ -316,7 +315,6 @@ impl ActorSubagentSpawner {
             let parent_id_for_task = parent.id.clone();
             let fan_out_root_for_task = fan_out_root.clone();
             let limiter_for_task = Arc::clone(&self.dispatch_limiter);
-            let inherited_context_for_child = inherited_context.clone();
             tokio::spawn(async move {
                 // Subscribe before feeding the prompt so a child that exits
                 // quickly can't slip its terminal past us.
@@ -325,7 +323,6 @@ impl ActorSubagentSpawner {
                     .send(AgentMessage::SubagentSpawned {
                         initial_message: Box::new(incoming),
                         parent_turn_id,
-                        inherited_context: inherited_context_for_child,
                     })
                     .await
                 {
@@ -363,7 +360,6 @@ impl ActorSubagentSpawner {
             .send(AgentMessage::SubagentSpawned {
                 initial_message: Box::new(incoming),
                 parent_turn_id,
-                inherited_context,
             })
             .await
         {
@@ -1748,7 +1744,10 @@ mod foreground_turn_tests {
 
     fn test_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
-        AgentSupervisor::new(tx)
+        AgentSupervisor::new(
+            tx,
+            std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+        )
     }
 
     fn test_session_manager() -> Arc<SessionManager> {

@@ -7,6 +7,12 @@ mod agent_loop_e2e;
 mod channel_registration;
 #[path = "context_compression_e2e.rs"]
 mod context_compression_e2e;
+#[path = "human_ask_e2e.rs"]
+mod human_ask_e2e;
+#[path = "human_ask_restart_e2e.rs"]
+mod human_ask_restart_e2e;
+#[path = "human_ask_settle_e2e.rs"]
+mod human_ask_settle_e2e;
 #[path = "security_pipeline.rs"]
 mod security_pipeline;
 #[path = "smoke.rs"]

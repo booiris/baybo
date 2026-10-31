@@ -899,7 +899,9 @@ mod tests {
             approval: Some(ApprovalHandle::new(
                 Arc::new(AutoDenyGate),
                 Arc::new(Mutex::new(Vec::new())),
-                None,
+                String::new(),
+                baybo_tools::ParkGauge::new(),
+                baybo_tools::AskCancel::never(),
             )),
             ..ToolContext::for_test()
         }

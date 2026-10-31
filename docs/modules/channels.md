@@ -20,7 +20,7 @@ talks only to that sink.
 Core responsibilities:
 
 - Define the concrete [`Channel`] handle (`channel_type`,
-  [`ChannelKind`], optional [`ApprovalSurface`]), the [`Connection`]
+  [`ChannelKind`], optional [`AskSurface`]), the [`Connection`]
   transport instance, and the [`ConnectionSink`] trait the transport
   implements.
 - Define the kind-typed [`SubscribedView`] that gates operations like
@@ -59,7 +59,7 @@ lifecycle (open / close / drop) into the channel itself.
 pub struct Channel {
     channel_type: ChannelType,
     kind: ChannelKind,
-    approvals: Option<ApprovalSurface>,
+    approvals: Option<AskSurface>,
     connections: DashMap<ConnectionId, Arc<Connection>>,
     // Only consulted on Subscribed channels:
     subscriptions: DashMap<SessionId, DashSet<ConnectionId>>,
@@ -72,7 +72,7 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub fn new(channel_type: ChannelType, kind: ChannelKind, approvals: Option<ApprovalSurface>) -> Self;
+    pub fn new(channel_type: ChannelType, kind: ChannelKind, approvals: Option<AskSurface>) -> Self;
 
     // Kind-agnostic dispatch surface — agent + tool path calls.
     pub fn dispatch_agent(&self, output: AgentOutput);
@@ -90,8 +90,10 @@ impl Channel {
     pub fn has_subscribers(&self, session_id: &SessionId) -> bool;
     pub fn connection_count(&self) -> usize;
     pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
+    pub fn pending_approval_sessions(&self) -> HashSet<SessionId>;
+    pub fn ask_queue(&self) -> Option<&AskQueue>;
     pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<StampedEvent>;
-    pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId>;
+    // No resolve method: asks resolve through `HumanAskManager::resolve`.
 
     // Kind narrowing — see `SubscribedView` below.
     pub fn as_subscribed(&self) -> Option<SubscribedView<'_>>;
@@ -170,14 +172,15 @@ Add one when there's a real method to put on it.
 
 ## Dispatch Surface
 
-External callers reach the channel through three kind-agnostic
+External callers reach the channel through four kind-agnostic
 methods on `Channel`:
 
 | Method                          | Origin                                       | Event constructed              |
 | ------------------------------- | -------------------------------------------- | ------------------------------ |
 | `dispatch_agent(output)`        | Agent router (per-turn assistant output)     | `SessionEvent::Agent(_)`       |
-| `dispatch_approval_requested(…)`| `ChannelApprovalGate` waker, when a tool call blocks | `SessionEvent::ApprovalRequested {..}` |
-| `dispatch_approval_resolved(…)` | Connection sent `Frame::ResolveApproval` first; the resolver fans out so concurrent UIs drop the prompt | `SessionEvent::ApprovalResolved {..}` |
+| `dispatch_approval_requested(…)`| The queue's `AskRaised` watcher (installed in `build_channel`), when a tool call parks on an approval | `SessionEvent::ApprovalRequested {..}` |
+| `dispatch_approval_resolved(…)` | The queue's `AskClosed` watcher, when a human decided an approval (via `HumanAskManager::resolve`) | `SessionEvent::ApprovalResolved {..}` |
+| `dispatch_ask_resolved(…)`      | The queue's `AskClosed` watcher, on every close — answered or abandoned — so concurrent UIs drop the card | `SessionEvent::AskResolved {..}` |
 
 Plus one Subscribed-exclusive method on the view:
 
@@ -302,10 +305,22 @@ gates registered later are visible immediately without re-plumbing.
 `ChannelRegistry::install` populates only the type-level tier of the gate
 map; the map itself is two-tier — a session-level `(ChannelType,
 SessionId)` entry (used by the one-shot `baybo prompt` path) wins over the
-channel-type gate, and lookup fails closed to `AutoDenyGate`. Concurrent
-TUI / web tabs subscribed to the same session still resolve approvals
-through the same per-channel gate, and the channel fans out
-`ApprovalResolved` so the loser tabs drop their prompt card.
+channel-type gate, and lookup fails closed to `AutoDenyGate`.
+
+Each channel's gate is a `baybo_human_ask::ChannelAskGate` over the
+channel's `AskQueue` (fetched from the shared `AskQueues`, so a queue the
+boot reload already filled is the one the channel attaches to); the
+channel's `AskSurface` bundles the two. The gate writes the ask to the
+`human_asks` ledger before enqueueing it and never times out. Frames are
+dispatched by queue watchers the gateway installs in `build_channel`, not by
+the gate: `AskRaised` → `SessionEvent::ApprovalRequested`, and every
+`AskClosed` → `SessionEvent::AskResolved { session_id, ask_id, outcome }`
+plus `SessionEvent::ApprovalResolved` when a human decided an approval. So
+concurrent TUI / web tabs drop their card on any close — answered by one of
+them, or abandoned by `/stop`, a card close or the user moving on. A
+`ResolveApproval` frame resolves through `HumanAskManager::resolve` (ledger
+claim first), never through the queue directly; `Channel` has no resolve
+method. See [`human-ask.md`](human-ask.md).
 
 ### The owner channel (`owner` — web + mobile, one channel)
 
@@ -598,6 +613,6 @@ deliberately.
 | ---------- | ----------------------------------------------------------------------------------------------------------------- |
 | `model`    | Provides `ContentBlock`, `ChannelType`, `SessionId`, `ResourceAccess`, `User`                      |
 | `agent`    | Router owns the registry and calls `Channel::dispatch_agent` (and the approval-dispatch helpers) by `ChannelType` |
-| `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `ApprovalQueue` backs `ApprovalSurface`       |
+| `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `human-ask`'s `AskQueue` backs `AskSurface` |
 | `gateway`  | Hosts the in-tree transports (`/v1/channel-ws` and the paired-device Noise relay leg); installs channels at boot from config and lazily on any uninstalled type's first connect, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |
 | `security` | Inbound user messages go to `SecurityGateway` first after entering the system                                     |

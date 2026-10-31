@@ -25,6 +25,7 @@ bench = false
 [dependencies]
 baybo-model = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-channels = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }

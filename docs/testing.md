@@ -55,6 +55,7 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `baybo-security`    | `MemorySecretStore`                                                     | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
 | domain crates      | `MemoryTurnStore` (`baybo-turn`), `MemoryTraceStore` (`baybo-trace`), `MemoryCostStore` (`baybo-cost`), `RecordingMemory` (`baybo-memory` — records `recall` / `on_turn_complete` calls), `MemorySessionStore` + `MemorySessionFolderStore` (`baybo-session`) | In-memory backends for the `*Store` traits (the trait contracts live in `baybo-store`; each fake sits in its domain crate's `test_support.rs`). Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage lookups (`list_lineage_children` returns empty); tests that need that surface should use the real sqlite store via `Store::open` against a tempfile. |
+| `baybo-human-ask`   | `MemoryHumanAskStore`, `NoResume`, `NoLivePendingAsks`                  | In-memory `HumanAskStore` (the `human_asks` ledger) with `rows()` / `row(id)` / `insert(row)` for asserting what a gate or verb persisted; note it does **not** enforce the sqlite foreign key to `sessions`, which the real store does. `NoResume` is a `ResumeSink` that routes nothing (no router); `NoLivePendingAsks` is the reaper probe that never holds an actor. |
 | `baybo-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
 | `baybo-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
 | `remote-host-protocol` | `AddressPolicy::for_tests`                                          | With `test-support`, `AddressPolicy::active()` returns it: 127/8, 198.18/15 and 2001:2::/48 are `Public` and `::1` is `Lan`, so direct-carrier tests run over loopback. `remote-host-relay`'s and `baybo-gateway`'s tests enable it. Features unify per build, so any crate tested in the same `cargo`/`nextest` invocation as those sees the test policy too: tests that classify addresses use data that reads the same under either policy. |
@@ -72,7 +73,7 @@ The integration-tests crate composes these into higher-level builders:
 | `SessionBuilder`                | `baybo_integration_tests::fixtures`                 | Fluent builder for `Session` so tests don't repeat field lists. |
 | `master_key_for_tests()`        | `baybo_integration_tests::fixtures`                 | Stable 32-byte `EncryptionKey` so placeholder hex stays reproducible across runs. |
 | `capture_tracing()`             | `baybo_integration_tests::tracing_capture`          | Per-test thread-local `tracing` subscriber. Returns `TracingCapture` (RAII) with `events()`, `at_level(Level)`, `any_contains(&str)`. |
-| `AgentTestHarnessBuilder` / `AgentTestHarness` | `baybo_integration_tests::harness`   | Spawns a real `AgentActor` wired to the in-memory stores, the `StubLlm`, and the gateway. Tests push canned LLM responses, send user input via `harness.send_text(...)` (which runs `SecurityGateway::sanitize_input` first, just like the real `Router`), then drain `AgentOutput` from the channel side. `with_tool(Arc<dyn Tool>, ToolManifest)` registers tools before the actor spawns. `send_content(Vec<ContentBlock>)` sends arbitrary user content (an uncaptioned image). The conversation-title pass is off unless `with_title_sink(..)` wires a sink — its `chat()` then draws on the same stub, so queue a `push_response` for it — and `with_model_vision(true)` makes the stub report `supports_vision`. |
+| `AgentTestHarnessBuilder` / `AgentTestHarness` | `baybo_integration_tests::harness`   | Spawns a real `AgentActor` wired to the in-memory stores, the `StubLlm`, and the gateway. Tests push canned LLM responses, send user input via `harness.send_text(...)` (which runs `SecurityGateway::sanitize_input` first, just like the real `Router`), then drain `AgentOutput` from the channel side. `with_tool(Arc<dyn Tool>, ToolManifest)` registers tools before the actor spawns. `send_content(Vec<ContentBlock>)` sends arbitrary user content (an uncaptioned image). The conversation-title pass is off unless `with_title_sink(..)` wires a sink — its `chat()` then draws on the same stub, so queue a `push_response` for it — and `with_model_vision(true)` makes the stub report `supports_vision`. Ask wiring: `with_channel_ask_gate()` parks asks on a real `ChannelAskGate`; `with_store(Store)` persists sessions, transcripts, turns and asks to a sqlite `Store` (read them back through `session_store` / `ask_ledger`), so a test can drop the harness and build another over the same database file — a restart; `with_resume_door()` wires the real `RouterResumeSink`, forwarding `ResumeAsk` into the actor's mailbox; `with_strict_tool_pairing()` makes the LLM refuse any request whose `tool_use` is not answered by the very next message (`strict_rejections` counts refusals). |
 
 ## Six conventions
 
@@ -153,6 +154,14 @@ keeping it in lockstep with the Rust router is what lets the frontend
   step closed `Failed`, one `Warn` notice to the user).
 - `tool_concurrency.rs` — tool-call concurrency scheduling in
   `run_iteration`.
+- `human_ask_e2e.rs` — a parked approval under `/stop` vs shutdown, and
+  unattended turns (cron fire, subagent) getting `PolicyDenied` rows.
+- `human_ask_settle_e2e.rs` — the turn prelude through every door, and the
+  Resume door, over a seeded post-restart session.
+- `human_ask_restart_e2e.rs` — real restarts over one sqlite file: the card,
+  the session mark and the push after the boot reload, the answer resuming
+  the turn, a claim re-driven by the next boot, a new message or an issue-run
+  requeue settling the dead ask, against a strict provider.
 
 (`all.rs` is the aggregator, not a suite.)
 

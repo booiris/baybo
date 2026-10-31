@@ -29,6 +29,7 @@ baybo-channels = { workspace = true }
 baybo-context = { workspace = true }
 baybo-cost = { workspace = true, features = ["test-support"] }
 baybo-cron = { workspace = true, features = ["test-support"] }
+baybo-human-ask = { workspace = true, features = ["test-support"] }
 baybo-turn = { workspace = true, features = ["test-support"] }
 baybo-llm = { workspace = true, features = ["test-support"] }
 baybo-memory = { workspace = true, features = ["test-support"] }
@@ -55,6 +56,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 baybo-cli = { workspace = true, features = ["test-support"] }
+baybo-config = { workspace = true }
 baybo-gateway = { workspace = true }
 baybo-setup = { workspace = true }
 hex = { workspace = true }

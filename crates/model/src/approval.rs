@@ -11,6 +11,42 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::SessionId;
+
+/// One approval prompt: which tool call wants which resources.
+///
+/// Lives in `baybo-model` so the `human_asks` ledger (`baybo-store`) can type
+/// its persisted payload without depending on `baybo-tools`; `baybo-tools`
+/// re-exports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    /// This prompt's own id — a fresh UUID per prompt, the ask's `AskId`.
+    pub call_id: String,
+    /// LLM `tool_use_id` of the tool call this prompt blocks — what
+    /// `ToolStarted`/`ToolCompleted` events carry. Not unique per prompt: one
+    /// call can prompt more than once. Defaults to empty for input written
+    /// before the field was required.
+    #[serde(default)]
+    pub tool_call_id: String,
+    /// Session the tool call runs under.
+    pub session_id: SessionId,
+    /// Baybo user id the tool call is running on behalf of. Sidecars that
+    /// route prompts by platform user (Telegram chat, Discord DM) use this
+    /// instead of reverse-mapping from `session_id`. Empty string when no
+    /// user context applies.
+    #[serde(default)]
+    pub user_id: String,
+    pub tool: String,
+    pub accesses: Vec<ResourceAccess>,
+    /// Short truncated JSON preview of the parameters, for UI display only.
+    pub params_preview: String,
+    /// Caller-supplied label produced by `baybo_tools::Tool::call_label`
+    /// (e.g. Bash's `description` parameter). Missing on input deserializes
+    /// to `None`; `None` is omitted on serialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Decision returned by an approval gate.
 ///
 /// Lives in `baybo-model` so trace `SpanEvent`s can record approval
@@ -63,7 +99,8 @@ pub enum ApprovalResolution {
     /// rows written before this distinction existed read as answered.
     #[default]
     Answered,
-    /// Nobody answered within the gate's window; denied by default.
+    /// Historical: gates used to deny themselves after a fixed window.
+    /// Nothing produces this any more; it stays so old span events decode.
     TimedOut,
     /// The prompt went away undecided — its turn was cancelled or its
     /// process shut down. Denied by default.

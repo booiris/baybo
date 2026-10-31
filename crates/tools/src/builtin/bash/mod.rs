@@ -86,9 +86,11 @@ const MAX_OUTPUT_BYTES: usize = 2 * baybo_model::MAX_TOOL_OUTPUT_BYTES;
 const COMMAND_HEAD_MAX_CHARS: usize = 160;
 /// [`Tool::max_timeout`] for Bash, and the `maximum` advertised for
 /// `timeout_ms`: builds, test suites and migration scripts are all fair game
-/// here, so the trait default 30 s would clip anything non-trivial. Beyond
-/// this the executor's own deadline starts racing the background handoff, so
-/// a larger budget buys the model nothing.
+/// here, so the trait default 30 s would clip anything non-trivial. The
+/// executor's outer deadline is `ctx.timeout` plus `TOOL_DEADLINE_GRACE`
+/// (`baybo-agent`), a few seconds of slack that keeps its timer from racing
+/// the detach-to-background handoff after this command's own deadline fires;
+/// time parked on an approval is not counted against it.
 const MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// One-line, log-safe digest of a shell command for a structured log
@@ -3557,7 +3559,13 @@ mod tests {
     ) -> ToolContext {
         let mut ctx = ctx_with(sandbox);
         let cache: Arc<Mutex<Vec<ApprovedResource>>> = Arc::new(Mutex::new(Vec::new()));
-        ctx.approval = Some(ApprovalHandle::new(gate, cache, None));
+        ctx.approval = Some(ApprovalHandle::new(
+            gate,
+            cache,
+            String::new(),
+            crate::ParkGauge::new(),
+            crate::AskCancel::never(),
+        ));
         ctx
     }
 
@@ -4830,7 +4838,13 @@ mod tests {
         let cache = Arc::new(Mutex::new(vec![ApprovedResource::ExecCommand {
             command: command.to_string(),
         }]));
-        ctx.approval = Some(ApprovalHandle::new(gate.clone(), cache, None));
+        ctx.approval = Some(ApprovalHandle::new(
+            gate.clone(),
+            cache,
+            String::new(),
+            crate::ParkGauge::new(),
+            crate::AskCancel::never(),
+        ));
 
         let out = BashTool::for_test()
             .execute(

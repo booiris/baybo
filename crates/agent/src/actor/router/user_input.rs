@@ -367,6 +367,36 @@ impl Router {
         Ok(())
     }
 
+    /// A human answered a dead ask: route a `ResumeAsk` to the session's
+    /// actor, hydrating one if none is live. A failure here loses nothing —
+    /// the row stays resolved, and the session's next turn or the next boot
+    /// applies it.
+    pub(super) async fn handle_resume_ask(&self, req: baybo_model::human_ask::ResumeRequest) {
+        let session = match self.session_manager.get(&req.session_id).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                warn!(session_id = %req.session_id, ask_id = %req.ask_id, "resume for a session that does not exist");
+                return;
+            }
+            Err(e) => {
+                warn!(session_id = %req.session_id, error = %e, "could not load the session to resume an ask");
+                return;
+            }
+        };
+        let routed = self
+            .route_one_to_actor(
+                &req.session_id,
+                &session,
+                AgentMessage::ResumeAsk {
+                    ask_id: req.ask_id.clone(),
+                },
+            )
+            .await;
+        if !routed {
+            warn!(session_id = %req.session_id, ask_id = %req.ask_id, "could not route a resume to the session's actor");
+        }
+    }
+
     /// Route one `AgentMessage` to the session's actor, cold-spawning from
     /// `session` if needed. The spawn closure clones `session` so this can be
     /// called repeatedly (the slash-split batch path); the clone is only paid on
@@ -725,7 +755,10 @@ mod tests {
 
     fn fixture(rate_limit_max: usize, detector: LeakDetector) -> RouterFixture {
         let (response_tx, response_rx) = mpsc::channel(64);
-        let supervisor = AgentSupervisor::new(response_tx);
+        let supervisor = AgentSupervisor::new(
+            response_tx,
+            std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+        );
         let sessions = Arc::new(SessionManager::new(
             Arc::new(MemorySessionStore::new()),
             Arc::new(MemorySessionFolderStore::new()),

@@ -304,6 +304,20 @@ impl AgentActor {
     /// Advance the delivery stage. An active ledger always completes first;
     /// any fresh results remain buffered as the following batch.
     async fn run_background_notification_delivery(&mut self) {
+        let notifications = &self.durable.session.state.background_notifications;
+        if notifications.active_delivery.is_none() && notifications.buffered_results.is_empty() {
+            return;
+        }
+        // Both stages below append the notification prompt; an unapplied
+        // ask's result has to land before it.
+        if let Err(error) = self.settle_unapplied_asks().await {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %error,
+                "could not settle unapplied asks before a background notification; retrying later"
+            );
+            return;
+        }
         if self
             .durable
             .session
@@ -640,7 +654,6 @@ impl AgentActor {
                 TurnInput::SubagentNotification { content },
                 None,
                 Some(response_tx),
-                None,
                 None,
                 None,
                 None,

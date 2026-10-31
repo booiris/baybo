@@ -18,6 +18,7 @@ pub mod cron;
 pub mod deck;
 pub mod device;
 pub mod error;
+pub mod human_ask;
 pub mod message_search;
 pub mod project;
 pub mod secret;
@@ -40,6 +41,7 @@ pub use cron::{CronFire, CronStore, ExecutionCompletion};
 pub use deck::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
+pub use human_ask::{HumanAskRow, HumanAskStore};
 pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
 pub use project::{
     IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueRun,

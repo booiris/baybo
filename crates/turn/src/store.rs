@@ -20,6 +20,7 @@ fn turn_input_kind_str(kind: TurnInputKind) -> &'static str {
         TurnInputKind::Spawned => "spawned",
         TurnInputKind::SubagentNotification => "subagent_notification",
         TurnInputKind::IssueRun => "issue_run",
+        TurnInputKind::Resume => "resume",
     }
 }
 

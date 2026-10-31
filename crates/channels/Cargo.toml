@@ -19,6 +19,7 @@ ts-export = ["dep:ts-rs"]
 baybo-model = { workspace = true }
 wire = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-human-ask = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

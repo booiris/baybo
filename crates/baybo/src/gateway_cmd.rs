@@ -544,9 +544,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         shutdown.clone(),
         Arc::clone(&leak_detector),
         embedded_mcp_servers,
+        baybo_human_ask::ReloadScope::ResumeAnswered,
     )
     .await?;
-    let run_handle = runtime::wire_router(&mut graph).await;
+    let run_handle = runtime::wire_router(&mut graph).await?;
 
     // WS-backed sidecars register themselves from the route task when a
     // client connects; nothing to pre-register here.
@@ -647,37 +648,23 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             Arc::new(baybo_gateway::push::HttpNotifySink::new(push_client)),
             Some(registrar),
         ));
-        // Second push source: a tool call parked at the approval gate. Nothing
-        // reaches the lifecycle bus while it waits — the turn has not
-        // completed, and never will unless the user answers — so the gate
-        // needs its own path to the dispatcher.
-        //
-        // Installed on `owner` alone: the queue is per-channel, and the app
-        // holds an `owner` connection, so a prompt parked on the TUI's or
-        // Telegram's queue is one the phone could not answer even after
-        // opening the conversation the push routed it to.
-        let (approval_relay, approval_stream) =
-            baybo_gateway::push::approval::ApprovalPushRelay::new();
-        let approval_wired = match graph
-            .channels_registry
-            .get(&baybo_model::ChannelType::owner())
-        {
-            Some(owner) => {
-                approval_relay.install(&owner);
-                true
-            }
-            None => false,
-        };
+        // Second push source: a tool call parked on an ask. Nothing reaches
+        // the lifecycle bus while it waits — the turn has not completed, and
+        // never will unless the user answers — so the ask queue needs its own
+        // path to the dispatcher. The relay itself is built in
+        // `build_managers`, ahead of the boot reload whose edges it must see.
+        let ask_stream = graph.ask_push_stream.take();
+        let ask_pushes = ask_stream.is_some();
         let push_shutdown = shutdown.clone();
         task_tracker.track(baybo_gateway::push::spawn(
             dispatcher,
             Arc::clone(&graph.turn_lifecycle),
-            approval_stream,
+            ask_stream,
             async move { push_shutdown.wait().await },
         ));
         tracing::debug!(
-            approval_pushes = approval_wired,
-            "push: dispatcher started (turn lifecycle bus + approval gate)"
+            ask_pushes,
+            "push: dispatcher started (turn lifecycle bus + ask queue)"
         );
     }
 
@@ -750,6 +737,9 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         relay_dialer: baybo_gateway::relay::dial::RelayDialer::new(boot::proxy_settings(
             &graph.config,
         )),
+        ask_core: Arc::clone(&graph.ask_core),
+        ask_queues: graph.ask_queues.clone(),
+        human_asks: Arc::clone(&graph.human_asks),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

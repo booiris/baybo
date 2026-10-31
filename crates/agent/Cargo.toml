@@ -9,6 +9,7 @@ doctest = false
 [dependencies]
 baybo-cron = { workspace = true }
 baybo-model = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-process = { workspace = true }
 baybo-llm = { workspace = true }
 baybo-tools = { workspace = true }
@@ -52,6 +53,7 @@ libc = { workspace = true }
 [dev-dependencies]
 baybo-cost = { workspace = true, features = ["test-support"] }
 baybo-store = { workspace = true, features = ["test-support"] }
+baybo-human-ask = { workspace = true, features = ["test-support"] }
 # `InMemoryCronStore` — the router tests drive cron delivery without sqlite.
 baybo-cron = { workspace = true, features = ["test-support"] }
 baybo-turn = { workspace = true, features = ["test-support"] }

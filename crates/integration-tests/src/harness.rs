@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use baybo_agent::{
@@ -17,16 +18,24 @@ use baybo_agent::{
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
     tool_executor::ToolExecutor,
 };
-use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
+use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, RouterInbound};
 use baybo_context::{ContextManager, ContextManagerConfig, HeuristicTokenizer};
 use baybo_cost::test_support::MemoryCostStore;
 use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
+use baybo_human_ask::test_support::MemoryHumanAskStore;
+use baybo_human_ask::{
+    AskCore, AskQueues, ChannelAskGate, HumanAskManager, HumanAskManagerConfig, PolicyDenyGate,
+    ResumeSink,
+};
 use baybo_llm::test_support::StubLlm;
 use baybo_llm::{LlmCompletion, ModelPricing};
-use baybo_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
+use baybo_model::{
+    ChannelType, ChatMessage, ContentBlock, LlmEntryName, MessageMetadata, Session, User,
+};
 use baybo_security::test_support::MemorySecretStore;
 use baybo_security::{LeakDetector, SecretVault};
 use baybo_skills::SkillRegistry;
+use baybo_store::{HumanAskRow, HumanAskStore};
 use baybo_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, TraceEventStream, TraceStore};
@@ -83,6 +92,30 @@ pub struct AgentTestHarness {
     /// result to this session. Exposed so a test can seed an execution and
     /// assert the delivery resolved it.
     pub cron_store: Arc<baybo_cron::test_support::InMemoryCronStore>,
+    /// The ask ledger behind the loop's `TurnAsks` port and, with
+    /// [`AgentTestHarnessBuilder::with_channel_ask_gate`], the session
+    /// channel's gate.
+    pub ask_store: Arc<MemoryHumanAskStore>,
+    /// The ask ledger actually wired: `ask_store`, or the sqlite one under
+    /// [`AgentTestHarnessBuilder::with_store`].
+    pub ask_ledger: Arc<dyn HumanAskStore>,
+    /// The session store actually wired: `memory_session_store`, or the
+    /// sqlite one under [`AgentTestHarnessBuilder::with_store`].
+    pub session_store: Arc<dyn baybo_session::SessionStore>,
+    /// The ledger + observers the gates and the verbs share, so a test can
+    /// install gateway channels over the same asks.
+    pub ask_core: Arc<AskCore>,
+    /// The ask queues the channel gate parks on.
+    pub ask_queues: AskQueues,
+    /// The verbs over `ask_store` (resolve, abandon, …).
+    pub human_asks: Arc<HumanAskManager>,
+    /// Parent of the actor's token. Cancelling it is what process shutdown
+    /// does: every turn the actor runs reads the cancel as `Ancestor`.
+    pub actor_parent_token: tokio_util::sync::CancellationToken,
+    /// LLM requests the strict provider fake refused because a `tool_use`
+    /// was not answered by the very next message. Stays 0 unless
+    /// [`AgentTestHarnessBuilder::with_strict_tool_pairing`] is on.
+    pub strict_rejections: Arc<AtomicUsize>,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -221,6 +254,24 @@ pub struct AgentTestHarnessBuilder {
     /// off: with one stub serving every call, a title `chat()` would take
     /// the reply a test queued for a compaction or a request count.
     title_sink: Option<Arc<dyn baybo_agent::SessionTitleSink>>,
+    /// Install the production `ChannelAskGate` for the session's channel.
+    /// Defaults to `false`: the gate map stays empty and every ask is
+    /// denied by `AutoDenyGate`, so tests that do not answer asks never park.
+    channel_ask_gate: bool,
+    /// Transcript rows and ask-ledger rows present before the actor spawns,
+    /// as a restart leaves them: the actor hydrates over both.
+    seed_transcript: Vec<ChatMessage>,
+    seed_asks: Vec<HumanAskRow>,
+    /// Persist sessions, transcripts, turns and asks to this sqlite store
+    /// instead of the in-memory fakes, so a test can drop the harness and
+    /// build another over the same database — a restart.
+    store: Option<baybo_storage::Store>,
+    /// Route an answer to a dead ask back into this actor's mailbox, the way
+    /// the router's Resume door does.
+    resume_door: bool,
+    /// Refuse any LLM request whose `tool_use` is not answered by the very
+    /// next message, as a real provider does.
+    strict_tool_pairing: bool,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -242,11 +293,64 @@ impl Default for AgentTestHarnessBuilder {
             chat_gate: None,
             model_supports_vision: false,
             title_sink: None,
+            channel_ask_gate: false,
+            seed_transcript: Vec::new(),
+            seed_asks: Vec::new(),
+            store: None,
+            resume_door: false,
+            strict_tool_pairing: false,
         }
     }
 }
 
 impl AgentTestHarnessBuilder {
+    /// Route the session channel's asks through a real `ChannelAskGate` over
+    /// the harness's ledger, so an ask parks until a test resolves it via
+    /// [`AgentTestHarness::human_asks`].
+    pub fn with_channel_ask_gate(mut self) -> Self {
+        self.channel_ask_gate = true;
+        self
+    }
+
+    /// Back sessions, transcripts, turns and the ask ledger with `store`.
+    /// The session row must already be saved in it (asks reference it); the
+    /// in-memory `memory_session_store` / `turn_store` / `ask_store` fields
+    /// are then unwired — read `session_store` / `ask_ledger` /
+    /// `turn_lifecycle` instead.
+    pub fn with_store(mut self, store: baybo_storage::Store) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Wire the chat Resume door: the manager's real `RouterResumeSink`,
+    /// with the router's routing replaced by a forward into this actor's
+    /// mailbox.
+    pub fn with_resume_door(mut self) -> Self {
+        self.resume_door = true;
+        self
+    }
+
+    /// Make the wired LLM a strict provider: a request with a `tool_use`
+    /// not answered by the very next message fails as a bad request and is
+    /// counted in [`AgentTestHarness::strict_rejections`].
+    pub fn with_strict_tool_pairing(mut self) -> Self {
+        self.strict_tool_pairing = true;
+        self
+    }
+
+    /// Persist `messages` on the session's transcript before the actor
+    /// spawns, so its hydration sees them.
+    pub fn with_seed_transcript(mut self, messages: Vec<ChatMessage>) -> Self {
+        self.seed_transcript = messages;
+        self
+    }
+
+    /// Put `row` on the ask ledger before the actor spawns.
+    pub fn with_seed_ask(mut self, row: HumanAskRow) -> Self {
+        self.seed_asks.push(row);
+        self
+    }
+
     pub fn session(mut self, session: Session) -> Self {
         self.session = Some(session);
         self
@@ -390,7 +494,6 @@ impl AgentTestHarnessBuilder {
         let cost_store = Arc::new(MemoryCostStore::new());
         let trace_store = Arc::new(MemoryTraceStore::new());
 
-        let turn_lifecycle = Arc::new(TurnLifecycle::new(share_turn_store(&turn_store)));
         // One shared bus per harness — the recorder publishes into it
         // and the cost subscriber drains the same bus. Constructing it
         // upfront keeps both sides explicit about which stream they
@@ -442,6 +545,15 @@ impl AgentTestHarnessBuilder {
                 None => stub_llm.clone(),
             },
         };
+        let strict_rejections = Arc::new(AtomicUsize::new(0));
+        let wired_llm: Arc<dyn baybo_llm::LlmCompletion> = if self.strict_tool_pairing {
+            Arc::new(StrictToolPairing {
+                inner: wired_llm,
+                rejections: Arc::clone(&strict_rejections),
+            })
+        } else {
+            wired_llm
+        };
         let mut tool_registry = ToolRegistry::new();
         for (tool, manifest) in self.tools {
             tool_registry.register(tool, manifest);
@@ -457,19 +569,69 @@ impl AgentTestHarnessBuilder {
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
         let approval_gates = Arc::new(ApprovalGateMap::new());
+        let ask_store = MemoryHumanAskStore::new();
         let memory_session_store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
-        // Mirror production's "session row exists before the actor spawns"
-        // shape so the transcript-read intercept's cross-session lookup finds
-        // the row instead of returning NotFound.
-        memory_session_store.seed_session(&session);
-        let session_store =
-            Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>;
-        let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
-            as Arc<dyn baybo_session::SessionFolderStore>;
+        let (session_store, folder_store, turn_store_dyn, ask_ledger) = match &self.store {
+            Some(store) => {
+                assert!(
+                    self.seed_transcript.is_empty() && self.seed_asks.is_empty(),
+                    "seed a durable harness through its store, not the builder"
+                );
+                (
+                    store.session.clone(),
+                    store.session_folder.clone(),
+                    store.turn.clone(),
+                    store.human_ask.clone(),
+                )
+            }
+            None => {
+                for row in self.seed_asks {
+                    ask_store.insert(row);
+                }
+                // Mirror production's "session row exists before the actor
+                // spawns" shape so the transcript-read intercept's
+                // cross-session lookup finds the row instead of NotFound.
+                memory_session_store.seed_session(&session);
+                memory_session_store.seed_messages(&session.id, &self.seed_transcript);
+                (
+                    Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>,
+                    Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
+                        as Arc<dyn baybo_session::SessionFolderStore>,
+                    share_turn_store(&turn_store),
+                    Arc::clone(&ask_store) as Arc<dyn HumanAskStore>,
+                )
+            }
+        };
+        let turn_lifecycle = Arc::new(TurnLifecycle::new(turn_store_dyn));
         let session_manager = Arc::new(baybo_agent::SessionManager::new(
-            session_store,
+            Arc::clone(&session_store),
             folder_store,
         ));
+        let (mailbox_tx, mailbox_rx) = baybo_agent::mailbox::channel(self.mailbox_capacity);
+        let ask_core = Arc::new(AskCore::new(Arc::clone(&ask_ledger)));
+        let ask_queues = AskQueues::new();
+        let resume_sink: Arc<dyn ResumeSink> = if self.resume_door {
+            Arc::new(resume_door(
+                Arc::clone(&session_manager),
+                mailbox_tx.clone(),
+            ))
+        } else {
+            Arc::new(baybo_human_ask::test_support::NoResume)
+        };
+        let human_asks = Arc::new(HumanAskManager::from_config(HumanAskManagerConfig {
+            core: Arc::clone(&ask_core),
+            queues: ask_queues.clone(),
+            resume_sink,
+        }));
+        if self.channel_ask_gate {
+            approval_gates.insert(
+                session.channel.clone(),
+                Arc::new(ChannelAskGate::new(
+                    ask_queues.get_or_create(&session.channel),
+                    Arc::clone(&ask_core),
+                )),
+            );
+        }
         let virtual_reads: Option<Arc<dyn baybo_tools::VirtualReadResolver>> =
             Some(Arc::new(baybo_agent::SessionTranscriptReader::new(
                 Arc::clone(&session_manager) as Arc<dyn baybo_agent::SessionTranscript>,
@@ -487,6 +649,7 @@ impl AgentTestHarnessBuilder {
             None,
             None,
             None,
+            Arc::new(PolicyDenyGate::new(Arc::clone(&ask_core))),
         ));
 
         let tokenizer = Arc::new(HeuristicTokenizer);
@@ -536,6 +699,9 @@ impl AgentTestHarnessBuilder {
             subagent_profile: Some((subagent_registry, "harness".to_string())),
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(baybo_agent::runtime::asks::UnappliedAsks(Arc::clone(
+                &human_asks,
+            ))),
         });
 
         let guarded_llm =
@@ -571,8 +737,8 @@ impl AgentTestHarnessBuilder {
             memory: self.memory,
             task_store: task_store.clone(),
             title_sink: self.title_sink,
+            asks: human_asks.clone(),
         });
-        let (mailbox_tx, mailbox_rx) = baybo_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
         // Mirror production's turn-state projector so the turn-*ended*
@@ -621,6 +787,14 @@ impl AgentTestHarnessBuilder {
             task_store,
             cron_store,
             memory_session_store,
+            ask_store,
+            ask_ledger,
+            session_store,
+            ask_core,
+            ask_queues,
+            human_asks,
+            actor_parent_token,
+            strict_rejections,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),
@@ -677,6 +851,97 @@ impl LlmCompletion for GatedChat {
         &self,
         request: &baybo_llm::ChatRequest,
     ) -> baybo_llm::Result<baybo_llm::LlmStream> {
+        self.inner.chat_stream(request).await
+    }
+
+    fn model_info(&self) -> &baybo_llm::ModelInfo {
+        self.inner.model_info()
+    }
+
+    fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
+        self.inner.effective_effort(requested)
+    }
+
+    fn delivers_image_block(&self, block: &baybo_model::ContentBlock) -> bool {
+        self.inner.delivers_image_block(block)
+    }
+
+    fn audio_delivery(&self) -> baybo_llm::AudioDelivery {
+        self.inner.audio_delivery()
+    }
+}
+
+/// The chat Resume door with the router cut out: the production sink queues
+/// `RouterInbound::ResumeAsk`, and this forwards it to the one actor the
+/// harness hosts, as `Router::handle_resume_ask` would.
+fn resume_door(
+    sessions: Arc<baybo_agent::SessionManager>,
+    mailbox: MailboxSender<AgentMessage>,
+) -> baybo_agent::runtime::asks::RouterResumeSink {
+    let (tx, mut rx) = mpsc::channel::<RouterInbound>(16);
+    tokio::spawn(async move {
+        while let Some(inbound) = rx.recv().await {
+            if let RouterInbound::ResumeAsk(req) = inbound
+                && mailbox
+                    .send(AgentMessage::ResumeAsk { ask_id: req.ask_id })
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    });
+    baybo_agent::runtime::asks::RouterResumeSink::new(tx, sessions)
+}
+
+/// A provider that rejects a transcript whose `tool_use` is not answered by
+/// the very next message — what Anthropic's API does, and what a misplaced
+/// settlement result would trip in production.
+struct StrictToolPairing {
+    inner: Arc<dyn LlmCompletion>,
+    rejections: Arc<AtomicUsize>,
+}
+
+impl StrictToolPairing {
+    fn check(&self, request: &baybo_llm::ChatRequest) -> baybo_llm::Result<()> {
+        let messages = &request.messages;
+        for (i, message) in messages.iter().enumerate() {
+            for block in &message.content {
+                let ContentBlock::ToolUse { id, .. } = block else {
+                    continue;
+                };
+                let answered = messages.get(i + 1).is_some_and(|next| {
+                    next.content.iter().any(|b| {
+                        matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                    })
+                });
+                if !answered {
+                    self.rejections.fetch_add(1, Ordering::SeqCst);
+                    return Err(baybo_llm::LlmError::BadRequest(format!(
+                        "tool_use {id} is not followed by its tool_result"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmCompletion for StrictToolPairing {
+    async fn chat(
+        &self,
+        request: &baybo_llm::ChatRequest,
+    ) -> baybo_llm::Result<baybo_llm::LlmResponse> {
+        self.check(request)?;
+        self.inner.chat(request).await
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &baybo_llm::ChatRequest,
+    ) -> baybo_llm::Result<baybo_llm::LlmStream> {
+        self.check(request)?;
         self.inner.chat_stream(request).await
     }
 

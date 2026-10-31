@@ -613,7 +613,6 @@ impl Tool for SpawnSubagentTool {
             span_id: ctx.span_id,
             cancel_token: ctx.cancellation_token.clone(),
             background_eligible: ctx.background_eligible,
-            inherited_context: ctx.inherited_context.clone(),
         };
         let mut request = request;
         request.fan_out_root = Some(root_session_id.clone());
@@ -896,39 +895,6 @@ mod tests {
             req.backend
         );
         assert_eq!(parent.session_id.as_ref(), "parent-sess");
-        assert!(parent.inherited_context.is_none());
-    }
-
-    #[tokio::test]
-    async fn forwards_inherited_tool_context_to_the_child_spawner() {
-        let (spawner, captured) = fake_spawner(SubagentResult {
-            child_session_id: baybo_model::SessionId::from("child-1"),
-            final_content: Some(vec![baybo_model::ContentBlock::Text("done".into())]),
-            status: SubagentExitStatus::Completed,
-        });
-        let context = ToolContext {
-            inherited_context: Some(baybo_model::InheritedToolContext),
-            ..ctx()
-        };
-
-        tool_with_default(spawner)
-            .await
-            .execute(
-                json!({
-                    "subagent_type": "general-purpose",
-                    "description": "browse the page",
-                    "prompt": "Open the page and report its title.",
-                }),
-                &context,
-            )
-            .await
-            .expect("spawn succeeds");
-
-        let (_, parent) = captured.lock().take().expect("spawner saw a request");
-        assert!(
-            parent.inherited_context.is_some(),
-            "the unattended marker must reach the child spawner"
-        );
     }
 
     #[tokio::test]

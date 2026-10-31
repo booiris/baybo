@@ -65,9 +65,9 @@ folder_id?: FolderChange,
  */
 title?: string, 
 /**
- * `true` while at least one tool call in this session is parked on the
- * approval gate; `false` the moment its LAST prompt is answered,
- * cancelled, or times out. Absent means no change.
+ * `true` while at least one ask of any kind — a tool approval or a
+ * question — is pending in this session; `false` the moment its LAST
+ * one is answered or abandoned. Absent means no change.
  *
  * This rides a patch rather than [`Frame::ApprovalRequested`] because the
  * prompt frame is dispatched only to connections **subscribed to that
@@ -76,7 +76,7 @@ title?: string,
  * every connection on the channel, so the mark reaches a session the
  * device has never opened.
  *
- * Carries nothing about *what* the tool wants — a list row must not leak
- * a command line. Opening the conversation is what shows the prompt.
+ * Carries nothing about *what* is asked — a list row must not leak a
+ * command line. Opening the conversation is what shows the prompt.
  */
-approval_pending?: boolean, };
+awaiting_human?: boolean, };

@@ -10,8 +10,10 @@
 
 use std::sync::Arc;
 
+use baybo_human_ask::{AskQueue, PendingWatcher};
+use baybo_model::human_ask::AskId;
 use baybo_model::{ChannelType, ResourceAccess, SessionId};
-use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest, PendingWatcher};
+use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -33,15 +35,13 @@ use crate::wire::{ActivityKind, FolderView, Frame, SessionPatch};
 /// invokes the observer after re-narrowing to a `SubscribedView`.
 pub type DispatchObserver = Arc<dyn for<'a> Fn(&SessionEvent, SubscribedView<'a>) + Send + Sync>;
 
-/// Bundle of the channel's approval gate (the `ApprovalGate` trait
-/// object the agent / tool path calls through) and the underlying
-/// queue (used to resolve pending entries by call id when a client
-/// sends `Frame::ResolveApproval`). Both share the same queue handle
-/// internally; this struct just keeps the second one externally
-/// addressable from the channel.
-pub struct ApprovalSurface {
-    pub gate: Arc<dyn ApprovalGate>,
-    pub queue: ApprovalQueue,
+/// Bundle of the channel's ask gate (the `ApprovalGate` trait object the
+/// agent / tool path calls through) and the channel's [`AskQueue`] (the read
+/// model of its pending asks). The gate holds the same queue internally;
+/// this struct keeps it addressable from the channel.
+pub struct AskSurface {
+    pub approval_gate: Arc<dyn ApprovalGate>,
+    pub queue: AskQueue,
 }
 
 /// Live protocol surface. One per [`ChannelType`]. Created eagerly at
@@ -60,7 +60,7 @@ pub struct StampedEvent {
 pub struct Channel {
     channel_type: ChannelType,
     kind: ChannelKind,
-    approvals: Option<ApprovalSurface>,
+    approvals: Option<AskSurface>,
     connections: DashMap<ConnectionId, Arc<Connection>>,
     /// Reverse index for `Subscribed` channels: `session_id` →
     /// connections that asked to see it. Untouched for `Multiplexed`.
@@ -93,7 +93,7 @@ impl Channel {
     pub fn new(
         channel_type: ChannelType,
         kind: ChannelKind,
-        approvals: Option<ApprovalSurface>,
+        approvals: Option<AskSurface>,
     ) -> Self {
         Self {
             channel_type,
@@ -186,7 +186,9 @@ impl Channel {
     }
 
     pub fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>> {
-        self.approvals.as_ref().map(|a| Arc::clone(&a.gate))
+        self.approvals
+            .as_ref()
+            .map(|a| Arc::clone(&a.approval_gate))
     }
 
     /// Snapshot the full pending [`ApprovalRequest`] entries scoped to
@@ -204,7 +206,7 @@ impl Channel {
         };
         approvals
             .queue
-            .list()
+            .list_approvals()
             .into_iter()
             .filter(|req| req.session_id == *session_id)
             .collect()
@@ -235,15 +237,9 @@ impl Channel {
         }
     }
 
-    /// Resolve a pending approval by `call_id`. Returns the matched
-    /// entry's `session_id` so the caller can follow up with
-    /// [`Channel::dispatch_approval_resolved`] targeting the right
-    /// subscriber set — the connection-side `ResolveApproval` frame
-    /// doesn't carry `session_id` itself. `None` when no queue entry
-    /// matched (or the channel has no approval surface).
-    pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId> {
-        let approvals = self.approvals.as_ref()?;
-        approvals.queue.resolve_by_call_id(call_id, decision)
+    /// This channel's ask queue, when it has an ask surface.
+    pub fn ask_queue(&self) -> Option<&AskQueue> {
+        self.approvals.as_ref().map(|a| &a.queue)
     }
 
     /// Attach a transport-provided connection. Idempotent on the
@@ -322,8 +318,7 @@ impl Channel {
     }
 
     /// Publish an `ApprovalResolved` event so concurrent UIs drop the
-    /// prompt. Caller must have already resolved the queue entry via
-    /// [`Channel::resolve_approval`].
+    /// prompt. Called by the ask watcher once the queue entry is gone.
     pub fn dispatch_approval_resolved(
         &self,
         call_id: String,
@@ -334,6 +329,21 @@ impl Channel {
             call_id,
             session_id,
             decision,
+        });
+    }
+
+    /// Publish an `AskResolved` event: an ask of any kind left the queue,
+    /// answered or not, so every client showing it drops the card.
+    pub fn dispatch_ask_resolved(
+        &self,
+        session_id: SessionId,
+        ask_id: AskId,
+        outcome: wire::AskOutcomeKind,
+    ) {
+        self.dispatch_event(SessionEvent::AskResolved {
+            session_id,
+            ask_id,
+            outcome,
         });
     }
 
@@ -361,7 +371,8 @@ impl Channel {
     /// Internal event fan-out — the raw broadcast/subscription
     /// machinery. External callers go through [`Self::dispatch_agent`]
     /// / [`Self::dispatch_approval_requested`] /
-    /// [`Self::dispatch_approval_resolved`] (kind-agnostic) or
+    /// [`Self::dispatch_approval_resolved`] / [`Self::dispatch_ask_resolved`]
+    /// (kind-agnostic) or
     /// through [`SubscribedView::echo_inbound`]
     /// (Subscribed-exclusive). Non-blocking. Drops the event for any
     /// connection whose outbound queue is full and nudges that

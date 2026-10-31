@@ -74,6 +74,7 @@ async fn build_router_with_lifecycle() -> (
         secret_vault: std::sync::Arc::clone(&tg.deps.secret_vault),
         deck_manager: std::sync::Arc::clone(&tg.deps.deck_manager),
         project_manager: std::sync::Arc::clone(&tg.deps.project_manager),
+        human_asks: std::sync::Arc::clone(&tg.deps.human_asks),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
         device_links: tg.deps.device_links.clone(),
     };
