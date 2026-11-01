@@ -1179,6 +1179,7 @@ impl AgentLoop {
                 &cancel_token,
                 delta_tx.as_ref(),
                 &mut compaction_failure_reported,
+                background_eligible,
             )
             .await?;
 
@@ -1256,6 +1257,7 @@ impl AgentLoop {
                         iterations,
                         turn_started,
                         &mut observer_state,
+                        background_eligible,
                     )
                     .await;
                 }
@@ -1338,7 +1340,14 @@ impl AgentLoop {
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
-            .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
+            .call_llm_with_retry(
+                session,
+                span_recorder,
+                &step,
+                delta_tx,
+                cancel_token,
+                background_eligible,
+            )
             .await
         {
             Ok(pair) => pair,
@@ -1884,11 +1893,19 @@ impl AgentLoop {
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         cancel_token: &CancellationToken,
+        background_eligible: bool,
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
             match self
-                .call_llm(session, span_recorder, step, delta_tx, cancel_token)
+                .call_llm(
+                    session,
+                    span_recorder,
+                    step,
+                    delta_tx,
+                    cancel_token,
+                    background_eligible,
+                )
                 .await
             {
                 Ok(pair) => return Ok(pair),
@@ -1960,10 +1977,11 @@ impl AgentLoop {
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         cancel_token: &CancellationToken,
+        background_eligible: bool,
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
-        let tool_defs = self.session_tool_defs(session);
+        let tool_defs = self.session_tool_defs(session, background_eligible);
 
         // Mirrored off the wire list rather than re-read from the registry:
         // the trace has to record what this request actually carried, and a
@@ -2883,6 +2901,7 @@ impl AgentLoop {
     /// the main call starts refusing oversized requests.
     /// `failure_reported` is that once-per-turn latch, owned by `run_inner`;
     /// it gates the `warn!` line as well, so a long turn does not repeat it.
+    #[allow(clippy::too_many_arguments)]
     async fn compress_if_needed(
         &mut self,
         session: &mut Session,
@@ -2891,6 +2910,7 @@ impl AgentLoop {
         cancel_token: &CancellationToken,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         failure_reported: &mut bool,
+        background_eligible: bool,
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(
             session,
@@ -2900,7 +2920,7 @@ impl AgentLoop {
             CompressionTrigger::Threshold,
         );
         let model_id = runner.model_info.id.clone();
-        let tool_defs = self.session_tool_defs(session);
+        let tool_defs = self.session_tool_defs(session, background_eligible);
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
         // report the phase when a pass will actually run.
         let compacting = self
@@ -2984,11 +3004,18 @@ impl AgentLoop {
     /// filter is not — see
     /// [`ToolRegistry::tool_definitions_for_session`] for what changes it
     /// underneath a live session, and what that costs.
-    fn session_tool_defs(&self, session: &Session) -> Vec<ToolDefinitionForLlm> {
+    fn session_tool_defs(
+        &self,
+        session: &Session,
+        background_eligible: bool,
+    ) -> Vec<ToolDefinitionForLlm> {
         self.tool_registry
             .tool_definitions_for_session(
                 &session.channel,
-                &session.trigger,
+                baybo_tools::ToolSchemaContext {
+                    trigger: &session.trigger,
+                    background_eligible,
+                },
                 session.state.tool_allowlist.as_deref(),
             )
             .into_iter()
@@ -3045,6 +3072,7 @@ impl AgentLoop {
         iterations: usize,
         turn_started: std::time::Instant,
         observer_state: &mut ObserverState,
+        background_eligible: bool,
     ) {
         // Drain the previous detached call first. If it finished, emit its
         // line (the snapshot it summarized is from a prior boundary, but it's
@@ -3110,7 +3138,7 @@ impl AgentLoop {
             messages,
             temperature: None,
             // Preserve the cached tool prefix while keeping the observer read-only.
-            tools: self.session_tool_defs(session),
+            tools: self.session_tool_defs(session, background_eligible),
             tool_choice: baybo_llm::ToolChoice::None,
             reasoning_effort: Some(baybo_llm::effort::OUT_OF_BAND_EFFORT.as_str().to_string()),
             ..Default::default()
@@ -3245,7 +3273,7 @@ impl AgentLoop {
                     CompressionTrigger::Forced,
                 );
                 let model_id = runner.model_info.id.clone();
-                let tool_defs = self.session_tool_defs(session);
+                let tool_defs = self.session_tool_defs(session, session.can_host_background_jobs());
                 let outcome = self
                     .context_manager
                     .force_compress(&model_id, tool_defs, |req, marker| async move {

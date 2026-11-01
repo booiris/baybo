@@ -683,15 +683,18 @@ impl Tool for BashTool {
     /// that knob raises. Offering either is offering a choice the runtime
     /// has already made.
     ///
-    /// This is the one schema that varies on the live permission and not
-    /// just the trigger. It costs no extra prompt-cache invalidation:
-    /// `description()` is permission-skinned too and is rebuilt beside the
-    /// schema on every definition build.
-    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
+    /// Live permission changes already reskin `description()`, so adapting
+    /// the schema beside it costs no extra prompt-cache invalidation.
+    fn parameters_schema_for(&self, context: crate::ToolSchemaContext<'_>) -> Value {
         let mut schema = self.parameters_schema();
         if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            if !trigger.can_host_background_jobs() {
+            if !context.background_eligible {
                 props.remove("on_timeout");
+                if let Some(timeout) = props.get_mut("timeout_ms") {
+                    timeout["description"] = json!(
+                        "Execution deadline in milliseconds. Exceeding it terminates the command; this turn cannot run background jobs. Omit or use 0 for the tool-context default."
+                    );
+                }
             }
             if permission_skips_os_sandbox(self.permission()) {
                 props.remove("sandbox_permissions");

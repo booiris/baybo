@@ -136,6 +136,13 @@ pub enum OutputSource {
 // Tool trait
 // ---------------------------------------------------------------------------
 
+/// Runtime policy used when offering tool parameters to the model.
+#[derive(Clone, Copy)]
+pub struct ToolSchemaContext<'a> {
+    pub trigger: &'a TriggerSource,
+    pub background_eligible: bool,
+}
+
 /// Tool trait — the unified interface for all tool implementations.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -149,7 +156,7 @@ pub trait Tool: Send + Sync {
 
     fn parameters_schema(&self) -> Value;
 
-    /// The schema a session started by `trigger` is actually offered.
+    /// The schema offered under the current execution policy.
     ///
     /// Defaults to [`Self::parameters_schema`], which is also what the
     /// governance manifest keeps — that is the tool's whole surface, and the
@@ -158,14 +165,8 @@ pub trait Tool: Send + Sync {
     /// be in front of the model at all. Naming it and then explaining when it
     /// does nothing costs tokens on every request and still gets tried.
     ///
-    /// Vary on the trigger by default: it is fixed for a session's whole
-    /// life, so the offered schema is too, which is what the prompt-cache
-    /// prefix needs. Live, hot-swappable state is admissible only where
-    /// [`Self::description`] already re-renders with it — Bash's permission
-    /// mode is the one such case — because the two are rebuilt together, so
-    /// anything that reskins the description has already invalidated the
-    /// prefix and the schema costs nothing further.
-    fn parameters_schema_for(&self, _trigger: &TriggerSource) -> Value {
+    /// The background policy must match the gate passed to tool execution.
+    fn parameters_schema_for(&self, _context: ToolSchemaContext<'_>) -> Value {
         self.parameters_schema()
     }
 

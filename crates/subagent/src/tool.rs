@@ -529,9 +529,9 @@ impl Tool for SpawnSubagentTool {
     /// spawner's `if background` arm, so on this path it is read and dropped
     /// while its description promises the opposite. `background: true` was
     /// already being sent and silently ignored.
-    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
+    fn parameters_schema_for(&self, context: baybo_tools::ToolSchemaContext<'_>) -> Value {
         let mut schema = self.parameters_schema();
-        if !trigger.can_host_background_jobs()
+        if !context.background_eligible
             && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
         {
             for knob in ["background", "on_timeout", "group"] {
@@ -1521,7 +1521,10 @@ mod tests {
             max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         });
         let names = |t: &TriggerSource| {
-            let schema = tool.parameters_schema_for(t);
+            let schema = tool.parameters_schema_for(baybo_tools::ToolSchemaContext {
+                trigger: t,
+                background_eligible: t.can_host_background_jobs(),
+            });
             let mut v: Vec<String> = schema["properties"]
                 .as_object()
                 .expect("an object schema")
@@ -1531,6 +1534,14 @@ mod tests {
             v.sort();
             v
         };
+        let nested = tool.parameters_schema_for(baybo_tools::ToolSchemaContext {
+            trigger: &TriggerSource::User,
+            background_eligible: false,
+        });
+        for knob in ["background", "on_timeout", "group"] {
+            assert!(nested["properties"].get(knob).is_none());
+        }
+        assert!(nested["properties"].get("prompt").is_some());
         let chat = names(&TriggerSource::User);
         let run = names(&TriggerSource::Issue {
             project_id: baybo_model::ProjectId::generate(),

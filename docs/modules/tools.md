@@ -449,6 +449,14 @@ The detailed design is in [`../permission.md`](../permission.md).
 
 `tool_definitions()` exposes only `name`, `description`, and `parameters_schema` to the model. Capabilities and trust level are never exposed.
 
+Tool schemas receive a `ToolSchemaContext` with the trigger and the resolved
+per-turn `background_eligible` policy. The agent passes the same gate to schema
+generation and execution; deferred discovery through `ToolSearch` carries it
+too. Ineligible turns, including subagents with a user trigger, are not offered
+Bash's `on_timeout` or `spawn_subagent`'s `background`, `on_timeout` and `group`.
+Bash retains `timeout_ms` and explains that reaching it terminates the command;
+omission or zero uses the tool-context default.
+
 ### Per-tool timeout ceiling
 
 Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer cancel deadline (`+ APPROVAL_HEADROOM`). There is no `baybo.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
