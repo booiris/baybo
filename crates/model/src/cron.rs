@@ -525,6 +525,36 @@ pub struct PendingCronResult {
     /// Why the fire failed, when `outcome` is [`ExecutionOutcome::Failed`].
     pub failure_reason: Option<String>,
     pub completed_at: DateTime<Utc>,
+    /// The fire left background work running when its turn ended, so a
+    /// [`ExecutionOutcome::Blank`] reply means "results will follow" rather
+    /// than "produced nothing". Never persisted on the execution row: a boot
+    /// re-drive rebuilds it as `false`, which is right because background
+    /// jobs do not survive a restart.
+    #[serde(default)]
+    pub background_pending: bool,
+}
+
+/// One background follow-up of a finished one-shot fire, handed to the
+/// **origin** conversation's actor (`AgentMessage::CronFollowUpReady`).
+///
+/// A one-shot fire that moved work to the background reports its interim
+/// result through [`PendingCronResult`] as usual; each later notification
+/// turn in the fire's own workspace — where the agent that started the work
+/// reviews its result — is forwarded here, so the analysed follow-up reaches
+/// the conversation that scheduled the job. Delivered with no inference,
+/// like the result itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCronFollowUp {
+    pub execution_id: String,
+    /// The job's display title, used in the notification header.
+    pub job_title: String,
+    /// Session the fire ran in; its reply row at `reply_ordinal` carries the
+    /// content to deliver.
+    pub fire_session_id: SessionId,
+    pub reply_ordinal: i64,
+    /// The follow-up turn this reply closed. With `execution_id` it keys the
+    /// origin's transcript row, so a re-forwarded follow-up lands once.
+    pub turn_id: crate::TurnId,
 }
 
 #[cfg(test)]

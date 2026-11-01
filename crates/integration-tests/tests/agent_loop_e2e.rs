@@ -3687,6 +3687,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         outcome: ExecutionOutcome::Success,
         failure_reason: None,
         completed_at: chrono::Utc::now(),
+        background_pending: false,
     };
     harness
         .mailbox
@@ -3840,6 +3841,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         outcome: ExecutionOutcome::Success,
         failure_reason: None,
         completed_at: chrono::Utc::now(),
+        background_pending: false,
     };
     // Deliver once, then the user hides the conversation, then the same
     // execution replays — exactly what the boot re-drive does when the ledger
@@ -4067,6 +4069,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
             outcome: ExecutionOutcome::Blank,
             failure_reason: None,
             completed_at: chrono::Utc::now(),
+            background_pending: false,
         })))
         .await
         .unwrap();
@@ -4108,6 +4111,7 @@ async fn failed_one_shot_cron_fire_still_notifies_the_conversation() {
         outcome: ExecutionOutcome::Failed,
         failure_reason: Some("provider timed out".into()),
         completed_at: chrono::Utc::now(),
+        background_pending: false,
     };
     harness
         .mailbox
@@ -5996,4 +6000,451 @@ async fn stop_aborts_an_in_flight_tool_batch_without_dangling_tool_use() {
     tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
         .await
         .expect("actor must terminate after its in-flight tool batch is cancelled");
+}
+
+/// A one-shot fire's background follow-up lands in the origin conversation the
+/// way its result does: one framed assistant row, no inference, and exactly
+/// once even when forwarded twice. A follow-up with nothing to say forwards
+/// nothing.
+#[tokio::test(start_paused = true)]
+async fn cron_follow_up_is_delivered_once_to_the_origin() {
+    use baybo_model::{ChatMessage, PendingCronFollowUp};
+
+    let mut harness = AgentTestHarness::builder().build();
+    let origin_id = harness.session.id.clone();
+    let fire_session = harness
+        .session_manager
+        .create_session_with_trigger(
+            harness.session.user.clone(),
+            harness.session.channel.clone(),
+            TriggerSource::Cron {
+                cron_job_id: "cj-build".into(),
+                origin_session_id: Some(origin_id.clone()),
+                conversation: false,
+                job_title: None,
+                project_id: None,
+            },
+        )
+        .await
+        .expect("create fire session");
+    let report_ordinal = harness
+        .session_manager
+        .append_session_message(
+            &fire_session.id,
+            &ChatMessage::assistant(vec![ContentBlock::Text("The build passed.".into())]),
+        )
+        .await
+        .expect("append follow-up reply");
+    let blank_ordinal = harness
+        .session_manager
+        .append_session_message(
+            &fire_session.id,
+            &ChatMessage::assistant(vec![ContentBlock::Text("  ".into())]),
+        )
+        .await
+        .expect("append blank follow-up reply");
+
+    let follow_up = |reply_ordinal, turn_id| PendingCronFollowUp {
+        execution_id: "ce-build".into(),
+        job_title: "nightly build".into(),
+        fire_session_id: fire_session.id.clone(),
+        reply_ordinal,
+        turn_id,
+    };
+    let report_turn = baybo_model::TurnId::new();
+    for message in [
+        follow_up(report_ordinal, report_turn),
+        follow_up(report_ordinal, report_turn),
+        follow_up(blank_ordinal, baybo_model::TurnId::new()),
+    ] {
+        harness
+            .mailbox
+            .send(AgentMessage::CronFollowUpReady(Box::new(message)))
+            .await
+            .unwrap();
+    }
+
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let messages: Vec<&str> = outs
+        .iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::Message(m) => m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "one follow-up row, however often it is forwarded, and none for a blank one: {outs:?}"
+    );
+    assert!(
+        messages[0].contains(r#"Scheduled task "nightly build" — background work finished:"#),
+        "the row names the job: {}",
+        messages[0]
+    );
+    assert!(messages[0].contains("The build passed."));
+    assert!(
+        harness.stub_llm.captured_requests().is_empty(),
+        "forwarding a follow-up must not call the LLM"
+    );
+
+    let rows = harness
+        .session_manager
+        .load_active_session_messages(&origin_id)
+        .await
+        .expect("load origin transcript");
+    assert_eq!(
+        rows.iter()
+            .filter(|m| m.source() == baybo_model::MessageSource::CronNotification)
+            .count(),
+        1
+    );
+
+    harness.shutdown().await;
+}
+
+/// Stand-in for `report_nothing` on a background follow-up turn: flips the
+/// turn's silence handle exactly as the real tool does.
+struct FollowUpSilenceProbe;
+
+#[async_trait::async_trait]
+impl Tool for FollowUpSilenceProbe {
+    fn name(&self) -> &str {
+        "report_nothing"
+    }
+    fn description(&self) -> String {
+        "test stand-in for report_nothing".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn trigger_scope(&self) -> baybo_tools::ToolTriggerScope {
+        baybo_tools::ToolTriggerScope::CronConversation
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+        ctx: &baybo_tools::ToolContext,
+    ) -> baybo_tools::Result<ToolOutput> {
+        if let Some(silence) = &ctx.notify_silence {
+            silence.request();
+        }
+        Ok(ToolOutput::Text("noted".into()))
+    }
+}
+
+/// A cron fire session whose own fire turn started `bg-7` (see
+/// [`finished_build_check`]), as the actor records when that turn ends.
+fn cron_fire_session(conversation: bool, hidden: bool) -> baybo_model::Session {
+    let mut session = SessionBuilder::new().build();
+    session.state.background_notifications.fire_handles = vec!["bg-7".into()];
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "cj-watch".into(),
+        origin_session_id: Some(SessionId::from("sess-origin")),
+        conversation,
+        job_title: Some("Watcher".into()),
+        project_id: None,
+    };
+    session.hidden = hidden;
+    session
+}
+
+fn finished_build_check() -> PendingBackgroundResult {
+    PendingBackgroundResult::subagent(
+        "bg-7",
+        "general-purpose",
+        "run the build",
+        SessionId::from("child-build"),
+        "the build failed: 3 tests red",
+        SubagentExitStatus::Completed,
+    )
+}
+
+fn sent_messages(outs: &[AgentOutput]) -> usize {
+    outs.iter()
+        .filter(|o| matches!(o.event, AgentEvent::Message(_)))
+        .count()
+}
+
+/// The cron-notification turns completed in `session` — the edges push acts on.
+async fn cron_notification_turns(
+    harness: &AgentTestHarness,
+    session: &SessionId,
+) -> Vec<baybo_turn::Turn> {
+    use baybo_store::TurnStore;
+    TurnStore::list_all(harness.turn_store.as_ref())
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_str::<baybo_turn::Turn>(&r.data).expect("turn row"))
+        .filter(|t| {
+            &t.session_id == session
+                && t.input_kind() == baybo_turn::TurnInputKind::CronNotification
+        })
+        .collect()
+}
+
+/// A recurring fire that moved its work to the background — and called
+/// `report_nothing`, so its conversation is hidden — still reports when the
+/// follow-up has something to say: the reply is dispatched, the conversation
+/// is back in the user's list, and a `CronNotification` edge on the reply row
+/// drives the push.
+#[tokio::test(start_paused = true)]
+async fn a_recurring_fires_follow_up_reports_and_unhides_its_conversation() {
+    let session = cron_fire_session(true, true);
+    let fire_session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder().session(session).build();
+    harness.stub_llm.push_stream(vec![StreamEvent::Text(
+        "The build broke: 3 tests red.".into(),
+    )]);
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            finished_build_check(),
+        )))
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(sent_messages(&outs), 1, "the follow-up reports: {outs:?}");
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session");
+    assert!(
+        !stored.hidden,
+        "a reporting follow-up un-hides the conversation"
+    );
+    let pushed = cron_notification_turns(&harness, &fire_session_id).await;
+    assert_eq!(pushed.len(), 1, "one push edge for the follow-up");
+    assert!(matches!(
+        pushed[0].final_result,
+        Some(baybo_turn::TurnOutput::Message {
+            ordinal: Some(_),
+            ..
+        })
+    ));
+
+    harness.shutdown().await;
+}
+
+/// Work a user started by replying in a recurring fire's conversation reports
+/// like any chat's: `report_nothing` cannot silence it, it does not push, and
+/// it leaves the conversation's listing alone.
+#[tokio::test(start_paused = true)]
+async fn a_users_background_work_in_a_cron_conversation_reports_like_chat() {
+    let mut session = cron_fire_session(true, true);
+    session.state.background_notifications.fire_handles = vec!["bg-fire".into()];
+    let fire_session_id = session.id.clone();
+    let manifest = baybo_tools::ToolManifest {
+        name: "report_nothing".into(),
+        description: "test stand-in for report_nothing".into(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object"}),
+        capabilities: vec![],
+        channels: Vec::new(),
+    };
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(Arc::new(FollowUpSilenceProbe) as Arc<dyn Tool>, manifest)
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "c1".into(),
+            name: "report_nothing".into(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("The build broke.".into())]);
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            finished_build_check(),
+        )))
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        sent_messages(&outs),
+        1,
+        "the result is sent as in any chat: {outs:?}"
+    );
+    assert!(
+        cron_notification_turns(&harness, &fire_session_id)
+            .await
+            .is_empty(),
+        "and does not push"
+    );
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session");
+    assert!(stored.hidden, "nor touch the conversation's listing");
+
+    harness.shutdown().await;
+}
+
+/// `report_nothing` silences a recurring fire's follow-up the way it silences
+/// the fire: nothing is dispatched and the conversation stays hidden.
+#[tokio::test(start_paused = true)]
+async fn a_recurring_fires_follow_up_can_report_nothing() {
+    let session = cron_fire_session(true, true);
+    let fire_session_id = session.id.clone();
+    let manifest = baybo_tools::ToolManifest {
+        name: "report_nothing".into(),
+        description: "test stand-in for report_nothing".into(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object"}),
+        capabilities: vec![],
+        channels: Vec::new(),
+    };
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(Arc::new(FollowUpSilenceProbe) as Arc<dyn Tool>, manifest)
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "c1".into(),
+            name: "report_nothing".into(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    // Prose after the tool call: only the silence handle keeps it unsent.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("Nothing new to report.".into())]);
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            finished_build_check(),
+        )))
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        sent_messages(&outs),
+        0,
+        "a silenced follow-up notifies no one: {outs:?}"
+    );
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session");
+    assert!(stored.hidden, "and leaves the conversation hidden");
+
+    harness.shutdown().await;
+}
+
+/// A one-shot fire's workspace is never opened: its follow-up turn runs (the
+/// cron waiter forwards the reply to the origin), but nothing is announced or
+/// dispatched from the workspace itself.
+#[tokio::test(start_paused = true)]
+async fn a_one_shot_fires_follow_up_dispatches_nothing_from_its_workspace() {
+    let mut harness = AgentTestHarness::builder()
+        .session(cron_fire_session(false, false))
+        .build();
+    harness.stub_llm.push_stream(vec![StreamEvent::Text(
+        "The build broke: 3 tests red.".into(),
+    )]);
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            finished_build_check(),
+        )))
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        !harness.stub_llm.captured_requests().is_empty(),
+        "the follow-up turn itself still runs"
+    );
+    assert!(
+        !outs
+            .iter()
+            .any(|o| matches!(o.event, AgentEvent::Message(_) | AgentEvent::Notice { .. })),
+        "nothing may be announced or dispatched from a private workspace: {outs:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A one-shot fire's workspace can never take the user turn that passive
+/// delivery waits for, so when every review of its background result fails
+/// it completes a follow-up saying so — which the cron waiter forwards to the
+/// origin, already told that results would follow.
+#[tokio::test(start_paused = true)]
+async fn a_one_shot_fires_failed_review_still_reports_a_follow_up() {
+    use baybo_store::TurnStore;
+
+    let mut harness = AgentTestHarness::builder()
+        .session(cron_fire_session(false, false))
+        .build();
+    for _ in 0..10 {
+        harness
+            .stub_llm
+            .push_stream_results(vec![Err(LlmError::Internal(anyhow::anyhow!(
+                "provider down"
+            )))]);
+    }
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            finished_build_check(),
+        )))
+        .await
+        .unwrap();
+    let _ = harness.drain_outputs(Duration::from_secs(5000)).await;
+
+    let follow_up = TurnStore::list_all(harness.turn_store.as_ref())
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_str::<baybo_turn::Turn>(&r.data).expect("turn row"))
+        .find(|t| {
+            t.input_kind() == baybo_turn::TurnInputKind::SubagentNotification
+                && matches!(t.status, baybo_turn::TurnStatus::Completed)
+        })
+        .expect("a completed follow-up turn for the waiter to forward");
+    let Some(baybo_turn::TurnOutput::Message {
+        ordinal: Some(ordinal),
+        ..
+    }) = follow_up.final_result
+    else {
+        panic!("the follow-up names its reply row");
+    };
+    let rows = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .unwrap();
+    assert!(
+        rows.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text(t)
+                if t == baybo_context::prompts::cron::NOTIFICATION_FOLLOW_UP_FAILED_BODY
+        ))),
+        "the reply row at {ordinal} says the review failed"
+    );
+
+    harness.shutdown().await;
 }

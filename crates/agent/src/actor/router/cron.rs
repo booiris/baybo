@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use baybo_context::prompts::cron::{DreamDigestGroup, DreamDigestSession, frame_dream_digest};
@@ -7,7 +7,7 @@ use baybo_context::tokenizer::HeuristicTokenizer;
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
     AgentBinding, AgentFramework, AgentProfileId, BuiltinCronJob, CronExecution, ExecutionOutcome,
-    PendingCronResult, Session, SessionId, TriggerSource, User,
+    PendingCronFollowUp, PendingCronResult, Session, SessionId, TriggerSource, TurnId, User,
 };
 use baybo_session::SessionManager;
 use baybo_store::CronStore;
@@ -88,16 +88,15 @@ impl Router {
     ///   is **registered** with the supervisor, so a reply routes to that actor
     ///   rather than forking a second one over the same transcript.
     /// - **One-shot** — the fire session is a private workspace: invisible,
-    ///   unopenable, dispatching nothing, and its actor deliberately
-    ///   **unregistered** (no follow-up traffic will ever arrive, so a handle
-    ///   would just dangle in the supervisor's map). A waiter — spawned here,
-    ///   before the trigger is sent, so the terminal event cannot be missed —
-    ///   picks the result off the fire job's terminal lifecycle edge and
-    ///   delivers it into the conversation that scheduled the job.
+    ///   unopenable, dispatching nothing. A waiter — spawned here, before the
+    ///   trigger is sent, so the terminal event cannot be missed — picks the
+    ///   result off the fire job's terminal lifecycle edge and delivers it
+    ///   into the conversation that scheduled the job, then forwards each
+    ///   background follow-up the same way.
     ///
-    /// Either way the actor gets `CronTrigger` followed by `ActorStop`; the
-    /// priority mailbox serves the trigger first (`ActorStop` is the lowest
-    /// tier), so the actor runs the fire and then exits.
+    /// Either way the actor is **registered** and outlives the fire turn, so
+    /// a background job the fire started can deliver its result back to it;
+    /// the idle reaper reclaims it once nothing is in flight.
     pub(super) async fn handle_cron_trigger(
         &mut self,
         event: CronTriggerEvent,
@@ -692,10 +691,15 @@ impl Router {
     }
 
     /// A **one-shot** fire: it runs in a private workspace nobody will ever
-    /// message again, so its actor is deliberately **unregistered** (a handle in
-    /// the supervisor's map would only dangle) and is stopped as soon as the
-    /// turn ends. `waiter` reports the result into the conversation that
-    /// scheduled the job.
+    /// message, and `waiter` reports the result — and every background
+    /// follow-up — into the conversation that scheduled the job.
+    ///
+    /// The actor is **registered** and not stopped after the turn, for the same
+    /// reason a recurring fire's is: a background job the fire started delivers
+    /// its result by routing to the parent session, and only a registered actor
+    /// can be routed to. The in-flight registry pins it against the idle reaper
+    /// while that work runs; once it is idle the reaper reclaims it, which also
+    /// ends the waiter.
     ///
     /// The waiter is spawned **whatever happens here**, including when the actor
     /// is already gone. The scheduler has recorded this execution as dispatched,
@@ -711,35 +715,28 @@ impl Router {
         let session_id = session.id.clone();
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
-        let (mailbox, actor_token) = self.spawn_oneshot_actor(
-            session,
-            pins.entry,
-            pins.model,
-            pins.effort,
-            response_tx,
-            &self.actor_parent_token,
-        );
-
-        match mailbox.send(trigger).await {
-            Ok(()) => {
-                // Lowest mailbox priority, so it is served after the fire: the
-                // workspace exits as soon as its one turn is done.
-                if let Err(e) = mailbox.send(AgentMessage::ActorStop).await {
-                    warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "post-fire shutdown was not queued; the actor still exits when its mailbox drops",
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "cron fire could not reach its actor; reporting it as a failed fire",
-                );
-                actor_token.cancel();
-            }
+        let actor_token = self.actor_parent_token.child_token();
+        let spawn_token = actor_token.clone();
+        let actor_spawner = self.actor_spawner.as_ref();
+        let routed = self
+            .supervisor
+            .route_or_spawn(&session_id, trigger, || {
+                actor_spawner(
+                    session,
+                    pins.entry,
+                    pins.model,
+                    pins.effort,
+                    response_tx,
+                    spawn_token,
+                )
+            })
+            .await;
+        if !routed {
+            warn!(
+                session_id = %session_id,
+                "cron fire could not reach its actor; reporting it as a failed fire",
+            );
+            actor_token.cancel();
         }
 
         tokio::spawn(waiter.run(actor_token));
@@ -825,6 +822,8 @@ impl Router {
 
 /// Watches one one-shot fire to its terminal state, records the outcome on the
 /// execution, and hands the result to the conversation that scheduled the job.
+/// Then keeps watching the fire's workspace for background follow-up turns and
+/// forwards each one there too, until the fire's actor stops.
 ///
 /// Mirrors the subagent waiter (`crate::actor::subagent`): a detached task on
 /// the lifecycle bus, with a store reconcile for the cases the bus can't cover
@@ -840,7 +839,7 @@ struct CronResultWaiter {
 
 impl CronResultWaiter {
     async fn run(mut self, actor_token: CancellationToken) {
-        let outcome = self.await_fire(actor_token).await;
+        let outcome = self.await_fire(&actor_token).await;
         let completed_at = Utc::now();
 
         // Record the outcome BEFORE delivering it: a crash in the delivery
@@ -875,10 +874,115 @@ impl CronResultWaiter {
             outcome: outcome.outcome,
             failure_reason: outcome.failure_reason,
             completed_at,
+            // Every job the fire started, finished or not: one that finished
+            // during the turn has left the in-flight registry, but its
+            // follow-up is still to come.
+            background_pending: !self
+                .delivery
+                .supervisor
+                .started_background_handles(&self.fire_session_id)
+                .is_empty(),
         };
 
         self.delivery
             .deliver(self.event.origin_session_id.clone(), result)
+            .await;
+
+        self.forward_follow_ups(actor_token).await;
+    }
+
+    /// Forward each background follow-up the fire's workspace produces until
+    /// its actor stops (idle reap or shutdown). A follow-up is a completed
+    /// `SubagentNotification` turn with a reply row: the agent that started
+    /// the work reviewing its result, with the fire's whole transcript in
+    /// view. A silent one (no reply row) forwards nothing.
+    async fn forward_follow_ups(&mut self, actor_token: CancellationToken) {
+        let mut forwarded = HashSet::new();
+        loop {
+            tokio::select! {
+                event = self.terminal_rx.recv() => match event {
+                    Ok(ev) if self.is_our_follow_up(&ev) => {
+                        if let TurnPhase::Completed { reply_ordinal: Some(ordinal) } = ev.phase {
+                            self.forward_follow_up(&mut forwarded, ev.turn_id, ordinal).await;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(
+                            session_id = %self.fire_session_id,
+                            skipped = n,
+                            "cron follow-up watcher lagged on the lifecycle bus; reconciling via store"
+                        );
+                        self.reconcile_follow_ups(&mut forwarded).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                _ = actor_token.cancelled() => {
+                    // The last follow-up may have completed after the final
+                    // event this receiver drained.
+                    self.reconcile_follow_ups(&mut forwarded).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn is_our_follow_up(&self, ev: &TurnLifecycleEvent) -> bool {
+        ev.session_id == self.fire_session_id && ev.kind == TurnInputKind::SubagentNotification
+    }
+
+    /// Forward every completed follow-up the store knows of that this watcher
+    /// has not forwarded yet.
+    async fn reconcile_follow_ups(&self, forwarded: &mut HashSet<TurnId>) {
+        let jobs = match self
+            .lifecycle
+            .list_by_session(&self.fire_session_id, None)
+            .await
+        {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                warn!(
+                    session_id = %self.fire_session_id,
+                    error = %e,
+                    "cron follow-up store reconcile failed"
+                );
+                return;
+            }
+        };
+        for job in jobs {
+            if job.input_kind() != TurnInputKind::SubagentNotification
+                || job.status.kind() != TurnStatusKind::Completed
+            {
+                continue;
+            }
+            if let Some(baybo_turn::TurnOutput::Message {
+                ordinal: Some(ordinal),
+                ..
+            }) = job.final_result
+            {
+                self.forward_follow_up(forwarded, job.id, ordinal).await;
+            }
+        }
+    }
+
+    async fn forward_follow_up(
+        &self,
+        forwarded: &mut HashSet<TurnId>,
+        turn_id: TurnId,
+        reply_ordinal: i64,
+    ) {
+        if !forwarded.insert(turn_id) {
+            return;
+        }
+        let follow_up = PendingCronFollowUp {
+            execution_id: self.event.execution_id.clone(),
+            job_title: self.event.title.clone(),
+            fire_session_id: self.fire_session_id.clone(),
+            reply_ordinal,
+            turn_id,
+        };
+        self.delivery
+            .deliver_follow_up(self.event.origin_session_id.as_ref(), follow_up)
             .await;
     }
 
@@ -891,7 +995,7 @@ impl CronResultWaiter {
     /// - the fire actor stopping without a terminal event (it died before
     ///   opening a job, e.g. the framed prompt could not be appended) — one
     ///   last store reconcile, then report a failure.
-    async fn await_fire(&mut self, actor_token: CancellationToken) -> FireOutcome {
+    async fn await_fire(&mut self, actor_token: &CancellationToken) -> FireOutcome {
         loop {
             tokio::select! {
                 event = self.terminal_rx.recv() => match event {
@@ -1051,6 +1155,7 @@ fn pending_result_from_execution(exec: &CronExecution) -> Option<PendingCronResu
         // session still carries the failed job for anyone who looks.
         failure_reason: None,
         completed_at: exec.completed_at.unwrap_or_else(Utc::now),
+        background_pending: false,
     })
 }
 
@@ -1097,27 +1202,8 @@ impl CronResultDelivery {
         };
 
         let origin_id = origin.id.clone();
-        let response_tx = self.supervisor.response_tx().clone();
-        let parent_token = self.actor_parent_token.clone();
-        let actor_spawner = self.actor_spawner.as_ref();
-        let pins = super::resolve_spawn_pins(&origin, &self.agent_profiles).await;
         let delivered = self
-            .supervisor
-            .route_or_spawn(
-                &origin_id,
-                AgentMessage::CronResultReady(Box::new(result)),
-                || {
-                    let actor_token = parent_token.child_token();
-                    actor_spawner(
-                        origin,
-                        pins.entry,
-                        pins.model,
-                        pins.effort,
-                        response_tx,
-                        actor_token,
-                    )
-                },
-            )
+            .hand_to_origin(origin, AgentMessage::CronResultReady(Box::new(result)))
             .await;
         if !delivered {
             // The mailbox is gone (a shutting-down actor). Leave the ledger
@@ -1128,6 +1214,60 @@ impl CronResultDelivery {
                 "failed to hand cron result to its conversation; leaving it for re-drive"
             );
         }
+    }
+
+    /// Deliver a one-shot fire's background follow-up into its origin
+    /// conversation. Nothing to resolve on failure: the execution's ledger
+    /// row closed with the fire's own result, and background jobs do not
+    /// survive a restart, so there is no re-drive to leave it for.
+    async fn deliver_follow_up(
+        &self,
+        origin_session_id: Option<&SessionId>,
+        follow_up: PendingCronFollowUp,
+    ) {
+        let Some(origin) = resolve_origin(&self.session_manager, origin_session_id).await else {
+            warn!(
+                execution_id = %follow_up.execution_id,
+                origin_session_id = ?origin_session_id,
+                "one-shot cron follow-up has no conversation to report to; dropping it"
+            );
+            return;
+        };
+        let origin_id = origin.id.clone();
+        let execution_id = follow_up.execution_id.clone();
+        if !self
+            .hand_to_origin(origin, AgentMessage::CronFollowUpReady(Box::new(follow_up)))
+            .await
+        {
+            warn!(
+                session_id = %origin_id,
+                execution_id = %execution_id,
+                "failed to hand cron follow-up to its conversation"
+            );
+        }
+    }
+
+    /// Route `message` to the origin conversation's actor, hydrating it if
+    /// the idle reaper already reclaimed it.
+    async fn hand_to_origin(&self, origin: Session, message: AgentMessage) -> bool {
+        let origin_id = origin.id.clone();
+        let response_tx = self.supervisor.response_tx().clone();
+        let parent_token = self.actor_parent_token.clone();
+        let actor_spawner = self.actor_spawner.as_ref();
+        let pins = super::resolve_spawn_pins(&origin, &self.agent_profiles).await;
+        self.supervisor
+            .route_or_spawn(&origin_id, message, || {
+                let actor_token = parent_token.child_token();
+                actor_spawner(
+                    origin,
+                    pins.entry,
+                    pins.model,
+                    pins.effort,
+                    response_tx,
+                    actor_token,
+                )
+            })
+            .await
     }
 
     /// Stamp an execution's delivery as resolved without notifying anyone —
@@ -1184,9 +1324,7 @@ async fn resolve_origin(
             return None;
         }
     };
-    let unreadable_fire_workspace = matches!(session.trigger, TriggerSource::Cron { .. })
-        && !session.trigger.is_cron_conversation();
-    if unreadable_fire_workspace {
+    if session.trigger.is_private_cron_workspace() {
         return None;
     }
     Some(session)
@@ -1435,6 +1573,77 @@ mod tests {
                 )
                 .await
                 .expect("settle the turn");
+        }
+
+        /// Run one whole turn of `input` in `session`, completing with
+        /// `output` — what a fire actor's turn looks like on the bus.
+        async fn run_turn(
+            &self,
+            session: &SessionId,
+            input: baybo_turn::TurnInput,
+            output: baybo_turn::TurnOutput,
+        ) {
+            let turn = self
+                .turn_lifecycle
+                .start_turn(session.clone(), baybo_model::TriggerKind::Cron, input, None)
+                .await
+                .expect("open a turn");
+            self.turn_lifecycle
+                .start(&turn.id)
+                .await
+                .expect("start the turn");
+            self.turn_lifecycle
+                .complete(&turn.id, output)
+                .await
+                .expect("complete the turn");
+        }
+
+        fn reply(ordinal: Option<i64>) -> baybo_turn::TurnOutput {
+            baybo_turn::TurnOutput::Message {
+                content: Vec::new(),
+                ordinal,
+            }
+        }
+
+        fn cron_input() -> baybo_turn::TurnInput {
+            baybo_turn::TurnInput::Cron {
+                action_payload: serde_json::Value::Null,
+            }
+        }
+
+        fn notification_input() -> baybo_turn::TurnInput {
+            baybo_turn::TurnInput::SubagentNotification {
+                content: Vec::new(),
+            }
+        }
+
+        /// The next message the origin conversation's (fake) actor receives,
+        /// waiting for the waiter task to hydrate and route to it.
+        async fn next_origin_message(
+            &self,
+            origin: &mut Option<MailboxReceiver<AgentMessage>>,
+        ) -> AgentMessage {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if origin.is_none() {
+                        let mut spawned = self.spawned.lock();
+                        if let Some(i) = spawned
+                            .iter()
+                            .position(|(id, _)| id.as_str() == "sess-user")
+                        {
+                            *origin = Some(spawned.remove(i).1);
+                        }
+                    }
+                    if let Some(rx) = origin.as_mut()
+                        && let Ok(message) = rx.try_recv()
+                    {
+                        return message;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the origin conversation must receive a message")
         }
 
         /// The session the fake spawner was handed, plus its mailbox.
@@ -2191,12 +2400,13 @@ mod tests {
         );
     }
 
-    /// A one-shot's session is a private workspace with no follow-up traffic:
-    /// leaving it unregistered is what keeps the supervisor's map from filling
-    /// with dangling handles. It also dispatches nothing — its result is
-    /// reported into the conversation that scheduled it.
+    /// A one-shot's session is a private workspace that dispatches nothing —
+    /// its result is reported into the conversation that scheduled it. Its
+    /// actor is still registered and not stopped behind the fire: a background
+    /// job the fire started routes its result back to this session, and only a
+    /// registered actor can receive it. The idle reaper reclaims it later.
     #[tokio::test]
-    async fn a_one_shot_fires_actor_stays_unregistered_and_silent() {
+    async fn a_one_shot_fires_actor_is_registered_and_silent() {
         let mut h = RouterHarness::new();
         h.router
             .handle_cron_trigger(RouterHarness::event(true))
@@ -2204,9 +2414,10 @@ mod tests {
             .expect("route the fire");
 
         let (fire_session_id, mut mailbox) = h.fire();
-        assert!(
-            h.supervisor.is_empty(),
-            "a one-shot's workspace must not be registered"
+        assert_eq!(
+            h.supervisor.registered_session_ids(),
+            vec![fire_session_id.clone()],
+            "a one-shot's actor must be routable for its background results"
         );
         assert!(matches!(
             mailbox.try_recv(),
@@ -2215,6 +2426,10 @@ mod tests {
                 ..
             })
         ));
+        assert!(
+            matches!(mailbox.try_recv(), Err(mailbox::TryRecvError::Empty)),
+            "stopping it behind the fire would drop a background job's result"
+        );
 
         let session = h
             .sessions
@@ -2232,6 +2447,97 @@ mod tests {
             Some("sess-user"),
             "it carries the origin so a chained CronCreate can inherit it",
         );
+    }
+
+    /// A one-shot fire that moved work to the background reports its interim
+    /// result, and the follow-up turn that reviews the work is forwarded to the
+    /// origin too — the fire's workspace is never opened, so without the
+    /// forward the real answer would reach nobody. A follow-up that stayed
+    /// silent (no reply row) forwards nothing.
+    #[tokio::test]
+    async fn a_one_shot_fires_background_follow_up_reaches_its_origin() {
+        let mut h = RouterHarness::new();
+        h.seed_execution().await;
+        h.router
+            .handle_cron_trigger(RouterHarness::event(true))
+            .await
+            .expect("route the fire");
+        let (fire_session_id, _fire_mailbox) = h.fire();
+        let mut origin = None;
+
+        h.run_turn(
+            &fire_session_id,
+            RouterHarness::cron_input(),
+            RouterHarness::reply(Some(3)),
+        )
+        .await;
+        let AgentMessage::CronResultReady(result) = h.next_origin_message(&mut origin).await else {
+            panic!("the fire's own result is delivered first");
+        };
+        assert_eq!(result.reply_ordinal, Some(3));
+
+        h.run_turn(
+            &fire_session_id,
+            RouterHarness::notification_input(),
+            baybo_turn::TurnOutput::Structured {
+                value: serde_json::Value::Null,
+            },
+        )
+        .await;
+        h.run_turn(
+            &fire_session_id,
+            RouterHarness::notification_input(),
+            RouterHarness::reply(Some(9)),
+        )
+        .await;
+        let AgentMessage::CronFollowUpReady(follow_up) = h.next_origin_message(&mut origin).await
+        else {
+            panic!("the follow-up must be forwarded to the origin");
+        };
+        assert_eq!(follow_up.fire_session_id, fire_session_id);
+        assert_eq!(follow_up.execution_id, "ce-1");
+        assert_eq!(
+            follow_up.reply_ordinal, 9,
+            "the silent follow-up before it forwarded nothing"
+        );
+    }
+
+    /// A blank fire that left background work running has not "produced no
+    /// output": the result says the rest is on its way.
+    #[tokio::test]
+    async fn a_blank_one_shot_with_work_in_flight_says_results_will_follow() {
+        let mut h = RouterHarness::new();
+        h.seed_execution().await;
+        h.router
+            .handle_cron_trigger(RouterHarness::event(true))
+            .await
+            .expect("route the fire");
+        let (fire_session_id, _fire_mailbox) = h.fire();
+        h.supervisor.note_background_subagent_started(
+            &fire_session_id,
+            &SessionId::from("bg-1"),
+            "command",
+            "sleep 600",
+            "bg-1",
+            CancellationToken::new(),
+        );
+        // It already finished — its result is queued behind the fire turn —
+        // so the in-flight registry alone would call this a blank run.
+        h.supervisor
+            .note_background_subagent_finished(&fire_session_id, &SessionId::from("bg-1"));
+
+        h.run_turn(
+            &fire_session_id,
+            RouterHarness::cron_input(),
+            RouterHarness::reply(None),
+        )
+        .await;
+        let mut origin = None;
+        let AgentMessage::CronResultReady(result) = h.next_origin_message(&mut origin).await else {
+            panic!("the fire's result is delivered");
+        };
+        assert_eq!(result.outcome, ExecutionOutcome::Blank);
+        assert!(result.background_pending);
     }
 
     /// A one-shot whose actor is already gone when the trigger is handed over

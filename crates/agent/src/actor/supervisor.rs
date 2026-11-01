@@ -61,11 +61,18 @@ pub struct InFlightJob {
 /// drains it to enumerate what to cancel + report, and the removal doubles
 /// as the suppress signal (a wait task whose entry is gone delivers
 /// nothing). Process-local (background dispatches don't survive restart).
+///
+/// `started_background_handles` remembers every background job handle a
+/// live actor's session has started, finished or not, until that actor
+/// deregisters. The in-flight registry cannot answer "did this turn start
+/// background work": an escort clears its marker as soon as it has queued
+/// the result, while the actor is still busy with the turn that started it.
 #[derive(Clone)]
 pub struct AgentSupervisor {
     actors: Arc<DashMap<SessionId, ActorHandle>>,
     response_tx: mpsc::Sender<AgentOutput>,
     in_flight_background_subagents: Arc<DashMap<SessionId, HashMap<SessionId, InFlightJob>>>,
+    started_background_handles: Arc<DashMap<SessionId, Vec<String>>>,
 }
 
 impl AgentSupervisor {
@@ -74,6 +81,7 @@ impl AgentSupervisor {
             actors: Arc::new(DashMap::new()),
             response_tx,
             in_flight_background_subagents: Arc::new(DashMap::new()),
+            started_background_handles: Arc::new(DashMap::new()),
         }
     }
 
@@ -91,6 +99,10 @@ impl AgentSupervisor {
         handle: &str,
         cancel_token: CancellationToken,
     ) {
+        self.started_background_handles
+            .entry(parent_session_id.clone())
+            .or_default()
+            .push(handle.to_string());
         self.in_flight_background_subagents
             .entry(parent_session_id.clone())
             .or_default()
@@ -146,6 +158,24 @@ impl AgentSupervisor {
 
     /// True iff at least one background subagent dispatched from
     /// `parent_session_id` is still running.
+    /// Every background job handle `session_id` has started since its actor
+    /// registered, including jobs that already finished. Empty once the
+    /// actor deregisters.
+    pub fn started_background_handles(&self, session_id: &SessionId) -> Vec<String> {
+        self.started_background_handles
+            .get(session_id)
+            .map(|handles| handles.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every session that currently has background work in flight.
+    pub fn sessions_with_in_flight_background(&self) -> Vec<SessionId> {
+        self.in_flight_background_subagents
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     pub fn has_in_flight_background_subagents(&self, parent_session_id: &SessionId) -> bool {
         self.in_flight_background_subagents
             .get(parent_session_id)
@@ -358,6 +388,7 @@ impl AgentSupervisor {
         if self.actors.remove(session_id).is_some() {
             debug!(%session_id, "deregistering actor");
         }
+        self.started_background_handles.remove(session_id);
     }
 
     /// Returns the number of currently registered actors. Intended for
@@ -647,6 +678,32 @@ mod tests {
     fn make_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
         AgentSupervisor::new(tx)
+    }
+
+    /// The started-handles record outlives each job (a job that finished
+    /// during the turn that started it still counts) and ends with the actor.
+    #[test]
+    fn started_background_handles_survive_the_job_but_not_the_actor() {
+        let sup = make_supervisor();
+        let parent = SessionId::from("fire");
+        let child = SessionId::from("bg-1");
+        sup.note_background_subagent_started(
+            &parent,
+            &child,
+            "command",
+            "sleep 1",
+            "bg-1",
+            CancellationToken::new(),
+        );
+        sup.note_background_subagent_finished(&parent, &child);
+        assert!(!sup.has_in_flight_background_subagents(&parent));
+        assert_eq!(
+            sup.started_background_handles(&parent),
+            vec!["bg-1".to_string()]
+        );
+
+        sup.remove(&parent);
+        assert!(sup.started_background_handles(&parent).is_empty());
     }
 
     #[test]

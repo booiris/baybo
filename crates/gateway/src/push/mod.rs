@@ -501,20 +501,39 @@ impl PushDispatcher {
     /// True iff this terminal event might buzz a phone: a successfully-
     /// completed turn whose reply a user is meant to read.
     ///
-    /// Three kinds qualify — a real user turn, and both halves of the cron
-    /// story: a **recurring** fire, whose session is a conversation the user
-    /// reads the result in, and the **delivery** of a one-shot's result into
-    /// the conversation that scheduled it. A recurring fire is only confirmed
-    /// once the session is loaded (`dispatch_completed`) — a cron session that
-    /// is *not* a conversation is a private workspace nobody would open.
-    /// Everything else (compaction, subagents, their notifications) is
-    /// machinery, not a message.
+    /// Three kinds qualify — a real user turn, and the cron story: a
+    /// **recurring** fire, whose session is a conversation the user reads the
+    /// result in, and a `CronNotification` — the delivery of a one-shot's
+    /// result or follow-up into the conversation that scheduled it, or the
+    /// marker a recurring fire's background follow-up completes on its reply
+    /// row. A recurring fire is only confirmed once the session is loaded
+    /// (`dispatch_completed`) — a cron session that is *not* a conversation is
+    /// a private workspace nobody would open. Everything else (compaction,
+    /// subagents, background notifications) is machinery, not a message.
     pub fn should_dispatch(ev: &TurnLifecycleEvent) -> bool {
         matches!(ev.phase, TurnPhase::Completed { .. })
             && matches!(
                 ev.kind,
                 TurnInputKind::UserChat | TurnInputKind::Cron | TurnInputKind::CronNotification
             )
+    }
+
+    /// Whether a completed `kind` turn in a session started by `trigger` is
+    /// a report the user reads *in that session*.
+    ///
+    /// - An issue run is board work, not a message to the operator: the card
+    ///   shows its state, and buzzing a phone for every run of every issue is
+    ///   exactly the noise a board exists to absorb.
+    /// - A cron fire pushes only from a cron **conversation**. A one-shot
+    ///   fire's session is a private workspace: its reply is delivered into
+    ///   the conversation that scheduled it, and *that* delivery pushes (as a
+    ///   `CronNotification`). Pushing here as well would buzz the phone twice,
+    ///   with the deep link pointing at a session the user cannot even open.
+    fn is_report_to_the_user(kind: TurnInputKind, trigger: &baybo_model::TriggerSource) -> bool {
+        if trigger.is_issue_session() {
+            return false;
+        }
+        kind != TurnInputKind::Cron || trigger.is_cron_conversation()
     }
 
     /// Dispatch on the completed edge of a real user turn. The reply's ordinal
@@ -570,25 +589,11 @@ impl PushDispatcher {
             );
             return;
         }
-        // A one-shot fire's session is a private workspace: its reply is
-        // delivered into the conversation that scheduled it, and *that*
-        // delivery pushes (as a `CronNotification`). Pushing here as well would
-        // buzz the phone twice for one scheduled task, with the deep link
-        // pointing at a session the user cannot even open.
-        // An issue run is board work, not a message to the operator: the
-        // card shows its state, and buzzing a phone for every run of every
-        // issue is exactly the noise a board exists to absorb.
-        if session.trigger.is_issue_session() {
+        if !Self::is_report_to_the_user(ev.kind, &session.trigger) {
             tracing::debug!(
                 session = %ev.session_id,
-                "push: issue runs report on their card; not pushing"
-            );
-            return;
-        }
-        if ev.kind == TurnInputKind::Cron && !session.trigger.is_cron_conversation() {
-            tracing::debug!(
-                session = %ev.session_id,
-                "push: one-shot cron fire pushes from its origin conversation; not pushing here"
+                kind = ?ev.kind,
+                "push: this session's turn is not a report the user reads here; not pushing"
             );
             return;
         }
@@ -1267,11 +1272,43 @@ mod tests {
         }
     }
 
+    /// A cron fire pushes from its own conversation, never from a one-shot's
+    /// private workspace (whose origin pushes instead); a `CronNotification`
+    /// pushes wherever it lands — including a recurring fire's conversation,
+    /// where it marks the fire's background follow-up.
+    #[test]
+    fn a_cron_fire_pushes_only_from_a_cron_conversation() {
+        let cron = |conversation: bool| baybo_model::TriggerSource::Cron {
+            cron_job_id: "cj".into(),
+            origin_session_id: Some(baybo_model::SessionId::from("origin")),
+            conversation,
+            job_title: None,
+            project_id: None,
+        };
+        assert!(PushDispatcher::is_report_to_the_user(
+            TurnInputKind::Cron,
+            &cron(true)
+        ));
+        assert!(!PushDispatcher::is_report_to_the_user(
+            TurnInputKind::Cron,
+            &cron(false)
+        ));
+        assert!(PushDispatcher::is_report_to_the_user(
+            TurnInputKind::CronNotification,
+            &cron(true)
+        ));
+        assert!(PushDispatcher::is_report_to_the_user(
+            TurnInputKind::CronNotification,
+            &baybo_model::TriggerSource::User
+        ));
+    }
+
     #[test]
     fn dispatches_only_completed_turns_a_user_is_meant_to_read() {
         // The three buzzing cases: a real user turn, a cron fire (confirmed to
-        // be a conversation once the session is loaded), and the delivery of a
-        // one-shot fire's result into the conversation that scheduled it.
+        // be a conversation once the session is loaded), and a cron
+        // notification (a one-shot's delivery, or a recurring fire's
+        // follow-up marker).
         for kind in [
             TurnInputKind::UserChat,
             TurnInputKind::Cron,

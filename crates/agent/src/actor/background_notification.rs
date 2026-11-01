@@ -430,7 +430,11 @@ impl AgentActor {
         // prevent — it hashed the batch's handle set, so a result joining the
         // batch between a failed attempt and its retry produced a second
         // acknowledgement for the same work.
-        if append_outcome.was_inserted() {
+        // A one-shot fire's workspace is never opened, so a notice there would
+        // reach nobody; its analysed follow-up is forwarded to the origin.
+        if append_outcome.was_inserted()
+            && !self.durable.session.trigger.is_private_cron_workspace()
+        {
             self.announce_background_completion(&pending, prompt_ordinal)
                 .await;
         }
@@ -616,6 +620,12 @@ impl AgentActor {
                 .state
                 .background_notifications
                 .active_delivery = None;
+            if self.durable.session.trigger.is_private_cron_workspace() {
+                // Passive delivery waits for a user turn, and nobody can ever
+                // take one here — so tell the origin, which was promised
+                // results, that the review failed.
+                self.report_follow_up_failure().await;
+            }
         }
         self.persist_session_state_with_activity("background_notification_failed")
             .await;
@@ -626,7 +636,10 @@ impl AgentActor {
         // compatibility; this path now covers every background-turn kind. Its
         // delta sink exposes reasoning, tool progress, and answer prose before
         // the canonical final Message.
-        let response_tx = self.volatile.response_tx.clone();
+        // A one-shot fire's workspace is never opened, so nothing streams from
+        // it; the cron waiter forwards the final reply to the origin.
+        let private_workspace = self.durable.session.trigger.is_private_cron_workspace();
+        let response_tx = (!private_workspace).then(|| self.volatile.response_tx.clone());
         // Arm the request-time retry cue for the duration of the turn. It rides
         // a request only while the transcript tail is an assistant row (a prior
         // attempt's cancelled salvage) — so the fresh path, where the tail is
@@ -635,18 +648,31 @@ impl AgentActor {
         // This single arm covers every entry (fresh drain, timer retry, crash
         // replay), so no caller has to reason about the tail.
         self.volatile.agent_loop.set_notification_cue(true);
+        // Work a recurring fire's own turn started comes back as the fire's
+        // real report: `report_nothing` may silence it exactly as it could the
+        // fire, and it pushes. Work a user started by replying there reports
+        // like any chat's.
+        let fire_report = self.durable.session.trigger.is_cron_conversation() && {
+            let notifications = &self.durable.session.state.background_notifications;
+            notifications
+                .active_delivery
+                .as_ref()
+                .is_some_and(|delivery| notifications.reports_fire_work(&delivery.handle_ids))
+        };
+        let silence = fire_report.then(baybo_tools::NotifySilence::new);
         let result = self
             .run_agent_loop(
                 TurnInput::SubagentNotification { content },
                 None,
-                Some(response_tx),
+                response_tx,
                 None,
                 None,
-                None,
+                silence.clone(),
                 None,
             )
             .await;
         self.volatile.agent_loop.set_notification_cue(false);
+        let silenced = silence.as_ref().is_some_and(|s| s.requested());
 
         match result {
             Ok(response) => {
@@ -659,7 +685,9 @@ impl AgentActor {
                     .as_ref()
                     .map(|delivery| delivery.failed_attempts)
                     .unwrap_or(0);
-                if let Some(gap) = self.unreported_background_results(&response.content) {
+                if !silenced
+                    && let Some(gap) = self.unreported_background_results(&response.content)
+                {
                     warn!(
                         session_id = %self.durable.session.id,
                         batch = gap.batch,
@@ -690,8 +718,30 @@ impl AgentActor {
                     }
                     return;
                 }
+                if silenced {
+                    debug!(
+                        session_id = %self.durable.session.id,
+                        "cron follow-up called report_nothing; suppressing send"
+                    );
+                    return;
+                }
+                if private_workspace {
+                    // Nobody reads this workspace: the cron waiter forwards
+                    // the reply to the conversation that scheduled the job.
+                    return;
+                }
+                let reply = (response.ordinal, response.content.clone());
+                if fire_report {
+                    // A silenced fire hid this conversation; a follow-up with
+                    // something to say is exactly what makes it relevant again,
+                    // and its push deep-links here.
+                    self.unhide_for_cron_notification().await;
+                }
                 self.send_response(response.into(), "background_notification")
                     .await;
+                if fire_report && let (Some(ordinal), content) = reply {
+                    self.push_cron_follow_up(content, ordinal).await;
+                }
             }
             Err(error) => {
                 if is_turn_cancelled(&error) {

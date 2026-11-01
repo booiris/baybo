@@ -521,8 +521,8 @@ impl Tool for SpawnSubagentTool {
     }
 
     /// Withholds every knob that only chooses *how* to background, where
-    /// backgrounding is refused. A card's run, a scheduled job's own run and
-    /// a nested subagent block regardless of all three.
+    /// backgrounding is refused. A card's run and a nested subagent block
+    /// regardless of all three.
     ///
     /// `group` belongs with them: it forces `background` on, and its whole
     /// payoff — parallel fan-out, one merged notification — lives inside the

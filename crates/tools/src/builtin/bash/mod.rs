@@ -4141,7 +4141,7 @@ mod tests {
         );
     }
 
-    /// An ineligible turn (a cron fire's own run, a nested subagent) keeps
+    /// An ineligible turn (a nested subagent, a card's run) keeps
     /// kill-on-timeout even with a sink wired: the sink is a capability, the
     /// gate is `background_eligible`. Same command + timeout as the test
     /// above, which backgrounds.

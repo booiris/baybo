@@ -34,7 +34,7 @@ pub use control_event::{ControlEvent, ControlEventKind, control_event_row_id};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
 pub use cron::{
     BuiltinCronJob, CronExecution, CronJob, CronJobPatch, CronSchedule, CronStatus,
-    ExecutionOutcome, ExecutionStatus, PendingCronResult,
+    ExecutionOutcome, ExecutionStatus, PendingCronFollowUp, PendingCronResult,
 };
 pub use external_agent::{
     BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,

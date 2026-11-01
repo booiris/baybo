@@ -123,8 +123,11 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
 /// visible only inside a recurring fire ([`ToolTriggerScope::CronConversation`]) and
 /// takes effect only there: it flips the fire's `NotifySilence` handle, which
 /// the agent loop reads to complete the fire without a notification (no chat
-/// row, no push, no live pulse). Where the handle is absent — a user reply in a
-/// cron conversation, or a one-shot fire — it is a no-op.
+/// row, no push, no live pulse). The handle is also present on that
+/// conversation's background follow-up turns, whose reply is the fire's real
+/// report when it moved its work to the background. Where the handle is
+/// absent — a user reply in a cron conversation, or a one-shot fire — it is a
+/// no-op.
 struct CronReportNothingTool;
 
 #[async_trait]
@@ -134,7 +137,7 @@ impl Tool for CronReportNothingTool {
     }
 
     fn description(&self) -> String {
-        r#"For a recurring scheduled run ONLY: call this when the check you just performed found nothing the user needs to know about right now, so this run notifies no one — no message, no push. Use it for a job whose intent is to WATCH for a condition and speak up only when it holds (e.g. "check the build and tell me only if it broke", "let me know if that PR gets a review"). Do NOT use it to skip work you were asked to do: a job told to always produce something — a daily digest, a summary, a recurring reminder — must still produce it every run, even when the content is thin. When in doubt, report: a missed notification is worse than an extra one. Calling this suppresses this run's notification entirely, so produce no other reply."#
+        r#"For a recurring scheduled run ONLY: call this when the check you just performed found nothing the user needs to know about right now, so this run notifies no one — no message, no push. Use it for a job whose intent is to WATCH for a condition and speak up only when it holds (e.g. "check the build and tell me only if it broke", "let me know if that PR gets a review"). Do NOT use it to skip work you were asked to do: a job told to always produce something — a daily digest, a summary, a recurring reminder — must still produce it every run, even when the content is thin. When in doubt, report: a missed notification is worse than an extra one. Calling this suppresses this run's notification entirely, so produce no other reply. When a scheduled run moved work to the background, the same rule applies to the follow-up turn that reviews that work's result."#
             .to_string()
     }
 

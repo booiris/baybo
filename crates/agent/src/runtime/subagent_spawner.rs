@@ -257,9 +257,9 @@ impl ActorSubagentSpawner {
 
         // A foreground subagent converts to background after a fixed
         // foreground wait (unless `on_timeout` is `Kill`) — but only when the
-        // dispatching turn may create background work. A cron fire's own turn
-        // and a nested-subagent parent can't surface a notification, so they
-        // keep the block-until-terminal behaviour with no timer.
+        // dispatching turn may create background work. A nested-subagent parent
+        // or a card's run can't surface a notification, so they keep the
+        // block-until-terminal behaviour with no timer.
         // An ineligible turn also downgrades an explicit `background=true` /
         // grouped spawn to a blocking foreground run (result returned inline)
         // rather than dispatching to a notification that would be dropped.
@@ -548,7 +548,7 @@ impl ActorSubagentSpawner {
 
         // Foreground external run under the shared wait/convert/kill policy: a
         // user parent gets the same foreground-wait → convert-to-background
-        // behaviour as the Baybo backend; a nested/cron parent blocks until the
+        // behaviour as the Baybo backend; an ineligible parent blocks until the
         // run finishes (or hits `EXTERNAL_SUBAGENT_TIMEOUT`). The cancel token
         // is the foreground turn's `child_token` so a `/stop` or `Kill`-timeout
         // reaches the in-flight subprocess.
@@ -846,7 +846,7 @@ async fn run_foreground_job(
     tokio::pin!(fut);
 
     if !background_eligible {
-        // A cron fire's own turn, or a nested-subagent parent: conversion and
+        // A nested-subagent parent or a card's run: conversion and
         // the notification turn that delivers its result are out of reach, so
         // block until terminal with no foreground-wait timer.
         let result = fut.await;
@@ -1556,11 +1556,11 @@ mod resume_validation_tests {
         baybo_model::SubagentBackendTag::Baybo
     }
 
-    fn mk_cron(id: &str, conversation: bool) -> Session {
+    fn mk_cron(id: &str, conversation: bool, origin: Option<&str>) -> Session {
         let mut s = mk_parent(id);
         s.trigger = TriggerSource::Cron {
             cron_job_id: "job-1".into(),
-            origin_session_id: None,
+            origin_session_id: origin.map(SessionId::from),
             conversation,
             job_title: None,
             project_id: None,
@@ -1578,15 +1578,15 @@ mod resume_validation_tests {
         let child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
         assert!(!child.can_host_background_jobs());
 
-        // One-shot cron fire: an invisible, deliberately unregistered
-        // workspace — nothing to notify into.
-        assert!(!mk_cron("cr", false).can_host_background_jobs());
+        // One-shot cron fire: its follow-ups are forwarded to the origin
+        // conversation, so it qualifies only when it has one.
+        assert!(mk_cron("cr", false, Some("origin")).can_host_background_jobs());
+        assert!(!mk_cron("cr-orphan", false, None).can_host_background_jobs());
 
         // Recurring cron fire's own conversation: listed, replyable, and its
-        // actor is registered, so a notification turn reaches the user. The
-        // *fire's* turn is still excluded — by the turn half of the gate in
-        // the agent loop, not here.
-        assert!(mk_cron("cr-conv", true).can_host_background_jobs());
+        // actor is registered, so the fire's turn and every reply background
+        // alike.
+        assert!(mk_cron("cr-conv", true, None).can_host_background_jobs());
     }
 
     fn claude_tag(resume_key: Option<&str>) -> baybo_model::SubagentBackendTag {
@@ -1865,7 +1865,7 @@ mod foreground_turn_tests {
         assert!(token.is_cancelled(), "the kill cancelled the run's token");
     }
 
-    // An ineligible turn (a cron fire's own turn, a nested subagent) has no
+    // An ineligible turn (a nested subagent, a card's run) has no
     // foreground-wait timer: it blocks until terminal and never converts,
     // even on a long run.
     #[tokio::test(start_paused = true)]

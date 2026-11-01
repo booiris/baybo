@@ -187,12 +187,20 @@ impl TriggerSource {
     /// spelling of this is how the `on_timeout` descriptions came to promise
     /// a card's run something the runtime then refused it.
     ///
+    /// A cron fire qualifies when its follow-up has somewhere to be read: a
+    /// recurring fire's own conversation, or — for a one-shot — the origin
+    /// conversation its follow-ups are forwarded to.
+    ///
     /// The lineage half — a subagent's turn ends with the child — stays on
     /// [`Session`], which is the only place that knows it.
     pub fn can_host_background_jobs(&self) -> bool {
         match self {
             TriggerSource::User => true,
-            TriggerSource::Cron { .. } => self.is_cron_conversation(),
+            TriggerSource::Cron {
+                conversation,
+                origin_session_id,
+                ..
+            } => *conversation || origin_session_id.is_some(),
             TriggerSource::Issue { .. } => false,
         }
     }
@@ -255,6 +263,17 @@ impl TriggerSource {
     pub fn is_cron_conversation(&self) -> bool {
         match self {
             TriggerSource::Cron { conversation, .. } => *conversation,
+            TriggerSource::User | TriggerSource::Issue { .. } => false,
+        }
+    }
+
+    /// True for a one-shot fire's private workspace: a cron session that is
+    /// not a conversation, which nobody can open. Whatever it produces is
+    /// reported into its origin conversation instead, so nothing may notify,
+    /// push or dispatch from here directly.
+    pub fn is_private_cron_workspace(&self) -> bool {
+        match self {
+            TriggerSource::Cron { conversation, .. } => !*conversation,
             TriggerSource::User | TriggerSource::Issue { .. } => false,
         }
     }
@@ -404,19 +423,17 @@ impl Session {
     /// and detached `Bash` commands).
     ///
     /// Delivering a background result means running an autonomous
-    /// notification turn in a conversation the user can open and read, so
-    /// the requirement is a live, registered, user-visible conversation.
-    /// Top-level user sessions qualify, and so does a recurring cron fire's
-    /// own conversation: it is listed, replyable and pushable, and its actor
-    /// is registered with the supervisor exactly so a reply reaches it (see
-    /// `agent::actor::router::cron`). A one-shot fire's workspace is
-    /// invisible and deliberately unregistered, and a subagent session's
-    /// turn ends with the child, so both keep blocking / kill-on-timeout.
+    /// notification turn in a registered actor whose reply reaches a
+    /// conversation the user can open and read. Top-level user sessions
+    /// qualify; so does every cron fire with a readable destination (see
+    /// [`TriggerSource::can_host_background_jobs`]) — both kinds of fire
+    /// actor are registered and outlive their turn, and a one-shot's
+    /// follow-up replies are forwarded to its origin (see
+    /// `agent::actor::router::cron`). A subagent session's turn ends with the
+    /// child, so it keeps blocking / kill-on-timeout.
     ///
-    /// The **turn** half lives in the agent loop: a cron fire's own turn
-    /// must still block rather than convert, so the fire's report is
-    /// complete by the time it notifies. See
-    /// `agent::runtime::background_jobs::background_eligible`.
+    /// Fixed for the session's life, which is what keeps the offered tool
+    /// schemas — and so the prompt-cache prefix — stable across its turns.
     pub fn can_host_background_jobs(&self) -> bool {
         self.trigger.can_host_background_jobs()
             && match &self.lineage {
@@ -625,9 +642,23 @@ pub struct BackgroundNotificationState {
         skip_serializing_if = "Option::is_none"
     )]
     pub active_delivery: Option<BackgroundNotificationDelivery>,
+
+    /// Handles of the background jobs a recurring cron fire's own turn
+    /// started, recorded when that turn ends. A notification batch carrying
+    /// one of them is the fire's real report — it may be silenced with
+    /// `report_nothing`, and it pushes — whereas work a user later starts by
+    /// replying in the same conversation reports like any chat's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fire_handles: Vec<String>,
 }
 
 impl BackgroundNotificationState {
+    /// Whether a batch settling `handle_ids` reports work the cron fire's own
+    /// turn started (see [`Self::fire_handles`]).
+    pub fn reports_fire_work(&self, handle_ids: &[String]) -> bool {
+        handle_ids.iter().any(|id| self.fire_handles.contains(id))
+    }
+
     /// Whether the actor must stay on its notification timer path.
     pub fn has_work(&self) -> bool {
         !self.buffered_results.is_empty()

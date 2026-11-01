@@ -417,9 +417,10 @@ impl Router {
         // gives us the cancel targets + ack summaries AND suppresses each
         // child's terminal delivery (its wait task sees the entry gone), so a
         // stopped result can't repopulate the notification buffer.
-        let background = self
+        let mut background = self
             .supervisor
             .take_in_flight_background_subagents(session_id);
+        background.extend(self.take_scheduled_workspace_jobs(session_id).await);
 
         // Cancel the in-flight turn, then walk its in-flight descendants.
         // Cancelling the turn trips the turn's loop cancel token first,
@@ -638,6 +639,38 @@ fn is_stop_command(content: &[ContentBlock]) -> bool {
 /// Compose the `/stop` acknowledgement: confirm what was cancelled and list
 /// each background task by its type + summary so the user sees exactly what
 /// was dropped. Idle session → a plain "nothing to stop".
+impl Router {
+    /// Drain the in-flight background jobs of every one-shot cron fire that
+    /// `origin` scheduled. A fire's private workspace can never be opened, so
+    /// the conversation its results are forwarded to is the only place a
+    /// runaway job it started can be stopped from.
+    async fn take_scheduled_workspace_jobs(
+        &self,
+        origin: &SessionId,
+    ) -> Vec<(SessionId, InFlightJob)> {
+        let mut drained = Vec::new();
+        for parent in self.supervisor.sessions_with_in_flight_background() {
+            if &parent == origin {
+                continue;
+            }
+            let session = match self.session_manager.get(&parent).await {
+                Ok(Some(session)) => session,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(session_id = %parent, error = %e, "stop: load background parent failed");
+                    continue;
+                }
+            };
+            if session.trigger.is_private_cron_workspace()
+                && session.trigger.cron_origin_session_id() == Some(origin)
+            {
+                drained.extend(self.supervisor.take_in_flight_background_subagents(&parent));
+            }
+        }
+        drained
+    }
+}
+
 fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob)]) -> String {
     if !cancelled_turn && background.is_empty() {
         return "Nothing in progress to stop.".to_string();
@@ -774,6 +807,69 @@ mod tests {
             _trigger_tx: trigger_tx,
             _response_rx: response_rx,
         }
+    }
+
+    /// A one-shot fire's private workspace can never be opened, so `/stop` in
+    /// the conversation that scheduled it is the only place its runaway
+    /// background jobs can be stopped from. Another conversation's fires, and
+    /// recurring fires (whose own conversation has its own `/stop`), are left
+    /// alone.
+    #[tokio::test]
+    async fn stop_in_the_origin_drains_its_one_shot_fires_background_jobs() {
+        let fx = fixture(100, LeakDetector::with_default_rules());
+        let origin = SessionId::from("sess-1");
+        let fire = |origin: &str, conversation: bool| baybo_model::TriggerSource::Cron {
+            cron_job_id: "cj".into(),
+            origin_session_id: Some(SessionId::from(origin)),
+            conversation,
+            job_title: None,
+            project_id: None,
+        };
+        let user = User {
+            id: "u1".into(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        let mut parents = Vec::new();
+        for trigger in [
+            fire("sess-1", false),
+            fire("sess-other", false),
+            fire("sess-1", true),
+        ] {
+            let session = fx
+                .router
+                .session_manager
+                .create_session_with_trigger(user.clone(), ChannelType::tui(), trigger)
+                .await
+                .expect("create fire session");
+            fx.router.supervisor.note_background_subagent_started(
+                &session.id,
+                &SessionId::from(format!("job-{}", session.id)),
+                "command",
+                "sleep 600",
+                "bg-1",
+                CancellationToken::new(),
+            );
+            parents.push(session.id);
+        }
+
+        let drained = fx.router.take_scheduled_workspace_jobs(&origin).await;
+        assert_eq!(drained.len(), 1, "only this conversation's one-shot fire");
+        assert!(
+            !fx.router
+                .supervisor
+                .has_in_flight_background_subagents(&parents[0])
+        );
+        assert!(
+            fx.router
+                .supervisor
+                .has_in_flight_background_subagents(&parents[1])
+        );
+        assert!(
+            fx.router
+                .supervisor
+                .has_in_flight_background_subagents(&parents[2])
+        );
     }
 
     /// The gate-rejection un-record, at the Router seam it lives on: the

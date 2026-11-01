@@ -343,7 +343,7 @@ list is rendered and reused for slash-command matching.
 
 `ToolManifest` carries coarse capability ceilings (`ToolCapability`): `ReadFile`, `WriteFile`, `Http`, `ExecCommand`. The manifest answers "what *kind* of thing may this tool do"; the concrete resource per call comes from `Tool::accessed_resources(params)` as [`ResourceAccess`] and is what the approval gate routes on. Trust level is a separate axis enforced before execution.
 
-The manifest also carries `channels: Vec<ChannelType>` (empty = every channel, the norm). It is one of **three** axes that decide which tools a session is offered; the second is `Tool::trigger_scope() -> ToolTriggerScope` (`Any` / `CronConversation` / `ProjectBoard` / `SharedWorkspace`), and the third is the subagent profile's own `tools:` list (below). The first two are enforced twice — the agent loop assembles the LLM's tool list via `ToolRegistry::tool_definitions_for_session(&session.channel, &session.trigger)` so other sessions never see the tool (channel and trigger are both session-stable, so the list stays byte-identical across calls and the prompt-cache sort guarantee holds), and the executor refuses a call that names it anyway (omission is not a gate against a hallucinated or skill-body-prompted name).
+The manifest also carries `channels: Vec<ChannelType>` (empty = every channel, the norm). It is one of **three** axes that decide which tools a session is offered; the second is `Tool::trigger_scope() -> ToolTriggerScope` (`Any` / `CronConversation` / `ProjectBoard` / `SharedWorkspace`), and the third is the subagent profile's own `tools:` list (below). The first two are enforced twice — the agent loop assembles the LLM's tool list via `ToolRegistry::tool_definitions_for_session(&session.channel, ToolSchemaContext { trigger, background_eligible }, allowlist)` so other sessions never see the tool (channel, trigger and the session's `background_eligible` bit are all session-stable, so the list stays byte-identical across calls and the prompt-cache sort guarantee holds), and the executor refuses a call that names it anyway (omission is not a gate against a hallucinated or skill-body-prompted name).
 
 Each `trigger_scope` variant restricts to a range: it names where the tool would have **nothing to act on** — `report_nothing` has no fire to silence outside a recurring cron conversation, `Issue*` has no board to name outside an issue run or project-linked cron fire, the browser server is one process-wide Chrome and a card's run was cut its own checkout precisely so it would not share — so offering it elsewhere would be offering an action that can only fail. An MCP server carries the axis too, as `McpServerEntry::trigger_scope` in `.mcp.json` (`#[serde(default)]` = `Any`, so a file written before the field kept every server everywhere); every tool the reconciler registers for that server answers with it, and the value is folded into the server's identity hash so an edit reconnects rather than leaving the previously-registered tools in place. The deck tools (`DeckCardList`/`DeckCardGet`/`DeckCardCreate`/`DeckCardUpdate`) carry `channels: [owner]` — the deck is the owner's surface — *and* `SharedWorkspace`, because an issue run is dispatched on the owner channel too and the channel axis alone never kept them out of one.
 
@@ -449,10 +449,11 @@ The detailed design is in [`../permission.md`](../permission.md).
 
 `tool_definitions()` exposes only `name`, `description`, and `parameters_schema` to the model. Capabilities and trust level are never exposed.
 
-Tool schemas receive a `ToolSchemaContext` with the trigger and the resolved
-per-turn `background_eligible` policy. The agent passes the same gate to schema
+Tool schemas receive a `ToolSchemaContext` with the trigger and the session's
+`background_eligible` bit (`Session::can_host_background_jobs`, which also sees
+the lineage the trigger cannot). The agent passes the same gate to schema
 generation and execution; deferred discovery through `ToolSearch` carries it
-too. Ineligible turns, including subagents with a user trigger, are not offered
+too. Ineligible sessions, including subagents with a user trigger, are not offered
 Bash's `on_timeout` or `spawn_subagent`'s `background`, `on_timeout` and `group`.
 Bash retains `timeout_ms` and explains that reaching it terminates the command;
 omission or zero uses the tool-context default.

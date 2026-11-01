@@ -93,8 +93,9 @@ pub struct VolatileResources {
     pub actor_token: CancellationToken,
     /// Supervisor handle used by [`crate::actor::supervisor::ActorRegistryGuard`]
     /// in [`crate::actor::AgentActor::run`] to self-deregister when the
-    /// task exits. `None` for one-shot actors that are not tracked by
-    /// the supervisor (cron fires, maintenance spawns, tests).
+    /// task exits, and to read which background jobs this session started.
+    /// `None` for actors not tracked by the supervisor (maintenance spawns,
+    /// tests).
     pub supervisor: Option<AgentSupervisor>,
     /// Session-row writer used by handlers whose state mutations must
     /// survive actor eviction. Today only the background-subagent

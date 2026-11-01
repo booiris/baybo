@@ -19,7 +19,7 @@ use baybo_channels::{
 };
 use baybo_model::{
     ContentBlock, ControlEventKind, ExecutionOutcome, LlmEntryName, PendingBackgroundResult,
-    PendingCronResult,
+    PendingCronFollowUp, PendingCronResult, SessionId,
 };
 use baybo_session::SessionMessageAppendOutcome;
 use baybo_turn::TurnInput;
@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const CRON_NOTIFICATION_SOURCE_EVENT_PREFIX: &str = "cron-execution:";
+const CRON_FOLLOW_UP_SOURCE_EVENT_INFIX: &str = ":follow-up:";
 
 /// How many rows to pull around a cron fire's reply ordinal when reading it out
 /// of the fire's session. The reply sits exactly at the recorded ordinal; the
@@ -125,6 +126,11 @@ pub enum AgentMessage {
     /// an assistant row, dispatches it, and resolves the delivery ledger. See
     /// [`AgentActor::handle_cron_result_ready`].
     CronResultReady(Box<PendingCronResult>),
+    /// A one-shot fire's background follow-up, forwarded into **this**
+    /// conversation (the one that scheduled the turn) the same way as its
+    /// result: no inference, one framed assistant row. See
+    /// [`AgentActor::handle_cron_follow_up_ready`].
+    CronFollowUpReady(Box<PendingCronFollowUp>),
     /// A subagent was spawned. Carries the initial prompt assembled by
     /// `Router::handle_subagent_spawn` and the parent's `TurnId` for
     /// lineage. The child actor runs `agent_loop.run` with `TurnInput::Spawned`;
@@ -196,9 +202,9 @@ impl mailbox::Prioritized for AgentMessage {
             | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
             // Same tier as a finished background job: both are autonomous
             // deliveries that wait for a queued user turn but outrank a stop.
-            AgentMessage::BackgroundJobFinished(_) | AgentMessage::CronResultReady(_) => {
-                MessagePriority::BackgroundJobFinished
-            }
+            AgentMessage::BackgroundJobFinished(_)
+            | AgentMessage::CronResultReady(_)
+            | AgentMessage::CronFollowUpReady(_) => MessagePriority::BackgroundJobFinished,
             AgentMessage::ActorStop => MessagePriority::Stop,
         }
     }
@@ -215,6 +221,13 @@ fn is_blank_reply(content: &[ContentBlock]) -> bool {
 
 fn cron_notification_source_event_id(execution_id: &str) -> String {
     format!("{CRON_NOTIFICATION_SOURCE_EVENT_PREFIX}{execution_id}")
+}
+
+fn cron_follow_up_source_event_id(execution_id: &str, turn_id: &baybo_model::TurnId) -> String {
+    format!(
+        "{}{CRON_FOLLOW_UP_SOURCE_EVENT_INFIX}{turn_id}",
+        cron_notification_source_event_id(execution_id)
+    )
 }
 
 /// Mirrors the gateway slash dispatcher's tolerance for casing and
@@ -335,8 +348,12 @@ impl AgentActor {
         let _registry_guard = self
             .volatile
             .supervisor
-            .take()
+            .clone()
             .map(|s| ActorRegistryGuard::new(s, session_id.clone()));
+        // Whatever ends this loop — `ActorStop`, a closed mailbox, a panic —
+        // trips the token, so anything watching it (a cron fire's follow-up
+        // waiter) learns the actor is gone.
+        let _cancel_on_exit = self.volatile.actor_token.clone().drop_guard();
 
         // Cold-start hydration: pull any persisted transcript out of
         // the store before processing the first message. No-ops for
@@ -534,6 +551,9 @@ impl AgentActor {
             }
             AgentMessage::CronResultReady(pending) => {
                 self.handle_cron_result_ready(*pending).await;
+            }
+            AgentMessage::CronFollowUpReady(follow_up) => {
+                self.handle_cron_follow_up_ready(*follow_up).await;
             }
             AgentMessage::SubagentSpawned {
                 initial_message,
@@ -744,6 +764,8 @@ impl AgentActor {
         // Only a recurring fire (which owns a listed conversation) can be
         // silenced by `report_nothing`; a one-shot always reports back, so it
         // gets no handle and the tool is never even offered in its session.
+        // A silenced fire that left background work running stays hidden only
+        // until a follow-up has something to say.
         let silence =
             matches!(delivery, CronDelivery::Channel).then(baybo_tools::NotifySilence::new);
         let response = self
@@ -758,6 +780,7 @@ impl AgentActor {
             )
             .await?;
         let silenced = silence.as_ref().is_some_and(|s| s.requested());
+        let background_pending = self.record_fire_background_handles().await;
         match delivery {
             CronDelivery::OriginSession => {}
             CronDelivery::Channel if silenced => {
@@ -774,14 +797,44 @@ impl AgentActor {
                 // would leave a conversation that is empty when opened and —
                 // because clients learn a new conversation exists from the
                 // activity pulse the gateway derives from channel dispatch —
-                // never announced itself at all.
-                self.report_cron_outcome(title, false, "").await;
+                // never announced itself at all. A fire that left work running
+                // has not produced nothing: its follow-up is on the way.
+                let detail = if background_pending {
+                    baybo_context::prompts::cron::NOTIFICATION_BACKGROUND_PENDING_BODY
+                } else {
+                    ""
+                };
+                self.report_cron_outcome(title, false, detail).await;
             }
             CronDelivery::Channel => {
                 self.send_response(response.into(), "cron").await;
             }
         }
         Ok(())
+    }
+
+    /// Record the background jobs the fire's own turn started, so their
+    /// follow-up is recognised as the fire's report (see
+    /// `BackgroundNotificationState::fire_handles`). Returns whether there
+    /// were any. Read from the supervisor rather than the in-flight registry:
+    /// a job that finished during the turn has already left the registry,
+    /// but its result is still queued behind the turn and will report.
+    async fn record_fire_background_handles(&mut self) -> bool {
+        let Some(supervisor) = &self.volatile.supervisor else {
+            return false;
+        };
+        let handles = supervisor.started_background_handles(&self.durable.session.id);
+        if handles.is_empty() {
+            return false;
+        }
+        self.durable
+            .session
+            .state
+            .background_notifications
+            .fire_handles = handles;
+        self.persist_session_state_with_activity("cron_fire_background_handles")
+            .await;
+        true
     }
 
     /// A recurring fire that called `report_nothing`: drop it from the user's
@@ -920,6 +973,95 @@ impl AgentActor {
         Ok(append_outcome)
     }
 
+    /// Push a recurring fire's background follow-up — the reply row at
+    /// `ordinal`, already persisted and dispatched — by completing a
+    /// zero-inference `CronNotification` turn on it. That turn's
+    /// `Completed { reply_ordinal }` edge is what the push dispatcher acts on;
+    /// background notification turns themselves never push, because outside a
+    /// fire's report they are machinery.
+    async fn push_cron_follow_up(&mut self, content: Vec<ContentBlock>, ordinal: i64) {
+        if let Err(e) = self
+            .complete_turn_on_row(
+                TurnInput::CronNotification {
+                    content: content.clone(),
+                },
+                content,
+                ordinal,
+            )
+            .await
+        {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to push the cron fire's background follow-up"
+            );
+        }
+    }
+
+    /// A one-shot fire whose background follow-up could not be reviewed:
+    /// persist a reply saying so and complete a `SubagentNotification` turn on
+    /// it, which the cron waiter forwards to the origin like any follow-up.
+    pub(super) async fn report_follow_up_failure(&mut self) {
+        let content = vec![ContentBlock::Text(
+            baybo_context::prompts::cron::NOTIFICATION_FOLLOW_UP_FAILED_BODY.to_string(),
+        )];
+        let result = async {
+            let ordinal = self
+                .volatile
+                .agent_loop
+                .append_cron_notification(content.clone(), None)
+                .await?
+                .ordinal();
+            self.complete_turn_on_row(
+                TurnInput::SubagentNotification {
+                    content: Vec::new(),
+                },
+                content,
+                ordinal,
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = result {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to report a cron follow-up's review failure"
+            );
+        }
+    }
+
+    /// Open and complete a zero-inference turn of `input` whose reply is the
+    /// already-persisted row at `ordinal`.
+    async fn complete_turn_on_row(
+        &self,
+        input: TurnInput,
+        content: Vec<ContentBlock>,
+        ordinal: i64,
+    ) -> anyhow::Result<()> {
+        crate::runtime::scope::with_turn(
+            &self.volatile.turn_lifecycle,
+            // Nothing to interrupt: the turn only names an existing row.
+            CancellationToken::new(),
+            crate::runtime::scope::TurnSpec {
+                session_id: self.durable.session.id.clone(),
+                origin: self.durable.session.trigger.kind(),
+                input,
+                parent_turn_id: None,
+            },
+            |_turn_id| async move {
+                Ok((
+                    baybo_turn::TurnOutput::Message {
+                        content,
+                        ordinal: Some(ordinal),
+                    },
+                    (),
+                ))
+            },
+        )
+        .await
+    }
+
     /// Deliver a finished one-shot cron fire's result into **this**
     /// conversation — the one that scheduled the turn. Runs at a turn boundary
     /// with **no inference**: the fire already did the thinking, in its own
@@ -1009,6 +1151,72 @@ impl AgentActor {
         );
     }
 
+    /// Forward a one-shot fire's background follow-up into **this**
+    /// conversation, with no inference — the follow-up turn in the fire's own
+    /// workspace already did the reviewing. Unlike the result itself, a
+    /// follow-up with nothing to say forwards nothing: the fire's result
+    /// already told the user work was continuing, and an empty "it finished"
+    /// row would only be noise.
+    ///
+    /// Idempotent on the (execution, follow-up turn) key, checked before the
+    /// un-hide for the same reason as [`Self::handle_cron_result_ready`].
+    async fn handle_cron_follow_up_ready(&mut self, follow_up: PendingCronFollowUp) {
+        let session_id = self.durable.session.id.clone();
+        let source_event_id =
+            cron_follow_up_source_event_id(&follow_up.execution_id, &follow_up.turn_id);
+        match self
+            .volatile
+            .session_manager
+            .find_message_ordinal_by_source_event_id(&session_id, &source_event_id)
+            .await
+        {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    session_id = %session_id,
+                    execution_id = %follow_up.execution_id,
+                    error = %error,
+                    "could not check for an existing cron follow-up row; proceeding to idempotent append"
+                );
+            }
+        }
+
+        let (body, attachments) = self
+            .read_fire_reply(&follow_up.fire_session_id, Some(follow_up.reply_ordinal))
+            .await;
+        if body.trim().is_empty() && attachments.is_empty() {
+            debug!(
+                session_id = %session_id,
+                execution_id = %follow_up.execution_id,
+                "cron follow-up has nothing to report; not forwarding"
+            );
+            return;
+        }
+        let mut content = vec![ContentBlock::Text(
+            baybo_context::prompts::cron::frame_cron_follow_up(&follow_up.job_title, &body),
+        )];
+        content.extend(attachments);
+        self.unhide_for_cron_notification().await;
+        if let Err(error) = self
+            .publish_cron_notification(content, Some(source_event_id))
+            .await
+        {
+            error!(
+                session_id = %session_id,
+                execution_id = %follow_up.execution_id,
+                error = %error,
+                "cron follow-up delivery failed"
+            );
+            return;
+        }
+        info!(
+            session_id = %session_id,
+            execution_id = %follow_up.execution_id,
+            "delivered cron follow-up to origin conversation"
+        );
+    }
+
     /// The notification's content: a header naming the turn, the fire's own
     /// reply text (or a per-outcome fallback), and any media the fire
     /// produced.
@@ -1019,8 +1227,15 @@ impl AgentActor {
                 pending.failure_reason.clone().unwrap_or_default(),
                 Vec::new(),
             ),
+            ExecutionOutcome::Blank if pending.background_pending => (
+                baybo_context::prompts::cron::NOTIFICATION_BACKGROUND_PENDING_BODY.to_string(),
+                Vec::new(),
+            ),
             ExecutionOutcome::Blank => (String::new(), Vec::new()),
-            ExecutionOutcome::Success => self.read_fire_reply(pending).await,
+            ExecutionOutcome::Success => {
+                self.read_fire_reply(&pending.fire_session_id, pending.reply_ordinal)
+                    .await
+            }
         };
         let header = baybo_context::prompts::cron::frame_cron_notification(
             &pending.job_title,
@@ -1038,20 +1253,24 @@ impl AgentActor {
     /// over. An unreadable or absent row yields empty text, which
     /// `frame_cron_notification` turns into the blank-run fallback rather than
     /// a silent non-delivery.
-    async fn read_fire_reply(&self, pending: &PendingCronResult) -> (String, Vec<ContentBlock>) {
-        let Some(ordinal) = pending.reply_ordinal else {
+    async fn read_fire_reply(
+        &self,
+        fire_session_id: &SessionId,
+        reply_ordinal: Option<i64>,
+    ) -> (String, Vec<ContentBlock>) {
+        let Some(ordinal) = reply_ordinal else {
             return (String::new(), Vec::new());
         };
         let rows = match self
             .volatile
             .session_manager
-            .history_since(&pending.fire_session_id, ordinal - 1, FIRE_REPLY_READ_LIMIT)
+            .history_since(fire_session_id, ordinal - 1, FIRE_REPLY_READ_LIMIT)
             .await
         {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(
-                    fire_session_id = %pending.fire_session_id,
+                    fire_session_id = %fire_session_id,
                     ordinal,
                     error = %e,
                     "failed to read cron fire reply; notifying without its body"
@@ -1061,7 +1280,7 @@ impl AgentActor {
         };
         let Some((_, _, reply)) = rows.into_iter().find(|(ord, _, _)| *ord == ordinal) else {
             warn!(
-                fire_session_id = %pending.fire_session_id,
+                fire_session_id = %fire_session_id,
                 ordinal,
                 "cron fire reply row not found at its recorded ordinal"
             );

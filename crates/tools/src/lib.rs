@@ -292,8 +292,9 @@ impl ToolTriggerScope {
 
 /// A tool's request that the current turn produce **no** user-facing
 /// notification. The agent loop hands a fresh signal to the tools of a turn
-/// that *can* be silenced — today only a recurring cron fire, for its
-/// `report_nothing` tool — and reads it back after the turn; it is `None`
+/// that *can* be silenced — today only a recurring cron fire's turn and its
+/// background follow-ups, for the `report_nothing` tool — and reads it back
+/// after the turn; it is `None`
 /// everywhere else, so a tool that flips it outside such a turn is a no-op.
 /// Cheap to clone: the flag is shared through an `Arc`.
 #[derive(Clone, Default)]
@@ -429,11 +430,11 @@ pub struct ToolContext {
     pub inherited_context: Option<InheritedToolContext>,
     /// Whether this call may **create** background work: a `Bash` command
     /// that converts to background on timeout, or a subagent that converts
-    /// (or is dispatched) instead of blocking. Decided per turn by the agent
-    /// loop — the session must be somewhere a completion notification can
-    /// land, and the turn must not be a cron fire's own turn (a fire blocks
-    /// so its report is complete when it notifies). `false` for cron fires,
-    /// nested subagents and argv-mode boots, which keep kill-on-timeout.
+    /// (or is dispatched) instead of blocking: whether the session is
+    /// somewhere a completion notification can land
+    /// (`Session::can_host_background_jobs`). `false` for card runs, nested
+    /// subagents, one-shot cron fires with no origin and argv-mode boots,
+    /// which keep kill-on-timeout.
     ///
     /// Observing existing jobs is not creating work, so `JobList` / `JobStop`
     /// deliberately ignore this and go straight to
@@ -448,10 +449,10 @@ pub struct ToolContext {
     /// `JobList` / `JobStop` tools. Wired like [`Self::background_jobs`].
     pub background_control: Option<Arc<dyn BackgroundJobControl>>,
     /// Handle a tool flips to suppress this turn's user-facing notification.
-    /// `Some` **only for a recurring cron fire turn** (wired by the actor's
-    /// cron dispatch, read by the `report_nothing` tool); `None` everywhere
-    /// else, so the tool no-ops on a user reply, a one-shot fire, or any
-    /// ordinary turn. See [`NotifySilence`].
+    /// `Some` **only for a recurring cron fire's turn and its background
+    /// follow-up turns** (wired by the actor, read by the `report_nothing`
+    /// tool); `None` everywhere else, so the tool no-ops on a user reply, a
+    /// one-shot fire, or any ordinary turn. See [`NotifySilence`].
     pub notify_silence: Option<NotifySilence>,
     /// The checkout this session owns, when it is a kanban issue's run: the
     /// git worktree cut for that issue. Shell commands default their cwd to
