@@ -30,5 +30,5 @@ pub use dispatch::{FanOutLimiter, SubagentDispatchLimiter, unbounded_limiter};
 pub use loader::{load_profile_from_file, parse_profile_md};
 pub use profile::{SubagentProfile, SubagentProfileSummary};
 pub use registry::SubagentRegistry;
-pub use spawner::SubagentSpawner;
+pub use spawner::{SpawnedSubagent, SubagentRun, SubagentSpawner};
 pub use validation::{normalize_line_endings, validate_profile_name, validate_profile_version};

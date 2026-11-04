@@ -46,23 +46,29 @@ pub fn new_background_handle() -> String {
     )
 }
 
-/// Leading marker of the tool result a *successful* background subagent
-/// dispatch returns (the ack with its `bg-…` handle). The agent loop matches
-/// it to count grouped members: a router-side dispatch failure comes back as
-/// a `[subagent failed: …]` result instead, which must NOT inflate the group's
-/// expected count (no escorted result will ever arrive for it). Single source
-/// of truth — the producer (`ack_background_dispatch`) and the consumer (the
-/// agent loop's group counter) both reference it.
-pub const BACKGROUND_DISPATCH_ACK_PREFIX: &str = "[background subagent dispatched]";
-
-/// Shared tail appended to every background-dispatch ack (explicit
-/// `background: true` and foreground-timeout conversion alike). Tells the
-/// parent LLM the one thing it needs to hear when its work is now detached:
-/// yield the turn instead of busy-waiting. Single-sourced so both ack sites
-/// carry identical guidance — the observed failure was a model that, having
-/// backgrounded its only task, looped on `sleep` + `JobList` for minutes
-/// because the ack merely described the handoff instead of directing it.
+/// Shared tail of every "moved to the background" answer
+/// (`baybo_tools::background::ack`, for every tool and both ways work gets
+/// there). Tells the parent LLM the one thing it needs to hear when its work
+/// is now detached: yield the turn instead of busy-waiting — the observed
+/// failure was a model that, having backgrounded its only task, looped on
+/// `sleep` + `JobList` for minutes because the ack merely described the
+/// handoff instead of directing it.
 pub const BACKGROUND_DISPATCH_YIELD_GUIDANCE: &str = "It runs in the background now. END YOUR TURN unless you have other independent work to do right now — do NOT sleep and do NOT poll JobList to wait for it. The runtime re-invokes you with its result prepended to a fresh turn once it finishes; that result can ONLY arrive after this turn ends, so waiting here cannot surface it and only delays it.";
+
+/// What a background-capable tool does with a call still running when its
+/// foreground window elapses (`baybo_tools::background::run`): hand it to
+/// the background or cancel it. Ignored where the session cannot host
+/// background work, and for a call started detached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnTimeout {
+    /// Detach and keep running; deliver the result via a notification
+    /// turn when it finishes. The default.
+    #[default]
+    Background,
+    /// Cancel the child and surface a timeout to the parent.
+    Kill,
+}
 
 /// What the parent LLM asks for when it calls `spawn_subagent`.
 ///
@@ -76,20 +82,6 @@ pub const BACKGROUND_DISPATCH_YIELD_GUIDANCE: &str = "It runs in the background 
 /// Field naming follows Claude Code's Agent tool: `task_summary` is
 /// the short 3-5 word title surfaced in traces, while `prompt` is the
 /// self-contained brief that becomes the child's first user message.
-/// What to do when a *foreground* subagent exceeds its foreground wait.
-/// Only consulted for foreground spawns from a user-facing session;
-/// `background: true` spawns and non-user parents ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OnTimeout {
-    /// Detach and keep running; deliver the result via a notification
-    /// turn when it finishes. The default.
-    #[default]
-    Background,
-    /// Cancel the child and surface a timeout to the parent.
-    Kill,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSpawnRequest {
     /// Profile name the parent LLM emitted. The child's `ContextManager`
@@ -116,21 +108,10 @@ pub struct SubagentSpawnRequest {
     /// model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<ModelTier>,
-    /// Fire-and-forget mode. When `true` the router surfaces a handle
-    /// id and parents the child's wait task on the parent actor's
-    /// token rather than the parent turn's token, so the child outlives
-    /// the dispatching turn and escorts its result back later.
-    #[serde(default)]
-    pub background: bool,
-    /// Policy when a *foreground* spawn exceeds its foreground wait: a
-    /// user-facing session converts to background (default) or kills.
-    /// Ignored for `background: true` and for non-user parents.
-    #[serde(default)]
-    pub on_timeout: OnTimeout,
     /// Root session id used by the dispatcher's fan-out limiter.
     /// Stamped by `spawn_subagent` after it walks the lineage chain
-    /// (and reserves a slot in the limiter), so the router's wait
-    /// task can release the slot on terminal without re-walking.
+    /// (and reserves a slot in the limiter), so the spawner can release
+    /// the slot when the child's run ends without re-walking.
     /// `None` only on synthesized requests from tests / future
     /// programmatic call sites that don't go through the limiter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,12 +127,6 @@ pub struct SubagentSpawnRequest {
     /// routing the new task into the existing child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<SessionId>,
-    /// Barrier cohort. When set, this subagent runs in the background and
-    /// its result is held until every member of the group reaches a
-    /// terminal state, then the whole group delivers in one merged
-    /// notification. Tagged onto the escorted `PendingBackgroundResult`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
 }
 
 /// Parent-side context the tool builds from its `ToolContext` and passes to
@@ -165,12 +140,11 @@ pub struct SubagentParentContext {
     /// tool span to the child session.
     pub span_id: SpanId,
     pub cancel_token: CancellationToken,
-    /// Whether the dispatching turn may create background work — the gate
-    /// the agent loop computed for this turn (see
-    /// `ToolContext::background_eligible`), carried through the tool so the
-    /// spawner does not re-derive it from the parent session alone and miss
-    /// the turn half. `false` makes a foreground spawn block until terminal
-    /// and downgrades an explicit `background: true` to a blocking run.
+    /// Whether the parent may hand this child to the background
+    /// (`ToolContext::can_hand_over_background`). The spawner uses it only to
+    /// pick what the child hangs off: the process-wide token when it may
+    /// outlive the dispatching turn, the parent's turn scope otherwise. How
+    /// long the parent waits is `baybo_tools::background::run`'s business.
     pub background_eligible: bool,
     /// Unattended-lineage marker inherited from the dispatching execution.
     /// Its presence keeps delegated work in the same no-approval-prompts

@@ -19,7 +19,7 @@ Contents:
 - **Inherited tool context**: `InheritedToolContext`, a field-less marker that an in-process execution lineage is unattended (no operator to answer approval prompts); it follows spawned children without becoming persistent session state
 - **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
 - **Approval types**: `ApprovalDecision`, `ApprovedResource`, `HostPattern`, `ResourceAccess`
-- **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentParentContext`, `SubagentResult`, `SubagentExitStatus`, `PendingBackgroundResult`, `BackgroundJobKind`, `OnTimeout`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers (`SUBAGENT_CHANNEL_TAG`, `BACKGROUND_SUBAGENT_HANDLE_PREFIX`, `BACKGROUND_DISPATCH_ACK_PREFIX`, `new_background_handle`)
+- **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentParentContext`, `SubagentResult`, `SubagentExitStatus`, `PendingBackgroundResult`, `BackgroundJobKind`, `OnTimeout`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers (`SUBAGENT_CHANNEL_TAG`, `BACKGROUND_SUBAGENT_HANDLE_PREFIX`, `BACKGROUND_DISPATCH_YIELD_GUIDANCE`, `new_background_handle`)
 - **External-agent types**: `ExternalAgentKind`, `SubagentBackend`, `SubagentBackendKind`, `SubagentBackendTag`, the `BAYBO_BACKEND_TAG` const
 - **LLM routing types**: `LlmEntryName`, `ModelTier`, `LlmPricingOverride`
 - **Fingerprints**: `FileFingerprint` (mtime + size, used by the read-before-write tracker)

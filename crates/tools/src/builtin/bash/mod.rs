@@ -62,9 +62,11 @@ use std::sync::Arc;
 
 use baybo_model::new_background_handle;
 
+use futures::FutureExt;
+
 use crate::{
-    ApprovalDecision, BackgroundJobSink, DetachedCommand, ExecSandbox, NoticeLevel, ResourceAccess,
-    RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput, refusal_reason,
+    ApprovalDecision, ExecSandbox, NoticeLevel, ResourceAccess, RunningChild, SpawnOpts, Tool,
+    ToolContext, ToolError, ToolOutput, refusal_reason,
 };
 
 mod judge;
@@ -90,6 +92,20 @@ const COMMAND_HEAD_MAX_CHARS: usize = 160;
 /// this the executor's own deadline starts racing the background handoff, so
 /// a larger budget buys the model nothing.
 const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// The deadline parameter, which is also the foreground window `on_timeout`
+/// acts on.
+const TIMEOUT_PARAM: &str = "timeout_ms";
+
+/// Bash backgrounds a command only once it overruns its own deadline; a
+/// command has produced nothing worth handing over before it starts, so there
+/// is no `background` / `group`.
+const BASH_BACKGROUND: crate::background::BackgroundSupport =
+    crate::background::BackgroundSupport {
+        window: crate::background::ForegroundWindow::Param(TIMEOUT_PARAM),
+        start_detached: false,
+        background_hint: "",
+    };
 
 /// One-line, log-safe digest of a shell command for a structured log
 /// field: the first line with control chars flattened via `escape_debug`
@@ -640,13 +656,6 @@ struct Params {
     cwd: Option<PathBuf>,
     #[serde(default)]
     secret_env: Vec<String>,
-    /// `"background"` (default) or `"kill"`: what to do when the command
-    /// exceeds its timeout. `background` detaches it (you get a handle + a
-    /// completion notification); `kill` keeps the old kill-on-timeout
-    /// behaviour. Ignored when the turn is not
-    /// [`ToolContext::background_eligible`](crate::ToolContext::background_eligible).
-    #[serde(default)]
-    on_timeout: Option<String>,
 }
 
 fn sandbox_permissions_from_params(params: &Value) -> SandboxPermissions {
@@ -672,26 +681,29 @@ impl Tool for BashTool {
         out
     }
 
-    /// Withholds `on_timeout` where detaching is refused, and the escalation
-    /// pair where the route already skips the OS sandbox. Without a
-    /// background host a slow command is killed whatever `on_timeout` says,
-    /// and the timeout the model picks is then the only thing standing
-    /// between a long build and losing its work; under `free`/bench
+    /// Rewords `timeout_ms` where detaching is refused (the registry withholds
+    /// `on_timeout` there itself), and withholds the escalation pair where the
+    /// route already skips the OS sandbox. Without a background host a slow
+    /// command is killed whatever `on_timeout` says, and the timeout the model
+    /// picks is then the only thing standing between a long build and losing
+    /// its work; under `free`/bench
     /// [`SandboxPermissions::requires_approval`] is structurally false, so
     /// `sandbox_permissions` cannot change a route that is already
     /// unsandboxed and `justification` is only ever rendered by the prompt
     /// that knob raises. Offering either is offering a choice the runtime
     /// has already made.
     ///
-    /// This is the one schema that varies on the live permission and not
-    /// just the trigger. It costs no extra prompt-cache invalidation:
-    /// `description()` is permission-skinned too and is rebuilt beside the
-    /// schema on every definition build.
-    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
+    /// Live permission changes already reskin `description()`, so adapting
+    /// the schema beside it costs no extra prompt-cache invalidation.
+    fn parameters_schema_for(&self, context: crate::ToolSchemaContext<'_>) -> Value {
         let mut schema = self.parameters_schema();
         if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            if !trigger.can_host_background_jobs() {
-                props.remove("on_timeout");
+            if !context.background_eligible
+                && let Some(timeout) = props.get_mut(TIMEOUT_PARAM)
+            {
+                timeout["description"] = json!(
+                    "Exceeding it terminates the command. Use `0` for the tool-context default."
+                );
             }
             if permission_skips_os_sandbox(self.permission()) {
                 props.remove("sandbox_permissions");
@@ -707,19 +719,23 @@ impl Tool for BashTool {
         } else {
             "Use 'require_escalated' only when the user explicitly asks to run this command without the OS sandbox; Baybo then shows the exact command for approval before switching a sandboxed route to unsandboxed."
         };
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "command":    { "type": "string" },
                 "sandbox_permissions": { "type": "string", "enum": ["use_default", "require_escalated"], "default": "use_default", "description": sandbox_permissions_description },
                 "justification": { "type": "string", "description": "A concise user-facing question or reason explaining why this command needs unsandboxed execution. Shown only when sandbox_permissions is 'require_escalated' and the configured route is sandboxed. An empty string uses a generic prompt; omit it for 'use_default' or permission 'free'." },
-                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": MAX_TIMEOUT_MS, "description": "Use `0` for the tool-context default." },
+                TIMEOUT_PARAM: { "type": "integer", "minimum": 0, "maximum": MAX_TIMEOUT_MS, "description": "Use `0` for the tool-context default." },
                 "cwd":        { "type": "string", "description": "An empty string uses the default cwd." },
-                "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
-                "on_timeout": { "type": "string", "enum": ["background", "kill"], "default": "background", "description": "'background' detaches the command and delivers its result in a later turn; 'kill' terminates it and returns a timeout error." }
+                "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." }
             },
             "required": ["command"]
-        })
+        });
+        crate::background::declare_options(schema, &BASH_BACKGROUND)
+    }
+
+    fn background_support(&self) -> Option<crate::background::BackgroundSupport> {
+        Some(BASH_BACKGROUND)
     }
 
     fn call_label(&self, params: &Value) -> Option<String> {
@@ -777,6 +793,8 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+        let background = crate::background::BackgroundRequest::parse(&params, &BASH_BACKGROUND)
+            .map_err(ToolError::InvalidParams)?;
         let mut p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         p.timeout_ms = p.timeout_ms.filter(|timeout| *timeout > 0);
@@ -933,15 +951,9 @@ impl Tool for BashTool {
         // `secret_env` does not block detach. Background output files and
         // completion tails are raw; if secrets were injected, the background
         // arm below records that risk before handing the child to the sink.
-        let convert_on_timeout = !p
-            .on_timeout
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| s.eq_ignore_ascii_case("kill"));
-        if convert_on_timeout
-            && ctx.background_eligible
+        if background.on_timeout == baybo_model::OnTimeout::Background
+            && ctx.can_hand_over_background()
             && let Some(detached_route) = detached_route
-            && let Some(sink) = ctx.background_jobs.clone()
             && let Some(output) = run_detached(
                 self,
                 detached_route,
@@ -951,7 +963,7 @@ impl Tool for BashTool {
                 &extra_env,
                 timeout,
                 ctx,
-                &sink,
+                &background,
                 effective_escape_policy,
             )
             .await?
@@ -1138,19 +1150,26 @@ fn prune_outputs_before(dir: &Path, cutoff: std::time::SystemTime) -> usize {
     pruned
 }
 
-enum DetachedOutcome {
-    Cancelled,
-    Completed(i32),
-    Backgrounded,
+/// How a detached command's process ended.
+struct CommandExit {
+    /// `None` when it was killed through its job's cancel token.
+    code: Option<i32>,
 }
 
+/// How many bytes of each output file the completion notification inlines.
+/// The full output stays on disk for the agent to `Read`.
+const COMMAND_OUTPUT_TAIL_BYTES: u64 = 8 * 1024;
+
+/// What `JobList` and `/stop` call a detached command.
+const COMMAND_JOB_KIND: &str = "command";
+
 /// Run a command on the detached path: spawn it live, stream stdout/stderr
-/// to per-turn files, and wait up to the foreground budget. If it finishes
-/// in time, return the normal result; if it overruns, hand the still-running
-/// child to the [`BackgroundJobSink`] and return a "moved to background"
-/// notice. Returns `Ok(None)` when the command couldn't be detached (sandbox
-/// backend without detached support / spawn failure) so the caller falls back
-/// to the blocking kill-on-timeout path.
+/// to per-call files, and let [`crate::background::run`] own the foreground
+/// window. If it finishes in time, return the normal result; if it overruns,
+/// it is handed to the background and the model gets the handle. Returns
+/// `Ok(None)` when the command couldn't be detached (sandbox backend without
+/// detached support / spawn failure) so the caller falls back to the blocking
+/// kill-on-timeout path.
 #[allow(clippy::too_many_arguments)]
 async fn run_detached(
     tool: &BashTool,
@@ -1161,7 +1180,7 @@ async fn run_detached(
     extra_env: &ChildEnv,
     timeout: Duration,
     ctx: &ToolContext,
-    sink: &Arc<dyn BackgroundJobSink>,
+    request: &crate::background::BackgroundRequest,
     escape_policy: SandboxEscapePolicy,
 ) -> crate::Result<Option<ToolOutput>> {
     let Some(mut child) = spawn_detached_child(
@@ -1193,34 +1212,82 @@ async fn run_detached(
         spawn_copy_to_file(child.take_stderr(), stderr_path.clone()),
     ];
 
-    // Wait up to the foreground budget. The wait future is scoped so its
-    // `&mut` borrow of `child` ends before the backgrounded arm moves it.
-    let outcome = {
-        let exit_fut = child.wait();
-        tokio::pin!(exit_fut);
-        tokio::select! {
-            biased;
-            _ = ctx.cancellation_token.cancelled() => DetachedOutcome::Cancelled,
-            code = &mut exit_fut => DetachedOutcome::Completed(code),
-            _ = tokio::time::sleep(timeout) => DetachedOutcome::Backgrounded,
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let terminal = {
+        let cancel = cancel.clone();
+        async move {
+            // `wait()` kills the process group even after a clean exit, which
+            // is what lets the copy tasks reach EOF — so it comes first.
+            let code = {
+                let exit = child.wait();
+                tokio::pin!(exit);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    code = &mut exit => Some(code),
+                }
+            };
+            if code.is_none() {
+                child.start_kill();
+                let _ = child.wait().await;
+            }
+            for task in copy_tasks {
+                let _ = task.await;
+            }
+            CommandExit { code }
         }
+        .boxed()
+    };
+    let into_result = {
+        let handle_id = handle_id.clone();
+        let command = command.to_string();
+        let stdout_path = stdout_path.clone();
+        let stderr_path = stderr_path.clone();
+        Box::new(move |exit: CommandExit| {
+            async move {
+                let tail = read_command_tail(&stdout_path, &stderr_path).await;
+                let exit_code = exit.code.unwrap_or(-1);
+                let status = if exit_code == 0 {
+                    baybo_model::SubagentExitStatus::Completed
+                } else {
+                    baybo_model::SubagentExitStatus::Failed {
+                        reason: format!("exit code {exit_code}"),
+                    }
+                };
+                baybo_model::PendingBackgroundResult::command(
+                    handle_id,
+                    command,
+                    exit_code,
+                    stdout_path.display().to_string(),
+                    tail,
+                    status,
+                )
+            }
+            .boxed()
+        }) as Box<dyn FnOnce(CommandExit) -> _ + Send>
+    };
+    let job = crate::background::Job {
+        handle: handle_id,
+        kind: COMMAND_JOB_KIND.to_string(),
+        summary: command.to_string(),
+        session: None,
+        cancel,
+        terminal,
+        into_result,
     };
 
-    match outcome {
-        DetachedOutcome::Cancelled => {
-            child.start_kill();
-            let _ = child.wait().await;
-            for t in copy_tasks {
-                let _ = t.await;
-            }
+    match crate::background::run(ctx, &BASH_BACKGROUND, request, timeout, job).await {
+        crate::background::Ran::Cancelled(_) => {
             let _ = tokio::fs::remove_file(&stdout_path).await;
             let _ = tokio::fs::remove_file(&stderr_path).await;
             Err(ToolError::Execution("cancelled".into()))
         }
-        DetachedOutcome::Completed(exit_code) => {
-            for t in copy_tasks {
-                let _ = t.await;
-            }
+        crate::background::Ran::TimedOut(_) => {
+            let _ = tokio::fs::remove_file(&stdout_path).await;
+            let _ = tokio::fs::remove_file(&stderr_path).await;
+            Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")))
+        }
+        crate::background::Ran::Finished(exit) => {
             let stdout = tokio::fs::read(&stdout_path).await.unwrap_or_default();
             let stderr = tokio::fs::read(&stderr_path).await.unwrap_or_default();
             // Transient foreground capture — drop the files now that the
@@ -1229,10 +1296,9 @@ async fn run_detached(
             let _ = tokio::fs::remove_file(&stderr_path).await;
             // A command that completed in-window (the common fast-failing case)
             // still gets the auto-permission on-failure judge — same as the
-            // blocking path. A command that overran and backgrounded does not
-            // (below).
+            // blocking path. A command that overran and backgrounded does not.
             let out = crate::SandboxedOutput {
-                exit_code,
+                exit_code: exit.code.unwrap_or(-1),
                 stdout,
                 stderr,
                 timed_out: false,
@@ -1256,63 +1322,58 @@ async fn run_detached(
                 .await?,
             ))
         }
-        DetachedOutcome::Backgrounded => {
+        crate::background::Ran::Backgrounded(backgrounded) => {
             let display_path = stdout_path.display().to_string();
-            let stderr_display_path = stderr_path.display().to_string();
-            let secret_risk_note = if extra_env.secret_values.is_empty() {
-                ""
-            } else {
+            let mut details = vec![format!(
+                "output: streaming to `{display_path}` (Read it for progress)"
+            )];
+            if !extra_env.secret_values.is_empty() {
                 tracing::warn!(
                     target: "baybo::tools::bash",
                     command = %command,
                     secret_env_count = extra_env.secret_values.len(),
                     stdout_path = %display_path,
-                    stderr_path = %stderr_display_path,
+                    stderr_path = %stderr_path.display(),
                     "background Bash command injected secret_env; output files are not redacted"
                 );
-                " Secret environment variables were injected; background output files and completion tails are stored raw and are not secret-redacted."
-            };
-            let turn = DetachedCommand {
-                handle_id: handle_id.clone(),
-                session_id: ctx.session_id.clone(),
-                command: command.to_string(),
-                child,
-                copy_tasks,
-                stdout_path,
-                stderr_path,
-            };
-            let returned = sink.detach_command(turn).await;
-            Ok(Some(ToolOutput::Text(background_handoff(
-                timeout,
-                &returned,
-                &display_path,
-                secret_risk_note,
+                details.push(SECRET_OUTPUT_RISK_NOTE.to_string());
+            }
+            Ok(Some(ToolOutput::Text(crate::background::ack(
+                &backgrounded,
+                &details,
             ))))
         }
     }
 }
 
-/// What a command pushed to the background hands back.
-///
-/// Carries [`baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE`] rather than a
-/// second wording of it: that rule has one home, and this is one of the three
-/// dispatch points that deliver it (the other two are the subagent spawner's
-/// explicit and auto-converted paths). Delivering it here rather than from the
-/// system prompt is also what lets `PromptShape::Issue` drop the standing
-/// version — the rule only becomes actionable once something is actually in
-/// the background.
-fn background_handoff(
-    timeout: std::time::Duration,
-    handle: &str,
-    display_path: &str,
-    secret_risk_note: &str,
-) -> String {
-    format!(
-        "Command still running after {timeout:?}; moved to the background as `{handle}`. \
-         Output is streaming to `{display_path}` (Read it for progress). {guidance}\
-         {secret_risk_note}",
-        guidance = baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE
-    )
+const SECRET_OUTPUT_RISK_NOTE: &str = "warning: secret environment variables were injected; background output files and completion tails are stored raw and are not secret-redacted.";
+
+/// The completion notification's view of a command's output: the tail of
+/// each stream, labelled.
+async fn read_command_tail(stdout_path: &Path, stderr_path: &Path) -> String {
+    let out = read_file_tail(stdout_path, COMMAND_OUTPUT_TAIL_BYTES).await;
+    let err = read_file_tail(stderr_path, COMMAND_OUTPUT_TAIL_BYTES).await;
+    match (out.trim().is_empty(), err.trim().is_empty()) {
+        (true, true) => "[no output]".to_string(),
+        (false, true) => out,
+        (true, false) => format!("[stderr]\n{err}"),
+        (false, false) => format!("{out}\n[stderr]\n{err}"),
+    }
+}
+
+/// The last `max_bytes` of `path`, lossily decoded. Empty when unreadable.
+async fn read_file_tail(path: &Path, max_bytes: u64) -> String {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let Ok(mut f) = tokio::fs::File::open(path).await else {
+        return String::new();
+    };
+    let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+    if len > max_bytes {
+        let _ = f.seek(std::io::SeekFrom::Start(len - max_bytes)).await;
+    }
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 async fn spawn_detached_child(
@@ -3561,23 +3622,19 @@ mod tests {
         ctx
     }
 
-    /// A `BackgroundJobSink` that records `(handle_id, command)` and drains
-    /// the handed-off child so the test doesn't leak it.
+    /// A `BackgroundJobSink` that records `(handle, command)` and ends the
+    /// handed-over job — cancelling it kills the child and drains its copy
+    /// tasks — so the test doesn't leak it.
     struct RecordingSink {
         seen: Arc<Mutex<Option<(String, String)>>>,
     }
 
     #[async_trait]
-    impl crate::BackgroundJobSink for RecordingSink {
-        async fn detach_command(&self, mut turn: crate::DetachedCommand) -> String {
-            turn.child.start_kill();
-            let _ = turn.child.wait().await;
-            for t in turn.copy_tasks.drain(..) {
-                let _ = t.await;
-            }
-            let handle = turn.handle_id.clone();
-            *self.seen.lock() = Some((handle.clone(), turn.command.clone()));
-            handle
+    impl crate::background::BackgroundJobSink for RecordingSink {
+        async fn adopt(&self, job: crate::background::DetachedJob) {
+            job.cancel.cancel();
+            let _ = job.result.await;
+            *self.seen.lock() = Some((job.handle, job.summary));
         }
     }
 
@@ -4049,7 +4106,6 @@ mod tests {
     #[tokio::test]
     async fn detached_command_completing_in_window_returns_normal_result() {
         let (ctx, seen) = ctx_for_detached();
-        let sink = ctx.background_jobs.clone().unwrap();
         let args = vec!["-c".into(), "echo hi".into()];
         let tool = BashTool::for_test();
         let out = run_detached(
@@ -4061,7 +4117,7 @@ mod tests {
             &ChildEnv::default(),
             Duration::from_secs(5),
             &ctx,
-            &sink,
+            &crate::background::BackgroundRequest::default(),
             SandboxEscapePolicy::None,
         )
         .await
@@ -4080,7 +4136,6 @@ mod tests {
     #[tokio::test]
     async fn detached_command_overrunning_budget_goes_to_background() {
         let (ctx, seen) = ctx_for_detached();
-        let sink = ctx.background_jobs.clone().unwrap();
         let args = vec!["-c".into(), "sleep 30".into()];
         let tool = BashTool::for_test();
         let out = run_detached(
@@ -4092,7 +4147,7 @@ mod tests {
             &ChildEnv::default(),
             Duration::from_millis(150),
             &ctx,
-            &sink,
+            &crate::background::BackgroundRequest::default(),
             SandboxEscapePolicy::None,
         )
         .await
@@ -4138,7 +4193,7 @@ mod tests {
         );
     }
 
-    /// An ineligible turn (a cron fire's own run, a nested subagent) keeps
+    /// An ineligible turn (a nested subagent, a card's run) keeps
     /// kill-on-timeout even with a sink wired: the sink is a capability, the
     /// gate is `background_eligible`. Same command + timeout as the test
     /// above, which backgrounds.
@@ -4208,7 +4263,6 @@ mod tests {
     #[tokio::test]
     async fn detached_unsandboxed_cancel_reaps_process_group() {
         let (ctx, _seen) = ctx_for_detached();
-        let sink = ctx.background_jobs.clone().unwrap();
         let pidfile = std::env::temp_dir().join(format!(
             "baybo-bg-pgkill-{}-{}.pid",
             std::process::id(),
@@ -4234,7 +4288,7 @@ mod tests {
             &ChildEnv::default(),
             Duration::from_millis(150),
             &ctx,
-            &sink,
+            &crate::background::BackgroundRequest::default(),
             SandboxEscapePolicy::None,
         )
         .await
@@ -6428,30 +6482,5 @@ mod tests {
                 .any(|l| l == "BAYBO_TEST_SECRET=injected-value"),
             "injected env var must reach the child:\n{stdout}"
         );
-    }
-}
-
-#[cfg(test)]
-mod background_handoff_tests {
-    use super::background_handoff;
-
-    /// The handoff carries the yield rule verbatim. This is the only place it
-    /// reaches a card's run: `PromptShape::Issue` drops the standing hint
-    /// because every dispatch delivers it here instead, so a reworded copy
-    /// here would silently leave that run with no rule at all.
-    #[test]
-    fn a_backgrounded_command_hands_back_the_one_yield_rule() {
-        let text = background_handoff(
-            std::time::Duration::from_secs(120),
-            "bg-7",
-            "/w/out.log",
-            "",
-        );
-        assert!(
-            text.contains(baybo_model::BACKGROUND_DISPATCH_YIELD_GUIDANCE),
-            "the shared rule must be present verbatim: {text}"
-        );
-        assert!(text.contains("bg-7"), "{text}");
-        assert!(text.contains("/w/out.log"), "{text}");
     }
 }

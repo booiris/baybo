@@ -221,6 +221,7 @@ pub struct AgentTestHarnessBuilder {
     /// off: with one stub serving every call, a title `chat()` would take
     /// the reply a test queued for a compaction or a request count.
     title_sink: Option<Arc<dyn baybo_agent::SessionTitleSink>>,
+    background_jobs: Option<Arc<dyn baybo_tools::background::BackgroundJobSink>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -242,6 +243,7 @@ impl Default for AgentTestHarnessBuilder {
             chat_gate: None,
             model_supports_vision: false,
             title_sink: None,
+            background_jobs: None,
         }
     }
 }
@@ -334,6 +336,16 @@ impl AgentTestHarnessBuilder {
     /// `push_response` for it.
     pub fn with_title_sink(mut self, sink: Arc<dyn baybo_agent::SessionTitleSink>) -> Self {
         self.title_sink = Some(sink);
+        self
+    }
+
+    /// Wire the sink background-capable tools hand their work to. Defaults to
+    /// `None`, so nothing backgrounds unless a test asks for it.
+    pub fn with_background_jobs(
+        mut self,
+        sink: Arc<dyn baybo_tools::background::BackgroundJobSink>,
+    ) -> Self {
+        self.background_jobs = Some(sink);
         self
     }
 
@@ -484,7 +496,7 @@ impl AgentTestHarnessBuilder {
             None,
             None,
             virtual_reads,
-            None,
+            self.background_jobs,
             None,
             None,
         ));

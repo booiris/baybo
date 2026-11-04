@@ -807,15 +807,18 @@ pub async fn build_managers(
         });
     }
 
-    // Background-turn sink for "Bash timeout → background". The manager
-    // routes completion notifications via the supervisor, which is built
-    // further down, so it holds it behind a `OnceLock` set right after.
+    // The one background-job sink every background-capable tool hands its
+    // work to. It routes completion notifications via the supervisor, which
+    // is built further down, so it holds it behind a `OnceLock` set right
+    // after.
     let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
     let bg_manager = Arc::new(baybo_agent::BackgroundJobManager::new(
         Arc::clone(&bg_supervisor_slot),
+        Arc::clone(&session_manager),
         shutdown.cancellation_token(),
     ));
-    let background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>> = Some(bg_manager.clone());
+    let background_jobs: Option<Arc<dyn baybo_tools::background::BackgroundJobSink>> =
+        Some(bg_manager.clone());
     let background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>> = Some(bg_manager);
 
     // `ToolExecutor` doesn't store an LLM handle; the active
@@ -1168,7 +1171,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         baybo_agent::runtime::subagent_spawner::ActorSubagentSpawner::from_config(
             baybo_agent::runtime::subagent_spawner::SubagentSpawnerConfig {
                 session_manager: Arc::clone(&graph.session_manager),
-                supervisor: supervisor.clone(),
                 dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
                 cost_manager: Arc::clone(&cost_manager),
                 turn_lifecycle: Arc::clone(&graph.turn_lifecycle),

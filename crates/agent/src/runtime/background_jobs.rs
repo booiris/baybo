@@ -1,31 +1,32 @@
-//! Runtime side of background jobs. Two things live here:
+//! Runtime side of background jobs: the [`BackgroundJobSink`] every
+//! background-capable tool hands its work to once it runs past its turn, and
+//! the escort that sees each job to its end and routes an
+//! [`AgentMessage::BackgroundJobFinished`] back to the parent session.
+//! Whether a turn may create background work at all is
+//! [`background_eligible`]; the foreground window before a job gets here is
+//! [`baybo_tools::background::run`].
 //!
-//! * [`background_eligible`] — the per-turn gate deciding whether work may be
-//!   backgrounded at all. Both the `Bash` and the subagent path read it, so it
-//!   is defined once here rather than in either consumer.
-//! * The "Bash timeout → background" machinery: the [`BackgroundJobSink`] the
-//!   tool layer hands a still-running command to, plus the detached escort
-//!   that streams it to completion and routes a
-//!   [`AgentMessage::BackgroundJobFinished`] back to the parent session.
-//!
-//! The escort reuses the supervisor's in-flight-background registry (shared
-//! with background subagents) for two things: pinning the parent against the
-//! idle reaper while the command runs, and `/stop` suppression — `/stop`
-//! cancels the registered token and drains the entry, so the escort kills
-//! the child and skips delivery (a user-stopped result must not surface).
+//! The escort uses the supervisor's in-flight registry for two things:
+//! pinning the parent against the idle reaper while the job runs, and `/stop`
+//! suppression — `/stop` / `JobStop` cancel the registered token and drain
+//! the entry, so the escort sees the job end and skips delivery (a
+//! user-stopped result must not surface). Process shutdown cancels the job
+//! too, and is never reported as a failure.
 
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use baybo_model::{PendingBackgroundResult, Session, SessionId, SubagentExitStatus};
-use baybo_tools::{BackgroundJobControl, BackgroundJobInfo, BackgroundJobSink, DetachedCommand};
+use baybo_model::Session;
+use baybo_session::SessionManager;
+use baybo_tools::background::{BackgroundJobSink, DetachedJob};
+use baybo_tools::{BackgroundJobControl, BackgroundJobInfo};
 use baybo_turn::TurnInputKind;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
-use crate::actor::supervisor::AgentSupervisor;
+use crate::actor::supervisor::{AgentSupervisor, InFlightJob};
 
 /// Whether this turn may **create** background work — a `Bash` command that
 /// converts to background on timeout, or a subagent that converts (or is
@@ -46,28 +47,24 @@ pub(crate) fn background_eligible(session: &Session, turn_kind: TurnInputKind) -
     session.can_host_background_jobs() && !matches!(turn_kind, TurnInputKind::Cron)
 }
 
-/// In-flight-registry label for a detached command (the registry is shared
-/// with background subagents, which use the subagent profile name here).
-const COMMAND_JOB_LABEL: &str = "command";
-
-/// How much of each output file to inline in the completion notification.
-/// The full output stays on disk for the agent to `Read`.
-const COMMAND_OUTPUT_TAIL_BYTES: u64 = 8 * 1024;
-
-/// Implements [`BackgroundJobSink`]: takes a detached command, registers it
-/// (pinning the parent), and spawns an escort that delivers the result when
-/// it finishes. Constructed before the supervisor exists in the boot
-/// sequence, so it holds the supervisor behind a `OnceLock` set right after
-/// the supervisor is built.
+/// Implements [`BackgroundJobSink`] and [`BackgroundJobControl`]. Constructed
+/// before the supervisor exists in the boot sequence, so it holds the
+/// supervisor behind a `OnceLock` set right after the supervisor is built.
 pub struct BackgroundJobManager {
     supervisor: Arc<OnceLock<AgentSupervisor>>,
+    session_manager: Arc<SessionManager>,
     shutdown: CancellationToken,
 }
 
 impl BackgroundJobManager {
-    pub fn new(supervisor: Arc<OnceLock<AgentSupervisor>>, shutdown: CancellationToken) -> Self {
+    pub fn new(
+        supervisor: Arc<OnceLock<AgentSupervisor>>,
+        session_manager: Arc<SessionManager>,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             supervisor,
+            session_manager,
             shutdown,
         }
     }
@@ -75,61 +72,53 @@ impl BackgroundJobManager {
 
 #[async_trait]
 impl BackgroundJobSink for BackgroundJobManager {
-    async fn detach_command(&self, job: DetachedCommand) -> String {
-        let handle_id = job.handle_id.clone();
-        let parent_id = job.session_id.clone();
-        // Synthetic child id = the handle, so the command rides the same
-        // per-parent in-flight map background subagents use (pin + /stop).
-        let registry_id = SessionId::from(handle_id.clone());
-        let cancel = CancellationToken::new();
-        if let Some(sup) = self.supervisor.get() {
-            sup.note_background_subagent_started(
-                &parent_id,
-                &registry_id,
-                COMMAND_JOB_LABEL,
-                &job.command,
-                &handle_id,
-                cancel.clone(),
-            );
-        } else {
+    async fn adopt(&self, job: DetachedJob) {
+        let Some(sup) = self.supervisor.get().cloned() else {
             warn!(
-                %handle_id,
-                "background command dispatched before supervisor wired; result will be lost"
+                handle = %job.handle,
+                "background job dispatched before supervisor wired; result will be lost"
             );
-        }
-        let supervisor = Arc::clone(&self.supervisor);
+            return;
+        };
+        sup.note_background_job_started(
+            &job.parent,
+            InFlightJob {
+                handle: job.handle.clone(),
+                kind: job.kind.clone(),
+                task_summary: job.summary.clone(),
+                session: job.session.clone(),
+                cancel_token: job.cancel.clone(),
+            },
+        );
+        // Registering and spawning the escort happen with no await between
+        // them: `adopt` runs inside a tool call the agent loop may drop at any
+        // await, and a registered job with no escort would never clear.
+        let session_manager = Arc::clone(&self.session_manager);
         let shutdown = self.shutdown.clone();
-        let returned = handle_id.clone();
         tokio::spawn(async move {
-            escort_command(
-                CommandEscort {
-                    supervisor,
-                    parent_id,
-                    registry_id,
-                    handle_id,
-                    cancel,
-                    shutdown,
-                },
-                job,
-            )
-            .await;
+            // A job going to the background is activity on the parent: it
+            // keeps the session's recency honest while nothing else is said.
+            if let Err(e) = session_manager.touch(&job.parent).await {
+                warn!(
+                    parent_session_id = %job.parent,
+                    error = %e,
+                    "background job: failed to touch parent session"
+                );
+            }
+            escort(sup, shutdown, job).await;
         });
-        returned
     }
 }
 
 #[async_trait]
 impl BackgroundJobControl for BackgroundJobManager {
-    async fn list(&self, session_id: &SessionId) -> Vec<BackgroundJobInfo> {
+    async fn list(&self, session_id: &baybo_model::SessionId) -> Vec<BackgroundJobInfo> {
         let Some(sup) = self.supervisor.get() else {
             return Vec::new();
         };
         sup.list_in_flight_background(session_id)
             .into_iter()
-            // Report the advertised handle, not the registry key — for a
-            // subagent the key is its child session id, but the agent only
-            // knows the `bg-…` handle from the dispatch notice.
-            .map(|(_, info)| BackgroundJobInfo {
+            .map(|info| BackgroundJobInfo {
                 handle: info.handle,
                 kind: info.kind,
                 summary: info.task_summary,
@@ -137,7 +126,7 @@ impl BackgroundJobControl for BackgroundJobManager {
             .collect()
     }
 
-    async fn stop(&self, session_id: &SessionId, handle: &str) -> bool {
+    async fn stop(&self, session_id: &baybo_model::SessionId, handle: &str) -> bool {
         let Some(sup) = self.supervisor.get() else {
             return false;
         };
@@ -146,150 +135,214 @@ impl BackgroundJobControl for BackgroundJobManager {
     }
 }
 
-/// Await the detached child (or kill it on `/stop` / JobStop), flush its
-/// output files, then route a completion notification to the parent —
-/// unless `/stop` already drained the in-flight entry, in which case the
-/// delivery is suppressed.
-struct CommandEscort {
-    supervisor: Arc<OnceLock<AgentSupervisor>>,
-    parent_id: SessionId,
-    registry_id: SessionId,
-    handle_id: String,
-    cancel: CancellationToken,
-    shutdown: CancellationToken,
-}
-
-async fn escort_command(escort: CommandEscort, mut job: DetachedCommand) {
-    let CommandEscort {
-        supervisor,
-        parent_id,
-        registry_id,
-        handle_id,
+/// See the job to its end, then deliver its result to the parent — unless
+/// `/stop` / `JobStop` drained its in-flight entry, or the process is
+/// shutting down. The entry is cleared only AFTER delivery, so the reaper
+/// cannot tear the parent down between the job ending and its result
+/// reaching the mailbox.
+async fn escort(supervisor: AgentSupervisor, shutdown: CancellationToken, job: DetachedJob) {
+    let DetachedJob {
+        handle,
+        parent,
+        group,
         cancel,
-        shutdown,
-    } = escort;
+        result,
+        ..
+    } = job;
+    // A job that panics still has to leave the registry, or its parent stays
+    // pinned against the reaper and listed in `JobList` forever.
+    let mut result = std::panic::AssertUnwindSafe(result).catch_unwind();
     let outcome = tokio::select! {
         biased;
         _ = shutdown.cancelled() => {
-            job.child.start_kill();
-            let _ = job.child.wait().await;
-            CommandOutcome::Shutdown
+            cancel.cancel();
+            let _ = result.await;
+            None
         }
-        _ = cancel.cancelled() => {
-            job.child.start_kill();
-            let _ = job.child.wait().await;
-            CommandOutcome::Stopped
-        }
-        code = job.child.wait() => CommandOutcome::Exited(code),
+        outcome = &mut result => Some(outcome),
     };
-    // Drain the stdout/stderr → file copy tasks so the files are fully
-    // flushed before we read their tails.
-    for task in job.copy_tasks.drain(..) {
-        let _ = task.await;
-    }
-
-    if matches!(outcome, CommandOutcome::Shutdown) || shutdown.is_cancelled() {
-        if let Some(sup) = supervisor.get() {
-            sup.note_background_subagent_finished(&parent_id, &registry_id);
-        }
+    let Some(outcome) = outcome.filter(|_| !shutdown.is_cancelled()) else {
+        supervisor.note_background_job_finished(&parent, &handle);
         debug!(
-            parent_session_id = %parent_id,
-            %handle_id,
-            "background command stopped during process shutdown; suppressing delivery"
+            parent_session_id = %parent,
+            %handle,
+            "background job stopped during process shutdown; suppressing delivery"
+        );
+        return;
+    };
+    let Ok(mut pending) = outcome else {
+        supervisor.note_background_job_finished(&parent, &handle);
+        warn!(
+            parent_session_id = %parent,
+            %handle,
+            "background job panicked; nothing to deliver"
+        );
+        return;
+    };
+    if !supervisor.is_background_job_in_flight(&parent, &handle) {
+        debug!(
+            parent_session_id = %parent,
+            %handle,
+            "background job was stopped; suppressing delivery"
         );
         return;
     }
+    pending.group = group;
+    let delivered = supervisor
+        .route(
+            &parent,
+            AgentMessage::BackgroundJobFinished(Box::new(pending)),
+        )
+        .await;
+    if !delivered {
+        warn!(
+            parent_session_id = %parent,
+            %handle,
+            "background job result could not be routed — parent actor not registered"
+        );
+    }
+    supervisor.note_background_job_finished(&parent, &handle);
+}
 
-    let Some(sup) = supervisor.get() else {
-        return;
-    };
-    // PEEK (don't clear) — an absent marker means `/stop` already drained
-    // this command, so suppress delivery; the clear happens below.
-    if sup.is_background_subagent_in_flight(&parent_id, &registry_id) {
-        let tail = read_command_tail(&job.stdout_path, &job.stderr_path).await;
-        // No `Cancelled` arm: a `/stop` (or `JobStop`) cancels the token AND
-        // drains the in-flight marker, so a cancelled command fails the peek
-        // above and is suppressed — it never reaches this delivery branch.
-        // Here the child ran to a real exit.
-        let exit_code = match outcome {
-            CommandOutcome::Exited(code) => code,
-            CommandOutcome::Stopped => -1,
-            CommandOutcome::Shutdown => return,
-        };
-        let status = if exit_code == 0 {
-            SubagentExitStatus::Completed
-        } else {
-            SubagentExitStatus::Failed {
-                reason: format!("exit code {exit_code}"),
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use baybo_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
+    use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
+    use futures::FutureExt;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::*;
+    use crate::actor::mailbox::{self, MailboxReceiver};
+
+    struct Fixture {
+        manager: BackgroundJobManager,
+        supervisor: AgentSupervisor,
+        parent: SessionId,
+        mailbox: MailboxReceiver<AgentMessage>,
+    }
+
+    fn fixture() -> Fixture {
+        let (tx, _rx) = mpsc::channel(8);
+        let supervisor = AgentSupervisor::new(tx);
+        let parent = SessionId::from("parent");
+        let (sender, mailbox) = mailbox::channel(8);
+        supervisor
+            .register_if_absent(parent.clone(), sender)
+            .expect("parent registers once");
+        let slot = Arc::new(OnceLock::new());
+        assert!(slot.set(supervisor.clone()).is_ok());
+        let sessions = Arc::new(SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        ));
+        Fixture {
+            manager: BackgroundJobManager::new(slot, sessions, CancellationToken::new()),
+            supervisor,
+            parent,
+            mailbox,
+        }
+    }
+
+    /// A job whose result is ready once `finish` fires — or, being cancelled,
+    /// once its token does.
+    fn job(parent: &SessionId, group: Option<&str>) -> (DetachedJob, oneshot::Sender<()>) {
+        let (finish, finished) = oneshot::channel::<()>();
+        let cancel = CancellationToken::new();
+        let result = {
+            let cancel = cancel.clone();
+            async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = finished => {}
+                }
+                PendingBackgroundResult::command(
+                    "bg-1",
+                    "make",
+                    0,
+                    "/dev/null",
+                    "ok",
+                    SubagentExitStatus::Completed,
+                )
             }
+            .boxed()
         };
-        let pending = PendingBackgroundResult::command(
-            handle_id.clone(),
-            job.command.clone(),
-            exit_code,
-            job.stdout_path.display().to_string(),
-            tail,
-            status,
+        let job = DetachedJob {
+            handle: "bg-1".into(),
+            parent: parent.clone(),
+            kind: "command".into(),
+            summary: "make".into(),
+            session: None,
+            group: group.map(str::to_string),
+            cancel,
+            result,
+        };
+        (job, finish)
+    }
+
+    async fn settle(supervisor: &AgentSupervisor, parent: &SessionId) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while supervisor.has_in_flight_background_jobs(parent) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the escort clears the job");
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_is_delivered_to_its_parent_with_its_cohort() {
+        let mut fx = fixture();
+        let (job, finish) = job(&fx.parent, Some("turn::g"));
+        fx.manager.adopt(job).await;
+        assert!(
+            fx.supervisor
+                .is_background_job_in_flight(&fx.parent, "bg-1")
         );
-        let delivered = sup
-            .route(
-                &parent_id,
-                AgentMessage::BackgroundJobFinished(Box::new(pending)),
-            )
-            .await;
-        if !delivered {
-            warn!(
-                parent_session_id = %parent_id,
-                %handle_id,
-                "background command terminal could not be routed — parent actor not registered; output remains on disk"
-            );
-        }
-    } else {
-        debug!(
-            parent_session_id = %parent_id,
-            %handle_id,
-            "background command was /stop-cancelled; suppressing delivery"
+
+        finish.send(()).unwrap();
+        settle(&fx.supervisor, &fx.parent).await;
+        let Ok(AgentMessage::BackgroundJobFinished(pending)) = fx.mailbox.try_recv() else {
+            panic!("the result reaches the parent's mailbox");
+        };
+        assert_eq!(pending.handle_id, "bg-1");
+        assert_eq!(pending.group.as_deref(), Some("turn::g"));
+    }
+
+    /// A job whose work panics still leaves the registry, so its parent is
+    /// neither pinned against the reaper nor listed in `JobList` forever.
+    #[tokio::test]
+    async fn a_panicking_job_still_clears_its_registry_entry() {
+        let mut fx = fixture();
+        let (mut job, _finish) = job(&fx.parent, None);
+        job.result = async { panic!("the job blew up") }.boxed();
+        fx.manager.adopt(job).await;
+
+        settle(&fx.supervisor, &fx.parent).await;
+        assert!(fx.mailbox.try_recv().is_err(), "nothing to deliver");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_job_ends_and_delivers_nothing() {
+        let mut fx = fixture();
+        let (job, _finish) = job(&fx.parent, None);
+        fx.manager.adopt(job).await;
+
+        assert!(
+            fx.manager.stop(&fx.parent, "bg-1").await,
+            "JobStop finds it"
+        );
+        // The stop drained the entry at once; give the escort time to see the
+        // cancelled job end and decide what to do with its result.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            fx.mailbox.try_recv().is_err(),
+            "a user-stopped result must not surface"
         );
     }
-    sup.note_background_subagent_finished(&parent_id, &registry_id);
 }
 
-enum CommandOutcome {
-    Exited(i32),
-    Stopped,
-    Shutdown,
-}
-
-/// Combined tail of a command's stdout + stderr files for the completion
-/// notification. Empty streams are dropped; if both have content the stderr
-/// tail is fenced under a marker.
-async fn read_command_tail(stdout_path: &Path, stderr_path: &Path) -> String {
-    let out = read_file_tail(stdout_path, COMMAND_OUTPUT_TAIL_BYTES).await;
-    let err = read_file_tail(stderr_path, COMMAND_OUTPUT_TAIL_BYTES).await;
-    match (out.trim().is_empty(), err.trim().is_empty()) {
-        (true, true) => "[no output]".to_string(),
-        (false, true) => out,
-        (true, false) => format!("[stderr]\n{err}"),
-        (false, false) => format!("{out}\n[stderr]\n{err}"),
-    }
-}
-
-/// Read the last `max_bytes` of a file (whole file if smaller), lossily as
-/// UTF-8. Returns empty on any IO error (the file path is still surfaced).
-async fn read_file_tail(path: &Path, max_bytes: u64) -> String {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-    let mut f = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return String::new(),
-    };
-    let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
-    if len > max_bytes {
-        let _ = f.seek(SeekFrom::Start(len - max_bytes)).await;
-    }
-    let mut buf = Vec::new();
-    let _ = f.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).into_owned()
-}
 #[cfg(test)]
 mod background_eligible_tests {
     //! The turn half of the background-job gate. The session half lives on
