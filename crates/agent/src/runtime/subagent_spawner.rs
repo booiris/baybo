@@ -1578,9 +1578,9 @@ mod resume_validation_tests {
         let child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
         assert!(!child.can_host_background_jobs());
 
-        // One-shot cron fire: its follow-ups are forwarded to the origin
-        // conversation, so it qualifies only when it has one.
-        assert!(mk_cron("cr", false, Some("origin")).can_host_background_jobs());
+        // One-shot cron fire: a private workspace whose actor stops after the
+        // fire, so there is nowhere for a result to land — even with an origin.
+        assert!(!mk_cron("cr", false, Some("origin")).can_host_background_jobs());
         assert!(!mk_cron("cr-orphan", false, None).can_host_background_jobs());
 
         // Recurring cron fire's own conversation: listed, replyable, and its

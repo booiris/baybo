@@ -9,7 +9,7 @@
 //!
 //! The `Router` struct itself, its `select!`-driven [`Router::run`]
 //! loop, and the one-shot actor spawn helper ([`build_oneshot_actor`])
-//! used by the issue-run path live here in [`mod@self`]. Subagent spawns are
+//! used by the cron path live here in [`mod@self`]. Subagent spawns are
 //! handled out-of-band by [`crate::runtime::subagent_spawner`], which the
 //! `spawn_subagent` tool calls directly.
 
@@ -142,11 +142,10 @@ pub type ActorSpawner = Arc<
 /// Build a one-shot actor: derive a child `actor_token` from
 /// `parent_token`, hand the session to `actor_spawner` (which spawns the
 /// actor's run loop on its own task), and return the mailbox + token.
-/// Shared by the router's issue-run path and the subagent spawner — neither
+/// Shared by the router's cron path and the subagent spawner — neither
 /// registers the handle with the supervisor (one-shot sessions have no
 /// follow-up traffic, so registering would just accumulate dangling
-/// handles). Cron fires do have follow-up traffic — their background
-/// results — so both kinds register through `route_or_spawn` instead. The persistent counterpart for user sessions lives in
+/// handles). The persistent counterpart for user sessions lives in
 /// [`AgentSupervisor::route_or_spawn`].
 pub(crate) fn build_oneshot_actor(
     actor_spawner: &ActorSpawner,
@@ -431,7 +430,7 @@ impl Router {
         self.supervisor.shutdown_all().await;
     }
 
-    /// Thin instance wrapper over [`build_oneshot_actor`] for the issue-run
+    /// Thin instance wrapper over [`build_oneshot_actor`] for the cron
     /// path, which has `&self` in hand.
     fn spawn_oneshot_actor(
         &self,

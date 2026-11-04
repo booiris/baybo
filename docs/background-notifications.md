@@ -10,11 +10,8 @@ only what happens to the notification turn's reply differs by session. In a
 recurring fire's conversation, a batch carrying a handle the fire's own turn
 started (`fire_handles`) is the fire's report: the turn may call
 `report_nothing`, and a reply un-hides the conversation and pushes via a
-zero-inference `CronNotification` turn on the reply row. In a one-shot fire's
-private workspace nothing is announced, streamed or dispatched; the cron waiter
-forwards the reply to the origin conversation, and a batch that exhausts its
-attempts completes a "review failed" follow-up instead of waiting for a user
-turn that cannot come (see [`modules/cron.md`](modules/cron.md)).
+zero-inference `CronNotification` turn on the reply row. A one-shot fire runs
+no background work (see [`modules/cron.md`](modules/cron.md)).
 
 ## Vocabulary and ownership
 

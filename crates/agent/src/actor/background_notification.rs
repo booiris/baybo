@@ -430,11 +430,7 @@ impl AgentActor {
         // prevent — it hashed the batch's handle set, so a result joining the
         // batch between a failed attempt and its retry produced a second
         // acknowledgement for the same work.
-        // A one-shot fire's workspace is never opened, so a notice there would
-        // reach nobody; its analysed follow-up is forwarded to the origin.
-        if append_outcome.was_inserted()
-            && !self.durable.session.trigger.is_private_cron_workspace()
-        {
+        if append_outcome.was_inserted() {
             self.announce_background_completion(&pending, prompt_ordinal)
                 .await;
         }
@@ -620,12 +616,6 @@ impl AgentActor {
                 .state
                 .background_notifications
                 .active_delivery = None;
-            if self.durable.session.trigger.is_private_cron_workspace() {
-                // Passive delivery waits for a user turn, and nobody can ever
-                // take one here — so tell the origin, which was promised
-                // results, that the review failed.
-                self.report_follow_up_failure().await;
-            }
         }
         self.persist_session_state_with_activity("background_notification_failed")
             .await;
@@ -636,10 +626,7 @@ impl AgentActor {
         // compatibility; this path now covers every background-turn kind. Its
         // delta sink exposes reasoning, tool progress, and answer prose before
         // the canonical final Message.
-        // A one-shot fire's workspace is never opened, so nothing streams from
-        // it; the cron waiter forwards the final reply to the origin.
-        let private_workspace = self.durable.session.trigger.is_private_cron_workspace();
-        let response_tx = (!private_workspace).then(|| self.volatile.response_tx.clone());
+        let response_tx = self.volatile.response_tx.clone();
         // Arm the request-time retry cue for the duration of the turn. It rides
         // a request only while the transcript tail is an assistant row (a prior
         // attempt's cancelled salvage) — so the fresh path, where the tail is
@@ -664,7 +651,7 @@ impl AgentActor {
             .run_agent_loop(
                 TurnInput::SubagentNotification { content },
                 None,
-                response_tx,
+                Some(response_tx),
                 None,
                 None,
                 silence.clone(),
@@ -723,11 +710,6 @@ impl AgentActor {
                         session_id = %self.durable.session.id,
                         "cron follow-up called report_nothing; suppressing send"
                     );
-                    return;
-                }
-                if private_workspace {
-                    // Nobody reads this workspace: the cron waiter forwards
-                    // the reply to the conversation that scheduled the job.
                     return;
                 }
                 let reply = (response.ordinal, response.content.clone());

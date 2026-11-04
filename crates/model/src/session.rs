@@ -187,20 +187,16 @@ impl TriggerSource {
     /// spelling of this is how the `on_timeout` descriptions came to promise
     /// a card's run something the runtime then refused it.
     ///
-    /// A cron fire qualifies when its follow-up has somewhere to be read: a
-    /// recurring fire's own conversation, or — for a one-shot — the origin
-    /// conversation its follow-ups are forwarded to.
+    /// A cron fire qualifies only as a recurring fire's own conversation,
+    /// where its follow-up is read. A one-shot fire's workspace is private and
+    /// its actor stops after the fire, so its work blocks / kills on timeout.
     ///
     /// The lineage half — a subagent's turn ends with the child — stays on
     /// [`Session`], which is the only place that knows it.
     pub fn can_host_background_jobs(&self) -> bool {
         match self {
             TriggerSource::User => true,
-            TriggerSource::Cron {
-                conversation,
-                origin_session_id,
-                ..
-            } => *conversation || origin_session_id.is_some(),
+            TriggerSource::Cron { conversation, .. } => *conversation,
             TriggerSource::Issue { .. } => false,
         }
     }
@@ -425,12 +421,10 @@ impl Session {
     /// Delivering a background result means running an autonomous
     /// notification turn in a registered actor whose reply reaches a
     /// conversation the user can open and read. Top-level user sessions
-    /// qualify; so does every cron fire with a readable destination (see
-    /// [`TriggerSource::can_host_background_jobs`]) — both kinds of fire
-    /// actor are registered and outlive their turn, and a one-shot's
-    /// follow-up replies are forwarded to its origin (see
-    /// `agent::actor::router::cron`). A subagent session's turn ends with the
-    /// child, so it keeps blocking / kill-on-timeout.
+    /// qualify, and so does a recurring cron fire's own conversation (see
+    /// [`TriggerSource::can_host_background_jobs`]). A one-shot fire's
+    /// workspace is private and unregistered, and a subagent session's turn
+    /// ends with the child, so both keep blocking / kill-on-timeout.
     ///
     /// Fixed for the session's life, which is what keeps the offered tool
     /// schemas — and so the prompt-cache prefix — stable across its turns.

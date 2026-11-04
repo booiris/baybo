@@ -82,22 +82,10 @@ const NOTIFICATION_BLANK_BODY: &str = "It ran, but produced no output.";
 /// Body used when a failed fire left no error detail to quote.
 const NOTIFICATION_FAILURE_UNKNOWN: &str = "No error detail was recorded.";
 
-/// Body used when a fire produced no text but left background work running:
-/// its result is not "nothing", it is still on the way.
+/// Body used when a recurring fire produced no text but started background
+/// work: its result is not "nothing", it is still on the way.
 pub const NOTIFICATION_BACKGROUND_PENDING_BODY: &str =
     "It started work that is still running in the background; the results will follow.";
-
-/// Body of the follow-up a one-shot fire reports when reviewing its
-/// background work's results kept failing: the origin was told results would
-/// follow, so it must hear that they will not.
-pub const NOTIFICATION_FOLLOW_UP_FAILED_BODY: &str = "The background work finished, but reviewing its results failed repeatedly, so no summary is available.";
-
-/// Header of a one-shot fire's background follow-up, forwarded into the
-/// conversation that scheduled it once the work the fire left running has
-/// been reviewed. Baked into the persisted row for the same reasons as
-/// [`NOTIFICATION_HEADER_SUCCESS`].
-const NOTIFICATION_HEADER_FOLLOW_UP: &str =
-    r#"⏰ Scheduled task "{{title}}" — background work finished:"#;
 
 /// The leading text block of a one-shot cron notification: a header naming the
 /// job, followed by `body` (the fire's reply text, a blank-run fallback, or the
@@ -120,15 +108,6 @@ pub fn frame_cron_notification(title: &str, failed: bool, body: &str) -> String 
         NOTIFICATION_BLANK_BODY
     };
     format!("{header}\n\n{body}")
-}
-
-/// The leading text block of a one-shot fire's background follow-up: a header
-/// naming the job, followed by `body` (the follow-up turn's reply text). The
-/// caller only forwards a follow-up that has something to say, so there is no
-/// blank fallback here.
-pub fn frame_cron_follow_up(title: &str, body: &str) -> String {
-    let header = NOTIFICATION_HEADER_FOLLOW_UP.replace("{{title}}", title);
-    format!("{header}\n\n{}", body.trim())
 }
 
 /// Recover the original instruction from synthesized cron content, for

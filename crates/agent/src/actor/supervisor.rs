@@ -168,14 +168,6 @@ impl AgentSupervisor {
             .unwrap_or_default()
     }
 
-    /// Every session that currently has background work in flight.
-    pub fn sessions_with_in_flight_background(&self) -> Vec<SessionId> {
-        self.in_flight_background_subagents
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect()
-    }
-
     pub fn has_in_flight_background_subagents(&self, parent_session_id: &SessionId) -> bool {
         self.in_flight_background_subagents
             .get(parent_session_id)
