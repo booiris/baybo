@@ -692,7 +692,7 @@ impl Tool for BashTool {
                 props.remove("on_timeout");
                 if let Some(timeout) = props.get_mut("timeout_ms") {
                     timeout["description"] = json!(
-                        "Execution deadline in milliseconds. Exceeding it terminates the command; this turn cannot run background jobs. Omit or use 0 for the tool-context default."
+                        "Exceeding it terminates the command. Use `0` for the tool-context default."
                     );
                 }
             }

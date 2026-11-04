@@ -137,7 +137,7 @@ impl Tool for CronReportNothingTool {
     }
 
     fn description(&self) -> String {
-        r#"For a recurring scheduled run ONLY: call this when the check you just performed found nothing the user needs to know about right now, so this run notifies no one — no message, no push. Use it for a job whose intent is to WATCH for a condition and speak up only when it holds (e.g. "check the build and tell me only if it broke", "let me know if that PR gets a review"). Do NOT use it to skip work you were asked to do: a job told to always produce something — a daily digest, a summary, a recurring reminder — must still produce it every run, even when the content is thin. When in doubt, report: a missed notification is worse than an extra one. Calling this suppresses this run's notification entirely, so produce no other reply. When a scheduled run moved work to the background, the same rule applies to the follow-up turn that reviews that work's result."#
+        r#"For a recurring scheduled run ONLY: call this when the check you just performed found nothing the user needs to know about right now, so this run notifies no one — no message, no push. Use it for a job whose intent is to WATCH for a condition and speak up only when it holds (e.g. "check the build and tell me only if it broke", "let me know if that PR gets a review"). Do NOT use it to skip work you were asked to do: a job told to always produce something — a daily digest, a summary, a recurring reminder — must still produce it every run, even when the content is thin. When in doubt, report: a missed notification is worse than an extra one. Calling this suppresses this run's notification entirely, so produce no other reply."#
             .to_string()
     }
 
