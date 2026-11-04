@@ -577,6 +577,10 @@ pub struct AgentLoop {
     /// ordinary work when the user asked for it between turns, and only
     /// becomes churn inside a single turn.
     progress_monitor: TurnProgressMonitor,
+    /// Handles of the jobs the current (or last finished) turn handed to the
+    /// background. Reset at the top of every turn; read once it ends through
+    /// [`Self::take_turn_background_handles`].
+    turn_background_handles: Vec<baybo_model::BackgroundHandle>,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -716,6 +720,7 @@ impl AgentLoop {
             title_sink,
             read_tracker: ReadTracker::default(),
             progress_monitor: TurnProgressMonitor::default(),
+            turn_background_handles: Vec::new(),
         }
     }
 
@@ -1026,13 +1031,13 @@ impl AgentLoop {
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
-        let background_eligible =
-            crate::runtime::background_jobs::background_eligible(session, turn_kind);
+        let background_eligible = session.can_host_background_jobs();
         self.context_manager.ensure_seeded().await?;
         // Churn and repeated failure are within-turn properties. Editing a
         // file back to how it was is exactly what "undo that" means when the
         // user asks between turns.
         self.progress_monitor.clear();
+        self.turn_background_handles.clear();
         self.context_manager.set_progress_observation(None);
 
         // Fire-and-forget at turn start so the title derives concurrently with
@@ -1660,11 +1665,15 @@ impl AgentLoop {
             // namespaced by this turn's `turn_id`, which the result's own
             // cohort key carries too, so a group name reused in a later turn
             // opens a fresh cohort.
-            if let Some(group) = executed.background_group.as_ref() {
-                session
-                    .state
-                    .background_notifications
-                    .register_group_member(turn_id, group);
+            if let Some(handed_over) = &executed.handed_over {
+                if let Some(group) = handed_over.group.as_ref() {
+                    session
+                        .state
+                        .background_notifications
+                        .register_group_member(turn_id, group);
+                }
+                self.turn_background_handles
+                    .push(handed_over.handle.clone());
             }
 
             let raw_result_text = match &executed.output {
@@ -2481,6 +2490,12 @@ impl AgentLoop {
             .context_manager
             .append_idempotent(source_event_id, &ChatMessage::agent_context(content))
             .await?)
+    }
+
+    /// The handles of the jobs the last turn handed to the background,
+    /// emptying the record.
+    pub(crate) fn take_turn_background_handles(&mut self) -> Vec<baybo_model::BackgroundHandle> {
+        std::mem::take(&mut self.turn_background_handles)
     }
 
     /// Arm or clear the request-time background-notification retry cue. Applied
@@ -3768,7 +3783,7 @@ mod tool_completion_summary_tests {
         ExecutedTool {
             output,
             approval,
-            background_group: None,
+            handed_over: None,
         }
     }
 

@@ -399,9 +399,9 @@ pub struct Session {
 pub const MAX_SESSION_TITLE_LEN: usize = 80;
 
 impl Session {
-    /// Whether a background job's completion notification could land here —
-    /// the **session** half of the background-job gate (detached subagents
-    /// and detached `Bash` commands).
+    /// Whether a turn in this session may create background work (detached
+    /// subagents and detached `Bash` commands): whether a job's completion
+    /// notification could land here.
     ///
     /// Delivering a background result means running an autonomous
     /// notification turn in a conversation the user can open and read, so
@@ -413,10 +413,11 @@ impl Session {
     /// invisible and deliberately unregistered, and a subagent session's
     /// turn ends with the child, so both keep blocking / kill-on-timeout.
     ///
-    /// The **turn** half lives in the agent loop: a cron fire's own turn
-    /// must still block rather than convert, so the fire's report is
-    /// complete by the time it notifies. See
-    /// `agent::runtime::background_jobs::background_eligible`.
+    /// That includes a recurring fire's own turn: it reports what it has,
+    /// and the result arrives as a follow-up (see
+    /// [`BackgroundNotificationState::fire_handles`]). Fixed for the
+    /// session's life, which keeps the offered tool schemas — and so the
+    /// prompt-cache prefix — stable across its turns.
     pub fn can_host_background_jobs(&self) -> bool {
         self.trigger.can_host_background_jobs()
             && match &self.lineage {
@@ -625,9 +626,26 @@ pub struct BackgroundNotificationState {
         skip_serializing_if = "Option::is_none"
     )]
     pub active_delivery: Option<BackgroundNotificationDelivery>,
+
+    /// Handles of the background jobs a recurring cron fire started — its own
+    /// turn, and the follow-ups reporting them, which may hand over more —
+    /// recorded as each of those turns ends. A notification batch carrying
+    /// one of them is the fire's real report — it may be silenced with
+    /// `report_nothing`, and it pushes — whereas work a user later starts by
+    /// replying in the same conversation reports like any chat's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fire_handles: Vec<crate::BackgroundHandle>,
 }
 
 impl BackgroundNotificationState {
+    /// Whether a batch settling `handle_ids` reports only work the cron fire
+    /// started (see [`Self::fire_handles`]). A batch that also carries work a
+    /// user started reports like any chat's: treating it as the fire's would
+    /// let `report_nothing` silence the user's own result.
+    pub fn reports_fire_work(&self, handle_ids: &[crate::BackgroundHandle]) -> bool {
+        !handle_ids.is_empty() && handle_ids.iter().all(|id| self.fire_handles.contains(id))
+    }
+
     /// Whether the actor must stay on its notification timer path.
     pub fn has_work(&self) -> bool {
         !self.buffered_results.is_empty()

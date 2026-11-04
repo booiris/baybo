@@ -316,20 +316,28 @@ pub trait BackgroundJobSink: Send + Sync {
     async fn adopt(&self, job: DetachedJob);
 }
 
-/// What the executor learns about the job a call started detached, so the
-/// agent loop can count a grouped call into its cohort. Filled by [`run`],
-/// read once the call returns.
+/// A job a call handed to the background.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandedOver {
+    pub handle: BackgroundHandle,
+    /// The group it was started under, if it was part of one.
+    pub group: Option<BackgroundGroupName>,
+}
+
+/// What the executor learns about the job a call handed to the background:
+/// the agent loop counts a grouped one into its cohort, and records every one
+/// as started by its turn. Filled by [`run`], read once the call returns.
 #[derive(Debug, Default)]
-pub struct DispatchRecord(parking_lot::Mutex<Option<BackgroundGroupName>>);
+pub struct DispatchRecord(parking_lot::Mutex<Option<HandedOver>>);
 
 impl DispatchRecord {
-    /// The raw group of the job this call started detached, if it had one.
-    pub fn take_group(&self) -> Option<BackgroundGroupName> {
+    /// The job this call handed to the background, if it handed one over.
+    pub fn take(&self) -> Option<HandedOver> {
         self.0.lock().take()
     }
 
-    fn record_group(&self, group: BackgroundGroupName) {
-        *self.0.lock() = Some(group);
+    fn record(&self, handed_over: HandedOver) {
+        *self.0.lock() = Some(handed_over);
     }
 }
 
@@ -395,12 +403,13 @@ pub async fn run<T: Send + 'static>(
     let on_timeout = match request {
         BackgroundRequest::Wait(on_timeout) => *on_timeout,
         BackgroundRequest::Detach { group } => {
-            if let Some(group) = group {
-                ctx.background_dispatch.record_group(group.clone());
-            }
             let cohort = group.as_ref().map(|g| CohortKey::new(ctx.turn_id, g));
             sink.adopt(detached(work, cohort)).await;
             stop_if_abandoned.disarm();
+            ctx.background_dispatch.record(HandedOver {
+                handle: handle.clone(),
+                group: group.clone(),
+            });
             return Ran::Backgrounded(Backgrounded {
                 handle,
                 how: BackgroundedHow::Dispatched,
@@ -423,6 +432,7 @@ pub async fn run<T: Send + 'static>(
             OnTimeout::Background => {
                 let handle = handle.clone();
                 sink.adopt(detached(work, None)).await;
+                ctx.background_dispatch.record(HandedOver { handle: handle.clone(), group: None });
                 Ran::Backgrounded(Backgrounded { handle, how: BackgroundedHow::Converted(window) })
             }
         }
@@ -682,6 +692,14 @@ mod tests {
             assert_eq!(adopted.handle, "bg-1");
             assert_eq!(adopted.parent, ctx.session_id);
             assert_eq!(adopted.cohort, None, "a converted job is never grouped");
+            assert_eq!(
+                ctx.background_dispatch.take(),
+                Some(HandedOver {
+                    handle: "bg-1".into(),
+                    group: None
+                }),
+                "a conversion is recorded as a hand-over too"
+            );
             finish.send(()).unwrap();
             assert_eq!(adopted.result.await.summary_text, "done");
         }
@@ -740,8 +758,11 @@ mod tests {
             };
             assert_eq!(backgrounded.how, BackgroundedHow::Dispatched);
             assert_eq!(
-                ctx.background_dispatch.take_group(),
-                BackgroundGroupName::parse("g")
+                ctx.background_dispatch.take(),
+                Some(HandedOver {
+                    handle: "bg-1".into(),
+                    group: BackgroundGroupName::parse("g")
+                })
             );
             let adopted = sink.0.lock().pop().expect("handed to the sink");
             assert_eq!(

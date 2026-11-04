@@ -5,6 +5,14 @@ subagents and detached `Bash` commands into their parent conversation. It does
 not cover cron-result delivery, progress notices, or background context
 summarisation; those are separate pipelines with different delivery contracts.
 
+A recurring cron fire uses this pipeline unchanged for work it moves to the
+background; only what happens to the notification turn differs. A batch
+carrying only handles the fire started (`fire_handles`) is the fire's report:
+the turn does not stream and may call `report_nothing`, a reply un-hides the
+conversation and pushes via a zero-inference `CronNotification` turn on the
+reply row, and a batch that exhausts its attempts posts a framed failure
+notice instead of settling passively (see [`modules/cron.md`](modules/cron.md)).
+
 ## Vocabulary and ownership
 
 | Concept | Meaning | Owner |

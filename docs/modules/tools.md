@@ -452,11 +452,10 @@ The detailed design is in [`../permission.md`](../permission.md).
 Tool schemas receive a `ToolSchemaContext` with the trigger and the session's
 `background_eligible` bit (`Session::can_host_background_jobs`, which also sees
 the lineage the trigger cannot), so a subagent with a user trigger is no longer
-offered options it cannot use. The bit is session-fixed, which keeps the offered
-schemas stable across a session's turns. Execution reads the per-turn
-`ToolContext::background_eligible`, which additionally refuses a cron fire's own
-turn; that turn is offered the options and runs them blocking, as it always
-has. Deferred discovery through `ToolSearch` reads the per-turn bit.
+offered options it cannot use. Execution reads the same bit
+(`ToolContext::background_eligible`), and so does deferred discovery through
+`ToolSearch`. It is session-fixed, which keeps the offered schemas stable
+across a session's turns.
 
 The background options themselves have one home, `baybo_tools::background`.
 A tool that can hand slow work to the background returns a `BackgroundSupport`

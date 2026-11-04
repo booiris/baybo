@@ -618,22 +618,60 @@ impl AgentActor {
                 reason,
                 "background notification delivery kept failing; degrading to passive delivery"
             );
+            let fire_report = self.delivery_reports_fire_work();
             self.durable
                 .session
                 .state
                 .background_notifications
                 .active_delivery = None;
+            if fire_report {
+                // Passive delivery waits for the user to come back to a
+                // conversation that may be hidden and was promised a report;
+                // a scheduled task must never end in silence, so say it failed.
+                self.unhide_for_cron_notification().await;
+                let title = self
+                    .durable
+                    .session
+                    .trigger
+                    .cron_job_title()
+                    .unwrap_or(baybo_context::prompts::cron::UNTITLED_JOB)
+                    .to_string();
+                self.report_cron_outcome(
+                    &title,
+                    true,
+                    baybo_context::prompts::cron::NOTIFICATION_FOLLOW_UP_FAILED_BODY,
+                )
+                .await;
+            }
         }
         self.persist_session_state_with_activity("background_notification_failed")
             .await;
     }
 
+    /// Whether the batch being delivered is a recurring cron fire's report
+    /// (see `BackgroundNotificationState::fire_handles`).
+    fn delivery_reports_fire_work(&self) -> bool {
+        let notifications = &self.durable.session.state.background_notifications;
+        self.durable.session.trigger.is_cron_conversation()
+            && notifications
+                .active_delivery
+                .as_ref()
+                .is_some_and(|delivery| notifications.reports_fire_work(&delivery.handle_ids))
+    }
+
     async fn drive_background_notification_turn(&mut self, content: Vec<ContentBlock>) {
+        // Work a recurring fire's own turn started comes back as the fire's
+        // real report: `report_nothing` may silence it exactly as it could the
+        // fire, and it pushes. Work a user started by replying there reports
+        // like any chat's.
+        let fire_report = self.delivery_reports_fire_work();
         // The persisted/public turn kind retains its historical name for data
         // compatibility; this path now covers every background-turn kind. Its
         // delta sink exposes reasoning, tool progress, and answer prose before
-        // the canonical final Message.
-        let response_tx = self.volatile.response_tx.clone();
+        // the canonical final Message — except for a fire's report, which,
+        // like the fire turn itself, does not stream: it may yet decide to
+        // stay silent.
+        let response_tx = (!fire_report).then(|| self.volatile.response_tx.clone());
         // Arm the request-time retry cue for the duration of the turn. It rides
         // a request only while the transcript tail is an assistant row (a prior
         // attempt's cancelled salvage) — so the fresh path, where the tail is
@@ -642,18 +680,31 @@ impl AgentActor {
         // This single arm covers every entry (fresh drain, timer retry, crash
         // replay), so no caller has to reason about the tail.
         self.volatile.agent_loop.set_notification_cue(true);
+        let silence = fire_report.then(baybo_tools::NotifySilence::new);
         let result = self
             .run_agent_loop(
                 TurnInput::SubagentNotification { content },
                 None,
-                Some(response_tx),
+                response_tx,
                 None,
                 None,
-                None,
+                silence.clone(),
                 None,
             )
             .await;
         self.volatile.agent_loop.set_notification_cue(false);
+        let silenced = silence.as_ref().is_some_and(|s| s.requested());
+        if fire_report {
+            // Work the fire's report hands over in turn is still the fire's:
+            // its own follow-up is the next part of the same report.
+            let handed_over = self.volatile.agent_loop.take_turn_background_handles();
+            self.durable
+                .session
+                .state
+                .background_notifications
+                .fire_handles
+                .extend(handed_over);
+        }
 
         match result {
             Ok(response) => {
@@ -666,7 +717,9 @@ impl AgentActor {
                     .as_ref()
                     .map(|delivery| delivery.failed_attempts)
                     .unwrap_or(0);
-                if let Some(gap) = self.unreported_background_results(&response.content) {
+                if !silenced
+                    && let Some(gap) = self.unreported_background_results(&response.content)
+                {
                     warn!(
                         session_id = %self.durable.session.id,
                         batch = gap.batch,
@@ -697,8 +750,25 @@ impl AgentActor {
                     }
                     return;
                 }
+                if silenced {
+                    debug!(
+                        session_id = %self.durable.session.id,
+                        "cron follow-up called report_nothing; suppressing send"
+                    );
+                    return;
+                }
+                let reply = (response.ordinal, response.content.clone());
+                if fire_report {
+                    // A silenced fire hid this conversation; a follow-up with
+                    // something to say is exactly what makes it relevant again,
+                    // and its push deep-links here.
+                    self.unhide_for_cron_notification().await;
+                }
                 self.send_response(response.into(), "background_notification")
                     .await;
+                if fire_report && let (Some(ordinal), content) = reply {
+                    self.push_cron_follow_up(content, ordinal).await;
+                }
             }
             Err(error) => {
                 if is_turn_cancelled(&error) {
