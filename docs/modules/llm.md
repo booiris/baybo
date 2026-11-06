@@ -150,6 +150,39 @@ No other provider's request or response is touched. Transcripts written
 before this fix can still hold repeated ids; context hydration disambiguates
 them (see [`context.md`](context.md)).
 
+### Tool results on the wire
+
+baybo stores every tool result as its own `Role::Tool` row. The shared
+request builder (`LlmClient::build_completion_request`, used by every
+provider) sends a run of consecutive tool rows as **one** rig
+`Message::User` holding all their `ToolResult` parts in stored order; the
+rows themselves are not changed. Gemini requires it: a model content with N
+`functionCall` parts must be followed by one content with exactly N
+`functionResponse` parts, and rig 0.37 maps each message to one `Content`
+with no merging, so one message per result was a `400 INVALID_ARGUMENT` on
+every turn after a parallel call.
+
+Only rows that hold nothing but tool results merge, and only with results
+directly before them on the wire. A user message (an interjection) or an
+assistant message between two results starts a new message, and so does a
+legacy plain-text tool row — OpenAI's converter drops text that shares a
+message with tool results. A system message goes to the preamble, not the
+history, so it does not separate the results around it.
+
+Every other converter already accepts several results in one message
+(rig 0.37 unless noted):
+
+| Path | Merged message becomes |
+|------|------------------------|
+| OpenAI Chat Completions (`OpenAI`, Z.ai, XiaomiMiMo, Moonshot, Groq, Together, Hyperbolic, llamafile, OpenCode chat models) | one `tool` message per result |
+| DeepSeek, Mistral, Cohere, Ollama, HuggingFace | one tool message per result |
+| OpenAI Responses (`OpenAIResponses`, OpenCode Responses models) | one `function_call_output` per result |
+| `OpenAiSubscription` (baybo's own converter) | one `function_call_output` per result |
+| Anthropic, MiniMax, OpenCode Messages models | one user message with N `tool_result` blocks |
+| Gemini, OpenCode Gemini | one user content with N `functionResponse` parts |
+| xAI | one `function_call_output` per result — but rig requires a `call_id` on every tool call and result, which the builder never sets, so xAI rejects any tool history in either shape |
+| Perplexity | rejects tool results in any shape |
+
 ### Multimodal support
 
 When a `BlobFetcher` is attached (`LlmClient::with_blob_fetcher`) and the model reports the required capability, `ContentBlock::Image` / `Audio` / `File` user blocks are materialised into real rig `Image` / `Audio` / `Document` content (base64-encoded blob bytes). Provider gates then match the actual wire adapter: Anthropic accepts base64 PDF documents but rejects audio and video; OpenAI Chat Completions accepts audio only on audio/realtime model families and does not receive PDFs; OpenAI subscription Responses accepts images and PDF `input_file`; Gemini accepts the existing native image, audio, and PDF paths. Images are also gated on **format** (`is_portable_image_type`): png, jpeg and webp are delivered and everything else `parse_image_media_type` admits — heic, heif, gif, svg — is stubbed **before the fetch**, on every provider. Those three are what every provider taking an inline image accepts; the rest each fail somewhere (rig's Anthropic converter errors on a HEIC, Gemini's on a GIF, OpenAI answers a 400 and documents only a *non-animated* GIF). A per-provider matrix would buy a HEIC on Gemini and a GIF on Anthropic for the cost of tracking every vendor's list, where one wrong entry costs a whole session. The gate exists because a refused image is never just the image: the converter's error (or the API's 400) fails the WHOLE request, and `build_completion_request` resends the whole history every turn, so one iPhone HEIC on an Anthropic session used to fail every turn after it — compaction included, since it replays the same prefix through the same client. A side pass that picks images itself rather than replaying the transcript (the conversation title) asks `LlmClient::delivers_image_block` — the same gates, answered from the block's metadata without a fetch — so, short of the blob fetch itself failing, it never hands the model a stub where a picture was meant. Video remains a `File` block and is stubbed because neither the OpenAI nor Anthropic chat path accepts native video input. That materialisation exists only in the ephemeral provider request: `session_messages` and trace input markers retain the original `BlobRef` metadata and never receive the base64 payload. Otherwise — no fetcher, missing capability, unsupported MIME type, or blob fetch failure — the block degrades to a descriptive text placeholder via the `multimodal` module (`[image: …]`-style stubs). `extract_text` joins text blocks for system/assistant message conversion.
@@ -203,6 +236,8 @@ Because that gate is per-provider, the ESTIMATE caps at the ceiling rather than 
 ### Error handling
 
 Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Turn monitoring can mark long-running calls as `Stuck`.
+
+`llm` only classifies: `LlmError::is_retriable` is true for `Transient` and `RateLimited` alone. `status_to_error` maps a status to a variant — 408 and 5xx → `Transient`, 429 → `RateLimited`, 401/403 → `Auth`, any other 4xx → `BadRequest`. `rig_completion_to_error` routes rig's statused HTTP errors through it. rig's `ProviderError` carries no status: Gemini (and other rig converters) put a non-2xx body there on a unary call, and rig's stream adapters wrap the `Invalid status code …` error there when a stream fails to open — bare from the Gemini adapter, behind an `SSE Error: ` prefix from the Anthropic one (Anthropic, MiniMax, OpenCode Messages models). `provider_error_status` reads the status back from either shape — rig's status display (with or without that prefix), or a JSON body whose `error.code` is an HTTP status (Google's `{"error":{"code":400,"status":"INVALID_ARGUMENT"}}`, bare or in a one-element array) — and routes it through `status_to_error`, so a Gemini 400 surfaces at once instead of being retried ten times. A `ProviderError` with no readable status stays `Transient`, so an unrecognised 5xx still retries.
 
 ## Constraints
 

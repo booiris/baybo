@@ -348,6 +348,53 @@ pub(crate) mod tests {
         (calls, responses)
     }
 
+    /// Count of `key` parts in one Gemini content.
+    fn parts_with(content: &Value, key: &str) -> usize {
+        content["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part.get(key).is_some())
+            .count()
+    }
+
+    /// Gemini's own check on a request body: a model content with N
+    /// `functionCall` parts must be followed directly by one user content
+    /// holding exactly N `functionResponse` parts, and no response may sit
+    /// anywhere else. The real API answers a violation with
+    /// `400 INVALID_ARGUMENT`; the mock endpoint answers 200 to anything, so
+    /// every test that sends tool history checks the body with this.
+    pub(crate) fn assert_gemini_accepts_function_turns(body: &Value) {
+        let contents = body["contents"].as_array().unwrap();
+        for (i, content) in contents.iter().enumerate() {
+            let calls = parts_with(content, "functionCall");
+            let responses = parts_with(content, "functionResponse");
+            if calls > 0 {
+                assert_eq!(content["role"], "model", "content {i}: {body}");
+                let next = contents
+                    .get(i + 1)
+                    .unwrap_or_else(|| panic!("content {i}: calls with no response turn: {body}"));
+                assert_eq!(next["role"], "user", "content {}: {body}", i + 1);
+                assert_eq!(
+                    parts_with(next, "functionResponse"),
+                    calls,
+                    "content {} must answer all {calls} function calls of content {i}: {body}",
+                    i + 1
+                );
+            }
+            if responses > 0 {
+                let answered = i
+                    .checked_sub(1)
+                    .map(|prev| parts_with(&contents[prev], "functionCall"))
+                    .unwrap_or(0);
+                assert_eq!(
+                    responses, answered,
+                    "content {i}: {responses} function responses answer {answered} calls: {body}"
+                );
+            }
+        }
+    }
+
     pub(crate) fn assert_responses_name_their_calls(body: &Value) {
         let (calls, responses) = function_names(body);
         let expected = [
@@ -394,8 +441,36 @@ pub(crate) mod tests {
         collect_calls(client.chat_stream(&request).await.unwrap()).await;
         client.chat(&request).await.unwrap();
         for _ in 0..2 {
-            assert_responses_name_their_calls(&captured.recv().await.unwrap().body);
+            let body = captured.recv().await.unwrap().body;
+            assert_gemini_accepts_function_turns(&body);
+            assert_responses_name_their_calls(&body);
         }
+    }
+
+    /// Gemini's 400 for a malformed request reaches baybo as a bare body
+    /// (unary) or rig's status display (stream); both must come out
+    /// `BadRequest`, so the agent loop surfaces them instead of retrying.
+    #[tokio::test]
+    async fn an_invalid_argument_400_is_not_retried() {
+        let rejection = json!({"error":{"code":400,"message":"function response parts mismatch","status":"INVALID_ARGUMENT"}}).to_string();
+        let (origin, _captured) = endpoint(vec![
+            (400, "application/json", rejection.clone()),
+            (400, "application/json", rejection),
+        ])
+        .await;
+        let client = gemini_client(origin);
+        let request = mixed_history_request();
+        let unary = client.chat(&request).await.unwrap_err();
+        assert!(matches!(unary, crate::LlmError::BadRequest(_)), "{unary:?}");
+        let streamed = match client.chat_stream(&request).await {
+            Err(e) => e,
+            Ok(mut stream) => stream.next().await.unwrap().unwrap_err(),
+        };
+        assert!(
+            matches!(streamed, crate::LlmError::BadRequest(_)),
+            "{streamed:?}"
+        );
+        assert!(!unary.is_retriable() && !streamed.is_retriable());
     }
 
     #[test]

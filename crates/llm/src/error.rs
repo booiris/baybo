@@ -175,11 +175,12 @@ pub(crate) fn proxied_client(
 ///     `Internal` — these mean we built the request wrong, retrying
 ///     can't fix it.
 ///
-/// The residual is `ProviderError(String)`: rig stuffs the raw
-/// response body in here without preserving the HTTP status, so we
-/// can't distinguish 4xx from 5xx without parsing the body. Default
-/// to `Transient` so 5xx still retries, accepting that 4xx will burn
-/// the retry quota until rig surfaces status separately.
+/// The residual is `ProviderError(String)`: rig puts a non-2xx answer
+/// in here without its status — the raw body on a unary call (Gemini's,
+/// among others), or the formatted `http_client::Error` when the stream
+/// fails to open. [`provider_error_status`] reads the status back out of
+/// either shape and routes it like any other; a message that carries
+/// none stays `Transient`, so an unrecognised 5xx still retries.
 pub(crate) fn rig_completion_to_error(e: rig::completion::CompletionError) -> LlmError {
     use rig::completion::CompletionError as Rig;
     use rig::http_client::Error as RigHttp;
@@ -215,8 +216,59 @@ pub(crate) fn rig_completion_to_error(e: rig::completion::CompletionError) -> Ll
             Ok(ours) => *ours,
             Err(inner) => LlmError::Internal(anyhow::anyhow!("rig request: {inner}")),
         },
-        Rig::ProviderError(msg) => LlmError::Transient(format!("rig provider: {msg}")),
+        Rig::ProviderError(msg) => {
+            let message = format!("rig provider: {msg}");
+            match provider_error_status(&msg) {
+                Some(status) => status_to_error(status, message),
+                None => LlmError::Transient(message),
+            }
+        }
     }
+}
+
+/// Prefix of rig's `http_client::Error::InvalidStatusCode*` display, which
+/// rig's stream adapters wrap into `ProviderError` when the stream fails to
+/// open: `Invalid status code: 400 Bad Request` or
+/// `Invalid status code 400 Bad Request with message: …`.
+const RIG_INVALID_STATUS_PREFIX: &str = "Invalid status code";
+
+/// Prefix rig's Anthropic stream adapter puts in front of that display
+/// (`SSE Error: Invalid status code: 400 Bad Request`); Anthropic, MiniMax
+/// and OpenCode's Messages models all stream through it.
+const RIG_ANTHROPIC_SSE_ERROR_PREFIX: &str = "SSE Error: ";
+
+/// The HTTP status a rig `ProviderError` message carries, if any: either
+/// rig's own status display, or an error body whose `error.code` is a
+/// status — Google's `{"error":{"code":400,"status":"INVALID_ARGUMENT"}}`,
+/// sent bare or as a one-element array.
+fn provider_error_status(msg: &str) -> Option<u16> {
+    let msg = msg.trim();
+    let status_display = msg
+        .strip_prefix(RIG_ANTHROPIC_SSE_ERROR_PREFIX)
+        .unwrap_or(msg);
+    if let Some(rest) = status_display.strip_prefix(RIG_INVALID_STATUS_PREFIX) {
+        let digits: String = rest
+            .trim_start_matches(':')
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        return digits.parse().ok().filter(is_http_error_status);
+    }
+    let body: serde_json::Value = serde_json::from_str(msg).ok()?;
+    let error = match &body {
+        serde_json::Value::Array(items) => items.first()?.get("error")?,
+        other => other.get("error")?,
+    };
+    error
+        .get("code")?
+        .as_u64()
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(is_http_error_status)
+}
+
+fn is_http_error_status(status: &u16) -> bool {
+    (400..600).contains(status)
 }
 
 #[cfg(test)]
@@ -306,16 +358,61 @@ mod tests {
     }
 
     /// `ProviderError` is the residual rig variant that drops the
-    /// status; we keep the old "default to retry" behaviour so 5xx
-    /// bodies still retry. This test pins that contract so a future
-    /// "let's just BadRequest it" change is forced to think about
-    /// the 5xx regression first.
+    /// status; a message with no recoverable status keeps the old
+    /// "default to retry" behaviour so 5xx bodies still retry. This test
+    /// pins that contract so a future "let's just BadRequest it" change
+    /// is forced to think about the 5xx regression first.
     #[test]
     fn rig_provider_error_defaults_to_transient() {
-        let err = rig_completion_to_error(CompletionError::ProviderError(
-            r#"{"error":{"message":"upstream overloaded"}}"#.into(),
-        ));
-        assert!(matches!(err, LlmError::Transient(_)));
-        assert!(err.is_retriable());
+        for body in [
+            r#"{"error":{"message":"upstream overloaded"}}"#,
+            r#"{"error":{"code":"server_error","message":"upstream overloaded"}}"#,
+            "upstream overloaded",
+            "Invalid status code: garbled",
+        ] {
+            let err = rig_completion_to_error(CompletionError::ProviderError(body.into()));
+            assert!(matches!(err, LlmError::Transient(_)), "{body}: {err:?}");
+            assert!(err.is_retriable());
+        }
+    }
+
+    /// A Gemini 400 reaches us as a `ProviderError` holding only the body
+    /// (unary) or rig's status display (stream open). Either way it must
+    /// surface at once instead of burning the retry budget on a request
+    /// that will be rejected the same way every time; 429 and 5xx in the
+    /// same shapes keep retrying.
+    #[test]
+    fn rig_provider_error_routes_a_recoverable_status() {
+        let classify =
+            |msg: &str| rig_completion_to_error(CompletionError::ProviderError(msg.into()));
+        for msg in [
+            r#"{"error":{"code":400,"message":"Please ensure that the number of function response parts is equal to the number of function call parts of the function call turn.","status":"INVALID_ARGUMENT"}}"#,
+            r#"[{"error":{"code":400,"status":"INVALID_ARGUMENT"}}]"#,
+            "Invalid status code: 400 Bad Request",
+            r#"Invalid status code 400 Bad Request with message: {"error":{"code":400}}"#,
+            "SSE Error: Invalid status code: 400 Bad Request",
+        ] {
+            let err = classify(msg);
+            assert!(matches!(err, LlmError::BadRequest(_)), "{msg}: {err:?}");
+        }
+        let denied = classify(r#"{"error":{"code":403,"status":"PERMISSION_DENIED"}}"#);
+        assert!(matches!(denied, LlmError::Auth(_)), "{denied:?}");
+        let rejected_key = classify("SSE Error: Invalid status code: 401 Unauthorized");
+        assert!(
+            matches!(rejected_key, LlmError::Auth(_)),
+            "{rejected_key:?}"
+        );
+        let throttled = classify(r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#);
+        assert!(
+            matches!(throttled, LlmError::RateLimited { .. }),
+            "{throttled:?}"
+        );
+        for msg in [
+            "Invalid status code: 503 Service Unavailable",
+            "SSE Error: Invalid status code: 529 <unknown status code>",
+        ] {
+            let err = classify(msg);
+            assert!(matches!(err, LlmError::Transient(_)), "{msg}: {err:?}");
+        }
     }
 }
