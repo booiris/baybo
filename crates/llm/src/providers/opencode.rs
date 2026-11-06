@@ -849,8 +849,9 @@ mod tests {
     #[tokio::test]
     async fn gemini_repeated_tool_calls_get_distinct_ids_and_named_responses() {
         use crate::providers::gemini::tests::{
-            assert_distinct_portable_ids, assert_responses_name_their_calls, collect_calls,
-            mixed_history_request, repeated_call_body, repeated_call_sse, search_tools_request,
+            assert_distinct_portable_ids, assert_gemini_accepts_function_turns,
+            assert_responses_name_their_calls, collect_calls, mixed_history_request,
+            repeated_call_body, repeated_call_sse, search_tools_request,
         };
         let (origin, mut captured) = endpoint(vec![
             (200, "text/event-stream", repeated_call_sse()),
@@ -872,7 +873,9 @@ mod tests {
         collect_calls(client.chat_stream(&mixed_history_request()).await.unwrap()).await;
         captured.recv().await.unwrap();
         captured.recv().await.unwrap();
-        assert_responses_name_their_calls(&captured.recv().await.unwrap().body);
+        let body = captured.recv().await.unwrap().body;
+        assert_gemini_accepts_function_turns(&body);
+        assert_responses_name_their_calls(&body);
     }
 
     #[tokio::test]

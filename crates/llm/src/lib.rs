@@ -1732,6 +1732,9 @@ impl LlmClient {
     async fn build_completion_request(&self, request: &ChatRequest) -> CompletionRequest {
         let mut system_parts = Vec::new();
         let mut chat_messages: Vec<Message> = Vec::new();
+        // Whether the last message on the wire holds only tool results, so
+        // the next tool message's results join it (see `Role::Tool` below).
+        let mut open_tool_results = false;
 
         for msg in &request.messages {
             match msg.role {
@@ -1750,6 +1753,7 @@ impl LlmClient {
                             content.push(part);
                         }
                         chat_messages.push(Message::User { content });
+                        open_tool_results = false;
                     }
                 }
                 baybo_model::Role::Assistant => {
@@ -1791,8 +1795,17 @@ impl LlmClient {
                             content.push(part);
                         }
                         chat_messages.push(Message::Assistant { id: None, content });
+                        open_tool_results = false;
                     }
                 }
+                // baybo stores one row per tool result, but the results
+                // answering one assistant turn go out as ONE user message:
+                // Gemini rejects a model turn with N function calls unless
+                // the next content holds all N responses, and every other
+                // converter splits a merged message back into per-result
+                // items. Only results merge, and only with results directly
+                // before them on the wire, so an interjected user message
+                // or a legacy plain-text tool row is never folded in.
                 baybo_model::Role::Tool => {
                     let mut parts: Vec<UserContent> = Vec::new();
                     for block in &msg.content {
@@ -1823,14 +1836,28 @@ impl LlmClient {
                             _ => {}
                         }
                     }
-                    if !parts.is_empty() {
-                        let first = parts.remove(0);
-                        let mut content = OneOrMany::one(first);
-                        for part in parts {
-                            content.push(part);
-                        }
-                        chat_messages.push(Message::User { content });
+                    if parts.is_empty() {
+                        continue;
                     }
+                    let only_results = parts
+                        .iter()
+                        .all(|part| matches!(part, UserContent::ToolResult(_)));
+                    match chat_messages.last_mut() {
+                        Some(Message::User { content }) if open_tool_results && only_results => {
+                            for part in parts {
+                                content.push(part);
+                            }
+                        }
+                        _ => {
+                            let first = parts.remove(0);
+                            let mut content = OneOrMany::one(first);
+                            for part in parts {
+                                content.push(part);
+                            }
+                            chat_messages.push(Message::User { content });
+                        }
+                    }
+                    open_tool_results = only_results;
                 }
             }
         }
@@ -4516,5 +4543,204 @@ mod effort_wiring_tests {
             Some(json!({"reasoning_effort": "ultra"}))
         );
         assert_eq!(client.effective_effort(None).as_deref(), Some("ultra"));
+    }
+}
+
+#[cfg(test)]
+mod tool_result_grouping_tests {
+    use baybo_model::{ChatMessage, ContentBlock};
+    use rig::message::UserContent;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::mock_http::endpoint;
+    use crate::registry::{LlmProviderConfig, LlmProviderRegistry};
+
+    fn client(provider: &str, model: &str, base_url: Option<String>) -> LlmClient {
+        LlmProviderRegistry::with_default_providers()
+            .build_client(&LlmProviderConfig {
+                provider: provider.into(),
+                api_key: Some("test-key".into()),
+                base_url,
+                model: model.into(),
+                supports_vision: None,
+                context_window: None,
+                pricing: None,
+                reasoning_effort: None,
+                vault: None,
+                proxy: None,
+            })
+            .unwrap()
+    }
+
+    fn calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage::assistant(
+            ids.iter()
+                .map(|id| ContentBlock::ToolUse {
+                    id: (*id).into(),
+                    name: "read_file".into(),
+                    input: json!({}),
+                    signature: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn result(id: &str) -> ChatMessage {
+        ChatMessage::tool_result_with_meta(id.into(), format!("output of {id}"), None)
+    }
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage::user(vec![ContentBlock::Text(text.into())])
+    }
+
+    /// Each wire message as a role tag plus, for a user message, the ids
+    /// of its tool results (`text` for any other part).
+    async fn wire_shape(messages: Vec<ChatMessage>) -> Vec<(&'static str, Vec<String>)> {
+        let request = ChatRequest {
+            messages,
+            ..Default::default()
+        };
+        client("openai", "gpt-4o", None)
+            .build_completion_request(&request)
+            .await
+            .chat_history
+            .iter()
+            .map(|message| match message {
+                Message::User { content } => (
+                    "user",
+                    content
+                        .iter()
+                        .map(|part| match part {
+                            UserContent::ToolResult(r) => r.id.clone(),
+                            _ => "text".to_string(),
+                        })
+                        .collect(),
+                ),
+                Message::Assistant { .. } => ("assistant", Vec::new()),
+                Message::System { .. } => ("system", Vec::new()),
+            })
+            .collect()
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// Stored rows hold one tool result each; the wire answers one
+    /// assistant turn with one user message, results in stored order.
+    #[tokio::test]
+    async fn consecutive_tool_results_share_one_user_message() {
+        let shape = wire_shape(vec![
+            user("go"),
+            calls(&["a", "b", "c"]),
+            result("a"),
+            result("b"),
+            result("c"),
+            calls(&["d"]),
+            result("d"),
+        ])
+        .await;
+        assert_eq!(
+            shape,
+            [
+                ("user", ids(&["text"])),
+                ("assistant", vec![]),
+                ("user", ids(&["a", "b", "c"])),
+                ("assistant", vec![]),
+                ("user", ids(&["d"])),
+            ]
+        );
+    }
+
+    /// A user message between two results is a turn of its own: neither
+    /// side is folded into it, and results after it start a new message.
+    #[tokio::test]
+    async fn results_never_merge_across_a_user_message() {
+        let shape = wire_shape(vec![
+            calls(&["a", "b"]),
+            result("a"),
+            user("wait"),
+            result("b"),
+        ])
+        .await;
+        assert_eq!(
+            shape,
+            [
+                ("assistant", vec![]),
+                ("user", ids(&["a"])),
+                ("user", ids(&["text"])),
+                ("user", ids(&["b"])),
+            ]
+        );
+    }
+
+    /// A legacy plain-text tool row keeps its own message — OpenAI's
+    /// converter drops text that shares a message with tool results — and
+    /// nothing merges into it either.
+    #[tokio::test]
+    async fn a_plain_text_tool_row_keeps_its_own_message() {
+        let shape = wire_shape(vec![
+            calls(&["a", "b"]),
+            result("a"),
+            ChatMessage::tool(vec![ContentBlock::Text("legacy".into())]),
+            result("b"),
+        ])
+        .await;
+        assert_eq!(
+            shape,
+            [
+                ("assistant", vec![]),
+                ("user", ids(&["a"])),
+                ("user", ids(&["text"])),
+                ("user", ids(&["b"])),
+            ]
+        );
+    }
+
+    /// A system message goes to the preamble, not the history, so it does
+    /// not separate the results around it on the wire.
+    #[tokio::test]
+    async fn a_system_message_does_not_split_results() {
+        let shape = wire_shape(vec![
+            calls(&["a", "b"]),
+            result("a"),
+            ChatMessage::system(vec![ContentBlock::Text("note".into())]),
+            result("b"),
+        ])
+        .await;
+        assert_eq!(shape, [("assistant", vec![]), ("user", ids(&["a", "b"]))]);
+    }
+
+    /// OpenAI Chat Completions — the wire most rig hosts share — still
+    /// gets one `tool` message per result from a merged message.
+    #[tokio::test]
+    async fn openai_chat_sends_one_tool_message_per_merged_result() {
+        let reply = json!({"id":"c1","object":"chat.completion","created":0,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        let (origin, mut captured) =
+            endpoint(vec![(200, "application/json", reply.to_string())]).await;
+        client("openai", "gpt-4o", Some(origin))
+            .chat(&ChatRequest {
+                messages: vec![user("go"), calls(&["a", "b"]), result("a"), result("b")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let body = captured.recv().await.unwrap().body;
+        let tool_ids: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_ids, ["a", "b"], "{body}");
+        let roles: Vec<&Value> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| &m["role"])
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool"], "{body}");
     }
 }
