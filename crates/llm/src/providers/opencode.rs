@@ -798,7 +798,7 @@ mod tests {
         let events = [
             json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"checking"}]}}],"usageMetadata":{}}),
             json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}}}]}}],"usageMetadata":{}}),
-            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8570,"candidatesTokenCount":10,"totalTokenCount":8580}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10,"totalTokenCount":130}}),
         ];
         let sse = events
             .iter()
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments, json!({"path":"a.rs"}));
         let usage = usage.unwrap();
-        assert_eq!((usage.input_tokens, usage.output_tokens), (8570, 10));
+        assert_eq!((usage.input_tokens, usage.output_tokens), (120, 10));
         let req = captured.recv().await.unwrap();
         assert!(
             req.path
@@ -849,7 +849,7 @@ mod tests {
             json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"hmm","thought":true}]}}],"usageMetadata":{}}),
             json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":" done","thought":true,"thoughtSignature":"sig1"}]}}],"usageMetadata":{}}),
             json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}},"thoughtSignature":"sig2"}]}}],"usageMetadata":{"promptTokenCount":5}}),
-            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8570,"candidatesTokenCount":10}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10}}),
         ];
         let sse = events
             .iter()
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].signature.as_deref(), Some("sig2"));
         let usage = usage.unwrap();
-        assert_eq!((usage.input_tokens, usage.output_tokens), (8570, 10));
+        assert_eq!((usage.input_tokens, usage.output_tokens), (120, 10));
     }
 
     #[tokio::test]
