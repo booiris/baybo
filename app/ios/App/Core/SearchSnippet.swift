@@ -81,55 +81,66 @@ enum SearchSnippet {
     /// none of what was searched for.
     static func snippet(_ text: String, query: String) -> [Segment] {
         let g = Array(text)
-        let gl = folded(g)
+        let hits = locate(g, query: query)
 
-        var hits: [(at: Int, end: Int)] = []
+        if hits.isEmpty {
+            let head = String(g.prefix(headLength))
+            return [Segment(text: head + (g.count > headLength ? "…" : ""), match: false)]
+        }
+
+        let anchor = hits[0]
+        let from = max(0, anchor.at - leadPad)
+        let to = min(g.count, anchor.end + trailPad)
+
+        // Highlight every term landing in the window, not just the anchor.
+        var segments = mark(g, hits, from: from, to: to)
+        if from > 0 { segments.insert(Segment(text: "…", match: false), at: 0) }
+        if to < g.count { segments.append(Segment(text: "…", match: false)) }
+        return segments
+    }
+
+    /// Flag every term in the WHOLE of `text`, with no window and no `…` — for
+    /// a result card's title, which `snippet`'s lead window would crop from the
+    /// left. Mirrors the JS `highlightAll`.
+    static func highlightAll(_ text: String, query: String) -> [Segment] {
+        let g = Array(text)
+        return mark(g, locate(g, query: query), from: 0, to: g.count)
+    }
+
+    private typealias Hit = (at: Int, end: Int)
+
+    /// Every occurrence of every query term in `g`, earliest first.
+    private static func locate(_ g: [Character], query: String) -> [Hit] {
+        let gl = folded(g)
+        var hits: [Hit] = []
         for chunk in queryChunks(query) {
             let needle = folded(Array(chunk))
             for at in occurrences(gl, needle) {
                 hits.append((at: at, end: at + needle.count))
             }
         }
-
-        func cut(_ from: Int, _ to: Int) -> String {
-            guard from < to else { return "" }
-            return String(g[from..<min(to, g.count)])
-        }
-
-        if hits.isEmpty {
-            let head = cut(0, min(headLength, g.count))
-            return [Segment(text: head + (g.count > headLength ? "…" : ""), match: false)]
-        }
-
         // Stable sort: two terms matching at the same index must keep the order
         // the query listed them, exactly as JS's `Array.sort` comparator leaves
         // them. Swift's `sort` is NOT guaranteed stable, so sort on the pair.
-        hits = hits.enumerated()
+        return hits.enumerated()
             .sorted { ($0.element.at, $0.offset) < ($1.element.at, $1.offset) }
             .map(\.element)
+    }
 
-        let anchor = hits[0]
-        let from = max(0, anchor.at - leadPad)
-        let to = min(g.count, anchor.end + trailPad)
-
+    /// Segment `g[from..<to]`, flagging the hits that fit inside it.
+    /// Overlapping hits (a term inside another) collapse into the first.
+    private static func mark(_ g: [Character], _ hits: [Hit], from: Int, to: Int) -> [Segment] {
         var segments: [Segment] = []
-        func push(_ t: String, _ match: Bool) {
-            if !t.isEmpty { segments.append(Segment(text: t, match: match)) }
+        func push(_ a: Int, _ b: Int, _ match: Bool) {
+            if b > a { segments.append(Segment(text: String(g[a..<b]), match: match)) }
         }
-
         var cursor = from
-        for hit in hits {
-            // Highlight every term landing in the window, not just the anchor.
-            // Overlapping hits (a term inside another) collapse into the first.
-            if hit.at < cursor || hit.end > to { continue }
-            push(cut(cursor, hit.at), false)
-            push(cut(hit.at, hit.end), true)
+        for hit in hits where hit.at >= cursor && hit.end <= to {
+            push(cursor, hit.at, false)
+            push(hit.at, hit.end, true)
             cursor = hit.end
         }
-        push(cut(cursor, to), false)
-
-        if from > 0 { segments.insert(Segment(text: "…", match: false), at: 0) }
-        if to < g.count { segments.append(Segment(text: "…", match: false)) }
+        push(cursor, to, false)
         return segments
     }
 }

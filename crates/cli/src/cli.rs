@@ -156,8 +156,8 @@ pub enum Commands {
     /// for the conversation transcript (with
     /// `--include-superseded` / `--superseded-only` to surface
     /// compaction-dropped turns), `search <query…>` for full-text
-    /// search over transcripts, and `export <id> [--out]` for the
-    /// full LLM/tool call tree as JSON.
+    /// search over session titles and transcripts, and
+    /// `export <id> [--out]` for the full LLM/tool call tree as JSON.
     #[command(hide = true)]
     Session {
         #[command(subcommand)]
@@ -777,22 +777,24 @@ pub enum SessionCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Full-text search over transcript prose, grouped by session, best
-    /// match first (`docs/search.md`). Reaches every channel `session list`
-    /// shows — bot channels and subagent runs included — but, like the chat
-    /// UI, skips hidden, archived and cron-workspace sessions until asked
-    /// (`--include-*` / `--all`). Words are AND-ed and matched literally:
-    /// FTS5 operators are inert, Latin words of three or more letters are
-    /// prefix-widened, Han text is substring-matched. Each hit prints
-    /// `#<ordinal>`, the `ordinal` of the row `history <id>
-    /// --include-superseded` returns.
+    /// Full-text search over session titles and transcript prose, grouped
+    /// by session (`docs/search.md`). Sessions whose title matches come
+    /// first, marked `[title match]`, then the rest by their best message
+    /// hit; a title-only match prints no hit lines. Reaches every channel
+    /// `session list` shows — bot channels and subagent runs included —
+    /// but, like the chat UI, skips hidden, archived and cron-workspace
+    /// sessions until asked (`--include-*` / `--all`). Words are AND-ed and
+    /// matched literally: FTS5 operators are inert, Latin words of three or
+    /// more letters are prefix-widened, Han text is substring-matched. Each
+    /// message hit prints `#<ordinal>`, the `ordinal` of the row
+    /// `history <id> --include-superseded` returns.
     Search(SessionSearchArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct SessionSearchArgs {
-    /// Query words; several are AND-ed (`deploy script` finds rows holding
-    /// both). Put `--` before a word that starts with `-`.
+    /// Query words; several are AND-ed (`deploy script` finds a title or a
+    /// message holding both). Put `--` before a word that starts with `-`.
     #[arg(required = true, num_args = 1.., value_name = "QUERY")]
     pub query: Vec<String>,
     /// Restrict to one channel (`owner`, `tui`, `telegram`, `subagent`, …).
@@ -826,7 +828,8 @@ pub struct SessionSearchArgs {
             .range(1..=baybo_session::search::MAX_SEARCH_LIMIT as i64)
     )]
     pub limit: usize,
-    /// Hits shown per session; the per-session total is still counted.
+    /// Message hits shown per session; the per-session total is still
+    /// counted.
     #[arg(
         long,
         value_name = "N",
@@ -834,8 +837,8 @@ pub struct SessionSearchArgs {
         value_parser = clap::builder::RangedI64ValueParser::<usize>::new().range(1..)
     )]
     pub per_session: usize,
-    /// Raw index rows scanned before grouping. Raise it when the result
-    /// says the scan window filled.
+    /// Raw index rows scanned before grouping, for messages and titles
+    /// each. Raise it when the result says the scan window filled.
     #[arg(
         long,
         value_name = "N",

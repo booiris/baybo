@@ -44,7 +44,7 @@ final class SearchModelTests: XCTestCase {
         ChatSearchResults(
             groups: [
                 ChatSearchGroup(
-                    sessionId: sessionId, sessionTitle: nil,
+                    sessionId: sessionId, sessionTitle: nil, titleMatch: false,
                     hits: [
                         ChatSearchHit(
                             ordinal: 7, role: "user", text: "hit",
@@ -215,5 +215,26 @@ final class SearchModelTests: XCTestCase {
 
         model.update(query: "")
         XCTAssertTrue(isIdle(model))
+    }
+
+    /// A title-only group has no message hits — it must reach the view as sent,
+    /// in the gateway's order, not be dropped for having nothing to excerpt.
+    func testATitleOnlyGroupSurvivesInTheGatewaysOrder() async {
+        let client = FakeBayboClient()
+        let titleOnly = ChatSearchGroup(
+            sessionId: "title-session", sessionTitle: "data plan", titleMatch: true,
+            hits: [], totalHits: 0)
+        client.stubSearch(
+            "data",
+            with: ChatSearchResults(
+                groups: [titleOnly] + results("message-session").groups, truncated: false))
+        let model = model(client)
+
+        model.update(query: "data")
+        await settle()
+
+        XCTAssertEqual(groups(model)?.map(\.sessionId), ["title-session", "message-session"])
+        XCTAssertEqual(groups(model)?.map(\.titleMatch), [true, false])
+        XCTAssertEqual(groups(model)?.first?.hits.count, 0)
     }
 }

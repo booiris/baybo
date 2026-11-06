@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use baybo_model::{ChannelType, SessionId};
 use baybo_query::QueryApi;
 use baybo_session::StoredMessage;
-use baybo_session::search::{SearchLimits, SearchResults, SessionSearch};
+use baybo_session::search::{SearchLimits, SearchResults, SessionSearch, SessionSearchGroup};
 use baybo_store::SearchScope;
 use serde_json::{Value, json};
 use tokio::fs;
@@ -18,6 +18,7 @@ const SEARCH_EXCERPT_MAX_CHARS: usize = 120;
 /// Chars of context kept before the matched term inside an excerpt.
 const SEARCH_EXCERPT_LEAD_CHARS: usize = 40;
 const UNTITLED: &str = "(untitled)";
+const TITLE_MATCH_MARK: &str = "title match";
 const ELLIPSIS: &str = "…";
 
 pub async fn handle(ctx: &CommandContext, cmd: SessionCmd) -> Result<CommandOutput> {
@@ -139,6 +140,17 @@ fn excerpt(text: &str, first_term: &str) -> String {
     out
 }
 
+/// A title-only group has no message hits, so `0 hits` would read as a
+/// miss; it says what matched instead.
+fn group_counts(group: &SessionSearchGroup) -> String {
+    let hits = format!("{} hit{}", group.total_hits, plural(group.total_hits));
+    match (group.title_match, group.total_hits) {
+        (false, _) => hits,
+        (true, 0) => format!("[{TITLE_MATCH_MARK}]"),
+        (true, _) => format!("[{TITLE_MATCH_MARK}] + {hits}"),
+    }
+}
+
 fn render_search_human(
     query: &str,
     scope: &SearchScope,
@@ -161,12 +173,18 @@ fn render_search_human(
 
     let total: usize = results.groups.iter().map(|g| g.total_hits).sum();
     let sessions = results.groups.len();
+    let by_title = results.groups.iter().filter(|g| g.title_match).count();
     let verb = if sessions == 1 { "matches" } else { "match" };
     buf.push_str(&format!(
-        "{sessions} session{} {verb} \"{query}\" ({total} hit{})",
+        "{sessions} session{} {verb} \"{query}\" ({total} hit{}",
         plural(sessions),
         plural(total)
     ));
+    if by_title > 0 {
+        let es = if by_title == 1 { "" } else { "es" };
+        buf.push_str(&format!(", {by_title} {TITLE_MATCH_MARK}{es}"));
+    }
+    buf.push(')');
     if results.truncated {
         buf.push_str(&format!(
             " — scan window full ({} rows): narrow the query or raise --scan",
@@ -186,12 +204,11 @@ fn render_search_human(
     let first_term = query.split_whitespace().next().unwrap_or_default();
     for group in &results.groups {
         buf.push_str(&format!(
-            "{:<38}  {:<8}  {}  {} hit{}\n",
+            "{:<38}  {:<8}  {}  {}\n",
             group.session_id,
             group.channel,
             group.title.as_deref().unwrap_or(UNTITLED),
-            group.total_hits,
-            plural(group.total_hits),
+            group_counts(group),
         ));
         for hit in &group.hits {
             buf.push_str(&format!(
@@ -207,9 +224,13 @@ fn render_search_human(
             buf.push_str(&format!("  {ELLIPSIS} and {more} more\n"));
         }
     }
-    buf.push_str(
-        "\nfull text of a hit: baybo session history <id> --include-superseded --json   (rows carry \"ordinal\")",
-    );
+    if results.groups.iter().any(|g| !g.hits.is_empty()) {
+        buf.push_str(
+            "\nfull text of a hit: baybo session history <id> --include-superseded --json   (rows carry \"ordinal\")",
+        );
+    } else {
+        buf.push_str("\nread a transcript: baybo session history <id>");
+    }
     buf
 }
 
@@ -241,6 +262,7 @@ fn render_search_json(
                 "session_id": g.session_id,
                 "channel": g.channel,
                 "session_title": g.title,
+                "title_match": g.title_match,
                 "total_hits": g.total_hits,
                 "hits": hits,
             })
@@ -682,6 +704,7 @@ mod tests {
                 session_id: SessionId::from("01J8Q0ABCDEFGHJKMNPQRSTVWXYZ"),
                 channel: ChannelType::owner(),
                 title: Some("Migrating the schema".into()),
+                title_match: false,
                 hits: vec![hit(12, "数据库的迁移怎么做"), hit(15, "second")],
                 total_hits: 3,
             },
@@ -689,6 +712,7 @@ mod tests {
                 session_id: SessionId::from("tg-1"),
                 channel: ChannelType::telegram(),
                 title: None,
+                title_match: false,
                 hits: vec![hit(0, "once")],
                 total_hits: 1,
             },
@@ -717,12 +741,87 @@ mod tests {
         assert!(!out.contains("showing"), "{out}");
     }
 
+    fn group(id: &str, title_match: bool, hits: Vec<SessionSearchHit>) -> SessionSearchGroup {
+        SessionSearchGroup {
+            session_id: SessionId::from(id),
+            channel: ChannelType::owner(),
+            title: Some(format!("{id} title")),
+            title_match,
+            total_hits: hits.len(),
+            hits,
+        }
+    }
+
+    #[test]
+    fn human_render_marks_title_matches_and_prints_no_hit_lines_for_title_only() {
+        let groups = vec![
+            group("both", true, vec![hit(3, "body")]),
+            group("title-only", true, vec![]),
+            group("prose", false, vec![hit(9, "prose")]),
+        ];
+        let out = render_search_human(
+            "q",
+            &SearchScope::default(),
+            SearchLimits::default(),
+            &results(groups, false),
+        );
+        assert!(
+            out.starts_with("3 sessions match \"q\" (2 hits, 2 title matches)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("both title  [title match] + 1 hit\n  #3 "),
+            "{out}"
+        );
+        assert!(
+            out.contains("title-only title  [title match]\nprose"),
+            "{out}"
+        );
+        assert!(out.contains("prose title  1 hit\n"), "{out}");
+        assert!(out.ends_with("(rows carry \"ordinal\")"), "{out}");
+    }
+
+    #[test]
+    fn human_render_of_only_title_matches_points_at_the_transcript() {
+        let out = render_search_human(
+            "q",
+            &SearchScope::default(),
+            SearchLimits::default(),
+            &results(vec![group("t", true, vec![])], false),
+        );
+        assert!(
+            out.starts_with("1 session matches \"q\" (0 hits, 1 title match)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("  #"), "{out}");
+        assert!(
+            out.ends_with("read a transcript: baybo session history <id>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn json_render_carries_title_match() {
+        let value = render_search_json(
+            "q",
+            &SearchScope::default(),
+            SearchLimits::default(),
+            &results(vec![group("t", true, vec![])], false),
+        );
+        let group = &value["groups"][0];
+        assert_eq!(group["title_match"], true);
+        assert_eq!(group["session_title"], "t title");
+        assert_eq!(group["total_hits"], 0);
+        assert!(group["hits"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn human_render_flags_a_session_cap_cut() {
         let groups = vec![SessionSearchGroup {
             session_id: SessionId::from("s"),
             channel: ChannelType::owner(),
             title: None,
+            title_match: false,
             hits: vec![hit(0, "x")],
             total_hits: 1,
         }];
@@ -745,6 +844,7 @@ mod tests {
             session_id: SessionId::from("s"),
             channel: ChannelType::owner(),
             title: None,
+            title_match: false,
             hits: vec![hit(0, "x")],
             total_hits: 1,
         }];
@@ -800,6 +900,7 @@ mod tests {
             session_id: SessionId::from("s"),
             channel: ChannelType::owner(),
             title: None,
+            title_match: false,
             hits: vec![hit(4, "full prose")],
             total_hits: 1,
         }];
@@ -822,6 +923,7 @@ mod tests {
         assert_eq!(group["session_id"], "s");
         assert_eq!(group["channel"], "owner");
         assert!(group["session_title"].is_null());
+        assert_eq!(group["title_match"], false);
         assert_eq!(group["total_hits"], 1);
         let hit = &group["hits"][0];
         assert_eq!(hit["ordinal"], 4);

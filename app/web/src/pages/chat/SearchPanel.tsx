@@ -1,4 +1,4 @@
-// Server-backed message search, rendered in place of the session tree while the
+// Server-backed search over conversation titles and messages, rendered in place of the session tree while the
 // sidebar's search box holds a query. See `docs/search.md`.
 //
 // Deliberately NOT the shared `components/SearchBox`: that one is a client-side
@@ -11,8 +11,8 @@ import { RiLoader4Line, RiSearchLine } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import type { components } from '../../api/schema';
-import { jumpOrdinal } from './searchJump';
-import { snippet } from './searchSnippet';
+import { groupOpenOrdinal, jumpOrdinal } from './searchJump';
+import { highlightAll, snippet, type Segment } from './searchSnippet';
 
 type Hit = components['schemas']['ChatSearchHit'];
 type Group = components['schemas']['ChatSearchGroup'];
@@ -35,19 +35,27 @@ function timeLabel(iso: string): string {
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
 }
 
+function Highlighted({ segments }: { segments: Segment[] }) {
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.match ? (
+          <mark key={i} className="bg-brand/60 text-ink rounded-[2px]">
+            {seg.text}
+          </mark>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
 function Excerpt({ hit, query }: { hit: Hit; query: string }) {
   return (
     <div className="border-l-2 border-black/15 pl-2">
       <p className="text-[0.78rem] leading-snug break-words line-clamp-2">
-        {snippet(hit.text, query).map((seg, i) =>
-          seg.match ? (
-            <mark key={i} className="bg-brand/60 text-ink rounded-[2px]">
-              {seg.text}
-            </mark>
-          ) : (
-            <span key={i}>{seg.text}</span>
-          ),
-        )}
+        <Highlighted segments={snippet(hit.text, query)} />
       </p>
       <div className="flex items-center gap-2">
         <span className="text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
@@ -76,7 +84,12 @@ function Excerpt({ hit, query }: { hit: Hit; query: string }) {
  *  Each excerpt is its own click target, and the card is no longer one big
  *  button: a result is a *place in a conversation*, and three hits in one
  *  conversation are three different places. The title row keeps the
- *  whole-card gesture, landing on the best-scoring hit. */
+ *  whole-card gesture, landing on the best-scoring hit — or, for a group that
+ *  matched on its title alone, opening the conversation with no jump.
+ *
+ *  A title match marks the terms across the WHOLE title (`highlightAll`, not
+ *  the excerpts' windowed `snippet`, which would crop the name from the left);
+ *  the count is message hits only, so a title-only card shows none. */
 function GroupCard({
   group,
   query,
@@ -86,13 +99,10 @@ function GroupCard({
   group: Group;
   query: string;
   active: boolean;
-  onOpen: (sessionId: string, ordinal: number) => void;
+  onOpen: (sessionId: string, ordinal: number | null) => void;
 }) {
   const more = group.total_hits - group.hits.length;
-  // A group exists because a hit created it, so the server never sends an empty
-  // one; the length check is what keeps that a server invariant rather than a
-  // crash in the panel if it ever stops holding.
-  const bestOrdinal = group.hits.length > 0 ? jumpOrdinal(group.hits[0]) : 0;
+  const title = group.session_title ?? 'Untitled';
   return (
     <div
       className={`w-full px-2 py-2 border-2 rounded-md flex flex-col gap-1.5 ${
@@ -101,15 +111,17 @@ function GroupCard({
     >
       <button
         type="button"
-        onClick={() => onOpen(group.session_id, bestOrdinal)}
+        onClick={() => onOpen(group.session_id, groupOpenOrdinal(group))}
         className="flex items-baseline gap-2 text-left cursor-pointer"
       >
         <span className="text-[0.75rem] font-bold truncate flex-1">
-          {group.session_title ?? 'Untitled'}
+          {group.title_match ? <Highlighted segments={highlightAll(title, query)} /> : title}
         </span>
-        <span className="text-[0.6rem] font-mono text-ink-soft shrink-0">
-          {group.total_hits}
-        </span>
+        {group.total_hits > 0 ? (
+          <span className="text-[0.6rem] font-mono text-ink-soft shrink-0">
+            {group.total_hits}
+          </span>
+        ) : null}
       </button>
       {group.hits.map((hit) => (
         <button
@@ -135,7 +147,7 @@ export function SearchPanel({
 }: {
   query: string;
   activeSessionId: string | null | undefined;
-  onOpen: (sessionId: string, ordinal: number) => void;
+  onOpen: (sessionId: string, ordinal: number | null) => void;
 }) {
   const client = useAdminClient();
   const { logout } = useAuth();

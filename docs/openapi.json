@@ -1247,7 +1247,7 @@
           {
             "name": "q",
             "in": "query",
-            "description": "What the user typed, verbatim. FTS5 syntax is NOT accepted: the store\nquotes the whole thing into a literal phrase, so `-`, `*`, `NEAR` and\nfriends match themselves rather than meaning anything.",
+            "description": "What the user typed, verbatim, matched against conversation titles and\nmessage prose alike. FTS5 syntax is NOT accepted: the store\nquotes the whole thing into a literal phrase, so `-`, `*`, `NEAR` and\nfriends match themselves rather than meaning anything.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1298,7 +1298,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Matching messages, best first",
+            "description": "Conversations whose title or messages match, best first",
             "content": {
               "application/json": {
                 "schema": {
@@ -8162,6 +8162,7 @@
         "description": "One conversation's matches, collapsed into a single result.",
         "required": [
           "session_id",
+          "title_match",
           "hits",
           "total_hits"
         ],
@@ -8171,7 +8172,7 @@
             "items": {
               "$ref": "#/components/schemas/ChatSearchHit"
             },
-            "description": "Best-matching excerpts, best first, at most [`MAX_HITS_PER_SESSION`]."
+            "description": "Best-matching message excerpts, best first, at most\n[`MAX_HITS_PER_SESSION`]. Message hits only — a title match adds none."
           },
           "session_id": {
             "type": "string"
@@ -8183,9 +8184,13 @@
             ],
             "description": "Conversation title, when one has been generated."
           },
+          "title_match": {
+            "type": "boolean",
+            "description": "The query matched `session_title`. Title-matched conversations come\nfirst, in title-relevance order; the rest follow by best message hit.\nA group can be a title match with no message hits at all — then `hits`\nis empty and `total_hits` is 0, and opening it has no row to land on."
+          },
           "total_hits": {
             "type": "integer",
-            "description": "Matches this conversation has in total — `hits.len()` when it is at or\nunder the per-conversation cap, more when it is over, so a client can say\n\"and 12 more\" without another call. Exact unless `truncated`.",
+            "description": "Message matches this conversation has in total — `hits.len()` when it is\nat or under the per-conversation cap, more when it is over, so a client\ncan say \"and 12 more\" without another call. Exact unless `truncated`.",
             "minimum": 0
           }
         }
@@ -8238,11 +8243,11 @@
             "items": {
               "$ref": "#/components/schemas/ChatSearchGroup"
             },
-            "description": "Conversations, best match first. A conversation's rank is its best hit's."
+            "description": "Conversations, best match first: title matches by title relevance, then\nthe rest by their best message hit."
           },
           "truncated": {
             "type": "boolean",
-            "description": "True when the query matched more than the scan window, so some\nconversations are missing and `total_hits` undercounts. There is no\ncursor: a search box refines the query, it does not page."
+            "description": "True when the query matched more than the scan window — of messages or\nof titles — so some conversations are missing and `total_hits` may\nundercount. There is no\ncursor: a search box refines the query, it does not page."
           }
         }
       },
