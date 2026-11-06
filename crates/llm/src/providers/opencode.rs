@@ -7,6 +7,8 @@ use crate::effort::EffortWire;
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, LlmError, ModelInfo};
 
+pub(crate) mod gemini_usage;
+
 pub(crate) const ZEN_PROVIDER_NAME: &str = "opencode";
 pub(crate) const GO_PROVIDER_NAME: &str = "opencode-go";
 const SESSION_HEADER: &str = "x-opencode-session";
@@ -251,10 +253,13 @@ impl OpencodeCompletionModel {
         };
         macro_rules! client {
             ($provider:ident) => {
+                client!($provider, self.http_client.clone())
+            };
+            ($provider:ident, $http:expr) => {
                 $provider::Client::builder()
                     .api_key(api_key)
                     .base_url(&base)
-                    .http_client(self.http_client.clone())
+                    .http_client($http)
                     .http_headers(headers)
                     .build()
                     .map_err(|e| LlmError::Config(format!("build OpenCode client: {e}")))?
@@ -274,9 +279,13 @@ impl OpencodeCompletionModel {
                     .completion_model(&self.model)
                     .with_prompt_caching(),
             ),
-            Protocol::Gemini => {
-                AnyCompletionModel::Gemini(client!(gemini).completion_model(&self.model))
-            }
+            Protocol::Gemini => AnyCompletionModel::OpencodeGemini(
+                client!(
+                    gemini,
+                    gemini_usage::GeminiUsageClient::new(self.http_client.clone())
+                )
+                .completion_model(&self.model),
+            ),
         })
     }
 
@@ -323,7 +332,7 @@ struct ModelEntry {
 mod tests {
     use std::collections::HashMap;
 
-    use baybo_model::{ChatMessage, ContentBlock};
+    use baybo_model::{ChatMessage, ContentBlock, ThinkingContent};
     use futures::StreamExt;
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -782,6 +791,130 @@ mod tests {
         let call = items.iter().find(|i| i["type"] == "function_call").unwrap();
         assert_eq!(call["id"], "fc_item");
         assert_eq!(call["call_id"], "call_tool");
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_keeps_chunks_whose_usage_lacks_a_total() {
+        let events = [
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"checking"}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}}}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10,"totalTokenCount":130}}),
+        ];
+        let sse = events
+            .iter()
+            .map(|event| format!("data: {event}\r\n\r\n"))
+            .collect::<String>();
+        let (origin, mut captured) = endpoint(vec![(200, "text/event-stream", sse)]).await;
+        let client = LlmProviderRegistry::with_default_providers()
+            .build_client(&config(
+                OpencodeProviderFactory::Go,
+                "gemini-4-argon",
+                Some(origin),
+            ))
+            .unwrap();
+        let mut stream = client
+            .chat_stream(&request("session-gemini"))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                StreamEvent::Text(t) => text.push_str(&t),
+                StreamEvent::ToolCall(call) => calls.push(call),
+                StreamEvent::Usage(u) => usage = Some(u),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "checking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, json!({"path":"a.rs"}));
+        let usage = usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (120, 10));
+        let req = captured.recv().await.unwrap();
+        assert!(
+            req.path
+                .starts_with("/google/v1beta/models/gemini-4-argon:streamGenerateContent")
+        );
+        assert!(!req.path.contains("test-opencode-key"));
+        assert_eq!(req.headers["x-goog-api-key"], "test-opencode-key");
+        assert_eq!(req.headers[SESSION_HEADER], "session-gemini");
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_keeps_thoughts_and_signatures_when_usage_lacks_a_total() {
+        let events = [
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"hmm","thought":true}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":" done","thought":true,"thoughtSignature":"sig1"}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}},"thoughtSignature":"sig2"}]}}],"usageMetadata":{"promptTokenCount":5}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10}}),
+        ];
+        let sse = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let (origin, _captured) = endpoint(vec![(200, "text/event-stream", sse)]).await;
+        let client = LlmProviderRegistry::with_default_providers()
+            .build_client(&config(
+                OpencodeProviderFactory::Go,
+                "gemini-4-argon",
+                Some(origin),
+            ))
+            .unwrap();
+        let mut stream = client
+            .chat_stream(&request("session-gemini-thoughts"))
+            .await
+            .unwrap();
+        let mut reasoning = String::new();
+        let mut block_signatures = Vec::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                StreamEvent::Reasoning(r) => reasoning.push_str(&r),
+                StreamEvent::ThinkingBlock(ContentBlock::Thinking { content, .. }) => {
+                    block_signatures.extend(content.into_iter().filter_map(|c| match c {
+                        ThinkingContent::Text { signature, .. } => signature,
+                        _ => None,
+                    }));
+                }
+                StreamEvent::ToolCall(call) => calls.push(call),
+                StreamEvent::Usage(u) => usage = Some(u),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "hmm");
+        assert_eq!(block_signatures, vec!["sig1".to_string()]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].signature.as_deref(), Some("sig2"));
+        let usage = usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (120, 10));
+    }
+
+    #[tokio::test]
+    async fn gemini_completion_accepts_usage_without_a_total() {
+        let body = json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"cachedContentTokenCount":3}});
+        let (origin, _captured) = endpoint(vec![(200, "application/json", body.to_string())]).await;
+        let client = LlmProviderRegistry::with_default_providers()
+            .build_client(&config(
+                OpencodeProviderFactory::Go,
+                "gemini-4-argon",
+                Some(origin),
+            ))
+            .unwrap();
+        let result = client.chat(&request("session-gemini")).await.unwrap();
+        assert_eq!(result.content, "done");
+        assert_eq!(
+            (
+                result.usage.input_tokens,
+                result.usage.output_tokens,
+                result.usage.cached_input_tokens
+            ),
+            (10, 2, 3)
+        );
     }
 
     #[tokio::test]
