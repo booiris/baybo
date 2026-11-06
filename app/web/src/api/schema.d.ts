@@ -1798,15 +1798,25 @@ export interface components {
         };
         /** @description One conversation's matches, collapsed into a single result. */
         ChatSearchGroup: {
-            /** @description Best-matching excerpts, best first, at most [`MAX_HITS_PER_SESSION`]. */
+            /**
+             * @description Best-matching message excerpts, best first, at most
+             *     [`MAX_HITS_PER_SESSION`]. Message hits only — a title match adds none.
+             */
             hits: components["schemas"]["ChatSearchHit"][];
             session_id: string;
             /** @description Conversation title, when one has been generated. */
             session_title?: string | null;
             /**
-             * @description Matches this conversation has in total — `hits.len()` when it is at or
-             *     under the per-conversation cap, more when it is over, so a client can say
-             *     "and 12 more" without another call. Exact unless `truncated`.
+             * @description The query matched `session_title`. Title-matched conversations come
+             *     first, in title-relevance order; the rest follow by best message hit.
+             *     A group can be a title match with no message hits at all — then `hits`
+             *     is empty and `total_hits` is 0, and opening it has no row to land on.
+             */
+            title_match: boolean;
+            /**
+             * @description Message matches this conversation has in total — `hits.len()` when it is
+             *     at or under the per-conversation cap, more when it is over, so a client
+             *     can say "and 12 more" without another call. Exact unless `truncated`.
              */
             total_hits: number;
         };
@@ -1846,11 +1856,15 @@ export interface components {
             text: string;
         };
         ChatSearchResults: {
-            /** @description Conversations, best match first. A conversation's rank is its best hit's. */
+            /**
+             * @description Conversations, best match first: title matches by title relevance, then
+             *     the rest by their best message hit.
+             */
             groups: components["schemas"]["ChatSearchGroup"][];
             /**
-             * @description True when the query matched more than the scan window, so some
-             *     conversations are missing and `total_hits` undercounts. There is no
+             * @description True when the query matched more than the scan window — of messages or
+             *     of titles — so some conversations are missing and `total_hits` may
+             *     undercount. There is no
              *     cursor: a search box refines the query, it does not page.
              */
             truncated: boolean;
@@ -4932,7 +4946,8 @@ export interface operations {
         parameters: {
             query: {
                 /**
-                 * @description What the user typed, verbatim. FTS5 syntax is NOT accepted: the store
+                 * @description What the user typed, verbatim, matched against conversation titles and
+                 *     message prose alike. FTS5 syntax is NOT accepted: the store
                  *     quotes the whole thing into a literal phrase, so `-`, `*`, `NEAR` and
                  *     friends match themselves rather than meaning anything.
                  */
@@ -4962,7 +4977,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Matching messages, best first */
+            /** @description Conversations whose title or messages match, best first */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -127,7 +127,8 @@ pub struct ListSessionsQuery {
 /// Query string for `GET /v1/chat/search`.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SearchMessagesQuery {
-    /// What the user typed, verbatim. FTS5 syntax is NOT accepted: the store
+    /// What the user typed, verbatim, matched against conversation titles and
+    /// message prose alike. FTS5 syntax is NOT accepted: the store
     /// quotes the whole thing into a literal phrase, so `-`, `*`, `NEAR` and
     /// friends match themselves rather than meaning anything.
     pub q: String,
@@ -183,20 +184,28 @@ pub struct ChatSearchGroup {
     /// Conversation title, when one has been generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_title: Option<String>,
-    /// Best-matching excerpts, best first, at most [`MAX_HITS_PER_SESSION`].
+    /// The query matched `session_title`. Title-matched conversations come
+    /// first, in title-relevance order; the rest follow by best message hit.
+    /// A group can be a title match with no message hits at all — then `hits`
+    /// is empty and `total_hits` is 0, and opening it has no row to land on.
+    pub title_match: bool,
+    /// Best-matching message excerpts, best first, at most
+    /// [`MAX_HITS_PER_SESSION`]. Message hits only — a title match adds none.
     pub hits: Vec<ChatSearchHit>,
-    /// Matches this conversation has in total — `hits.len()` when it is at or
-    /// under the per-conversation cap, more when it is over, so a client can say
-    /// "and 12 more" without another call. Exact unless `truncated`.
+    /// Message matches this conversation has in total — `hits.len()` when it is
+    /// at or under the per-conversation cap, more when it is over, so a client
+    /// can say "and 12 more" without another call. Exact unless `truncated`.
     pub total_hits: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatSearchResults {
-    /// Conversations, best match first. A conversation's rank is its best hit's.
+    /// Conversations, best match first: title matches by title relevance, then
+    /// the rest by their best message hit.
     pub groups: Vec<ChatSearchGroup>,
-    /// True when the query matched more than the scan window, so some
-    /// conversations are missing and `total_hits` undercounts. There is no
+    /// True when the query matched more than the scan window — of messages or
+    /// of titles — so some conversations are missing and `total_hits` may
+    /// undercount. There is no
     /// cursor: a search box refines the query, it does not page.
     pub truncated: bool,
 }
@@ -941,7 +950,7 @@ async fn create_session(
     tag = "chat",
     params(SearchMessagesQuery),
     responses(
-        (status = 200, description = "Matching messages, best first", body = ChatSearchResults),
+        (status = 200, description = "Conversations whose title or messages match, best first", body = ChatSearchResults),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Search failed", body = ErrorBody),
     )
@@ -989,6 +998,7 @@ fn chat_search_group(group: SessionSearchGroup) -> ChatSearchGroup {
     ChatSearchGroup {
         session_id: group.session_id.to_string(),
         session_title: group.title,
+        title_match: group.title_match,
         hits: group.hits.into_iter().map(chat_search_hit).collect(),
         total_hits: group.total_hits,
     }

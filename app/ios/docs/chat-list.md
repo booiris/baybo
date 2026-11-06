@@ -89,7 +89,7 @@ not render again.
 
 ## Searching conversations
 
-Full-text search over every conversation's prose, served by the gateway's
+Full-text search over every conversation's title and prose, served by the gateway's
 `GET /v1/chat/search` — the same endpoint app/web's `SearchPanel` calls, so this
 is **one protocol implemented twice** and anything that differs between the two
 clients is a bug on one of them. The index itself is documented in
@@ -222,6 +222,18 @@ sequence or stranding a combining mark. A card's title prefers THIS device's row
 (`SessionHeadline`, the same rule the list's bold line uses) so one conversation
 is not called two different things two screens apart.
 
+**Title matches lead the list.** The gateway puts groups whose TITLE matched
+first (`ChatSearchGroup.title_match`, decoded with `#[serde(default)]` so an
+older gateway reads as "no title matches"). Such a card highlights its title
+with `SearchSnippet.highlightAll` — the whole name, matched terms bold, never
+the excerpts' windowed `snippet`, whose 12-cluster lead would crop the name from
+the left and prefix it with `…` — and, to keep the highlight honest, names itself
+with the gateway's `session_title` rather than this device's row — that string
+is what the query matched, and the two only differ while the row's title is
+catching up. `hits` / `total_hits` count messages only, so a **title-only**
+group arrives with no excerpts and a count of 0, and the card shows neither the
+excerpts nor a bare "0".
+
 ### Jumping to a hit
 
 Each excerpt is its own button: with anchored jumping every hit is a distinct
@@ -233,6 +245,15 @@ The ordinal travels in `AppStore.pendingJump[sessionId]`, consumed once by
 compared for equality in several places, so a payload would make one
 conversation two routes) and **not** by calling the bridge at the tap site (the
 queued JS would be lost if the `TranscriptHost` were rebuilt in between).
+
+**A title-matched card's title row opens like app/web's.** It is a button
+(`search.title.<sessionId>`) that lands on the best-scoring hit when the group
+has one, and for a **title-only** group calls
+`openSearchResult(sessionId:ordinal: nil)` — no jump. That call REMOVES any
+`pendingJump` entry for the session instead of writing one: a title has no
+message to park on, and jumping to ordinal 0 would yank the reader to the start
+of a long conversation. Clearing rather than skipping the write means a jump
+left unconsumed for that session cannot fire in its place.
 
 `TranscriptBridge.jumpToOrdinal` addresses the row **by ordinal, never by row
 id**. A user row is keyed by its `platform_msg_id` with the ordinal carried

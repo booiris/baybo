@@ -10,14 +10,13 @@
 // the contract and the Swift side dutifully reproduces it.
 //
 // Expect `SearchSnippetVectorTests` (app/ios) to go red after a regen until the
-// Swift side is ported to match. That red is the gate working; app/ios has no
-// CI (every `ios-*` job is `if: false`), so run it by hand.
+// Swift side is ported to match. That red is the gate working.
 
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { snippet } from '../src/pages/chat/searchSnippet.ts';
+import { highlightAll, snippet } from '../src/pages/chat/searchSnippet.ts';
 
 /** `[name, text, query]`. Keep names stable — the Swift suite reports by name. */
 const cases = [
@@ -50,12 +49,34 @@ const cases = [
   ['decomposed combining mark (e+U+0301) stays with its base', `${'e\u0301'.repeat(70)}检索`, '检索'],
 ];
 
-const vectors = cases.map(([name, text, query]) => ({
-  name,
-  text,
-  query,
-  segments: snippet(text, query),
-}));
+/** `highlightAll` — a result card's TITLE: the whole string, never windowed. */
+const titleCases = [
+  [
+    'title: a match past the excerpt lead window keeps the whole name',
+    'Weekly review of the database migration plan',
+    'plan',
+  ],
+  ['title: every term marked, no ellipsis', `${'长'.repeat(150)}数据库${'尾'.repeat(150)}迁移`, '数据库 迁移'],
+  ['title: no locatable term is the whole title, unmarked', 'résumé of the work', 'resume'],
+  ['title: empty title', '', 'foo'],
+];
+
+const vectors = [
+  ...cases.map(([name, text, query]) => ({
+    name,
+    fn: 'snippet',
+    text,
+    query,
+    segments: snippet(text, query),
+  })),
+  ...titleCases.map(([name, text, query]) => ({
+    name,
+    fn: 'highlightAll',
+    text,
+    query,
+    segments: highlightAll(text, query),
+  })),
+];
 
 const out = join(
   dirname(fileURLToPath(import.meta.url)),

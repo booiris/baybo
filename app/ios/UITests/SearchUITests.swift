@@ -62,6 +62,25 @@ final class SearchUITests: BayboUITestCase {
         XCTAssertTrue(app.buttons["search.hit.demo-2.1"].exists)
     }
 
+    /// A title-only match has no excerpt to tap, so its title row is the button
+    /// — and it opens the conversation like any result, with no jump to park on.
+    func testATitleOnlyMatchOpensFromItsTitle() {
+        let app = launchSearch()
+        let field = openSearch(app)
+        field.tap()
+        field.typeText("demo")
+
+        let title = app.buttons["search.title.demo-3"]
+        XCTAssertTrue(
+            title.waitForExistence(timeout: 10),
+            "a title-only group must be tappable by its title")
+        title.tap()
+
+        XCTAssertTrue(
+            app.buttons["Back to conversations"].waitForExistence(timeout: Self.webviewTimeout),
+            "tapping a title match must open the conversation")
+    }
+
     /// Opening a hit pushes onto the OUTER NavigationStack, which wraps the whole
     /// TabView — so the conversation covers the shell and this tab stays selected
     /// underneath it. `openSearchResult` passes `keepTab: true` for exactly this;

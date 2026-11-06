@@ -1,4 +1,5 @@
-//! Full-text search over chat transcript prose. See `docs/search.md`.
+//! Full-text search over chat transcript prose and session titles. See
+//! `docs/search.md`.
 //!
 //! FTS5 tokenizes at INSERT time with the tokenizer named in the schema, so
 //! whatever the tokenizer decides is what the index can ever return. This module
@@ -10,14 +11,15 @@
 use rusqlite::OptionalExtension;
 use unicode_normalization::UnicodeNormalization;
 
-/// Identity of the index-side pipeline: `segment`'s output shape and
-/// `is_unigram_script`'s ranges. Stored in `search_meta`; a mismatch on open
-/// rebuilds the index from scratch. Bump it on any change to either.
+/// Identity of the index-side pipeline: `segment`'s output shape,
+/// `is_unigram_script`'s ranges, and the shape of BOTH index tables
+/// (`message_fts` and `session_title_fts`). Stored in `search_meta`; a mismatch
+/// on open rebuilds both from scratch. Bump it on any change to any of them.
 ///
 /// Query-side work (prefix widening, a future query splitter) never reads this
 /// and must never bump it — that is the whole point of keeping language handling
 /// off the index side.
-pub(crate) const SEGMENTER_FINGERPRINT: &str = "unigram-u61-v2";
+pub(crate) const SEGMENTER_FINGERPRINT: &str = "unigram-u61-v3";
 
 pub(crate) const FINGERPRINT_KEY: &str = "segmenter_fingerprint";
 
@@ -215,13 +217,82 @@ const CREATE_FTS_TABLE: &str = r#"
     )
 "#;
 
+/// One row per titled session. Like `message_fts` it carries its own segmented
+/// text, and unlike it there is no channel snapshot: a title always has a
+/// `sessions` row (it lives there), so every scope axis is joined live.
+const CREATE_TITLE_FTS_TABLE: &str = r#"
+    CREATE VIRTUAL TABLE session_title_fts USING fts5(
+        segmented,
+        session_id UNINDEXED,
+        tokenize   = 'unicode61',
+        detail     = 'full'
+    )
+"#;
+
+const INSERT_TITLE_FTS_ROW: &str =
+    "INSERT INTO session_title_fts (segmented, session_id) VALUES (?1, ?2)";
+
+/// `session_id` is UNINDEXED, so this scans the table. That is one row per
+/// titled session, and it runs only on a title write.
+const DELETE_TITLE_FTS_ROW: &str = "DELETE FROM session_title_fts WHERE session_id = ?1";
+
+/// The segmented form of a title, or `None` when it holds nothing to index.
+fn indexable_title(title: &str) -> Option<String> {
+    let normalized = normalize(title);
+    (!normalized.trim().is_empty()).then(|| segment(&normalized))
+}
+
+/// Replace a session's row in `session_title_fts` with `title` — `None` (or a
+/// blank title) leaves it with none. Call inside the same transaction as the
+/// `sessions.title` write, and only when that write changed a row: a title that
+/// lands in one but not the other is unsearchable, or worse, findable under a
+/// name the session no longer has.
+pub(crate) fn index_title(
+    tx: &rusqlite::Connection,
+    session_id: &str,
+    title: Option<&str>,
+) -> rusqlite::Result<()> {
+    tx.execute(DELETE_TITLE_FTS_ROW, [session_id])?;
+    if let Some(segmented) = title.and_then(indexable_title) {
+        tx.execute(
+            INSERT_TITLE_FTS_ROW,
+            rusqlite::params![segmented, session_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// The session-flag half of [`SearchScope`](baybo_store::SearchScope), shared by
+/// both search queries so a title can never reach a session a message hit could
+/// not. Binds `?4` include_hidden, `?5` include_archived, `?6`
+/// include_cron_workspaces, against a `sessions` row aliased `s`.
+///
+/// The cron predicate mirrors the gateway's `is_private_cron_session`: a fire
+/// that is not a conversation of its own is unlistable and unattachable, so a
+/// hit there names something no client can open. `trigger_kind` is flat and is
+/// tested FIRST so the `json_extract` is reached only by the cron rows —
+/// `conversation` lives inside the `data` blob's trigger and is absent on every
+/// historical fire (serde default), which is what `COALESCE(..., 0)` reads as
+/// "not a conversation".
+///
+/// `COALESCE(s.trigger_kind, '')` is load-bearing, not defensive: the message
+/// query's join is LEFT, so a row whose session is missing yields NULL here, and
+/// a bare `s.trigger_kind = 'cron'` would make the whole predicate NULL —
+/// dropping exactly the rows the LEFT JOIN exists to keep findable.
+const SESSION_FLAGS_PREDICATE: &str = r#"
+    AND (?4 OR COALESCE(s.hidden, 0) = 0)
+    AND (?5 OR COALESCE(s.archived, 0) = 0)
+    AND (?6 OR NOT (COALESCE(s.trigger_kind, '') = 'cron'
+         AND COALESCE(json_extract(s.data, '$.trigger.conversation'), 0) = 0))
+"#;
+
 /// Drop, recreate and refill the index whenever the pipeline that built it is
 /// not the one running now. Called from `init_db`, so it completes before the
 /// pool warms and `Store::open` returns: the index is never half-built, never
 /// half-stale, and never a schema behind.
 ///
-/// This is the whole migration story for `message_fts` — both its rows and its
-/// columns. There is no incremental backfill and no per-row version column
+/// This is the whole migration story for `message_fts` and `session_title_fts`
+/// — both their rows and their columns. There is no incremental backfill and no per-row version column
 /// because there is nothing to save: a full rebuild of a live corpus measures
 /// ~60 ms (`segment` runs at ~350 MB/s; the FTS5 insert dominates). The absent
 /// fingerprint on a fresh database performs the initial build by the same path,
@@ -251,6 +322,8 @@ pub(crate) fn rebuild_if_stale(conn: &mut rusqlite::Connection) -> anyhow::Resul
     let tx = conn.transaction()?;
     tx.execute("DROP TABLE IF EXISTS message_fts", [])?;
     tx.execute(CREATE_FTS_TABLE, [])?;
+    tx.execute("DROP TABLE IF EXISTS session_title_fts", [])?;
+    tx.execute(CREATE_TITLE_FTS_TABLE, [])?;
     let mut indexed = 0usize;
     {
         let mut stmt = tx.prepare(
@@ -285,6 +358,21 @@ pub(crate) fn rebuild_if_stale(conn: &mut rusqlite::Connection) -> anyhow::Resul
             indexed += 1;
         }
     }
+    let mut titles = 0usize;
+    {
+        let mut stmt = tx.prepare("SELECT id, title FROM sessions WHERE title IS NOT NULL")?;
+        let mut rows = stmt.query([])?;
+        let mut insert = tx.prepare(INSERT_TITLE_FTS_ROW)?;
+        while let Some(row) = rows.next()? {
+            let session_id: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let Some(segmented) = indexable_title(&title) else {
+                continue;
+            };
+            insert.execute(rusqlite::params![segmented, session_id])?;
+            titles += 1;
+        }
+    }
     tx.execute(
         "INSERT INTO search_meta (key, value) VALUES (?1, ?2) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -293,6 +381,7 @@ pub(crate) fn rebuild_if_stale(conn: &mut rusqlite::Connection) -> anyhow::Resul
     tx.commit()?;
     tracing::info!(
         indexed,
+        titles,
         fingerprint = SEGMENTER_FINGERPRINT,
         "rebuilt message search index"
     );
@@ -354,20 +443,8 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // filters must stay INSIDE, or the limit would be applied before
                 // them and return short.
                 //
-                // The cron predicate mirrors the gateway's
-                // `is_private_cron_session`: a fire that is not a conversation of
-                // its own is unlistable and unattachable, so a hit there names
-                // something no client can open. `trigger_kind` is flat and is
-                // tested FIRST so the `json_extract` is reached only by the cron
-                // rows — `conversation` lives inside the `data` blob's trigger
-                // and is absent on every historical fire (serde default), which
-                // is what `COALESCE(..., 0)` reads as "not a conversation".
-                //
-                // `COALESCE(s.trigger_kind, '')` is load-bearing, not defensive:
-                // the join is LEFT, so a row whose session is missing yields NULL
-                // here, and a bare `s.trigger_kind = 'cron'` would make the whole
-                // predicate NULL — dropping exactly the rows the LEFT JOIN exists
-                // to keep findable.
+                // The hidden / archived / cron-workspace axes are
+                // `SESSION_FLAGS_PREDICATE`, shared with the title query.
                 //
                 // `compaction_inserted = 0` INSIDE the window: a compaction
                 // re-inserts the recent slice it keeps as fresh rows and indexes
@@ -379,7 +456,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // dropped after the LIMIT still spent a window slot, so the
                 // caller's `hits.len() == limit` test for "the window filled"
                 // would read false while real rows had been cut off.
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare(&format!(
                     "SELECT f.session_id, f.ordinal, f.channel, m.role, m.content, m.source, \
                             m.platform_msg_id, m.created_at, m.superseded_by, f.score \
                      FROM ( \
@@ -390,10 +467,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                          WHERE message_fts MATCH ?1 \
                            AND (?2 IS NULL OR x.channel = ?2) \
                            AND (?3 IS NULL OR x.session_id = ?3) \
-                           AND (?4 OR COALESCE(s.hidden, 0) = 0) \
-                           AND (?5 OR COALESCE(s.archived, 0) = 0) \
-                           AND (?6 OR NOT (COALESCE(s.trigger_kind, '') = 'cron' \
-                                AND COALESCE(json_extract(s.data, '$.trigger.conversation'), 0) = 0)) \
+                           {SESSION_FLAGS_PREDICATE} \
                            AND EXISTS (SELECT 1 FROM session_messages r \
                                         WHERE r.session_id = x.session_id \
                                           AND r.ordinal = x.ordinal \
@@ -404,7 +478,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                      JOIN session_messages_read m \
                        ON m.session_id = f.session_id AND m.ordinal = f.ordinal \
                      ORDER BY f.score",
-                )?;
+                ))?;
                 let params = rusqlite::params![
                     expr,
                     channel,
@@ -462,6 +536,60 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                     });
                 }
                 Ok(hits)
+            })
+            .await
+    }
+
+    async fn search_titles(
+        &self,
+        query: &str,
+        scope: &baybo_store::SearchScope,
+        limit: u32,
+    ) -> Result<Vec<baybo_store::TitleHit>, baybo_store::StorageError> {
+        let Some(expr) = build_match(query) else {
+            return Ok(Vec::new());
+        };
+        let channel = scope.channel.as_ref().map(|c| c.0.clone());
+        let session = scope.session.as_ref().map(|s| s.as_str().to_owned());
+        let include_hidden = scope.include_hidden;
+        let include_archived = scope.include_archived;
+        let include_cron_workspaces = scope.include_cron_workspaces;
+        self.pool
+            .interact("search.search_titles", move |conn| {
+                // An inner join: the title IS a `sessions` column, so a title row
+                // without its session has nothing to return. `s.channel` is the
+                // flat column `save` writes, so no `json_extract` and no snapshot.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT x.session_id, COALESCE(s.channel, ''), s.title, \
+                            bm25(session_title_fts) AS score \
+                     FROM session_title_fts x \
+                     JOIN sessions s ON s.id = x.session_id \
+                     WHERE session_title_fts MATCH ?1 \
+                       AND s.title IS NOT NULL \
+                       AND (?2 IS NULL OR s.channel = ?2) \
+                       AND (?3 IS NULL OR x.session_id = ?3) \
+                       {SESSION_FLAGS_PREDICATE} \
+                     ORDER BY score \
+                     LIMIT ?7",
+                ))?;
+                let params = rusqlite::params![
+                    expr,
+                    channel,
+                    session,
+                    include_hidden,
+                    include_archived,
+                    include_cron_workspaces,
+                    limit
+                ];
+                let rows = stmt.query_map(params, |row| {
+                    Ok(baybo_store::TitleHit {
+                        session_id: baybo_model::SessionId::from(row.get::<_, String>(0)?),
+                        channel: baybo_model::ChannelType(row.get(1)?),
+                        title: row.get(2)?,
+                        score: row.get(3)?,
+                    })
+                })?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             })
             .await
     }
@@ -1398,6 +1526,328 @@ mod tests {
 
     fn store_of(pool: &super::super::SqlitePool) -> SqliteMessageSearchStore {
         SqliteMessageSearchStore::new(pool.clone())
+    }
+
+    fn titled_session(
+        id: &str,
+        channel: &str,
+        trigger: baybo_model::TriggerSource,
+    ) -> baybo_model::Session {
+        use baybo_model::{ChannelType, Session, SessionState, User};
+        let sid = SessionId::from(id.to_string());
+        let ch = ChannelType::from(channel);
+        Session {
+            id: sid.clone(),
+            user: User {
+                id: "u1".into(),
+                name: None,
+                channel: ch.clone(),
+            },
+            channel: ch,
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+            state: SessionState::default(),
+            root_session_id: sid,
+            trigger,
+            lineage: None,
+            hidden: false,
+            pinned: false,
+            archived: false,
+            folder_id: None,
+            title: None,
+        }
+    }
+
+    async fn title_fixture() -> (
+        tempfile::TempDir,
+        super::super::SqlitePool,
+        super::super::SqliteSessionStore,
+    ) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let sessions = super::super::SqliteSessionStore::new(pool.clone());
+        (tmpdir, pool, sessions)
+    }
+
+    async fn title_ids(
+        store: &SqliteMessageSearchStore,
+        query: &str,
+        scope: &SearchScope,
+    ) -> Vec<String> {
+        let mut ids: Vec<String> = store
+            .search_titles(query, scope, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.session_id.as_str().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A rename must replace the indexed title, not add to it: a session found
+    /// under a name it no longer has is worse than one not found at all.
+    #[tokio::test]
+    async fn set_title_indexes_renames_replace_and_clearing_removes() {
+        let (_dir, pool, sessions) = title_fixture().await;
+        let s = titled_session("t", "owner", baybo_model::TriggerSource::User);
+        sessions.save(&s).await.unwrap();
+        let store = store_of(&pool);
+        let all = SearchScope::default();
+
+        assert!(
+            sessions
+                .set_title(&s.id, Some("Migrating the schema"))
+                .await
+                .unwrap()
+        );
+        let hits = store.search_titles("schema", &all, 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].title, "Migrating the schema",
+            "the original title, not the segmented index text"
+        );
+        assert_eq!(hits[0].channel, baybo_model::ChannelType::from("owner"));
+
+        assert!(
+            sessions
+                .set_title(&s.id, Some("Fixing login"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            title_ids(&store, "schema", &all).await.is_empty(),
+            "the old title must stop matching"
+        );
+        assert_eq!(
+            title_ids(&store, "login", &all).await,
+            vec!["t".to_string()]
+        );
+
+        assert!(sessions.set_title(&s.id, None).await.unwrap());
+        assert!(
+            title_ids(&store, "login", &all).await.is_empty(),
+            "clearing a title removes it from the index"
+        );
+
+        assert!(sessions.set_title(&s.id, Some("   ")).await.unwrap());
+        let rows: i64 = pool
+            .interact("test.count_titles", |conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM session_title_fts", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a blank title indexes nothing");
+    }
+
+    /// The auto-titler losing to a rename must not index the title it failed
+    /// to write.
+    #[tokio::test]
+    async fn set_title_if_absent_indexes_only_when_it_wrote() {
+        let (_dir, pool, sessions) = title_fixture().await;
+        let s = titled_session("t", "owner", baybo_model::TriggerSource::User);
+        sessions.save(&s).await.unwrap();
+        let store = store_of(&pool);
+        let all = SearchScope::default();
+
+        assert!(
+            sessions
+                .set_title_if_absent(&s.id, "Generated first")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            title_ids(&store, "generated", &all).await,
+            vec!["t".to_string()]
+        );
+
+        assert!(
+            sessions
+                .set_title(&s.id, Some("Renamed by user"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !sessions
+                .set_title_if_absent(&s.id, "Autogen late")
+                .await
+                .unwrap()
+        );
+        assert!(title_ids(&store, "autogen", &all).await.is_empty());
+        assert_eq!(
+            title_ids(&store, "renamed", &all).await,
+            vec!["t".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn titles_get_cjk_substring_and_latin_prefix_semantics() {
+        let (_dir, pool, sessions) = title_fixture().await;
+        let s = titled_session("t", "owner", baybo_model::TriggerSource::User);
+        sessions.save(&s).await.unwrap();
+        sessions
+            .set_title(&s.id, Some("数据库的迁移 sessions"))
+            .await
+            .unwrap();
+        let store = store_of(&pool);
+        let all = SearchScope::default();
+
+        for query in ["迁移", "数据库", "session", "数据 sessions"] {
+            assert_eq!(
+                title_ids(&store, query, &all).await,
+                vec!["t".to_string()],
+                "query {query:?}"
+            );
+        }
+        for miss in ["库迁", "ession", "---"] {
+            assert!(
+                title_ids(&store, miss, &all).await.is_empty(),
+                "query {miss:?}"
+            );
+        }
+    }
+
+    /// Titles honour exactly the scope message hits do, or a title search
+    /// resurfaces what the user hid or a conversation no client can open.
+    #[tokio::test]
+    async fn title_search_honours_every_scope_axis() {
+        use baybo_model::{ChannelType, TriggerSource};
+
+        let (_dir, pool, sessions) = title_fixture().await;
+        let cron = |conversation: bool| TriggerSource::Cron {
+            cron_job_id: "job-1".into(),
+            origin_session_id: None,
+            conversation,
+            job_title: None,
+            project_id: None,
+        };
+        for (id, channel, trigger) in [
+            ("plain", "owner", TriggerSource::User),
+            ("hidden", "owner", TriggerSource::User),
+            ("archived", "owner", TriggerSource::User),
+            (
+                "sub",
+                baybo_model::SUBAGENT_CHANNEL_TAG,
+                TriggerSource::User,
+            ),
+            ("workspace", "owner", cron(false)),
+            ("recurring", "owner", cron(true)),
+        ] {
+            let s = titled_session(id, channel, trigger);
+            sessions.save(&s).await.unwrap();
+            sessions.set_title(&s.id, Some("共同的标题")).await.unwrap();
+        }
+        sessions
+            .set_hidden(&SessionId::from("hidden"), true)
+            .await
+            .unwrap();
+        sessions
+            .set_archived(&SessionId::from("archived"), true)
+            .await
+            .unwrap();
+        let store = store_of(&pool);
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            title_ids(&store, "标题", &SearchScope::default()).await,
+            ids(&["plain", "recurring", "sub"])
+        );
+        assert_eq!(
+            title_ids(
+                &store,
+                "标题",
+                &SearchScope {
+                    channel: Some(ChannelType::from("owner")),
+                    ..SearchScope::default()
+                }
+            )
+            .await,
+            ids(&["plain", "recurring"])
+        );
+        assert_eq!(
+            title_ids(
+                &store,
+                "标题",
+                &SearchScope {
+                    session: Some(SessionId::from("plain")),
+                    ..SearchScope::default()
+                }
+            )
+            .await,
+            ids(&["plain"])
+        );
+        assert!(
+            title_ids(
+                &store,
+                "标题",
+                &SearchScope {
+                    session: Some(SessionId::from("hidden")),
+                    ..SearchScope::default()
+                }
+            )
+            .await
+            .is_empty(),
+            "naming a hidden session does not lapse the hidden rule"
+        );
+        assert_eq!(
+            title_ids(
+                &store,
+                "标题",
+                &SearchScope {
+                    include_hidden: true,
+                    include_archived: true,
+                    include_cron_workspaces: true,
+                    ..SearchScope::default()
+                }
+            )
+            .await,
+            ids(&[
+                "archived",
+                "hidden",
+                "plain",
+                "recurring",
+                "sub",
+                "workspace"
+            ])
+        );
+    }
+
+    /// Titles written before the title index existed must become findable on
+    /// the first open of a build that has it.
+    #[tokio::test]
+    async fn a_stale_fingerprint_indexes_pre_existing_titles() {
+        let (_dir, pool, sessions) = title_fixture().await;
+        let s = titled_session("t", "owner", baybo_model::TriggerSource::User);
+        sessions.save(&s).await.unwrap();
+        sessions.set_title(&s.id, Some("老的标题")).await.unwrap();
+
+        pool.interact_write("test.simulate_previous_build", |conn| {
+            conn.execute("DROP TABLE session_title_fts", [])?;
+            conn.execute(
+                "UPDATE search_meta SET value = 'unigram-u61-v2' WHERE key = ?1",
+                [FINGERPRINT_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        pool.interact_write("test.rebuild", rebuild_if_stale)
+            .await
+            .unwrap();
+        assert_eq!(
+            title_ids(&store_of(&pool), "标题", &SearchScope::default()).await,
+            vec!["t".to_string()]
+        );
+    }
+
+    /// The title table is an index-side change: a database stamped by the
+    /// previous build must rebuild, or it never gets a `session_title_fts`.
+    #[test]
+    fn fingerprint_was_bumped_for_the_title_index() {
+        assert_ne!(SEGMENTER_FINGERPRINT, "unigram-u61-v2");
     }
 
     #[test]

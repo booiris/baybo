@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// Full-text search over every conversation — the home shell's `.search` tab.
+/// Full-text search over every conversation's title and prose — the home
+/// shell's `.search` tab.
 ///
 /// The tab carries `TabRole.search`, which on iOS 26 the system lifts out of the
 /// glass pill and floats as its own trailing circle; that separated affordance
@@ -266,30 +267,27 @@ struct SearchScreen: View {
     ///
     /// Every excerpt is its own button: the anchored jump means each hit is a
     /// distinct destination, so a card-wide tap target would show the reader the
-    /// line they wanted and then land them on a different one.
+    /// line they wanted and then land them on a different one. When the TITLE
+    /// matched, the title row is a button too, with app/web's rule: it lands on
+    /// the best-scoring hit, or — for a title-only group, which has no message
+    /// to park on — opens the conversation with no jump.
     private func card(_ group: ChatSearchGroup) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(verbatim: title(for: group))
-                    .font(Theme.mono(14, weight: .semibold))
-                    .foregroundStyle(Theme.ink)
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                Text(verbatim: String(group.totalHits))
-                    .font(Theme.mono(11))
-                    .foregroundStyle(Theme.inkSoft)
+            if group.titleMatch {
+                Button {
+                    openResult(group.sessionId, ordinal: group.hits.first?.ordinal)
+                } label: {
+                    titleRow(group)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("search.title.\(group.sessionId)")
+            } else {
+                titleRow(group)
             }
 
             ForEach(group.hits.prefix(Self.excerptsPerCard), id: \.ordinal) { hit in
                 Button {
-                    // Drop focus BEFORE the push. Otherwise the field is still
-                    // first responder when the conversation covers it, UIKit
-                    // restores it on the pop, and the keyboard re-presents itself
-                    // over the results — grey snapshot first, live keyboard a
-                    // beat later. Nobody coming back from a conversation asked
-                    // for a keyboard; the results are what they came back to.
-                    focused = false
-                    appStore.openSearchResult(sessionId: group.sessionId, ordinal: hit.ordinal)
+                    openResult(group.sessionId, ordinal: hit.ordinal)
                 } label: {
                     excerpt(hit)
                 }
@@ -310,6 +308,49 @@ struct SearchScreen: View {
             RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
                 .fill(Theme.ink.opacity(0.035))
         )
+    }
+
+    /// The card's headline: the conversation's name and its message-hit count.
+    ///
+    /// A title match marks the terms across the whole name
+    /// (`SearchSnippet.highlightAll` — never the excerpts' windowed `snippet`,
+    /// which would crop the name from the left), so the reader sees WHY a card
+    /// with few or no message hits is in the list. The
+    /// count is message hits only, so a title-only group shows none rather than
+    /// a bare "0".
+    private func titleRow(_ group: ChatSearchGroup) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Group {
+                if group.titleMatch {
+                    highlightedTitle(title(for: group))
+                } else {
+                    Text(verbatim: title(for: group))
+                        .foregroundStyle(Theme.ink)
+                }
+            }
+            .font(Theme.mono(14, weight: .semibold))
+            .lineLimit(1)
+            Spacer(minLength: 8)
+            if group.totalHits > 0 {
+                Text(verbatim: String(group.totalHits))
+                    .font(Theme.mono(11))
+                    .foregroundStyle(Theme.inkSoft)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    /// Open a result: parked on `ordinal` for a message hit, at the
+    /// conversation's normal landing spot for a title-only match (`nil`).
+    private func openResult(_ sessionId: String, ordinal: Int64?) {
+        // Drop focus BEFORE the push. Otherwise the field is still first
+        // responder when the conversation covers it, UIKit restores it on the
+        // pop, and the keyboard re-presents itself over the results — grey
+        // snapshot first, live keyboard a beat later. Nobody coming back from a
+        // conversation asked for a keyboard; the results are what they came back
+        // to.
+        focused = false
+        appStore.openSearchResult(sessionId: sessionId, ordinal: ordinal)
     }
 
     private func excerpt(_ hit: ChatSearchHit) -> some View {
@@ -337,19 +378,38 @@ struct SearchScreen: View {
     /// `searchSnippet.ts`, held to it by shared vectors — so what this bolds is
     /// what the other client bolds.
     private func highlighted(_ text: String) -> Text {
-        SearchSnippet.snippet(text, query: query.trimmingCharacters(in: .whitespaces))
-            .reduce(Text(verbatim: "")) { acc, segment in
-                let piece = Text(verbatim: segment.text)
-                    .foregroundColor(segment.match ? Theme.ink : Theme.inkSoft)
-                return acc + (segment.match ? piece.bold() : piece)
-            }
+        render(
+            SearchSnippet.snippet(text, query: query.trimmingCharacters(in: .whitespaces)),
+            rest: Theme.inkSoft)
+    }
+
+    /// A headline, not an excerpt: the whole name in the headline's own ink, the
+    /// matched terms bold.
+    private func highlightedTitle(_ text: String) -> Text {
+        render(
+            SearchSnippet.highlightAll(text, query: query.trimmingCharacters(in: .whitespaces)),
+            rest: Theme.ink)
+    }
+
+    private func render(_ segments: [SearchSnippet.Segment], rest: Color) -> Text {
+        segments.reduce(Text(verbatim: "")) { acc, segment in
+            let piece = Text(verbatim: segment.text)
+                .foregroundColor(segment.match ? Theme.ink : rest)
+            return acc + (segment.match ? piece.bold() : piece)
+        }
     }
 
     /// Prefer THIS device's row for the name, so one conversation is not called
     /// two different things in two places: the list falls back to a short
     /// snippet of the last user message before the title pass has run, and the
     /// search response carries no such field to fall back to.
+    ///
+    /// Except on a title match: there the gateway's title is the text the query
+    /// matched, so it is shown as sent — a device row whose title has not caught
+    /// up yet would otherwise headline the card with a name that holds none of
+    /// what was searched for. Normally the two are the same string.
     private func title(for group: ChatSearchGroup) -> String {
+        if group.titleMatch, let title = group.sessionTitle, !title.isEmpty { return title }
         if let row = index.rows.first(where: { $0.id == group.sessionId }) {
             let headline = SessionHeadline.text(title: row.title, userText: row.userText)
             if !headline.isEmpty { return headline }

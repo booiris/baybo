@@ -112,10 +112,11 @@ final class SearchModel: ObservableObject {
     }
 
     #if DEBUG
-        /// Canned hits over the `-baybo-open-home` demo conversations. Two
-        /// groups, so grouping and the per-excerpt tap targets are both real;
-        /// the ordinals are the ones `-baybo-demo-frames` writes into
-        /// `debug-session`, so a jump has somewhere to land.
+        /// Canned hits over the `-baybo-open-home` demo conversations. A
+        /// title-only group first (title matches lead, and it opens with no
+        /// jump), then two message groups, so grouping and the per-excerpt tap
+        /// targets are both real; the ordinals are the ones `-baybo-demo-frames`
+        /// writes into `debug-session`, so a jump has somewhere to land.
         static func demoResults(for query: String) -> ChatSearchResults? {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-search") else {
                 return nil
@@ -128,14 +129,17 @@ final class SearchModel: ObservableObject {
             return ChatSearchResults(
                 groups: [
                     ChatSearchGroup(
-                        sessionId: "demo-1", sessionTitle: nil,
+                        sessionId: "demo-3", sessionTitle: "Notes on \(query)",
+                        titleMatch: true, hits: [], totalHits: 0),
+                    ChatSearchGroup(
+                        sessionId: "demo-1", sessionTitle: nil, titleMatch: false,
                         hits: [
                             hit(2, "user", "Demo conversation number 1 mentions \(query) here"),
                             hit(3, "assistant", "The reply also covers \(query) in passing"),
                         ],
                         totalHits: 5),
                     ChatSearchGroup(
-                        sessionId: "demo-2", sessionTitle: nil,
+                        sessionId: "demo-2", sessionTitle: nil, titleMatch: false,
                         hits: [hit(1, "user", "A second conversation about \(query)")],
                         totalHits: 1),
                 ],
