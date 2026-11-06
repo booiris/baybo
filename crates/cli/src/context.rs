@@ -56,8 +56,8 @@ pub struct CommandContext {
     pub llm: Option<Arc<BillableLlm>>,
     pub workspace: Arc<WorkspacePaths>,
     pub session: Option<Arc<SessionManager>>,
-    /// Grouped transcript search for `baybo session search`. Wired beside
-    /// `session` under `needs_query_graph`; `None` in argv-light boots.
+    /// Grouped title and transcript search for `baybo session search`. Wired
+    /// beside `session` under `needs_query_graph`; `None` in argv-light boots.
     pub session_search: Option<Arc<SessionSearch>>,
     pub turn: Option<Arc<TurnLifecycle>>,
     pub cron: Option<Arc<CronScheduler>>,

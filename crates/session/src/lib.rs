@@ -5,7 +5,7 @@
 //! trait and its `ActiveMessageRow` / `StoredMessage` row types live in
 //! `baybo-store` (the ports
 //! crate). This crate owns the `SessionManager` business-logic facade and
-//! the grouped transcript search service `search::SessionSearch`;
+//! the grouped title and transcript search service `search::SessionSearch`;
 //! `baybo-storage` provides the sqlite implementations of the stores.
 
 mod error;

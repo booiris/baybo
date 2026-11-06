@@ -28,7 +28,7 @@ specs carry their detailed status and unresolved decisions.
 - [Turn progress events](turn-progress-events.md).
 - [Background-job notifications](background-notifications.md).
 - [Cron groups](cron-groups.md).
-- [Transcript search](search.md).
+- [Chat search (titles and transcripts)](search.md).
 - [Mid-turn user interjection](mid-turn-user-interjection.md) — design rationale.
 - [External agents](external-agents.md).
 

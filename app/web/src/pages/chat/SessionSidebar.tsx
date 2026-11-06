@@ -51,6 +51,7 @@ import {
   type CronGroup,
 } from './sessionBuckets';
 import { SearchPanel } from './SearchPanel';
+import { searchOpenHref } from './searchJump';
 
 // Chat zone 2: the session list sidebar (the global icon rail is zone 1, the
 // thread + floating composer is zone 3). A recency-ordered conversation list
@@ -989,8 +990,8 @@ export function SessionSidebar({
             onKeyDown={(e) => {
               if (e.key === 'Escape') setSearch('');
             }}
-            placeholder="Search messages"
-            aria-label="Search messages"
+            placeholder="Search conversations"
+            aria-label="Search titles and messages"
             className="w-full pl-8 pr-7 py-1.5 bg-white border-2 border-black rounded-md text-[0.8rem] font-mono placeholder:text-ink-soft focus:outline-none focus:shadow-brutal-sm"
           />
           {search.length > 0 ? (
@@ -1013,13 +1014,7 @@ export function SessionSidebar({
           <SearchPanel
             query={search}
             activeSessionId={activeSessionId}
-            // `m` is the row to land on, `q` the terms to light up once there —
-            // both on the URL so the jump survives a reload and can be shared.
-            onOpen={(id, ordinal) =>
-              navigate(
-                `/chat/${id}?m=${ordinal}&q=${encodeURIComponent(search.trim())}`,
-              )
-            }
+            onOpen={(id, ordinal) => navigate(searchOpenHref(id, ordinal, search))}
           />
         ) : loading ? (
           <div className="flex justify-center py-6 text-ink-soft">

@@ -40,7 +40,7 @@ pub use cron::{CronFire, CronStore, ExecutionCompletion};
 pub use deck::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
-pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
+pub use message_search::{MessageSearchStore, SearchHit, SearchScope, TitleHit};
 pub use project::{
     IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueRun,
     ProjectRow, ProjectStore, ProjectUpdate, RunStatus, RunTrigger,

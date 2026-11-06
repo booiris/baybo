@@ -20,6 +20,7 @@ const TERM: &str = "迁移";
 struct Fixture {
     _tmpdir: tempfile::TempDir,
     ctx: CommandContext,
+    manager: Arc<SessionManager>,
     owner: SessionId,
     telegram: SessionId,
     hidden: SessionId,
@@ -125,6 +126,7 @@ async fn seeded() -> Fixture {
     Fixture {
         _tmpdir: tmpdir,
         ctx,
+        manager,
         owner,
         telegram,
         hidden,
@@ -451,4 +453,62 @@ async fn argv_light_boot_reports_the_missing_service() {
     .await
     .expect_err("no search service wired");
     assert!(matches!(err, CliError::Manager(_)), "{err}");
+}
+
+#[tokio::test]
+async fn titles_match_rank_first_and_keep_the_session_scope() {
+    let fx = seeded().await;
+    fx.manager
+        .set_title(&fx.telegram, Some("停机窗口 迁移计划"))
+        .await
+        .unwrap();
+    fx.manager
+        .set_title(&fx.hidden, Some("停机窗口 也藏了"))
+        .await
+        .unwrap();
+
+    let data = search(&fx.ctx, args(&[TERM])).await;
+    assert_eq!(
+        session_ids(&data),
+        [fx.telegram.as_str(), fx.owner.as_str()],
+        "{data}"
+    );
+    let titled = &data["groups"][0];
+    assert_eq!(titled["title_match"], true);
+    assert_eq!(titled["session_title"], "停机窗口 迁移计划");
+    assert_eq!(titled["total_hits"], 1, "message hits ride along: {data}");
+    assert_eq!(data["groups"][1]["title_match"], false);
+    assert_eq!(data["sessions_matched"], 2);
+
+    let out = run_search(&fx.ctx, args(&["窗口"])).await;
+    let data = out.data.clone().unwrap();
+    assert_eq!(session_ids(&data), [fx.telegram.as_str()], "{data}");
+    let group = &data["groups"][0];
+    assert_eq!(group["title_match"], true);
+    assert_eq!(group["channel"], "telegram");
+    assert_eq!(group["total_hits"], 0);
+    assert!(group["hits"].as_array().unwrap().is_empty());
+    assert!(out.human.contains("[title match]\n"), "{}", out.human);
+    assert!(!out.human.contains("  #"), "{}", out.human);
+
+    let data = search(
+        &fx.ctx,
+        SessionSearchArgs {
+            include_hidden: true,
+            ..args(&["窗口"])
+        },
+    )
+    .await;
+    assert_eq!(
+        sorted(session_ids(&data)),
+        sorted(vec![fx.telegram.as_str(), fx.hidden.as_str()]),
+        "{data}"
+    );
+
+    fx.manager.set_title(&fx.telegram, None).await.unwrap();
+    let data = search(&fx.ctx, args(&["窗口"])).await;
+    assert!(
+        session_ids(&data).is_empty(),
+        "a cleared title unindexes: {data}"
+    );
 }
