@@ -17,9 +17,8 @@
 //!  1. Tool calls `try_reserve(root, cap)`.
 //!  2. On `Ok(())`: a slot has been incremented. The caller MUST
 //!     eventually call `release(root)` exactly once. Multiple release
-//!     paths converge on the supervisor (envelope-send failure,
-//!     router-level setup failure, wait task's terminal hook); each
-//!     emits one release.
+//!     paths converge on the spawner (a spawn that fails to start, or
+//!     the end of the child's run); each emits one release.
 //!  3. On `Err(current_count)`: nothing was incremented. The caller
 //!     surfaces `ToolError::SubagentFanoutExceeded`.
 
@@ -85,8 +84,8 @@ pub fn unbounded_limiter() -> Arc<dyn SubagentDispatchLimiter> {
 
 /// Process-wide counting limiter. Tracks in-flight subagents per
 /// root session in a sharded DashMap. Cloned via `Arc<FanOutLimiter>`
-/// so the `spawn_subagent` tool (which reserves) and the router's
-/// wait task (which releases on terminal) share state without the
+/// so the `spawn_subagent` tool (which reserves) and the spawner
+/// (which releases when the child's run ends) share state without the
 /// counter being threaded through the agent supervisor.
 ///
 /// The DashMap entry API gives us a check-and-increment that's

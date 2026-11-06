@@ -62,8 +62,10 @@ different flavor of LLM:
   (`crates/agent/src/runtime/subagent_spawner.rs`) — branches on
   `request.backend`: `Baybo` takes the existing `AgentActor` spawn
   path; `External` looks up the agent, builds a fresh child Session
-  (or loads an existing one on resume), runs the agent, persists any
-  emitted resume_key, returns a `SubagentResult`.
+  (or loads an existing one on resume), and returns a `SubagentRun`
+  whose terminal future runs the agent, persists any emitted
+  resume_key and resolves to its `SubagentResult`. The foreground wait
+  and background hand-over are the shared `baybo_tools::background::run`.
 
 ## Spawn protocol
 

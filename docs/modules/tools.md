@@ -343,7 +343,7 @@ list is rendered and reused for slash-command matching.
 
 `ToolManifest` carries coarse capability ceilings (`ToolCapability`): `ReadFile`, `WriteFile`, `Http`, `ExecCommand`. The manifest answers "what *kind* of thing may this tool do"; the concrete resource per call comes from `Tool::accessed_resources(params)` as [`ResourceAccess`] and is what the approval gate routes on. Trust level is a separate axis enforced before execution.
 
-The manifest also carries `channels: Vec<ChannelType>` (empty = every channel, the norm). It is one of **three** axes that decide which tools a session is offered; the second is `Tool::trigger_scope() -> ToolTriggerScope` (`Any` / `CronConversation` / `ProjectBoard` / `SharedWorkspace`), and the third is the subagent profile's own `tools:` list (below). The first two are enforced twice — the agent loop assembles the LLM's tool list via `ToolRegistry::tool_definitions_for_session(&session.channel, &session.trigger)` so other sessions never see the tool (channel and trigger are both session-stable, so the list stays byte-identical across calls and the prompt-cache sort guarantee holds), and the executor refuses a call that names it anyway (omission is not a gate against a hallucinated or skill-body-prompted name).
+The manifest also carries `channels: Vec<ChannelType>` (empty = every channel, the norm). It is one of **three** axes that decide which tools a session is offered; the second is `Tool::trigger_scope() -> ToolTriggerScope` (`Any` / `CronConversation` / `ProjectBoard` / `SharedWorkspace`), and the third is the subagent profile's own `tools:` list (below). The first two are enforced twice — the agent loop assembles the LLM's tool list via `ToolRegistry::tool_definitions_for_session(&session.channel, ToolSchemaContext { trigger, background_eligible }, allowlist)` so other sessions never see the tool (channel, trigger and the session's `background_eligible` bit are all session-stable, so the list stays byte-identical across calls and the prompt-cache sort guarantee holds), and the executor refuses a call that names it anyway (omission is not a gate against a hallucinated or skill-body-prompted name).
 
 Each `trigger_scope` variant restricts to a range: it names where the tool would have **nothing to act on** — `report_nothing` has no fire to silence outside a recurring cron conversation, `Issue*` has no board to name outside an issue run or project-linked cron fire, the browser server is one process-wide Chrome and a card's run was cut its own checkout precisely so it would not share — so offering it elsewhere would be offering an action that can only fail. An MCP server carries the axis too, as `McpServerEntry::trigger_scope` in `.mcp.json` (`#[serde(default)]` = `Any`, so a file written before the field kept every server everywhere); every tool the reconciler registers for that server answers with it, and the value is folded into the server's identity hash so an edit reconnects rather than leaving the previously-registered tools in place. The deck tools (`DeckCardList`/`DeckCardGet`/`DeckCardCreate`/`DeckCardUpdate`) carry `channels: [owner]` — the deck is the owner's surface — *and* `SharedWorkspace`, because an issue run is dispatched on the owner channel too and the channel axis alone never kept them out of one.
 
@@ -439,7 +439,7 @@ The permission is a shared, **hot-reloadable** `LivePermissionMode` handle: a `p
 
 **The `baybo` self-CLI route is leading-position only.** A command whose first sub-command is the canonical absolute path of the running gateway binary runs unsandboxed — the sandbox masks `~/.baybo` and never mounts the binary's own directory, so a sandboxed `baybo …` is broken by construction. The work-dir jail exempts that exact leading argv0 even when the installed binary lives inside the workspace but outside `work/`; every later path token remains guarded, and the binary's parent directory is not exempt. Bash injects the active config as an absolute `BAYBO_CONFIG_PATH`, resolved in the gateway before the child's cwd changes, so self-CLI calls omit `--config`; an explicit config path remains a guarded later token and its rejection teaches that supported shape. The route decides the fate of the *whole* `sh -c` string, so a baybo invocation found anywhere else in the line cannot be honoured: doing so would let `curl … | sh && /abs/baybo status` escape the sandbox. Such a line is instead **rejected** with an `InvalidParams` instruction naming the binary and telling the caller to split it into two Bash calls — under every permission mode, including `free`, so the accepted command shape does not change when the mode does. Silently sandboxing it (the previous behaviour) produced a bare `exit 127` that reads like a deleted binary. Bare-name and relative-path invocations keep their own rejection, which names the canonical absolute path.
 
-On a turn that is `ToolContext::background_eligible` (see [`agent.md`](agent.md) → *Background jobs*), `on_timeout=background` detaches over-budget Bash commands for both execution routes: sandboxed commands hand the sandbox backend's detached child to the background-job sink, while `permission=free` / self-CLI commands spawn an unsandboxed child in its own process group so `/stop` can cancel the whole tree. Commands with `secret_env` can background too, but the output files and completion notification tails are raw; the handoff logs and returns an explicit warning when secret env vars were injected.
+On a turn that is `ToolContext::background_eligible` (see [`agent.md`](agent.md) → *Background jobs*), `on_timeout=background` detaches over-budget Bash commands for both execution routes, through the shared `background::run` (below): sandboxed commands hand the sandbox backend's detached child over, while `permission=free` / self-CLI commands spawn an unsandboxed child in its own process group so `/stop` can cancel the whole tree. Commands with `secret_env` can background too, but the output files and completion notification tails are raw; the handoff logs and returns an explicit warning when secret env vars were injected.
 
 Separately, the **`bench-bash` Cargo feature** (off by default, compiled out of every prod build — see `bench/swe` + `bench/terminal-bench-2.0`) switches `BashTool` to a **bench profile**: raw exec with no OS sandbox, no uv shim, no work-dir jail, cwd inherited from the process, and a dedicated prompt — for running inside a disposable container where bwrap can't nest. It overrides `permission` and disables the judge. `permission=free` is the config counterpart that only drops the OS sandbox; the feature is the bench-only behavior hack.
 
@@ -448,6 +448,64 @@ The detailed design is in [`../permission.md`](../permission.md).
 ### LLM visibility boundary
 
 `tool_definitions()` exposes only `name`, `description`, and `parameters_schema` to the model. Capabilities and trust level are never exposed.
+
+Tool schemas receive a `ToolSchemaContext` with the trigger and the session's
+`background_eligible` bit (`Session::can_host_background_jobs`, which also sees
+the lineage the trigger cannot), so a subagent with a user trigger is no longer
+offered options it cannot use. The bit is session-fixed, which keeps the offered
+schemas stable across a session's turns. Execution reads the per-turn
+`ToolContext::background_eligible`, which additionally refuses a cron fire's own
+turn; that turn is offered the options and runs them blocking, as it always
+has. Deferred discovery through `ToolSearch` reads the per-turn bit.
+
+The background options themselves have one home, `baybo_tools::background`.
+A tool that can hand slow work to the background returns a `BackgroundSupport`
+from `Tool::background_support` — its foreground window (a deadline parameter,
+or a fixed wait) and whether it can start detached — and adds the options to
+its schema with `background::declare_options`: `on_timeout` always, plus
+`background` and `group` when it can start detached. `BackgroundRequest::parse`
+is the one, strict reading of them (an unknown `on_timeout` is an error, never
+a silent default). The registry withholds the declared options in
+`tool_definition_offered` wherever the session is not `background_eligible`, so
+no tool strips them by hand; ineligible sessions, including subagents with a
+user trigger, are offered none of them. Bash keeps `timeout_ms` there and
+rewords it to say reaching it terminates the command.
+
+### Background jobs as a capability
+
+The lifecycle is shared too. A tool turns its slow work into a
+`background::Job<T>` — a handle (minted with `new_background_handle`, so a
+tool can name things after it before the work starts), a kind and summary for
+`JobList` / `/stop`, the session the work runs in if any, a cancel token, the
+`terminal` future, and `into_result` turning its outcome into a
+`PendingBackgroundResult` — and calls `background::run`, which owns:
+
+- **The window.** An ineligible session (or no sink wired) waits with no
+  window at all. A call asking to start detached (`background` / `group`, only
+  for a tool whose support says `start_detached`) is handed over at once.
+  Otherwise the job runs up to the window; then `on_timeout` either hands it
+  over or cancels it. The turn's own stop cancels a job only while it is in
+  the foreground.
+- **The hand-over** to the `BackgroundJobSink` (`ToolContext::background_jobs`,
+  `baybo_agent::BackgroundJobManager` in production): one in-flight registry
+  entry keyed by handle, one escort that delivers the result as
+  `BackgroundJobFinished` unless `/stop` / `JobStop` drained the entry or the
+  process is shutting down, and the turn-scoped cohort key for a grouped job.
+- **The answer** the model gets: `background::ack`, one header per way the
+  job got there, the handle, the tool's own detail lines, and
+  `BACKGROUND_DISPATCH_YIELD_GUIDANCE`.
+- **Group counting.** `run` records a grouped hand-over on
+  `ToolContext::background_dispatch`; the executor surfaces it as
+  `ExecutedTool::background_group` and the agent loop counts it into the
+  turn's cohort — for any tool, with no string matching on the answer.
+
+The tool keeps what differs: how its work survives the turn (Bash: a detached
+process group streaming to output files; `spawn_subagent`: a child actor or
+external process on the process-wide token), how a `Ran::Finished` /
+`Cancelled` / `TimedOut` outcome is rendered, and what its result says. A new
+background-capable tool needs only `background_support`, `declare_options` in
+its schema, and `background::run` in `execute`; the integration test's
+`FanOutProbe` is that minimal shape.
 
 ### Per-tool timeout ceiling
 
