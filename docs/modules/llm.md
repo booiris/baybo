@@ -125,6 +125,31 @@ the operator sets per-model `pricing`. Set those overrides when monetary
 budget enforcement is needed for Zen. Real token counts are recorded on
 both providers.
 
+### Gemini tool-call ids
+
+Gemini's function calls carry no id, and rig 0.37 fills a call's id with the
+function name in both its streaming and unary paths, then sends a tool
+result's id back as `functionResponse.name`. Left alone, two calls to one tool
+share an id in the transcript, and a conversation moved to or from another
+provider breaks on ids that mean something else there. Both Gemini variants
+(`Gemini` and `OpencodeGemini`) therefore adjust ids at the dispatch in
+`AnyCompletionModel`, through `providers/gemini.rs`:
+
+- **Inbound**: every tool call, streamed or unary, gets a fresh id of nine
+  ASCII alphanumerics; the thought signature stays on the call. Nine
+  alphanumerics is Mistral's required shape, the strictest of the providers a
+  conversation can move to, and also fits Anthropic's `^[a-zA-Z0-9_-]{1,64}$`
+  and OpenAI's 40-character limit.
+- **Outbound**: before rig builds the Gemini body, each tool result's id is
+  replaced by the (sanitised) function name of the nearest preceding call with
+  that id, so `functionResponse.name` names the function whatever provider
+  minted the id. A result with no such call is left as is. rig sends only a
+  call's name and arguments, so call ids never reach Gemini.
+
+No other provider's request or response is touched. Transcripts written
+before this fix can still hold repeated ids; context hydration disambiguates
+them (see [`context.md`](context.md)).
+
 ### Multimodal support
 
 When a `BlobFetcher` is attached (`LlmClient::with_blob_fetcher`) and the model reports the required capability, `ContentBlock::Image` / `Audio` / `File` user blocks are materialised into real rig `Image` / `Audio` / `Document` content (base64-encoded blob bytes). Provider gates then match the actual wire adapter: Anthropic accepts base64 PDF documents but rejects audio and video; OpenAI Chat Completions accepts audio only on audio/realtime model families and does not receive PDFs; OpenAI subscription Responses accepts images and PDF `input_file`; Gemini accepts the existing native image, audio, and PDF paths. Images are also gated on **format** (`is_portable_image_type`): png, jpeg and webp are delivered and everything else `parse_image_media_type` admits — heic, heif, gif, svg — is stubbed **before the fetch**, on every provider. Those three are what every provider taking an inline image accepts; the rest each fail somewhere (rig's Anthropic converter errors on a HEIC, Gemini's on a GIF, OpenAI answers a 400 and documents only a *non-animated* GIF). A per-provider matrix would buy a HEIC on Gemini and a GIF on Anthropic for the cost of tracking every vendor's list, where one wrong entry costs a whole session. The gate exists because a refused image is never just the image: the converter's error (or the API's 400) fails the WHOLE request, and `build_completion_request` resends the whole history every turn, so one iPhone HEIC on an Anthropic session used to fail every turn after it — compaction included, since it replays the same prefix through the same client. A side pass that picks images itself rather than replaying the transcript (the conversation title) asks `LlmClient::delivers_image_block` — the same gates, answered from the block's metadata without a fetch — so, short of the blob fetch itself failing, it never hands the model a stub where a picture was meant. Video remains a `File` block and is stubbed because neither the OpenAI nor Anthropic chat path accepts native video input. That materialisation exists only in the ephemeral provider request: `session_messages` and trace input markers retain the original `BlobRef` metadata and never receive the base64 payload. Otherwise — no fetcher, missing capability, unsupported MIME type, or blob fetch failure — the block degrades to a descriptive text placeholder via the `multimodal` module (`[image: …]`-style stubs). `extract_text` joins text blocks for system/assistant message conversion.

@@ -12,25 +12,33 @@
 //! crash-during-tool-execution window by repairing the transcript when
 //! the actor rehydrates — before any new turn runs.
 //!
-//! [`repair_tool_pairing`] does three things in one deterministic pass:
+//! [`repair_tool_pairing`] does four things in one deterministic pass:
 //!
-//! 1. **Quarantine**: a `ToolResult` with no matching `ToolUse`, or a second
+//! 1. **Disambiguate**: transcripts written before Gemini tool calls got
+//!    unique ids reuse the function name as the id, so one id can name several
+//!    calls. Each repeated `ToolUse` id gets a suffixed id
+//!    ([`disambiguate_repeated_call_ids`]) and the result answering that call
+//!    follows it, in the window only. The renaming depends only on the rows
+//!    before it, so it is identical on every load and a persisted fill keyed to
+//!    a renamed id keeps pairing.
+//! 2. **Quarantine**: a `ToolResult` with no matching `ToolUse`, or a second
 //!    result for an already-answered call, is omitted from the in-memory LLM
 //!    window. Its durable row is untouched so the user-facing transcript stays
 //!    recoverable.
-//! 2. **Fill**: every dangling `ToolUse` id gets a synthetic `ToolResult`
+//! 3. **Fill**: every dangling `ToolUse` id gets a synthetic `ToolResult`
 //!    saying the execution was interrupted. Fills are returned separately
 //!    so the caller can persist them (append-only — session rows are
 //!    never rewritten).
-//! 3. **Reposition**: every tool-result row is emitted immediately after
+//! 4. **Reposition**: every tool-result row is emitted immediately after
 //!    the assistant row that issued it, in `ToolUse` block order. On a
 //!    healthy transcript this is a no-op; on an already-wedged one (a
 //!    resume nudge was appended after the dangling row before this repair
 //!    existed, or a prior repair's fills were persisted at the tail) it
 //!    restores the adjacency both OpenAI and Anthropic validate. The
 //!    in-memory window may therefore diverge from strict ordinal order
-//!    for such sessions. Quarantined blocks are the other intentional
-//!    divergence: they remain in storage but never reach a provider request.
+//!    for such sessions. Quarantined blocks and disambiguated ids are the
+//!    other intentional divergences: storage keeps the rows as written, and
+//!    only the provider-facing window differs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,11 +50,122 @@ use baybo_model::{ChatMessage, ContentBlock};
 const INTERRUPTED_TOOL_RESULT_BODY: &str =
     "[tool execution was interrupted by a crash or restart before it produced a result]";
 
+/// Joins a repeated tool-call id to the occurrence number that makes it
+/// unique (`web_search` → `web_search_2`); `_` is valid in every provider's
+/// tool-call id alphabet.
+const REPEATED_CALL_ID_SEPARATOR: char = '_';
+
+/// Occurrence number given to the first repeat of a tool-call id.
+const FIRST_REPEAT_ORDINAL: usize = 2;
+
 pub(crate) struct ToolPairingRepair {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) fills: Vec<ChatMessage>,
     pub(crate) orphan_result_ids: Vec<String>,
     pub(crate) duplicate_result_ids: Vec<String>,
+    /// Original ids of the `ToolUse` blocks given a new id in the window.
+    pub(crate) renamed_call_ids: Vec<String>,
+}
+
+struct CallSlot {
+    original: String,
+    renamed: String,
+    message: usize,
+    answered: bool,
+}
+
+fn unused_repeat_id(original: &str, taken: &HashSet<String>) -> String {
+    (FIRST_REPEAT_ORDINAL..)
+        .map(|n| format!("{original}{REPEATED_CALL_ID_SEPARATOR}{n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or_else(|| original.to_string())
+}
+
+/// The call a result with `id` answers. A synthetic fill was written under
+/// the window id of its call, which is unique across the transcript and may
+/// sit in any earlier turn (a fill lands at the tail when an earlier fill
+/// write failed), so it pairs with the unanswered call carrying that id. Any
+/// other result was written under its call's original id and answers the
+/// earliest unanswered call originally named `id` in the nearest preceding
+/// assistant turn; matching on window ids there would let a tool literally
+/// named `<x>_2` steal the answer to a renamed `<x>`.
+fn pairing_call<'a>(
+    calls: &'a mut [CallSlot],
+    id: &str,
+    is_fill: bool,
+) -> Option<&'a mut CallSlot> {
+    if is_fill
+        && let Some(i) = calls
+            .iter()
+            .rposition(|call| !call.answered && call.renamed == id)
+    {
+        return calls.get_mut(i);
+    }
+    let message = calls.last()?.message;
+    let start = calls
+        .iter()
+        .rposition(|call| call.message != message)
+        .map_or(0, |i| i + 1);
+    calls[start..]
+        .iter_mut()
+        .find(|call| !call.answered && call.original == id)
+}
+
+/// Give every repeated `ToolUse` id a unique suffixed id and move the result
+/// that answers each call onto it. A call keeps its id unless an earlier call
+/// already used it, and a result's pairing depends only on the rows before
+/// it, so appending rows never changes an earlier assignment. A result no
+/// call is waiting for keeps its id and is left to quarantine.
+pub(crate) fn disambiguate_repeated_call_ids(
+    mut messages: Vec<ChatMessage>,
+) -> (Vec<ChatMessage>, Vec<String>) {
+    let mut seen = HashSet::new();
+    let repeated = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(
+            |block| matches!(block, ContentBlock::ToolUse { id, .. } if !seen.insert(id.as_str())),
+        );
+    if !repeated {
+        return (messages, Vec::new());
+    }
+
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut calls: Vec<CallSlot> = Vec::new();
+    let mut renamed = Vec::new();
+    for (index, message) in messages.iter_mut().enumerate() {
+        for block in &mut message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    let original = id.clone();
+                    if taken.contains(&original) {
+                        *id = unused_repeat_id(&original, &taken);
+                        renamed.push(original.clone());
+                    }
+                    taken.insert(id.clone());
+                    calls.push(CallSlot {
+                        original,
+                        renamed: id.clone(),
+                        message: index,
+                        answered: false,
+                    });
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    let is_fill = content.contains(INTERRUPTED_TOOL_RESULT_BODY);
+                    if let Some(call) = pairing_call(&mut calls, tool_use_id, is_fill) {
+                        call.answered = true;
+                        tool_use_id.clone_from(&call.renamed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (messages, renamed)
 }
 
 /// True when every block of `msg` is a `ToolResult` — the shape of a
@@ -118,6 +237,7 @@ fn quarantine_invalid_results(
 /// are diagnostic only: their original durable rows must not be rewritten or
 /// deleted.
 pub(crate) fn repair_tool_pairing(messages: Vec<ChatMessage>) -> ToolPairingRepair {
+    let (messages, renamed_call_ids) = disambiguate_repeated_call_ids(messages);
     let (messages, orphan_result_ids, duplicate_result_ids) = quarantine_invalid_results(messages);
 
     // Index every tool-result row by the ids it carries. Persisted rows
@@ -168,6 +288,7 @@ pub(crate) fn repair_tool_pairing(messages: Vec<ChatMessage>) -> ToolPairingRepa
             fills: Vec::new(),
             orphan_result_ids,
             duplicate_result_ids,
+            renamed_call_ids,
         };
     }
 
@@ -212,6 +333,7 @@ pub(crate) fn repair_tool_pairing(messages: Vec<ChatMessage>) -> ToolPairingRepa
         fills,
         orphan_result_ids,
         duplicate_result_ids,
+        renamed_call_ids,
     }
 }
 
@@ -354,6 +476,233 @@ mod tests {
         assert!(repair.orphan_result_ids.is_empty());
         assert_eq!(repair.duplicate_result_ids, vec!["a"]);
         assert_eq!(ids_in_order(&repair.messages), vec!["use:a", "res:a"]);
+    }
+
+    #[test]
+    fn repeated_ids_in_one_turn_keep_every_result() {
+        let msgs = vec![
+            user_text("q"),
+            assistant_with_uses(&["web_search", "web_search", "web_search"]),
+            result("web_search"),
+            result("web_search"),
+            result("web_search"),
+        ];
+        let repair = repair_tool_pairing(msgs.clone());
+        assert!(repair.fills.is_empty());
+        assert!(repair.duplicate_result_ids.is_empty());
+        assert!(repair.orphan_result_ids.is_empty());
+        assert_eq!(repair.renamed_call_ids, vec!["web_search", "web_search"]);
+        assert_eq!(
+            ids_in_order(&repair.messages),
+            vec![
+                "use:web_search",
+                "use:web_search_2",
+                "use:web_search_3",
+                "res:web_search",
+                "res:web_search_2",
+                "res:web_search_3",
+            ]
+        );
+        let bodies: Vec<String> = repair.messages[2..]
+            .iter()
+            .map(|m| match &m.content[0] {
+                ContentBlock::ToolResult { content, .. } => content.clone(),
+                other => panic!("expected ToolResult, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(bodies, vec!["out-web_search"; 3]);
+        assert_eq!(repair_tool_pairing(msgs).messages, repair.messages);
+    }
+
+    #[test]
+    fn repeated_ids_across_turns_pair_with_their_own_turn() {
+        let msgs = vec![
+            assistant_with_uses(&["web_search"]),
+            result("web_search"),
+            user_text("again"),
+            assistant_with_uses(&["web_search", "read"]),
+            result("read"),
+            result("web_search"),
+        ];
+        let repair = repair_tool_pairing(msgs);
+        assert!(repair.fills.is_empty());
+        assert!(repair.duplicate_result_ids.is_empty());
+        assert_eq!(
+            ids_in_order(&repair.messages),
+            vec![
+                "use:web_search",
+                "res:web_search",
+                "use:web_search_2",
+                "use:read",
+                "res:read",
+                "res:web_search_2",
+            ]
+        );
+    }
+
+    #[test]
+    fn disambiguated_ids_skip_ids_already_in_use() {
+        let msgs = vec![
+            assistant_with_uses(&["web_search_2", "web_search", "web_search"]),
+            result("web_search_2"),
+            result("web_search"),
+            result("web_search"),
+            assistant_with_uses(&["web_search_3"]),
+            result("web_search_3"),
+        ];
+        let repair = repair_tool_pairing(msgs);
+        assert!(repair.duplicate_result_ids.is_empty());
+        assert_eq!(
+            ids_in_order(&repair.messages),
+            vec![
+                "use:web_search_2",
+                "use:web_search",
+                "use:web_search_3",
+                "res:web_search_2",
+                "res:web_search",
+                "res:web_search_3",
+                "use:web_search_3_2",
+                "res:web_search_3_2",
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_for_a_disambiguated_call_pairs_on_the_next_load() {
+        let stored = vec![
+            assistant_with_uses(&["web_search", "web_search"]),
+            result("web_search"),
+            user_text("nudge"),
+        ];
+        let first = repair_tool_pairing(stored.clone());
+        assert_eq!(first.fills.len(), 1);
+        assert!(matches!(&first.fills[0].content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "web_search_2"));
+
+        let mut reloaded = stored;
+        reloaded.extend(first.fills.iter().cloned());
+        let second = repair_tool_pairing(reloaded);
+        assert!(second.fills.is_empty(), "the persisted fill must pair");
+        assert!(second.orphan_result_ids.is_empty());
+        assert!(second.duplicate_result_ids.is_empty());
+        assert_eq!(second.messages, first.messages);
+    }
+
+    #[test]
+    fn surplus_result_for_a_repeated_id_is_still_quarantined() {
+        let msgs = vec![
+            assistant_with_uses(&["web_search", "web_search"]),
+            result("web_search"),
+            result("web_search"),
+            result("web_search"),
+        ];
+        let repair = repair_tool_pairing(msgs);
+        assert_eq!(repair.duplicate_result_ids, vec!["web_search"]);
+        assert_eq!(
+            ids_in_order(&repair.messages),
+            vec![
+                "use:web_search",
+                "use:web_search_2",
+                "res:web_search",
+                "res:web_search_2"
+            ]
+        );
+    }
+
+    fn result_bodies(msgs: &[ChatMessage]) -> Vec<(String, String)> {
+        msgs.iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some((tool_use_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_named_like_a_rename_keeps_its_own_result() {
+        let msgs = vec![
+            assistant_with_uses(&["ws", "ws", "ws_2"]),
+            result("ws"),
+            result("ws_2"),
+            result("ws"),
+        ];
+        let repair = repair_tool_pairing(msgs);
+        assert!(repair.fills.is_empty());
+        assert!(repair.duplicate_result_ids.is_empty());
+        assert!(repair.orphan_result_ids.is_empty());
+        assert_eq!(
+            ids_in_order(&repair.messages),
+            vec![
+                "use:ws",
+                "use:ws_2",
+                "use:ws_2_2",
+                "res:ws",
+                "res:ws_2_2",
+                "res:ws_2",
+            ]
+        );
+        assert_eq!(
+            result_bodies(&repair.messages),
+            vec![
+                ("ws".to_string(), "out-ws".to_string()),
+                ("ws_2_2".to_string(), "out-ws_2".to_string()),
+                ("ws_2".to_string(), "out-ws".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_under_a_renamed_id_pairs_beside_a_tool_named_like_it() {
+        let stored = vec![
+            assistant_with_uses(&["ws", "ws", "ws_2"]),
+            result("ws"),
+            result("ws_2"),
+            user_text("nudge"),
+        ];
+        let first = repair_tool_pairing(stored.clone());
+        assert_eq!(first.fills.len(), 1);
+        assert!(matches!(&first.fills[0].content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "ws_2"));
+        assert_eq!(
+            result_bodies(&first.messages)[2],
+            ("ws_2_2".to_string(), "out-ws_2".to_string())
+        );
+
+        let mut reloaded = stored;
+        reloaded.extend(first.fills.iter().cloned());
+        let second = repair_tool_pairing(reloaded);
+        assert!(second.fills.is_empty(), "the persisted fill must pair");
+        assert!(second.orphan_result_ids.is_empty());
+        assert!(second.duplicate_result_ids.is_empty());
+        assert_eq!(second.messages, first.messages);
+    }
+
+    #[test]
+    fn surplus_result_does_not_answer_an_older_turn() {
+        let msgs = vec![
+            assistant_with_uses(&["ws", "ws"]),
+            result("ws"),
+            user_text("again"),
+            assistant_with_uses(&["ws"]),
+            result("ws"),
+            result("ws"),
+        ];
+        let repair = repair_tool_pairing(msgs);
+        assert_eq!(repair.duplicate_result_ids, vec!["ws"]);
+        assert_eq!(repair.fills.len(), 1);
+        assert!(matches!(&repair.fills[0].content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "ws_2"));
+        assert_eq!(
+            ids_in_order(&repair.messages),
+            vec![
+                "use:ws", "use:ws_2", "res:ws", "res:ws_2", "use:ws_3", "res:ws_3",
+            ]
+        );
     }
 
     #[test]
