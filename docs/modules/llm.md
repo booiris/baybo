@@ -95,6 +95,20 @@ registrations; plan-specific routing stays inside that module.
 The native Responses adapter preserves both tool item and call ids in an
 opaque transcript tool handle, so the next request can reconstruct both.
 
+OpenCode's Gemini surface emits `usageMetadata` objects without
+`totalTokenCount` (often `{}`) on content chunks, a field rig 0.37 requires in
+both the streaming and unary response types; rig then discards those SSE
+events, text and function calls included, and rejects such a unary body. The
+Gemini route therefore builds rig's Gemini client over
+`opencode::gemini_usage::GeminiUsageClient`, an `HttpClientExt` around the
+shared `reqwest::Client` that fills a missing total in (sum of the prompt,
+candidates, thoughts and tool-use prompt counts) on every SSE `data:` payload
+and unary JSON body before rig parses it, leaving everything else as sent.
+Because that changes rig's client type parameter, the per-call model is the
+`AnyCompletionModel::OpencodeGemini` variant; it shares the native `Gemini`
+variant's completion and stream handling, and the native `gemini` provider
+still uses plain `reqwest`.
+
 Every request identifies itself as `baybo/<version>` and sends
 `x-opencode-session`. Billed calls use their session cache key; calls without
 one use a stable client-local id. Headers are constructed per call while the

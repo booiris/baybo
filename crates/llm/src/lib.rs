@@ -1215,6 +1215,14 @@ pub(crate) enum AnyCompletionModel {
     Opencode(crate::providers::opencode::OpencodeCompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
+    /// OpenCode's Gemini surface, reached only through
+    /// [`OpencodeCompletionModel::for_session`](crate::providers::opencode::OpencodeCompletionModel::for_session).
+    /// Its HTTP client repairs the `usageMetadata` rig 0.37 cannot parse.
+    OpencodeGemini(
+        gemini::completion::CompletionModel<
+            crate::providers::opencode::gemini_usage::GeminiUsageClient,
+        >,
+    ),
     /// DeepSeek's dedicated provider — round-trips `reasoning_content`
     /// on assistant tool-call turns, which thinking mode requires.
     DeepSeek(deepseek::CompletionModel),
@@ -1246,9 +1254,8 @@ pub(crate) enum AnyCompletionModel {
 }
 
 /// Erase a provider `CompletionResponse<R>`'s raw-response payload for the
-/// agent loop. For OpenAI-compatible rig providers that need no per-field
-/// usage massaging (unlike Anthropic's cache folding / Gemini's cache
-/// re-derivation).
+/// agent loop. For rig providers whose `Usage` needs no per-field
+/// massaging (unlike Anthropic's cache folding).
 fn repack_completion<R>(
     resp: completion::CompletionResponse<R>,
 ) -> completion::CompletionResponse<()> {
@@ -1275,7 +1282,7 @@ impl AnyCompletionModel {
             Self::OpenAI(_) => openai_model_accepts_audio(model_id),
             // Every Gemini chat model rig can build is natively
             // multimodal over audio; the text-only 1.0 line is retired.
-            Self::Gemini(_) => true,
+            Self::Gemini(_) | Self::OpencodeGemini(_) => true,
             Self::Opencode(model) => model.accepts_audio_content(),
             _ => false,
         }
@@ -1304,7 +1311,7 @@ impl AnyCompletionModel {
             return false;
         }
         let priced = match self {
-            Self::Gemini(_) => gemini_image_tokens(width, height),
+            Self::Gemini(_) | Self::OpencodeGemini(_) => gemini_image_tokens(width, height),
             Self::OpenAI(_) | Self::OpenAiSubscription(_) => openai_image_tokens(width, height),
             Self::OpenAIResponses(_) => openai_image_tokens(width, height),
             Self::Opencode(model) => model.image_tokens(width, height),
@@ -1328,6 +1335,7 @@ impl AnyCompletionModel {
             self,
             Self::Anthropic(_)
                 | Self::Gemini(_)
+                | Self::OpencodeGemini(_)
                 | Self::OpenAiSubscription(_)
                 | Self::OpenAIResponses(_)
         )
@@ -1383,24 +1391,8 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
-            Self::Gemini(m) => {
-                let resp = m.completion(request).await?;
-                // rig 0.34's Gemini path leaves `cached_input_tokens` at 0
-                // even when the response carries `cachedContentTokenCount`.
-                // Re-derive it from the raw `usage_metadata` so prompt-cache
-                // hits land in cost_records correctly. Drop this once rig
-                // upstream populates the field itself.
-                let mut usage = resp.usage;
-                if let Some(meta) = resp.raw_response.usage_metadata.as_ref() {
-                    usage.cached_input_tokens = meta.cached_content_token_count.unwrap_or(0) as u64;
-                }
-                Ok(completion::CompletionResponse {
-                    choice: resp.choice,
-                    usage,
-                    raw_response: (),
-                    message_id: resp.message_id,
-                })
-            }
+            Self::Gemini(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::OpencodeGemini(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::DeepSeek(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Xai(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Mistral(m) => Ok(repack_completion(m.completion(request).await?)),
@@ -1453,10 +1445,8 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_anthropic_stream(stream))
             }
-            Self::Gemini(m) => {
-                let stream = m.stream(request).await?;
-                Ok(LlmStream::from_gemini_stream(stream))
-            }
+            Self::Gemini(m) => Ok(LlmStream::from_gemini_stream(m.stream(request).await?)),
+            Self::OpencodeGemini(m) => Ok(LlmStream::from_gemini_stream(m.stream(request).await?)),
             Self::DeepSeek(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Xai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Mistral(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
