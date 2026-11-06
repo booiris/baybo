@@ -5,6 +5,8 @@ mod error;
 pub mod guard;
 pub mod json_extract;
 pub mod media_probe;
+#[cfg(test)]
+mod mock_http;
 pub mod multimodal;
 pub mod openrouter;
 pub mod providers;
@@ -1120,7 +1122,9 @@ impl LlmStream {
     /// `cached_input_tokens` at 0; this wrapper reads
     /// `usage_metadata.cached_content_token_count` straight off the raw
     /// `Final` payload so prompt-cache hits land in cost_records. Drop
-    /// once rig upstream fixes the impl.
+    /// once rig upstream fixes the impl. It also replaces rig's
+    /// name-as-id on each tool call with a unique id
+    /// ([`crate::providers::gemini::assign_tool_call_id`]).
     fn from_gemini_stream(
         rig_stream: streaming::StreamingCompletionResponse<
             gemini::streaming::StreamingCompletionResponse,
@@ -1140,7 +1144,12 @@ impl LlmStream {
                         cache_creation_input_tokens: usage.cache_creation_input_tokens as usize,
                     })))
                 }
-                Ok(event) => convert_stream_event(event),
+                Ok(mut event) => {
+                    if let StreamedAssistantContent::ToolCall { tool_call, .. } = &mut event {
+                        crate::providers::gemini::assign_tool_call_id(tool_call);
+                    }
+                    convert_stream_event(event)
+                }
             })
         });
         Self {
@@ -1391,8 +1400,18 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
-            Self::Gemini(m) => Ok(repack_completion(m.completion(request).await?)),
-            Self::OpencodeGemini(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Gemini(m) => Ok(crate::providers::gemini::assign_response_tool_call_ids(
+                repack_completion(
+                    m.completion(crate::providers::gemini::prepare_request(request))
+                        .await?,
+                ),
+            )),
+            Self::OpencodeGemini(m) => Ok(crate::providers::gemini::assign_response_tool_call_ids(
+                repack_completion(
+                    m.completion(crate::providers::gemini::prepare_request(request))
+                        .await?,
+                ),
+            )),
             Self::DeepSeek(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Xai(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Mistral(m) => Ok(repack_completion(m.completion(request).await?)),
@@ -1445,8 +1464,14 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_anthropic_stream(stream))
             }
-            Self::Gemini(m) => Ok(LlmStream::from_gemini_stream(m.stream(request).await?)),
-            Self::OpencodeGemini(m) => Ok(LlmStream::from_gemini_stream(m.stream(request).await?)),
+            Self::Gemini(m) => Ok(LlmStream::from_gemini_stream(
+                m.stream(crate::providers::gemini::prepare_request(request))
+                    .await?,
+            )),
+            Self::OpencodeGemini(m) => Ok(LlmStream::from_gemini_stream(
+                m.stream(crate::providers::gemini::prepare_request(request))
+                    .await?,
+            )),
             Self::DeepSeek(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Xai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Mistral(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
