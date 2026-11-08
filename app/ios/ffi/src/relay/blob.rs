@@ -162,13 +162,12 @@ async fn upload_file_over_tunnel(
 ) -> Result<String, String> {
     // The head declares the digest, so the file is hashed BEFORE a byte of it
     // is dialed for — hence the second read here rather than one streaming pass.
-    let ticker = blob_helper::UploadTicker::new(progress, digest.len);
     let tee = blob_helper::UploadCacheTee::open(&digest.hex).await;
     let mut reader = blob_helper::UploadReader::open(
         source,
         digest.len,
         crate::core::MAX_TUNNEL_CHUNK,
-        ticker.clone(),
+        progress,
         tee.clone(),
     )
     .await?;
@@ -180,7 +179,6 @@ async fn upload_file_over_tunnel(
             .await?;
         offset += len;
     }
-    ticker.finish();
     let blob_id = finish_upload(leg, &digest.hex).await?;
     tee.publish().await;
     Ok(blob_id)

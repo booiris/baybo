@@ -959,6 +959,52 @@ struct ComposerStagingTests {
         #expect(!onQueued)
     }
 
+    // MARK: - progress
+
+    /// `sent == total` means every byte is handed to the transport, not that
+    /// the gateway has it: over the relay most of a large pick is still in
+    /// socket buffers. The tile stops counting there and says so, instead of
+    /// sitting on a full `20 MB / 20 MB` until the blob id comes back.
+    @Test func theClosingTickReadsAsFinishingNotAFullCounter() {
+        var state = StagedAttachment.State.uploading(sent: 0)
+
+        state.progressed(sent: 600, total: 1000)
+        #expect(state.sentBytes == 600)
+
+        state.progressed(sent: 1000, total: 1000)
+        guard case .finishing = state else {
+            Issue.record("a closing tick must read as finishing, got \(state)")
+            return
+        }
+        #expect(state.isUploading, "still on the wire: it holds its concurrency slot")
+        #expect(state.isPending, "and still gates the send")
+
+        state.progressed(sent: 1000, total: 1000)
+        state.progressed(sent: 999, total: 1000)
+        guard case .finishing = state else {
+            Issue.record("finishing never steps back to a counter, got \(state)")
+            return
+        }
+
+        // A tick with no known total can't claim the end.
+        var unknown = StagedAttachment.State.uploading(sent: 0)
+        unknown.progressed(sent: 1000, total: nil)
+        #expect(unknown.sentBytes == 1000)
+
+        // A late tick after the call returned (the forwarder hops to the main
+        // actor) must not resurrect a landed or failed pick.
+        var landed = StagedAttachment.State.ready(blobId: "sha256:abc.tok")
+        landed.progressed(sent: 10, total: 1000)
+        guard case .ready(let blobId) = landed else {
+            Issue.record("a landed pick must stay landed, got \(landed)")
+            return
+        }
+        #expect(blobId == "sha256:abc.tok")
+        var failed = StagedAttachment.State.error
+        failed.progressed(sent: 10, total: 1000)
+        #expect(failed.isError)
+    }
+
     // MARK: - the wire reference
 
     @Test func theRealFilenameRidesTheSend() {

@@ -34,6 +34,12 @@ struct StagedAttachment: Identifiable {
     enum State {
         case queued
         case uploading(sent: UInt64)
+        /// Every byte is handed to the transport, but the gateway has not
+        /// answered with the blob yet. The bytes are still in socket and relay
+        /// buffers — over the relay that is seconds of a large pick — so a
+        /// counter reading `20 MB / 20 MB` here would claim a landing that has
+        /// not happened.
+        case finishing
         case ready(blobId: String)
         case error
 
@@ -42,13 +48,28 @@ struct StagedAttachment: Identifiable {
             return false
         }
 
+        /// On the wire: streaming, or waiting on the gateway's answer.
         var isUploading: Bool {
-            if case .uploading = self { return true }
-            return false
+            switch self {
+            case .uploading, .finishing: return true
+            default: return false
+            }
         }
 
         /// Not on the gateway yet, and not failed either.
         var isPending: Bool { isQueued || isUploading }
+
+        /// A progress tick from the core. Only an upload in flight moves, and
+        /// never backwards out of `finishing` — the core's closing tick can be
+        /// followed by nothing but the call's own return.
+        mutating func progressed(sent: UInt64, total: UInt64?) {
+            guard case .uploading = self else { return }
+            if let total, sent >= total {
+                self = .finishing
+            } else {
+                self = .uploading(sent: sent)
+            }
+        }
 
         var isError: Bool {
             if case .error = self { return true }

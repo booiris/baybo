@@ -315,6 +315,8 @@ Cancellation stops a photo's `loadTransferable`, but **not an upload already on 
 
 Progress presents exactly like a download does: an indeterminate spinner with the **byte counter beside it as the real progress** (`884 KB / 2.3 MB`), on the tile's second line.
 
+**The counter measures bytes handed to the transport, not bytes the gateway holds.** Nothing upstream acknowledges progress: the core ticks as `UploadReader` reads each chunk off disk, and from there the chunk sits in the phone's TCP send buffer, the relay's receive buffer, and behind the relay's per-key throttle (`RELAY_BYTES_PER_SEC`, 1 MiB/s by default) before the gateway writes, `fsync`s and answers. A 20 MB pick over the relay reached `20 MB / 20 MB` and then sat there, looking finished, for as long as those buffers took to drain. So the reader emits its closing tick itself the moment it hands over the last chunk — on both legs, with no caller `finish` (the direct leg's reader never sees its own EOF: reqwest stops polling at the declared `Content-Length`) — and that tick moves the tile to **`finishing`** (`State.progressed`), which reads *Finishing…* instead of a full counter until the call returns the blob id. `finishing` is still `isUploading`: it holds its concurrency slot and gates the send. The QUIC carrier leg is far tighter (a 256 KB stream window) but takes the same path.
+
 ### Send gating, and the retry
 
 Staged picks count as a draft, so an attachment-only send works with an empty field. Send is **gated** while anything is still on its way to the gateway and **blocked** while anything FAILED — a failed pick carries no blob, and shipping the message without it would drop the user's file in silence.
