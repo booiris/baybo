@@ -136,10 +136,10 @@ provider breaks on ids that mean something else there. Both Gemini variants
 `AnyCompletionModel`, through `providers/gemini.rs`:
 
 - **Inbound**: every tool call, streamed or unary, gets a fresh id of nine
-  ASCII alphanumerics; the thought signature stays on the call. Nine
-  alphanumerics is Mistral's required shape, the strictest of the providers a
-  conversation can move to, and also fits Anthropic's `^[a-zA-Z0-9_-]{1,64}$`
-  and OpenAI's 40-character limit.
+  ASCII alphanumerics; the thought signature stays on the call (stamped, see
+  below). Nine alphanumerics is Mistral's required shape, the strictest of the
+  providers a conversation can move to, and also fits Anthropic's
+  `^[a-zA-Z0-9_-]{1,64}$` and OpenAI's 40-character limit.
 - **Outbound**: before rig builds the Gemini body, each tool result's id is
   replaced by the (sanitised) function name of the nearest preceding call with
   that id, so `functionResponse.name` names the function whatever provider
@@ -149,6 +149,38 @@ provider breaks on ids that mean something else there. Both Gemini variants
 No other provider's request or response is touched. Transcripts written
 before this fix can still hold repeated ids; context hydration disambiguates
 them (see [`context.md`](context.md)).
+
+### Gemini thought signatures
+
+Gemini signs a turn's function calls (and thinking) with an opaque
+`thoughtSignature` that must be replayed with the history, and it validates
+the signatures it is sent. Measured against OpenCode's Gemini surface:
+
+| Signature on a replayed function call | older turn | current turn |
+|---|---|---|
+| issued by this model | accepted | accepted |
+| issued by another model | `Invalid thought signature` | `Invalid thought signature` |
+| none | accepted | `Function call is missing a thought_signature` |
+| `skip_thought_signature_validator` | accepted | accepted |
+
+So a signature is only ever replayed to the model that issued it, and the
+same two dispatch arms enforce that through `providers/gemini.rs`:
+
+- **Inbound**: every signature on a tool call or reasoning block is stamped
+  with the producing model, `baybo:gemini-sig:v1:<model>|<signature>`, before
+  it reaches the transcript. Only the Gemini path writes or reads this format;
+  other providers' converters ignore tool-call signatures.
+- **Outbound**: a stamped signature whose model matches the request's model is
+  unwrapped to the raw value. Any other tool-call signature, from another model
+  or stored before stamping existed, becomes the placeholder
+  `skip_thought_signature_validator`, and a model turn left with no signed call
+  (one written by another provider, say) gets the placeholder on its first
+  call. Thinking with a foreign signature is not sent; if it is the turn's only
+  part it is sent unsigned.
+
+This is what lets a conversation switch Gemini models, or fall back from a
+pinned model that no longer exists, without every later request failing.
+Stored rows are not rewritten; the decision is made per request.
 
 ### Tool results on the wire
 

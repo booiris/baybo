@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use rig::OneOrMany;
 use rig::client::CompletionClient;
 use rig::completion::{AssistantContent, CompletionRequest, CompletionResponse};
-use rig::message::{Message, ToolCall, UserContent};
+use rig::message::{Message, Reasoning, ReasoningContent, ToolCall, UserContent};
+use rig::streaming::StreamedAssistantContent;
 use serde::Deserialize;
 
 use crate::providers::rig_providers::rig_provider_factory;
@@ -47,28 +49,138 @@ fn mint_tool_call_id() -> String {
     id
 }
 
-/// Give a tool call Gemini returned an id unique within the transcript.
-pub(crate) fn assign_tool_call_id(call: &mut ToolCall) {
-    call.id = mint_tool_call_id();
+/// Marks a thought signature baybo stamped with the model that produced it:
+/// `<prefix><model>|<signature>`. Gemini signatures are base64, so they never
+/// contain the separator, and model ids never do either.
+const SIGNATURE_STAMP_PREFIX: &str = "baybo:gemini-sig:v1:";
+const SIGNATURE_STAMP_SEPARATOR: char = '|';
+
+/// Gemini's documented stand-in for a thought signature it did not issue.
+/// A signature from another model is rejected as invalid, and a function
+/// call in the current turn with no signature is rejected as missing one;
+/// this value is accepted in both places.
+pub(crate) const THOUGHT_SIGNATURE_PLACEHOLDER: &str = "skip_thought_signature_validator";
+
+fn stamp_signature(signature: &mut Option<String>, model: &str) {
+    if let Some(raw) = signature.take() {
+        *signature = Some(format!(
+            "{SIGNATURE_STAMP_PREFIX}{model}{SIGNATURE_STAMP_SEPARATOR}{raw}"
+        ));
+    }
 }
 
-/// [`assign_tool_call_id`] over every tool call of a unary response.
-pub(crate) fn assign_response_tool_call_ids(
+/// The raw signature, when `stamped` was issued by `model`. Unstamped
+/// signatures predate provenance and count as foreign.
+fn own_signature<'a>(stamped: &'a str, model: &str) -> Option<&'a str> {
+    let (issuer, raw) = stamped
+        .strip_prefix(SIGNATURE_STAMP_PREFIX)?
+        .split_once(SIGNATURE_STAMP_SEPARATOR)?;
+    (issuer == model).then_some(raw)
+}
+
+fn stamp_reasoning(reasoning: &mut Reasoning, model: &str) {
+    for content in &mut reasoning.content {
+        if let ReasoningContent::Text { signature, .. } = content {
+            stamp_signature(signature, model);
+        }
+    }
+}
+
+/// Adopt a tool call `model` returned: give it an id unique within the
+/// transcript and stamp its signature with `model`.
+pub(crate) fn adopt_tool_call(call: &mut ToolCall, model: &str) {
+    call.id = mint_tool_call_id();
+    stamp_signature(&mut call.signature, model);
+}
+
+/// [`adopt_tool_call`] and [`stamp_reasoning`] over one streamed event.
+pub(crate) fn adopt_stream_event<R>(event: &mut StreamedAssistantContent<R>, model: &str) {
+    match event {
+        StreamedAssistantContent::ToolCall { tool_call, .. } => adopt_tool_call(tool_call, model),
+        StreamedAssistantContent::Reasoning(reasoning) => stamp_reasoning(reasoning, model),
+        _ => {}
+    }
+}
+
+/// [`adopt_stream_event`] over every part of a unary response.
+pub(crate) fn adopt_response(
     mut response: CompletionResponse<()>,
+    model: &str,
 ) -> CompletionResponse<()> {
     for part in response.choice.iter_mut() {
-        if let AssistantContent::ToolCall(call) = part {
-            assign_tool_call_id(call);
+        match part {
+            AssistantContent::ToolCall(call) => adopt_tool_call(call, model),
+            AssistantContent::Reasoning(reasoning) => stamp_reasoning(reasoning, model),
+            _ => {}
         }
     }
     response
 }
 
-/// rig sends a tool result's id as Gemini's `functionResponse.name`, which
-/// must name the function it answers. Rewrite each result id to the name of
-/// the nearest preceding call carrying that id; a result with no such call
-/// is left as it is.
-pub(crate) fn prepare_request(mut request: CompletionRequest) -> CompletionRequest {
+/// Replay only `model`'s own signatures. A tool call signed by anyone else
+/// carries the placeholder instead, and a model turn whose calls end up with
+/// no signature at all gets the placeholder on its first call, since Gemini
+/// rejects an unsigned call in the current turn. Foreign thinking is dropped
+/// from the request (its signature cleared when it is the turn's only part).
+fn replay_signatures(content: &mut OneOrMany<AssistantContent>, model: &str) {
+    let mut signed = false;
+    for part in content.iter_mut() {
+        match part {
+            AssistantContent::ToolCall(call) => {
+                call.signature = call.signature.as_deref().map(|stamped| {
+                    own_signature(stamped, model)
+                        .unwrap_or(THOUGHT_SIGNATURE_PLACEHOLDER)
+                        .to_string()
+                });
+                signed |= call.signature.is_some();
+            }
+            AssistantContent::Reasoning(reasoning) => {
+                for block in &mut reasoning.content {
+                    if let ReasoningContent::Text { signature, .. } = block {
+                        *signature = signature
+                            .as_deref()
+                            .and_then(|stamped| own_signature(stamped, model))
+                            .map(str::to_string);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !signed
+        && let Some(AssistantContent::ToolCall(call)) = content
+            .iter_mut()
+            .find(|part| matches!(part, AssistantContent::ToolCall(_)))
+    {
+        call.signature = Some(THOUGHT_SIGNATURE_PLACEHOLDER.to_string());
+    }
+}
+
+/// Which reasoning parts of a stored turn to keep: thinking that carried a
+/// signature `model` did not issue is foreign and goes.
+fn drop_foreign_thinking(content: &mut OneOrMany<AssistantContent>, model: &str) {
+    let foreign = |part: &AssistantContent| match part {
+        AssistantContent::Reasoning(reasoning) => reasoning
+            .first_signature()
+            .is_some_and(|stamped| own_signature(stamped, model).is_none()),
+        _ => false,
+    };
+    if !content.iter().any(foreign) {
+        return;
+    }
+    let kept: Vec<AssistantContent> = content.iter().filter(|p| !foreign(p)).cloned().collect();
+    if let Ok(kept) = OneOrMany::many(kept) {
+        *content = kept;
+    }
+}
+
+/// Shape a request for Gemini `model`:
+/// - rig sends a tool result's id as `functionResponse.name`, which must name
+///   the function it answers, so each result id becomes the name of the
+///   nearest preceding call carrying that id (an unpaired result keeps it);
+/// - thought signatures are replayed only to the model that issued them
+///   (see [`replay_signatures`]).
+pub(crate) fn prepare_request(mut request: CompletionRequest, model: &str) -> CompletionRequest {
     let mut call_names: HashMap<String, String> = HashMap::new();
     for message in request.chat_history.iter_mut() {
         match message {
@@ -78,6 +190,8 @@ pub(crate) fn prepare_request(mut request: CompletionRequest) -> CompletionReque
                         call_names.insert(call.id.clone(), call.function.name.clone());
                     }
                 }
+                drop_foreign_thinking(content, model);
+                replay_signatures(content, model);
             }
             Message::User { content } => {
                 for part in content.iter_mut() {
@@ -274,9 +388,15 @@ pub(crate) mod tests {
         calls
     }
 
+    /// The raw signature `model` issued, read back out of a stored stamp.
+    pub(crate) fn issued_by<'a>(stamped: Option<&'a str>, model: &str) -> Option<&'a str> {
+        stamped.and_then(|s| own_signature(s, model))
+    }
+
     /// Two `web_search` calls come back with distinct ids that every
-    /// provider accepts, each keeping its own arguments and signature.
-    pub(crate) fn assert_distinct_portable_ids(calls: &[ToolCallInfo]) {
+    /// provider accepts, each keeping its own arguments and signature,
+    /// stamped as issued by `model`.
+    pub(crate) fn assert_distinct_portable_ids(calls: &[ToolCallInfo], model: &str) {
         assert_eq!(calls.len(), 2);
         let ids: HashSet<&str> = calls.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids.len(), 2, "repeated calls share an id: {calls:?}");
@@ -292,7 +412,14 @@ pub(crate) mod tests {
         }
         assert_eq!(calls[0].arguments, json!({"q":"alpha"}));
         assert_eq!(calls[1].arguments, json!({"q":"beta"}));
-        assert_eq!(calls[0].signature.as_deref(), Some("sig-a"));
+        assert_eq!(
+            issued_by(calls[0].signature.as_deref(), model),
+            Some("sig-a")
+        );
+        assert_eq!(
+            issued_by(calls[0].signature.as_deref(), "another-model"),
+            None
+        );
         assert_eq!(calls[1].signature, None);
     }
 
@@ -415,7 +542,7 @@ pub(crate) mod tests {
             .chat_stream(&search_tools_request())
             .await
             .unwrap();
-        assert_distinct_portable_ids(&collect_calls(stream).await);
+        assert_distinct_portable_ids(&collect_calls(stream).await, "gemini-test");
     }
 
     #[tokio::test]
@@ -426,7 +553,7 @@ pub(crate) mod tests {
             .chat(&search_tools_request())
             .await
             .unwrap();
-        assert_distinct_portable_ids(&response.tool_calls);
+        assert_distinct_portable_ids(&response.tool_calls, "gemini-test");
     }
 
     #[tokio::test]
@@ -509,7 +636,7 @@ pub(crate) mod tests {
             additional_params: None,
             output_schema: None,
         };
-        let prepared = prepare_request(request);
+        let prepared = prepare_request(request, "gemini-test");
         let ids: Vec<String> = prepared
             .chat_history
             .iter()
@@ -587,5 +714,151 @@ pub(crate) mod tests {
                 "{id}"
             );
         }
+    }
+
+    fn stamped(model: &str, raw: &str) -> Option<String> {
+        let mut signature = Some(raw.to_string());
+        stamp_signature(&mut signature, model);
+        signature
+    }
+
+    fn signed_use(id: &str, signature: Option<String>) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: "web_search".into(),
+            input: json!({}),
+            signature,
+        }
+    }
+
+    fn thinking(text: &str, signature: Option<String>) -> ContentBlock {
+        ContentBlock::Thinking {
+            id: None,
+            content: vec![baybo_model::ThinkingContent::Text {
+                text: text.into(),
+                signature,
+            }],
+        }
+    }
+
+    /// One history turn per provenance case, each followed by its results.
+    fn provenance_history_request() -> ChatRequest {
+        let mut request = search_tools_request();
+        let turns: Vec<Vec<ContentBlock>> = vec![
+            vec![signed_use("own1", stamped("gemini-test", "own-sig"))],
+            vec![
+                signed_use("for1", stamped("other-model", "foreign-sig")),
+                signed_use("for2", None),
+            ],
+            vec![signed_use("leg1", Some("legacy-sig".into()))],
+            vec![signed_use("unsg1", None), signed_use("unsg2", None)],
+            vec![
+                thinking("mine", stamped("gemini-test", "own-thought")),
+                signed_use("thk1", stamped("gemini-test", "own-call")),
+            ],
+            vec![
+                thinking("theirs", stamped("other-model", "foreign-thought")),
+                signed_use("thk2", stamped("other-model", "foreign-call")),
+            ],
+        ];
+        for turn in turns {
+            let ids: Vec<String> = turn
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            request.messages.push(ChatMessage::assistant(turn));
+            request.messages.extend(ids.iter().map(|id| result(id)));
+        }
+        request
+    }
+
+    /// Per model content: the thought texts kept and each functionCall's
+    /// `thoughtSignature`.
+    type TurnSignatures = (Vec<(String, Option<String>)>, Vec<Option<String>>);
+
+    fn model_turn_signatures(body: &Value) -> Vec<TurnSignatures> {
+        let sig = |part: &Value| part["thoughtSignature"].as_str().map(str::to_string);
+        body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["role"] == "model")
+            .map(|c| {
+                let parts = c["parts"].as_array().unwrap();
+                let thoughts = parts
+                    .iter()
+                    .filter(|p| p["thought"] == true)
+                    .map(|p| (p["text"].as_str().unwrap_or_default().to_string(), sig(p)))
+                    .collect();
+                let calls = parts
+                    .iter()
+                    .filter(|p| p.get("functionCall").is_some())
+                    .map(sig)
+                    .collect();
+                (thoughts, calls)
+            })
+            .collect()
+    }
+
+    /// A signature reaches Gemini only from the model that issued it. Any
+    /// other one, stamped by another model or stored before provenance,
+    /// becomes the placeholder; a turn left with no signed call gets the
+    /// placeholder on its first call; foreign thinking is not sent.
+    #[tokio::test]
+    async fn signatures_replay_only_to_their_issuer() {
+        let (origin, mut captured) = endpoint(vec![
+            (200, "text/event-stream", repeated_call_sse()),
+            (200, "application/json", repeated_call_body()),
+        ])
+        .await;
+        let client = gemini_client(origin);
+        let request = provenance_history_request();
+        collect_calls(client.chat_stream(&request).await.unwrap()).await;
+        client.chat(&request).await.unwrap();
+        let placeholder = || Some(THOUGHT_SIGNATURE_PLACEHOLDER.to_string());
+        let own = |s: &str| Some(s.to_string());
+        let expected: Vec<TurnSignatures> = vec![
+            (vec![], vec![own("own-sig")]),
+            (vec![], vec![placeholder(), None]),
+            (vec![], vec![placeholder()]),
+            (vec![], vec![placeholder(), None]),
+            (
+                vec![("mine".into(), own("own-thought"))],
+                vec![own("own-call")],
+            ),
+            (vec![], vec![placeholder()]),
+        ];
+        for _ in 0..2 {
+            let body = captured.recv().await.unwrap().body;
+            assert_gemini_accepts_function_turns(&body);
+            assert_eq!(model_turn_signatures(&body), expected);
+        }
+    }
+
+    #[test]
+    fn a_stamp_names_its_issuer() {
+        let signature = stamped("gemini-test", "raw");
+        let signature = signature.as_deref().unwrap();
+        assert_eq!(own_signature(signature, "gemini-test"), Some("raw"));
+        assert_eq!(own_signature(signature, "gemini-test-2"), None);
+        assert_eq!(own_signature("raw", "gemini-test"), None);
+    }
+
+    /// A turn whose only part is foreign thinking keeps the thought with
+    /// its signature cleared rather than becoming an empty model turn.
+    #[test]
+    fn foreign_thinking_alone_is_kept_unsigned() {
+        let mut content = OneOrMany::one(AssistantContent::Reasoning(
+            Reasoning::new_with_signature("theirs", stamped("other-model", "sig")),
+        ));
+        drop_foreign_thinking(&mut content, "gemini-test");
+        replay_signatures(&mut content, "gemini-test");
+        let AssistantContent::Reasoning(reasoning) = content.first() else {
+            panic!("thinking was dropped");
+        };
+        assert_eq!(reasoning.first_signature(), None);
     }
 }
