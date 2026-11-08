@@ -1799,7 +1799,7 @@ export interface components {
         /** @description One conversation's matches, collapsed into a single result. */
         ChatSearchGroup: {
             /**
-             * @description Best-matching message excerpts, best first, at most
+             * @description Matching message excerpts, newest first, at most
              *     [`MAX_HITS_PER_SESSION`]. Message hits only — a title match adds none.
              */
             hits: components["schemas"]["ChatSearchHit"][];
@@ -1807,8 +1807,8 @@ export interface components {
             /** @description Conversation title, when one has been generated. */
             session_title?: string | null;
             /**
-             * @description The query matched `session_title`. Title-matched conversations come
-             *     first, in title-relevance order; the rest follow by best message hit.
+             * @description The query matched `session_title`. Such a conversation is dated by its
+             *     last activity in the newest-first order rather than by a message.
              *     A group can be a title match with no message hits at all — then `hits`
              *     is empty and `total_hits` is 0, and opening it has no row to land on.
              */
@@ -1857,8 +1857,8 @@ export interface components {
         };
         ChatSearchResults: {
             /**
-             * @description Conversations, best match first: title matches by title relevance, then
-             *     the rest by their best message hit.
+             * @description Conversations, newest first: each by its newest matching message, or by
+             *     its last activity when its title matched.
              */
             groups: components["schemas"]["ChatSearchGroup"][];
             /**
@@ -4977,7 +4977,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Conversations whose title or messages match, best first */
+            /** @description Conversations whose title or messages match, newest first */
             200: {
                 headers: {
                     [name: string]: unknown;

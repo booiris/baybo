@@ -1298,7 +1298,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Conversations whose title or messages match, best first",
+            "description": "Conversations whose title or messages match, newest first",
             "content": {
               "application/json": {
                 "schema": {
@@ -8172,7 +8172,7 @@
             "items": {
               "$ref": "#/components/schemas/ChatSearchHit"
             },
-            "description": "Best-matching message excerpts, best first, at most\n[`MAX_HITS_PER_SESSION`]. Message hits only — a title match adds none."
+            "description": "Matching message excerpts, newest first, at most\n[`MAX_HITS_PER_SESSION`]. Message hits only — a title match adds none."
           },
           "session_id": {
             "type": "string"
@@ -8186,7 +8186,7 @@
           },
           "title_match": {
             "type": "boolean",
-            "description": "The query matched `session_title`. Title-matched conversations come\nfirst, in title-relevance order; the rest follow by best message hit.\nA group can be a title match with no message hits at all — then `hits`\nis empty and `total_hits` is 0, and opening it has no row to land on."
+            "description": "The query matched `session_title`. Such a conversation is dated by its\nlast activity in the newest-first order rather than by a message.\nA group can be a title match with no message hits at all — then `hits`\nis empty and `total_hits` is 0, and opening it has no row to land on."
           },
           "total_hits": {
             "type": "integer",
@@ -8243,7 +8243,7 @@
             "items": {
               "$ref": "#/components/schemas/ChatSearchGroup"
             },
-            "description": "Conversations, best match first: title matches by title relevance, then\nthe rest by their best message hit."
+            "description": "Conversations, newest first: each by its newest matching message, or by\nits last activity when its title matched."
           },
           "truncated": {
             "type": "boolean",

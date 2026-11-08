@@ -184,12 +184,12 @@ pub struct ChatSearchGroup {
     /// Conversation title, when one has been generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_title: Option<String>,
-    /// The query matched `session_title`. Title-matched conversations come
-    /// first, in title-relevance order; the rest follow by best message hit.
+    /// The query matched `session_title`. Such a conversation is dated by its
+    /// last activity in the newest-first order rather than by a message.
     /// A group can be a title match with no message hits at all — then `hits`
     /// is empty and `total_hits` is 0, and opening it has no row to land on.
     pub title_match: bool,
-    /// Best-matching message excerpts, best first, at most
+    /// Matching message excerpts, newest first, at most
     /// [`MAX_HITS_PER_SESSION`]. Message hits only — a title match adds none.
     pub hits: Vec<ChatSearchHit>,
     /// Message matches this conversation has in total — `hits.len()` when it is
@@ -200,8 +200,8 @@ pub struct ChatSearchGroup {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatSearchResults {
-    /// Conversations, best match first: title matches by title relevance, then
-    /// the rest by their best message hit.
+    /// Conversations, newest first: each by its newest matching message, or by
+    /// its last activity when its title matched.
     pub groups: Vec<ChatSearchGroup>,
     /// True when the query matched more than the scan window — of messages or
     /// of titles — so some conversations are missing and `total_hits` may
@@ -950,7 +950,7 @@ async fn create_session(
     tag = "chat",
     params(SearchMessagesQuery),
     responses(
-        (status = 200, description = "Conversations whose title or messages match, best first", body = ChatSearchResults),
+        (status = 200, description = "Conversations whose title or messages match, newest first", body = ChatSearchResults),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Search failed", body = ErrorBody),
     )

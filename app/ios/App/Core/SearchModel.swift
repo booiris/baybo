@@ -113,9 +113,9 @@ final class SearchModel: ObservableObject {
 
     #if DEBUG
         /// Canned hits over the `-baybo-open-home` demo conversations. A
-        /// title-only group first (title matches lead, and it opens with no
-        /// jump), then two message groups, so grouping and the per-excerpt tap
-        /// targets are both real; the ordinals are the ones `-baybo-demo-frames`
+        /// title-only group (it opens with no jump) and two message groups,
+        /// newest first as the gateway sends them, so grouping and the
+        /// per-excerpt tap targets are both real; the ordinals are the ones `-baybo-demo-frames`
         /// writes into `debug-session`, so a jump has somewhere to land.
         static func demoResults(for query: String) -> ChatSearchResults? {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-search") else {
@@ -134,8 +134,8 @@ final class SearchModel: ObservableObject {
                     ChatSearchGroup(
                         sessionId: "demo-1", sessionTitle: nil, titleMatch: false,
                         hits: [
-                            hit(2, "user", "Demo conversation number 1 mentions \(query) here"),
                             hit(3, "assistant", "The reply also covers \(query) in passing"),
+                            hit(2, "user", "Demo conversation number 1 mentions \(query) here"),
                         ],
                         totalHits: 5),
                     ChatSearchGroup(

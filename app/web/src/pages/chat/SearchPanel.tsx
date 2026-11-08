@@ -84,7 +84,7 @@ function Excerpt({ hit, query }: { hit: Hit; query: string }) {
  *  Each excerpt is its own click target, and the card is no longer one big
  *  button: a result is a *place in a conversation*, and three hits in one
  *  conversation are three different places. The title row keeps the
- *  whole-card gesture, landing on the best-scoring hit — or, for a group that
+ *  whole-card gesture, landing on its first (newest) hit — or, for a group that
  *  matched on its title alone, opening the conversation with no jump.
  *
  *  A title match marks the terms across the WHOLE title (`highlightAll`, not

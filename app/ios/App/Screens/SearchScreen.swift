@@ -269,7 +269,7 @@ struct SearchScreen: View {
     /// distinct destination, so a card-wide tap target would show the reader the
     /// line they wanted and then land them on a different one. When the TITLE
     /// matched, the title row is a button too, with app/web's rule: it lands on
-    /// the best-scoring hit, or — for a title-only group, which has no message
+    /// the newest hit, or — for a title-only group, which has no message
     /// to park on — opens the conversation with no jump.
     private func card(_ group: ChatSearchGroup) -> some View {
         VStack(alignment: .leading, spacing: 8) {

@@ -24,7 +24,7 @@ export function jumpOrdinal(hit: components['schemas']['ChatSearchHit']): number
 }
 
 /**
- * Where the card's title row opens: the best-scoring hit, or `null` for a
+ * Where the card's title row opens: the group's first (newest) hit, or `null` for a
  * group the server returned on its title alone. A title-only group has no
  * message hits, so there is no row to land on — opening it is a plain open,
  * not a jump to ordinal 0 (the conversation's first row, which the title
@@ -33,8 +33,8 @@ export function jumpOrdinal(hit: components['schemas']['ChatSearchHit']): number
 export function groupOpenOrdinal(
   group: components['schemas']['ChatSearchGroup'],
 ): number | null {
-  const best = group.hits.at(0);
-  return best === undefined ? null : jumpOrdinal(best);
+  const newest = group.hits.at(0);
+  return newest === undefined ? null : jumpOrdinal(newest);
 }
 
 /**

@@ -60,7 +60,7 @@ absolute path to the running binary, baked in at boot time.
 | "What's the metadata for session X?" | `{{BAYBO_BIN}} session show <id>` |
 | "What did the user/agent say?" | `{{BAYBO_BIN}} session history <id>` |
 | "What got dropped by compaction?" | `{{BAYBO_BIN}} session history <id> --include-superseded` (or `--superseded-only`) |
-| "Where did we talk about X? / which session mentioned X? / find the chat titled X" | `{{BAYBO_BIN}} session search <words…>` (searches session titles and messages, grouped by session; title matches first, marked `[title match]`, then best message match; `--all` also reaches hidden, archived and cron-workspace sessions) |
+| "Where did we talk about X? / which session mentioned X? / find the chat titled X" | `{{BAYBO_BIN}} session search <words…>` (searches session titles and messages, grouped by session, newest first; title matches are marked `[title match]`; `--all` also reaches hidden, archived and cron-workspace sessions) |
 | "Did this chat mention X?" | `{{BAYBO_BIN}} session search <words…> --session <id>` |
 | "What LLM calls / tool calls happened?" | `{{BAYBO_BIN}} session export <id>` (full JSON tree) |
 | "Which turns are in-flight / failed?" | `{{BAYBO_BIN}} turn list [--status in-progress \| failed \| stuck]` |

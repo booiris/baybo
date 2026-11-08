@@ -1293,8 +1293,7 @@ impl BayboClient {
     }
 
     /// Full-text search over the owner's conversation titles and transcripts
-    /// (`GET /v1/chat/search`), grouped by conversation: title matches first,
-    /// then by best message hit.
+    /// (`GET /v1/chat/search`), grouped by conversation, newest first.
     ///
     /// Scope is the gateway's default and is not configurable from here: hidden
     /// sessions stay lost, archived ones stay archived, and cron workspaces —

@@ -27,7 +27,7 @@ pub const MAX_SEARCH_LIMIT: usize = 50;
 /// cannot fix that: the other 10 conversations were never sent.
 ///
 /// Scanning wide is nearly free. Query cost tracks the number of MATCHES, not
-/// the limit — `ORDER BY bm25` scores every hit before it drops any — so this
+/// the limit — `ORDER BY` visits every match before it drops any — so this
 /// bounds the rows carried back through the trait, not the work sqlite does.
 pub const SEARCH_SCAN_LIMIT: u32 = 300;
 
@@ -85,7 +85,7 @@ pub struct SessionSearchGroup {
     /// The session's title matched the query. `title` is then the matched
     /// title, to highlight by substring like a hit's prose.
     pub title_match: bool,
-    /// Message hits only, best first, at most `SearchLimits::hits_per_session`.
+    /// Message hits only, newest first, at most `SearchLimits::hits_per_session`.
     /// Empty for a group that matched on its title alone.
     pub hits: Vec<SessionSearchHit>,
     /// Every message match in the scan window, including those past the
@@ -96,8 +96,8 @@ pub struct SessionSearchGroup {
 
 #[derive(Debug, Clone)]
 pub struct SearchResults {
-    /// Best conversation first: every title match, in title-score order, then
-    /// the message-only conversations, each ranked by its best hit.
+    /// Newest conversation first: a message-only conversation dates from its
+    /// newest matching message, a title-matched one from its last activity.
     pub groups: Vec<SessionSearchGroup>,
     /// Distinct conversations the two scan windows held before
     /// `SearchLimits::sessions` cut the list; `groups.len()` when nothing was
@@ -124,8 +124,8 @@ impl SessionSearch {
         }
     }
 
-    /// Sessions within `scope` whose title or prose matches `query`, title
-    /// matches first, best session first within each tier.
+    /// Sessions within `scope` whose title or prose matches `query`, newest
+    /// first (see `group_hits` for what dates a conversation).
     pub async fn search(
         &self,
         query: &str,
@@ -173,11 +173,11 @@ impl SessionSearch {
     }
 }
 
-/// Title matches lead, in title-score order, each carrying whatever message
-/// hits the message window holds for it; the message-only conversations follow
-/// in their own order. A title names the whole conversation, so it outranks
-/// any one line inside one — and bm25 scores from two tables are not on one
-/// scale, so interleaving them would be a guess.
+/// Newest first, across both windows. A message-only conversation dates from
+/// its newest matching message; a title-matched one from its `last_active`,
+/// because a title names the whole conversation — and since no message is
+/// newer than the conversation's last activity, that one rule covers a
+/// conversation matched by both. Ties keep arrival order (the sort is stable).
 ///
 /// Returns the cut list and the number of distinct conversations before the
 /// cut.
@@ -186,43 +186,58 @@ fn group_hits(
     hits: Vec<SearchHit>,
     limits: SearchLimits,
 ) -> (Vec<SessionSearchGroup>, usize) {
-    let message_groups = group_message_hits(hits, limits);
-    let position: HashMap<SessionId, usize> = message_groups
+    let mut newest: HashMap<SessionId, DateTime<Utc>> = HashMap::new();
+    for hit in &hits {
+        newest
+            .entry(hit.session_id.clone())
+            .or_insert(hit.created_at);
+    }
+    let mut dated: Vec<(DateTime<Utc>, SessionSearchGroup)> = group_message_hits(hits, limits)
+        .into_iter()
+        .map(|g| (newest.get(&g.session_id).copied().unwrap_or_default(), g))
+        .collect();
+    let position: HashMap<SessionId, usize> = dated
         .iter()
         .enumerate()
-        .map(|(i, g)| (g.session_id.clone(), i))
+        .map(|(i, (_, g))| (g.session_id.clone(), i))
         .collect();
-    let mut slots: Vec<Option<SessionSearchGroup>> = message_groups.into_iter().map(Some).collect();
-    let mut groups: Vec<SessionSearchGroup> = Vec::with_capacity(titles.len() + slots.len());
     let mut seen: HashSet<SessionId> = HashSet::new();
     for title in titles {
         if !seen.insert(title.session_id.clone()) {
             continue;
         }
-        let mut group = position
-            .get(&title.session_id)
-            .and_then(|&i| slots[i].take())
-            .unwrap_or_else(|| SessionSearchGroup {
-                session_id: title.session_id.clone(),
-                channel: title.channel.clone(),
-                title: None,
-                title_match: false,
-                hits: Vec::new(),
-                total_hits: 0,
-            });
-        group.title = Some(title.title);
-        group.title_match = true;
-        groups.push(group);
+        match position.get(&title.session_id) {
+            Some(&i) => {
+                let (at, group) = &mut dated[i];
+                *at = (*at).max(title.last_active);
+                group.title = Some(title.title);
+                group.title_match = true;
+            }
+            None => dated.push((
+                title.last_active,
+                SessionSearchGroup {
+                    session_id: title.session_id,
+                    channel: title.channel,
+                    title: Some(title.title),
+                    title_match: true,
+                    hits: Vec::new(),
+                    total_hits: 0,
+                },
+            )),
+        }
     }
-    groups.extend(slots.into_iter().flatten());
-    let matched = groups.len();
-    groups.truncate(limits.sessions.min(MAX_SEARCH_LIMIT));
+    dated.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let matched = dated.len();
+    let groups = dated
+        .into_iter()
+        .map(|(_, g)| g)
+        .take(limits.sessions.min(MAX_SEARCH_LIMIT))
+        .collect();
     (groups, matched)
 }
 
-/// Hits arrive sorted by bm25, so first-seen order IS relevance order: a
-/// conversation ranks by its best hit, which falls out of pushing each hit
-/// onto its group in arrival order. Nothing re-sorts.
+/// Hits arrive newest first, so pushing each onto its group in arrival order
+/// leaves every group's hits newest first and its first hit its newest.
 fn group_message_hits(hits: Vec<SearchHit>, limits: SearchLimits) -> Vec<SessionSearchGroup> {
     let mut groups: Vec<SessionSearchGroup> = Vec::new();
     let mut index: HashMap<SessionId, usize> = HashMap::new();
@@ -243,7 +258,7 @@ fn group_message_hits(hits: Vec<SearchHit>, limits: SearchLimits) -> Vec<Session
             }
         };
         let group = &mut groups[slot];
-        // Count every match but carry only the best few: `total_hits` is what
+        // Count every match but carry only the newest few: `total_hits` is what
         // lets a caller say "and 12 more" without a second call.
         group.total_hits += 1;
         if group.hits.len() >= limits.hits_per_session {
@@ -321,21 +336,31 @@ mod tests {
         }
     }
 
-    fn title(session: &str, channel: &str, text: &str, score: f64) -> TitleHit {
+    /// A fixed clock: `Utc::now()` per fixture would make each later fixture
+    /// newer and turn arrival order upside down.
+    fn minutes_ago(minutes: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000, 0).unwrap_or_default()
+            - chrono::Duration::minutes(minutes)
+    }
+
+    fn title(session: &str, channel: &str, text: &str, active_minutes_ago: i64) -> TitleHit {
         TitleHit {
             session_id: SessionId::from(session),
             channel: ChannelType::from(channel),
             title: text.to_owned(),
-            score,
+            last_active: minutes_ago(active_minutes_ago),
+            score: -1.0,
         }
     }
 
+    /// Dated `ordinal` minutes ago, so ascending ordinals arrive newest first
+    /// as the store returns them.
     fn hit(session: &str, ordinal: i64, channel: &str, text: &str) -> SearchHit {
         SearchHit {
             session_id: SessionId::from(session),
             ordinal,
             channel: ChannelType::from(channel),
-            created_at: Utc::now(),
+            created_at: minutes_ago(ordinal),
             superseded_by: None,
             message: ChatMessage::user(vec![ContentBlock::Text(text.to_owned())]),
             score: -(ordinal as f64),
@@ -538,49 +563,61 @@ mod tests {
         );
         assert_eq!(results.groups[1].title, None);
     }
-    /// Title matches lead in title-score order; a session matching both is one
-    /// group carrying its message hits; message-only groups keep their order.
+    /// Conversations interleave by date across both windows: a message-only
+    /// one by its newest hit, a title-matched one by its last activity. A
+    /// session matching both is one group carrying its message hits.
     #[test]
-    fn title_matches_lead_and_a_session_matching_both_is_one_group() {
+    fn groups_are_newest_first_and_a_session_matching_both_is_one_group() {
         let hits = vec![
-            hit("a", 0, "owner", "检索 a"),
-            hit("both", 1, "owner", "检索 both"),
-            hit("b", 2, "owner", "检索 b"),
-            hit("both", 3, "owner", "检索 both again"),
+            hit("a", 1, "owner", "检索 a"),
+            hit("both", 3, "owner", "检索 both"),
+            hit("b", 5, "owner", "检索 b"),
+            hit("both", 9, "owner", "检索 both again"),
         ];
         let titles = vec![
-            title("both", "owner", "检索的标题", -3.0),
-            title("only-title", "telegram", "另一个检索", -1.0),
+            title("only-title", "telegram", "另一个检索", 4),
+            title("both", "owner", "检索的标题", 0),
         ];
         let (groups, matched) = group_hits(titles, hits, SearchLimits::default());
 
         let ids: Vec<&str> = groups.iter().map(|g| g.session_id.as_str()).collect();
-        assert_eq!(ids, ["both", "only-title", "a", "b"]);
+        assert_eq!(ids, ["both", "a", "only-title", "b"]);
         assert_eq!(matched, 4, "a session matching both counts once");
 
         let both = &groups[0];
         assert!(both.title_match);
         assert_eq!(both.title.as_deref(), Some("检索的标题"));
         assert_eq!(both.total_hits, 2, "message hits ride along");
-        assert_eq!(both.hits.len(), 2);
+        let ordinals: Vec<i64> = both.hits.iter().map(|h| h.ordinal).collect();
+        assert_eq!(ordinals, [3, 9], "hits stay newest first");
 
-        let only = &groups[1];
+        let only = &groups[2];
         assert!(only.title_match);
         assert!(only.hits.is_empty());
         assert_eq!(only.total_hits, 0, "a title match is not a message hit");
         assert_eq!(only.channel.as_str(), "telegram");
         assert_eq!(only.title.as_deref(), Some("另一个检索"));
 
-        assert!(!groups[2].title_match);
-        assert_eq!(groups[2].title, None);
+        assert!(!groups[1].title_match);
+        assert_eq!(groups[1].title, None);
+    }
+
+    /// A stale title match does not outrank a fresh message match: titles get
+    /// no tier of their own.
+    #[test]
+    fn an_old_title_match_sorts_below_a_newer_message_match() {
+        let (groups, _) = group_hits(
+            vec![title("old", "owner", "x", 60)],
+            vec![hit("fresh", 2, "owner", "x")],
+            SearchLimits::default(),
+        );
+        let ids: Vec<&str> = groups.iter().map(|g| g.session_id.as_str()).collect();
+        assert_eq!(ids, ["fresh", "old"]);
     }
 
     #[test]
     fn a_repeated_title_hit_does_not_duplicate_its_group() {
-        let titles = vec![
-            title("s", "owner", "t", -2.0),
-            title("s", "owner", "t", -1.0),
-        ];
+        let titles = vec![title("s", "owner", "t", 0), title("s", "owner", "t", 0)];
         let (groups, matched) = group_hits(titles, Vec::new(), SearchLimits::default());
         assert_eq!(groups.len(), 1);
         assert_eq!(matched, 1);
@@ -588,11 +625,8 @@ mod tests {
 
     #[test]
     fn the_session_cut_applies_to_the_merged_list() {
-        let hits = vec![hit("m1", 0, "owner", "x"), hit("m2", 0, "owner", "x")];
-        let titles = vec![
-            title("t1", "owner", "x", -2.0),
-            title("t2", "owner", "x", -1.0),
-        ];
+        let hits = vec![hit("m1", 1, "owner", "x"), hit("m2", 3, "owner", "x")];
+        let titles = vec![title("t1", "owner", "x", 0), title("t2", "owner", "x", 2)];
         let (groups, matched) = group_hits(
             titles,
             hits,
@@ -602,14 +636,14 @@ mod tests {
             },
         );
         let ids: Vec<&str> = groups.iter().map(|g| g.session_id.as_str()).collect();
-        assert_eq!(ids, ["t1", "t2", "m1"]);
+        assert_eq!(ids, ["t1", "m1", "t2"]);
         assert_eq!(matched, 4);
     }
 
     #[tokio::test]
     async fn a_full_title_window_truncates_and_scan_bounds_both_queries() {
         let titles: Vec<TitleHit> = (0..5)
-            .map(|i| title(&format!("t{i}"), "owner", "x", -(i as f64)))
+            .map(|i| title(&format!("t{i}"), "owner", "x", i))
             .collect();
         let (search, _, fake) = service_with_titles(Vec::new(), titles);
         let limits = SearchLimits {
@@ -632,8 +666,8 @@ mod tests {
     #[tokio::test]
     async fn a_title_match_needs_no_title_batch() {
         let (search, sessions, _) = service_with_titles(
-            vec![hit("m", 0, "owner", "x")],
-            vec![title("t", "owner", "Matched title", -1.0)],
+            vec![hit("m", 1, "owner", "x")],
+            vec![title("t", "owner", "Matched title", 0)],
         );
         sessions.fail_titles(true);
         let results = search

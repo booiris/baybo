@@ -778,11 +778,12 @@ pub enum SessionCmd {
         yes: bool,
     },
     /// Full-text search over session titles and transcript prose, grouped
-    /// by session (`docs/search.md`). Sessions whose title matches come
-    /// first, marked `[title match]`, then the rest by their best message
-    /// hit; a title-only match prints no hit lines. Reaches every channel
-    /// `session list` shows — bot channels and subagent runs included —
-    /// but, like the chat UI, skips hidden, archived and cron-workspace
+    /// by session, newest first (`docs/search.md`): sessions by their newest
+    /// match (a title match dates from the session's last activity), hits
+    /// inside a session newest first. Title matches are marked
+    /// `[title match]`; a title-only match prints no hit lines. Reaches
+    /// every channel `session list` shows — bot channels and subagent runs
+    /// included — but, like the chat UI, skips hidden, archived and cron-workspace
     /// sessions until asked (`--include-*` / `--all`). Words are AND-ed and
     /// matched literally: FTS5 operators are inert, Latin words of three or
     /// more letters are prefix-widened, Han text is substring-matched. Each

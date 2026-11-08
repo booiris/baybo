@@ -314,7 +314,8 @@ async fn limit_knobs_reach_the_search_and_the_output_says_what_was_cut() {
     );
 
     // A wide scan with a tight session cap: the cap, not the window, is
-    // what cut the list, and the header says so.
+    // what cut the list, and the header says so. Newest first, so the cap
+    // keeps the telegram session, whose one match was written last.
     let out = run_search(
         &fx.ctx,
         SessionSearchArgs {
@@ -327,15 +328,50 @@ async fn limit_knobs_reach_the_search_and_the_output_says_what_was_cut() {
     let data = out.data.clone().unwrap();
     assert_eq!(data["truncated"], false, "{data}");
     assert_eq!(data["sessions_matched"], 2);
-    assert_eq!(session_ids(&data), [fx.owner.as_str()], "{data}");
-    assert_eq!(data["groups"][0]["total_hits"], 3);
-    assert_eq!(data["groups"][0]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(session_ids(&data), [fx.telegram.as_str()], "{data}");
+    assert_eq!(data["groups"][0]["total_hits"], 1);
     assert!(
         out.human.contains("showing 1 of 2: raise -n"),
         "{}",
         out.human
     );
+
+    let out = run_search(
+        &fx.ctx,
+        SessionSearchArgs {
+            per_session: 1,
+            ..args(&[TERM])
+        },
+    )
+    .await;
+    let data = out.data.clone().unwrap();
+    assert_eq!(data["groups"][1]["session_id"], fx.owner.as_str(), "{data}");
+    assert_eq!(data["groups"][1]["total_hits"], 3);
+    assert_eq!(data["groups"][1]["hits"].as_array().unwrap().len(), 1);
     assert!(out.human.contains("… and 2 more"), "{}", out.human);
+}
+
+/// Newest first, at both levels: conversations by their newest match, and
+/// the hits inside one conversation newest first.
+#[tokio::test]
+async fn results_are_newest_first() {
+    let fx = seeded().await;
+    let data = search(&fx.ctx, args(&[TERM])).await;
+    assert_eq!(
+        session_ids(&data),
+        [fx.telegram.as_str(), fx.owner.as_str()],
+        "{data}"
+    );
+    let ordinals: Vec<i64> = data["groups"][1]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["ordinal"].as_i64().unwrap())
+        .collect();
+    let mut newest_first = ordinals.clone();
+    newest_first.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(ordinals, newest_first, "{data}");
+    assert!(ordinals.len() > 1, "{data}");
 }
 
 #[tokio::test]
@@ -456,7 +492,7 @@ async fn argv_light_boot_reports_the_missing_service() {
 }
 
 #[tokio::test]
-async fn titles_match_rank_first_and_keep_the_session_scope() {
+async fn titles_match_and_keep_the_session_scope() {
     let fx = seeded().await;
     fx.manager
         .set_title(&fx.telegram, Some("停机窗口 迁移计划"))

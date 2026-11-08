@@ -418,8 +418,11 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
         let include_cron_workspaces = scope.include_cron_workspaces;
         self.pool
             .interact("search.search_messages", move |conn| {
-                // `bm25` is ascending-better, so plain ORDER BY is best-first.
-                // The `session_messages` join rides its primary key.
+                // Newest first: results are chronological, so the window keeps
+                // the most recent matches. `bm25` is still computed and returned
+                // but orders nothing. Both `session_messages` joins ride its
+                // primary key, and `r.created_at` is a flat column, so ordering
+                // by it decodes no content.
                 //
                 // `channel` is a snapshot on the fts row because it is the one
                 // scope axis `sessions` does not carry as a flat column (it lives
@@ -435,8 +438,8 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // make it vanish silently if it ever did.
                 //
                 // ORDER BY / LIMIT live in the subquery so `session_messages` is
-                // reached only for the rows that survive. `ORDER BY` cannot early
-                // terminate — every match is scored before anything is dropped —
+                // decoded only for the rows that survive. `ORDER BY` cannot early
+                // terminate — every match is visited before anything is dropped —
                 // so the flat form joins and decodes the whole match set to
                 // return 50 rows: measured 1.4–1.7x slower, worst on the queries
                 // that match most (`的` hits 43% of the corpus). The scope
@@ -460,24 +463,23 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                     "SELECT f.session_id, f.ordinal, f.channel, m.role, m.content, m.source, \
                             m.platform_msg_id, m.created_at, m.superseded_by, f.score \
                      FROM ( \
-                         SELECT x.session_id, x.ordinal, x.channel, \
+                         SELECT x.session_id, x.ordinal, x.channel, r.created_at, \
                                 bm25(message_fts) AS score \
                          FROM message_fts x \
+                         JOIN session_messages r \
+                           ON r.session_id = x.session_id AND r.ordinal = x.ordinal \
                          LEFT JOIN sessions s ON s.id = x.session_id \
                          WHERE message_fts MATCH ?1 \
+                           AND r.compaction_inserted = 0 \
                            AND (?2 IS NULL OR x.channel = ?2) \
                            AND (?3 IS NULL OR x.session_id = ?3) \
                            {SESSION_FLAGS_PREDICATE} \
-                           AND EXISTS (SELECT 1 FROM session_messages r \
-                                        WHERE r.session_id = x.session_id \
-                                          AND r.ordinal = x.ordinal \
-                                          AND r.compaction_inserted = 0) \
-                         ORDER BY score \
+                         ORDER BY r.created_at DESC, x.session_id, x.ordinal DESC \
                          LIMIT ?7 \
                      ) f \
                      JOIN session_messages_read m \
                        ON m.session_id = f.session_id AND m.ordinal = f.ordinal \
-                     ORDER BY f.score",
+                     ORDER BY f.created_at DESC, f.session_id, f.ordinal DESC",
                 ))?;
                 let params = rusqlite::params![
                     expr,
@@ -560,7 +562,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // without its session has nothing to return. `s.channel` is the
                 // flat column `save` writes, so no `json_extract` and no snapshot.
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT x.session_id, COALESCE(s.channel, ''), s.title, \
+                    "SELECT x.session_id, COALESCE(s.channel, ''), s.title, s.last_active, \
                             bm25(session_title_fts) AS score \
                      FROM session_title_fts x \
                      JOIN sessions s ON s.id = x.session_id \
@@ -569,7 +571,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                        AND (?2 IS NULL OR s.channel = ?2) \
                        AND (?3 IS NULL OR x.session_id = ?3) \
                        {SESSION_FLAGS_PREDICATE} \
-                     ORDER BY score \
+                     ORDER BY s.last_active DESC, x.session_id \
                      LIMIT ?7",
                 ))?;
                 let params = rusqlite::params![
@@ -582,14 +584,28 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                     limit
                 ];
                 let rows = stmt.query_map(params, |row| {
-                    Ok(baybo_store::TitleHit {
-                        session_id: baybo_model::SessionId::from(row.get::<_, String>(0)?),
-                        channel: baybo_model::ChannelType(row.get(1)?),
-                        title: row.get(2)?,
-                        score: row.get(3)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ))
                 })?;
-                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                let mut hits = Vec::new();
+                for row in rows {
+                    let (sid, chan, title, last_active, score) = row?;
+                    hits.push(baybo_store::TitleHit {
+                        session_id: baybo_model::SessionId::from(sid),
+                        channel: baybo_model::ChannelType(chan),
+                        title,
+                        last_active: super::time::from_us(last_active).ok_or_else(|| {
+                            anyhow::anyhow!("sessions.last_active out of range: {last_active}")
+                        })?,
+                        score,
+                    });
+                }
+                Ok(hits)
             })
             .await
     }
@@ -1347,8 +1363,45 @@ mod tests {
         );
         assert!(
             hits.iter().any(|h| h.session_id == other),
-            "the lower-ranked conversation must not be displaced by compaction copies"
+            "the other conversation must not be displaced by compaction copies"
         );
+    }
+
+    /// Chronological, and the window is cut on time: with room for two, the
+    /// two newest matches come back, newest first, whichever scores best.
+    #[tokio::test]
+    async fn messages_arrive_newest_first_and_the_window_keeps_the_newest() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let sessions = super::super::SqliteSessionStore::new(pool.clone());
+        let a = SessionId::from("a".to_string());
+        let b = SessionId::from("b".to_string());
+        for (sid, text) in [
+            (&a, "迁移"),
+            (&b, "一句很长的话，迁移只是其中一个词而已"),
+            (&a, "又一次迁移，这句更长一些所以分数更低"),
+        ] {
+            sessions
+                .append_session_message(
+                    sid,
+                    &ChatMessage::user(vec![ContentBlock::Text(text.into())]),
+                )
+                .await
+                .unwrap();
+        }
+
+        let hits = SqliteMessageSearchStore::new(pool)
+            .search_messages("迁移", &SearchScope::default(), 2)
+            .await
+            .unwrap();
+        let got: Vec<(&str, i64)> = hits
+            .iter()
+            .map(|h| (h.session_id.as_str(), h.ordinal))
+            .collect();
+        assert_eq!(got, [("a", 1), ("b", 0)]);
+        assert!(hits[0].created_at >= hits[1].created_at);
     }
 
     /// The fingerprint is the whole staleness defence: change the segmenter and
@@ -1585,6 +1638,30 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    /// Titles arrive most recently active conversation first, not best first.
+    #[tokio::test]
+    async fn titles_arrive_most_recently_active_first() {
+        let (_dir, pool, sessions) = title_fixture().await;
+        let now = chrono::Utc::now();
+        for (id, title, minutes_ago) in [
+            ("stale", "迁移", 60),
+            ("fresh", "一个很长的标题，迁移只是其中之一", 1),
+        ] {
+            let mut s = titled_session(id, "owner", baybo_model::TriggerSource::User);
+            s.last_active = now - chrono::Duration::minutes(minutes_ago);
+            sessions.save(&s).await.unwrap();
+            sessions.set_title(&s.id, Some(title)).await.unwrap();
+        }
+
+        let hits = SqliteMessageSearchStore::new(pool)
+            .search_titles("迁移", &SearchScope::default(), 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.session_id.as_str()).collect();
+        assert_eq!(ids, ["fresh", "stale"]);
+        assert!(hits[0].last_active > hits[1].last_active);
     }
 
     /// A rename must replace the indexed title, not add to it: a session found

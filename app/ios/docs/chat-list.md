@@ -247,7 +247,7 @@ conversation two routes) and **not** by calling the bridge at the tap site (the
 queued JS would be lost if the `TranscriptHost` were rebuilt in between).
 
 **A title-matched card's title row opens like app/web's.** It is a button
-(`search.title.<sessionId>`) that lands on the best-scoring hit when the group
+(`search.title.<sessionId>`) that lands on the group's first (newest) hit when the group
 has one, and for a **title-only** group calls
 `openSearchResult(sessionId:ordinal: nil)` — no jump. That call REMOVES any
 `pendingJump` entry for the session instead of writing one: a title has no

@@ -2568,13 +2568,24 @@ async fn chat_search_groups_by_conversation_so_one_cannot_crowd_out_the_rest() {
 }
 
 /// A title is searchable on its own: a conversation whose transcript never
-/// says the word still comes back, flagged `title_match`, with no excerpts —
-/// and ahead of a conversation that matched only in its messages.
+/// says the word still comes back, flagged `title_match`, with no excerpts.
+/// Results are newest first, and the titled conversation was active last.
 #[tokio::test]
 async fn chat_search_matches_a_title_with_no_message_hits() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let prose = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &prose,
+            &ChatMessage::user(vec![ContentBlock::Text("迁移脚本跑完了".into())]),
+        )
+        .await
+        .expect("append");
 
     let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
     let titled = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
@@ -2593,17 +2604,6 @@ async fn chat_search_matches_a_title_with_no_message_hits() {
         StatusCode::NO_CONTENT,
     )
     .await;
-
-    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
-    let prose = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
-    tg.deps
-        .session_manager
-        .append_session_message(
-            &prose,
-            &ChatMessage::user(vec![ContentBlock::Text("迁移脚本跑完了".into())]),
-        )
-        .await
-        .expect("append");
 
     let res = get(
         &router,

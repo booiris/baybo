@@ -72,11 +72,11 @@ describe('groupOpenOrdinal', () => {
     total_hits: hits.length,
   });
 
-  it('lands on the best-scoring hit, which the server sends first', () => {
+  it('lands on the newest hit, which the server sends first', () => {
     expect(groupOpenOrdinal(group([hit(30, null), hit(4, null)], false))).toBe(30);
   });
 
-  it('follows compaction for the best hit too', () => {
+  it('follows compaction for the newest hit too', () => {
     expect(groupOpenOrdinal(group([hit(30, 52)], true))).toBe(52);
   });
 

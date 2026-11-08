@@ -268,7 +268,9 @@ FTS5 bare. Verified: `数据" OR "库` emits `"数 据 "" OR "" 库"` and matche
 operator escapes the quotes.
 
 Results `JOIN session_messages ON (session_id, ordinal)` for role / timestamp / prose, `LEFT JOIN
-sessions` for the live scope flags, ordered by `bm25(message_fts)` ascending. `LEFT`, not inner: a
+sessions` for the live scope flags, ordered **newest first** by `session_messages.created_at` (see
+[Order](#order)); `bm25(message_fts)` is still computed and returned as `score`, but orders nothing.
+`LEFT`, not inner: a
 message whose session row is missing must stay findable. Session rows are never deleted (see
 CLAUDE.md's "Session data is core data"), so it cannot happen — and an inner join would make it
 vanish silently if it ever did.
@@ -333,7 +335,7 @@ This is query-side: **it does not bump `SEGMENTER_FINGERPRINT` and triggers no r
 ### Callers
 
 Both callers go through `baybo_session::search::SessionSearch`, which owns the scan windows, the
-title-then-message merge, the grouping-by-session rule and the title batch, so neither surface
+title/message merge, the newest-first order, the grouping-by-session rule and the title batch, so neither surface
 re-implements them. Both surface `title_match` per group:
 
 - `GET /v1/chat/search` pins `channel = owner`, every flag false, and never exposes
@@ -414,17 +416,9 @@ a hidden conversation comes back through its name.
 ### Merging titles with messages
 
 `SessionSearch::search` runs both queries concurrently, each bounded by the same scan window, and
-merges them per session:
-
-1. **Title-matched sessions first**, in title-`bm25` order. A session whose title matches the query
-   is the strongest answer to "find the conversation about X": the title is a one-line summary of
-   the whole conversation, where a message hit is one sentence somewhere in it. And the two scores
-   are not comparable — `bm25` over a handful of title tokens and `bm25` over a paragraph live on
-   different scales — so interleaving by score would be arbitrary. Ranking titles as a tier is the
-   honest ordering.
-2. Each title-matched group **carries its message hits** from the message scan window, if any, so a
-   session matching both appears once.
-3. Then the **message-only groups** in their existing order (best hit first).
+merges them per session: a title-matched group **carries its message hits** from the message scan
+window, if any, so a session matching both appears once. Groups are then ordered newest first like
+everything else — see [Order](#order). Titles get no tier of their own.
 
 `hits` and `total_hits` stay **message-only**. A title-only group has `hits = []` and
 `total_hits = 0`, and says what matched through `title_match: true`. Counting the title as a hit
@@ -435,6 +429,28 @@ title-only result opens the conversation, it does not scroll anywhere.
 is set when **either** window fills. A title-matched group's `title` comes from its `TitleHit`, so
 the `session_titles` batch is fetched only for the message-only groups (and skipped when there are
 none).
+
+## Order
+
+**Results are chronological, newest first** — at both levels:
+
+- **Hits inside a conversation** are newest first, by `session_messages.created_at`.
+- **Conversations** are newest first by the time of their newest match. A message-only
+  conversation dates from its newest matching message. A title-matched one dates from its
+  `sessions.last_active`: the title names the whole conversation, so its match is as recent as the
+  conversation is. No message is newer than its conversation's last activity, so that one rule also
+  covers a conversation matched by both. Ties keep arrival order.
+
+**The scan window is cut on time, not score.** The message query orders by
+`created_at DESC, session_id, ordinal DESC` *inside* the windowed subquery, and the title query by
+`last_active DESC, session_id`, before `LIMIT`. Sorting the best-scoring 300 by date would not be
+chronological: a fresh match that scored 301st would silently vanish while older ones showed. So
+`truncated` now means "older matches exist past the window", and raising `--scan` reaches further
+back in time. Both sort keys are flat integer columns reached over primary keys, so ordering by them
+decodes no content.
+
+`bm25` scores are still returned (`SearchHit::score`, `TitleHit::score`, the CLI's JSON `score`) but
+order nothing. This is query-side only: **no fingerprint bump, no rebuild.**
 
 ## Why there is no dictionary
 
@@ -565,8 +581,10 @@ word-segmented index's, and it does not matter: size stays dead linear at 2.0× 
 because FTS5 delta-encodes the doclists as varints and a denser term is a smaller delta. This was the
 open risk in the whole design, and it is measured shut.
 
-**Query cost tracks the number of matches, not `LIMIT`.** `ORDER BY bm25(...)` cannot early
-terminate — every match is scored before anything is dropped. So a realistic query stays under 25 ms
+**Query cost tracks the number of matches, not `LIMIT`.** The `ORDER BY` cannot early
+terminate — every match is visited before anything is dropped. (These timings were measured when
+results were ordered by `bm25(...)`; the window is now cut on `created_at`, which visits the same
+match set.) So a realistic query stays under 25 ms
 even at 100×, while `的` (one of the most common characters in the language; it hits 43% of the
 corpus) reaches 216 ms. That is the shape of the ceiling: it is reached by queries that mean nothing,
 not by queries anyone types. `ORDER BY rank` was measured as the escape and is **slower**, not
