@@ -774,6 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn gemini_stream_keeps_thoughts_and_signatures_when_usage_lacks_a_total() {
+        use crate::providers::gemini::tests::issued_by;
         let events = [
             json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"hmm","thought":true}]}}],"usageMetadata":{}}),
             json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":" done","thought":true,"thoughtSignature":"sig1"}]}}],"usageMetadata":{}}),
@@ -815,10 +816,17 @@ mod tests {
             }
         }
         assert_eq!(reasoning, "hmm");
-        assert_eq!(block_signatures, vec!["sig1".to_string()]);
+        let issued: Vec<Option<&str>> = block_signatures
+            .iter()
+            .map(|s| issued_by(Some(s), "gemini-4-argon"))
+            .collect();
+        assert_eq!(issued, vec![Some("sig1")]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
-        assert_eq!(calls[0].signature.as_deref(), Some("sig2"));
+        assert_eq!(
+            issued_by(calls[0].signature.as_deref(), "gemini-4-argon"),
+            Some("sig2")
+        );
         let usage = usage.unwrap();
         assert_eq!((usage.input_tokens, usage.output_tokens), (120, 10));
     }
@@ -867,9 +875,9 @@ mod tests {
             ))
             .unwrap();
         let stream = client.chat_stream(&search_tools_request()).await.unwrap();
-        assert_distinct_portable_ids(&collect_calls(stream).await);
+        assert_distinct_portable_ids(&collect_calls(stream).await, "gemini-4-argon");
         let response = client.chat(&search_tools_request()).await.unwrap();
-        assert_distinct_portable_ids(&response.tool_calls);
+        assert_distinct_portable_ids(&response.tool_calls, "gemini-4-argon");
         collect_calls(client.chat_stream(&mixed_history_request()).await.unwrap()).await;
         captured.recv().await.unwrap();
         captured.recv().await.unwrap();
