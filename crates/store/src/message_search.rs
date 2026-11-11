@@ -1,4 +1,4 @@
-//! Full-text search over transcript prose. See `docs/search.md`.
+//! Full-text search over transcript prose and session titles. See `docs/search.md`.
 
 use async_trait::async_trait;
 use baybo_model::{ChannelType, ChatMessage, SessionId};
@@ -35,7 +35,25 @@ pub struct SearchHit {
     /// substring: a phrase of unigrams matches exactly the substring the user
     /// typed, so a client-side match agrees with what the index matched.
     pub message: ChatMessage,
-    /// FTS5 bm25 score. More negative is a better match; hits arrive sorted.
+    /// FTS5 bm25 score; more negative is a better match. Reported only: hits
+    /// arrive newest `created_at` first, not best score first.
+    pub score: f64,
+}
+
+/// One session whose title matches, resolved back to its `sessions` row.
+#[derive(Debug, Clone)]
+pub struct TitleHit {
+    pub session_id: SessionId,
+    /// Read live from the `sessions` row, not snapshotted: a title row carries
+    /// no scope of its own.
+    pub channel: ChannelType,
+    /// The original title, not the segmented index text — highlight it by
+    /// substring, exactly as a message hit's prose.
+    pub title: String,
+    /// The session's `last_active`. A title names the whole conversation, so
+    /// its match is as recent as the conversation; hits arrive newest first.
+    pub last_active: DateTime<Utc>,
+    /// FTS5 bm25 score; more negative is a better match. Reported only.
     pub score: f64,
 }
 
@@ -77,7 +95,7 @@ pub struct SearchScope {
     pub include_cron_workspaces: bool,
 }
 
-/// Read-only search over transcript prose.
+/// Read-only search over transcript prose and session titles.
 ///
 /// Implementors own the query dialect: callers pass the user's raw string and
 /// never build FTS5 syntax themselves — `-`, `*`, `^`, `:`, `NEAR` and `OR` all
@@ -85,8 +103,9 @@ pub struct SearchScope {
 /// an injection surface.
 #[async_trait]
 pub trait MessageSearchStore: Send + Sync {
-    /// Rows within `scope` whose prose matches `query`, best first, capped at
-    /// `limit`.
+    /// Rows within `scope` whose prose matches `query`, newest first, capped
+    /// at `limit` — so the window keeps the most recent matches, not the
+    /// best-scoring ones.
     ///
     /// A query with nothing indexable in it (punctuation only, or empty) yields
     /// an empty result rather than an error — it is a user typing, not a bug.
@@ -96,4 +115,15 @@ pub trait MessageSearchStore: Send + Sync {
         scope: &SearchScope,
         limit: u32,
     ) -> Result<Vec<SearchHit>>;
+
+    /// Sessions within `scope` whose title matches `query`, most recently
+    /// active first, capped at `limit`. Same query dialect and the same `scope` semantics as
+    /// [`search_messages`](Self::search_messages), so a title can never reach
+    /// a session a message hit could not.
+    async fn search_titles(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        limit: u32,
+    ) -> Result<Vec<TitleHit>>;
 }

@@ -69,7 +69,7 @@ Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *impl
 
 ```
 sqlite/session.rs         → impl SessionStore                         (trait + ActiveMessageRow / StoredMessage from baybo-store)
-sqlite/search.rs          → impl MessageSearchStore                   (trait + SearchHit / SearchScope from baybo-store; also owns the message_fts DDL)
+sqlite/search.rs          → impl MessageSearchStore                   (trait + SearchHit / TitleHit / SearchScope from baybo-store; also owns the message_fts + session_title_fts DDL)
 sqlite/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
 sqlite/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
 sqlite/turn.rs            → impl TurnStore                            (trait from baybo-store; rows ↔ Turn via baybo-turn)
@@ -88,7 +88,7 @@ sqlite/project.rs         → impl ProjectStore                         (trait +
 sqlite/deck.rs            → impl DeckCardStore                        (trait + DeckCardRow / DeckSnapshotRow / DeckLayoutEntry / DeckSize from baybo-store; deck_cards + latest-N-pruned deck_snapshots)
 ```
 
-Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one. One table is deliberately outside it: the FTS5 index `message_fts` is owned by `sqlite/search.rs`, which drops and recreates it from `search::rebuild_if_stale` whenever the segmenter fingerprint changes, because `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table that already exists. It is therefore the one table whose DDL is not `IF NOT EXISTS` and not in `mod.rs`; only its fingerprint row's table, `search_meta`, is (see [`search.md`](../search.md)).
+Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one. Two tables are deliberately outside it: the FTS5 indexes `message_fts` and `session_title_fts` are owned by `sqlite/search.rs`, which drops and recreates both from `search::rebuild_if_stale` whenever the segmenter fingerprint changes, because `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table that already exists. They are therefore the only tables whose DDL is not `IF NOT EXISTS` and not in `mod.rs` (`session_title_fts` is written by `set_title` / `set_title_if_absent` in the same transaction as the `sessions.title` update); only their fingerprint row's table, `search_meta`, is (see [`search.md`](../search.md)).
 
 `Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` trait and its row types live in `baybo-store`; current active rows use the narrow `ActiveMessageRow { ordinal, message }`, while historical trace reads use `StoredMessage` with supersede and timestamp metadata. `baybo-storage` implements the trait and `baybo-session` calls it.
 

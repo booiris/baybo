@@ -783,7 +783,7 @@ GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregat
 
 POST   /v1/chat/sessions                create an owner chat session
 GET    /v1/chat/sessions                ?include_hidden=&include_cron=  newest-first list
-GET    /v1/chat/search                  full-text search across transcript prose, best match first
+GET    /v1/chat/search                  full-text search across titles + transcript prose; newest first
 GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice (+ last_llm pin); backward paging (backfill)
 GET    /v1/chat/sessions/:id/sync       ?since_ordinal=&limit=  the one forward-recovery pull (difference after cursor, or newest-page baseline / rebase)
 GET    /v1/chat/sessions/:id/messages   ?platform_msg_id=  per-send durability point lookup for the client outbox

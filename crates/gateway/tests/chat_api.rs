@@ -2567,6 +2567,70 @@ async fn chat_search_groups_by_conversation_so_one_cannot_crowd_out_the_rest() {
     );
 }
 
+/// A title is searchable on its own: a conversation whose transcript never
+/// says the word still comes back, flagged `title_match`, with no excerpts.
+/// Results are newest first, and the titled conversation was active last.
+#[tokio::test]
+async fn chat_search_matches_a_title_with_no_message_hits() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let prose = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &prose,
+            &ChatMessage::user(vec![ContentBlock::Text("迁移脚本跑完了".into())]),
+        )
+        .await
+        .expect("append");
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let titled = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &titled,
+            &ChatMessage::user(vec![ContentBlock::Text("随便聊聊".into())]),
+        )
+        .await
+        .expect("append");
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{}/title", titled.as_str()),
+        Body::from(json!({ "title": "数据库迁移方案" }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let res = get(
+        &router,
+        "/v1/chat/search?q=%E8%BF%81%E7%A7%BB",
+        StatusCode::OK,
+    )
+    .await;
+    let groups = res["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2);
+
+    let first = &groups[0];
+    assert_eq!(first["session_id"].as_str(), Some(titled.as_str()));
+    assert_eq!(first["title_match"].as_bool(), Some(true));
+    assert_eq!(first["session_title"].as_str(), Some("数据库迁移方案"));
+    assert!(first["hits"].as_array().expect("hits").is_empty());
+    assert_eq!(first["total_hits"].as_u64(), Some(0));
+
+    let second = &groups[1];
+    assert_eq!(second["session_id"].as_str(), Some(prose.as_str()));
+    assert_eq!(
+        second["title_match"].as_bool(),
+        Some(false),
+        "always serialized, not omitted when false"
+    );
+    assert_eq!(second["total_hits"].as_u64(), Some(1));
+}
+
 /// "Find it in *this* chat" — and the filter composes with the others.
 #[tokio::test]
 async fn chat_search_scopes_to_one_session() {

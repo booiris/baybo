@@ -24,6 +24,32 @@ export function jumpOrdinal(hit: components['schemas']['ChatSearchHit']): number
 }
 
 /**
+ * Where the card's title row opens: the group's first (newest) hit, or `null` for a
+ * group the server returned on its title alone. A title-only group has no
+ * message hits, so there is no row to land on — opening it is a plain open,
+ * not a jump to ordinal 0 (the conversation's first row, which the title
+ * matched no more than any other).
+ */
+export function groupOpenOrdinal(
+  group: components['schemas']['ChatSearchGroup'],
+): number | null {
+  const newest = group.hits.at(0);
+  return newest === undefined ? null : jumpOrdinal(newest);
+}
+
+/**
+ * The URL a search result opens. `m` is the row to land on and `q` the terms
+ * to light up once there — both on the URL so a jump survives a reload and can
+ * be shared. With no ordinal there is nothing to land on or paint, so neither
+ * is set and the conversation opens on its newest page like any other open.
+ */
+export function searchOpenHref(sessionId: string, ordinal: number | null, query: string): string {
+  const base = `/chat/${sessionId}`;
+  if (ordinal === null) return base;
+  return `${base}?m=${ordinal}&q=${encodeURIComponent(query.trim())}`;
+}
+
+/**
  * The rendered row that holds `target`.
  *
  * Not `getElementById('…m<target>')`: a searchable message is not always a row.
