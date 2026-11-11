@@ -201,11 +201,27 @@ gw → phone   Head { status: 200|206, Content-Length, Content-Type }
 gw → phone   Body { offset, data(≤60 KiB), last } | Error { status, reason }
 
 phone → gw   Head { method: "POST", path: "/v1/blobs",
-                    Content-Type, Content-Length, x-baybo-content-sha256 }
+                    Content-Type, Content-Length, x-baybo-content-sha256,
+                    report_progress: true }
 phone → gw   Body { offset, data(≤60 KiB), last }
+gw → phone   Progress { received }      (at once, every 200 ms, and at the full length)
 gw → phone   Head { status: 201, Content-Type: application/json }
 gw → phone   Body { data: {"blob_id": "..."} }
 ```
+
+**Upload progress is the gateway's count, not the phone's.** The phone can only
+see bytes its socket accepted, and over the relay most of a file is still queued
+in the phone's send buffer and behind the relay's throttle at that point. A file
+upload therefore sets `report_progress` on its head, and the gateway answers with
+`Progress { received }`. `received` counts bytes handed to the blob store's body
+channel (`stream_forward_body`). The opt-in is a typed head field for the reasons
+`TunnelReuse` is one (see [`relay-api-tunnel.md`](relay-api-tunnel.md)). An old
+gateway skips the unknown key and sends nothing, and the phone falls back to
+counting its own reads. An old phone never sets it, so it never receives the frame
+type it cannot decode. The phone reads the frames between chunk sends
+(`LegIo::drain_ready_progress`, which never waits) and while it waits for the
+answer (`expect_upload_response_head`). The direct HTTP leg has no channel back
+mid-request and keeps the local count.
 
 60 KiB chunks seal to ~one Noise message with MessagePack + Noise overhead, comfortably
 under the relay's 128 KiB frame cap (`serve.rs:69`).

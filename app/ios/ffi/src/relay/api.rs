@@ -286,6 +286,7 @@ async fn run_exchange<F: TunnelFrames>(
         path: path.into(),
         headers,
         body_len,
+        report_progress: false,
     };
     leg.send(&head).await.map_err(|e| (e, None))?;
     if let Some(body) = body {
