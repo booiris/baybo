@@ -1,6 +1,7 @@
 # Cutting a release
 
-A release is a git tag, a GitHub Release, two Linux binaries, and `install.sh`.
+A release is a git tag, a GitHub Release, two Linux binaries, one macOS binary,
+and `install.sh`.
 It is **not** a crates.io publish (blocked — every internal dep is a bare
 `{ path = … }` with no version, and `crates/gateway` path-depends across the
 workspace boundary into the excluded `remote-host/` tree, so `cargo package`
@@ -58,7 +59,7 @@ Tick `dry_run` first if you want to prove the build before publishing anything;
 a dry run does everything except create the release.
 
 That is the whole ritual. The workflow reads the version out of `Cargo.toml`,
-refuses if that tag already exists, builds both targets, smoke-tests each
+refuses if that tag already exists, builds all three targets, smoke-tests each
 artifact, publishes, and then installs the published release in three distro
 containers to prove `install.sh` still agrees with the asset names.
 
@@ -73,6 +74,50 @@ deletes the release and its tag outright, on the grounds that a live release
 `install.sh` cannot consume is worse than no release. Either way the gate will
 accept the same version again. Use **Re-run failed jobs** rather than *Re-run
 all jobs* when you can — both work, but the former skips a 25-minute rebuild.
+
+## Rules earlier releases paid for
+
+**Never create a version tag by hand.** The workflow creates the tag last, after
+every build job is green, so a build that dies at minute 40 leaves nothing
+behind and a re-run just works. Tagging by hand inverts that and then blocks the
+release outright: the gate does
+`git ls-remote --exit-code --tags origin refs/tags/$tag` and hard-errors with
+*"already exists. Bump [workspace.package] version in Cargo.toml first"*, so a
+hand-pushed `vX.Y.Z` is precisely the thing that stops `vX.Y.Z` from ever being
+published.
+
+**The bump commit carries all three generated files.** 0.1.1 shipped without the
+`app/ios` lockfile and the regenerated spec, and both landed on master:
+`docs/openapi.json` still said `0.1.0`, and `app/ios/Cargo.lock` still pinned the
+old crate versions, where `--locked` refuses to update it. They fail on the NEXT
+PR that touches those paths rather than on the release PR, which is what makes
+this worth a checklist rather than a habit:
+
+- `openapi_json_is_in_sync` DID fail on the release PR (#314's `cargo test` is
+  red in the record) and it was merged anyway. A red gating check on a release PR
+  is the signal, not noise.
+- `ios-core` could not have caught its half at all: it is path-filtered on
+  `IOS_DEPS`, which a commit touching only `CLAUDE.md` / `Cargo.toml` /
+  `Cargo.lock` never matches, so the job never ran.
+
+**The dispatch is the owner's call**, like marking a PR ready — it is what
+publishes binaries under their name.
+
+**The trigger is dispatch-only on purpose.** `push: branches: [master]` was the
+obvious alternative and is worse: master takes ~10 pushes a day, so an
+unfiltered version gate would add ~3,600 no-op runs a year to buy one avoided
+button click per release. Dispatch also takes a ref for free, so a failed
+release re-cuts from the same commit without a new PR.
+
+**`install.sh` installs release ASSETS, not tags.** It fetches
+`releases/download/<tag>/baybo-<target>.tar.gz` plus `SHA256SUMS`, defaulting to
+`releases/latest`. A tag with no release attached is invisible to
+`curl -fsSL …/install.sh | sh` — that command will happily reinstall the
+previous version and report success.
+
+**Installing does not restart anything.** A running gateway keeps serving the
+old code until `baybo gateway restart` (under the service manager, restart the
+unit). The installer says so and then exits; nobody else will.
 
 ## What the workflow does, and the three traps it is shaped around
 
