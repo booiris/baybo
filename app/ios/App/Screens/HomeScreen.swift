@@ -122,15 +122,19 @@ struct HomeTabView: View {
         case .settings:
             section { SettingsScreen() }
         case .deck:
-            section { DeckScreen() }
+            // No `section` wrapper: Deck draws the shared header itself, because
+            // its corner controls follow `DeckStore` state the shell can't see.
+            DeckScreen()
+                .background(Theme.paper)
         case .projects:
-            section(
-                action: {
+            section {
+                ProjectsScreen(store: store.projectsStore)
+            } trailing: {
+                HeaderCircleButton(systemImage: "plus", label: lang.t("projects.new")) {
                     Haptics.tap()
                     store.openNewProject()
-                }, icon: "plus", labelKey: "projects.new"
-            ) {
-                ProjectsScreen(store: store.projectsStore)
+                }
+                .accessibilityIdentifier("header-action")
             }
         case .search:
             // No `section` wrapper: this screen's field IS its header, and the
@@ -176,13 +180,13 @@ struct HomeTabView: View {
     }
 
     /// Non-chat sections: content under the shared wordmark header.
-    private func section<Content: View>(
-        action: (() -> Void)? = nil, icon: String = "plus", labelKey: String = "",
-        @ViewBuilder _ content: () -> Content
+    private func section<Content: View, Trailing: View>(
+        @ViewBuilder _ content: () -> Content,
+        @ViewBuilder trailing: () -> Trailing = { EmptyView() }
     ) -> some View {
         ZStack(alignment: .top) {
             content()
-            HomeHeaderView(onAction: action, actionIcon: icon, actionLabelKey: labelKey)
+            HomeHeaderView(trailing: trailing)
         }
         .background(Theme.paper)
     }
@@ -236,27 +240,25 @@ extension AppStore.HomeTab {
     }
 }
 
-/// The shared paper-veil header: the centered wordmark, optionally flanked by a
-/// glass compose circle on the trailing edge and a glass ☰ menu circle on the
-/// leading edge (both Chats only). Reuses the chat header's veil so the
-/// screens' fades can't drift apart. A transient compose-failure line hangs
-/// under it.
-struct HomeHeaderView: View {
+/// The shared paper-veil header: the centered wordmark between a LEADING and a
+/// TRAILING control slot. Every home tab hands its corner controls to these
+/// slots instead of overlaying its own, so one inset places them all and the
+/// corners can't drift from tab to tab; on a side rail the same slots stack in
+/// the column instead. Reuses the chat header's veil so the screens' fades
+/// can't drift apart either. A transient compose-failure line hangs under it.
+struct HomeHeaderView<Leading: View, Trailing: View>: View {
     var notice: String? = nil
-    var onAction: (() -> Void)? = nil
-    var actionIcon: String = "square.and.pencil"
-    var actionLabelKey: String = "list.newChat"
-    /// Chats only: the ☰ menu's entries — push the archived list, and the live
-    /// scheduled jobs. The menu renders iff `onArchived` is set; both entries
-    /// belong to the same Chats-only surface.
-    var onArchived: (() -> Void)? = nil
-    var onCronJobs: (() -> Void)? = nil
     /// Chats only: pull-to-refresh feedback rendered BESIDE the wordmark (as an
     /// overlay, so it never shifts it). Shown only while the refresh runs — after
     /// the pull rebounds — never during the drag.
     var isRefreshing: Bool = false
+    @ViewBuilder var leading: Leading
+    @ViewBuilder var trailing: Trailing
 
-    private static let barHeight: CGFloat = 46
+    private static var barHeight: CGFloat { 46 }
+    /// Matches `ChatHeaderView`'s inset, so a corner control sits in the same
+    /// column whether the tab shell or a pushed chat is frontmost.
+    private static var edgeInset: CGFloat { 24 }
     @Environment(\.sideRail) private var rail
 
     var body: some View {
@@ -274,14 +276,14 @@ struct HomeHeaderView: View {
                     }
 
                 if rail == nil {
-                    HStack {
-                        menuButton
-                        Spacer()
-                        actionButton
+                    HStack(spacing: 0) {
+                        leading
+                        Spacer(minLength: 0)
+                        trailing
                     }
                 }
             }
-            .padding(.horizontal, 24)
+            .padding(.horizontal, Self.edgeInset)
             .frame(height: Self.barHeight)
 
             if let notice {
@@ -289,59 +291,66 @@ struct HomeHeaderView: View {
                     .font(Theme.mono(12))
                     .foregroundStyle(Theme.err)
                     .multilineTextAlignment(.center)
-                    .padding(.horizontal, 24)
+                    .padding(.horizontal, Self.edgeInset)
             }
         }
         .frame(maxWidth: .infinity)
         .sideRailItems(rail) {
-            menuButton
-            actionButton
+            leading
+            trailing
         }
         .background(alignment: .top) { veil }
     }
 
-    @ViewBuilder private var menuButton: some View {
-        if let onArchived {
-            Menu {
-                Button(action: onArchived) {
-                    Label(
-                        Lang.shared.t("list.menuArchived"),
-                        systemImage: "archivebox")
-                }
-                if let onCronJobs {
-                    Button(action: onCronJobs) {
-                        Label(
-                            Lang.shared.t("list.menuCronJobs"),
-                            systemImage: "alarm")
-                    }
-                }
-            } label: {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Theme.ink)
-                    .frame(width: 45, height: 45)
-            }
-            .glassSurface(interactive: true, in: .circle)
-            .accessibilityLabel(Text(verbatim: Lang.shared.t("list.menu")))
-        }
-    }
-
-    @ViewBuilder private var actionButton: some View {
-        if let onAction {
-            Button(action: onAction) {
-                Image(systemName: actionIcon)
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Theme.ink)
-                    .frame(width: 45, height: 45)
-            }
-            .glassSurface(interactive: true, in: .circle)
-            .accessibilityIdentifier("header-action")
-            .accessibilityLabel(Text(verbatim: Lang.shared.t(actionLabelKey)))
-        }
-    }
-
     private var veil: some View {
         HeaderVeil()
+    }
+}
+
+extension HomeHeaderView where Leading == EmptyView {
+    init(@ViewBuilder trailing: () -> Trailing) {
+        self.init(leading: { EmptyView() }, trailing: trailing)
+    }
+}
+
+/// A home header corner control: one glass circle around a line-weight glyph.
+struct HeaderCircleButton: View {
+    let systemImage: String
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HeaderGlyph(systemImage: systemImage)
+        }
+        .glassSurface(interactive: true, in: .circle)
+        .accessibilityLabel(Text(verbatim: label))
+    }
+}
+
+/// The ☰ glass circle a home tab hangs its secondary surfaces off.
+struct HeaderMenu<Entries: View>: View {
+    @ViewBuilder var entries: Entries
+
+    var body: some View {
+        Menu {
+            entries
+        } label: {
+            HeaderGlyph(systemImage: "line.3.horizontal")
+        }
+        .glassSurface(interactive: true, in: .circle)
+        .accessibilityLabel(Text(verbatim: Lang.shared.t("list.menu")))
+    }
+}
+
+private struct HeaderGlyph: View {
+    let systemImage: String
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 16, weight: .medium))
+            .foregroundStyle(Theme.ink)
+            .frame(width: SideRail.extent, height: SideRail.extent)
     }
 }
 

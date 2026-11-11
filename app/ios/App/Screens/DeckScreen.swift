@@ -17,7 +17,6 @@ struct DeckScreen: View {
 }
 
 private struct DeckContent: View {
-    @Environment(\.sideRail) private var rail
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject var deck: DeckStore
     let host: DeckHost
@@ -143,42 +142,19 @@ private struct DeckContent: View {
     }
 
     private var header: some View {
-        HomeHeaderView()
-            .overlay(alignment: .leading) {
-                if rail == nil {
-                    menu.padding(.leading, 20)
+        HomeHeaderView {
+            // The Chats header's ☰ grammar: menu entries for the section's
+            // secondary surfaces. Deck has one — the recycle bin.
+            HeaderMenu {
+                Button {
+                    appStore.openDeckRecycle()
+                } label: {
+                    Label(lang.t("deck.menuRecycle"), systemImage: "arrow.uturn.backward")
                 }
             }
-            .overlay(alignment: .trailing) {
-                if rail == nil {
-                    trailingControl.padding(.trailing, 20)
-                }
-            }
-            .sideRailItems(rail) {
-                menu
-                trailingControl
-            }
-    }
-
-    /// The Chats header's ☰ grammar: one glass circle, menu entries for the
-    /// section's secondary surfaces. Deck has one — the recycle bin.
-    private var menu: some View {
-        Menu {
-            Button {
-                appStore.openDeckRecycle()
-            } label: {
-                Label(
-                    lang.t("deck.menuRecycle"),
-                    systemImage: "arrow.uturn.backward")
-            }
-        } label: {
-            Image(systemName: "line.3.horizontal")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(Theme.ink)
-                .frame(width: 45, height: 45)
+        } trailing: {
+            trailingControl
         }
-        .glassSurface(interactive: true, in: .circle)
-        .accessibilityLabel(Text(verbatim: lang.t("list.menu")))
     }
 
     /// The header's top-right control. While a card is maximized it is the ✕
@@ -187,28 +163,17 @@ private struct DeckContent: View {
     /// in and out of edit mode (reorder/resize/remove), no long-press entry.
     @ViewBuilder private var trailingControl: some View {
         if deck.maximized {
-            Button {
+            HeaderCircleButton(systemImage: "xmark", label: lang.t("deck.editDone")) {
                 deck.requestRestore()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(Theme.ink)
-                    .frame(width: 45, height: 45)
             }
-            .glassSurface(interactive: true, in: .circle)
-            .accessibilityLabel(Text(verbatim: lang.t("deck.editDone")))
             .transition(.opacity)
         } else if !deck.isEmpty {
-            Button {
+            HeaderCircleButton(
+                systemImage: deck.editMode ? "checkmark" : "pencil",
+                label: lang.t(deck.editMode ? "deck.editDone" : "deck.edit")
+            ) {
                 deck.setEditMode(!deck.editMode)
-            } label: {
-                Image(systemName: deck.editMode ? "checkmark" : "pencil")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Theme.ink)
-                    .frame(width: 45, height: 45)
             }
-            .glassSurface(interactive: true, in: .circle)
-            .accessibilityLabel(Text(verbatim: lang.t(deck.editMode ? "deck.editDone" : "deck.edit")))
             .transition(.opacity)
         }
     }
