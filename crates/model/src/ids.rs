@@ -300,6 +300,127 @@ impl fmt::Display for ParallelGroup {
     }
 }
 
+/// Declare a `String`-backed newtype that serializes as its bare string, with
+/// the read-only surface every such id shares. How a value is *built* differs
+/// per type and stays with the type.
+macro_rules! string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_inner(self) -> String {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        // Sound: the derived `Hash` / `Eq` see only the inner `String`, which
+        // hash and compare exactly as its `str` does.
+        impl std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+    };
+}
+
+string_newtype! {
+    /// The id of one background job (`bg-…`): what the model is told, what
+    /// `JobList` / `JobStop` take, what names a detached command's output
+    /// files, and what its completion notification carries.
+    BackgroundHandle
+}
+
+impl BackgroundHandle {
+    /// Mint a fresh handle. A tool mints one before its work starts, so it can
+    /// name things (output files, child sessions) after it.
+    pub fn new() -> Self {
+        Self(format!(
+            "{}{}",
+            crate::spawn_protocol::BACKGROUND_SUBAGENT_HANDLE_PREFIX,
+            uuid::Uuid::new_v4()
+        ))
+    }
+}
+
+impl Default for BackgroundHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A handle that came back from outside — the model's `JobStop` argument, a
+/// persisted row, a test fixture.
+impl From<String> for BackgroundHandle {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for BackgroundHandle {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+string_newtype! {
+    /// The name a call's `group` option gave its barrier cohort, as the model
+    /// wrote it (trimmed, never blank). Meaningful only within the turn that
+    /// sent it; [`CohortKey`] is the turn-scoped key the runtime routes by.
+    BackgroundGroupName
+}
+
+impl BackgroundGroupName {
+    /// The name in `raw`, trimmed; `None` when nothing is left.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| Self(trimmed.to_owned()))
+    }
+}
+
+string_newtype! {
+    /// The key of one barrier cohort: a group name scoped to the turn that
+    /// used it, so reusing a name in a later turn starts a fresh cohort instead
+    /// of extending a finished one. Built only by [`CohortKey::new`].
+    CohortKey
+}
+
+impl CohortKey {
+    pub fn new(turn_id: TurnId, group: &BackgroundGroupName) -> Self {
+        Self(format!("{turn_id}::{group}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

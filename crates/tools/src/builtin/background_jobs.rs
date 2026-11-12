@@ -3,8 +3,7 @@
 //! Backed by [`crate::BackgroundJobControl`]; where no manager is wired the
 //! tools simply report nothing in flight. Observing existing jobs is not
 //! creating work, so neither tool consults
-//! [`crate::ToolContext::background_eligible`] — a scheduled job's own run
-//! can still see and stop what a reply in the same conversation started.
+//! [`crate::ToolContext::background_eligible`].
 
 use async_trait::async_trait;
 use baybo_workspace::WorkspacePaths;

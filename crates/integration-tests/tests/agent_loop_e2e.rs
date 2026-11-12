@@ -33,12 +33,12 @@ use baybo_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, To
 use baybo_memory::test_support::RecordingMemory;
 use baybo_memory::{Memory, RecalledMemory};
 use baybo_model::{
-    BACKGROUND_DISPATCH_ACK_PREFIX, BlobRef, ContentBlock, MessageMetadata, MicroUsd,
-    PendingBackgroundResult, Role, SHA256_PREFIX, SPAWN_SUBAGENT_TOOL_NAME, SessionId,
-    SubagentExitStatus, ThinkingContent, TriggerSource,
+    BlobRef, ContentBlock, MessageMetadata, MicroUsd, PendingBackgroundResult, Role, SHA256_PREFIX,
+    SessionId, SubagentExitStatus, ThinkingContent, TriggerSource,
 };
+use baybo_tools::background::{BackgroundJobSink, DetachedJob};
 use baybo_tools::test_support::RecordingTool;
-use baybo_tools::{BackgroundJobSink, DetachedCommand, RunningChild, Tool, ToolOutput};
+use baybo_tools::{Tool, ToolOutput};
 use chrono::Utc;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -48,30 +48,6 @@ const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 /// Generous enough to absorb scheduler jitter on a loaded CI host while
 /// still keeping a hung test from blocking the suite for long.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-
-struct LongRunningChild {
-    killed: CancellationToken,
-}
-
-#[async_trait::async_trait]
-impl RunningChild for LongRunningChild {
-    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
-        None
-    }
-
-    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
-        None
-    }
-
-    async fn wait(&mut self) -> i32 {
-        self.killed.cancelled().await;
-        -1
-    }
-
-    fn start_kill(&mut self) {
-        self.killed.cancel();
-    }
-}
 
 #[tokio::test(start_paused = true)]
 async fn transcript_append_failure_stops_before_the_llm_call() {
@@ -1782,34 +1758,47 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
         "supervisor slot is initialized once"
     );
     let shutdown = CancellationToken::new();
-    let temp = tempfile::tempdir().expect("temporary background directory");
-    let stdout_path = temp.path().join("long-running.out");
-    let stderr_path = temp.path().join("long-running.err");
-    tokio::fs::write(&stdout_path, b"partial output")
-        .await
-        .expect("seed stdout");
-    tokio::fs::write(&stderr_path, b"partial error")
-        .await
-        .expect("seed stderr");
     let killed = CancellationToken::new();
-    let manager = BackgroundJobManager::new(supervisor_slot, shutdown.clone());
+    let manager = BackgroundJobManager::new(
+        supervisor_slot,
+        Arc::clone(&harness.session_manager),
+        shutdown.clone(),
+    );
 
-    let handle = manager
-        .detach_command(DetachedCommand {
-            handle_id: "bg-shutdown-test".into(),
-            session_id: session_id.clone(),
-            command: "python -m http.server 8877".into(),
-            child: Box::new(LongRunningChild {
-                killed: killed.clone(),
-            }),
-            copy_tasks: Vec::new(),
-            stdout_path: stdout_path.clone(),
-            stderr_path: stderr_path.clone(),
+    // A job that only ends when cancelled, like a long-running server.
+    let cancel = CancellationToken::new();
+    let result = {
+        let cancel = cancel.clone();
+        let killed = killed.clone();
+        async move {
+            cancel.cancelled().await;
+            killed.cancel();
+            PendingBackgroundResult::command(
+                "bg-shutdown-test",
+                "python -m http.server 8877",
+                -1,
+                "/dev/null",
+                "",
+                SubagentExitStatus::Failed {
+                    reason: "killed".into(),
+                },
+            )
+        }
+    };
+    manager
+        .adopt(DetachedJob {
+            handle: "bg-shutdown-test".into(),
+            parent: session_id.clone(),
+            kind: "command".into(),
+            summary: "python -m http.server 8877".into(),
+            session: None,
+            cohort: None,
+            cancel,
+            result: Box::pin(result),
         })
         .await;
-    assert_eq!(handle, "bg-shutdown-test");
     assert!(
-        supervisor.has_in_flight_background_subagents(&session_id),
+        supervisor.has_in_flight_background_jobs(&session_id),
         "long-running command is tracked before shutdown"
     );
 
@@ -1818,7 +1807,7 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
         .await
         .expect("shutdown kills the child");
     tokio::time::timeout(DRAIN_TIMEOUT, async {
-        while supervisor.has_in_flight_background_subagents(&session_id) {
+        while supervisor.has_in_flight_background_jobs(&session_id) {
             tokio::task::yield_now().await;
         }
     })
@@ -1862,10 +1851,6 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
             .active_delivery
             .is_none(),
         "shutdown must not open a delivery ledger"
-    );
-    assert!(
-        stdout_path.exists() && stderr_path.exists(),
-        "shutdown preserves partial command output for inspection"
     );
 
     harness.shutdown().await;
@@ -4796,18 +4781,16 @@ async fn task_tools_persist_and_emit_checklist_to_the_channel() {
 /// cohort fill → single drained notification.
 #[tokio::test(start_paused = true)]
 async fn grouped_subagents_deliver_one_merged_notification() {
-    // Stand-in `spawn_subagent` tool: returns the background-dispatch ack so
-    // the agent loop's grouped-member counter fires (it keys on the tool name
-    // + the ack prefix). The real spawn tool's internals are covered by its
-    // own unit tests; this exercises the barrier path.
-    let spawn = Arc::new(RecordingTool::new(SPAWN_SUBAGENT_TOOL_NAME));
-    spawn.set_response(ToolOutput::Text(format!(
-        "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: bg-stub"
-    )));
-    let manifest = spawn.manifest();
+    // A tool that composes the background capability and nothing else: the
+    // grouped-member counting, cohort keying and barrier below must work for
+    // any such tool, not only `spawn_subagent`.
+    let sink = Arc::new(HoldingSink::default());
+    let probe = Arc::new(FanOutProbe);
+    let manifest = probe.manifest();
 
     let mut harness = AgentTestHarness::builder()
-        .with_tool(spawn.clone() as Arc<dyn Tool>, manifest)
+        .with_tool(probe as Arc<dyn Tool>, manifest)
+        .with_background_jobs(Arc::clone(&sink) as Arc<dyn BackgroundJobSink>)
         .build();
 
     // Turn 1: two grouped spawns in one iteration (same `group: "g"`), then a
@@ -4816,13 +4799,8 @@ async fn grouped_subagents_deliver_one_merged_notification() {
     let grouped_call = |id: &str, label: &str| {
         StreamEvent::ToolCall(ToolCallInfo {
             id: id.into(),
-            name: SPAWN_SUBAGENT_TOOL_NAME.into(),
-            arguments: json!({
-                "subagent_type": "general-purpose",
-                "description": label,
-                "prompt": label,
-                "group": "g",
-            }),
+            name: FAN_OUT_PROBE.into(),
+            arguments: json!({ "task": label, "group": "g" }),
             signature: None,
         })
     };
@@ -4836,17 +4814,15 @@ async fn grouped_subagents_deliver_one_merged_notification() {
 
     harness.send_text("spawn a group of two").await.unwrap();
     let turn_outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
-    assert_eq!(spawn.invocations().len(), 2, "both grouped spawns ran");
+    let groups = sink.groups();
+    assert_eq!(groups.len(), 2, "both grouped calls went to the background");
     // The cohort is keyed by the dispatching turn's `turn_id`
-    // (`BackgroundNotificationGroup::cohort_key`), so a delivered member must
-    // carry the same turn-scoped group to route into it — exactly as the real
-    // spawner stamps it.
-    let cohort_group = baybo_model::BackgroundNotificationGroup::cohort_key(
-        spawn
-            .last_turn_id()
-            .expect("the spawn tool ran, so it captured the turn's turn_id"),
-        "g",
-    );
+    // (`CohortKey::new`); the runtime stamps that key
+    // on each handed-over job, and a delivered member carries it back.
+    let cohort_group = groups[0]
+        .clone()
+        .expect("a grouped call carries its cohort");
+    assert_eq!(groups[1].as_ref(), Some(&cohort_group));
     let dispatch_answers = turn_outs
         .iter()
         .filter(|o| matches!(o.event, AgentEvent::Message(_)))
@@ -4942,25 +4918,19 @@ async fn grouped_subagents_deliver_one_merged_notification() {
 /// still-sealed cohort, holding the first member hostage and merging the two.)
 #[tokio::test(start_paused = true)]
 async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
-    let spawn = Arc::new(RecordingTool::new(SPAWN_SUBAGENT_TOOL_NAME));
-    spawn.set_response(ToolOutput::Text(format!(
-        "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: bg-stub"
-    )));
-    let manifest = spawn.manifest();
+    let sink = Arc::new(HoldingSink::default());
+    let probe = Arc::new(FanOutProbe);
+    let manifest = probe.manifest();
     let mut harness = AgentTestHarness::builder()
-        .with_tool(spawn.clone() as Arc<dyn Tool>, manifest)
+        .with_tool(probe as Arc<dyn Tool>, manifest)
+        .with_background_jobs(Arc::clone(&sink) as Arc<dyn BackgroundJobSink>)
         .build();
 
     let grouped_call = |id: &str| {
         StreamEvent::ToolCall(ToolCallInfo {
             id: id.into(),
-            name: SPAWN_SUBAGENT_TOOL_NAME.into(),
-            arguments: json!({
-                "subagent_type": "general-purpose",
-                "description": id,
-                "prompt": id,
-                "group": "g",
-            }),
+            name: FAN_OUT_PROBE.into(),
+            arguments: json!({ "task": id, "group": "g" }),
             signature: None,
         })
     };
@@ -4972,7 +4942,6 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .push_stream(vec![StreamEvent::Text("dispatched A".into())]);
     harness.send_text("first batch").await.unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
-    let turn_a = spawn.last_turn_id().expect("turn 1 captured a turn_id");
 
     // Turn 2: another grouped spawn with the SAME name "g" (cohort B), while
     // cohort A's member is still in flight.
@@ -4982,8 +4951,15 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .push_stream(vec![StreamEvent::Text("dispatched B".into())]);
     harness.send_text("second batch").await.unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
-    let turn_b = spawn.last_turn_id().expect("turn 2 captured a turn_id");
-    assert_ne!(turn_a, turn_b, "the two turns ran under distinct turns");
+    let groups = sink.groups();
+    let (cohort_a, cohort_b) = match groups.as_slice() {
+        [Some(a), Some(b)] => (a.clone(), b.clone()),
+        other => panic!("one grouped job per turn, got {other:?}"),
+    };
+    assert_ne!(
+        cohort_a, cohort_b,
+        "the same name in two turns is two cohorts"
+    );
 
     // Each notification turn streams its analysed report after a separate
     // deterministic completion reply. A merge bug would consume only one
@@ -5002,7 +4978,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
     harness.stub_llm.push_stream(notif("A complete"));
     harness.stub_llm.push_stream(notif("B complete"));
 
-    let finish = |handle: &str, group: String| {
+    let finish = |handle: &str, group: baybo_model::CohortKey| {
         let mut pending = PendingBackgroundResult::subagent(
             handle,
             "general-purpose",
@@ -5033,10 +5009,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
     // held waiting for turn 2's member (the pre-fix merge bug).
     harness
         .mailbox
-        .send(finish(
-            "bg-a",
-            baybo_model::BackgroundNotificationGroup::cohort_key(turn_a, "g"),
-        ))
+        .send(finish("bg-a", cohort_a))
         .await
         .expect("mailbox open");
     let after_a = harness.drain_outputs(DRAIN_TIMEOUT).await;
@@ -5049,10 +5022,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
     // Cohort B then fires its own separate notification.
     harness
         .mailbox
-        .send(finish(
-            "bg-b",
-            baybo_model::BackgroundNotificationGroup::cohort_key(turn_b, "g"),
-        ))
+        .send(finish("bg-b", cohort_b))
         .await
         .expect("mailbox open");
     let after_b = harness.drain_outputs(DRAIN_TIMEOUT).await;
@@ -5996,4 +5966,109 @@ async fn stop_aborts_an_in_flight_tool_batch_without_dangling_tool_use() {
     tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
         .await
         .expect("actor must terminate after its in-flight tool batch is cancelled");
+}
+
+/// Name of [`FanOutProbe`].
+const FAN_OUT_PROBE: &str = "fan_out_probe";
+
+/// The smallest background-capable tool: it declares the capability, parses
+/// the shared options, and runs its work through `background::run`. Its work
+/// never finishes on its own, so a grouped call is always handed over.
+struct FanOutProbe;
+
+const FAN_OUT_PROBE_BACKGROUND: baybo_tools::background::BackgroundSupport =
+    baybo_tools::background::BackgroundSupport {
+        window: baybo_tools::background::ForegroundWindow::Fixed(Duration::from_secs(60)),
+        start_detached: true,
+    };
+
+impl FanOutProbe {
+    fn manifest(&self) -> baybo_tools::ToolManifest {
+        baybo_tools::ToolManifest {
+            name: FAN_OUT_PROBE.into(),
+            description: self.description(),
+            trust_level: baybo_model::TrustLevel::Trusted,
+            parameters_schema: self.parameters_schema(),
+            capabilities: vec![],
+            channels: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for FanOutProbe {
+    fn name(&self) -> &str {
+        FAN_OUT_PROBE
+    }
+    fn description(&self) -> String {
+        "test tool that runs its task in the background".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        baybo_tools::background::declare_options(
+            json!({"type": "object", "properties": {"task": {"type": "string"}}}),
+            &FAN_OUT_PROBE_BACKGROUND,
+        )
+    }
+    fn background_support(&self) -> Option<baybo_tools::background::BackgroundSupport> {
+        Some(FAN_OUT_PROBE_BACKGROUND)
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &baybo_tools::ToolContext,
+    ) -> baybo_tools::Result<ToolOutput> {
+        let request =
+            baybo_tools::background::BackgroundRequest::parse(&params, &FAN_OUT_PROBE_BACKGROUND)
+                .map_err(baybo_tools::ToolError::InvalidParams)?;
+        let task = params["task"].as_str().unwrap_or_default().to_string();
+        let handle = baybo_model::BackgroundHandle::new();
+        let cancel = CancellationToken::new();
+        let job = baybo_tools::background::Job {
+            handle: handle.clone(),
+            kind: FAN_OUT_PROBE.into(),
+            summary: task.clone(),
+            session: None,
+            terminal: {
+                let cancel = cancel.clone();
+                Box::pin(async move { cancel.cancelled().await })
+            },
+            cancel,
+            into_result: Box::new(move |()| {
+                Box::pin(async move {
+                    PendingBackgroundResult::subagent(
+                        handle,
+                        FAN_OUT_PROBE,
+                        task,
+                        SessionId::from(""),
+                        "",
+                        SubagentExitStatus::Cancelled,
+                    )
+                })
+            }),
+        };
+        match baybo_tools::background::run(ctx, &request, Duration::from_secs(60), job).await {
+            baybo_tools::background::Ran::Backgrounded(backgrounded) => Ok(ToolOutput::Text(
+                baybo_tools::background::ack(&backgrounded, &[]),
+            )),
+            _ => Ok(ToolOutput::Text("finished in the foreground".into())),
+        }
+    }
+}
+
+/// A sink that keeps what it is handed and never delivers it, so a test can
+/// read what the runtime adopted and deliver results itself.
+#[derive(Default)]
+struct HoldingSink(parking_lot::Mutex<Vec<DetachedJob>>);
+
+impl HoldingSink {
+    fn groups(&self) -> Vec<Option<baybo_model::CohortKey>> {
+        self.0.lock().iter().map(|job| job.cohort.clone()).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl BackgroundJobSink for HoldingSink {
+    async fn adopt(&self, job: DetachedJob) {
+        self.0.lock().push(job);
+    }
 }

@@ -4,7 +4,9 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde_json::Value;
 
-use crate::{Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolManifest, ToolOutput};
+use crate::{
+    Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolManifest, ToolOutput, ToolSchemaContext,
+};
 
 pub struct ToolRegistry {
     builtin: HashMap<String, Arc<dyn Tool>>,
@@ -256,11 +258,14 @@ impl ToolRegistry {
     }
 
     /// [`Self::tool_definitions`] minus tools out of scope for a session on
-    /// `channel` started by `trigger`: the manifest's `channels` axis (e.g.
+    /// `channel` started by `context.trigger`: the manifest's `channels` axis (e.g.
     /// owner-only deck tools) and the tool's [`Tool::trigger_scope`] axis (e.g.
     /// `report_nothing`, visible only in a recurring cron fire). This is what
     /// the agent loop sends the LLM. A tool with no manifest is treated as
     /// channel-unrestricted (defensive — `register` always stores one).
+    /// Parameter schemas use `context.background_eligible`
+    /// (`Session::can_host_background_jobs`, resolved by the caller), and a
+    /// tool's declared background options are withheld where it is false.
     ///
     /// All three axes below are fixed for a session, and it is tempting to
     /// conclude the answer is too. It is not: the axes are fixed, the set they
@@ -290,9 +295,10 @@ impl ToolRegistry {
     pub fn tool_definitions_for_session(
         &self,
         channel: &baybo_model::ChannelType,
-        trigger: &baybo_model::TriggerSource,
+        context: ToolSchemaContext<'_>,
         allowlist: Option<&[String]>,
     ) -> Vec<ToolDefinition> {
+        let trigger = context.trigger;
         let allowed = |name: &String| allowlist.is_none_or(|list| list.contains(name));
         let mut defs: HashMap<String, ToolDefinition> = HashMap::new();
         for (name, tool) in &self.builtin {
@@ -301,7 +307,7 @@ impl ToolRegistry {
                 .get(name)
                 .is_none_or(|m| m.allows_channel(channel));
             if channel_ok && tool.trigger_scope().allows_trigger(trigger) && allowed(name) {
-                let def = tool_definition_offered(tool.as_ref(), trigger);
+                let def = tool_definition_offered(tool.as_ref(), context);
                 defs.insert(def.name.clone(), def);
             }
         }
@@ -322,7 +328,7 @@ impl ToolRegistry {
                 && allowed(name)
                 && !withheld
             {
-                let def = tool_definition_offered(tool.as_ref(), trigger);
+                let def = tool_definition_offered(tool.as_ref(), context);
                 defs.insert(def.name.clone(), def);
             } else {
                 // A restricted dynamic tool must not fall back to a
@@ -428,9 +434,9 @@ impl DeferredToolIndex {
     pub fn visible(
         &self,
         channel: &baybo_model::ChannelType,
-        trigger: &baybo_model::TriggerSource,
+        context: ToolSchemaContext<'_>,
     ) -> Vec<ToolDefinition> {
-        self.visible_with_source(channel, trigger)
+        self.visible_with_source(channel, context)
             .into_iter()
             .map(|(_, def)| def)
             .collect()
@@ -444,8 +450,9 @@ impl DeferredToolIndex {
     pub fn visible_with_source(
         &self,
         channel: &baybo_model::ChannelType,
-        trigger: &baybo_model::TriggerSource,
+        context: ToolSchemaContext<'_>,
     ) -> Vec<(String, ToolDefinition)> {
+        let trigger = context.trigger;
         let dynamic = self.dynamic.read();
         let mut out: Vec<(String, ToolDefinition)> = Vec::new();
         for (source, names) in &dynamic.by_source {
@@ -463,7 +470,7 @@ impl DeferredToolIndex {
                 if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
                     out.push((
                         source.clone(),
-                        tool_definition_offered(tool.as_ref(), trigger),
+                        tool_definition_offered(tool.as_ref(), context),
                     ));
                 }
             }
@@ -482,8 +489,9 @@ impl DeferredToolIndex {
         &self,
         name: &str,
         channel: &baybo_model::ChannelType,
-        trigger: &baybo_model::TriggerSource,
+        context: ToolSchemaContext<'_>,
     ) -> DeferredLookup {
+        let trigger = context.trigger;
         let dynamic = self.dynamic.read();
         let canonical = if dynamic.tools.contains_key(name) {
             None
@@ -504,7 +512,7 @@ impl DeferredToolIndex {
         if !dynamic.deferred.contains(name) {
             return DeferredLookup::Eager;
         }
-        DeferredLookup::Visible(tool_definition_offered(tool.as_ref(), trigger))
+        DeferredLookup::Visible(tool_definition_offered(tool.as_ref(), context))
     }
 }
 
@@ -534,16 +542,28 @@ fn tool_definition_for(tool: &dyn Tool) -> ToolDefinition {
     }
 }
 
-/// What a session started by `trigger` is actually handed: the surface minus
-/// any parameter [`Tool::parameters_schema_for`] withholds from it.
-fn tool_definition_offered(
-    tool: &dyn Tool,
-    trigger: &baybo_model::TriggerSource,
-) -> ToolDefinition {
+/// What a turn is actually handed under its execution policy: the surface minus
+/// any parameter [`Tool::parameters_schema_for`] withholds from it, and minus
+/// the background options where the session cannot run background work.
+fn tool_definition_offered(tool: &dyn Tool, context: ToolSchemaContext<'_>) -> ToolDefinition {
+    let mut parameters_schema = tool.parameters_schema_for(context);
+    if !context.background_eligible
+        && let Some(support) = tool.background_support()
+    {
+        crate::background::withhold_options(&mut parameters_schema, &support);
+    }
     ToolDefinition {
         name: tool.name().to_string(),
         description: tool.description(),
-        parameters_schema: tool.parameters_schema_for(trigger),
+        parameters_schema,
+    }
+}
+
+#[cfg(test)]
+fn test_schema_context(trigger: &baybo_model::TriggerSource) -> ToolSchemaContext<'_> {
+    ToolSchemaContext {
+        trigger,
+        background_eligible: trigger.can_host_background_jobs(),
     }
 }
 
@@ -663,7 +683,7 @@ mod tests {
 
         let owner = names(registry.tool_definitions_for_session(
             &baybo_model::ChannelType::owner(),
-            &baybo_model::TriggerSource::User,
+            crate::registry::test_schema_context(&baybo_model::TriggerSource::User),
             None,
         ));
         assert!(owner.contains(&"OwnerOnly".to_string()));
@@ -671,7 +691,7 @@ mod tests {
 
         let telegram = names(registry.tool_definitions_for_session(
             &baybo_model::ChannelType::telegram(),
-            &baybo_model::TriggerSource::User,
+            crate::registry::test_schema_context(&baybo_model::TriggerSource::User),
             None,
         ));
         assert!(!telegram.contains(&"OwnerOnly".to_string()));
@@ -726,7 +746,11 @@ mod tests {
 
         let has = |trigger: &TriggerSource| {
             registry
-                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger, None)
+                .tool_definitions_for_session(
+                    &baybo_model::ChannelType::owner(),
+                    crate::registry::test_schema_context(trigger),
+                    None,
+                )
                 .into_iter()
                 .any(|d| d.name == "report_nothing")
         };
@@ -789,7 +813,11 @@ mod tests {
 
         let has = |trigger: &TriggerSource| {
             registry
-                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger, None)
+                .tool_definitions_for_session(
+                    &baybo_model::ChannelType::owner(),
+                    crate::registry::test_schema_context(trigger),
+                    None,
+                )
                 .into_iter()
                 .any(|d| d.name == "IssueList")
         };
@@ -872,7 +900,11 @@ mod tests {
         };
         let names = |allow: Option<&[String]>| {
             registry
-                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), &run, allow)
+                .tool_definitions_for_session(
+                    &baybo_model::ChannelType::owner(),
+                    crate::registry::test_schema_context(&run),
+                    allow,
+                )
                 .into_iter()
                 .map(|d| d.name)
                 .collect::<Vec<_>>()
@@ -953,7 +985,7 @@ mod tests {
             registry
                 .tool_definitions_for_session(
                     &baybo_model::ChannelType::owner(),
-                    &TriggerSource::User,
+                    crate::registry::test_schema_context(&TriggerSource::User),
                     allow,
                 )
                 .into_iter()
@@ -1071,7 +1103,11 @@ mod tests {
 
         let has = |trigger: &TriggerSource| {
             registry
-                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger, None)
+                .tool_definitions_for_session(
+                    &baybo_model::ChannelType::owner(),
+                    crate::registry::test_schema_context(trigger),
+                    None,
+                )
                 .into_iter()
                 .any(|d| d.name == "browser/navigate_page")
         };
@@ -1209,7 +1245,11 @@ mod offered_schema_tests {
         let registry = registry();
         let owner = baybo_model::ChannelType::owner();
 
-        let in_chat = registry.tool_definitions_for_session(&owner, &TriggerSource::User, None);
+        let in_chat = registry.tool_definitions_for_session(
+            &owner,
+            crate::registry::test_schema_context(&TriggerSource::User),
+            None,
+        );
         let bash = in_chat
             .iter()
             .find(|d| d.name == "Bash")
@@ -1220,7 +1260,11 @@ mod offered_schema_tests {
             props(bash)
         );
 
-        let in_run = registry.tool_definitions_for_session(&owner, &issue_run(), None);
+        let in_run = registry.tool_definitions_for_session(
+            &owner,
+            crate::registry::test_schema_context(&issue_run()),
+            None,
+        );
         let bash = in_run
             .iter()
             .find(|d| d.name == "Bash")
@@ -1235,6 +1279,37 @@ mod offered_schema_tests {
             "the rest of the schema survives: {:?}",
             props(bash)
         );
+    }
+
+    #[test]
+    fn a_subagent_is_not_offered_background_even_with_a_user_trigger() {
+        let registry = registry();
+        let owner = baybo_model::ChannelType::owner();
+        let context = ToolSchemaContext {
+            trigger: &TriggerSource::User,
+            background_eligible: false,
+        };
+        let defs = registry.tool_definitions_for_session(&owner, context, None);
+        let bash = defs.iter().find(|def| def.name == "Bash").unwrap();
+        assert!(!props(bash).iter().any(|name| name == "on_timeout"));
+        assert!(props(bash).iter().any(|name| name == "timeout_ms"));
+        assert!(
+            bash.parameters_schema["properties"]["timeout_ms"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("terminates the command")
+        );
+
+        let (tool, manifest) = registry.get_with_manifest("Bash").unwrap();
+        registry.register_dynamic_deferred("test", tool, manifest.unwrap());
+        let index = registry.deferred_tool_index();
+        let listed = index.visible(&owner, context);
+        let listed_bash = listed.iter().find(|def| def.name == "Bash").unwrap();
+        assert_eq!(listed_bash.parameters_schema, bash.parameters_schema);
+        let DeferredLookup::Visible(found) = index.lookup("Bash", &owner, context) else {
+            panic!("Bash must be discoverable");
+        };
+        assert_eq!(found.parameters_schema, bash.parameters_schema);
     }
 
     /// The full surface still exists — the manifest and the inventory views

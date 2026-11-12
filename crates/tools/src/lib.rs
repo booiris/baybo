@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod background;
 pub mod blob_media;
 pub mod builtin;
 pub mod error;
@@ -136,6 +137,16 @@ pub enum OutputSource {
 // Tool trait
 // ---------------------------------------------------------------------------
 
+/// What the offered schemas may depend on, for one session.
+#[derive(Clone, Copy)]
+pub struct ToolSchemaContext<'a> {
+    pub trigger: &'a TriggerSource,
+    /// Whether the session can host background work at all
+    /// (`Session::can_host_background_jobs`). Session-fixed, so the offered
+    /// schemas — and the prompt-cache prefix — stay stable across its turns.
+    pub background_eligible: bool,
+}
+
 /// Tool trait — the unified interface for all tool implementations.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -149,7 +160,7 @@ pub trait Tool: Send + Sync {
 
     fn parameters_schema(&self) -> Value;
 
-    /// The schema a session started by `trigger` is actually offered.
+    /// The schema a session is actually offered.
     ///
     /// Defaults to [`Self::parameters_schema`], which is also what the
     /// governance manifest keeps — that is the tool's whole surface, and the
@@ -158,15 +169,26 @@ pub trait Tool: Send + Sync {
     /// be in front of the model at all. Naming it and then explaining when it
     /// does nothing costs tokens on every request and still gets tried.
     ///
-    /// Vary on the trigger by default: it is fixed for a session's whole
-    /// life, so the offered schema is too, which is what the prompt-cache
-    /// prefix needs. Live, hot-swappable state is admissible only where
-    /// [`Self::description`] already re-renders with it — Bash's permission
-    /// mode is the one such case — because the two are rebuilt together, so
-    /// anything that reskins the description has already invalidated the
-    /// prefix and the schema costs nothing further.
-    fn parameters_schema_for(&self, _trigger: &TriggerSource) -> Value {
+    /// Vary only on `context`, which is fixed for a session's whole life, so
+    /// the offered schema is too — what the prompt-cache prefix needs. Live,
+    /// hot-swappable state is admissible only where [`Self::description`]
+    /// already re-renders with it — Bash's permission mode is the one such
+    /// case — because the two are rebuilt together.
+    ///
+    /// The background options are not this method's business: a tool that
+    /// declares [`Self::background_support`] has them withheld for it by the
+    /// registry, wherever the session cannot host background work.
+    fn parameters_schema_for(&self, _context: ToolSchemaContext<'_>) -> Value {
         self.parameters_schema()
+    }
+
+    /// Whether this tool can hand slow work to the background, and which of
+    /// the shared options ([`background`]) it takes. A tool that returns
+    /// `Some` adds the options to [`Self::parameters_schema`] with
+    /// [`background::declare_options`]; the registry withholds them wherever
+    /// the session cannot run background work.
+    fn background_support(&self) -> Option<background::BackgroundSupport> {
+        None
     }
 
     /// Resources this call will touch, derived from the parameters.
@@ -438,14 +460,18 @@ pub struct ToolContext {
     /// deliberately ignore this and go straight to
     /// [`Self::background_control`].
     pub background_eligible: bool,
-    /// Runtime hook for detaching a slow command into the background.
+    /// The sink background-capable tools hand work to (through
+    /// [`background::run`]) once it runs past its foreground window.
     /// A capability handle, not a policy switch: `None` only when the
     /// runtime has no background-job manager wired (argv-mode boots, tests).
     /// Whether a given call may use it is [`Self::background_eligible`].
-    pub background_jobs: Option<Arc<dyn BackgroundJobSink>>,
+    pub background_jobs: Option<Arc<dyn background::BackgroundJobSink>>,
     /// View + control of this session's in-flight background jobs, for the
     /// `JobList` / `JobStop` tools. Wired like [`Self::background_jobs`].
     pub background_control: Option<Arc<dyn BackgroundJobControl>>,
+    /// Filled by [`background::run`] when this call starts a grouped job
+    /// detached, so the agent loop can count it into the turn's cohort.
+    pub background_dispatch: background::DispatchRecord,
     /// Handle a tool flips to suppress this turn's user-facing notification.
     /// `Some` **only for a recurring cron fire turn** (wired by the actor's
     /// cron dispatch, read by the `report_nothing` tool); `None` everywhere
@@ -470,6 +496,16 @@ pub struct ToolContext {
     /// the sandbox remaps `HOME` and the operator's own config is therefore
     /// not where git looks. `None` for every session that is not an issue run.
     pub checkout_git_config: Option<PathBuf>,
+}
+
+impl ToolContext {
+    /// Whether work this call starts may be handed to the background: the
+    /// turn may create background work and a sink is wired to take it. The
+    /// one answer to that question — [`background::run`] decides by it, and a
+    /// tool that would otherwise take a cheaper blocking path asks it first.
+    pub fn can_hand_over_background(&self) -> bool {
+        self.background_eligible && self.background_jobs.is_some()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -516,6 +552,7 @@ impl ToolContext {
             background_eligible: true,
             background_jobs: None,
             background_control: None,
+            background_dispatch: Default::default(),
             notify_silence: None,
             checkout_root: None,
             agent_handle: None,
@@ -817,7 +854,7 @@ pub trait ExecSandbox: Send + Sync {
     /// Spawn a command **detached**: return a live [`RunningChild`]
     /// immediately instead of waiting. The caller owns the foreground
     /// wait + timeout, and can hand the still-running child to a
-    /// [`BackgroundJobSink`] to keep it alive past the tool call. The
+    /// [`BackgroundJobSink`](background::BackgroundJobSink) to keep it alive past the tool call. The
     /// `opts.timeout` is ignored (the caller times out). Backends that
     /// can't expose a live child return an error and the caller falls
     /// back to the blocking [`Self::spawn_command`] (kill-on-timeout).
@@ -850,12 +887,12 @@ pub struct SandboxedOutput {
     pub timed_out: bool,
 }
 
-/// A live, detached child process the runtime keeps streaming and awaits
-/// out-of-band. Backs the "Bash timeout → background" path: the tool takes
-/// the stdout/stderr readers (to stream them to files), then hands the
-/// child to a [`BackgroundJobSink`] which awaits [`Self::wait`] and routes
-/// a completion notification. `/stop` / `JobStop` trip the escort's cancel
-/// token, which calls [`Self::start_kill`].
+/// A live, detached child process that can outlive the tool call. Backs
+/// Bash's background path: the tool takes the stdout/stderr readers (to
+/// stream them to files), and its [`background::Job`]'s `terminal` awaits
+/// [`Self::wait`] — calling [`Self::start_kill`] first once the job's cancel
+/// token fires (`/stop`, `JobStop`, the turn's stop while in the foreground,
+/// process shutdown).
 #[async_trait]
 pub trait RunningChild: Send {
     /// Take the child's stdout reader (once). `None` if already taken or
@@ -870,40 +907,9 @@ pub trait RunningChild: Send {
     fn start_kill(&mut self);
 }
 
-/// What a tool hands to the runtime when a command crosses into the
-/// background: the still-running child plus the in-flight stdout/stderr →
-/// file copy tasks (the escort awaits them so the files are fully flushed
-/// before it reads their tails for the completion notification).
-pub struct DetachedCommand {
-    /// Minted by the tool so the output file names, the handle returned to
-    /// the LLM, and the eventual completion notification all share one id.
-    pub handle_id: String,
-    pub session_id: SessionId,
-    pub command: String,
-    pub child: Box<dyn RunningChild>,
-    pub copy_tasks: Vec<tokio::task::JoinHandle<()>>,
-    pub stdout_path: std::path::PathBuf,
-    pub stderr_path: std::path::PathBuf,
-}
-
-/// Runtime hook that takes ownership of a [`DetachedCommand`], streams it
-/// to completion off the tool call, and routes a background-turn completion
-/// notification to the parent session. Implemented by the agent layer
-/// (`baybo-agent`) and injected via [`ToolContext::background_jobs`], which
-/// the runtime populates **only for user-facing sessions** — so the
-/// presence of the sink is itself the "is this conversation eligible to
-/// background work" gate.
-#[async_trait]
-pub trait BackgroundJobSink: Send + Sync {
-    /// Take the detached command; return the handle id the tool surfaces
-    /// to the LLM. Returns promptly (registers + spawns an escort task) —
-    /// it does NOT await the command.
-    async fn detach_command(&self, turn: DetachedCommand) -> String;
-}
-
 /// One in-flight background job, as surfaced by the `JobList` tool.
 pub struct BackgroundJobInfo {
-    pub handle: String,
+    pub handle: baybo_model::BackgroundHandle,
     /// Subagent profile name, or `"command"` for a detached `Bash` command.
     pub kind: String,
     /// The task summary (subagent) or the command line (command).
@@ -913,7 +919,7 @@ pub struct BackgroundJobInfo {
 /// Per-session view + control of in-flight background jobs (detached
 /// subagents and commands), backing the `JobList` / `JobStop` tools.
 /// Injected via [`ToolContext::background_control`] only for user-facing
-/// sessions (mirrors [`BackgroundJobSink`]); the same runtime component
+/// sessions (mirrors [`BackgroundJobSink`](background::BackgroundJobSink)); the same runtime component
 /// implements both.
 #[async_trait]
 pub trait BackgroundJobControl: Send + Sync {

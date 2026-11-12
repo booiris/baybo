@@ -23,16 +23,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_model::{
-    BAYBO_BACKEND_TAG, ExternalAgentKind, ModelTier, OnTimeout, SPAWN_SUBAGENT_TOOL_NAME,
-    SessionId, SubagentBackend, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
-    TrustLevel,
+    BAYBO_BACKEND_TAG, ExternalAgentKind, ModelTier, PendingBackgroundResult,
+    SPAWN_SUBAGENT_TOOL_NAME, SessionId, SubagentBackend, SubagentExitStatus,
+    SubagentParentContext, SubagentResult, SubagentSpawnRequest, TrustLevel,
 };
 use baybo_session::SessionManager;
+use baybo_tools::background::{BackgroundRequest, Job, Ran};
 use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
+use futures::FutureExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{SubagentDispatchLimiter, SubagentRegistry, SubagentSpawner};
+use crate::{
+    SpawnedSubagent, SubagentDispatchLimiter, SubagentRegistry, SubagentRun, SubagentSpawner,
+};
 
 /// Late-set handle to the actor-backed spawner. The tool is built while
 /// the tool registry is assembled (before the supervisor + actor spawner
@@ -93,19 +97,7 @@ struct SpawnParams {
     #[serde(default)]
     model_tier: Option<String>,
     #[serde(default)]
-    background: bool,
-    /// `"background"` (default) or `"kill"`: what to do when a foreground
-    /// spawn exceeds its 2-minute foreground wait. Ignored when the turn is
-    /// not `ToolContext::background_eligible`.
-    #[serde(default)]
-    on_timeout: Option<String>,
-    #[serde(default)]
     resume_session_id: Option<String>,
-    /// Barrier cohort. Subagents sharing a `group` (spawned together in one
-    /// turn) run in the background and deliver one merged notification only
-    /// once they all finish.
-    #[serde(default)]
-    group: Option<String>,
 }
 
 /// Outcome of parameter parsing — the fully-built request, or a
@@ -113,6 +105,9 @@ struct SpawnParams {
 #[derive(Debug)]
 struct ParsedSpawn {
     request: SubagentSpawnRequest,
+    /// The call's background options. The spawner never sees them: how the
+    /// parent waits is `baybo_tools::background::run`'s business.
+    background: BackgroundRequest,
 }
 
 /// The two subagent-admission gate inputs [`SpawnSubagentTool::lineage_gate_inputs`]
@@ -190,25 +185,7 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
         .filter(|s| !s.is_empty())
         .map(SessionId::from);
 
-    let on_timeout = match p.on_timeout.as_deref().map(str::trim) {
-        None | Some("") | Some("background") => OnTimeout::Background,
-        Some("kill") => OnTimeout::Kill,
-        Some(other) => {
-            return Err(format!(
-                "unknown on_timeout {other:?}; expected background|kill"
-            ));
-        }
-    };
-
-    let group = p
-        .group
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    // A grouped subagent is background-from-start: its result is barrier-held
-    // and delivered with the whole group, so it never blocks the turn.
-    let background = p.background || group.is_some();
+    let background = BackgroundRequest::parse(value, &SPAWN_BACKGROUND)?;
 
     Ok(ParsedSpawn {
         request: SubagentSpawnRequest {
@@ -217,8 +194,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
             task_summary: p.description,
             prompt: p.prompt,
             model_tier,
-            background,
-            on_timeout,
             // Filled in by the tool after the lineage walk; the
             // synthesized request leaves it `None` so test fixtures
             // can build a `SubagentSpawnRequest` without knowing the
@@ -226,8 +201,8 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
             fan_out_root: None,
             backend,
             resume_session_id,
-            group,
         },
+        background,
     })
 }
 
@@ -456,6 +431,17 @@ fn catalogue_blurb(description: &str) -> std::borrow::Cow<'_, str> {
 /// session, including the overwhelming majority that never dispatch anything.
 const PROMPT_FIELD_DESCRIPTION: &str = r#"Self-contained brief the subagent sees as its first user message. It has NOT seen this conversation, so brief it like a teammate who just sat down: goal in a sentence or two, then the facts. Include exact paths and line numbers (`crate/foo.rs:123`) rather than making it re-find what you already located. If the task is a fix, say what to change — pushing the synthesis back onto it ("based on your findings, decide what to do") gives away the point of dispatching one. Ask for short output if you want it."#;
 
+/// A child can be handed over before it has produced anything, so a spawn can
+/// start detached — alone or as a merged cohort — as well as convert after
+/// its foreground wait.
+const SPAWN_BACKGROUND: baybo_tools::background::BackgroundSupport =
+    baybo_tools::background::BackgroundSupport {
+        window: baybo_tools::background::ForegroundWindow::Fixed(
+            crate::spawner::SUBAGENT_FOREGROUND_WAIT,
+        ),
+        start_detached: true,
+    };
+
 /// `registered` is the live profile list, so the model gets the legal names as
 /// an `enum` rather than a prose pointer at the catalogue in the description.
 /// An empty registry would serialize as `"enum": []`, which admits no value at
@@ -466,7 +452,7 @@ fn parameters_schema(registered: &[String]) -> Value {
     } else {
         json!({ "type": "string", "enum": registered })
     };
-    json!({
+    let schema = json!({
         "type": "object",
         "required": ["subagent_type", "description", "prompt"],
         "properties": {
@@ -489,25 +475,13 @@ fn parameters_schema(registered: &[String]) -> Value {
                 "enum": ["baybo", "claude", "codex"],
                 "description": "Who runs it. 'baybo' (default) is an in-process agent with the configured LLMs, tools and skills. 'claude' and 'codex' hand the whole task to that CLI instead — one-shot, own tool loop, permissions bypassed — for heavy autonomous work. A backend whose CLI is not installed fails with a clear error."
             },
-            "background": {
-                "type": "boolean",
-                "description": "Return a handle immediately instead of blocking on the child. Any backend; best for long external (claude/codex) runs."
-            },
-            "on_timeout": {
-                "type": "string",
-                "enum": ["background", "kill"],
-                "description": "After a 2-minute foreground wait: 'background' (default) detaches it — handle now, notification later — and 'kill' cancels it. Ignored when background=true."
-            },
-            "group": {
-                "type": "string",
-                "description": "Barrier cohort name. Subagents sharing a group, spawned in one turn, run in parallel and deliver ONE merged notification once they ALL finish, instead of one each. A group always runs in the background."
-            },
             "resume_session_id": {
                 "type": "string",
                 "description": "Continue a prior subagent instead of starting one: a child_session_id from a 'subagent_session_id: ...' tail on THIS parent session. Any other id is rejected. The prompt is appended to that child's context."
             }
         }
-    })
+    });
+    baybo_tools::background::declare_options(schema, &SPAWN_BACKGROUND)
 }
 
 #[async_trait]
@@ -520,25 +494,8 @@ impl Tool for SpawnSubagentTool {
         (*self.cached_description()).clone()
     }
 
-    /// Withholds every knob that only chooses *how* to background, where
-    /// backgrounding is refused. A card's run, a scheduled job's own run and
-    /// a nested subagent block regardless of all three.
-    ///
-    /// `group` belongs with them: it forces `background` on, and its whole
-    /// payoff — parallel fan-out, one merged notification — lives inside the
-    /// spawner's `if background` arm, so on this path it is read and dropped
-    /// while its description promises the opposite. `background: true` was
-    /// already being sent and silently ignored.
-    fn parameters_schema_for(&self, trigger: &baybo_model::TriggerSource) -> Value {
-        let mut schema = self.parameters_schema();
-        if !trigger.can_host_background_jobs()
-            && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
-        {
-            for knob in ["background", "on_timeout", "group"] {
-                props.remove(knob);
-            }
-        }
-        schema
+    fn background_support(&self) -> Option<baybo_tools::background::BackgroundSupport> {
+        Some(SPAWN_BACKGROUND)
     }
 
     fn parameters_schema(&self) -> Value {
@@ -580,8 +537,10 @@ impl Tool for SpawnSubagentTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
-        let ParsedSpawn { request } =
-            parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
+        let ParsedSpawn {
+            request,
+            background,
+        } = parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
 
         let LineageGateInputs {
             depth,
@@ -596,7 +555,7 @@ impl Tool for SpawnSubagentTool {
 
         // Reserve a fan-out slot under the root BEFORE shipping the
         // envelope. Failure paths below release it; on the happy
-        // path the router's wait task releases on terminal.
+        // path the spawner releases it when the child's run ends.
         if let Err(current_count) = self
             .dispatch_limiter
             .try_reserve(&root_session_id, self.max_subagents_per_root)
@@ -612,40 +571,119 @@ impl Tool for SpawnSubagentTool {
             turn_id: ctx.turn_id,
             span_id: ctx.span_id,
             cancel_token: ctx.cancellation_token.clone(),
-            background_eligible: ctx.background_eligible,
+            background_eligible: ctx.can_hand_over_background(),
             inherited_context: ctx.inherited_context.clone(),
         };
         let mut request = request;
         request.fan_out_root = Some(root_session_id.clone());
-        // Foreground results carry the resume-id tail so the parent can
-        // continue the child via `resume_session_id`. The background ack
-        // is a dispatch notice, not a final result — its escorted
-        // delivery surfaces the id separately, so it stays tail-free.
-        let background = request.background;
-        let result = match self.spawner.get() {
-            // The spawner reserves nothing and releases the fan-out slot on
-            // the child's terminal (every path inside `spawn`). The tool
-            // reserved above; only the not-yet-wired case below needs the
+        let subagent_type = request.subagent_type.clone();
+        let task_summary = request.task_summary.clone();
+        let run = match self.spawner.get() {
+            // The spawner reserves nothing and releases the fan-out slot when
+            // the child's run ends (or at once when it fails to start). The
+            // tool reserved above; only the not-yet-wired case below needs the
             // tool to release, since `spawn` is never reached.
-            Some(spawner) => spawner.spawn(parent, request).await,
+            Some(spawner) => match spawner.spawn(parent, request).await {
+                SpawnedSubagent::Running(run) => run,
+                SpawnedSubagent::Failed(result) => return Ok(render_result(&result, ctx)),
+            },
             None => {
                 self.dispatch_limiter.release(&root_session_id);
-                SubagentResult::failed("subagent spawner not wired")
+                return Ok(render_result(
+                    &SubagentResult::failed("subagent spawner not wired"),
+                    ctx,
+                ));
             }
         };
-        // Foreground results carry the resume-id tail; the background ack
-        // is a dispatch notice whose escorted delivery surfaces the id
-        // separately, so it stays tail-free. The parent receives the
-        // subagent's textual report; raw media never crosses the boundary.
-        let text = if background {
-            result.result_text()
-        } else {
-            result.to_tool_result_text(
-                &ctx.workspace_paths
-                    .session_log_file(result.child_session_id.as_ref()),
-            )
+
+        let child_session_id = run.child_session_id.clone();
+        let job = subagent_job(run, subagent_type.clone(), task_summary);
+        let result = match baybo_tools::background::run(
+            ctx,
+            &background,
+            crate::spawner::SUBAGENT_FOREGROUND_WAIT,
+            job,
+        )
+        .await
+        {
+            Ran::Finished(result) => result,
+            Ran::Cancelled(_) => SubagentResult {
+                child_session_id,
+                final_content: None,
+                status: SubagentExitStatus::Cancelled,
+            },
+            // NOT `Timeout`: the child was working, it just ran past the wait
+            // the parent was willing to hold for.
+            Ran::TimedOut(_) => SubagentResult {
+                child_session_id,
+                final_content: None,
+                status: SubagentExitStatus::ForegroundWaitElapsed,
+            },
+            // A dispatch notice, not a final result: the child is still
+            // running, so it carries no resume tail; the delivered result
+            // surfaces the id later.
+            Ran::Backgrounded(backgrounded) => {
+                return Ok(ToolOutput::Text(baybo_tools::background::ack(
+                    &backgrounded,
+                    &[
+                        format!("subagent_type: {subagent_type}"),
+                        format!("child_session: {child_session_id}"),
+                    ],
+                )));
+            }
         };
-        Ok(ToolOutput::Text(text))
+        Ok(render_result(&result, ctx))
+    }
+}
+
+/// A subagent's result as the parent's tool call returns it: its textual
+/// report — raw media never crosses the boundary — plus the resume-id tail
+/// that lets the parent continue the child.
+fn render_result(result: &SubagentResult, ctx: &ToolContext) -> ToolOutput {
+    ToolOutput::Text(
+        result.to_tool_result_text(
+            &ctx.workspace_paths
+                .session_log_file(result.child_session_id.as_ref()),
+        ),
+    )
+}
+
+/// The child's run as a background-capable [`Job`].
+fn subagent_job(
+    run: SubagentRun,
+    subagent_type: String,
+    task_summary: String,
+) -> Job<SubagentResult> {
+    let handle = baybo_model::BackgroundHandle::new();
+    let SubagentRun {
+        child_session_id,
+        cancel,
+        terminal,
+    } = run;
+    let into_result = {
+        let handle = handle.clone();
+        let subagent_type = subagent_type.clone();
+        let task_summary = task_summary.clone();
+        Box::new(move |result: SubagentResult| {
+            futures::future::ready(PendingBackgroundResult::subagent(
+                handle,
+                subagent_type,
+                task_summary,
+                result.child_session_id.clone(),
+                result.result_text(),
+                result.status.clone(),
+            ))
+            .boxed()
+        }) as Box<dyn FnOnce(SubagentResult) -> _ + Send>
+    };
+    Job {
+        handle,
+        kind: subagent_type,
+        summary: task_summary,
+        session: Some(child_session_id),
+        cancel,
+        terminal,
+        into_result,
     }
 }
 
@@ -666,6 +704,7 @@ pub fn make(config: SpawnSubagentToolConfig) -> (Arc<dyn Tool>, ToolManifest) {
 mod tests {
     use super::*;
     use crate::{SubagentRegistry, unbounded_limiter};
+    use baybo_model::OnTimeout;
     use baybo_model::{
         ChannelType, Lineage, LineageKind, Session, SessionId, SubagentExitStatus, User,
     };
@@ -817,7 +856,8 @@ mod tests {
         Arc<parking_lot::Mutex<Option<(SubagentSpawnRequest, SubagentParentContext)>>>;
 
     /// Stand-in for the actor-backed spawner: records the (request, parent
-    /// session id) it was handed and returns a canned result.
+    /// session id) it was handed and returns a run that finishes at once with
+    /// a canned result.
     struct FakeSubagentSpawner {
         response: SubagentResult,
         captured: CapturedSpawn,
@@ -829,9 +869,14 @@ mod tests {
             &self,
             parent: SubagentParentContext,
             request: SubagentSpawnRequest,
-        ) -> SubagentResult {
+        ) -> SpawnedSubagent {
             *self.captured.lock() = Some((request, parent));
-            self.response.clone()
+            let response = self.response.clone();
+            SpawnedSubagent::Running(SubagentRun {
+                child_session_id: response.child_session_id.clone(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                terminal: futures::future::ready(response).boxed(),
+            })
         }
     }
 
@@ -889,7 +934,6 @@ mod tests {
         assert_eq!(req.task_summary, "look up X");
         assert_eq!(req.prompt, "Investigate X and report what you find.");
         assert_eq!(req.model_tier, Some(ModelTier::Lite));
-        assert!(!req.background);
         assert!(
             matches!(&req.backend, SubagentBackend::Baybo),
             "default backend should be Baybo, got {:?}",
@@ -973,21 +1017,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_flag_routes_through_envelope() {
-        // The tool surface for background mode is identical to foreground
-        // from the *tool's* perspective — it hands the request to the
-        // spawner and renders whatever `SubagentResult` comes back. The
-        // spawner-side branch (background dispatch ack + escorted
-        // `BackgroundJobFinished` on terminal) is tested in the agent crate
-        // alongside the supervisor fixtures. Here we just confirm the tool
-        // propagates `background: true` and the ack lands as Text output.
-        let ack_text = "[background subagent dispatched]";
+    async fn background_flag_hands_the_child_to_the_background() {
+        // `background: true` in a session that can run background work: the
+        // tool hands the child's run to the background sink at once and
+        // answers with the dispatch notice naming the child — it does not
+        // wait for the child.
+        #[derive(Default)]
+        struct RecordingSink(parking_lot::Mutex<Vec<baybo_tools::background::DetachedJob>>);
+        #[async_trait]
+        impl baybo_tools::background::BackgroundJobSink for RecordingSink {
+            async fn adopt(&self, job: baybo_tools::background::DetachedJob) {
+                self.0.lock().push(job);
+            }
+        }
+
         let (spawner, captured) = fake_spawner(SubagentResult {
             child_session_id: baybo_model::SessionId::from("child"),
-            final_content: Some(vec![baybo_model::ContentBlock::Text(ack_text.into())]),
+            final_content: Some(vec![baybo_model::ContentBlock::Text("done".into())]),
             status: SubagentExitStatus::Completed,
         });
         let tool = tool_with_default(spawner).await;
+        let sink = Arc::new(RecordingSink::default());
+        let mut ctx = ctx();
+        ctx.background_jobs = Some(Arc::clone(&sink) as _);
         let out = tool
             .execute(
                 json!({
@@ -996,16 +1048,25 @@ mod tests {
                     "prompt": "x",
                     "background": true,
                 }),
-                &ctx(),
+                &ctx,
             )
             .await
             .unwrap();
-        match out {
-            ToolOutput::Text(s) => assert_eq!(s, ack_text),
-            other => panic!("expected Text, got {other:?}"),
-        }
-        let (req, _) = captured.lock().take().expect("spawner saw a request");
-        assert!(req.background, "tool must propagate background=true");
+        let ToolOutput::Text(text) = out else {
+            panic!("expected Text, got {out:?}");
+        };
+        assert!(text.starts_with("[started in the background]"), "{text}");
+        assert!(text.contains("- child_session: child"), "{text}");
+        let jobs = sink.0.lock();
+        assert_eq!(jobs.len(), 1, "the child went to the background");
+        assert_eq!(jobs[0].kind, "general-purpose");
+        assert_eq!(jobs[0].session, Some(baybo_model::SessionId::from("child")));
+        assert!(text.contains(jobs[0].handle.as_str()), "{text}");
+        let (_, parent) = captured.lock().take().expect("spawner saw a request");
+        assert!(
+            parent.background_eligible,
+            "the spawner is told it may anchor the child past the turn"
+        );
     }
 
     #[tokio::test]
@@ -1520,8 +1581,33 @@ mod tests {
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         });
+        let manifest = baybo_tools::ToolManifest {
+            name: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
+            description: tool.description(),
+            trust_level: baybo_model::TrustLevel::Trusted,
+            parameters_schema: tool.parameters_schema(),
+            capabilities: Vec::new(),
+            channels: Vec::new(),
+        };
+        let mut registry = baybo_tools::registry::ToolRegistry::new();
+        registry.register(Arc::new(tool) as Arc<dyn Tool>, manifest);
+        let offered = |trigger: &TriggerSource, background_eligible: bool| {
+            registry
+                .tool_definitions_for_session(
+                    &baybo_model::ChannelType::owner(),
+                    baybo_tools::ToolSchemaContext {
+                        trigger,
+                        background_eligible,
+                    },
+                    None,
+                )
+                .into_iter()
+                .find(|d| d.name == SPAWN_SUBAGENT_TOOL_NAME)
+                .expect("spawn_subagent is offered")
+                .parameters_schema
+        };
         let names = |t: &TriggerSource| {
-            let schema = tool.parameters_schema_for(t);
+            let schema = offered(t, t.can_host_background_jobs());
             let mut v: Vec<String> = schema["properties"]
                 .as_object()
                 .expect("an object schema")
@@ -1531,6 +1617,11 @@ mod tests {
             v.sort();
             v
         };
+        let nested = offered(&TriggerSource::User, false);
+        for knob in ["background", "on_timeout", "group"] {
+            assert!(nested["properties"].get(knob).is_none());
+        }
+        assert!(nested["properties"].get("prompt").is_some());
         let chat = names(&TriggerSource::User);
         let run = names(&TriggerSource::Issue {
             project_id: baybo_model::ProjectId::generate(),
@@ -1565,10 +1656,8 @@ mod tests {
             &reg,
         )
         .unwrap()
-        .request;
-        assert!(!bare.background);
-        assert_eq!(bare.on_timeout, OnTimeout::Background);
-        assert!(bare.group.is_none());
+        .background;
+        assert_eq!(bare, BackgroundRequest::Wait(OnTimeout::Background));
 
         let sent = parse_spawn_request(
             &json!({
@@ -1582,11 +1671,15 @@ mod tests {
             &reg,
         )
         .unwrap()
-        .request;
-        assert!(sent.background, "still honoured at the door");
-        assert_eq!(sent.on_timeout, OnTimeout::Kill);
-        assert!(sent.group.is_some());
-        // The spawner is where an ineligible turn downgrades all three; the
+        .background;
+        assert_eq!(
+            sent,
+            BackgroundRequest::Detach {
+                group: baybo_model::BackgroundGroupName::parse("batch")
+            },
+            "still honoured at the door"
+        );
+        // `background::run` is where an ineligible turn ignores all three; the
         // parser stays a parser.
     }
 
@@ -1598,8 +1691,8 @@ mod tests {
             "description": "x",
             "prompt": "x",
         });
-        let req = parse_spawn_request(&v, &reg).unwrap().request;
-        assert_eq!(req.on_timeout, OnTimeout::Background);
+        let req = parse_spawn_request(&v, &reg).unwrap().background;
+        assert_eq!(req, BackgroundRequest::Wait(OnTimeout::Background));
     }
 
     #[test]
@@ -1611,8 +1704,8 @@ mod tests {
             "prompt": "x",
             "on_timeout": "kill",
         });
-        let req = parse_spawn_request(&v, &reg).unwrap().request;
-        assert_eq!(req.on_timeout, OnTimeout::Kill);
+        let req = parse_spawn_request(&v, &reg).unwrap().background;
+        assert_eq!(req, BackgroundRequest::Wait(OnTimeout::Kill));
     }
 
     #[test]
@@ -1636,10 +1729,12 @@ mod tests {
             "prompt": "x",
             "group": "research",
         });
-        let req = parse_spawn_request(&v, &reg).unwrap().request;
-        assert_eq!(req.group.as_deref(), Some("research"));
-        assert!(
-            req.background,
+        let req = parse_spawn_request(&v, &reg).unwrap().background;
+        assert_eq!(
+            req,
+            BackgroundRequest::Detach {
+                group: baybo_model::BackgroundGroupName::parse("research")
+            },
             "a grouped subagent must run in the background"
         );
     }
@@ -1653,9 +1748,12 @@ mod tests {
             "prompt": "x",
             "group": "   ",
         });
-        let req = parse_spawn_request(&v, &reg).unwrap().request;
-        assert_eq!(req.group, None);
-        assert!(!req.background, "blank group must not force background");
+        let req = parse_spawn_request(&v, &reg).unwrap().background;
+        assert_eq!(
+            req,
+            BackgroundRequest::default(),
+            "blank group must not force background"
+        );
     }
 
     #[test]

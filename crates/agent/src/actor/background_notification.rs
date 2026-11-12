@@ -38,8 +38,11 @@ const RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 const RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
 const BACKGROUND_NOTIFICATION_SOURCE_EVENT_PREFIX: &str = "background-notification:";
 
-fn background_batch_source_event_id(handle_ids: &[String]) -> String {
-    let mut handles: Vec<&str> = handle_ids.iter().map(String::as_str).collect();
+fn background_batch_source_event_id(handle_ids: &[baybo_model::BackgroundHandle]) -> String {
+    let mut handles: Vec<&str> = handle_ids
+        .iter()
+        .map(baybo_model::BackgroundHandle::as_str)
+        .collect();
     handles.sort_unstable();
     let mut hasher = Sha256::new();
     for handle in handles {
@@ -53,7 +56,7 @@ fn background_batch_source_event_id(handle_ids: &[String]) -> String {
     )
 }
 
-fn background_prompt_source_event_id(handle_ids: &[String]) -> String {
+fn background_prompt_source_event_id(handle_ids: &[baybo_model::BackgroundHandle]) -> String {
     format!("{}:prompt", background_batch_source_event_id(handle_ids))
 }
 
@@ -61,7 +64,10 @@ fn background_reanchor_source_event_id(delivery: &BackgroundNotificationDelivery
     background_reanchor_source_event_id_for(&delivery.handle_ids, delivery.prompt_ordinal)
 }
 
-fn background_reanchor_source_event_id_for(handle_ids: &[String], prompt_ordinal: i64) -> String {
+fn background_reanchor_source_event_id_for(
+    handle_ids: &[baybo_model::BackgroundHandle],
+    prompt_ordinal: i64,
+) -> String {
     if handle_ids.is_empty() {
         format!(
             "{BACKGROUND_NOTIFICATION_SOURCE_EVENT_PREFIX}legacy-prompt:{prompt_ordinal}:reanchor"
@@ -222,7 +228,7 @@ impl AgentActor {
     fn release_ready_background_groups(&mut self) -> bool {
         let now = chrono::Utc::now();
         let timeout = chrono::Duration::minutes(GROUP_TIMEOUT_MINUTES);
-        let ready: Vec<String> = self
+        let ready: Vec<baybo_model::CohortKey> = self
             .durable
             .session
             .state
@@ -328,10 +334,11 @@ impl AgentActor {
             return;
         }
 
-        let (handle_ids, result_labels): (Vec<String>, Vec<String>) = pending
-            .iter()
-            .map(|result| (result.handle_id.clone(), result.label.clone()))
-            .unzip();
+        let (handle_ids, result_labels): (Vec<baybo_model::BackgroundHandle>, Vec<String>) =
+            pending
+                .iter()
+                .map(|result| (result.handle_id.clone(), result.label.clone()))
+                .unzip();
         let content = baybo_context::prompts::background_notification::build_notification_content(
             &pending,
             &self.volatile.workspace,
@@ -823,9 +830,9 @@ mod tests {
 
     #[test]
     fn background_source_event_ids_are_stable_and_operation_scoped() {
-        let first = vec!["bg-b".to_string(), "bg-a".to_string()];
-        let reordered = vec!["bg-a".to_string(), "bg-b".to_string()];
-        let different = vec!["bg-a".to_string()];
+        let first: Vec<baybo_model::BackgroundHandle> = vec!["bg-b".into(), "bg-a".into()];
+        let reordered: Vec<baybo_model::BackgroundHandle> = vec!["bg-a".into(), "bg-b".into()];
+        let different: Vec<baybo_model::BackgroundHandle> = vec!["bg-a".into()];
 
         assert_eq!(
             background_prompt_source_event_id(&first),

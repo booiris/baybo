@@ -128,7 +128,7 @@ impl RecordingTool {
 
     /// The `turn_id` of the most recent `execute()` call — lets a test
     /// reconstruct the per-turn cohort key
-    /// (`BackgroundNotificationGroup::cohort_key`) that a
+    /// (`CohortKey::new`) that a
     /// grouped `spawn_subagent` running in that turn would have produced.
     pub fn last_turn_id(&self) -> Option<baybo_model::TurnId> {
         *self.last_turn_id.lock()
@@ -234,8 +234,8 @@ impl ExecSandbox for FakeExecSandbox {
     /// only execs when the script is a single trailing command) would leave the
     /// grandchild alive holding both pipe write ends — the test hangs until the
     /// orphan exits, on the machines where `/bin/sh` is dash and nowhere else.
-    /// It would also report no process group, silently skipping the ledger
-    /// branch in `BackgroundJobManager::detach_command`.
+    /// It would also report no process group, so a cancelled detached
+    /// command would leave that grandchild behind.
     async fn spawn_command_detached(
         &self,
         program: &Path,

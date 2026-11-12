@@ -7,24 +7,55 @@
 //! `baybo-subagent` depends on neither the runtime nor `baybo-tools`, so
 //! neither direction closes a loop.
 
-use async_trait::async_trait;
-use baybo_model::{SubagentParentContext, SubagentResult, SubagentSpawnRequest};
+use std::time::Duration;
 
-/// Launches a child subagent and returns the result the tool renders.
+use async_trait::async_trait;
+use baybo_model::{SessionId, SubagentParentContext, SubagentResult, SubagentSpawnRequest};
+use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
+
+/// How long a foreground spawn blocks the parent's turn before `on_timeout`
+/// decides whether it moves to the background or is cancelled.
+pub(crate) const SUBAGENT_FOREGROUND_WAIT: Duration = Duration::from_secs(120);
+
+/// Launches a child subagent and hands its run back to the tool.
 ///
-/// One call covers both regimes (the `request.background` flag selects):
-/// a **foreground** spawn blocks until the child reaches a terminal state
-/// and returns that `SubagentResult`; a **background** spawn returns the
-/// dispatch ack immediately while the child runs on, its terminal later
-/// escorted to the parent as a notification turn. The caller reserves a
-/// fan-out slot before calling and the implementation releases it on the
-/// child's terminal — except when `spawn` is never reached (e.g. the impl
-/// is not yet wired), where the caller releases.
+/// The spawner owns what is particular to a subagent — resolving or creating
+/// the child session, building its actor or external process, and wiring its
+/// cancellation. It does not decide how long the parent waits: the tool runs
+/// the returned [`SubagentRun`] through `baybo_tools::background::run`, which
+/// owns the foreground window, the conversion to background and delivery,
+/// exactly as it does for every other background-capable tool.
+///
+/// The caller reserves a fan-out slot before calling. The implementation
+/// releases it when the run's `terminal` completes, or at once when it
+/// returns [`SpawnedSubagent::Failed`] — except when `spawn` is never reached
+/// (e.g. the impl is not yet wired), where the caller releases.
 #[async_trait]
 pub trait SubagentSpawner: Send + Sync {
     async fn spawn(
         &self,
         parent: SubagentParentContext,
         request: SubagentSpawnRequest,
-    ) -> SubagentResult;
+    ) -> SpawnedSubagent;
+}
+
+/// What [`SubagentSpawner::spawn`] produced.
+pub enum SpawnedSubagent {
+    /// The child exists and its run is ready to be driven.
+    Running(SubagentRun),
+    /// The child never started; this is the result to report.
+    Failed(SubagentResult),
+}
+
+/// A child subagent's run, from the parent's side.
+pub struct SubagentRun {
+    pub child_session_id: SessionId,
+    /// Stops the child. Tripping it makes `terminal` resolve promptly.
+    pub cancel: CancellationToken,
+    /// Starts the child's work when first polled and resolves with its
+    /// terminal result. Anchored to the process when the parent may hand it
+    /// to the background (`SubagentParentContext::background_eligible`), so
+    /// it does not die with the dispatching turn.
+    pub terminal: BoxFuture<'static, SubagentResult>,
 }

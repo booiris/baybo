@@ -374,6 +374,9 @@ pub struct ExecutedTool {
     /// ungated tool). When a call prompts more than once, the LAST decision
     /// wins — it is the one that shaped the outcome.
     pub approval: Option<ApprovalDecision>,
+    /// The raw group of the job this call started detached, if it was part
+    /// of one — the agent loop counts it into the turn's cohort.
+    pub background_group: Option<baybo_model::BackgroundGroupName>,
 }
 
 /// The out-of-band media blocks a `WithAttachments` / `MultiModalText` result
@@ -421,7 +424,7 @@ pub struct ToolExecutor {
     /// is the per-turn [`ToolContext::background_eligible`] gate, not the
     /// presence of this handle. `None` ⇒ no manager wired (argv-mode boots,
     /// tests), so commands keep kill-on-timeout regardless.
-    background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
+    background_jobs: Option<Arc<dyn baybo_tools::background::BackgroundJobSink>>,
     /// Control surface for the `JobList` / `JobStop` tools. Wired like
     /// [`Self::background_jobs`] (same runtime component implements both).
     background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
@@ -451,7 +454,7 @@ impl ToolExecutor {
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
         sandbox_bypass_reason: Option<String>,
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
-        background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
+        background_jobs: Option<Arc<dyn baybo_tools::background::BackgroundJobSink>>,
         background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
         board: Option<BoardStores>,
     ) -> Self {
@@ -676,6 +679,7 @@ impl ToolExecutor {
                 return ExecutedTool {
                     output: Err(e),
                     approval: None,
+                    background_group: None,
                 };
             }
             // The channel-restricted tool is already omitted from the LLM's
@@ -689,6 +693,7 @@ impl ToolExecutor {
                         user.channel.as_str()
                     )),
                     approval: None,
+                    background_group: None,
                 };
             }
         }
@@ -702,6 +707,7 @@ impl ToolExecutor {
                     tool_name
                 )),
                 approval: None,
+                background_group: None,
             };
         }
         let (pinned_tool, pinned_manifest) = match registration {
@@ -723,6 +729,9 @@ impl ToolExecutor {
         // die with the closure.
         let approval_slot: Arc<Mutex<Option<ApprovalDecision>>> = Arc::new(Mutex::new(None));
         let approval_sink = Arc::clone(&approval_slot);
+        let group_slot: Arc<parking_lot::Mutex<Option<baybo_model::BackgroundGroupName>>> =
+            Arc::default();
+        let group_sink = Arc::clone(&group_slot);
 
         // Open the tool span up front so denials and approval failures still
         // appear in the trace tree. The handle carries the begin-time kind, so
@@ -1029,6 +1038,7 @@ impl ToolExecutor {
                     background_eligible,
                     background_jobs: self.background_jobs.clone(),
                     background_control: self.background_control.clone(),
+                    background_dispatch: Default::default(),
                     notify_silence,
                     checkout_root: checkout.map(|c| c.root),
                     agent_handle,
@@ -1066,6 +1076,7 @@ impl ToolExecutor {
                 if let Some(decision) = approval_probe.last_decision() {
                     *approval_sink.lock() = Some(decision);
                 }
+                *group_sink.lock() = ctx.background_dispatch.take_group();
 
                 // Flush tool-reported events as span events, regardless
                 // of whether the tool succeeded, failed, or hit the
@@ -1203,6 +1214,7 @@ impl ToolExecutor {
         ExecutedTool {
             output,
             approval: *approval_slot.lock(),
+            background_group: group_slot.lock().take(),
         }
     }
 }
