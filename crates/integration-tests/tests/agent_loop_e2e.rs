@@ -6244,7 +6244,6 @@ struct FanOutProbe;
 
 const FAN_OUT_PROBE_BACKGROUND: baybo_tools::background::BackgroundSupport =
     baybo_tools::background::BackgroundSupport {
-        window: baybo_tools::background::ForegroundWindow::Fixed(Duration::from_secs(60)),
         start_detached: true,
     };
 
@@ -6286,6 +6285,8 @@ impl Tool for FanOutProbe {
         let request =
             baybo_tools::background::BackgroundRequest::parse(&params, &FAN_OUT_PROBE_BACKGROUND)
                 .map_err(baybo_tools::ToolError::InvalidParams)?;
+        let run_time = baybo_tools::background::requested_run_time(&params, ctx)
+            .map_err(baybo_tools::ToolError::InvalidParams)?;
         let task = params["task"].as_str().unwrap_or_default().to_string();
         let handle = baybo_model::BackgroundHandle::new();
         let cancel = CancellationToken::new();
@@ -6312,14 +6313,20 @@ impl Tool for FanOutProbe {
                 })
             }),
         };
-        match baybo_tools::background::run(ctx, &request, Duration::from_secs(60), job).await {
+        match baybo_tools::background::run(ctx, &request, run_time, job).await {
             baybo_tools::background::Ran::Backgrounded(backgrounded) => Ok(ToolOutput::Text(
                 baybo_tools::background::ack(&backgrounded, &[]),
             )),
+            baybo_tools::background::Ran::TimedOut(()) => {
+                Ok(ToolOutput::Text(FAN_OUT_PROBE_KILLED.into()))
+            }
             _ => Ok(ToolOutput::Text("finished in the foreground".into())),
         }
     }
 }
+
+/// What [`FanOutProbe`] answers when its run time elapsed and it was killed.
+const FAN_OUT_PROBE_KILLED: &str = "killed when its run time elapsed";
 
 /// A sink that keeps what it is handed and never delivers it, so a test can
 /// read what the runtime adopted and deliver results itself.
@@ -6343,6 +6350,87 @@ impl BackgroundJobSink for HoldingSink {
 /// handed over is recorded as the fire's, so the follow-up is treated as the
 /// fire's report; and a fire that said nothing but started work reports that
 /// results will follow, not that it produced nothing.
+/// A fire's own turn kills a call that overruns, rather than moving it to the
+/// background: a fire that did would push "results will follow" and then the
+/// result. Starting work detached on purpose is unaffected (see
+/// `a_recurring_fires_own_turn_records_the_work_it_hands_over`).
+#[tokio::test]
+async fn a_recurring_fires_own_turn_kills_an_overrun() {
+    let mut session = cron_fire_session(true, false);
+    session.state.background_notifications.fire_handles.clear();
+    let fire_session_id = session.id.clone();
+    let sink = Arc::new(HoldingSink::default());
+    let probe = Arc::new(FanOutProbe);
+    let manifest = probe.manifest();
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(probe as Arc<dyn Tool>, manifest)
+        .with_background_jobs(Arc::clone(&sink) as Arc<dyn BackgroundJobSink>)
+        .build();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: String::new(),
+        content_blocks: vec![],
+        tool_calls: vec![ToolCallInfo {
+            id: "c1".into(),
+            name: FAN_OUT_PROBE.into(),
+            arguments: json!({ "task": "run the build", "timeout_ms": 50 }),
+            signature: None,
+        }],
+        usage: Default::default(),
+        thinking: None,
+    });
+    harness.stub_llm.push_response(LlmResponse {
+        content: "the build did not finish".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::CronTrigger {
+            builtin: None,
+            job_id: "cj-watch".into(),
+            title: "Watcher".into(),
+            prompt: "check the build".into(),
+            delivery: baybo_agent::actor::CronDelivery::Channel,
+        })
+        .await
+        .unwrap();
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        sink.0.lock().is_empty(),
+        "the overrun was killed, not handed over"
+    );
+    let requests = harness.stub_llm.captured_requests();
+    let tool_result = requests
+        .last()
+        .expect("the fire answered after its tool call")
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .any(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains(FAN_OUT_PROBE_KILLED)));
+    assert!(tool_result, "the call reports it was killed");
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session");
+    assert!(
+        stored
+            .state
+            .background_notifications
+            .fire_handles
+            .is_empty()
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_recurring_fires_own_turn_records_the_work_it_hands_over() {
     let mut session = cron_fire_session(true, false);

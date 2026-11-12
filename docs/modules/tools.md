@@ -459,16 +459,18 @@ across a session's turns.
 
 The background options themselves have one home, `baybo_tools::background`.
 A tool that can hand slow work to the background returns a `BackgroundSupport`
-from `Tool::background_support` — its foreground window (a deadline parameter,
-or a fixed wait) and whether it can start detached — and adds the options to
-its schema with `background::declare_options`: `on_timeout` always, plus
-`background` and `group` when it can start detached. `BackgroundRequest::parse`
-is the one, strict reading of them (an unknown `on_timeout` is an error, never
-a silent default). The registry withholds the declared options in
-`tool_definition_offered` wherever the session is not `background_eligible`, so
-no tool strips them by hand; ineligible sessions, including subagents with a
-user trigger, are offered none of them. Bash keeps `timeout_ms` there and
-rewords it to say reaching it terminates the command.
+from `Tool::background_support` — whether it can start detached — and adds the
+options to its schema with `background::declare_options`: `timeout_ms` and
+`on_timeout` always, plus `background` and `group` when it can start detached.
+`background::requested_run_time` and `BackgroundRequest::parse` are the one,
+strict reading of them (an unknown `on_timeout` is an error, never a silent
+default). `timeout_ms` is how long the call may run in the foreground:
+`FOREGROUND_WINDOW` (10 minutes) by default, at most `MAX_RUN_TIME` (1 hour).
+The registry narrows the declared options in `tool_definition_offered`
+wherever the session is not `background_eligible`, so no tool does it by hand:
+ineligible sessions, including subagents with a user trigger, are offered none
+of the background options, and `timeout_ms` there says reaching it terminates
+the call.
 
 ### Background jobs as a capability
 
@@ -479,13 +481,17 @@ tool can name things after it before the work starts), a kind and summary for
 `terminal` future, and `into_result` turning its outcome into a
 `PendingBackgroundResult` — and calls `background::run`, which owns:
 
-- **The window.** An ineligible session (or no sink wired) waits with no
-  window at all. A `BackgroundRequest::Detach` (`background` / `group`, which
-  `BackgroundRequest::parse` reads only for a tool whose support says
-  `start_detached`) is handed over at once.
-  Otherwise the job runs up to the window; then `on_timeout` either hands it
-  over or cancels it. The turn's own stop cancels a job only while it is in
-  the foreground.
+- **The run time.** A `BackgroundRequest::Detach` (`background` / `group`,
+  which `BackgroundRequest::parse` reads only for a tool whose support says
+  `start_detached`) is handed over at once where the session can take
+  background work. Otherwise the job runs in the foreground for up to its run
+  time. Where `ToolContext::overrun_moves_to_background` says an overrun moves
+  to the background (`on_timeout = background`, a `background_eligible`
+  session, a sink wired, and a turn that is not a cron fire's own), the wait is
+  also capped at `FOREGROUND_WINDOW` and the job is handed over; otherwise it
+  is cancelled when its run time elapses — so a call that cannot go to the
+  background runs at most an hour. The turn's own stop cancels a job only
+  while it is in the foreground.
 - **The hand-over** to the `BackgroundJobSink` (`ToolContext::background_jobs`,
   `baybo_agent::BackgroundJobManager` in production): one in-flight registry
   entry keyed by handle, one escort that delivers the result as
@@ -494,10 +500,11 @@ tool can name things after it before the work starts), a kind and summary for
 - **The answer** the model gets: `background::ack`, one header per way the
   job got there, the handle, the tool's own detail lines, and
   `BACKGROUND_DISPATCH_YIELD_GUIDANCE`.
-- **Group counting.** `run` records a grouped hand-over on
-  `ToolContext::background_dispatch`; the executor surfaces it as
-  `ExecutedTool::background_group` and the agent loop counts it into the
-  turn's cohort — for any tool, with no string matching on the answer.
+- **The hand-over record.** `run` records every hand-over
+  (`HandedOver { handle, group }`) on `ToolContext::background_dispatch`; the
+  executor surfaces it as `ExecutedTool::handed_over`, and the agent loop
+  counts a grouped one into the turn's cohort and keeps the turn's handles —
+  for any tool, with no string matching on the answer.
 
 The tool keeps what differs: how its work survives the turn (Bash: a detached
 process group streaming to output files; `spawn_subagent`: a child actor or
@@ -513,7 +520,7 @@ Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self
 
 Current overrides:
 
-- `BashTool` → 600 s — builds, test suites, and migrations regularly run for minutes; the per-call `timeout_ms` parameter still tightens further inside the tool.
+- `BashTool` → 1 h (`background::MAX_RUN_TIME`) — builds, test suites, and migrations regularly run for minutes; the per-call `timeout_ms` (10 minutes by default) bounds each command inside the tool.
 - `WebFetchTool` → 120 s — slow upstreams need headroom, but a stuck host shouldn't pin a turn forever; `connect_timeout` independently caps the connect phase at 10 s.
 - `SkillInstallTool` → 120 s — risk-assessor LLM call + recursive directory copy + registry hot-reload, against bundles that may carry templates + scripts + reference docs.
 - `GlobTool`, `GrepTool`, `AttachFileTool`, `PutBlobTool`, `SkillTool`, `McpTool` → 60 s — recursive walks against large monorepos (`Glob`, `Grep`), 100-MiB file streams into the blob store (`AttachFile`, `PutBlob`), the per-call risk-assessor LLM round-trip (`Skill`), and arbitrary upstream MCP servers (`McpTool`) all routinely overflow the 30 s default.

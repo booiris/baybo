@@ -380,6 +380,26 @@ pub struct ExecutedTool {
     pub handed_over: Option<baybo_tools::background::HandedOver>,
 }
 
+/// What a turn lets its calls leave running past it, fixed for the turn.
+/// Forwarded verbatim to the [`baybo_tools::ToolContext`] fields of the same
+/// meaning, which document the rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnBackground {
+    /// [`baybo_tools::ToolContext::background_eligible`].
+    pub eligible: bool,
+    /// [`baybo_tools::ToolContext::overrun_to_background`].
+    pub overrun_to_background: bool,
+}
+
+impl TurnBackground {
+    /// Nothing outlives the turn.
+    #[cfg(test)]
+    pub(crate) const NONE: Self = Self {
+        eligible: false,
+        overrun_to_background: false,
+    };
+}
+
 /// The out-of-band media blocks a `WithAttachments` / `MultiModalText` result
 /// carries beside its text. They never enter the `ToolResult` content, so a
 /// transcript-backed span keeps them on its `PersistedToolCallOutput` to
@@ -651,9 +671,8 @@ impl ToolExecutor {
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.lite_llm` is unset (argv-mode / older tests).
         bind_source: Option<&Arc<BillableLlm>>,
-        // Whether this turn may create background work — forwarded verbatim
-        // to `ToolContext::background_eligible`, which documents the rule.
-        background_eligible: bool,
+        // What this turn lets its calls leave running past it.
+        background: TurnBackground,
         // Per-session read-before-write tracker. `Read` records into it;
         // `Edit`/`Write` enforce against it. Cheap to clone (one `Arc`).
         read_tracker: ReadTracker,
@@ -1036,7 +1055,8 @@ impl ToolExecutor {
                     // contract here (unlike the background-summary pass).
                     read_tracker: Some(read_tracker),
                     inherited_context: inherited_context.clone(),
-                    background_eligible,
+                    background_eligible: background.eligible,
+                    overrun_to_background: background.overrun_to_background,
                     background_jobs: self.background_jobs.clone(),
                     background_control: self.background_control.clone(),
                     background_dispatch: Default::default(),
@@ -2030,7 +2050,7 @@ mod tests {
                 CancellationToken::new(),
                 None,
                 None,
-                false,
+                TurnBackground::NONE,
                 ReadTracker::default(),
                 None,
                 None,
@@ -2468,7 +2488,7 @@ mod tests {
                 CancellationToken::new(),
                 None,
                 None,
-                false,
+                TurnBackground::NONE,
                 ReadTracker::default(),
                 None,
                 inherited_context,
@@ -2725,7 +2745,7 @@ mod tests {
                 CancellationToken::new(),
                 None,
                 None,
-                false,
+                TurnBackground::NONE,
                 ReadTracker::default(),
                 None,
                 None,

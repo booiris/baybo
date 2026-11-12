@@ -71,7 +71,7 @@ The fire still ran and its reply row and transcript survive in the (hidden) sess
 
 ### A recurring fire can move its work to the background
 
-A recurring fire's own turn may hand slow work to the background like any chat turn (`Session::can_host_background_jobs`): it reports what it has, ends, and the analysed result arrives later as a background-notification turn in the same conversation. That follow-up is the fire's real report, so it is treated like the fire:
+A recurring fire's own turn may start slow work in the background (`Session::can_host_background_jobs`), as a chat turn can: it reports what it has, ends, and the analysed result arrives later as a background-notification turn in the same conversation. Only work started detached on purpose (`background` / `group`) goes there — a call that merely overruns its `timeout_ms` in the fire's own turn is killed, since moving it would push "results will follow" and then the result. That follow-up is the fire's real report, so it is treated like the fire:
 
 - **Which follow-ups count.** The agent loop records the handles each turn hands over; after the fire turn — even one that went on to fail — the actor stores them as `BackgroundNotificationState::fire_handles`, and a fire report's own hand-overs join them. A notification batch carrying only those handles is the fire's report. A batch with any work a user started by replying reports like any chat's, so the user's own result can never be silenced.
 - **Silence.** The follow-up turn gets a `NotifySilence`, so `report_nothing` silences it exactly as it could the fire. Like the fire, it does not stream, so a silenced follow-up shows nothing live.

@@ -7,16 +7,10 @@
 //! `baybo-subagent` depends on neither the runtime nor `baybo-tools`, so
 //! neither direction closes a loop.
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 use baybo_model::{SessionId, SubagentParentContext, SubagentResult, SubagentSpawnRequest};
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
-
-/// How long a foreground spawn blocks the parent's turn before `on_timeout`
-/// decides whether it moves to the background or is cancelled.
-pub(crate) const SUBAGENT_FOREGROUND_WAIT: Duration = Duration::from_secs(120);
 
 /// Launches a child subagent and hands its run back to the tool.
 ///

@@ -1031,7 +1031,12 @@ impl AgentLoop {
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
-        let background_eligible = session.can_host_background_jobs();
+        // A cron fire that overran would push "results will follow" and then
+        // the result; its overruns are killed instead.
+        let background = crate::runtime::tool_executor::TurnBackground {
+            eligible: session.can_host_background_jobs(),
+            overrun_to_background: !matches!(turn_kind, TurnInputKind::Cron),
+        };
         self.context_manager.ensure_seeded().await?;
         // Churn and repeated failure are within-turn properties. Editing a
         // file back to how it was is exactly what "undo that" means when the
@@ -1213,7 +1218,7 @@ impl AgentLoop {
                         notifier.clone(),
                         &cancel_token,
                         &mut turn_attachments,
-                        background_eligible,
+                        background,
                         notify_silence.clone(),
                         inherited_context.clone(),
                     );
@@ -1336,9 +1341,9 @@ impl AgentLoop {
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
         turn_attachments: &mut Vec<ContentBlock>,
-        // Whether this turn may create background work — computed once per
-        // turn in `run_inner`.
-        background_eligible: bool,
+        // What this turn lets its calls leave running past it — computed once
+        // per turn in `run_inner`.
+        background: crate::runtime::tool_executor::TurnBackground,
         notify_silence: Option<baybo_tools::NotifySilence>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<IterationOutcome> {
@@ -1585,7 +1590,7 @@ impl AgentLoop {
                             cancel,
                             notifier,
                             Some(&bind_source),
-                            background_eligible,
+                            background,
                             read_tracker,
                             notify_silence,
                             inherited_context,

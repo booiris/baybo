@@ -193,7 +193,7 @@ Each `<result>` element's `<output>` is capped at `MAX_RESULT_BYTES` —
 defined as `MAX_TOOL_OUTPUT_BYTES`, deliberately the same budget the *same*
 report would have kept had the job finished inside its foreground wait and
 returned as a tool result. The two paths must agree: a foreground subagent
-that crosses `SUBAGENT_FOREGROUND_WAIT` converts to background and delivers
+that crosses its foreground window (`FOREGROUND_WINDOW`) converts to background and delivers
 here instead, and when this cap was smaller that conversion silently cost a
 report ~30x more of itself than finishing a second earlier would have. One
 turn's combined bodies are additionally bounded by `MAX_BATCH_BYTES`, split

@@ -5,14 +5,15 @@
 //! [`BackgroundSupport`] from [`crate::Tool::background_support`]. Everything
 //! that is the same for every such tool lives here, once:
 //!
-//! - **The options.** [`declare_options`] adds `on_timeout` (and, where the
-//!   tool can start work detached, `background` and `group`) to the tool's
-//!   schema; the registry strips them again wherever the session cannot run
-//!   background work ([`withhold_options`]), so the model is never offered a
-//!   choice the runtime would refuse.
-//! - **Their parsing.** [`BackgroundRequest::parse`] is the one reading of
-//!   those options, strict for every tool.
-//! - **The lifecycle.** [`run`] owns the foreground window: it waits on the
+//! - **The options.** [`declare_options`] adds `timeout_ms` and `on_timeout`
+//!   (and, where the tool can start work detached, `background` and `group`)
+//!   to the tool's schema; the registry strips the background ones again
+//!   wherever the session cannot run background work ([`withhold_options`]),
+//!   so the model is never offered a choice the runtime would refuse.
+//! - **Their parsing.** [`requested_run_time`] and
+//!   [`BackgroundRequest::parse`] are the one reading of those options,
+//!   strict for every tool.
+//! - **The lifecycle.** [`run`] owns the foreground run time: it waits on the
 //!   work, stops it with the turn, and on overrun either kills it or hands it
 //!   to the [`BackgroundJobSink`] — which registers it, escorts it to its end
 //!   and delivers the result as a notification turn. It also writes the
@@ -50,20 +51,21 @@ pub const GROUP_PARAM: &str = "group";
 const ON_TIMEOUT_BACKGROUND: &str = "background";
 const ON_TIMEOUT_KILL: &str = "kill";
 
-/// How long a call runs in the foreground before `on_timeout` decides its
-/// fate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForegroundWindow {
-    /// The call's own deadline parameter (e.g. Bash's `timeout_ms`).
-    Param(&'static str),
-    /// A fixed wait the runtime applies to every call.
-    Fixed(Duration),
-}
+/// Parameter bounding how long the call runs in the foreground, in
+/// milliseconds.
+pub const TIMEOUT_PARAM: &str = "timeout_ms";
+/// A call's run time when it names none, and the longest it waits in the
+/// foreground before it may move to the background.
+pub const FOREGROUND_WINDOW: Duration = Duration::from_millis(FOREGROUND_WINDOW_MS);
+/// The longest a call may ask to run in the foreground.
+pub const MAX_RUN_TIME: Duration = Duration::from_millis(MAX_RUN_TIME_MS);
+
+const FOREGROUND_WINDOW_MS: u64 = 10 * 60 * 1000;
+const MAX_RUN_TIME_MS: u64 = 60 * 60 * 1000;
 
 /// A tool's declaration that it can run work past the turn that started it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackgroundSupport {
-    pub window: ForegroundWindow,
     /// Whether the tool accepts [`BACKGROUND_PARAM`] and [`GROUP_PARAM`]:
     /// starting detached at once, alone or as a merged cohort. Only work that
     /// can be handed over before it has produced anything qualifies.
@@ -71,33 +73,19 @@ pub struct BackgroundSupport {
 }
 
 impl BackgroundSupport {
-    fn option_names(&self) -> &'static [&'static str] {
+    fn background_option_names(&self) -> &'static [&'static str] {
         if self.start_detached {
             &[ON_TIMEOUT_PARAM, BACKGROUND_PARAM, GROUP_PARAM]
         } else {
             &[ON_TIMEOUT_PARAM]
         }
     }
-
-    fn window_phrase(&self) -> String {
-        match self.window {
-            ForegroundWindow::Param(param) => format!("When `{param}` elapses"),
-            ForegroundWindow::Fixed(wait) => {
-                let secs = wait.as_secs();
-                if secs >= 60 && secs.is_multiple_of(60) {
-                    format!("After a {}-minute foreground wait", secs / 60)
-                } else {
-                    format!("After a {secs}-second foreground wait")
-                }
-            }
-        }
-    }
 }
 
-/// `schema` plus the background options `support` accepts. The tool's
-/// declared surface — what the manifest records and the executor validates
-/// against — always carries them; [`withhold_options`] narrows only what a
-/// session is offered.
+/// `schema` plus `timeout_ms` and the background options `support` accepts.
+/// The tool's declared surface — what the manifest records and the executor
+/// validates against — always carries them; [`withhold_options`] narrows only
+/// what a session is offered.
 pub fn declare_options(mut schema: Value, support: &BackgroundSupport) -> Value {
     let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
         return schema;
@@ -106,7 +94,29 @@ pub fn declare_options(mut schema: Value, support: &BackgroundSupport) -> Value 
     schema
 }
 
+fn timeout_option(description: String) -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 0,
+        "maximum": MAX_RUN_TIME_MS,
+        "description": description,
+    })
+}
+
+fn run_time_bounds() -> String {
+    format!(
+        "Default (and `0`): {FOREGROUND_WINDOW_MS} (10 minutes); at most {MAX_RUN_TIME_MS} (1 hour)."
+    )
+}
+
 fn insert_options(props: &mut Map<String, Value>, support: &BackgroundSupport) {
+    props.insert(
+        TIMEOUT_PARAM.to_string(),
+        timeout_option(format!(
+            "Milliseconds the call may run. {} With on_timeout='background' it moves to the background once this elapses, and no later than 10 minutes in.",
+            run_time_bounds()
+        )),
+    );
     let ignored_when_detached = if support.start_detached {
         " Ignored when background=true."
     } else {
@@ -119,8 +129,7 @@ fn insert_options(props: &mut Map<String, Value>, support: &BackgroundSupport) {
             "enum": [ON_TIMEOUT_BACKGROUND, ON_TIMEOUT_KILL],
             "default": ON_TIMEOUT_BACKGROUND,
             "description": format!(
-                "{}: 'background' (default) detaches it — handle now, result in a later turn — and 'kill' terminates it.{ignored_when_detached}",
-                support.window_phrase()
+                "For a call still running when `{TIMEOUT_PARAM}` elapses: 'background' (default) detaches it — handle now, result in a later turn — and 'kill' terminates it.{ignored_when_detached}"
             ),
         }),
     );
@@ -142,15 +151,46 @@ fn insert_options(props: &mut Map<String, Value>, support: &BackgroundSupport) {
     }
 }
 
-/// Remove the options `support` declared, for a session that cannot run
-/// background work. Every one of them only chooses *how* to background, so
-/// offering them there is offering a choice the runtime has already made.
+/// Narrow the options `support` declared for a session that cannot run
+/// background work: the background ones go — each only chooses *how* to
+/// background, a choice the runtime has already made — and `timeout_ms`
+/// says the call is terminated when it elapses.
 pub(crate) fn withhold_options(schema: &mut Value, support: &BackgroundSupport) {
     if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-        for name in support.option_names() {
+        for name in support.background_option_names() {
             props.remove(*name);
         }
+        props.insert(
+            TIMEOUT_PARAM.to_string(),
+            timeout_option(format!(
+                "Milliseconds the call may run before it is terminated. {}",
+                run_time_bounds()
+            )),
+        );
     }
+}
+
+/// How long the call in `params` may run in the foreground: its `timeout_ms`,
+/// [`FOREGROUND_WINDOW`] when it names none (or `0`), never more than
+/// [`MAX_RUN_TIME`] — nor than the context's own budget
+/// ([`ToolContext::timeout`]), which is what keeps a test context fast.
+pub fn requested_run_time(params: &Value, ctx: &ToolContext) -> Result<Duration, String> {
+    let requested = match params.get(TIMEOUT_PARAM) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => {
+                return Err(format!(
+                    "{TIMEOUT_PARAM} must be a non-negative integer, got {value}"
+                ));
+            }
+        },
+    };
+    Ok(requested
+        .unwrap_or(FOREGROUND_WINDOW)
+        .min(MAX_RUN_TIME)
+        .min(ctx.timeout))
 }
 
 /// What one call asked for, as the tool's caller sent it.
@@ -173,14 +213,6 @@ pub enum BackgroundRequest {
 impl Default for BackgroundRequest {
     fn default() -> Self {
         Self::Wait(OnTimeout::Background)
-    }
-}
-
-impl BackgroundRequest {
-    /// Whether an overrun of the window hands the work over rather than
-    /// killing it. A detached request is handed over before any window.
-    pub fn backgrounds_on_timeout(&self) -> bool {
-        !matches!(self, Self::Wait(OnTimeout::Kill))
     }
 }
 
@@ -259,14 +291,14 @@ pub struct Job<T> {
 
 /// How a [`Job`] run through [`run`] ended, from the tool call's side.
 pub enum Ran<T> {
-    /// It finished in the foreground: within its window, or with no window at
-    /// all where the session cannot run background work.
+    /// It finished in the foreground, within its run time.
     Finished(T),
     /// The turn was stopped while it ran in the foreground; it was cancelled
     /// and drained.
     Cancelled(T),
-    /// It outlasted its window under `on_timeout = kill`; it was cancelled and
-    /// drained.
+    /// It outlasted its run time where it could not move to the background
+    /// (`on_timeout = kill`, a session or turn that cannot take background
+    /// work); it was cancelled and drained.
     TimedOut(T),
     /// It runs on in the background; tell the model with [`ack`].
     Backgrounded(Backgrounded),
@@ -343,11 +375,13 @@ impl DispatchRecord {
 
 /// Run `job` under the call's background options.
 ///
-/// - The session cannot run background work (or no sink is wired): wait for
-///   the job with no window at all, stopping it with the turn.
-/// - The call asked to start detached: hand it over at once.
-/// - Otherwise wait up to `window`; then `on_timeout` either hands it over or
-///   cancels it.
+/// - The call asked to start detached, and the session can take background
+///   work: hand it over at once.
+/// - Otherwise run it in the foreground for up to `run_time` (from
+///   [`requested_run_time`]). Where [`ToolContext::overrun_moves_to_background`]
+///   says a job still running then moves to the background, the wait is also
+///   capped at [`FOREGROUND_WINDOW`] and the job is handed over; otherwise it is
+///   cancelled once `run_time` elapses.
 ///
 /// The turn's own cancellation reaches the job only while it runs in the
 /// foreground — once handed over it is stopped through `JobStop` / `/stop`.
@@ -359,7 +393,7 @@ impl DispatchRecord {
 pub async fn run<T: Send + 'static>(
     ctx: &ToolContext,
     request: &BackgroundRequest,
-    window: Duration,
+    run_time: Duration,
     job: Job<T>,
 ) -> Ran<T> {
     let Job {
@@ -388,33 +422,24 @@ pub async fn run<T: Send + 'static>(
         .background_jobs
         .as_ref()
         .filter(|_| ctx.can_hand_over_background());
-    let Some(sink) = sink else {
-        let ran = tokio::select! {
-            biased;
-            _ = ctx.cancellation_token.cancelled() => {
-                cancel.cancel();
-                Ran::Cancelled(work.await)
-            }
-            done = &mut work => Ran::Finished(done),
-        };
+    if let (Some(sink), BackgroundRequest::Detach { group }) = (sink, request) {
+        let cohort = group.as_ref().map(|g| CohortKey::new(ctx.turn_id, g));
+        sink.adopt(detached(work, cohort)).await;
         stop_if_abandoned.disarm();
-        return ran;
-    };
-    let on_timeout = match request {
-        BackgroundRequest::Wait(on_timeout) => *on_timeout,
-        BackgroundRequest::Detach { group } => {
-            let cohort = group.as_ref().map(|g| CohortKey::new(ctx.turn_id, g));
-            sink.adopt(detached(work, cohort)).await;
-            stop_if_abandoned.disarm();
-            ctx.background_dispatch.record(HandedOver {
-                handle: handle.clone(),
-                group: group.clone(),
-            });
-            return Ran::Backgrounded(Backgrounded {
-                handle,
-                how: BackgroundedHow::Dispatched,
-            });
-        }
+        ctx.background_dispatch.record(HandedOver {
+            handle: handle.clone(),
+            group: group.clone(),
+        });
+        return Ran::Backgrounded(Backgrounded {
+            handle,
+            how: BackgroundedHow::Dispatched,
+        });
+    }
+    let overrun_sink = sink.filter(|_| ctx.overrun_moves_to_background(request));
+    let window = if overrun_sink.is_some() {
+        run_time.min(FOREGROUND_WINDOW)
+    } else {
+        run_time
     };
 
     let ran = tokio::select! {
@@ -424,16 +449,16 @@ pub async fn run<T: Send + 'static>(
             Ran::Cancelled(work.await)
         }
         done = &mut work => Ran::Finished(done),
-        _ = tokio::time::sleep(window) => match on_timeout {
-            OnTimeout::Kill => {
-                cancel.cancel();
-                Ran::TimedOut(work.await)
-            }
-            OnTimeout::Background => {
+        _ = tokio::time::sleep(window) => match overrun_sink {
+            Some(sink) => {
                 let handle = handle.clone();
                 sink.adopt(detached(work, None)).await;
                 ctx.background_dispatch.record(HandedOver { handle: handle.clone(), group: None });
                 Ran::Backgrounded(Backgrounded { handle, how: BackgroundedHow::Converted(window) })
+            }
+            None => {
+                cancel.cancel();
+                Ran::TimedOut(work.await)
             }
         }
     };
@@ -479,11 +504,9 @@ mod tests {
     use super::*;
 
     const COMMAND_LIKE: BackgroundSupport = BackgroundSupport {
-        window: ForegroundWindow::Param("timeout_ms"),
         start_detached: false,
     };
     const SPAWN_LIKE: BackgroundSupport = BackgroundSupport {
-        window: ForegroundWindow::Fixed(Duration::from_secs(120)),
         start_detached: true,
     };
 
@@ -503,38 +526,60 @@ mod tests {
         let base = json!({"type": "object", "properties": {"command": {"type": "string"}}});
         assert_eq!(
             props(&declare_options(base.clone(), &COMMAND_LIKE)),
-            ["command", "on_timeout"]
+            ["command", "on_timeout", "timeout_ms"]
         );
         assert_eq!(
             props(&declare_options(base, &SPAWN_LIKE)),
-            ["background", "command", "group", "on_timeout"]
+            ["background", "command", "group", "on_timeout", "timeout_ms"]
         );
     }
 
     #[test]
-    fn the_window_is_named_in_the_on_timeout_description() {
+    fn the_run_time_is_bounded_at_an_hour_in_the_schema() {
         let base = json!({"type": "object", "properties": {}});
-        let command = declare_options(base.clone(), &COMMAND_LIKE);
-        assert!(
-            command["properties"]["on_timeout"]["description"]
-                .as_str()
-                .unwrap()
-                .starts_with("When `timeout_ms` elapses:")
-        );
         let spawn = declare_options(base, &SPAWN_LIKE);
+        assert_eq!(spawn["properties"]["timeout_ms"]["maximum"], 3_600_000);
         let described = spawn["properties"]["on_timeout"]["description"]
             .as_str()
             .unwrap();
-        assert!(described.starts_with("After a 2-minute foreground wait:"));
+        assert!(described.starts_with("For a call still running when `timeout_ms` elapses:"));
         assert!(described.ends_with("Ignored when background=true."));
     }
 
+    /// Where nothing can go to the background, the background options go and
+    /// `timeout_ms` stays — as the call's hard limit.
     #[test]
-    fn withholding_removes_exactly_the_declared_options() {
+    fn withholding_keeps_the_run_time_as_a_hard_limit() {
         let base = json!({"type": "object", "properties": {"command": {"type": "string"}}});
         let mut schema = declare_options(base, &SPAWN_LIKE);
         withhold_options(&mut schema, &SPAWN_LIKE);
-        assert_eq!(props(&schema), ["command"]);
+        assert_eq!(props(&schema), ["command", "timeout_ms"]);
+        let described = schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(described.contains("before it is terminated"), "{described}");
+        assert!(!described.contains("background"), "{described}");
+    }
+
+    #[test]
+    fn the_run_time_defaults_to_ten_minutes_and_caps_at_an_hour() {
+        let mut ctx = ToolContext::for_test();
+        ctx.timeout = Duration::from_secs(24 * 60 * 60);
+        let run_time = |params: Value| requested_run_time(&params, &ctx);
+        assert_eq!(run_time(json!({})), Ok(FOREGROUND_WINDOW));
+        assert_eq!(run_time(json!({"timeout_ms": 0})), Ok(FOREGROUND_WINDOW));
+        assert_eq!(
+            run_time(json!({"timeout_ms": 1500})),
+            Ok(Duration::from_millis(1500))
+        );
+        assert_eq!(run_time(json!({"timeout_ms": 7_200_000})), Ok(MAX_RUN_TIME));
+        assert!(run_time(json!({"timeout_ms": "soon"})).is_err());
+        ctx.timeout = Duration::from_secs(5);
+        assert_eq!(
+            requested_run_time(&json!({}), &ctx),
+            Ok(Duration::from_secs(5)),
+            "the context's own budget bounds it too"
+        );
     }
 
     #[test]
@@ -615,13 +660,8 @@ mod tests {
         }
 
         const WINDOW: Duration = Duration::from_secs(120);
-        const CONVERTS: BackgroundSupport = BackgroundSupport {
-            window: ForegroundWindow::Fixed(WINDOW),
-            start_detached: false,
-        };
         const STARTS_DETACHED: BackgroundSupport = BackgroundSupport {
             start_detached: true,
-            ..CONVERTS
         };
 
         fn ctx(eligible: bool) -> (ToolContext, Arc<Adopted>) {
@@ -715,24 +755,48 @@ mod tests {
             assert!(sink.0.lock().is_empty());
         }
 
-        /// Where the session cannot run background work there is no window at
-        /// all: the call waits however long the work takes.
+        /// Where the session cannot run background work, the run time is a
+        /// hard limit: the work is killed when it elapses, `background` or not.
         #[tokio::test(start_paused = true)]
-        async fn an_ineligible_session_waits_past_the_window() {
+        async fn an_ineligible_session_kills_at_the_run_time() {
             let (ctx, sink) = ctx(false);
-            let (job, finish, _) = job();
-            let waiting =
-                tokio::spawn(
-                    async move { run(&ctx, &BackgroundRequest::default(), WINDOW, job).await },
-                );
-            tokio::time::advance(WINDOW * 3).await;
-            assert!(
-                !waiting.is_finished(),
-                "no timer where nothing can background"
-            );
-            finish.send(()).unwrap();
-            assert!(matches!(waiting.await.unwrap(), Ran::Finished("done")));
+            let (job, _finish, cancel) = job();
+            let ran = run(&ctx, &BackgroundRequest::default(), MAX_RUN_TIME, job).await;
+            assert!(matches!(ran, Ran::TimedOut("cancelled")));
+            assert!(cancel.is_cancelled());
             assert!(sink.0.lock().is_empty());
+        }
+
+        /// A cron fire's own turn kills an overrun instead of handing it over,
+        /// even where the session could take background work.
+        #[tokio::test(start_paused = true)]
+        async fn a_turn_that_keeps_overruns_kills_them() {
+            let (mut ctx, sink) = ctx(true);
+            ctx.overrun_to_background = false;
+            let (job, _finish, cancel) = job();
+            let ran = run(&ctx, &BackgroundRequest::default(), WINDOW, job).await;
+            assert!(matches!(ran, Ran::TimedOut("cancelled")));
+            assert!(cancel.is_cancelled());
+            assert!(sink.0.lock().is_empty());
+        }
+
+        /// A long run time does not hold a call that may move to the
+        /// background in the foreground past the window.
+        #[tokio::test(start_paused = true)]
+        async fn an_overrun_moves_to_the_background_no_later_than_the_window() {
+            let (ctx, sink) = ctx(true);
+            let (job, _finish, _) = job();
+            let started = tokio::time::Instant::now();
+            let ran = run(&ctx, &BackgroundRequest::default(), MAX_RUN_TIME, job).await;
+            let Ran::Backgrounded(backgrounded) = ran else {
+                panic!("the overrun moves to the background");
+            };
+            assert_eq!(started.elapsed(), FOREGROUND_WINDOW);
+            assert_eq!(
+                backgrounded.how,
+                BackgroundedHow::Converted(FOREGROUND_WINDOW)
+            );
+            assert_eq!(sink.0.lock().len(), 1);
         }
 
         #[tokio::test(start_paused = true)]

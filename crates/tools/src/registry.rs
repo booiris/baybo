@@ -1297,7 +1297,7 @@ mod offered_schema_tests {
             bash.parameters_schema["properties"]["timeout_ms"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("terminates the command")
+                .contains("before it is terminated")
         );
 
         let (tool, manifest) = registry.get_with_manifest("Bash").unwrap();

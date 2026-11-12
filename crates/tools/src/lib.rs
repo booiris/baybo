@@ -461,6 +461,12 @@ pub struct ToolContext {
     /// deliberately ignore this and go straight to
     /// [`Self::background_control`].
     pub background_eligible: bool,
+    /// Whether a call still running when its foreground window elapses may
+    /// move to the background (`on_timeout = background`). `false` in a cron
+    /// fire's own turn: a fire that overran would push "results will follow"
+    /// and then the result, so its overruns are killed instead. Starting work
+    /// detached on purpose (`background` / `group`) is unaffected.
+    pub overrun_to_background: bool,
     /// The sink background-capable tools hand work to (through
     /// [`background::run`]) once it runs past its foreground window.
     /// A capability handle, not a policy switch: `None` only when the
@@ -509,6 +515,19 @@ impl ToolContext {
     pub fn can_hand_over_background(&self) -> bool {
         self.background_eligible && self.background_jobs.is_some()
     }
+
+    /// Whether `request`'s call, still running when its window elapses, moves
+    /// to the background rather than being killed. The one answer to that
+    /// question — [`background::run`] decides by it, and Bash asks it before
+    /// choosing its blocking path.
+    pub fn overrun_moves_to_background(&self, request: &background::BackgroundRequest) -> bool {
+        self.can_hand_over_background()
+            && self.overrun_to_background
+            && matches!(
+                request,
+                background::BackgroundRequest::Wait(baybo_model::OnTimeout::Background)
+            )
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -553,6 +572,7 @@ impl ToolContext {
             // `background_jobs`, so defaulting to eligible keeps a fixture
             // that wires the sink meaning what it says.
             background_eligible: true,
+            overrun_to_background: true,
             background_jobs: None,
             background_control: None,
             background_dispatch: Default::default(),
