@@ -577,10 +577,6 @@ pub struct AgentLoop {
     /// ordinary work when the user asked for it between turns, and only
     /// becomes churn inside a single turn.
     progress_monitor: TurnProgressMonitor,
-    /// Handles of the jobs the current (or last finished) turn handed to the
-    /// background. Reset at the top of every turn; read once it ends through
-    /// [`Self::take_turn_background_handles`].
-    turn_background_handles: Vec<baybo_model::BackgroundHandle>,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -720,7 +716,6 @@ impl AgentLoop {
             title_sink,
             read_tracker: ReadTracker::default(),
             progress_monitor: TurnProgressMonitor::default(),
-            turn_background_handles: Vec::new(),
         }
     }
 
@@ -862,10 +857,11 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
-        // A recurring cron fire hands its tools a silence handle here so
-        // `report_nothing` can suppress the fire's notification. `None` for
-        // every other turn (see `AgentActor::dispatch_cron_prompt`).
-        notify_silence: Option<baybo_tools::NotifySilence>,
+        // A recurring cron fire's turn — its own, or its report's — passes
+        // its `FireTurn` here: `report_nothing` silences it, and every job the
+        // turn hands to the background is recorded on it. `None` for every
+        // other turn (see `AgentActor::dispatch_cron_prompt`).
+        fire: Option<crate::runtime::fire_turn::FireTurn>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.run_with_optional_inherited_context(
             session,
@@ -876,7 +872,7 @@ impl AgentLoop {
             delta_tx,
             cancel_token,
             interjections,
-            notify_silence,
+            fire,
             None,
         )
         .await
@@ -896,7 +892,7 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
-        notify_silence: Option<baybo_tools::NotifySilence>,
+        fire: Option<crate::runtime::fire_turn::FireTurn>,
         inherited_context: InheritedToolContext,
     ) -> anyhow::Result<OutgoingMessage> {
         self.run_with_optional_inherited_context(
@@ -908,7 +904,7 @@ impl AgentLoop {
             delta_tx,
             cancel_token,
             interjections,
-            notify_silence,
+            fire,
             Some(inherited_context),
         )
         .await
@@ -925,7 +921,7 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
-        notify_silence: Option<baybo_tools::NotifySilence>,
+        fire: Option<crate::runtime::fire_turn::FireTurn>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
@@ -969,11 +965,11 @@ impl AgentLoop {
                         interjections,
                         memory_query,
                         turn_kind,
-                        notify_silence.clone(),
+                        fire.clone(),
                         inherited_context.clone(),
                     )
                     .await?;
-                let output = if notify_silence.as_ref().is_some_and(|s| s.requested()) {
+                let output = if fire.as_ref().is_some_and(|f| f.silence.requested()) {
                     // A recurring cron fire called `report_nothing`: complete
                     // with a reply-less structured result so the Completed edge
                     // carries no reply ordinal and the push dispatcher skips it
@@ -1027,7 +1023,7 @@ impl AgentLoop {
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
         turn_kind: TurnInputKind,
-        notify_silence: Option<baybo_tools::NotifySilence>,
+        fire: Option<crate::runtime::fire_turn::FireTurn>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
@@ -1042,7 +1038,6 @@ impl AgentLoop {
         // file back to how it was is exactly what "undo that" means when the
         // user asks between turns.
         self.progress_monitor.clear();
-        self.turn_background_handles.clear();
         self.context_manager.set_progress_observation(None);
 
         // Fire-and-forget at turn start so the title derives concurrently with
@@ -1219,7 +1214,7 @@ impl AgentLoop {
                         &cancel_token,
                         &mut turn_attachments,
                         background,
-                        notify_silence.clone(),
+                        fire.clone(),
                         inherited_context.clone(),
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
@@ -1344,7 +1339,7 @@ impl AgentLoop {
         // What this turn lets its calls leave running past it — computed once
         // per turn in `run_inner`.
         background: crate::runtime::tool_executor::TurnBackground,
-        notify_silence: Option<baybo_tools::NotifySilence>,
+        fire: Option<crate::runtime::fire_turn::FireTurn>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
@@ -1524,7 +1519,7 @@ impl AgentLoop {
                 .record_prompt_delivered(&path, fingerprint);
         }
         let read_tracker_for_calls = self.read_tracker.clone();
-        let notify_silence_for_calls = notify_silence.clone();
+        let notify_silence_for_calls = fire.as_ref().map(|f| f.silence.clone());
         let inherited_context_for_calls = inherited_context.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response
@@ -1677,8 +1672,9 @@ impl AgentLoop {
                         .background_notifications
                         .register_group_member(turn_id, group);
                 }
-                self.turn_background_handles
-                    .push(handed_over.handle.clone());
+                if let Some(fire) = &fire {
+                    fire.record_hand_over(handed_over.handle.clone());
+                }
             }
 
             let raw_result_text = match &executed.output {
@@ -2495,12 +2491,6 @@ impl AgentLoop {
             .context_manager
             .append_idempotent(source_event_id, &ChatMessage::agent_context(content))
             .await?)
-    }
-
-    /// The handles of the jobs the last turn handed to the background,
-    /// emptying the record.
-    pub(crate) fn take_turn_background_handles(&mut self) -> Vec<baybo_model::BackgroundHandle> {
-        std::mem::take(&mut self.turn_background_handles)
     }
 
     /// Arm or clear the request-time background-notification retry cue. Applied

@@ -596,9 +596,10 @@ impl AgentActor {
         // otherwise leave to run as follow-up turns. Caught after the loop fully
         // returns, so it covers every cancellation path (incl. mid-LLM-call).
         stopped_out: Option<&mut bool>,
-        // A recurring cron fire's silence handle for `report_nothing`;
-        // `None` for every other turn. See `dispatch_cron_prompt`.
-        notify_silence: Option<baybo_tools::NotifySilence>,
+        // A recurring cron fire's turn (its own, or its report's): the
+        // `report_nothing` silence and the record of what it hands to the
+        // background. `None` for every other turn. See `dispatch_cron_prompt`.
+        fire: Option<crate::runtime::fire_turn::FireTurn>,
         // Transient authority supplied by the turn dispatcher. It is not
         // reconstructed from persistent session metadata on later turns.
         inherited_context: Option<baybo_model::InheritedToolContext>,
@@ -626,7 +627,7 @@ impl AgentActor {
                         delta_tx,
                         turn_token.clone(),
                         interjections,
-                        notify_silence,
+                        fire,
                         context,
                     )
                     .await
@@ -643,7 +644,7 @@ impl AgentActor {
                         delta_tx,
                         turn_token.clone(),
                         interjections,
-                        notify_silence,
+                        fire,
                     )
                     .await
             }
@@ -742,10 +743,11 @@ impl AgentActor {
             .append_cron_fire(job_id, prompt, prompt_context.as_deref())
             .await?;
         // Only a recurring fire (which owns a listed conversation) can be
-        // silenced by `report_nothing`; a one-shot always reports back, so it
-        // gets no handle and the tool is never even offered in its session.
-        let silence =
-            matches!(delivery, CronDelivery::Channel).then(baybo_tools::NotifySilence::new);
+        // silenced by `report_nothing` or leave work in the background; a
+        // one-shot always reports back and its workspace hosts no background
+        // work, so it gets no `FireTurn`.
+        let fire = matches!(delivery, CronDelivery::Channel)
+            .then(crate::runtime::fire_turn::FireTurn::new);
         let ran = self
             .run_agent_loop(
                 turn_input,
@@ -753,18 +755,18 @@ impl AgentActor {
                 None,
                 None,
                 None,
-                silence.clone(),
+                fire.clone(),
                 Some(baybo_model::InheritedToolContext),
             )
             .await;
         // Recorded whether or not the turn went on to fail: work it handed
-        // over runs on, and its follow-up is the fire's report either way. A
-        // one-shot fire's workspace cannot host background work, so only a
-        // recurring fire can have handed any over.
-        let started_background =
-            matches!(delivery, CronDelivery::Channel) && self.record_fire_handles().await;
+        // over runs on, and its follow-up is the fire's report either way.
+        let started_background = match &fire {
+            Some(fire) => self.record_fire_handles(fire.handed_over()).await,
+            None => false,
+        };
         let response = ran?;
-        let silenced = silence.as_ref().is_some_and(|s| s.requested());
+        let silenced = fire.as_ref().is_some_and(|f| f.silence.requested());
         match delivery {
             CronDelivery::OriginSession => {}
             CronDelivery::Channel if silenced => {
@@ -802,8 +804,7 @@ impl AgentActor {
     /// so their follow-up is recognised as the fire's report (see
     /// `BackgroundNotificationState::fire_handles`). Returns whether there
     /// were any.
-    async fn record_fire_handles(&mut self) -> bool {
-        let handles = self.volatile.agent_loop.take_turn_background_handles();
+    async fn record_fire_handles(&mut self, handles: Vec<baybo_model::BackgroundHandle>) -> bool {
         if handles.is_empty() {
             return false;
         }

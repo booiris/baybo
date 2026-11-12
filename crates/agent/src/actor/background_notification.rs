@@ -680,7 +680,7 @@ impl AgentActor {
         // This single arm covers every entry (fresh drain, timer retry, crash
         // replay), so no caller has to reason about the tail.
         self.volatile.agent_loop.set_notification_cue(true);
-        let silence = fire_report.then(baybo_tools::NotifySilence::new);
+        let fire = fire_report.then(crate::runtime::fire_turn::FireTurn::new);
         let result = self
             .run_agent_loop(
                 TurnInput::SubagentNotification { content },
@@ -688,16 +688,16 @@ impl AgentActor {
                 response_tx,
                 None,
                 None,
-                silence.clone(),
+                fire.clone(),
                 None,
             )
             .await;
         self.volatile.agent_loop.set_notification_cue(false);
-        let silenced = silence.as_ref().is_some_and(|s| s.requested());
-        if fire_report {
+        let silenced = fire.as_ref().is_some_and(|f| f.silence.requested());
+        if let Some(fire) = &fire {
             // Work the fire's report hands over in turn is still the fire's:
             // its own follow-up is the next part of the same report.
-            let handed_over = self.volatile.agent_loop.take_turn_background_handles();
+            let handed_over = fire.handed_over();
             self.durable
                 .session
                 .state
