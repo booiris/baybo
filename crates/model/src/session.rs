@@ -635,6 +635,14 @@ pub struct BackgroundNotificationState {
     /// replying in the same conversation reports like any chat's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cron_report_handles: Vec<crate::BackgroundHandle>,
+
+    /// The subset of [`Self::cron_report_handles`] whose result has not
+    /// arrived yet. A job's in-flight record is process-local, so this is the
+    /// only durable trace that a fire still owes a report: a restart that
+    /// kills the job leaves its handle here, and the next boot says so in the
+    /// conversation instead of leaving "results will follow" unanswered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cron_report_awaited: Vec<crate::BackgroundHandle>,
 }
 
 impl BackgroundNotificationState {
@@ -647,6 +655,24 @@ impl BackgroundNotificationState {
             && handle_ids
                 .iter()
                 .all(|id| self.cron_report_handles.contains(id))
+    }
+
+    /// Record the background jobs a recurring fire's turn handed over: their
+    /// follow-up is the fire's report, and each is owed until it arrives.
+    pub fn expect_cron_reports(&mut self, handles: Vec<crate::BackgroundHandle>) {
+        self.cron_report_awaited.extend(handles.iter().cloned());
+        self.cron_report_handles.extend(handles);
+    }
+
+    /// A job's result arrived, or the user stopped it: either way its report
+    /// is no longer owed.
+    pub fn settle_cron_report(&mut self, handle_id: &crate::BackgroundHandle) {
+        self.cron_report_awaited.retain(|id| id != handle_id);
+    }
+
+    /// Whether a recurring fire is still owed a background report.
+    pub fn awaits_cron_reports(&self) -> bool {
+        !self.cron_report_awaited.is_empty()
     }
 
     /// Whether the actor must stay on its notification timer path.

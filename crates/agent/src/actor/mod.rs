@@ -144,6 +144,17 @@ pub enum AgentMessage {
     /// is grouped/buffered and later delivered by one autonomous notification
     /// turn after higher-priority work drains.
     BackgroundJobFinished(Box<PendingBackgroundResult>),
+    /// The user stopped a background job (`/stop` / `JobStop`) and it has
+    /// ended. Nothing is delivered for it, so a recurring cron fire that was
+    /// waiting on its report stops waiting.
+    BackgroundJobStopped(baybo_model::BackgroundHandle),
+    /// A background job crashed: no result will ever be delivered for it. A
+    /// recurring cron fire waiting on its report says so in its conversation.
+    BackgroundJobLost(baybo_model::BackgroundHandle),
+    /// Sent at gateway start to each recurring cron fire still owed a
+    /// background report. No job survives a restart, so every report still
+    /// awaited is lost and the conversation says so.
+    CronBackgroundWorkLost,
     /// Re-pin the session's LLM (chat per-session model switch). `llm`
     /// is the `baybo.json` entry name to resolve against, or `None` to
     /// revert to `default-llm`. The handler re-pins the live loop in
@@ -196,9 +207,11 @@ impl mailbox::Prioritized for AgentMessage {
             | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
             // Same tier as a finished background job: both are autonomous
             // deliveries that wait for a queued user turn but outrank a stop.
-            AgentMessage::BackgroundJobFinished(_) | AgentMessage::CronResultReady(_) => {
-                MessagePriority::BackgroundJobFinished
-            }
+            AgentMessage::BackgroundJobFinished(_)
+            | AgentMessage::BackgroundJobStopped(_)
+            | AgentMessage::BackgroundJobLost(_)
+            | AgentMessage::CronBackgroundWorkLost
+            | AgentMessage::CronResultReady(_) => MessagePriority::BackgroundJobFinished,
             AgentMessage::ActorStop => MessagePriority::Stop,
         }
     }
@@ -554,6 +567,15 @@ impl AgentActor {
             AgentMessage::BackgroundJobFinished(pending) => {
                 self.handle_background_finished(*pending).await;
             }
+            AgentMessage::BackgroundJobStopped(handle) => {
+                self.handle_background_stopped(&handle).await;
+            }
+            AgentMessage::BackgroundJobLost(handle) => {
+                self.handle_background_lost(handle).await;
+            }
+            AgentMessage::CronBackgroundWorkLost => {
+                self.handle_cron_background_work_lost().await;
+            }
             AgentMessage::SetModel { llm, model, effort } => {
                 self.handle_set_model(llm, model, effort);
             }
@@ -820,7 +842,7 @@ impl AgentActor {
             .session
             .state
             .background_notifications
-            .cron_report_handles = handles;
+            .expect_cron_reports(handles);
         self.persist_session_state_with_activity("cron_fire_background_handles")
             .await;
         true
@@ -902,16 +924,23 @@ impl AgentActor {
     /// one-shot's outcome is reported into the conversation that *scheduled* it
     /// (see `handle_cron_result_ready`); reporting from its own invisible
     /// session as well would notify the user twice for one fire.
-    async fn report_cron_outcome(&mut self, title: &str, failed: bool, detail: &str) {
+    ///
+    /// Returns whether the row reached the store, for a caller holding a
+    /// ledger it may only clear once the user has actually been told.
+    async fn report_cron_outcome(&mut self, title: &str, failed: bool, detail: &str) -> bool {
         let content = vec![ContentBlock::Text(
             baybo_context::prompts::cron::frame_cron_notification(title, failed, detail),
         )];
-        if let Err(e) = self.publish_cron_notification(content, None).await {
-            warn!(
-                session_id = %self.durable.session.id,
-                error = %e,
-                "failed to report the cron fire's outcome in its own conversation"
-            );
+        match self.publish_cron_notification(content, None).await {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    error = %e,
+                    "failed to report the cron fire's outcome in its own conversation"
+                );
+                false
+            }
         }
     }
 
