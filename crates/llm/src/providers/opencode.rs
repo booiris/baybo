@@ -7,6 +7,8 @@ use crate::effort::EffortWire;
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, LlmError, ModelInfo};
 
+pub(crate) mod gemini_usage;
+
 pub(crate) const ZEN_PROVIDER_NAME: &str = "opencode";
 pub(crate) const GO_PROVIDER_NAME: &str = "opencode-go";
 const SESSION_HEADER: &str = "x-opencode-session";
@@ -251,10 +253,13 @@ impl OpencodeCompletionModel {
         };
         macro_rules! client {
             ($provider:ident) => {
+                client!($provider, self.http_client.clone())
+            };
+            ($provider:ident, $http:expr) => {
                 $provider::Client::builder()
                     .api_key(api_key)
                     .base_url(&base)
-                    .http_client(self.http_client.clone())
+                    .http_client($http)
                     .http_headers(headers)
                     .build()
                     .map_err(|e| LlmError::Config(format!("build OpenCode client: {e}")))?
@@ -274,9 +279,13 @@ impl OpencodeCompletionModel {
                     .completion_model(&self.model)
                     .with_prompt_caching(),
             ),
-            Protocol::Gemini => {
-                AnyCompletionModel::Gemini(client!(gemini).completion_model(&self.model))
-            }
+            Protocol::Gemini => AnyCompletionModel::OpencodeGemini(
+                client!(
+                    gemini,
+                    gemini_usage::GeminiUsageClient::new(self.http_client.clone())
+                )
+                .completion_model(&self.model),
+            ),
         })
     }
 
@@ -321,84 +330,13 @@ struct ModelEntry {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use baybo_model::{ChatMessage, ContentBlock};
+    use baybo_model::{ChatMessage, ContentBlock, ThinkingContent};
     use futures::StreamExt;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::mock_http::endpoint;
     use crate::{ChatRequest, LlmProviderRegistry, StreamEvent, ToolDefinitionForLlm};
-
-    struct CapturedRequest {
-        path: String,
-        headers: HashMap<String, String>,
-        body: Value,
-    }
-
-    async fn endpoint(
-        responses: Vec<(u16, &'static str, String)>,
-    ) -> (
-        String,
-        tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>,
-    ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            for (status, content_type, body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let mut buf = [0; 4096];
-                let header_end = loop {
-                    let n = socket.read(&mut buf).await.unwrap();
-                    assert_ne!(n, 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break end + 4;
-                    }
-                };
-                let head = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-                let mut lines = head.lines();
-                let path = lines
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .to_string();
-                let headers: HashMap<_, _> = lines
-                    .filter_map(|line| line.split_once(':'))
-                    .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
-                    .collect();
-                let len: usize = headers
-                    .get("content-length")
-                    .map(|n| n.parse().unwrap())
-                    .unwrap_or(0);
-                while bytes.len() < header_end + len {
-                    let n = socket.read(&mut buf).await.unwrap();
-                    assert_ne!(n, 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                }
-                let _ = tx.send(CapturedRequest {
-                    path,
-                    headers,
-                    body: if len == 0 {
-                        Value::Null
-                    } else {
-                        serde_json::from_slice(&bytes[header_end..header_end + len]).unwrap()
-                    },
-                });
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        (origin, rx)
-    }
 
     fn config(
         plan: OpencodeProviderFactory,
@@ -782,6 +720,170 @@ mod tests {
         let call = items.iter().find(|i| i["type"] == "function_call").unwrap();
         assert_eq!(call["id"], "fc_item");
         assert_eq!(call["call_id"], "call_tool");
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_keeps_chunks_whose_usage_lacks_a_total() {
+        let events = [
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"checking"}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}}}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10,"totalTokenCount":130}}),
+        ];
+        let sse = events
+            .iter()
+            .map(|event| format!("data: {event}\r\n\r\n"))
+            .collect::<String>();
+        let (origin, mut captured) = endpoint(vec![(200, "text/event-stream", sse)]).await;
+        let client = LlmProviderRegistry::with_default_providers()
+            .build_client(&config(
+                OpencodeProviderFactory::Go,
+                "gemini-4-argon",
+                Some(origin),
+            ))
+            .unwrap();
+        let mut stream = client
+            .chat_stream(&request("session-gemini"))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                StreamEvent::Text(t) => text.push_str(&t),
+                StreamEvent::ToolCall(call) => calls.push(call),
+                StreamEvent::Usage(u) => usage = Some(u),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "checking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, json!({"path":"a.rs"}));
+        let usage = usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (120, 10));
+        let req = captured.recv().await.unwrap();
+        assert!(
+            req.path
+                .starts_with("/google/v1beta/models/gemini-4-argon:streamGenerateContent")
+        );
+        assert!(!req.path.contains("test-opencode-key"));
+        assert_eq!(req.headers["x-goog-api-key"], "test-opencode-key");
+        assert_eq!(req.headers[SESSION_HEADER], "session-gemini");
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_keeps_thoughts_and_signatures_when_usage_lacks_a_total() {
+        use crate::providers::gemini::tests::issued_by;
+        let events = [
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"hmm","thought":true}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":" done","thought":true,"thoughtSignature":"sig1"}]}}],"usageMetadata":{}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}},"thoughtSignature":"sig2"}]}}],"usageMetadata":{"promptTokenCount":5}}),
+            json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10}}),
+        ];
+        let sse = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let (origin, _captured) = endpoint(vec![(200, "text/event-stream", sse)]).await;
+        let client = LlmProviderRegistry::with_default_providers()
+            .build_client(&config(
+                OpencodeProviderFactory::Go,
+                "gemini-4-argon",
+                Some(origin),
+            ))
+            .unwrap();
+        let mut stream = client
+            .chat_stream(&request("session-gemini-thoughts"))
+            .await
+            .unwrap();
+        let mut reasoning = String::new();
+        let mut block_signatures = Vec::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                StreamEvent::Reasoning(r) => reasoning.push_str(&r),
+                StreamEvent::ThinkingBlock(ContentBlock::Thinking { content, .. }) => {
+                    block_signatures.extend(content.into_iter().filter_map(|c| match c {
+                        ThinkingContent::Text { signature, .. } => signature,
+                        _ => None,
+                    }));
+                }
+                StreamEvent::ToolCall(call) => calls.push(call),
+                StreamEvent::Usage(u) => usage = Some(u),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "hmm");
+        let issued: Vec<Option<&str>> = block_signatures
+            .iter()
+            .map(|s| issued_by(Some(s), "gemini-4-argon"))
+            .collect();
+        assert_eq!(issued, vec![Some("sig1")]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(
+            issued_by(calls[0].signature.as_deref(), "gemini-4-argon"),
+            Some("sig2")
+        );
+        let usage = usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (120, 10));
+    }
+
+    #[tokio::test]
+    async fn gemini_completion_accepts_usage_without_a_total() {
+        let body = json!({"responseId":"r1","candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"cachedContentTokenCount":3}});
+        let (origin, _captured) = endpoint(vec![(200, "application/json", body.to_string())]).await;
+        let client = LlmProviderRegistry::with_default_providers()
+            .build_client(&config(
+                OpencodeProviderFactory::Go,
+                "gemini-4-argon",
+                Some(origin),
+            ))
+            .unwrap();
+        let result = client.chat(&request("session-gemini")).await.unwrap();
+        assert_eq!(result.content, "done");
+        assert_eq!(
+            (
+                result.usage.input_tokens,
+                result.usage.output_tokens,
+                result.usage.cached_input_tokens
+            ),
+            (10, 2, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_repeated_tool_calls_get_distinct_ids_and_named_responses() {
+        use crate::providers::gemini::tests::{
+            assert_distinct_portable_ids, assert_gemini_accepts_function_turns,
+            assert_responses_name_their_calls, collect_calls, mixed_history_request,
+            repeated_call_body, repeated_call_sse, search_tools_request,
+        };
+        let (origin, mut captured) = endpoint(vec![
+            (200, "text/event-stream", repeated_call_sse()),
+            (200, "application/json", repeated_call_body()),
+            (200, "text/event-stream", repeated_call_sse()),
+        ])
+        .await;
+        let client = LlmProviderRegistry::with_default_providers()
+            .build_client(&config(
+                OpencodeProviderFactory::Go,
+                "gemini-4-argon",
+                Some(origin),
+            ))
+            .unwrap();
+        let stream = client.chat_stream(&search_tools_request()).await.unwrap();
+        assert_distinct_portable_ids(&collect_calls(stream).await, "gemini-4-argon");
+        let response = client.chat(&search_tools_request()).await.unwrap();
+        assert_distinct_portable_ids(&response.tool_calls, "gemini-4-argon");
+        collect_calls(client.chat_stream(&mixed_history_request()).await.unwrap()).await;
+        captured.recv().await.unwrap();
+        captured.recv().await.unwrap();
+        let body = captured.recv().await.unwrap().body;
+        assert_gemini_accepts_function_turns(&body);
+        assert_responses_name_their_calls(&body);
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-# Search — full-text search over chat transcripts
+# Search — full-text search over chat transcripts and session titles
 
 Search runs on SQLite **FTS5**, which is already compiled into the binary: `libsqlite3-sys`'s
 bundled path passes `-DSQLITE_ENABLE_FTS5` unconditionally (`build.rs:133`), so the amalgamation
@@ -20,6 +20,10 @@ same function and are issued as **phrase** queries, so `数据库` becomes `MATC
 
 A phrase of character-unigrams *is* a contiguous-substring match. That equivalence is the whole
 design: **there is no segmentation decision, so there is nothing a segmentation decision can hide.**
+
+Two tables go through that one pipeline: `message_fts` holds transcript prose, and
+`session_title_fts` holds session titles ([Titles](#titles)). Everything below about the segmenter,
+the query builder and the fingerprint applies to both; where they differ, the section says so.
 
 > **There is no dictionary, and that is the design, not a gap.** Reaching for jieba/lindera/ICU on
 > the index side is the obvious move and it makes recall strictly worse. Read
@@ -84,8 +88,9 @@ owner collapse in `init_db` is already covered — the rebuild runs after it.
 ## The segmenter
 
 ```rust
-/// Bump on any change to `segment`'s output shape or `is_unigram_script`'s ranges.
-const SEGMENTER_FINGERPRINT: &str = "unigram-u61-v1";
+/// Bump on any change to `segment`'s output shape, `is_unigram_script`'s ranges,
+/// or the shape of either index table (`message_fts`, `session_title_fts`).
+const SEGMENTER_FINGERPRINT: &str = "unigram-u61-v3";
 
 /// Applied at BOTH the ingest seam and the query seam. NFD Hangul decomposes to
 /// conjoining jamo (U+1100..), which is in no range below, so `segment` no-ops and
@@ -218,8 +223,8 @@ transaction as the `session_messages` insert**; otherwise one crash silently dro
 index forever.
 
 **Rebuild** — `init_db` compares `search_meta.segmenter_fingerprint` against
-`SEGMENTER_FINGERPRINT`. On mismatch: `DROP TABLE IF EXISTS message_fts`, recreate, rescan, reinsert,
-restamp. It runs on the `init_db` connection before `warm()` opens the pool, so `Store::open` blocks
+`SEGMENTER_FINGERPRINT`. On mismatch: drop and recreate **both** `message_fts` and
+`session_title_fts`, rescan, reinsert, restamp — one transaction, one stamp. It runs on the `init_db` connection before `warm()` opens the pool, so `Store::open` blocks
 until the index is correct — never half-built, never half-stale, never a schema behind.
 
 There is no incremental backfill and no per-row version column, because a full rebuild of the live
@@ -228,7 +233,12 @@ the migration mechanism, for rows **and columns**: on a fresh database the stamp
 initial build takes the same path. `mod.rs`'s `ALTER TABLE`-only migration list needs no entry.
 
 **Bump the fingerprint for any index-side change** — the segmenter, `is_unigram_script`'s ranges,
-`is_searchable`, the table's columns, or a migration that rewrites `sessions.channel`. Query-side
+`is_searchable`, either table's columns (adding `session_title_fts` is what took it to `v3`), or a
+migration that rewrites `sessions.channel` or `sessions.title`. **One fingerprint owns both tables.**
+They share the segmenter, so a segmenter change must rebuild both; and a second stamp would let one
+table be rebuilt against a pipeline the other was never rebuilt for, which is the half-stale state
+the stamp exists to rule out. A rebuild of the title table is one row per titled session, so riding
+along costs nothing worth a second stamp. Query-side
 work (prefix widening, a future query splitter) must *not* bump it; that asymmetry is the whole
 reason language handling lives off the index side.
 
@@ -258,7 +268,9 @@ FTS5 bare. Verified: `数据" OR "库` emits `"数 据 "" OR "" 库"` and matche
 operator escapes the quotes.
 
 Results `JOIN session_messages ON (session_id, ordinal)` for role / timestamp / prose, `LEFT JOIN
-sessions` for the live scope flags, ordered by `bm25(message_fts)` ascending. `LEFT`, not inner: a
+sessions` for the live scope flags, ordered **newest first** by `session_messages.created_at` (see
+[Order](#order)); `bm25(message_fts)` is still computed and returned as `score`, but orders nothing.
+`LEFT`, not inner: a
 message whose session row is missing must stay findable. Session rows are never deleted (see
 CLAUDE.md's "Session data is core data"), so it cannot happen — and an inner join would make it
 vanish silently if it ever did.
@@ -322,15 +334,18 @@ This is query-side: **it does not bump `SEGMENTER_FINGERPRINT` and triggers no r
 
 ### Callers
 
-Both callers go through `baybo_session::search::SessionSearch`, which owns the scan window, the
-grouping-by-session rule and the title batch, so neither surface re-implements them:
+Both callers go through `baybo_session::search::SessionSearch`, which owns the scan windows, the
+title/message merge, the newest-first order, the grouping-by-session rule and the title batch, so neither surface
+re-implements them. Both surface `title_match` per group:
 
 - `GET /v1/chat/search` pins `channel = owner`, every flag false, and never exposes
-  `include_cron_workspaces`. It answers "find a conversation I can open".
+  `include_cron_workspaces`. It answers "find a conversation I can open"; a title-only group opens
+  the conversation without a jump.
 - `baybo session search` defaults to `channel = None` — the same universe `baybo session list`
   renders, bot channels and subagent runs included — with the same three flags false, and exposes
   all of them (`--include-hidden` / `--include-archived` / `--include-cron-workspaces`, or `--all`)
   plus `--scan`, because a `truncated` result with no widening knob is a dead end at a shell.
+  Title-matched groups print a `[title match]` marker; a title-only group prints no hit lines.
 
 **The CLI's channel default is an operator choice and must not be copied into a user-facing
 surface**: a chat client that searched every channel would return rows it cannot open.
@@ -354,6 +369,88 @@ FTS5 applies it to the last token, and Han tokens are single characters, so `库
 `tokenize='porter unicode61'` also fixes suffixes, and is rejected: it is index-side (fingerprint,
 rebuild), it is English-only against a 49%-Han corpus, and it **over- and under-matches at once** —
 `running` returns 254 against a truth of 181, while `session` returns 399 against 400.
+
+## Titles
+
+A conversation is often remembered by its name, not by any sentence in it — and the title is the one
+string the user sees for it in every list. So search also matches `sessions.title`, through a second
+FTS5 table on the same pipeline:
+
+```sql
+CREATE VIRTUAL TABLE session_title_fts USING fts5(
+    segmented,
+    session_id UNINDEXED,
+    tokenize   = 'unicode61',
+    detail     = 'full'
+);
+```
+
+Same `normalize()` + `segment()` on the way in, same `build_match()` on the way out, so a title
+gets exactly the semantics a message does: Han substring, Latin word-plus-prefix. Like
+`message_fts` it carries its own segmented text and is owned by `rebuild_if_stale`, not `init_db`'s
+`execute_batch`, for the same reasons. Unlike `message_fts` there is **no channel snapshot**: a title
+lives *on* the `sessions` row, so every scope axis is joined live, `channel` included (`sessions` has
+a flat `channel` column that `save` writes, so the join needs no `json_extract`). The query is an
+inner join — a title row without its session has nothing to return.
+
+**A title is mutable, so it is reindexed, not snapshotted.** Messages are append-only, so indexing
+them once at insert is enough. A title is renamed by the user and filled in by the auto-titler after
+the fact, and an index that kept the first value would find a conversation under a name it no longer
+has — worse than not finding it. So the write path is the title write itself: `set_title` and
+`set_title_if_absent` (the only writers of `sessions.title`) call `index_title` **in the same
+transaction as the `UPDATE`**, and only when the `UPDATE` changed a row. `index_title` deletes the
+session's row, then inserts the new title if it is present and not blank, so a rename replaces and a
+clear removes. "Only when it changed a row" matters for `set_title_if_absent`: an auto-title that
+lost to a user rename must not index the name it failed to write. Deleting by `session_id`, an
+`UNINDEXED` column, scans the table; that is one row per titled session, on a title write only.
+
+**Rebuild** scans `SELECT id, title FROM sessions WHERE title IS NOT NULL` into the freshly recreated
+table, alongside the message rescan. A database that had titles before this table existed gets them
+indexed by the `v3` bump, with no backfill code.
+
+**Scope parity.** `search_titles` takes the same `SearchScope` as `search_messages`, and the
+hidden / archived / cron-workspace conditions are one shared SQL fragment (`SESSION_FLAGS_PREDICATE`)
+that both queries splice in. A title must never reach a session a message hit could not — otherwise
+a hidden conversation comes back through its name.
+
+### Merging titles with messages
+
+`SessionSearch::search` runs both queries concurrently, each bounded by the same scan window, and
+merges them per session: a title-matched group **carries its message hits** from the message scan
+window, if any, so a session matching both appears once. Groups are then ordered newest first like
+everything else — see [Order](#order). Titles get no tier of their own.
+
+`hits` and `total_hits` stay **message-only**. A title-only group has `hits = []` and
+`total_hits = 0`, and says what matched through `title_match: true`. Counting the title as a hit
+would give it an ordinal it does not have, and every client turns a hit into a jump target — a
+title-only result opens the conversation, it does not scroll anywhere.
+
+`sessions_matched` counts distinct sessions across the union before the session cut; `truncated`
+is set when **either** window fills. A title-matched group's `title` comes from its `TitleHit`, so
+the `session_titles` batch is fetched only for the message-only groups (and skipped when there are
+none).
+
+## Order
+
+**Results are chronological, newest first** — at both levels:
+
+- **Hits inside a conversation** are newest first, by `session_messages.created_at`.
+- **Conversations** are newest first by the time of their newest match. A message-only
+  conversation dates from its newest matching message. A title-matched one dates from its
+  `sessions.last_active`: the title names the whole conversation, so its match is as recent as the
+  conversation is. No message is newer than its conversation's last activity, so that one rule also
+  covers a conversation matched by both. Ties keep arrival order.
+
+**The scan window is cut on time, not score.** The message query orders by
+`created_at DESC, session_id, ordinal DESC` *inside* the windowed subquery, and the title query by
+`last_active DESC, session_id`, before `LIMIT`. Sorting the best-scoring 300 by date would not be
+chronological: a fresh match that scored 301st would silently vanish while older ones showed. So
+`truncated` now means "older matches exist past the window", and raising `--scan` reaches further
+back in time. Both sort keys are flat integer columns reached over primary keys, so ordering by them
+decodes no content.
+
+`bm25` scores are still returned (`SearchHit::score`, `TitleHit::score`, the CLI's JSON `score`) but
+order nothing. This is query-side only: **no fingerprint bump, no rebuild.**
 
 ## Why there is no dictionary
 
@@ -484,8 +581,10 @@ word-segmented index's, and it does not matter: size stays dead linear at 2.0× 
 because FTS5 delta-encodes the doclists as varints and a denser term is a smaller delta. This was the
 open risk in the whole design, and it is measured shut.
 
-**Query cost tracks the number of matches, not `LIMIT`.** `ORDER BY bm25(...)` cannot early
-terminate — every match is scored before anything is dropped. So a realistic query stays under 25 ms
+**Query cost tracks the number of matches, not `LIMIT`.** The `ORDER BY` cannot early
+terminate — every match is visited before anything is dropped. (These timings were measured when
+results were ordered by `bm25(...)`; the window is now cut on `created_at`, which visits the same
+match set.) So a realistic query stays under 25 ms
 even at 100×, while `的` (one of the most common characters in the language; it hits 43% of the
 corpus) reaches 216 ms. That is the shape of the ceiling: it is reached by queries that mean nothing,
 not by queries anyone types. `ORDER BY rank` was measured as the escape and is **slower**, not

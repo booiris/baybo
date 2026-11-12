@@ -284,18 +284,25 @@ pub struct ChatSearchGroup {
     /// prefers this device's own list row (same headline rule as the chat list)
     /// so one conversation is not named two different things in two places.
     pub session_title: Option<String>,
-    /// Best-matching excerpts, best first, at most 3 (the gateway's cap).
+    /// The query matched this conversation's TITLE; such a group is dated by
+    /// the conversation's last activity in the newest-first order. A title match can also carry message hits; one
+    /// with none (`hits` empty, `total_hits` 0) has no message to park on, so
+    /// it opens the conversation without a jump.
+    pub title_match: bool,
+    /// Matching excerpts, newest first, at most 3 (the gateway's cap).
+    /// Message hits only — empty for a title-only group.
     pub hits: Vec<ChatSearchHit>,
-    /// Total matches in this conversation — equal to `hits.len()` at or under
-    /// the cap, larger above it, so a card can say "and N more" without a second
-    /// call.
+    /// Total message matches in this conversation — equal to `hits.len()` at or
+    /// under the cap, larger above it, so a card can say "and N more" without a
+    /// second call. A title match does not count.
     pub total_hits: i64,
 }
 
 /// A whole result set for one query (`GET /v1/chat/search`).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChatSearchResults {
-    /// Conversations, best match first; a conversation ranks by its best hit.
+    /// Conversations, newest first: each by its newest matching message, or by
+    /// its last activity when its title matched.
     pub groups: Vec<ChatSearchGroup>,
     /// The query matched more than the gateway's scan window, so some
     /// conversations are missing and `total_hits` undercounts. There is no

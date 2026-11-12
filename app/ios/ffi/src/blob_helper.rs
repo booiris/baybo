@@ -338,37 +338,19 @@ fn over_cap_message(cap: u64) -> String {
     format!("attachment is larger than the {cap} byte limit")
 }
 
-/// An upload's [`ProgressTicker`], shared between the body reader and the call
-/// that owns the request.
-///
-/// Shared because the reader cannot report the end: reqwest stops polling the
-/// body the instant the declared `Content-Length` is written, so the direct
-/// leg's reader never sees its own EOF. Whoever knows the bytes are up calls
-/// [`Self::finish`].
-#[derive(Clone)]
-pub(crate) struct UploadTicker(Arc<Mutex<ProgressTicker>>);
-
-impl UploadTicker {
-    pub(crate) fn new(progress: ProgressSink, total: u64) -> Self {
-        Self(Arc::new(Mutex::new(ProgressTicker::new(
-            progress,
-            Some(total),
-            0,
-        ))))
-    }
-
-    fn advance(&self, n: usize) {
-        self.0.lock().advance(n);
-    }
-
-    pub(crate) fn finish(&self) {
-        self.0.lock().finish();
-    }
-}
-
 /// Sequential body chunks for a streaming upload, ticking the same rate-limited
 /// [`ProgressTicker`] the download path uses and teeing every chunk into the
 /// blob cache.
+///
+/// Ticks count one of two things. By default, bytes handed to the transport:
+/// the reader emits the closing tick itself the moment it hands over the last
+/// chunk — not on its own EOF, which the direct leg never reaches (reqwest stops
+/// polling the body once the declared `Content-Length` is written). Over the
+/// relay that count runs well ahead of the gateway, because the bytes still sit
+/// in socket and relay buffers. So once a gateway that speaks upload progress
+/// reports in ([`Self::acknowledged`]), its count takes over and the reader's
+/// own reads stop ticking. Either way `sent == total` closes the count, and
+/// the caller's own return is what means "on the gateway".
 ///
 /// Reads exactly the length [`hash_upload_file`] measured: that is what both
 /// legs declared as their content length, and a file that shrank underneath us
@@ -377,7 +359,12 @@ pub(crate) struct UploadReader {
     file: tokio::fs::File,
     remaining: u64,
     chunk_bytes: usize,
-    ticker: UploadTicker,
+    ticker: ProgressTicker,
+    total: u64,
+    /// The gateway has reported in, so its count drives the ticker from now on.
+    acknowledged: bool,
+    /// The closing tick has gone out.
+    closed: bool,
     tee: UploadCacheTee,
 }
 
@@ -386,7 +373,7 @@ impl UploadReader {
         path: &Path,
         total: u64,
         chunk_bytes: usize,
-        ticker: UploadTicker,
+        progress: ProgressSink,
         tee: UploadCacheTee,
     ) -> Result<Self, String> {
         let file = tokio::fs::File::open(path)
@@ -396,7 +383,10 @@ impl UploadReader {
             file,
             remaining: total,
             chunk_bytes,
-            ticker,
+            ticker: ProgressTicker::new(progress, Some(total), 0),
+            total,
+            acknowledged: false,
+            closed: false,
             tee,
         })
     }
@@ -419,8 +409,35 @@ impl UploadReader {
         buf.truncate(n);
         self.remaining -= n as u64;
         self.tee.write(&buf).await;
-        self.ticker.advance(n);
+        if !self.acknowledged {
+            let emitted = self.ticker.advance(n);
+            self.close_at(self.total - self.remaining, emitted);
+        }
         Ok(Some(buf))
+    }
+
+    /// The gateway's count of this body's bytes it has taken in. From the first
+    /// one on, it is the only thing that moves the ticker.
+    ///
+    /// The ticker never steps back: if the reader had already ticked past what
+    /// the gateway now reports (the first round trip, when the socket swallows
+    /// the opening chunks at once), progress holds until the gateway catches up.
+    pub(crate) fn acknowledged(&mut self, received: u64) {
+        self.acknowledged = true;
+        let emitted = self.ticker.advance_to(received);
+        self.close_at(received, emitted);
+    }
+
+    /// Emit the closing tick once `position` reaches the total, unless the
+    /// throttled tick just now already carried it.
+    fn close_at(&mut self, position: u64, emitted: bool) {
+        if position < self.total || self.closed {
+            return;
+        }
+        if !emitted {
+            self.ticker.finish();
+        }
+        self.closed = true;
     }
 }
 
@@ -634,9 +651,20 @@ impl ProgressTicker {
     }
 
     /// Account for `n` freshly written bytes, emitting only when the interval
-    /// has elapsed. Returns whether it emitted (the tests read this).
+    /// has elapsed. Returns whether it emitted, so a caller closing on this
+    /// chunk knows whether it still owes a [`Self::finish`].
     pub(crate) fn advance(&mut self, n: usize) -> bool {
-        self.downloaded = self.downloaded.saturating_add(n as u64);
+        self.advance_to(self.downloaded.saturating_add(n as u64))
+    }
+
+    /// [`Self::advance`] to an absolute byte count, for a source that reports
+    /// totals rather than deltas. Never moves backwards: a count at or below
+    /// the current one changes nothing and emits nothing.
+    pub(crate) fn advance_to(&mut self, position: u64) -> bool {
+        if position <= self.downloaded {
+            return false;
+        }
+        self.downloaded = position;
         if self.sink.is_none() || self.last_emit.elapsed() < self.interval {
             return false;
         }
@@ -645,8 +673,8 @@ impl ProgressTicker {
         true
     }
 
-    /// The download completed: report the final byte count even if the last
-    /// chunk landed inside the throttle window.
+    /// The transfer's last chunk is through: report the final byte count even
+    /// if it landed inside the throttle window.
     pub(crate) fn finish(&self) {
         self.emit();
     }
@@ -901,22 +929,19 @@ mod tests {
     }
 
     /// The upload's ticks ride the SAME 100ms limiter as a download: three
-    /// chunks read, but only the opening and closing ticks cross the FFI.
+    /// chunks read, but only the opening and closing ticks cross the FFI — and
+    /// the closing one comes from the reader itself, with no caller `finish`.
     #[tokio::test]
     async fn an_upload_reads_the_declared_length_and_rate_limits_its_ticks() {
         let bytes: Vec<u8> = (0..25u8).collect();
         let path = scratch_file("reader", &bytes).await;
         let sink = Arc::new(RecordingProgress::default());
 
-        let ticker = UploadTicker::new(
-            Some(sink.clone() as Arc<dyn crate::api::BlobProgress>),
-            bytes.len() as u64,
-        );
         let mut reader = UploadReader::open(
             &path,
             bytes.len() as u64,
             10,
-            ticker.clone(),
+            Some(sink.clone() as Arc<dyn crate::api::BlobProgress>),
             UploadCacheTee::off(),
         )
         .await
@@ -926,7 +951,6 @@ mod tests {
         while let Some(chunk) = reader.next_chunk().await.expect("chunk") {
             chunks.push(chunk);
         }
-        ticker.finish();
 
         assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), [10, 10, 5]);
         assert_eq!(chunks.concat(), bytes);
@@ -937,20 +961,57 @@ mod tests {
         let _ = tokio::fs::remove_file(&path).await;
     }
 
+    /// Once the gateway reports in, its count is the progress: the reader's own
+    /// reads, which only measure what the socket swallowed, stop ticking. The
+    /// count never steps back, and closes exactly once, on the gateway's total.
+    #[tokio::test]
+    async fn the_gateways_count_takes_over_from_the_reader() {
+        let bytes: Vec<u8> = (0..30u8).collect();
+        let path = scratch_file("acked", &bytes).await;
+        let sink = Arc::new(RecordingProgress::default());
+        let mut reader = UploadReader::open(
+            &path,
+            bytes.len() as u64,
+            10,
+            Some(sink.clone() as Arc<dyn crate::api::BlobProgress>),
+            UploadCacheTee::off(),
+        )
+        .await
+        .expect("open");
+        reader.ticker = ProgressTicker::with_interval(
+            Some(sink.clone() as Arc<dyn crate::api::BlobProgress>),
+            Some(30),
+            0,
+            Duration::ZERO,
+        );
+        sink.ticks.lock().clear();
+
+        reader.next_chunk().await.expect("chunk");
+        reader.acknowledged(0);
+        reader.acknowledged(5);
+        reader.next_chunk().await.expect("chunk");
+        reader.next_chunk().await.expect("chunk");
+        reader.acknowledged(20);
+        reader.acknowledged(30);
+        reader.acknowledged(30);
+
+        assert_eq!(
+            sink.ticks.lock().as_slice(),
+            [(10, Some(30)), (20, Some(30)), (30, Some(30))],
+            "the reader's first read ticks; then only the gateway moves the count, \
+             holding at 10 until it passes it, and the total goes out once"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
     /// A body one frame short would hang the relay leg waiting for `last`, and
     /// make the direct leg's declared Content-Length a lie.
     #[tokio::test]
     async fn a_file_that_shrank_under_the_upload_is_an_error() {
         let path = scratch_file("shrank", &[9u8; 8]).await;
-        let mut reader = UploadReader::open(
-            &path,
-            64,
-            8,
-            UploadTicker::new(None, 64),
-            UploadCacheTee::off(),
-        )
-        .await
-        .expect("open");
+        let mut reader = UploadReader::open(&path, 64, 8, None, UploadCacheTee::off())
+            .await
+            .expect("open");
 
         reader.next_chunk().await.expect("first chunk");
         let err = reader.next_chunk().await.expect_err("truncated");
@@ -985,7 +1046,7 @@ mod tests {
     /// Drain a whole file through a reader teeing into `tee`, as an upload's
     /// body pass does.
     async fn stream_body(path: &Path, len: u64, tee: UploadCacheTee) {
-        let mut reader = UploadReader::open(path, len, 8, UploadTicker::new(None, len), tee)
+        let mut reader = UploadReader::open(path, len, 8, None, tee)
             .await
             .expect("open");
         while reader.next_chunk().await.expect("chunk").is_some() {}

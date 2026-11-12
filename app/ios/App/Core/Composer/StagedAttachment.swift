@@ -34,6 +34,12 @@ struct StagedAttachment: Identifiable {
     enum State {
         case queued
         case uploading(sent: UInt64)
+        /// Every byte is handed to the transport, but the gateway has not
+        /// answered with the blob yet. The bytes are still in socket and relay
+        /// buffers — over the relay that is seconds of a large pick — so a
+        /// counter reading `20 MB / 20 MB` here would claim a landing that has
+        /// not happened.
+        case finishing
         case ready(blobId: String)
         case error
 
@@ -42,13 +48,28 @@ struct StagedAttachment: Identifiable {
             return false
         }
 
+        /// On the wire: streaming, or waiting on the gateway's answer.
         var isUploading: Bool {
-            if case .uploading = self { return true }
-            return false
+            switch self {
+            case .uploading, .finishing: return true
+            default: return false
+            }
         }
 
         /// Not on the gateway yet, and not failed either.
         var isPending: Bool { isQueued || isUploading }
+
+        /// A progress tick from the core. Only an upload in flight moves, and
+        /// never backwards out of `finishing` — the core's closing tick can be
+        /// followed by nothing but the call's own return.
+        mutating func progressed(sent: UInt64, total: UInt64?) {
+            guard case .uploading = self else { return }
+            if let total, sent >= total {
+                self = .finishing
+            } else {
+                self = .uploading(sent: sent)
+            }
+        }
 
         var isError: Bool {
             if case .error = self { return true }
@@ -233,8 +254,25 @@ struct StagedAttachment: Identifiable {
         return UInt32(exactly: bytes)
     }
 
-    static func byteText(_ bytes: UInt64) -> String {
-        byteFormatter.string(fromByteCount: Int64(bytes))
+    /// A fixed number of decimals per unit (one for kB and MB, two for GB), so a
+    /// counting `9.9 MB / 24.8 MB` keeps its width instead of jumping to `10 MB`
+    /// the way `ByteCountFormatter` does by dropping a trailing `.0`. The unit is
+    /// picked after rounding, so 999,960 bytes reads `1.0 MB`, not `1000.0 kB`.
+    static func byteText(_ bytes: UInt64, locale: Locale = .current) -> String {
+        var value = Double(bytes)
+        var unit = 0
+        while unit < byteUnits.count - 1, (value * 10).rounded() / 10 >= 1000 {
+            value /= 1000
+            unit += 1
+        }
+        guard unit > 0 else { return byteFormatter.string(fromByteCount: Int64(bytes)) }
+        return Measurement(value: value, unit: byteUnits[unit]).formatted(
+            .measurement(
+                width: .abbreviated, usage: .asProvided,
+                numberFormatStyle: .number.precision(
+                    .fractionLength(byteUnits[unit] == .gigabytes ? 2 : 1))
+            )
+            .locale(locale))
     }
 
     static func spool(_ data: Data, id: UUID, mime: String) throws -> SpoolFile {
@@ -341,6 +379,11 @@ struct StagedAttachment: Identifiable {
     /// The tile draws at 64pt; 256px covers it at every screen scale.
     private static let thumbnailMaxPixels = 256
 
+    private static let byteUnits: [UnitInformationStorage] = [
+        .bytes, .kilobytes, .megabytes, .gigabytes,
+    ]
+
+    /// Under 1 kB only, where its localized "bytes" reads better than a unit symbol.
     private static let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file

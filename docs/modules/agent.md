@@ -284,7 +284,7 @@ Consolidated reference for every time bound a turn can hit. Two structural facts
 | `backoff_base` | 1s |
 | `backoff_max` | 30s |
 
-Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 3 min of waiting before the call gives up. Only `LlmError::is_retriable()` errors (transient) and raw `io::Error` retry; config / model-shape errors surface immediately.
+Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 3 min of waiting before the call gives up. Only `LlmError::is_retriable()` errors (transient) and raw `io::Error` retry; config / model-shape errors surface immediately, and so does a provider 4xx other than 408/429 (`BadRequest` / `Auth`) — including one rig reports without a typed status, such as Gemini's `400 INVALID_ARGUMENT` (classification in [`llm.md`](llm.md#error-handling)).
 
 **Tool execution** (`runtime/tool_executor.rs`) — two nested deadlines:
 

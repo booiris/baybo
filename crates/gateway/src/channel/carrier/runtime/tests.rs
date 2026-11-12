@@ -351,6 +351,7 @@ fn parked_upload() -> TunnelRequest {
         path: "/v1/blobs".to_owned(),
         headers: Vec::new(),
         body_len: Some(BLOB_BODY_LEN),
+        report_progress: false,
     }
 }
 
@@ -1736,6 +1737,7 @@ async fn a_quic_api_session_runs_the_tunnel() {
             path: "/v1/chat/sessions".to_owned(),
             headers: Vec::new(),
             body_len: None,
+            report_progress: false,
         })
         .await;
     match session.recv_tunnel().await {

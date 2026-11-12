@@ -2,6 +2,12 @@
 
 **Baybo** is an intelligent assistant framework built on large language models, supporting multi-channel access, tool invocation, skill extensions, with comprehensive context management, compression, and error recovery mechanisms.
 
+## Ownership
+
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it. When a change exposes duplicated logic, a rule living in the wrong crate, or a defect next to the code you are touching, fix it as part of the work instead of building beside it or only reporting it. List what you changed beyond the request in the PR description, because the owner reviews the diff and not just the summary.
+
+Owning the code does not extend to the calls this guide reserves for the owner: marking a PR ready, merging, dispatching a release, and anything that deletes session data.
+
 ## Session data is core data — never delete
 
 Session rows and their conversation transcripts are **user-facing core data**. They must never be deleted by the runtime:
@@ -61,22 +67,20 @@ gh pr ready <number>
 ```
 
 **A draft PR runs NO CI, and a skipped run looks exactly like a passing one.**
-Every job in `.github/workflows/ci.yml` carries
-`if: ${{ github.event.pull_request.draft == false }}` — deliberately, because a
-skipped job spins up no runner and bills no minutes. The trap is on the reading
-side: `gh pr checks --watch` on a draft reports every job as `skipping` and
+Every job in `.github/workflows/ci.yml` is guarded on
+`github.event.pull_request.draft == false` (the always-on jobs also admit
+`push`) — deliberately, because a skipped job spins up no runner. The trap is on
+the reading side: `gh pr checks --watch` on a draft reports every job as `skipping` and
 **exits 0**, which is indistinguishable from green at a glance. Before merging,
 confirm the gating jobs actually say `pass`. If they say `skipping`, CI has never
 seen the code.
 
-The three iOS jobs are ON, so `app/ios` is covered by CI: `ios-web` and
-`ios-core` on ubuntu, `ios-sim` on `macos-26`. They were `if: false` for a while
-(see `61eb9246`) when this repo was private and the Actions quota ran out. **The
-repo is public now and standard runners — `macos-26` included — are free and
-unlimited, so minutes are not a reason to skip a job.** What the path filters
-still buy is wall-clock and macOS queue slots (the free plan allows 20 concurrent
-jobs but only 5 macOS), so widening `IOS_DEPS` is a latency decision, not a
-billing one.
+Three iOS jobs cover `app/ios`: `ios-web` and `ios-core` on ubuntu, `ios-sim`
+on `macos-26`. **The repo is public, so standard runners — `macos-26` included —
+are free and unlimited, and minutes are not a reason to skip a job.** What the
+path filters buy is wall-clock and macOS queue slots (the free plan allows 20
+concurrent jobs but only 5 macOS), so widening `IOS_DEPS` is a latency decision,
+not a billing one.
 
 Coverage stops at the simulator: no job touches a device, and the UI smokes are
 non-gating — their own job, `ios-ui-smokes`, chained after `ios-sim` on its
@@ -86,74 +90,39 @@ publishes an xcresult with UI-test screenshots on every run.
 
 ## Releases
 
-**Never create a version tag by hand.** `.github/workflows/release.yml` owns tag
-creation, and it creates the tag **last** — after both build jobs are green — so
-a build that dies at minute 40 leaves nothing behind and a re-run just works.
-Tagging by hand inverts that and then blocks the release outright: the
-workflow's gate does `git ls-remote --exit-code --tags origin refs/tags/$tag`
-and hard-errors with *"already exists. Bump [workspace.package] version in
-Cargo.toml first"*, so a hand-pushed `vX.Y.Z` is precisely the thing that stops
-`vX.Y.Z` from ever being published.
+The full procedure, and the reasoning behind the workflow, is in
+[`docs/releasing.md`](docs/releasing.md). Read it before touching
+`.github/workflows/release.yml`, `install.sh` or `scripts/release-build.sh`.
+These rules apply in every session:
 
-**The version lives in one place: `[workspace.package] version` in the root
-`Cargo.toml`.** The tag is derived from it (`v${version}`), never the reverse.
-Bumping it is a normal PR — and it moves 40 `Cargo.lock` entries with it, so
-refresh the lockfile in the same commit.
+- **Never create a version tag by hand.** `release.yml` owns the tag and creates
+  it last, after every build job is green. Its gate hard-errors when
+  `v<version>` already exists, so a hand-pushed tag is exactly what stops that
+  version from being published.
+- **The version lives in one place: `[workspace.package] version` in the root
+  `Cargo.toml`.** The tag is derived from it, never the reverse. Bumping it is a
+  normal PR, and the bump commit has to carry three generated files:
 
-**The version is an input to three generated files, and the bump commit has to
-carry all of them:**
+  ```bash
+  cargo update -w                                                     # root Cargo.lock
+  (cd app/ios && cargo update -w)                                     # app/ios is its OWN workspace
+  UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync   # docs/openapi.json info.version
+  ```
 
-```bash
-cargo update -w                                                     # root Cargo.lock
-(cd app/ios && cargo update -w)                                     # app/ios is its OWN workspace
-UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync   # docs/openapi.json info.version
-```
-
-0.1.1 shipped without the second and third, and both landed on master:
-`docs/openapi.json` still said `0.1.0`, and `app/ios/Cargo.lock` still pinned the
-old crate versions, where `--locked` refuses to update it. They fail on the NEXT
-PR that touches those paths rather than on the release PR, which is what makes
-this worth a checklist rather than a habit:
-
-- `openapi_json_is_in_sync` DID fail on the release PR (#314's `cargo test` is
-  red in the record) and it was merged anyway. A red gating check on a release PR
-  is the signal, not noise.
-- `ios-core` could not have caught its half at all: it is path-filtered on
-  `IOS_DEPS`, which a commit touching only `CLAUDE.md` / `Cargo.toml` /
-  `Cargo.lock` never matches, so the job never ran.
-
-Cutting a release, in order:
-
-```bash
-# 1. bump [workspace.package] version + refresh Cargo.lock, via a PR to master
-# 2. then, from the Actions tab (or):
-gh workflow run release.yml --ref master        # dry_run input available
-```
-
-The dispatch is **the owner's call**, like marking a PR ready — it is what
-publishes binaries under their name.
-
-**The trigger is dispatch-only on purpose.** `push: branches: [master]` was the
-obvious alternative and is worse: master takes ~10 pushes a day, so an
-unfiltered version gate would add ~3,600 no-op runs a year to buy one avoided
-button click per release. Dispatch also takes a ref for free, so a failed
-release re-cuts from the same commit without a new PR.
-
-**This workflow is the only thing that builds what a user actually receives.**
-Both Rust jobs in `ci.yml` set `BAYBO_SKIP_WEBUI=1`, so no CI job has ever
-compiled the shipped shape — dashboard baked in, sidecars bundled. Green CI is
-not evidence the release artifact builds; that is why the workflow carries its
-own asset assertions and smoke tests instead of trusting the build.
-
-**`install.sh` installs release ASSETS, not tags.** It fetches
-`releases/download/<tag>/baybo-<target>.tar.gz` plus `SHA256SUMS`, defaulting to
-`releases/latest`. A tag with no release attached is invisible to
-`curl -fsSL …/install.sh | sh` — that command will happily reinstall the
-previous version and report success.
-
-**Installing does not restart anything.** A running gateway keeps serving the
-old code until `baybo gateway restart` (under the service manager, restart the
-unit). The installer says so and then exits; nobody else will.
+- **A red gating check on a release PR is the signal, not noise.**
+  `openapi_json_is_in_sync` fails there when the spec lags. A forgotten
+  `app/ios/Cargo.lock` is not caught at all: `ios-core` is path-filtered on
+  `IOS_DEPS`, so it only runs once that lockfile changes.
+- **Dispatching the release is the owner's call**, like marking a PR ready:
+  `gh workflow run release.yml --ref master` publishes binaries under their
+  name. The trigger is dispatch-only on purpose; do not add a `push` trigger.
+- **Green CI is not evidence the release artifact builds.** Both Rust jobs in
+  `ci.yml` set `BAYBO_SKIP_WEBUI=1`, so only the release workflow compiles what a
+  user receives (dashboard baked in, sidecars bundled). Keep its asset
+  assertions and smoke tests.
+- **`install.sh` installs release assets, not tags, and restarts nothing.** A
+  tag with no release attached is invisible to it, and a running gateway keeps
+  serving the old code until `baybo gateway restart`.
 
 ## Code Style
 
@@ -192,7 +161,7 @@ Baybo targets **Unix only** (Linux and macOS — see `default = ["linux", "macos
 
 ## Architecture
 
-Prefer generic/extensible architectures over hardcoding specific integrations. Ask clarifying questions about the desired abstraction level before implementing.
+Prefer generic/extensible architectures over hardcoding specific integrations. When a change introduces a new trait, registry or integration point and the module's design doc does not settle its shape, ask about the desired abstraction level before implementing. Otherwise follow the existing seam without asking.
 
 **Core design principles**:
 
@@ -223,7 +192,7 @@ Base cases, all real and all in-tree:
 - Settling a run is three writes — ledger row, invalidation, timeline entry. Every caller that did only two left a card saying something the ledger under it contradicted.
 - **Live now, unfixed:** `crates/cron/src/scheduler.rs` exports `record_execution_completion` / `mark_execution_notified` and documents them as the agent layer's door — and they have **zero callers**, because `router/cron.rs` was handed `Arc<dyn CronStore>` and writes the ledger straight past them. Building the port doesn't help if the store rides along beside it.
 - `worktree::prepare_for_issue` returned a bare `PathBuf` instead of the `Checkout` it had just cut, so the workdir-overlap rule got written a second time in `validate_workdir`. The API ships `project-<ULID>` and the web client re-derives `@dev-1` from it — wrongly.
-- `can_host_a_session` has four spellings, and two doors that skip it entirely.
+- `can_host_a_session` had four spellings before it got its one home in `baybo_project::runs`.
 
 ## Module Design Specs
 
@@ -233,7 +202,7 @@ Module index: [`docs/modules/README.md`](docs/modules/README.md)
 
 ## Subsystem Docs
 
-For non-module-crate topics, read the relevant doc before touching that area:
+For non-module-crate topics, read the relevant doc before touching that area. [`docs/README.md`](docs/README.md) is the full index — search, permissions, secret management, config hot reload, external agents, turn-progress events and more live there. The entries below are the ones that carry a note worth seeing before you open the doc:
 
 - [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`app/web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
 - [`docs/web-chat.md`](docs/web-chat.md) — web chat UI **feature** reference (`app/web/src/pages/ChatPage.tsx` + `app/web/src/pages/chat/`): conversations/folders/pin, composer + attachments + model switch, slash-command completion, input-history ring, the interjection queue, thread/turn rendering, and the WS data-flow backbone.
@@ -244,4 +213,5 @@ For non-module-crate topics, read the relevant doc before touching that area:
 - [`docs/modules/storage.md`](docs/modules/storage.md) — sqlite storage; deletable tables use plain `DELETE` (no soft-delete tombstones), except `cron_jobs` and `deck_cards`, which soft-delete into user-visible recycle bins via `deleted_at` (`deck_cards` alone adds a user-triggered `purge` hard delete).
 - [`docs/fuzzing.md`](docs/fuzzing.md) — `baybo-security` cargo-fuzz harness and targets.
 - [`docs/testing.md`](docs/testing.md) — test layout, `test-support` gating, shared fixtures.
+- [`docs/releasing.md`](docs/releasing.md) — cutting a CLI release: the version-bump PR, what `release.yml` does and why, `install.sh`, and the mistakes earlier releases made.
 - [`docs/external-commands.md`](docs/external-commands.md) — external binaries baybo shells out to (`git`/`sh`/`rg`/sandbox backends/`uv`/`bun`), required-vs-optional, and how the in-container benches provide or skip each.

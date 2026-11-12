@@ -127,6 +127,8 @@ struct StagedStrip: View {
             let sent = StagedAttachment.byteText(item.state.sentBytes)
             let total = StagedAttachment.byteText(UInt64(item.byteCount))
             return "\(sent) / \(total)"
+        case .finishing:
+            return Lang.shared.t("attach.finishingUpload")
         case .ready:
             return StagedAttachment.byteText(UInt64(item.byteCount))
         case .error:

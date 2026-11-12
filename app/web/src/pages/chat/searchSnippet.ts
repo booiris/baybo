@@ -116,16 +116,7 @@ function occurrences(haystack: string[], needle: string[]): number[] {
  */
 export function snippet(text: string, query: string): Segment[] {
   const g = graphemes(text);
-  const gl = folded(g);
-  const chunks = queryChunks(query);
-
-  const hits: Array<{ at: number; end: number }> = [];
-  for (const chunk of chunks) {
-    const needle = folded(graphemes(chunk));
-    for (const at of occurrences(gl, needle)) {
-      hits.push({ at, end: at + needle.length });
-    }
-  }
+  const hits = locate(g, query);
   const cut = (from: number, to: number) => g.slice(from, to).join('');
 
   if (hits.length === 0) {
@@ -133,29 +124,63 @@ export function snippet(text: string, query: string): Segment[] {
     return [{ text: head + (g.length > HEAD_LEN ? '…' : ''), match: false }];
   }
 
-  hits.sort((a, b) => a.at - b.at);
   const anchor = hits[0];
   const from = Math.max(0, anchor.at - LEAD_PAD);
   const to = Math.min(g.length, anchor.end + TRAIL_PAD);
 
-  const segments: Segment[] = [];
-  const push = (t: string, match: boolean) => {
-    if (t.length > 0) segments.push({ text: t, match });
-  };
-
-  let cursor = from;
-  for (const hit of hits) {
-    // Highlight every term that lands in the window, not just the anchor — a
-    // two-word query usually has its other term right there. Overlapping hits
-    // (a term inside another) collapse into the first.
-    if (hit.at < cursor || hit.end > to) continue;
-    push(cut(cursor, hit.at), false);
-    push(cut(hit.at, hit.end), true);
-    cursor = hit.end;
-  }
-  push(cut(cursor, to), false);
-
+  // Highlight every term that lands in the window, not just the anchor — a
+  // two-word query usually has its other term right there.
+  const segments = mark(g, hits, from, to);
   if (from > 0) segments.unshift({ text: '…', match: false });
   if (to < g.length) segments.push({ text: '…', match: false });
+  return segments;
+}
+
+/**
+ * Flag every term in the WHOLE of `text`, with no window and no `…`.
+ *
+ * For a result card's title rather than its excerpt. A title is the
+ * conversation's name: the row already truncates it on the right, and
+ * `snippet`'s lead window — sized for a line-clamped message body — would cut
+ * it from the left and headline the card with a fragment of the name.
+ */
+export function highlightAll(text: string, query: string): Segment[] {
+  const g = graphemes(text);
+  return mark(g, locate(g, query), 0, g.length);
+}
+
+interface Hit {
+  at: number;
+  end: number;
+}
+
+/** Every occurrence of every query term in `g`, earliest first. */
+function locate(g: string[], query: string): Hit[] {
+  const gl = folded(g);
+  const hits: Hit[] = [];
+  for (const chunk of queryChunks(query)) {
+    const needle = folded(graphemes(chunk));
+    for (const at of occurrences(gl, needle)) {
+      hits.push({ at, end: at + needle.length });
+    }
+  }
+  return hits.sort((a, b) => a.at - b.at);
+}
+
+/** Segment `g[from, to)`, flagging the hits that fit inside it. Overlapping
+ *  hits (a term inside another) collapse into the first. */
+function mark(g: string[], hits: Hit[], from: number, to: number): Segment[] {
+  const segments: Segment[] = [];
+  const push = (a: number, b: number, match: boolean) => {
+    if (b > a) segments.push({ text: g.slice(a, b).join(''), match });
+  };
+  let cursor = from;
+  for (const hit of hits) {
+    if (hit.at < cursor || hit.end > to) continue;
+    push(cursor, hit.at, false);
+    push(hit.at, hit.end, true);
+    cursor = hit.end;
+  }
+  push(cursor, to, false);
   return segments;
 }

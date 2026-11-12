@@ -157,10 +157,10 @@ pub struct AdminState {
     pub cron_scheduler: Arc<CronScheduler>,
     pub trace_store: Arc<dyn TraceStore>,
     pub cost_store: Arc<dyn baybo_cost::CostStore>,
-    /// Grouped full-text search over transcript prose (`docs/search.md`). A
-    /// domain verb rather than a `QueryApi` method: `QueryApi` composes the
-    /// analytics surface (session / turn / span / cost), and search shares
-    /// none of its error shape or its callers.
+    /// Grouped full-text search over session titles and transcript prose
+    /// (`docs/search.md`). A domain verb rather than a `QueryApi` method:
+    /// `QueryApi` composes the analytics surface (session / turn / span /
+    /// cost), and search shares none of its error shape or its callers.
     pub session_search: Arc<baybo_session::search::SessionSearch>,
     /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
     /// query-shaped endpoint don't allocate one per request.

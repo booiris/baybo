@@ -121,7 +121,10 @@ known before request #1.
 **No Ping/keepalive frame, ever.** `api_tunnel::decode::<TunnelRequest>` on an
 unknown `type` tag is an `Err` (internally-tagged serde enum, no
 `#[serde(other)]`), so `next_request` fails and the leg dies. A new variant may
-only be sent *after* the peer is known to be new — and by then the only thing it
+only be sent *after* the peer is known to be new — `TunnelResponse::Progress` is
+the one that does it right: the gateway sends it only for a request whose head
+set the typed `report_progress` field (see
+[`blob-transfer.md`](blob-transfer.md)) — and by then the only thing it
 could buy is outliving the idle budget the server just declared. To widen the
 window, raise `TUNNEL_REUSE_IDLE_TIMEOUT` — one constant, server-side, no
 negotiation, no radio wakeup.

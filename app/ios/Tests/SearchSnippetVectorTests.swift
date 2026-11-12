@@ -22,6 +22,7 @@ import XCTest
 final class SearchSnippetVectorTests: XCTestCase {
     private struct Vector: Decodable {
         let name: String
+        let fn: String
         let text: String
         let query: String
         let segments: [WireSegment]
@@ -40,6 +41,13 @@ final class SearchSnippetVectorTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("app/web/src/pages/chat/searchSnippetVectors.json")
+    }
+
+    /// The function a vector exercises, by its JS name.
+    private func run(_ vector: Vector) -> [SearchSnippet.Segment] {
+        vector.fn == "highlightAll"
+            ? SearchSnippet.highlightAll(vector.text, query: vector.query)
+            : SearchSnippet.snippet(vector.text, query: vector.query)
     }
 
     private func loadVectors() throws -> [Vector] {
@@ -61,7 +69,7 @@ final class SearchSnippetVectorTests: XCTestCase {
         XCTAssertFalse(vectors.isEmpty, "the fixture must not be empty")
 
         for vector in vectors {
-            let produced = SearchSnippet.snippet(vector.text, query: vector.query)
+            let produced = run(vector)
             let expected = vector.segments.map {
                 SearchSnippet.Segment(text: $0.text, match: $0.match)
             }
@@ -95,7 +103,7 @@ final class SearchSnippetVectorTests: XCTestCase {
     func testEveryExcerptIsBuiltFromWholeClusters() throws {
         for vector in try loadVectors() {
             let source = Set(vector.text.map(String.init))
-            let produced = SearchSnippet.snippet(vector.text, query: vector.query)
+            let produced = run(vector)
             let joined = produced.map(\.text).joined()
             for cluster in joined where String(cluster) != "…" {
                 XCTAssertTrue(

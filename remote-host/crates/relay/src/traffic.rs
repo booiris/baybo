@@ -131,8 +131,8 @@ struct Entry {
     counters: Arc<Counters>,
     /// Counts already persisted (the baseline the next delta subtracts from).
     flushed: Counts,
-    /// The snapshot captured by the last [`collect`], promoted to `flushed` by
-    /// [`commit`] once its delta is durably written.
+    /// The snapshot captured by the last [`collect`](TrafficRegistry::collect), promoted to
+    /// `flushed` by [`commit`](TrafficRegistry::commit) once its delta is durably written.
     pending: Counts,
     /// Consecutive flush intervals with no new traffic (reset on any delta).
     idle_epochs: u32,
