@@ -265,16 +265,7 @@ pub trait SessionStore: Send + Sync {
     /// background report (`BackgroundNotificationState::awaits_cron_reports`).
     /// Read once at boot, to tell each one whose job the previous process
     /// took down that its report is not coming.
-    ///
-    /// Default impl is the naive `list_all() → filter` fallback; the sqlite
-    /// impl narrows the scan in SQL.
-    async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>> {
-        let all = self.list_all().await?;
-        Ok(all
-            .into_iter()
-            .filter(|s| s.state.background_notifications.awaits_cron_reports())
-            .collect())
-    }
+    async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>>;
 
     /// Return live sessions whose `channel` equals `channel`,
     /// newest-active first. Used by the chat REST surface

@@ -293,6 +293,16 @@ fn decode_session_list_rows(rows: Vec<RawSessionListRow>) -> Vec<Session> {
     sessions
 }
 
+/// The `sessions.trigger_kind` column's spelling of a trigger kind.
+fn trigger_kind_column(kind: baybo_model::TriggerKind) -> &'static str {
+    match kind {
+        baybo_model::TriggerKind::User => "user",
+        baybo_model::TriggerKind::Cron => "cron",
+        baybo_model::TriggerKind::Spawned => "spawned",
+        baybo_model::TriggerKind::Issue => "issue",
+    }
+}
+
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
@@ -323,12 +333,7 @@ impl SessionStore for SqliteSessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         let data = serde_json::to_string(session)
             .map_err(|e| StorageError::Storage(format!("serialize session: {e}")))?;
-        let trigger_kind = match session.trigger.kind() {
-            baybo_model::TriggerKind::User => "user",
-            baybo_model::TriggerKind::Cron => "cron",
-            baybo_model::TriggerKind::Spawned => "spawned",
-            baybo_model::TriggerKind::Issue => "issue",
-        };
+        let trigger_kind = trigger_kind_column(session.trigger.kind());
         let parent_session = session
             .lineage
             .as_ref()
@@ -685,17 +690,22 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>> {
-        // The JSON path only narrows the scan; the model's predicate below is
-        // the rule, so the two cannot disagree about what "awaiting" means.
+        // The SQL only narrows the scan; the model's predicate below is the
+        // rule, so the two cannot disagree about what "awaiting" means. Only
+        // a cron fire's session is ever owed a report, and with no index
+        // behind this the kind check is what keeps every other session's
+        // blob from being parsed at each gateway start.
+        let cron = trigger_kind_column(baybo_model::TriggerKind::Cron);
         let rows = self
             .pool
             .interact("sessions.list_awaiting_cron_reports", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
-                     WHERE json_array_length(data, '$.state.cron_report_awaited') > 0"
+                     WHERE trigger_kind = ?1 \
+                       AND json_array_length(data, '$.state.cron_report_awaited') > 0"
                 ))?;
                 let rows = stmt
-                    .query_map([], read_session_list_row)?
+                    .query_map(rusqlite::params![cron], read_session_list_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
@@ -2541,13 +2551,25 @@ mod tests {
             .unwrap();
         let store = SqliteSessionStore::new(pool);
 
-        let mut owed = make_root_session("owed");
+        let cron_fire = |id: &str| {
+            let mut session = make_root_session(id);
+            session.trigger = TriggerSource::Cron {
+                cron_job_id: "cj-1".into(),
+                origin_session_id: None,
+                conversation: true,
+                job_title: None,
+                project_id: None,
+            };
+            session
+        };
+
+        let mut owed = cron_fire("owed");
         owed.state
             .background_notifications
             .expect_cron_reports(vec!["bg-1".into()]);
         store.save(&owed).await.unwrap();
 
-        let mut settled = make_root_session("settled");
+        let mut settled = cron_fire("settled");
         settled
             .state
             .background_notifications
