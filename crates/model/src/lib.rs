@@ -43,8 +43,8 @@ pub use fingerprint::FileFingerprint;
 pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use governance::{ArtifactSource, TrustLevel};
 pub use ids::{
-    CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, ToolSetHash,
-    ToolSetHashParseError, TurnId,
+    BackgroundGroupName, BackgroundHandle, CohortKey, CostRecordId, ParallelGroup, SessionId,
+    SpanId, StepId, TaskId, ToolSetHash, ToolSetHashParseError, TurnId,
 };
 pub use llm_entry_name::LlmEntryName;
 pub use llm_pin::LlmPin;
@@ -68,10 +68,9 @@ pub use session::{
     TriggerSource, User,
 };
 pub use spawn_protocol::{
-    BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_DISPATCH_YIELD_GUIDANCE,
-    BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind, OnTimeout, PendingBackgroundResult,
-    SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext,
-    SubagentResult, SubagentSpawnRequest, new_background_handle,
+    BACKGROUND_DISPATCH_YIELD_GUIDANCE, BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind,
+    OnTimeout, PendingBackgroundResult, SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG,
+    SubagentExitStatus, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
 };
 pub use task::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,

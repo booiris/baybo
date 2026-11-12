@@ -1197,6 +1197,7 @@ dependencies = [
  "baybo-workspace",
  "chrono",
  "dashmap",
+ "futures",
  "parking_lot",
  "regex",
  "serde",

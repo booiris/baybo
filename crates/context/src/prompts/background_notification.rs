@@ -178,7 +178,7 @@ pub fn build_notification_content(
         xml.push_str(
             &BACKGROUND_RESULT_TEMPLATE
                 .replace("{{index}}", &index.to_string())
-                .replace("{{handle}}", &xml_escape(&p.handle_id))
+                .replace("{{handle}}", &xml_escape(p.handle_id.as_str()))
                 .replace("{{type}}", &xml_escape(&type_attr))
                 .replace("{{status}}", pending_status_label(&p.status))
                 .replace("{{task}}", &xml_escape(&p.label))

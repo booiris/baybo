@@ -42,7 +42,7 @@ pub enum CancelReason {
     BudgetExhausted,
     /// The user ran `/stop` on the session, cancelling the in-flight turn
     /// and every in-flight subagent it spawned. Distinct from
-    /// `ParentCancelled` so the subagent wait task can suppress the
+    /// `ParentCancelled` so the background job's escort can suppress the
     /// terminal `BackgroundJobFinished` delivery (a stopped result must not
     /// repopulate the parent session's background-notification buffer).
     UserStopped,

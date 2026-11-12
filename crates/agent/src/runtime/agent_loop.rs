@@ -1712,32 +1712,15 @@ impl AgentLoop {
         )
         .await;
 
-        // Count a grouped subagent spawn into its barrier cohort so the
-        // turn-end seal knows the member total. Only a *successful
-        // dispatch* counts — a router-side failure (unregistered backend,
-        // closed channel, …) comes back as `Ok("[subagent failed: …]")`
-        // with no escorted result to ever arrive, so `is_ok()` is too
-        // broad: counting it would stall the cohort until its group
-        // timeout. A real dispatch returns the ack with its `bg-…` handle.
-        let dispatched = matches!(
-            &executed.output,
-            Ok(ToolOutput::Text(t))
-                if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
-        );
-        if dispatch.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
-            && dispatched
-            && let Some(group) = dispatch
-                .arguments
-                .get("group")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        {
-            // Namespace the cohort by this turn's `turn_id` so reusing a
-            // group name in a later turn opens a fresh cohort rather than
-            // extending the prior (still-sealed, still-draining) one. The
-            // spawner stamps the escorted member's `group` through the
-            // same helper, so routing back into the cohort agrees.
+        // Count a grouped job into its barrier cohort so the turn-end seal
+        // knows the member total. Only a job actually handed to the
+        // background reports a group (`baybo_tools::background::run`
+        // records it on hand-over), so a call that failed to start can't
+        // stall the cohort until its group timeout. The cohort is
+        // namespaced by this turn's `turn_id`, which the result's own
+        // cohort key carries too, so a group name reused in a later turn
+        // opens a fresh cohort.
+        if let Some(group) = executed.background_group.as_ref() {
             session
                 .state
                 .background_notifications
@@ -3038,7 +3021,10 @@ impl AgentLoop {
         self.tool_registry
             .tool_definitions_for_session(
                 &session.channel,
-                &session.trigger,
+                baybo_tools::ToolSchemaContext {
+                    trigger: &session.trigger,
+                    background_eligible: session.can_host_background_jobs(),
+                },
                 session.state.tool_allowlist.as_deref(),
             )
             .into_iter()
@@ -3833,6 +3819,7 @@ mod tool_completion_summary_tests {
             output,
             approval,
             abandoned: false,
+            background_group: None,
         }
     }
 

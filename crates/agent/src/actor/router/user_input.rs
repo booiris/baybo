@@ -443,13 +443,11 @@ impl Router {
         stopped_at: chrono::DateTime<chrono::Utc>,
         command_msg_id: &str,
     ) {
-        // Drain the in-flight background subagents first: the removal both
-        // gives us the cancel targets + ack summaries AND suppresses each
-        // child's terminal delivery (its wait task sees the entry gone), so a
-        // stopped result can't repopulate the notification buffer.
-        let background = self
-            .supervisor
-            .take_in_flight_background_subagents(session_id);
+        // Drain the in-flight background jobs first: the removal both gives
+        // us the cancel targets + ack summaries AND suppresses each job's
+        // delivery (its escort sees the entry gone), so a stopped result
+        // can't repopulate the notification buffer.
+        let background = self.supervisor.take_in_flight_background_jobs(session_id);
 
         // Cancel the in-flight turn, then walk its in-flight descendants.
         // Cancelling the turn trips the turn's loop cancel token first,
@@ -484,18 +482,20 @@ impl Router {
             }
         }
 
-        // Stop each drained background subagent. Cancel its running turn with
+        // Stop each drained background job. For one running in its own session
+        // (a subagent), cancel that session's running turn with
         // `UserStopped` FIRST — that trips the loop token AND makes the reason
         // win the race against the escort's `ParentCancelled` — then trip the
         // stored token to also cover the pre-turn-dispatch window: when no row
         // exists yet the token is the only handle, and the child aborts at
         // iteration 0 once it spawns its turn (`with_turn` then flips that row
         // terminal). `list_active_chat_turns_by_session` keeps the lookup bounded.
-        for (child_session, info) in &background {
-            if let Ok(turns) = self
-                .turn_lifecycle
-                .list_active_chat_turns_by_session(child_session)
-                .await
+        for info in &background {
+            if let Some(child_session) = &info.session
+                && let Ok(turns) = self
+                    .turn_lifecycle
+                    .list_active_chat_turns_by_session(child_session)
+                    .await
             {
                 for turn in turns {
                     let _ = self
@@ -668,7 +668,7 @@ fn is_stop_command(content: &[ContentBlock]) -> bool {
 /// Compose the `/stop` acknowledgement: confirm what was cancelled and list
 /// each background task by its type + summary so the user sees exactly what
 /// was dropped. Idle session → a plain "nothing to stop".
-fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob)]) -> String {
+fn build_stop_notice(cancelled_turn: bool, background: &[InFlightJob]) -> String {
     if !cancelled_turn && background.is_empty() {
         return "Nothing in progress to stop.".to_string();
     }
@@ -681,7 +681,7 @@ fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob
             "- Cancelled {} background task(s):",
             background.len()
         ));
-        for (_child, info) in background {
+        for info in background {
             lines.push(format!("  • [{}] {}", info.kind, info.task_summary));
         }
     }
@@ -933,24 +933,20 @@ mod tests {
         );
         // Background tasks listed by type + summary.
         let bg = vec![
-            (
-                SessionId::from("c1"),
-                InFlightJob {
-                    kind: "explorer".to_string(),
-                    task_summary: "find X".to_string(),
-                    handle: "bg-c1".to_string(),
-                    cancel_token: CancellationToken::new(),
-                },
-            ),
-            (
-                SessionId::from("c2"),
-                InFlightJob {
-                    kind: "planner".to_string(),
-                    task_summary: "draft Y".to_string(),
-                    handle: "bg-c2".to_string(),
-                    cancel_token: CancellationToken::new(),
-                },
-            ),
+            InFlightJob {
+                handle: "bg-c1".into(),
+                kind: "explorer".to_string(),
+                task_summary: "find X".to_string(),
+                session: Some(SessionId::from("c1")),
+                cancel_token: CancellationToken::new(),
+            },
+            InFlightJob {
+                handle: "bg-c2".into(),
+                kind: "planner".to_string(),
+                task_summary: "draft Y".to_string(),
+                session: Some(SessionId::from("c2")),
+                cancel_token: CancellationToken::new(),
+            },
         ];
         let notice = build_stop_notice(true, &bg);
         assert!(notice.starts_with("Stopped.\n- Cancelled the in-progress reply."));

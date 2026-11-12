@@ -137,7 +137,7 @@ async fn list_background_jobs(State(state): State<AdminState>) -> Json<Backgroun
         .list_all_in_flight_background()
         .into_iter()
         .map(|(parent, info)| BackgroundJob {
-            handle: info.handle,
+            handle: info.handle.into_inner(),
             session_id: parent.as_ref().to_string(),
             kind: info.kind,
             summary: info.task_summary,

@@ -18,11 +18,15 @@ Contents:
 - **Cost & money types**: `CostRecord`, `CostSummary`, `CallReason`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
 - **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
 - **Approval types**: `ApprovalDecision`, `ApprovedResource`, `HostPattern`, `ResourceAccess`
-- **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentParentContext`, `SubagentResult`, `SubagentExitStatus`, `PendingBackgroundResult`, `BackgroundJobKind`, `OnTimeout`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers (`SUBAGENT_CHANNEL_TAG`, `BACKGROUND_SUBAGENT_HANDLE_PREFIX`, `BACKGROUND_DISPATCH_ACK_PREFIX`, `new_background_handle`)
+- **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentParentContext`, `SubagentResult`, `SubagentExitStatus`, `PendingBackgroundResult`, `BackgroundJobKind`, `OnTimeout`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers (`SUBAGENT_CHANNEL_TAG`, `BACKGROUND_SUBAGENT_HANDLE_PREFIX`, `BACKGROUND_DISPATCH_YIELD_GUIDANCE`)
 - **External-agent types**: `ExternalAgentKind`, `SubagentBackend`, `SubagentBackendKind`, `SubagentBackendTag`, the `BAYBO_BACKEND_TAG` const
 - **LLM routing types**: `LlmEntryName`, `ModelTier`, `LlmPricingOverride`
 - **Fingerprints**: `FileFingerprint` (mtime + size, used by the read-before-write tracker)
 - **ID newtypes**: `SessionId`, `TurnId`, `SpanId`, `StepId`, `CostRecordId`, `TaskId`, `ParallelGroup`
+- **Background-job ids** (`ids.rs`, each a `serde(transparent)` string, so persisted rows are unchanged):
+  - `BackgroundHandle` — one job's `bg-…` id; `BackgroundHandle::new()` mints it.
+  - `BackgroundGroupName` — the `group` a call sent, trimmed and never blank; meaningful only within its turn.
+  - `CohortKey` — `CohortKey::new(turn_id, &name)`, the turn-scoped key a barrier cohort is held and routed under. A group name and a cohort key are different types so one cannot stand in for the other.
 
 ## Design Decisions
 

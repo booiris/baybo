@@ -197,16 +197,19 @@ impl AgentLoop {
                     output: Ok(ToolOutput::Json(baybo_human_ask::result::answered(answers))),
                     approval: None,
                     abandoned: false,
+                    background_group: None,
                 },
                 (AskResolution::Declined, _) => ExecutedTool {
                     output: Ok(ToolOutput::Json(baybo_human_ask::result::declined())),
                     approval: None,
                     abandoned: false,
+                    background_group: None,
                 },
                 (AskResolution::Abandoned, AskKind::Question) => ExecutedTool {
                     output: Ok(ToolOutput::Json(baybo_human_ask::result::abandoned())),
                     approval: None,
                     abandoned: false,
+                    background_group: None,
                 },
                 (AskResolution::Approval(ApprovalDecision::Deny), _) => {
                     denied(&call, ApprovalResolution::Answered)
@@ -398,6 +401,7 @@ fn denied(call: &SettledCall, resolution: ApprovalResolution) -> ExecutedTool {
         })),
         approval: Some(ApprovalDecision::Deny),
         abandoned: false,
+        background_group: None,
     }
 }
 

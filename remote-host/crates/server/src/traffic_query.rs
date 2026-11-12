@@ -9,7 +9,8 @@
 //! * the time window is always a **bound modifier** (`datetime('now', ?1)`) — never
 //!   `format!`'d into SQL — so an attacker-influenced range can't reach the query;
 //! * only **trusted consts** (table names from [`crate::traffic`], the bucket
-//!   expression, [`CURRENT_HOUR_EXPR`]) are ever interpolated.
+//!   expression, [`CURRENT_HOUR_EXPR`](crate::traffic::CURRENT_HOUR_EXPR)) are ever
+//!   interpolated.
 //!
 //! Masking is NOT done here: top-N queries return the raw `remote_api_key` /
 //! `device_id` / `ip`; the backend masks (or drops) the secret before any DTO is

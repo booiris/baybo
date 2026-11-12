@@ -272,6 +272,7 @@ pub struct AgentTestHarnessBuilder {
     /// Refuse any LLM request whose `tool_use` is not answered by the very
     /// next message, as a real provider does.
     strict_tool_pairing: bool,
+    background_jobs: Option<Arc<dyn baybo_tools::background::BackgroundJobSink>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -299,6 +300,7 @@ impl Default for AgentTestHarnessBuilder {
             store: None,
             resume_door: false,
             strict_tool_pairing: false,
+            background_jobs: None,
         }
     }
 }
@@ -438,6 +440,16 @@ impl AgentTestHarnessBuilder {
     /// `push_response` for it.
     pub fn with_title_sink(mut self, sink: Arc<dyn baybo_agent::SessionTitleSink>) -> Self {
         self.title_sink = Some(sink);
+        self
+    }
+
+    /// Wire the sink background-capable tools hand their work to. Defaults to
+    /// `None`, so nothing backgrounds unless a test asks for it.
+    pub fn with_background_jobs(
+        mut self,
+        sink: Arc<dyn baybo_tools::background::BackgroundJobSink>,
+    ) -> Self {
+        self.background_jobs = Some(sink);
         self
     }
 
@@ -646,7 +658,7 @@ impl AgentTestHarnessBuilder {
             None,
             None,
             virtual_reads,
-            None,
+            self.background_jobs,
             None,
             None,
             Arc::new(PolicyDenyGate::new(Arc::clone(&ask_core))),

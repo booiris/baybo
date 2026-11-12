@@ -614,7 +614,7 @@ pub struct BackgroundNotificationState {
         rename = "background_groups",
         skip_serializing_if = "HashMap::is_empty"
     )]
-    pub groups: HashMap<String, BackgroundNotificationGroup>,
+    pub groups: HashMap<crate::CohortKey, BackgroundNotificationGroup>,
 
     /// The one batch whose prompt is already durable in the transcript but
     /// whose proactive reply has not yet settled. A fresh batch may remain in
@@ -636,28 +636,28 @@ impl BackgroundNotificationState {
     }
 
     /// Whether a terminal result is already owned by any pipeline stage.
-    pub fn knows_handle(&self, handle_id: &str) -> bool {
+    pub fn knows_handle(&self, handle_id: &crate::BackgroundHandle) -> bool {
         self.buffered_results
             .iter()
-            .any(|result| result.handle_id == handle_id)
+            .any(|result| &result.handle_id == handle_id)
             || self.groups.values().any(|group| {
                 group
                     .results
                     .iter()
-                    .any(|result| result.handle_id == handle_id)
+                    .any(|result| &result.handle_id == handle_id)
             })
             || self
                 .active_delivery
                 .as_ref()
-                .is_some_and(|delivery| delivery.handle_ids.iter().any(|id| id == handle_id))
+                .is_some_and(|delivery| delivery.handle_ids.contains(handle_id))
     }
 
     /// Count one successfully dispatched member in a turn-namespaced barrier
     /// cohort. The completion path uses the same key constructor when routing
     /// the member back into this aggregate.
-    pub fn register_group_member(&mut self, turn_id: TurnId, group: &str) {
+    pub fn register_group_member(&mut self, turn_id: TurnId, group: &crate::BackgroundGroupName) {
         self.groups
-            .entry(BackgroundNotificationGroup::cohort_key(turn_id, group))
+            .entry(crate::CohortKey::new(turn_id, group))
             .or_default()
             .expected += 1;
     }
@@ -673,7 +673,7 @@ pub struct BackgroundNotificationDelivery {
     /// they keep a re-published terminal event from entering the next buffer
     /// while this batch is awaiting retry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub handle_ids: Vec<String>,
+    pub handle_ids: Vec<crate::BackgroundHandle>,
     /// Task labels this batch carries, in prompt order — the audit counterpart
     /// to `handle_ids`. A handle never appears in user-facing prose, so it
     /// cannot answer "did the analysed report account for every result this
@@ -732,13 +732,6 @@ impl BackgroundNotificationGroup {
     pub fn is_partial(&self) -> bool {
         self.results.len() < self.expected
     }
-
-    /// The dispatching turn's `turn_id` namespaces the LLM-chosen group name so
-    /// reuse in a later turn starts a fresh cohort instead of extending the
-    /// earlier one. Both the dispatch and completion paths derive the key here.
-    pub fn cohort_key(turn_id: TurnId, group: &str) -> String {
-        format!("{turn_id}::{group}")
-    }
 }
 
 #[cfg(test)]
@@ -781,25 +774,29 @@ mod tests {
         assert!(!complete.is_partial());
     }
 
+    fn name(raw: &str) -> crate::BackgroundGroupName {
+        crate::BackgroundGroupName::parse(raw).unwrap()
+    }
+
     #[test]
     fn cohort_key_namespaces_group_by_turn() {
         let j1 = TurnId::new();
         let j2 = TurnId::new();
         // Deterministic per (turn, name): same inputs → same key.
         assert_eq!(
-            BackgroundNotificationGroup::cohort_key(j1, "g"),
-            BackgroundNotificationGroup::cohort_key(j1, "g")
+            crate::CohortKey::new(j1, &name("g")),
+            crate::CohortKey::new(j1, &name("g"))
         );
-        // Reusing a name in a different turn (turn) yields a distinct cohort —
-        // the property that stops a later turn from extending a prior cohort.
+        // Reusing a name in a different turn yields a distinct cohort — the
+        // property that stops a later turn from extending a prior cohort.
         assert_ne!(
-            BackgroundNotificationGroup::cohort_key(j1, "g"),
-            BackgroundNotificationGroup::cohort_key(j2, "g")
+            crate::CohortKey::new(j1, &name("g")),
+            crate::CohortKey::new(j2, &name("g"))
         );
         // Distinct names within one turn stay distinct.
         assert_ne!(
-            BackgroundNotificationGroup::cohort_key(j1, "a"),
-            BackgroundNotificationGroup::cohort_key(j1, "b")
+            crate::CohortKey::new(j1, &name("a")),
+            crate::CohortKey::new(j1, &name("b"))
         );
     }
 
@@ -809,17 +806,15 @@ mod tests {
         let second_turn = TurnId::new();
         let mut notifications = BackgroundNotificationState::default();
 
-        notifications.register_group_member(first_turn, "research");
-        notifications.register_group_member(first_turn, "research");
-        notifications.register_group_member(second_turn, "research");
+        notifications.register_group_member(first_turn, &name("research"));
+        notifications.register_group_member(first_turn, &name("research"));
+        notifications.register_group_member(second_turn, &name("research"));
 
         assert_eq!(notifications.groups.len(), 2);
         assert_eq!(
             notifications
                 .groups
-                .get(&BackgroundNotificationGroup::cohort_key(
-                    first_turn, "research"
-                ))
+                .get(&crate::CohortKey::new(first_turn, &name("research")))
                 .map(|group| group.expected),
             Some(2)
         );
@@ -877,8 +872,9 @@ mod tests {
         );
         let mut state = SessionState::default();
         state.background_notifications.buffered_results.push(result);
+        let cohort = crate::CohortKey::new(TurnId::new(), &name("research"));
         state.background_notifications.groups.insert(
-            "turn::research".into(),
+            cohort.clone(),
             BackgroundNotificationGroup {
                 expected: 2,
                 ..BackgroundNotificationGroup::default()
@@ -920,7 +916,7 @@ mod tests {
             restored
                 .background_notifications
                 .groups
-                .get("turn::research")
+                .get(&cohort)
                 .map(|group| group.expected),
             Some(2)
         );
@@ -963,8 +959,8 @@ mod tests {
             ..BackgroundNotificationState::default()
         };
 
-        assert!(notifications.knows_handle("bg-active"));
-        assert!(!notifications.knows_handle("bg-other"));
+        assert!(notifications.knows_handle(&"bg-active".into()));
+        assert!(!notifications.knows_handle(&"bg-other".into()));
     }
 
     #[test]

@@ -124,7 +124,10 @@ impl Tool for ToolSearchTool {
         let exact = params.get("kind").and_then(Value::as_str) == Some("exact");
 
         let channel = &ctx.user.channel;
-        let trigger = &ctx.session_trigger;
+        let schema_context = crate::ToolSchemaContext {
+            trigger: &ctx.session_trigger,
+            background_eligible: ctx.background_eligible,
+        };
 
         if exact && !query.is_empty() {
             let mut out = Vec::new();
@@ -144,7 +147,7 @@ impl Tool for ToolSearchTool {
                     }));
                     continue;
                 }
-                let entry = match self.index.lookup(name, channel, trigger) {
+                let entry = match self.index.lookup(name, channel, schema_context) {
                     DeferredLookup::Visible(def) => json!({
                         "name": def.name,
                         "description": def.description,
@@ -172,7 +175,7 @@ impl Tool for ToolSearchTool {
         // Grouping and the `server` filter key off the registration SOURCE
         // (== the `server/` prefix for MCP tools; the batch label for the
         // deferred cron/deck builtins, whose names carry no prefix).
-        let visible = self.index.visible_with_source(channel, trigger);
+        let visible = self.index.visible_with_source(channel, schema_context);
         let candidates: Vec<_> = visible
             .into_iter()
             .filter(|(source, _)| server.is_none_or(|s| source == s))

@@ -19,7 +19,7 @@ The durable state is one aggregate on `SessionState`:
 
 ```rust
 BackgroundNotificationState {
-    groups: HashMap<String, BackgroundNotificationGroup>,
+    groups: HashMap<CohortKey, BackgroundNotificationGroup>,
     buffered_results: Vec<PendingBackgroundResult>,
     active_delivery: Option<BackgroundNotificationDelivery>,
 }
@@ -75,13 +75,14 @@ group barrier, when present -------- timeout / complete
 
 ### 1. Completion intake
 
-The detached wait task posts `AgentMessage::BackgroundJobFinished` to the
-parent actor. `/stop` removes still-running subagents from the supervisor's
-in-flight registry; their wait tasks observe the missing entry and suppress the
-terminal event. Results that completed before `/stop` remain valid and are not
-discarded. Process shutdown is also a suppressing cancellation edge for
-detached commands: the command escort kills the child, clears its registry, and
-never publishes `BackgroundJobFinished`. The partial stdout/stderr artifacts
+The job's escort (`BackgroundJobManager`) posts
+`AgentMessage::BackgroundJobFinished` to the parent actor. `/stop` removes
+still-running jobs from the supervisor's in-flight registry; their escorts
+observe the missing entry and suppress the terminal event. Results that
+completed before `/stop` remain valid and are not discarded. Process shutdown
+is also a suppressing cancellation edge for every background job: the escort
+cancels the job (a command's process group is killed), clears its registry
+entry, and never publishes `BackgroundJobFinished`. The partial stdout/stderr artifacts
 remain available for inspection. A command terminated by Baybo shutdown is not
 a failed task result owed to the user.
 
