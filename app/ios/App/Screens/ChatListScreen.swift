@@ -135,11 +135,23 @@ struct ChatListScreen: View {
 
             HomeHeaderView(
                 notice: notice ?? appStore.sessionNotice,
-                onAction: compose,
-                onArchived: appStore.openArchived,
-                onCronJobs: appStore.openCronJobs,
                 isRefreshing: isRefreshing
-            )
+            ) {
+                HeaderMenu {
+                    Button(action: appStore.openArchived) {
+                        Label(lang.t("list.menuArchived"), systemImage: "archivebox")
+                    }
+                    Button(action: appStore.openCronJobs) {
+                        Label(lang.t("list.menuCronJobs"), systemImage: "alarm")
+                    }
+                }
+            } trailing: {
+                HeaderCircleButton(
+                    systemImage: "square.and.pencil", label: lang.t("list.newChat"),
+                    action: compose
+                )
+                .accessibilityIdentifier("header-action")
+            }
         }
         .overlay(alignment: .bottom) {
             if undoSessionId != nil {
