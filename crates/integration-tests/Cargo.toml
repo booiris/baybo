@@ -32,6 +32,7 @@ baybo-cron = { workspace = true, features = ["test-support"] }
 baybo-turn = { workspace = true, features = ["test-support"] }
 baybo-llm = { workspace = true, features = ["test-support"] }
 baybo-memory = { workspace = true, features = ["test-support"] }
+baybo-human-ask = { workspace = true }
 baybo-model = { workspace = true }
 baybo-security = { workspace = true, features = ["test-support"] }
 baybo-session = { workspace = true, features = ["test-support"] }

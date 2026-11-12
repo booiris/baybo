@@ -3364,7 +3364,6 @@ async fn unattended_child_runs_zero_access_mcp_ungated_but_still_denies_uncovere
         .send(AgentMessage::SubagentSpawned {
             initial_message: Box::new(child_message("spawn-zero-access")),
             parent_turn_id: baybo_model::TurnId::default(),
-            inherited_context: Some(baybo_model::InheritedToolContext),
         })
         .await
         .expect("child turn accepted");
@@ -3381,7 +3380,6 @@ async fn unattended_child_runs_zero_access_mcp_ungated_but_still_denies_uncovere
         .send(AgentMessage::SubagentSpawned {
             initial_message: Box::new(child_message("spawn-gated")),
             parent_turn_id: baybo_model::TurnId::default(),
-            inherited_context: Some(baybo_model::InheritedToolContext),
         })
         .await
         .expect("gated child turn accepted");
@@ -3392,21 +3390,20 @@ async fn unattended_child_runs_zero_access_mcp_ungated_but_still_denies_uncovere
         "an uncovered approval-gated access is still denied in an unattended child"
     );
 
-    queue_turn(&harness, "ordinary-resume", ZERO_ACCESS_TOOL);
+    queue_turn(&harness, "second-spawn", ZERO_ACCESS_TOOL);
     harness
         .mailbox
         .send(AgentMessage::SubagentSpawned {
-            initial_message: Box::new(child_message("spawn-ordinary")),
+            initial_message: Box::new(child_message("spawn-second")),
             parent_turn_id: baybo_model::TurnId::default(),
-            inherited_context: None,
         })
         .await
-        .expect("ordinary resumed child turn accepted");
+        .expect("second child turn accepted");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
         zero_access_calls.load(Ordering::SeqCst),
         2,
-        "an independently resumed child runs with ordinary approval"
+        "a later child turn runs the zero-access tool again"
     );
 
     let stored = harness

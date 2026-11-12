@@ -329,6 +329,7 @@ dependencies = [
  "baybo-cron",
  "baybo-deck",
  "baybo-gateway",
+ "baybo-human-ask",
  "baybo-janitor",
  "baybo-llm",
  "baybo-memory",
@@ -379,6 +380,7 @@ dependencies = [
  "baybo-context",
  "baybo-cost",
  "baybo-cron",
+ "baybo-human-ask",
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
@@ -480,6 +482,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "baybo-human-ask",
  "baybo-model",
  "baybo-tools",
  "chrono",
@@ -682,6 +685,7 @@ dependencies = [
  "baybo-cron",
  "baybo-deck",
  "baybo-gateway",
+ "baybo-human-ask",
  "baybo-llm",
  "baybo-model",
  "baybo-pairing",
@@ -740,6 +744,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "baybo-human-ask"
+version = "0.1.3"
+dependencies = [
+ "async-trait",
+ "baybo-model",
+ "baybo-tools",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
 name = "baybo-integration-tests"
 version = "0.1.3"
 dependencies = [
@@ -752,6 +767,7 @@ dependencies = [
  "baybo-cost",
  "baybo-cron",
  "baybo-gateway",
+ "baybo-human-ask",
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
@@ -1284,6 +1300,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "baybo-channels",
+ "baybo-human-ask",
  "baybo-model",
  "baybo-term-harness",
  "baybo-tools",

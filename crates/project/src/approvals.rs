@@ -300,7 +300,7 @@ mod tests {
     fn the_summary_prefers_the_tools_own_label() {
         let base = ApprovalRequest {
             call_id: "c".into(),
-            tool_call_id: None,
+            tool_call_id: String::new(),
             session_id: SessionId::from("s".to_owned()),
             user_id: "u".into(),
             tool: "Bash".into(),

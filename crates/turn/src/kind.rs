@@ -37,6 +37,20 @@ impl TurnInputKind {
     pub fn is_chat_turn(self) -> bool {
         !matches!(self, Self::Compact | Self::CronNotification)
     }
+
+    /// A human can see and answer asks raised by this turn.
+    pub fn is_attended(self) -> bool {
+        match self {
+            Self::UserChat | Self::SubagentNotification | Self::Compact | Self::IssueRun => true,
+            Self::Cron | Self::CronNotification | Self::Spawned => false,
+        }
+    }
+
+    /// The user is directly in this conversation, so a failure surfaces to
+    /// them as a notice.
+    pub fn is_user_facing(self) -> bool {
+        matches!(self, Self::UserChat)
+    }
 }
 
 /// What initially fed this turn.
@@ -147,6 +161,24 @@ mod tests {
 
         let i = TurnInput::SubagentNotification { content: vec![] };
         assert_eq!(i.input_kind(), TurnInputKind::SubagentNotification);
+    }
+
+    #[test]
+    fn attendedness_and_user_facing_follow_the_spec_table() {
+        use TurnInputKind::*;
+        for (kind, attended, user_facing, chat) in [
+            (UserChat, true, true, true),
+            (SubagentNotification, true, false, true),
+            (Compact, true, false, false),
+            (IssueRun, true, false, true),
+            (Cron, false, false, true),
+            (CronNotification, false, false, false),
+            (Spawned, false, false, true),
+        ] {
+            assert_eq!(kind.is_attended(), attended, "{kind:?} attended");
+            assert_eq!(kind.is_user_facing(), user_facing, "{kind:?} user-facing");
+            assert_eq!(kind.is_chat_turn(), chat, "{kind:?} chat turn");
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! processes, telegram bot subprocesses) but the channel sits there
 //! waiting for them.
 //!
-//! Each channel is born with its own per-channel [`ChannelApprovalGate`].
+//! Each channel is born with its own per-channel [`ChannelAskGate`].
 //! The gate's waker closes over a `Weak<Channel>` and dispatches a
 //! [`SessionEvent::ApprovalRequested`](baybo_channels::SessionEvent::ApprovalRequested) into the channel's fan-out path
 //! so every subscriber to the call's session sees the prompt; the
@@ -21,10 +21,11 @@ use baybo_channels::{
     ApprovalSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult,
 };
 use baybo_config::ChannelsConfig;
+use baybo_human_ask::{AskQueue, ChannelAskGate};
 use baybo_model::{ChannelType, SessionId};
 use baybo_project::{ProjectManager, TimelineApprovalGate};
 use baybo_store::SessionStore;
-use baybo_tools::{ApprovalGate, ApprovalQueue, ApprovalRequest, ChannelApprovalGate};
+use baybo_tools::{ApprovalGate, ApprovalRequest};
 
 use super::session_pulse::SessionPulse;
 
@@ -136,7 +137,7 @@ pub(crate) fn install_channel(
 /// fan-outs `ApprovalRequested` through the channel itself. Returns
 /// an `Arc<Channel>` ready to install.
 pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc<Channel> {
-    let queue = ApprovalQueue::new();
+    let queue = AskQueue::new();
     // The gate's waker needs access to the channel for fan-out, but
     // the channel hasn't been constructed yet. Hand the closure a
     // `Weak<Channel>` slot we patch in once the Arc exists.
@@ -155,7 +156,7 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
         };
         channel.dispatch_approval_requested(
             entry.call_id,
-            entry.tool_call_id,
+            Some(entry.tool_call_id),
             entry.session_id,
             entry.user_id,
             entry.tool,
@@ -199,11 +200,8 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
         );
     }));
 
-    let gate: Arc<dyn ApprovalGate> = Arc::new(ChannelApprovalGate::new(
-        queue.clone(),
-        waker,
-        APPROVAL_TIMEOUT,
-    ));
+    let gate: Arc<dyn ApprovalGate> =
+        Arc::new(ChannelAskGate::new(queue.clone(), waker, APPROVAL_TIMEOUT));
     let approvals = ApprovalSurface { gate, queue };
     let channel = Arc::new(Channel::new(channel_type, kind, Some(approvals)));
     *weak_slot.lock() = Arc::downgrade(&channel);

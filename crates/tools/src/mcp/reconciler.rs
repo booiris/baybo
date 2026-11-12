@@ -552,7 +552,7 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
 /// node-launched server in the session), and did not follow the operator's
 /// `permission` policy, which reaches only Bash and the OS sandbox.
 ///
-/// Unattended lineages (`InheritedToolContext`) still deny any approval-gated
+/// Unattended turns (cron fires, subagents) still deny any approval-gated
 /// resource access — they cannot prompt — but since this list is empty, MCP
 /// calls raise none and execute in cron/subagent sessions like any other.
 fn resource_access_for(_entry: &McpServerEntry, _is_embedded: bool) -> Vec<ResourceAccess> {

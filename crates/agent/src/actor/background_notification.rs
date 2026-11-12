@@ -650,7 +650,6 @@ impl AgentActor {
                 None,
                 None,
                 None,
-                None,
             )
             .await;
         self.volatile.agent_loop.set_notification_cue(false);

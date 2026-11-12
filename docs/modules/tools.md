@@ -250,9 +250,10 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   [`todo/mcp-tool-approval.md`](../todo/mcp-tool-approval.md)), so MCP calls
   never prompt.
 
-- **Unattended lineages** — a cron/subagent lineage carries the field-less
-  `InheritedToolContext` marker; any approval-gated resource access is denied
-  there without a prompt (nobody can answer one). Since MCP tools declare no
+- **Unattended turns** — cron fires and subagent turns are unattended by
+  turn kind (`TurnInputKind::is_attended`); the executor sends their asks to
+  `PolicyDenyGate`, so any approval-gated resource access is denied without a
+  prompt (nobody can answer one). Since MCP tools declare no
   such accesses, they run in cron/subagent sessions exactly as in chat. See
   [`cron.md`](cron.md).
 
@@ -391,7 +392,7 @@ This is a deliberate departure from "concrete HTTP hosts are gated by approval" 
 
 Cross-host redirects are still rejected inside the redirect policy (with a "re-issue WebFetch on the new URL" error) so a host change is always visible in the call trace, not silently followed inside `reqwest`. Per-hop SSRF re-validation runs on every redirect target regardless.
 
-`ChannelApprovalGate` + `ApprovalQueue` (`crates/tools/src/approval.rs`) extract the common queue-and-oneshot pattern so each channel only supplies a sync waker callback (e.g. `|| event_tx.try_send(WakeUp)`). The queue exposes `peek_head` / `resolve_head` / `len` so the channel's event loop can render and dismiss inline prompts without touching oneshot internals.
+This crate holds the approval **ports** only. The channel-backed gate and its queue live in `baybo-human-ask` (see [`human-ask.md`](human-ask.md)): `ChannelAskGate` + `AskQueue` extract the common queue-and-oneshot pattern so each channel only supplies a sync waker callback (e.g. `|| event_tx.try_send(WakeUp)`). The queue exposes `peek_head` / `resolve_head` / `len` so the channel's event loop can render and dismiss inline prompts without touching oneshot internals. `PolicyDenyGate` is the gate the executor hands every ask of an unattended turn. `ApprovalRequest` itself is a `baybo-model` value type, re-exported here.
 
 #### Why a refusal is never just "denied"
 
@@ -560,7 +561,7 @@ Both previews are bounded by `SPAN_EVENT_TEXT_MAX_BYTES`. They used to carry the
 
 - Depends on `baybo-llm`, `baybo-model`, `baybo-security`, `baybo-storage`, `baybo-workspace`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
 - Does not install third-party artifacts
-- Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
+- Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-channel gate is `baybo_human_ask::ChannelAskGate` over an `AskQueue`, built by the gateway's channel install, and the TUI renders the resulting prompts inline in its scrollback. Never depends on `baybo-human-ask`
 
 ## Collaboration
 

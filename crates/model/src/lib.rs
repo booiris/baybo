@@ -8,7 +8,6 @@ mod fingerprint;
 mod folder;
 mod governance;
 mod ids;
-mod inherited_tool_context;
 mod llm_entry_name;
 mod llm_pin;
 mod message;
@@ -46,7 +45,6 @@ pub use ids::{
     BackgroundGroupName, BackgroundHandle, CohortKey, CostRecordId, ParallelGroup, SessionId,
     SpanId, StepId, TaskId, ToolSetHash, ToolSetHashParseError, TurnId,
 };
-pub use inherited_tool_context::InheritedToolContext;
 pub use llm_entry_name::LlmEntryName;
 pub use llm_pin::LlmPin;
 pub use message::{

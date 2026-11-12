@@ -106,6 +106,27 @@ pub enum TurnInputKind { UserChat, Cron, CronNotification, Compact, Spawned, Sub
 - **input kind** (`TurnInputKind`) — `Turn::input_kind()`, projected from `TurnInput`. `TurnInput` is a strongly typed payload enum whose variants line up 1:1 with `TurnInputKind`. `UserChat`, `Cron`, `Spawned`, and `SubagentNotification` are chat turns; `Compact` (a foreground maintenance command, no reply) and `CronNotification` (the delivery of a one-shot cron fire's result into the conversation that scheduled it) are not — see the subset table above. `CronNotification` still opens a real turn: its `Completed { reply_ordinal }` edge is what drives the push dispatcher off the row it just appended, exactly as a user turn does.
 - **origin** (`baybo_model::TriggerKind`, stored on `Turn.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: `/compact` can run inside a `User`-trigger session while carrying a `Compact` input. Subagent turns record `origin = Spawned` (their session's inherited root).
 
+### Kind-level predicates
+
+Three predicates live on `TurnInputKind`, each the one home for its question:
+
+| `TurnInputKind`        | `is_chat_turn` | `is_attended` | `is_user_facing` |
+| ---------------------- | -------------- | ------------- | ---------------- |
+| `UserChat`             | yes            | yes           | yes              |
+| `SubagentNotification` | yes            | yes           | no               |
+| `IssueRun`             | yes            | yes           | no               |
+| `Compact`              | no             | yes           | no               |
+| `Cron`                 | yes            | no            | no               |
+| `CronNotification`     | no             | no            | no               |
+| `Spawned`              | yes            | no            | no               |
+
+- `is_attended` — a human can see and answer asks raised by the turn; the
+  executor sends every ask of an unattended turn to `PolicyDenyGate`. See
+  [`human-ask.md`](human-ask.md#attendedness) for why each kind sits where it
+  does.
+- `is_user_facing` — the user is directly in the conversation, so a turn
+  failure surfaces as a terminal error notice (`AgentActor::run_agent_loop`).
+
 `TurnOutput` does not split this way — it has only `Message` and `Structured`, the two shapes any turn can produce.
 
 ### Turn owns its behavior
