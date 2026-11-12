@@ -684,6 +684,29 @@ impl SessionStore for SqliteSessionStore {
         Ok(decode_session_list_rows(rows))
     }
 
+    async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>> {
+        // The JSON path only narrows the scan; the model's predicate below is
+        // the rule, so the two cannot disagree about what "awaiting" means.
+        let rows = self
+            .pool
+            .interact("sessions.list_awaiting_cron_reports", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
+                     WHERE json_array_length(data, '$.state.cron_report_awaited') > 0"
+                ))?;
+                let rows = stmt
+                    .query_map([], read_session_list_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        Ok(decode_session_list_rows(rows)
+            .into_iter()
+            .filter(|s| s.state.background_notifications.awaits_cron_reports())
+            .collect())
+    }
+
     async fn list_lineage_children(
         &self,
         parent_session_id: &SessionId,
@@ -2508,6 +2531,38 @@ mod tests {
         // A channel with no rows comes back empty, not as an error.
         let empty = store.list_by_channel(&ChannelType::weixin()).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_awaiting_cron_reports_returns_only_sessions_owed_a_report() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+
+        let mut owed = make_root_session("owed");
+        owed.state
+            .background_notifications
+            .expect_cron_reports(vec!["bg-1".into()]);
+        store.save(&owed).await.unwrap();
+
+        let mut settled = make_root_session("settled");
+        settled
+            .state
+            .background_notifications
+            .expect_cron_reports(vec!["bg-2".into()]);
+        settled
+            .state
+            .background_notifications
+            .settle_cron_report(&"bg-2".into());
+        store.save(&settled).await.unwrap();
+
+        store.save(&make_root_session("plain")).await.unwrap();
+
+        let listed = store.list_awaiting_cron_reports().await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["owed"]);
     }
 
     #[tokio::test]

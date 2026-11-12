@@ -87,6 +87,13 @@ const NOTIFICATION_FAILURE_UNKNOWN: &str = "No error detail was recorded.";
 /// that it is not coming.
 pub const NOTIFICATION_FOLLOW_UP_FAILED_BODY: &str = "Its background work finished, but reviewing the results failed repeatedly, so no report is available.";
 
+/// Body of the failure a recurring fire reports when background work it
+/// started can no longer report — the process restarted under it, or the job
+/// crashed. "Results will follow" was the last the user heard of that work,
+/// so they hear that it will not. Worded for part of the fire's work: other
+/// jobs of the same fire may still report.
+pub const NOTIFICATION_BACKGROUND_INTERRUPTED_BODY: &str = "Background work it started was interrupted before it finished (a restart or a crash), so that work will not report.";
+
 /// Header title for a fire whose job title was never recorded (a session
 /// persisted before the snapshot existed).
 pub const UNTITLED_JOB: &str = "scheduled task";
