@@ -431,9 +431,43 @@ pub struct ExecutedTool {
     /// ([`ApprovalResolution::Abandoned`]): its result is a cancel artefact,
     /// and the loop must claim the ask before appending it.
     pub abandoned: bool,
-    /// The raw group of the job this call started detached, if it was part
-    /// of one — the agent loop counts it into the turn's cohort.
-    pub background_group: Option<baybo_model::BackgroundGroupName>,
+    /// The job this call handed to the background, if any — the agent loop
+    /// counts a grouped one into the turn's cohort and records it as started
+    /// by the turn.
+    pub handed_over: Option<baybo_tools::background::HandedOver>,
+}
+
+/// What a turn lets its calls leave running past it, fixed for the turn.
+/// Forwarded verbatim to the [`baybo_tools::ToolContext`] fields of the same
+/// meaning, which document the rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnBackground {
+    /// [`baybo_tools::ToolContext::background_eligible`].
+    pub eligible: bool,
+    /// [`baybo_tools::ToolContext::overrun_to_background`].
+    pub overrun_to_background: bool,
+}
+
+impl TurnBackground {
+    /// What a turn of `kind` in `session` lets its calls leave running. A cron
+    /// fire that overran would push "results will follow" and then the result,
+    /// so its overruns are killed instead.
+    pub(crate) fn for_turn(
+        session: &baybo_model::Session,
+        kind: baybo_turn::TurnInputKind,
+    ) -> Self {
+        Self {
+            eligible: session.can_host_background_jobs(),
+            overrun_to_background: !matches!(kind, baybo_turn::TurnInputKind::Cron),
+        }
+    }
+
+    /// Nothing outlives the turn.
+    #[cfg(test)]
+    pub(crate) const NONE: Self = Self {
+        eligible: false,
+        overrun_to_background: false,
+    };
 }
 
 /// The out-of-band media blocks a `WithAttachments` / `MultiModalText` result
@@ -715,9 +749,8 @@ impl ToolExecutor {
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.lite_llm` is unset (argv-mode / older tests).
         bind_source: Option<&Arc<BillableLlm>>,
-        // Whether this turn may create background work — forwarded verbatim
-        // to `ToolContext::background_eligible`, which documents the rule.
-        background_eligible: bool,
+        // What this turn lets its calls leave running past it.
+        background: TurnBackground,
         // Whether a human can answer this turn's asks — computed once per turn
         // by the agent loop from the turn's kind. Unattended calls send every
         // ask, in both phases, to the policy-deny gate. Tools never see it.
@@ -746,7 +779,7 @@ impl ToolExecutor {
                     output: Err(e),
                     approval: None,
                     abandoned: false,
-                    background_group: None,
+                    handed_over: None,
                 };
             }
             // The channel-restricted tool is already omitted from the LLM's
@@ -761,7 +794,7 @@ impl ToolExecutor {
                     )),
                     approval: None,
                     abandoned: false,
-                    background_group: None,
+                    handed_over: None,
                 };
             }
         }
@@ -776,7 +809,7 @@ impl ToolExecutor {
                 )),
                 approval: None,
                 abandoned: false,
-                background_group: None,
+                handed_over: None,
             };
         }
         let (pinned_tool, pinned_manifest) = match registration {
@@ -806,9 +839,9 @@ impl ToolExecutor {
         // die with the closure.
         let approval_slot: Arc<Mutex<Option<ApprovalOutcome>>> = Arc::new(Mutex::new(None));
         let approval_sink = Arc::clone(&approval_slot);
-        let group_slot: Arc<parking_lot::Mutex<Option<baybo_model::BackgroundGroupName>>> =
+        let handed_over_slot: Arc<parking_lot::Mutex<Option<baybo_tools::background::HandedOver>>> =
             Arc::default();
-        let group_sink = Arc::clone(&group_slot);
+        let handed_over_sink = Arc::clone(&handed_over_slot);
 
         // Open the tool span up front so denials and approval failures still
         // appear in the trace tree. The handle carries the begin-time kind, so
@@ -1090,7 +1123,8 @@ impl ToolExecutor {
                     // interactive agent loop, so `Edit`/`Write` enforce the
                     // contract here (unlike the background-summary pass).
                     read_tracker: Some(read_tracker),
-                    background_eligible,
+                    background_eligible: background.eligible,
+                    overrun_to_background: background.overrun_to_background,
                     background_jobs: self.background_jobs.clone(),
                     background_control: self.background_control.clone(),
                     background_dispatch: Default::default(),
@@ -1132,7 +1166,7 @@ impl ToolExecutor {
                 if let Some(outcome) = approval_probe.last_outcome() {
                     *approval_sink.lock() = Some(outcome);
                 }
-                *group_sink.lock() = ctx.background_dispatch.take_group();
+                *handed_over_sink.lock() = ctx.background_dispatch.take();
 
                 // Flush tool-reported events as span events, regardless
                 // of whether the tool succeeded, failed, or hit the
@@ -1272,7 +1306,7 @@ impl ToolExecutor {
             output,
             approval: outcome.map(|o| o.decision),
             abandoned: outcome.is_some_and(|o| o.resolution == ApprovalResolution::Abandoned),
-            background_group: group_slot.lock().take(),
+            handed_over: handed_over_slot.lock().take(),
         }
     }
 }
@@ -2107,7 +2141,7 @@ mod tests {
                 idle_tokens(),
                 None,
                 None,
-                false,
+                TurnBackground::NONE,
                 true,
                 ReadTracker::default(),
                 None,
@@ -2560,7 +2594,7 @@ mod tests {
                 idle_tokens(),
                 None,
                 None,
-                false,
+                TurnBackground::NONE,
                 attended,
                 ReadTracker::default(),
                 None,
@@ -2934,7 +2968,7 @@ mod tests {
                 idle_tokens(),
                 None,
                 None,
-                false,
+                TurnBackground::NONE,
                 true,
                 ReadTracker::default(),
                 None,

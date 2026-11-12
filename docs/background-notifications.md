@@ -5,6 +5,14 @@ subagents and detached `Bash` commands into their parent conversation. It does
 not cover cron-result delivery, progress notices, or background context
 summarisation; those are separate pipelines with different delivery contracts.
 
+A recurring cron fire uses this pipeline unchanged for work it moves to the
+background; only what happens to the notification turn differs. A batch
+carrying only handles the fire started (`cron_report_handles`) is the fire's report:
+the turn does not stream and may call `report_nothing`, a reply un-hides the
+conversation and pushes via a zero-inference `CronNotification` turn on the
+reply row, and a batch that exhausts its attempts posts a framed failure
+notice instead of settling passively (see [`modules/cron.md`](modules/cron.md)).
+
 ## Vocabulary and ownership
 
 | Concept | Meaning | Owner |
@@ -185,7 +193,7 @@ Each `<result>` element's `<output>` is capped at `MAX_RESULT_BYTES` —
 defined as `MAX_TOOL_OUTPUT_BYTES`, deliberately the same budget the *same*
 report would have kept had the job finished inside its foreground wait and
 returned as a tool result. The two paths must agree: a foreground subagent
-that crosses `SUBAGENT_FOREGROUND_WAIT` converts to background and delivers
+that crosses its `timeout_ms` (2 minutes by default) converts to background and delivers
 here instead, and when this cap was smaller that conversion silently cost a
 report ~30x more of itself than finishing a second earlier would have. One
 turn's combined bodies are additionally bounded by `MAX_BATCH_BYTES`, split

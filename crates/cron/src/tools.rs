@@ -123,8 +123,10 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
 /// visible only inside a recurring fire ([`ToolTriggerScope::CronConversation`]) and
 /// takes effect only there: it flips the fire's `NotifySilence` handle, which
 /// the agent loop reads to complete the fire without a notification (no chat
-/// row, no push, no live pulse). Where the handle is absent — a user reply in a
-/// cron conversation, or a one-shot fire — it is a no-op.
+/// row, no push, no live pulse). The handle is also present on that
+/// conversation's follow-up turns that report background work the fire
+/// started, whose reply is the fire's real report. Where the handle is absent
+/// — a user reply in a cron conversation, or a one-shot fire — it is a no-op.
 struct CronReportNothingTool;
 
 #[async_trait]

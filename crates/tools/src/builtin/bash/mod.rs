@@ -86,25 +86,11 @@ use parse::{
 const MAX_OUTPUT_BYTES: usize = 2 * baybo_model::MAX_TOOL_OUTPUT_BYTES;
 /// Cap for the one-line command digest logged on sandbox-bypass events.
 const COMMAND_HEAD_MAX_CHARS: usize = 160;
-/// [`Tool::max_timeout`] for Bash, and the `maximum` advertised for
-/// `timeout_ms`: builds, test suites and migration scripts are all fair game
-/// here, so the trait default 30 s would clip anything non-trivial. The
-/// executor's outer deadline is `ctx.timeout` plus `TOOL_DEADLINE_GRACE`
-/// (`baybo-agent`), a few seconds of slack that keeps its timer from racing
-/// the detach-to-background handoff after this command's own deadline fires;
-/// time parked on an approval is not counted against it.
-const MAX_TIMEOUT_MS: u64 = 600_000;
-
-/// The deadline parameter, which is also the foreground window `on_timeout`
-/// acts on.
-const TIMEOUT_PARAM: &str = "timeout_ms";
-
 /// Bash backgrounds a command only once it overruns its own deadline; a
 /// command has produced nothing worth handing over before it starts, so there
 /// is no `background` / `group`.
 const BASH_BACKGROUND: crate::background::BackgroundSupport =
     crate::background::BackgroundSupport {
-        window: crate::background::ForegroundWindow::Param(TIMEOUT_PARAM),
         start_detached: false,
     };
 
@@ -652,8 +638,6 @@ struct Params {
     #[serde(default)]
     justification: Option<String>,
     #[serde(default)]
-    timeout_ms: Option<u64>,
-    #[serde(default)]
     cwd: Option<PathBuf>,
     #[serde(default)]
     secret_env: Vec<String>,
@@ -682,13 +666,10 @@ impl Tool for BashTool {
         out
     }
 
-    /// Rewords `timeout_ms` where detaching is refused (the registry withholds
-    /// `on_timeout` there itself), and withholds the escalation pair where the
-    /// route already skips the OS sandbox. Without a background host a slow
-    /// command is killed whatever `on_timeout` says, and the timeout the model
-    /// picks is then the only thing standing between a long build and losing
-    /// its work; under `free`/bench
-    /// [`SandboxPermissions::requires_approval`] is structurally false, so
+    /// Withholds the escalation pair where the route already skips the OS
+    /// sandbox (the registry narrows the background options itself): under
+    /// `free`/bench [`SandboxPermissions::requires_approval`] is structurally
+    /// false, so
     /// `sandbox_permissions` cannot change a route that is already
     /// unsandboxed and `justification` is only ever rendered by the prompt
     /// that knob raises. Offering either is offering a choice the runtime
@@ -696,20 +677,13 @@ impl Tool for BashTool {
     ///
     /// Live permission changes already reskin `description()`, so adapting
     /// the schema beside it costs no extra prompt-cache invalidation.
-    fn parameters_schema_for(&self, context: crate::ToolSchemaContext<'_>) -> Value {
+    fn parameters_schema_for(&self, _context: crate::ToolSchemaContext<'_>) -> Value {
         let mut schema = self.parameters_schema();
-        if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            if !context.background_eligible
-                && let Some(timeout) = props.get_mut(TIMEOUT_PARAM)
-            {
-                timeout["description"] = json!(
-                    "Exceeding it terminates the command. Use `0` for the tool-context default."
-                );
-            }
-            if permission_skips_os_sandbox(self.permission()) {
-                props.remove("sandbox_permissions");
-                props.remove("justification");
-            }
+        if permission_skips_os_sandbox(self.permission())
+            && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
+        {
+            props.remove("sandbox_permissions");
+            props.remove("justification");
         }
         schema
     }
@@ -726,7 +700,6 @@ impl Tool for BashTool {
                 "command":    { "type": "string" },
                 "sandbox_permissions": { "type": "string", "enum": ["use_default", "require_escalated"], "default": "use_default", "description": sandbox_permissions_description },
                 "justification": { "type": "string", "description": "A concise user-facing question or reason explaining why this command needs unsandboxed execution. Shown only when sandbox_permissions is 'require_escalated' and the configured route is sandboxed. An empty string uses a generic prompt; omit it for 'use_default' or permission 'free'." },
-                TIMEOUT_PARAM: { "type": "integer", "minimum": 0, "maximum": MAX_TIMEOUT_MS, "description": "Use `0` for the tool-context default." },
                 "cwd":        { "type": "string", "description": "An empty string uses the default cwd." },
                 "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." }
             },
@@ -765,8 +738,11 @@ impl Tool for BashTool {
             .and_then(crate::progress::preview_arg)
     }
 
+    /// Builds, test suites and migration scripts are all fair game here, so
+    /// the trait default 30 s would clip anything non-trivial; the call's own
+    /// `timeout_ms` is bounded by the same limit.
     fn max_timeout(&self) -> Duration {
-        Duration::from_millis(MAX_TIMEOUT_MS)
+        crate::background::MAX_RUN_TIME
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
@@ -796,9 +772,10 @@ impl Tool for BashTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let background = crate::background::BackgroundRequest::parse(&params, &BASH_BACKGROUND)
             .map_err(ToolError::InvalidParams)?;
+        let run_time = crate::background::requested_run_time(&params, &background, ctx)
+            .map_err(ToolError::InvalidParams)?;
         let mut p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        p.timeout_ms = p.timeout_ms.filter(|timeout| *timeout > 0);
         p.cwd = p.cwd.filter(|cwd| !cwd.as_os_str().is_empty());
         p.justification = p
             .justification
@@ -814,10 +791,7 @@ impl Tool for BashTool {
             }
         }
 
-        let timeout = p
-            .timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(ctx.timeout);
+        let timeout = run_time;
 
         let command = p.command;
         let baybo_cli_kind = classify_baybo_cli_command(&command);
@@ -952,8 +926,7 @@ impl Tool for BashTool {
         // `secret_env` does not block detach. Background output files and
         // completion tails are raw; if secrets were injected, the background
         // arm below records that risk before handing the child to the sink.
-        if background.backgrounds_on_timeout()
-            && ctx.can_hand_over_background()
+        if ctx.overrun_moves_to_background(&background)
             && let Some(detached_route) = detached_route
             && let Some(output) = run_detached(
                 self,

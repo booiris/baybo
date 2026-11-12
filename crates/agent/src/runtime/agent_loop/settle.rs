@@ -197,19 +197,19 @@ impl AgentLoop {
                     output: Ok(ToolOutput::Json(baybo_human_ask::result::answered(answers))),
                     approval: None,
                     abandoned: false,
-                    background_group: None,
+                    handed_over: None,
                 },
                 (AskResolution::Declined, _) => ExecutedTool {
                     output: Ok(ToolOutput::Json(baybo_human_ask::result::declined())),
                     approval: None,
                     abandoned: false,
-                    background_group: None,
+                    handed_over: None,
                 },
                 (AskResolution::Abandoned, AskKind::Question) => ExecutedTool {
                     output: Ok(ToolOutput::Json(baybo_human_ask::result::abandoned())),
                     approval: None,
                     abandoned: false,
-                    background_group: None,
+                    handed_over: None,
                 },
                 (AskResolution::Approval(ApprovalDecision::Deny), _) => {
                     denied(&call, ApprovalResolution::Answered)
@@ -258,6 +258,7 @@ impl AgentLoop {
             executed,
             turn_attachments,
             llm_visible_images,
+            None,
         )
         .await
     }
@@ -342,8 +343,8 @@ impl AgentLoop {
         let bind_source = Arc::clone(&self.lite_client);
         let read_tracker = self.read_tracker.clone();
         let agent_id = session.state.agent_id_or_builtin();
-        let background_eligible =
-            crate::runtime::background_jobs::background_eligible(session, TurnInputKind::Resume);
+        let background =
+            crate::runtime::tool_executor::TurnBackground::for_turn(session, TurnInputKind::Resume);
         let call_tokens = TurnTokens {
             turn: tokens.turn.child_token(),
             actor: tokens.actor.clone(),
@@ -374,7 +375,7 @@ impl AgentLoop {
                         call_tokens,
                         notifier,
                         Some(&bind_source),
-                        background_eligible,
+                        background,
                         TurnInputKind::Resume.is_attended(),
                         read_tracker,
                         None,
@@ -401,7 +402,7 @@ fn denied(call: &SettledCall, resolution: ApprovalResolution) -> ExecutedTool {
         })),
         approval: Some(ApprovalDecision::Deny),
         abandoned: false,
-        background_group: None,
+        handed_over: None,
     }
 }
 

@@ -1092,9 +1092,8 @@ mod resume_validation_tests {
         assert!(!mk_cron("cr", false).can_host_background_jobs());
 
         // Recurring cron fire's own conversation: listed, replyable, and its
-        // actor is registered, so a notification turn reaches the user. The
-        // *fire's* turn is still excluded — by the turn half of the gate in
-        // the agent loop, not here.
+        // actor is registered, so a notification turn reaches the user — for
+        // work the fire itself started as much as for a reply's.
         assert!(mk_cron("cr-conv", true).can_host_background_jobs());
     }
 
