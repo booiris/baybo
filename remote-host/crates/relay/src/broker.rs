@@ -19,15 +19,26 @@
 //! pumps each socket's binary frames into/out of a [`RelayLeg`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use remote_host_protocol::key_tag;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
-/// Per-leg channel capacity (opaque frames buffered toward the peer before
-/// backpressure).
+/// Most frames one direction of a leg may have queued toward the peer. The
+/// byte budget below is the bound that matters for memory; this one only stops
+/// a stream of tiny frames from queueing without limit.
 const LEG_CHANNEL_CAP: usize = 256;
+
+/// Most bytes one direction of a leg may have queued toward the peer before its
+/// sender waits. The queue only fills when the receiving socket drains slower
+/// than the throttle admits (a stalled gateway, a slow downlink, a peer that
+/// stops reading); then a frame-count cap alone would let one leg hold
+/// 256 × 128 KiB = 32 MiB per direction. Waiting here stops the pump reading
+/// its socket, so the backlog moves to the sender's TCP buffers. One MiB is a
+/// second of the default per-key rate, so a healthy peer never meets it.
+const LEG_BUFFER_BYTES: u32 = 1024 * 1024;
 
 /// How long a parked leg waits for its partner before it's reaped. A WS upgrade
 /// that fails *after* the synchronous park leaves a half uncancelled (its
@@ -50,9 +61,58 @@ const MAX_PENDING_LEGS: usize = 1024;
 /// surface at the partner leg's [`from_peer`](Self::from_peer), blind.
 pub struct RelayLeg {
     /// Opaque frames this leg sends toward its peer.
-    pub to_peer: mpsc::Sender<Vec<u8>>,
+    pub to_peer: LegSender,
     /// Opaque frames the peer sent toward this leg.
-    pub from_peer: mpsc::Receiver<Vec<u8>>,
+    pub from_peer: LegReceiver,
+}
+
+/// The partner leg is gone, so a frame has nowhere to go.
+#[derive(Debug)]
+pub struct PeerGone;
+
+/// A queued frame and the share of [`LEG_BUFFER_BYTES`] it holds until the
+/// receiver takes it.
+type QueuedFrame = (Vec<u8>, OwnedSemaphorePermit);
+
+/// The sending half of one direction of a leg, bounded by
+/// [`LEG_CHANNEL_CAP`] frames and [`LEG_BUFFER_BYTES`] bytes.
+pub struct LegSender {
+    tx: mpsc::Sender<QueuedFrame>,
+    budget: Arc<Semaphore>,
+}
+
+impl LegSender {
+    /// Queue `frame` for the peer, waiting while the queue is at either bound.
+    pub async fn send(&self, frame: Vec<u8>) -> Result<(), PeerGone> {
+        let cost = u32::try_from(frame.len())
+            .unwrap_or(u32::MAX)
+            .clamp(1, LEG_BUFFER_BYTES);
+        let permit = Arc::clone(&self.budget)
+            .acquire_many_owned(cost)
+            .await
+            .map_err(|_| PeerGone)?;
+        self.tx.send((frame, permit)).await.map_err(|_| PeerGone)
+    }
+}
+
+/// The receiving half of one direction of a leg. Dropping it drops whatever is
+/// still queued, which hands the budget back and lets a waiting
+/// [`LegSender::send`] fail with [`PeerGone`] instead of hanging.
+pub struct LegReceiver {
+    rx: mpsc::Receiver<QueuedFrame>,
+}
+
+impl LegReceiver {
+    /// The next frame from the peer, or `None` once the peer is gone.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.recv().await.map(|(frame, _budget)| frame)
+    }
+}
+
+fn leg_channel() -> (LegSender, LegReceiver) {
+    let (tx, rx) = mpsc::channel(LEG_CHANNEL_CAP);
+    let budget = Arc::new(Semaphore::new(LEG_BUFFER_BYTES as usize));
+    (LegSender { tx, budget }, LegReceiver { rx })
 }
 
 /// Outcome of a park-only host [`join`](RelayBroker::park). A host never matches
@@ -71,11 +131,37 @@ pub enum ParkOutcome {
 /// The first leg's counterpart channels, parked until a partner joins.
 struct PendingHalf {
     /// First-leg → second-leg frames (the second leg reads these).
-    from_first: mpsc::Receiver<Vec<u8>>,
+    from_first: LegReceiver,
     /// Second-leg → first-leg frames (the second leg writes these).
-    to_first: mpsc::Sender<Vec<u8>>,
+    to_first: LegSender,
     /// When this half was parked — used to reap it if no partner ever arrives.
     parked_at: Instant,
+}
+
+impl PendingHalf {
+    /// A fresh pair: the first leg, and the half parked for its partner.
+    fn open() -> (RelayLeg, Self) {
+        let (first_to_second_tx, first_to_second_rx) = leg_channel();
+        let (second_to_first_tx, second_to_first_rx) = leg_channel();
+        let first = RelayLeg {
+            to_peer: first_to_second_tx,
+            from_peer: second_to_first_rx,
+        };
+        let half = Self {
+            from_first: first_to_second_rx,
+            to_first: second_to_first_tx,
+            parked_at: Instant::now(),
+        };
+        (first, half)
+    }
+
+    /// The second leg, matched to this parked half.
+    fn into_second(self) -> RelayLeg {
+        RelayLeg {
+            to_peer: self.to_first,
+            from_peer: self.from_first,
+        }
+    }
 }
 
 /// Matches two legs by key and pipes opaque bytes between them, blind.
@@ -127,11 +213,7 @@ impl RelayBroker {
     pub fn join(&self, key: &str) -> Option<RelayLeg> {
         let mut pending = self.pending.lock();
         if let Some(half) = pending.remove(key) {
-            // Second leg: write toward the first, read what the first writes.
-            Some(RelayLeg {
-                to_peer: half.to_first,
-                from_peer: half.from_first,
-            })
+            Some(half.into_second())
         } else {
             // About to park a new half: first reap any whose partner never
             // arrived, so a dropped upgrade or a no-show gateway can't grow the
@@ -148,20 +230,9 @@ impl RelayBroker {
                 );
                 return None;
             }
-            let (first_to_second_tx, first_to_second_rx) = mpsc::channel(LEG_CHANNEL_CAP);
-            let (second_to_first_tx, second_to_first_rx) = mpsc::channel(LEG_CHANNEL_CAP);
-            pending.insert(
-                key.to_string(),
-                PendingHalf {
-                    from_first: first_to_second_rx,
-                    to_first: second_to_first_tx,
-                    parked_at: Instant::now(),
-                },
-            );
-            Some(RelayLeg {
-                to_peer: first_to_second_tx,
-                from_peer: second_to_first_rx,
-            })
+            let (first, half) = PendingHalf::open();
+            pending.insert(key.to_string(), half);
+            Some(first)
         }
     }
 
@@ -185,20 +256,9 @@ impl RelayBroker {
         if pending.len() >= self.max_pending {
             return ParkOutcome::AtCapacity;
         }
-        let (first_to_second_tx, first_to_second_rx) = mpsc::channel(LEG_CHANNEL_CAP);
-        let (second_to_first_tx, second_to_first_rx) = mpsc::channel(LEG_CHANNEL_CAP);
-        pending.insert(
-            key.to_string(),
-            PendingHalf {
-                from_first: first_to_second_rx,
-                to_first: second_to_first_tx,
-                parked_at: Instant::now(),
-            },
-        );
-        ParkOutcome::Parked(RelayLeg {
-            to_peer: first_to_second_tx,
-            from_peer: second_to_first_rx,
-        })
+        let (first, half) = PendingHalf::open();
+        pending.insert(key.to_string(), half);
+        ParkOutcome::Parked(first)
     }
 
     /// Drop pending legs parked longer than `ttl` (their partner never arrived),
@@ -247,10 +307,10 @@ impl RelayBroker {
     /// uses `try_match`, so it can pair with a waiting host but can never occupy a
     /// rendezvous or flood the broker with parked legs.
     pub fn try_match(&self, key: &str) -> Option<RelayLeg> {
-        self.pending.lock().remove(key).map(|half| RelayLeg {
-            to_peer: half.to_first,
-            from_peer: half.from_first,
-        })
+        self.pending
+            .lock()
+            .remove(key)
+            .map(PendingHalf::into_second)
     }
 
     /// Drop a still-pending (unmatched) leg — a disconnect before the partner
@@ -408,6 +468,53 @@ mod tests {
         drop(app); // app disconnects
         // The peer's stream ends cleanly rather than hanging.
         assert!(gw.from_peer.recv().await.is_none());
+    }
+
+    /// A peer that stops reading holds at most [`LEG_BUFFER_BYTES`] of the other
+    /// side's frames, not [`LEG_CHANNEL_CAP`] of them: past the budget the
+    /// sender waits, and each frame the peer takes lets one more through.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stops_reading_holds_only_the_byte_budget() {
+        let broker = RelayBroker::new();
+        let phone = broker.join("k").expect("first leg parks");
+        let mut gateway = broker.join("k").expect("second leg matches");
+        let frame = vec![0u8; 64 * 1024];
+        let fits = LEG_BUFFER_BYTES as usize / frame.len();
+        assert!(fits < LEG_CHANNEL_CAP, "the byte budget binds first");
+
+        for _ in 0..fits {
+            phone.to_peer.send(frame.clone()).await.unwrap();
+        }
+        let wait = Duration::from_secs(5);
+        assert!(
+            tokio::time::timeout(wait, phone.to_peer.send(frame.clone()))
+                .await
+                .is_err(),
+            "a full budget makes the sender wait"
+        );
+
+        assert_eq!(gateway.from_peer.recv().await.unwrap().len(), frame.len());
+        tokio::time::timeout(wait, phone.to_peer.send(frame.clone()))
+            .await
+            .expect("a frame taken frees room for the next")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sender_waiting_on_a_full_budget_fails_once_the_peer_goes() {
+        let broker = RelayBroker::new();
+        let phone = broker.join("k").expect("first leg parks");
+        let gateway = broker.join("k").expect("second leg matches");
+        let frame = vec![0u8; LEG_BUFFER_BYTES as usize];
+        phone.to_peer.send(frame.clone()).await.unwrap();
+
+        let blocked = tokio::spawn(async move { phone.to_peer.send(frame).await });
+        tokio::task::yield_now().await;
+        drop(gateway);
+        assert!(
+            blocked.await.unwrap().is_err(),
+            "a vanished peer must not hang the sender"
+        );
     }
 
     #[tokio::test]

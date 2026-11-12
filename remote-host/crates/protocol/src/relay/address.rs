@@ -74,7 +74,7 @@ const SOURCE_KEY_IPV6_PREFIX_LEN: u32 = 64;
 const CLIENT_KEY_IPV6_PREFIX_LEN: u32 = 48;
 
 impl AddressPolicy {
-    /// The policy every caller uses: [`AddressPolicy::for_tests`] when the
+    /// The policy every caller uses: `AddressPolicy::for_tests` when the
     /// crate is built with `test-support`, the production table otherwise.
     pub fn active() -> Self {
         Self {
