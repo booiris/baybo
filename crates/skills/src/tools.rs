@@ -900,6 +900,8 @@ mod tests {
                 Arc::new(AutoDenyGate),
                 Arc::new(Mutex::new(Vec::new())),
                 String::new(),
+                baybo_tools::ParkGauge::new(),
+                baybo_tools::AskCancel::never(),
             )),
             ..ToolContext::for_test()
         }

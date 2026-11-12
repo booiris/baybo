@@ -1,145 +1,183 @@
-//! The gates that answer an [`ApprovalGate`] request: [`ChannelAskGate`]
-//! parks the call on its channel's [`AskQueue`] until a human answers;
-//! [`PolicyDenyGate`] denies without asking anyone.
+//! The two [`ApprovalGate`] implementations backed by the ledger.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_model::approval::{ApprovalDecision, ApprovalRequest};
-use baybo_tools::{ApprovalGate, ApprovalOutcome};
+use baybo_model::human_ask::{AskId, AskKind, AskRequest, AskResolution};
+use baybo_store::HumanAskRow;
+use baybo_tools::{ApprovalGate, ApprovalOutcome, AskCancel, AskSite, CancelOrigin};
+use chrono::Utc;
 use tokio::sync::oneshot;
 
-use crate::queue::{AskQueue, PendingApproval};
+use crate::core::{AskCore, AskEvent};
+use crate::queue::{AskQueue, PendingAsk};
 
-/// Generic [`ApprovalGate`] for any channel. Pushes requests onto an
-/// [`AskQueue`] and fires a sync waker callback so the channel's event
-/// loop redraws. The channel resolves entries by calling
-/// [`AskQueue::resolve_head`].
-///
-/// Fail-closed: if the oneshot is dropped without a decision (e.g. the
-/// channel exits while approvals are pending) or the timeout expires,
-/// `Deny` is returned.
+/// A channel's gate: persist the ask, enqueue it, wait for a verb to resolve
+/// it. No timeout. Clients learn of the ask from the queue's
+/// [`AskQueueEvent::AskRaised`](crate::AskQueueEvent::AskRaised), which the
+/// channel's ask watcher turns into a frame.
 pub struct ChannelAskGate {
     queue: AskQueue,
-    /// Handed the request it is being woken FOR. It must not re-read the queue
-    /// to find one: the queue is per-CHANNEL, so two sessions prompting at once
-    /// race, and a waker that took (say) the tail would broadcast one prompt
-    /// twice and the other never — leaving a user staring at a turn that
-    /// silently denies itself minutes later.
-    waker: Arc<dyn Fn(ApprovalRequest) + Send + Sync>,
-    timeout: Duration,
+    core: Arc<AskCore>,
 }
 
 impl ChannelAskGate {
-    pub fn new(
-        queue: AskQueue,
-        waker: Arc<dyn Fn(ApprovalRequest) + Send + Sync>,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            queue,
-            waker,
-            timeout,
-        }
+    pub fn new(queue: AskQueue, core: Arc<AskCore>) -> Self {
+        Self { queue, core }
     }
 
-    /// Access the underlying queue so the channel can peek/resolve entries.
     pub fn queue(&self) -> &AskQueue {
         &self.queue
+    }
+
+    /// Persist, enqueue and wait. `None` when the row could not be
+    /// written — nothing was shown, so there is nothing to wait for.
+    ///
+    /// On a turn cancel the arm returns at once without awaiting anything:
+    /// the loop drops the tool future the moment this yields `Pending`, so a
+    /// write started there would be torn. The write-ahead insert itself can
+    /// outlive a dropped future and commit after the loop's cancel fill,
+    /// leaving a pending row no queue shows; the next boot closes it. On an
+    /// ancestor cancel (process shutdown) it never returns: the row stays
+    /// pending, and the next boot closes it.
+    async fn park(&self, row: HumanAskRow, cancel: AskCancel) -> Option<AskResolution> {
+        if let Err(e) = self.core.store().create(&row).await {
+            tracing::warn!(
+                ask_id = %row.ask_id,
+                kind = row.kind.as_str(),
+                error = %e,
+                "could not persist ask; not raising it"
+            );
+            return None;
+        }
+        self.core.notify(&row, AskEvent::Raised).await;
+
+        let ask = PendingAsk::from_row(&row);
+        let (tx, rx) = oneshot::channel();
+        self.queue.push_live(ask, tx);
+        let _orphan = OrphanOnDrop {
+            queue: self.queue.clone(),
+            ask_id: row.ask_id.clone(),
+        };
+
+        tokio::select! {
+            biased;
+            answered = rx => {
+                let resolution = answered.unwrap_or(AskResolution::Abandoned);
+                if let Err(e) = self.core.mark_applied(&row.ask_id).await {
+                    tracing::warn!(ask_id = %row.ask_id, error = %e, "could not stamp ask applied");
+                }
+                Some(resolution)
+            }
+            _ = cancel.tokens.turn.cancelled() => match cancel.origin() {
+                CancelOrigin::Turn => Some(AskResolution::Abandoned),
+                CancelOrigin::Ancestor => std::future::pending().await,
+            },
+        }
     }
 }
 
 #[async_trait]
 impl ApprovalGate for ChannelAskGate {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
-        let call_id = req.call_id.clone();
-        let (tx, rx) = oneshot::channel();
-        let woken_for = req.clone();
-        self.queue.push(PendingApproval {
-            req,
-            responder: Some(tx),
-        });
-        (self.waker)(woken_for);
-
-        // RAII guard: if our future is dropped before a decision lands
-        // (e.g. the outer tool timeout fires while the user is still
-        // reading the modal) or the gate's own timeout elapses, remove
-        // the queue entry so the channel UI doesn't catch the user's
-        // *next* click on a stale, disconnected `tx` — which would
-        // cost an extra click per orphan and could let a stale
-        // resolution silently land on a disconnected receiver.
-        let _cleanup = QueueCleanup {
-            queue: self.queue.clone(),
-            call_id,
+    async fn request(
+        &self,
+        req: ApprovalRequest,
+        site: AskSite,
+        cancel: AskCancel,
+    ) -> ApprovalOutcome {
+        let Some(row) = approval_row(req, site) else {
+            return ApprovalOutcome::abandoned();
         };
-
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(decision)) => ApprovalOutcome::answered(decision),
-            // The responder is gone with no decision: the queue entry was
-            // torn down under us (turn cancel, channel exit).
-            Ok(Err(_)) => ApprovalOutcome::abandoned(),
-            Err(_) => ApprovalOutcome::timed_out(),
+        let ask_id = row.ask_id.clone();
+        match self.park(row, cancel).await {
+            Some(AskResolution::Approval(decision)) => ApprovalOutcome::answered(decision),
+            Some(AskResolution::PolicyDenied) => ApprovalOutcome::policy(ApprovalDecision::Deny),
+            Some(AskResolution::Abandoned) | None => ApprovalOutcome::abandoned(),
+            Some(other @ (AskResolution::Answered(_) | AskResolution::Declined)) => {
+                tracing::warn!(%ask_id, ?other, "approval ask resolved as a question; denying");
+                ApprovalOutcome::abandoned()
+            }
         }
     }
 }
 
-/// RAII helper that removes a queue entry when its owning request
-/// future is dropped. A no-op if `resolve_head` / `resolve_by_call_id`
-/// already popped the entry (the matching `call_id` is gone, and
-/// `drop_call` returns `false`).
-struct QueueCleanup {
-    queue: AskQueue,
-    call_id: String,
+/// Unattended turns: every approval is denied by policy, and the denial is
+/// still written to the ledger — already resolved and applied, with no queue
+/// entry, edge or frame.
+pub struct PolicyDenyGate {
+    core: Arc<AskCore>,
 }
-
-impl Drop for QueueCleanup {
-    fn drop(&mut self) {
-        let _ = self.queue.drop_call(&self.call_id);
-    }
-}
-
-/// The gate every ask of an unattended turn goes to, in both phases: nobody
-/// can see the prompt, so it is denied by policy without being raised.
-/// Fail-closed for the same reason as `baybo_tools::AutoDenyGate`, but kept
-/// distinct: that one guards a channel with no gate registered, this one is
-/// the attendedness rule's answer.
-#[derive(Debug, Default)]
-pub struct PolicyDenyGate;
 
 impl PolicyDenyGate {
-    pub fn new() -> Self {
-        Self
+    pub fn new(core: Arc<AskCore>) -> Self {
+        Self { core }
     }
 }
 
 #[async_trait]
 impl ApprovalGate for PolicyDenyGate {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
-        ApprovalOutcome::policy(ApprovalDecision::Deny)
+    async fn request(
+        &self,
+        req: ApprovalRequest,
+        site: AskSite,
+        _cancel: AskCancel,
+    ) -> ApprovalOutcome {
+        let denied = ApprovalOutcome::policy(ApprovalDecision::Deny);
+        let Some(mut row) = approval_row(req, site) else {
+            return denied;
+        };
+        let now = Utc::now();
+        row.resolved_at = Some(now);
+        row.resolution = Some(AskResolution::PolicyDenied);
+        row.applied_at = Some(now);
+        match self.core.store().create(&row).await {
+            Ok(()) => {
+                self.core
+                    .notify(&row, AskEvent::Resolved(AskResolution::PolicyDenied))
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record policy denial");
+            }
+        }
+        denied
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use baybo_model::approval::ApprovalResolution;
+/// The pending ledger row for an approval. `None` (logged) when the request
+/// carries no usable ask id.
+fn approval_row(req: ApprovalRequest, site: AskSite) -> Option<HumanAskRow> {
+    let ask_id: AskId = match req.call_id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(tool = %req.tool, error = %e, "approval request has no ask id");
+            return None;
+        }
+    };
+    Some(HumanAskRow {
+        ask_id,
+        session_id: req.session_id.clone(),
+        channel: site.channel,
+        tool_call_id: req.tool_call_id.clone(),
+        kind: AskKind::Approval,
+        phase: site.phase,
+        request: AskRequest::Approval(req),
+        created_at: Utc::now(),
+        resolved_at: None,
+        resolution: None,
+        applied_at: None,
+    })
+}
 
-    #[tokio::test]
-    async fn policy_deny_gate_denies_by_policy() {
-        let out = PolicyDenyGate::new()
-            .request(ApprovalRequest {
-                call_id: "x".into(),
-                tool_call_id: "use-1".into(),
-                session_id: "s".into(),
-                user_id: "u".into(),
-                tool: "Bash".into(),
-                accesses: vec![],
-                params_preview: String::new(),
-                description: None,
-            })
-            .await;
-        assert_eq!(out.decision, ApprovalDecision::Deny);
-        assert_eq!(out.resolution, ApprovalResolution::Policy);
+/// A dropped waiter takes its ask off the queue; it never resolves it.
+struct OrphanOnDrop {
+    queue: AskQueue,
+    ask_id: AskId,
+}
+
+impl Drop for OrphanOnDrop {
+    fn drop(&mut self) {
+        self.queue.orphan(&self.ask_id);
     }
 }

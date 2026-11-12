@@ -605,6 +605,10 @@ impl AgentActor {
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
+        let tokens = baybo_tools::TurnTokens {
+            turn: turn_token.clone(),
+            actor: self.volatile.actor_token.clone(),
+        };
         let result = self
             .volatile
             .agent_loop
@@ -615,7 +619,7 @@ impl AgentActor {
                 &self.volatile.span_recorder,
                 parent_turn_id,
                 delta_tx,
-                turn_token.clone(),
+                tokens,
                 interjections,
                 notify_silence,
             )

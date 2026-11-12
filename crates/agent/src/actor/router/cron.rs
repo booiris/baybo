@@ -1266,7 +1266,10 @@ mod tests {
 
         fn build(seed_origin: bool) -> Self {
             let (response_tx, response_rx) = mpsc::channel(64);
-            let supervisor = AgentSupervisor::new(response_tx);
+            let supervisor = AgentSupervisor::new(
+                response_tx,
+                std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+            );
             let sessions = Arc::new(SessionManager::new(
                 Arc::new(MemorySessionStore::new()),
                 Arc::new(MemorySessionFolderStore::new()),

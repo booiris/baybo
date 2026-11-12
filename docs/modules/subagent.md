@@ -44,9 +44,9 @@ A child actor boots with an empty context, the profile's `system_prompt` as its 
 
 A Baybo child always runs its work as a `Spawned` turn, and
 `TurnInputKind::Spawned` is unattended (`is_attended() == false`): every
-approval it raises goes to the executor's `PolicyDenyGate` and is denied
-rather than prompted — whoever dispatched it. No marker is carried through the
-spawn; the turn kind is the rule's one home (see
+approval it raises goes to the executor's `PolicyDenyGate` and is denied, with
+a `PolicyDenied` ledger row, rather than prompted — whoever dispatched it. No
+marker is carried through the spawn; the turn kind is the rule's one home (see
 [`human-ask.md`](human-ask.md#attendedness)). External backends do not run
 through Baybo's `ToolExecutor`.
 

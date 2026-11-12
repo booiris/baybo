@@ -35,7 +35,9 @@ use baybo_channels::{
 use baybo_config::BayboConfig;
 use baybo_human_ask::AskQueue;
 use baybo_model::{ChannelType, ContentBlock, MessageMetadata, SessionId, User};
-use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalRequest, AutoDenyGate};
+use baybo_tools::{
+    ApprovalDecision, ApprovalGate, ApprovalRequest, AskCancel, AskSite, AutoDenyGate,
+};
 use baybo_tui::{TransportEvent, TransportEventStream};
 use chrono::Utc;
 use futures::StreamExt;
@@ -209,8 +211,11 @@ async fn consume_ws_turn(
             }
             TransportEvent::ApprovalRequested => {
                 // No human to decide; resolve over the wire so the turn
-                // never stalls on the gateway's approval-gate timeout.
-                let tool = approvals.peek_head().map(|r| r.tool).unwrap_or_default();
+                // never parks on the gateway's approval gate.
+                let tool = approvals
+                    .peek_head_approval()
+                    .map(|r| r.tool)
+                    .unwrap_or_default();
                 approvals.resolve_head(decision);
                 note_approval(decision, &tool);
             }
@@ -248,6 +253,9 @@ async fn run_in_process(
         Vec::new(),
     )
     .await?;
+    // No push task runs here: drop the ask push stream so the relay sees a
+    // closed channel (a no-op) rather than filling a queue nobody drains.
+    drop(graph.ask_push_stream.take());
 
     // Override the channel's interactive approval gate with a session-
     // scoped auto gate. Session-level wins over the type-level gate
@@ -389,7 +397,12 @@ struct AutoApproveGate;
 
 #[async_trait::async_trait]
 impl ApprovalGate for AutoApproveGate {
-    async fn request(&self, _req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
+    async fn request(
+        &self,
+        _req: ApprovalRequest,
+        _site: AskSite,
+        _cancel: AskCancel,
+    ) -> baybo_tools::ApprovalOutcome {
         baybo_tools::ApprovalOutcome::policy(ApprovalDecision::Approve)
     }
 }

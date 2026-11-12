@@ -1,6 +1,11 @@
 # Approvals — merge the two gates onto one persisted record
 
-> **Status:** decided, not started. **Target: one gate. The original
+> **Status:** done — superseded by [`human-ask`](../modules/human-ask.md) PR 1: one
+> `ChannelAskGate` over the durable `human_asks` ledger, the card recorded by
+> `baybo_project::install_ask_bridge`'s observer. Kept as history; the rest of this note
+> describes the code as it was.
+>
+> **Original status:** decided, not started. **Target: one gate. The original
 > `ChannelApprovalGate` becomes durable, `TimelineApprovalGate` stops being a separate gate,
 > and the card and the chat become two renderings of the same record.** Finding 1 below is a
 > live bug that this deletes rather than patches — do the merge, or patch it knowing the

@@ -264,8 +264,13 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
         .await
         .expect("seed approved device row");
     // Device connections pool into the shared `owner` channel.
-    crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::owner())
-        .expect("install owner channel");
+    crate::channel::boot::install_channel(
+        &tg.deps.channel_registry,
+        ChannelType::owner(),
+        &tg.deps.ask_core,
+        &tg.deps.ask_queues,
+    )
+    .expect("install owner channel");
     let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
         .await
         .expect("gateway static key");
@@ -571,8 +576,13 @@ impl DirectRig {
     async fn start(carrier: RuntimeCarrierConfig) -> Self {
         let relay = DirectRelay::boot().await;
         let gateway = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-        crate::channel::boot::install_channel(&gateway.deps.channel_registry, ChannelType::owner())
-            .expect("install owner channel");
+        crate::channel::boot::install_channel(
+            &gateway.deps.channel_registry,
+            ChannelType::owner(),
+            &gateway.deps.ask_core,
+            &gateway.deps.ask_queues,
+        )
+        .expect("install owner channel");
         let device = StaticKeypair::generate().unwrap();
         let device_id =
             delegation::device_id_for(&delegation::generate_signing_key().verifying_key());

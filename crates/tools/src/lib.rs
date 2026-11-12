@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod ask;
 pub mod background;
 pub mod blob_media;
 pub mod builtin;
@@ -17,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-#[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
+use baybo_model::human_ask::AskPhase;
 use baybo_model::{AgentHandle, AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
@@ -31,6 +32,7 @@ pub use approval::{
     ApprovalResolution, ApprovedResource, AutoDenyGate, HostPattern, ResourceAccess,
     refusal_reason,
 };
+pub use ask::{AskCancel, AskSite, CancelOrigin, ParkGauge, ParkGuard, TurnTokens};
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::paths::shell_reachable_workspace_roots;
 pub use builtin::read::READ_TOOL_NAME;
@@ -665,6 +667,10 @@ pub fn noop_event_sink() -> Arc<dyn ToolEventSink> {
 /// - Write: on `ApproveAlways` the granted accesses are appended to
 ///   the cache so a follow-up call inside the same session does not
 ///   re-prompt.
+///
+/// Every prompt it raises is a [`AskPhase::DuringExecute`] ask on the
+/// requesting user's channel, raced against the call's [`AskCancel`], and
+/// holds the call's [`ParkGauge`] for as long as it waits.
 #[derive(Clone)]
 pub struct ApprovalHandle {
     gate: Arc<dyn ApprovalGate>,
@@ -675,10 +681,12 @@ pub struct ApprovalHandle {
     /// `tool_use_id` of the call this handle serves, stamped onto every
     /// [`ApprovalRequest`] so clients can badge the right work step.
     tool_call_id: String,
-    /// Last decision an ACTUAL prompt returned (cache short-circuits never
+    /// Last outcome an ACTUAL prompt returned (cache short-circuits never
     /// record). Shared across clones so the executor reads back what
     /// mid-execution prompts decided after the tool returns.
-    last_decision: Arc<parking_lot::Mutex<Option<ApprovalDecision>>>,
+    last_outcome: Arc<parking_lot::Mutex<Option<ApprovalOutcome>>>,
+    park: ParkGauge,
+    cancel: AskCancel,
 }
 
 impl ApprovalHandle {
@@ -686,20 +694,45 @@ impl ApprovalHandle {
         gate: Arc<dyn ApprovalGate>,
         approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
         tool_call_id: String,
+        park: ParkGauge,
+        cancel: AskCancel,
     ) -> Self {
         Self {
             gate,
             approved_cache,
             tool_call_id,
-            last_decision: Arc::new(parking_lot::Mutex::new(None)),
+            last_outcome: Arc::new(parking_lot::Mutex::new(None)),
+            park,
+            cancel,
         }
+    }
+
+    /// Raise one prompt through the gate, holding the park gauge while it
+    /// waits, and record what it decided.
+    async fn raise(&self, req: ApprovalRequest, channel: ChannelType) -> ApprovalOutcome {
+        let site = AskSite {
+            channel,
+            phase: AskPhase::DuringExecute,
+        };
+        let outcome = {
+            let _parked = self.park.park();
+            self.gate.request(req, site, self.cancel.clone()).await
+        };
+        *self.last_outcome.lock() = Some(outcome);
+        outcome
     }
 
     /// Decision of the most recent prompt this handle (or any clone) actually
     /// raised — `None` when everything was covered by cache. The executor
     /// stamps this into the persisted [`baybo_model::ToolResultMeta`].
     pub fn last_decision(&self) -> Option<ApprovalDecision> {
-        *self.last_decision.lock()
+        self.last_outcome().map(|outcome| outcome.decision)
+    }
+
+    /// The full outcome behind [`Self::last_decision`], including how it was
+    /// reached (a torn-down prompt reads [`ApprovalResolution::Abandoned`]).
+    pub fn last_outcome(&self) -> Option<ApprovalOutcome> {
+        *self.last_outcome.lock()
     }
 
     /// Forward a request to the gate WITHOUT consulting the session
@@ -751,9 +784,7 @@ impl ApprovalHandle {
             params_preview,
             description,
         };
-        let outcome = self.gate.request(req).await;
-        *self.last_decision.lock() = Some(outcome.decision);
-        outcome
+        self.raise(req, user.channel.clone()).await
     }
 
     /// Forward a request to the gate, filtered by the session approval
@@ -800,8 +831,7 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let outcome = self.gate.request(req).await;
-        *self.last_decision.lock() = Some(outcome.decision);
+        let outcome = self.raise(req, user.channel.clone()).await;
         if outcome.decision == ApprovalDecision::ApproveAlways {
             let mut cache = self.approved_cache.lock();
             for access in &uncovered {
@@ -1203,8 +1233,14 @@ mod approval_handle_tests {
 
     #[async_trait]
     impl ApprovalGate for FixedGate {
-        async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
+        async fn request(
+            &self,
+            req: ApprovalRequest,
+            site: AskSite,
+            _cancel: AskCancel,
+        ) -> ApprovalOutcome {
             assert_eq!(req.tool_call_id, "use-1", "prompt carries the tool call id");
+            assert_eq!(site.phase, AskPhase::DuringExecute);
             ApprovalOutcome::answered(self.0)
         }
     }
@@ -1214,6 +1250,8 @@ mod approval_handle_tests {
             Arc::new(FixedGate(decision)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
             "use-1".into(),
+            ParkGauge::new(),
+            AskCancel::never(),
         )
     }
 
@@ -1279,6 +1317,8 @@ mod approval_handle_tests {
             Arc::new(FixedGate(ApprovalDecision::Deny)),
             cache,
             "use-1".into(),
+            ParkGauge::new(),
+            AskCancel::never(),
         );
         let out = h
             .request(

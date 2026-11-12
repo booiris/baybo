@@ -21,6 +21,7 @@ const card: IssueDetail = {
   stage: 0,
   unread: 0,
   last_run_failed: false,
+  awaiting_human: false,
   approval_pending: false,
   opened_by_agent: false,
   created_at_ms: 1,

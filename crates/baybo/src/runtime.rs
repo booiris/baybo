@@ -218,8 +218,20 @@ pub struct ManagerGraph {
     /// cascades down through every actor's per-turn cancel tree.
     pub actor_parent_token: CancellationToken,
 
-    /// Approval wrapper retained so shutdown can close parked card prompts.
-    pub timeline_approvals: Option<Arc<baybo_project::TimelineApprovalGate>>,
+    /// The ask ledger + observers the channel gates share. Rides the graph
+    /// to `GatewayDeps` for the lazy channel install.
+    pub ask_core: Arc<baybo_human_ask::AskCore>,
+    /// One ask queue per channel; the lazy install fetches from it too.
+    pub ask_queues: baybo_human_ask::AskQueues,
+    /// The verbs over the ask ledger. Every actor's loop gets it as its
+    /// `TurnAsks` port; the gateway's resolve doors call it, and
+    /// `gateway_cmd` closes the stale asks with it at boot.
+    pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
+    /// Pushes for asks parked on the owner queue, drained by the gateway's
+    /// push task. A one-shot like `cron_trigger_rx`: `gateway_cmd` takes it.
+    /// `None` when there is no owner channel, and left unread by `baybo
+    /// prompt` (a closed stream is a no-op for the relay).
+    pub ask_push_stream: Option<baybo_gateway::push::ask::AskPushStream>,
 
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
@@ -235,10 +247,6 @@ const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_
 
 impl ManagerGraph {
     pub async fn shutdown(&mut self, deadline: tokio::time::Instant) {
-        // Close before cancellation because `Drop` cannot await runtime teardown.
-        if let Some(approvals) = &self.timeline_approvals {
-            approvals.close_open_prompts().await;
-        }
         self.actor_parent_token.cancel();
         let sandbox_runner = self.sandbox_runner.clone();
         tokio::join!(self.mcp_runtime.shutdown(deadline), async move {
@@ -331,10 +339,6 @@ pub async fn build_managers(
     };
     let workspace = Arc::new(workspace_paths.clone());
     let channels_registry = Arc::new(ChannelRegistry::new());
-    // Eagerly install every enabled channel from config so connections
-    // can attach to a pre-existing slot rather than racing on lazy
-    // first-connect creation. See docs/modules/channels-protocol-refactor.md.
-    baybo_gateway::channel::boot::install_channels(&channels_registry, &config.channels)?;
 
     // --- storage + domain managers. `stores` is kept whole: every Arc
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
@@ -507,6 +511,42 @@ pub async fn build_managers(
     )
     .await;
 
+    // The one read of the ask ledger: every channel's gate and the ask
+    // manager share this core, and every channel fetches its queue from
+    // `ask_queues` so the manager and the install meet on one queue.
+    let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
+    let ask_queues = baybo_human_ask::AskQueues::new();
+    // Eagerly install every enabled channel from config so connections
+    // can attach to a pre-existing slot rather than racing on lazy
+    // first-connect creation. See docs/modules/channels-protocol-refactor.md.
+    baybo_gateway::channel::boot::install_channels(
+        &channels_registry,
+        &config.channels,
+        &ask_core,
+        &ask_queues,
+    )?;
+
+    // The ask push relay watches the owner queue's edges, so it must exist
+    // before any ask parks: edges go to whoever is watching at drain time,
+    // with no replay. Installed on `owner` alone: the queue is per-channel,
+    // and the app holds an `owner` connection, so an ask parked on the TUI's or Telegram's queue is one
+    // the phone could not answer even after opening the conversation.
+    let ask_push_stream = match channels_registry.get(&baybo_model::ChannelType::owner()) {
+        Some(owner) => {
+            let (relay, stream) = baybo_gateway::push::ask::AskPushRelay::new();
+            relay.install(&owner);
+            Some(stream)
+        }
+        None => None,
+    };
+
+    let human_asks = Arc::new(baybo_human_ask::HumanAskManager::from_config(
+        baybo_human_ask::HumanAskManagerConfig {
+            core: Arc::clone(&ask_core),
+            queues: ask_queues.clone(),
+        },
+    ));
+
     // CostTracker has been retired in favour of a process-wide
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)
@@ -649,6 +689,12 @@ pub async fn build_managers(
     for (tool, manifest) in baybo_project::tools::agent_tools(Arc::clone(&project_manager)) {
         tool_registry.register(tool, manifest);
     }
+    baybo_project::install_ask_bridge(
+        &ask_core,
+        &project_manager,
+        Arc::clone(&human_asks),
+        stores.session.clone(),
+    );
 
     // --- security gateway + tool executor
     // Tool-output spill now lives in `baybo-context` (resolved from the
@@ -658,11 +704,6 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
-    let timeline_approvals = baybo_gateway::channel::boot::install_timeline_approval_gate(
-        &channels_registry,
-        Arc::clone(&project_manager),
-        stores.session.clone(),
-    );
 
     let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(
         config.permission,
@@ -840,7 +881,7 @@ pub async fn build_managers(
             projects: Arc::clone(&project_manager) as Arc<dyn baybo_project::ProjectRepo>,
             agents: stores.agent_profile.clone(),
         }),
-        Arc::new(baybo_human_ask::PolicyDenyGate::new()),
+        Arc::new(baybo_human_ask::PolicyDenyGate::new(Arc::clone(&ask_core))),
     ));
 
     // --- per-actor parent token. The spawner factory derives each
@@ -906,7 +947,10 @@ pub async fn build_managers(
         issue_run_rx: Some(issue_run_rx),
         subagent_spawner_slot,
         actor_parent_token,
-        timeline_approvals,
+        ask_core,
+        ask_queues,
+        human_asks,
+        ask_push_stream,
         subagent_dispatch_limiter,
     })
 }
@@ -950,7 +994,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
-    let supervisor = AgentSupervisor::new(response_tx);
+    let supervisor = AgentSupervisor::new(response_tx, graph.human_asks.clone());
     // Hand the now-built supervisor to the background-turn manager so its
     // escorts can route completion notifications back to parent sessions.
     let _ = graph.bg_supervisor_slot.set(supervisor.clone());
@@ -1000,6 +1044,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         // below; `None` keeps the no-op path (every memory hook skipped,
         // nothing billed).
         let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
+        let turn_asks: Arc<dyn baybo_agent::runtime::asks::TurnAsks> = graph.human_asks.clone();
         // Shared across every actor: the title pass notifies this sink once it
         // has persisted a generated title, and it fans a `SessionUpdated` patch
         // out to every Subscribed channel so the owning surface updates live.
@@ -1073,6 +1118,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     memory: memory.clone(),
                     task_store: task_store.clone(),
                     title_sink: title_sink.clone(),
+                    asks: Arc::clone(&turn_asks),
                 });
 
                 let span_recorder = Arc::new(SpanRecorder::new(

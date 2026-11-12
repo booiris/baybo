@@ -14,12 +14,8 @@
 //! same gate is shared across tool calls that may run in parallel within a
 //! single agent turn.
 //!
-//! ## Channel gates
-//!
-//! This crate defines only the tool-facing ports. The per-channel queue of
-//! parked prompts and the gate that parks on it (`AskQueue` /
-//! `ChannelAskGate`) live in `baybo-human-ask`, which depends on this crate,
-//! never the reverse.
+//! The channel-backed gate (persist, enqueue, wake, await) lives in
+//! `baybo-human-ask`; this module holds only the ports.
 
 use std::sync::Arc;
 
@@ -32,13 +28,15 @@ pub use baybo_model::approval::{
     ResourceAccess,
 };
 
+use crate::ask::{AskCancel, AskSite};
+
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
 
 /// What came back from a gate, and *how*. The decision alone is what the
 /// executor acts on; the resolution is what the ledgers downstream (the
-/// issue timeline, span events) need so a 300-second silence is not written
+/// issue timeline, span events) need so a torn-down prompt is not written
 /// down as a human saying no.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovalOutcome {
@@ -63,14 +61,6 @@ impl ApprovalOutcome {
         }
     }
 
-    /// The window expired with nobody answering. Fail-closed.
-    pub fn timed_out() -> Self {
-        Self {
-            decision: ApprovalDecision::Deny,
-            resolution: ApprovalResolution::TimedOut,
-        }
-    }
-
     /// The prompt was torn down undecided. Fail-closed.
     pub fn abandoned() -> Self {
         Self {
@@ -81,16 +71,16 @@ impl ApprovalOutcome {
 }
 
 const REFUSAL_ANSWERED: &str = r#"a human saw this prompt and said no"#;
-const REFUSAL_TIMED_OUT: &str = r#"nobody answered this prompt before its window expired, so it denied itself — no human has seen it, and re-sending the same request will park for the same window and expire the same way"#;
-const REFUSAL_ABANDONED: &str = r#"this prompt was torn down before anyone decided it — the turn was cancelled, or the process is shutting down"#;
+const REFUSAL_ABANDONED: &str = r#"this prompt was withdrawn before anyone decided it — the turn was stopped, or the user moved on without answering"#;
 const REFUSAL_POLICY: &str = r#"a standing policy denied this without asking anyone, because this session has no approval surface — every prompt here will be denied the same way"#;
 
 /// Explain the denial source without trailing punctuation.
 pub fn refusal_reason(resolution: ApprovalResolution) -> &'static str {
     match resolution {
         ApprovalResolution::Answered => REFUSAL_ANSWERED,
-        ApprovalResolution::TimedOut => REFUSAL_TIMED_OUT,
-        ApprovalResolution::Abandoned => REFUSAL_ABANDONED,
+        // `TimedOut` is historical: gates no longer expire, but old span
+        // events still carry it.
+        ApprovalResolution::Abandoned | ApprovalResolution::TimedOut => REFUSAL_ABANDONED,
         ApprovalResolution::Policy => REFUSAL_POLICY,
     }
 }
@@ -99,9 +89,18 @@ pub fn refusal_reason(resolution: ApprovalResolution) -> &'static str {
 /// approval requests. Must be safe to call concurrently — a single agent turn
 /// may dispatch multiple tool calls in parallel, each going through this gate
 /// independently.
+///
+/// `site` says which channel's queue and which phase of the tool call the
+/// prompt belongs to; `cancel` is what a parked prompt races. A gate never
+/// times out on its own.
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome;
+    async fn request(
+        &self,
+        req: ApprovalRequest,
+        site: AskSite,
+        cancel: AskCancel,
+    ) -> ApprovalOutcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +113,12 @@ pub struct AutoDenyGate;
 
 #[async_trait]
 impl ApprovalGate for AutoDenyGate {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+    async fn request(
+        &self,
+        _req: ApprovalRequest,
+        _site: AskSite,
+        _cancel: AskCancel,
+    ) -> ApprovalOutcome {
         ApprovalOutcome::policy(ApprovalDecision::Deny)
     }
 }
@@ -172,7 +176,7 @@ impl ApprovalGateMap {
 
     /// Evict a type-level gate. Called on sidecar unregister so tool
     /// calls scheduled after the channel disconnects fall back to the
-    /// fail-closed `AutoDenyGate` instead of timing out against a dead
+    /// fail-closed `AutoDenyGate` instead of parking against a dead
     /// transport.
     pub fn remove(&self, channel: &ChannelType) {
         self.type_level.remove(channel);
@@ -233,30 +237,37 @@ pub fn preview_params(params: &serde_json::Value, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_model::human_ask::AskPhase;
 
     #[tokio::test]
     async fn auto_deny_gate_always_denies() {
         let gate = AutoDenyGate;
         let out = gate
-            .request(ApprovalRequest {
-                tool_call_id: String::new(),
-                call_id: "x".into(),
-                session_id: "s".into(),
-                user_id: "u".into(),
-                tool: "t".into(),
-                accesses: vec![],
-                params_preview: String::new(),
-                description: None,
-            })
+            .request(
+                ApprovalRequest {
+                    tool_call_id: String::new(),
+                    call_id: "x".into(),
+                    session_id: "s".into(),
+                    user_id: "u".into(),
+                    tool: "t".into(),
+                    accesses: vec![],
+                    params_preview: String::new(),
+                    description: None,
+                },
+                AskSite {
+                    channel: ChannelType::tui(),
+                    phase: AskPhase::BeforeExecute,
+                },
+                AskCancel::never(),
+            )
             .await;
         assert_eq!(out, ApprovalOutcome::policy(ApprovalDecision::Deny));
     }
 
     #[test]
-    fn every_resolution_gets_its_own_refusal_wording() {
+    fn every_live_resolution_gets_its_own_refusal_wording() {
         let all = [
             ApprovalResolution::Answered,
-            ApprovalResolution::TimedOut,
             ApprovalResolution::Abandoned,
             ApprovalResolution::Policy,
         ];
@@ -267,9 +278,10 @@ mod tests {
             }
             assert!(!a.ends_with('.'), "callers punctuate: {a}");
         }
-        assert!(
-            !refusal_reason(ApprovalResolution::TimedOut).contains("human saw"),
-            "a window nobody opened must not read as a human refusal"
+        assert_eq!(
+            refusal_reason(ApprovalResolution::TimedOut),
+            refusal_reason(ApprovalResolution::Abandoned),
+            "historical expiries read as torn down, never as a human refusal"
         );
     }
 

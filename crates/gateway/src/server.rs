@@ -145,6 +145,14 @@ pub struct GatewayDeps {
     /// Dials the relay's control connection and data legs through the egress
     /// proxy with system trust roots.
     pub relay_dialer: crate::relay::dial::RelayDialer,
+    /// The ask ledger + observers every channel's gate writes through. Held
+    /// here for the lazy channel install on a sidecar's first connection.
+    pub ask_core: Arc<baybo_human_ask::AskCore>,
+    /// One ask queue per channel, shared with the boot reload.
+    pub ask_queues: baybo_human_ask::AskQueues,
+    /// The verbs over the ask ledger: every resolve door (the chat
+    /// `ResolveApproval` frame, the board's approval endpoint) goes through it.
+    pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -186,6 +194,9 @@ pub struct AdminState {
     pub deck_manager: Arc<baybo_deck::DeckManager>,
     /// Kanban projects and their boards (`/v1/projects/*` — docs/todo/kanban.md).
     pub project_manager: Arc<baybo_project::ProjectManager>,
+    /// The ask ledger's verbs; the board's approval endpoint resolves
+    /// through it.
+    pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
     /// Workspace addresses. The agents surface resolves an agent's `SOUL.md`
     /// and its private skills folder through these.
     pub workspace_paths: Arc<baybo_workspace::WorkspacePaths>,
@@ -251,6 +262,7 @@ impl AdminState {
             secret_vault: Arc::clone(&deps.secret_vault),
             deck_manager: Arc::clone(&deps.deck_manager),
             project_manager: Arc::clone(&deps.project_manager),
+            human_asks: Arc::clone(&deps.human_asks),
             workspace_paths: Arc::clone(&deps.workspace_paths),
             bind_display: deps.runtime_config.admin_bind.to_string(),
             device_links: deps.device_links.clone(),

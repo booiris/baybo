@@ -15,6 +15,7 @@ use std::sync::Arc;
 use baybo_channels::wire::{Frame, Message as WireMessage};
 use baybo_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
 use baybo_human_ask::AskQueue;
+use baybo_model::human_ask::AskResolution;
 use baybo_model::{ChannelType, ContentBlock, SessionId};
 use baybo_tools::ApprovalRequest;
 use parking_lot::RwLock;
@@ -96,7 +97,12 @@ impl WsTransport {
         // as a ResolveApproval frame so the tool gate releases
         // server-side.
         let client_for_resolver: Arc<WsClient> = Arc::clone(&client);
-        approval_queue.set_resolver(Arc::new(move |call_id, decision| {
+        approval_queue.set_resolver(Arc::new(move |ask_id, resolution| {
+            // The TUI only mirrors approval cards.
+            let AskResolution::Approval(decision) = resolution else {
+                return;
+            };
+            let call_id = ask_id.into_inner();
             let client = Arc::clone(&client_for_resolver);
             tokio::spawn(async move {
                 let frame = Frame::ResolveApproval {
@@ -352,6 +358,14 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
         Frame::ApprovalResolved { call_id, decision } => {
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
+        }
+        // Kind-agnostic close: the only signal that retires an approval
+        // another client abandoned (`/stop`, a card close), now that nothing
+        // self-denies. A no-op when `ApprovalResolved` already dropped it.
+        // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
+        Frame::AskResolved { ask_id, .. } => {
+            let _ = queue.drop_call(&ask_id);
+            None
         }
         Frame::Reasoning { .. } => {
             // The TUI surfaces an animated "working" indicator instead of

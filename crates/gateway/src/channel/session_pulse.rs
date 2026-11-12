@@ -87,11 +87,12 @@ impl SessionPulse {
                 (out.session_id.clone(), ActivityKind::Assistant)
             }
             SessionEvent::Agent(_) => return,
-            // Approval prompts already have their own dedicated frame
-            // (`ApprovalRequested`) that reaches every subscriber to
-            // the call's session. Re-emitting as activity would
-            // double-signal without buying anything new for sidebar UX.
-            SessionEvent::ApprovalRequested { .. } | SessionEvent::ApprovalResolved { .. } => {
+            // Asks already have their own dedicated frames (and the
+            // `awaiting_human` patch for the sidebar). Re-emitting as
+            // activity would double-signal without buying anything new.
+            SessionEvent::ApprovalRequested { .. }
+            | SessionEvent::ApprovalResolved { .. }
+            | SessionEvent::AskResolved { .. } => {
                 return;
             }
         };

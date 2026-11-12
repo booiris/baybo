@@ -1,12 +1,14 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **PR 1a landed; PR 1b/1c, 2 and 3 pending** — on master today,
-> `baybo-human-ask` holds the moved approval queue (`AskQueue`,
-> `ChannelAskGate`, still with the 300 s timeout) and `PolicyDenyGate`, and
-> attendedness (`TurnInputKind::is_attended`) replaces
-> `InheritedToolContext`. The ledger, `AskCore`, `HumanAskManager`, the
-> restart path and everything else under
-> [Implementation notes](#implementation-notes-pr-1) arrive with PR 1b/1c.
+> Status: **PR 1 in part; PR 2/3 pending** — PR 1 lands in three steps.
+> The refactor (1a) and durable approvals on the live path with no timeout
+> (1b: `baybo-human-ask` queue, core, gates and the manager's live verbs, the
+> ledger, the `tools::ask` ports, the agent's live path, the gateway doors,
+> frames, the project bridge) exist. Restart survival (1c: everything under
+> [Restart survival](#restart-survival) — reload, the turn prelude, the Resume
+> turn, the hydration skip) does not; until it lands a restart closes every
+> pending ask (see the 1b interim note there). The
+> [Implementation notes](#implementation-notes-pr-1) describe the full PR 1.
 > `AskUser` + web (PR 2) and iOS (PR 3) are not started. This document is the spec the three
 > PRs described in [PR plan](#pr-plan) are built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
@@ -471,6 +473,19 @@ turn links by id regardless.
 to close. Asks are meant to still be open after the process comes back.
 
 ### Restart survival
+
+> **Interim (PR 1b only — replaced by this section in 1c).** 1b ships none of
+> what follows: no reload, no Resume turn, no turn prelude, no hydration
+> skip. Instead `gateway_cmd`, right after `build_managers` and before any
+> channel starts, calls `HumanAskManager::close_stale_asks` once: every
+> unapplied row a previous process left is claimed `Abandoned` if still
+> pending (observers, so the card timeline, hear it) and stamped applied, so
+> 1c's settlement never picks up a 1b-era row. The dangling `tool_use` then
+> gets hydration's interrupted fill — the user-visible result of a restart
+> before durable asks. Within one process a dropped waiter takes its ask off
+> the queue (`AskQueue::orphan` removes every kind), and `resolve` of a
+> pending ask no tool future waits on returns `NotLive` and leaves the row
+> alone. `baybo prompt` does not call it; the gateway's next boot does.
 
 Boot order in `runtime.rs::build_managers`, new steps in **bold**, in the
 order the code can actually have:
@@ -1322,10 +1337,6 @@ user turn. See [above](#a-new-message-while-a-dead-ask-is-pending).
 no wait. Identical for `BeforeExecute` and `DuringExecute`.
 
 ## PR plan
-
-PR 1 is delivered as three stacked PRs: **1a** refactor (queue move,
-`ApprovalRequest` move, attendedness), **1b** durable live path (ledger,
-gates, manager, no timeout), **1c** restart resume (prelude, Resume turn).
 
 Three draft PRs, in order, each green on `cargo clippy --all --benches --tests
 --examples --all-features`, `scripts/check-rustdoc.sh`,

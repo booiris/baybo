@@ -669,7 +669,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     AppEvent::ApprovalRequested => {
                         if !state.approval_pending()
                             && let Some(queue) = state.approval.as_ref()
-                            && let Some(req) = queue.peek_head()
+                            && let Some(req) = queue.peek_head_approval()
                         {
                             state.set_pending_approval(ApprovalChatEntry {
                                 call_id: req.call_id,

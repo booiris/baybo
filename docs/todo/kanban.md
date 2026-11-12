@@ -788,14 +788,15 @@ announces which of these will happen before sending.
      board. Paging tiebreaks on `id DESC` so same-microsecond entries
      cannot page unstably.
 
-   - **Approvals on the card.** `TimelineApprovalGate` wraps the owner
-     channel's **type-level** gate once, at boot, rather than being armed
-     per run: nothing to disarm, so nothing leaks when a run dies oddly,
-     and a board opened later is covered without registration. It asks the
-     *session* what it belongs to, so an ordinary chat prompt passes
-     straight through. Both halves are recorded — including the gate's own
-     deny-on-timeout, because the prompt is exactly where a reader would go
-     looking. Pending-ness is derived (a request with no resolution on the
+   - **Approvals on the card.** The ask ledger (`human_asks`, see
+     [`../modules/human-ask.md`](../modules/human-ask.md)) owns the prompt;
+     `baybo_project::install_ask_bridge` adds an observer, once, at boot,
+     rather than arming anything per run: nothing to disarm, so nothing
+     leaks when a run dies oddly, and a board opened later is covered
+     without registration. It asks the *session* what it belongs to, so an
+     ordinary chat prompt passes straight through. Both halves are recorded
+     — including an abandoned prompt (asks no longer time out), because the
+     prompt is exactly where a reader would go looking. Pending-ness is derived (a request with no resolution on the
      same `call_id`), never a stored flag, on both sides of the wire.
      Answering rides `POST …/issues/{n}/approvals/{call_id}`, which
      resolves the **card** before touching the queue: the queue is keyed by
@@ -873,8 +874,6 @@ announces which of these will happen before sending.
      predicate. A push payload can only address a session, and the tap
      handler touches that session into the phone's chat list — which is
      exactly what the project-session exclusion exists to prevent.
-     `APPROVAL_TIMEOUT` is also a gateway-wide 300s, so pushing an
-     approval deadline to a locked phone is theatre.
      Board push is its own phase. State plainly in any PR: a web rail badge
      reaches an operator with a tab open, not one away from their machine.
 
@@ -976,9 +975,7 @@ remain, all recorded with their reasons rather than left to be re-derived:
   shipped (`app/ios/App/Screens/Project*`), so the surface is no longer the
   blocker — the addressing is: a push payload can only address a session, and
   the tap handler touches that session into the phone's chat list, which is
-  what the issue-session exclusion exists to prevent. `APPROVAL_TIMEOUT` is
-  also a gateway-wide 300s, so pushing an approval deadline to a locked
-  phone is theatre. Its own phase. The rail badge reaches an operator with
+  what the issue-session exclusion exists to prevent. Its own phase. The rail badge reaches an operator with
   a tab open, not one away from their machine; say so rather than letting
   the badge imply coverage it does not have.
 - **Re-pointing a cron job at a different board.** Refused on purpose: its

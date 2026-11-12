@@ -515,7 +515,7 @@ impl AppState {
 
         if let Some(queue) = self.approval.as_ref() {
             queue.resolve_head(decision);
-            if let Some(req) = queue.peek_head() {
+            if let Some(req) = queue.peek_head_approval() {
                 self.pending_approval = Some(ApprovalChatEntry {
                     call_id: req.call_id,
                     tool: req.tool,
