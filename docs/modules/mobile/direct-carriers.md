@@ -927,7 +927,7 @@ Additional rows and variants:
 
 P IPv6-only behind a NAT64 without CLAT is not in the matrix yet: it needs `jool`, which neither CI's runner nor a stock distribution kernel ships. That path, and HTTPS on the real relay, remain real-device checks.
 
-Each cell runs five times to catch order-dependence. Every run asserts, in order (steps 2 to 4 only for a cell that ends on a direct carrier):
+Each cell runs five times by default (`NETNS_RUNS`) to catch order-dependence; CI's PR job runs each cell once, so it finishes in about 40 minutes instead of two hours. Every run asserts, in order (steps 2 to 4 only for a cell that ends on a direct carrier):
 
 1. the first chat leg went over the relay;
 2. the final `CarrierKind`, and one API request on it;

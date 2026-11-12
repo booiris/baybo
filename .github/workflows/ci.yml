@@ -350,9 +350,11 @@ jobs:
 
   # The direct-carrier NAT matrix (docs/modules/mobile/direct-carriers.md §
   # Testing): the real C, A and P binaries, each in its own network namespace
-  # behind a NAT profile, five runs a cell. Non-gating and PR-only: it needs
-  # root and the better part of two hours, and a NAT corner it finds is a
-  # design question rather than a merge blocker.
+  # behind a NAT profile. Non-gating and PR-only: it needs root, and a NAT
+  # corner it finds is a design question rather than a merge blocker. A PR
+  # runs each cell once (24 cells at about a minute each, plus the build); the
+  # script's default of five runs a cell, which catches order-dependence, takes
+  # the better part of two hours and is for a local or a non-PR run.
   netns-matrix:
     name: netns NAT matrix (non-gating)
     needs: changes
@@ -363,6 +365,7 @@ jobs:
     env:
       BAYBO_SKIP_WEBUI: 1
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+      NETNS_RUNS: ${{ github.event_name == 'pull_request' && 1 || 5 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
