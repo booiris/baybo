@@ -591,9 +591,10 @@ impl AgentActor {
         // otherwise leave to run as follow-up turns. Caught after the loop fully
         // returns, so it covers every cancellation path (incl. mid-LLM-call).
         stopped_out: Option<&mut bool>,
-        // A recurring cron fire's silence handle for `report_nothing`;
-        // `None` for every other turn. See `dispatch_cron_prompt`.
-        notify_silence: Option<baybo_tools::NotifySilence>,
+        // A recurring cron fire's turn (its own, or its report's): the
+        // `report_nothing` silence and the record of what it hands to the
+        // background. `None` for every other turn. See `dispatch_cron_prompt`.
+        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = turn_input.input_kind().is_user_facing();
         // Kept so the error path below can tell a user `/stop` (token
@@ -617,7 +618,7 @@ impl AgentActor {
                 delta_tx,
                 turn_token.clone(),
                 interjections,
-                notify_silence,
+                cron_report,
             )
             .await;
         let cancelled = turn_token.is_cancelled();
@@ -714,14 +715,27 @@ impl AgentActor {
             .append_cron_fire(job_id, prompt, prompt_context.as_deref())
             .await?;
         // Only a recurring fire (which owns a listed conversation) can be
-        // silenced by `report_nothing`; a one-shot always reports back, so it
-        // gets no handle and the tool is never even offered in its session.
-        let silence =
-            matches!(delivery, CronDelivery::Channel).then(baybo_tools::NotifySilence::new);
-        let response = self
-            .run_agent_loop(turn_input, None, None, None, None, silence.clone())
-            .await?;
-        let silenced = silence.as_ref().is_some_and(|s| s.requested());
+        // silenced by `report_nothing` or leave work in the background; a
+        // one-shot always reports back and its workspace hosts no background
+        // work, so it gets no `CronReportTurn`.
+        let cron_report = matches!(delivery, CronDelivery::Channel)
+            .then(crate::runtime::cron_report_turn::CronReportTurn::new);
+        let ran = self
+            .run_agent_loop(turn_input, None, None, None, None, cron_report.clone())
+            .await;
+        // Recorded whether or not the turn went on to fail: work it handed
+        // over runs on, and its follow-up is the fire's report either way.
+        let started_background = match &cron_report {
+            Some(cron_report) => {
+                self.record_cron_report_handles(cron_report.handed_over())
+                    .await
+            }
+            None => false,
+        };
+        let response = ran?;
+        let silenced = cron_report
+            .as_ref()
+            .is_some_and(|turn| turn.silence.requested());
         match delivery {
             CronDelivery::OriginSession => {}
             CronDelivery::Channel if silenced => {
@@ -738,14 +752,81 @@ impl AgentActor {
                 // would leave a conversation that is empty when opened and —
                 // because clients learn a new conversation exists from the
                 // activity pulse the gateway derives from channel dispatch —
-                // never announced itself at all.
-                self.report_cron_outcome(title, false, "").await;
+                // never announced itself at all. A fire that started
+                // background work has not produced nothing: its follow-up is
+                // on the way.
+                let detail = if started_background {
+                    baybo_context::prompts::cron::NOTIFICATION_BACKGROUND_PENDING_BODY
+                } else {
+                    ""
+                };
+                self.report_cron_outcome(title, false, detail).await;
             }
             CronDelivery::Channel => {
                 self.send_response(response.into(), "cron").await;
             }
         }
         Ok(())
+    }
+
+    /// Record the background jobs the fire turn that just ended handed over,
+    /// so their follow-up is recognised as the fire's report (see
+    /// `BackgroundNotificationState::cron_report_handles`). Returns whether there
+    /// were any.
+    async fn record_cron_report_handles(
+        &mut self,
+        handles: Vec<baybo_model::BackgroundHandle>,
+    ) -> bool {
+        if handles.is_empty() {
+            return false;
+        }
+        self.durable
+            .session
+            .state
+            .background_notifications
+            .cron_report_handles = handles;
+        self.persist_session_state_with_activity("cron_fire_background_handles")
+            .await;
+        true
+    }
+
+    /// Push a recurring fire's background follow-up — the reply row at
+    /// `ordinal`, already persisted and dispatched — by completing a
+    /// zero-inference `CronNotification` turn whose reply is that row. That
+    /// turn's `Completed { reply_ordinal }` edge is what the push dispatcher
+    /// acts on; background notification turns themselves never push, because
+    /// outside a fire's report they are machinery.
+    async fn push_cron_follow_up(&mut self, content: Vec<ContentBlock>, ordinal: i64) {
+        let pushed = crate::runtime::scope::with_turn(
+            &self.volatile.turn_lifecycle,
+            // Nothing to interrupt: the turn only names an existing row.
+            CancellationToken::new(),
+            crate::runtime::scope::TurnSpec {
+                session_id: self.durable.session.id.clone(),
+                origin: self.durable.session.trigger.kind(),
+                input: TurnInput::CronNotification {
+                    content: content.clone(),
+                },
+                parent_turn_id: None,
+            },
+            |_turn_id| async move {
+                Ok((
+                    baybo_turn::TurnOutput::Message {
+                        content,
+                        ordinal: Some(ordinal),
+                    },
+                    (),
+                ))
+            },
+        )
+        .await;
+        if let Err(e) = pushed {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to push the cron fire's background follow-up"
+            );
+        }
     }
 
     /// A recurring fire that called `report_nothing`: drop it from the user's

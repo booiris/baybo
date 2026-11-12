@@ -310,8 +310,9 @@ impl ToolTriggerScope {
 
 /// A tool's request that the current turn produce **no** user-facing
 /// notification. The agent loop hands a fresh signal to the tools of a turn
-/// that *can* be silenced — today only a recurring cron fire, for its
-/// `report_nothing` tool — and reads it back after the turn; it is `None`
+/// that *can* be silenced — today only a recurring cron fire's turn and the
+/// follow-ups reporting work it started, for the `report_nothing` tool — and
+/// reads it back after the turn; it is `None`
 /// everywhere else, so a tool that flips it outside such a turn is a no-op.
 /// Cheap to clone: the flag is shared through an `Arc`.
 #[derive(Clone, Default)]
@@ -441,16 +442,22 @@ pub struct ToolContext {
     pub read_tracker: Option<ReadTracker>,
     /// Whether this call may **create** background work: a `Bash` command
     /// that converts to background on timeout, or a subagent that converts
-    /// (or is dispatched) instead of blocking. Decided per turn by the agent
-    /// loop — the session must be somewhere a completion notification can
-    /// land, and the turn must not be a cron fire's own turn (a fire blocks
-    /// so its report is complete when it notifies). `false` for cron fires,
-    /// nested subagents and argv-mode boots, which keep kill-on-timeout.
+    /// (or is dispatched) instead of blocking: whether the session is
+    /// somewhere a completion notification can land
+    /// (`Session::can_host_background_jobs`, the same bit the offered schemas
+    /// use). `false` for card runs, one-shot cron fires, nested subagents and
+    /// argv-mode boots, which keep kill-on-timeout.
     ///
     /// Observing existing jobs is not creating work, so `JobList` / `JobStop`
     /// deliberately ignore this and go straight to
     /// [`Self::background_control`].
     pub background_eligible: bool,
+    /// Whether a call still running when its foreground window elapses may
+    /// move to the background (`on_timeout = background`). `false` in a cron
+    /// fire's own turn: a fire that overran would push "results will follow"
+    /// and then the result, so its overruns are killed instead. Starting work
+    /// detached on purpose (`background` / `group`) is unaffected.
+    pub overrun_to_background: bool,
     /// The sink background-capable tools hand work to (through
     /// [`background::run`]) once it runs past its foreground window.
     /// A capability handle, not a policy switch: `None` only when the
@@ -460,14 +467,16 @@ pub struct ToolContext {
     /// View + control of this session's in-flight background jobs, for the
     /// `JobList` / `JobStop` tools. Wired like [`Self::background_jobs`].
     pub background_control: Option<Arc<dyn BackgroundJobControl>>,
-    /// Filled by [`background::run`] when this call starts a grouped job
-    /// detached, so the agent loop can count it into the turn's cohort.
+    /// Filled by [`background::run`] when this call hands a job to the
+    /// background, so the agent loop can count a grouped one into the turn's
+    /// cohort and record which jobs the turn started.
     pub background_dispatch: background::DispatchRecord,
     /// Handle a tool flips to suppress this turn's user-facing notification.
-    /// `Some` **only for a recurring cron fire turn** (wired by the actor's
-    /// cron dispatch, read by the `report_nothing` tool); `None` everywhere
-    /// else, so the tool no-ops on a user reply, a one-shot fire, or any
-    /// ordinary turn. See [`NotifySilence`].
+    /// `Some` **only for a recurring cron fire's turn and the follow-ups
+    /// reporting work it started** (wired by the actor, read by the
+    /// `report_nothing` tool); `None` everywhere else, so the tool no-ops on
+    /// a user reply, a one-shot fire, or any ordinary turn. See
+    /// [`NotifySilence`].
     pub notify_silence: Option<NotifySilence>,
     /// The checkout this session owns, when it is a kanban issue's run: the
     /// git worktree cut for that issue. Shell commands default their cwd to
@@ -496,6 +505,19 @@ impl ToolContext {
     /// tool that would otherwise take a cheaper blocking path asks it first.
     pub fn can_hand_over_background(&self) -> bool {
         self.background_eligible && self.background_jobs.is_some()
+    }
+
+    /// Whether `request`'s call, still running when its window elapses, moves
+    /// to the background rather than being killed. The one answer to that
+    /// question — [`background::run`] decides by it, and Bash asks it before
+    /// choosing its blocking path.
+    pub fn overrun_moves_to_background(&self, request: &background::BackgroundRequest) -> bool {
+        self.can_hand_over_background()
+            && self.overrun_to_background
+            && matches!(
+                request,
+                background::BackgroundRequest::Wait(baybo_model::OnTimeout::Background)
+            )
     }
 }
 
@@ -540,6 +562,7 @@ impl ToolContext {
             // `background_jobs`, so defaulting to eligible keeps a fixture
             // that wires the sink meaning what it says.
             background_eligible: true,
+            overrun_to_background: true,
             background_jobs: None,
             background_control: None,
             background_dispatch: Default::default(),
