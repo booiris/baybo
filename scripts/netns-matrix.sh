@@ -34,5 +34,10 @@ export NETNS_RELAY_BIN="$ROOT/remote-host/target/debug/remote-host"
 export NETNS_PHONE_BIN="$ROOT/app/ios/target/debug/examples/netns_phone"
 export NETNS_SQLITE3_BIN="$(command -v sqlite3)"
 
+# sudo on GitHub's runners refuses `-E`, so hand the test its NETNS_* knobs
+# (the binaries above plus any NETNS_CELLS / NETNS_RUNS / NETNS_IDLE_SECS)
+# through `env` instead.
+NETNS_VARS=()
+while IFS= read -r var; do NETNS_VARS+=("$var"); done < <(env | grep '^NETNS_')
 cd app/ios/ffi
-sudo -E env "PATH=$PATH" "$MATRIX_BIN" --ignored --test-threads=1 --nocapture
+sudo env "PATH=$PATH" "${NETNS_VARS[@]}" "$MATRIX_BIN" --ignored --test-threads=1 --nocapture
