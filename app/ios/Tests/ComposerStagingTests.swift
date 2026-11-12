@@ -961,6 +961,20 @@ struct ComposerStagingTests {
 
     // MARK: - progress
 
+    @Test func theByteCounterKeepsFixedDecimalsSoItDoesNotJitter() {
+        let en = Locale(identifier: "en_US")
+        #expect(StagedAttachment.byteText(1_000, locale: en) == "1.0 kB")
+        #expect(StagedAttachment.byteText(9_950_000, locale: en) == "10.0 MB")
+        #expect(StagedAttachment.byteText(10_000_000, locale: en) == "10.0 MB")
+        #expect(StagedAttachment.byteText(24_804_352, locale: en) == "24.8 MB")
+        #expect(StagedAttachment.byteText(1_500_000_000, locale: en) == "1.50 GB")
+        #expect(StagedAttachment.byteText(999_960_000, locale: en) == "1.00 GB")
+        #expect(StagedAttachment.byteText(999_960, locale: en) == "1.0 MB")
+        #expect(StagedAttachment.byteText(10_000_000, locale: Locale(identifier: "de_DE")) == "10,0 MB")
+        #expect(StagedAttachment.byteText(812).hasPrefix("812"))
+    }
+
+
     /// `sent == total` means every byte is handed to the transport, not that
     /// the gateway has it: over the relay most of a large pick is still in
     /// socket buffers. The tile stops counting there and says so, instead of
