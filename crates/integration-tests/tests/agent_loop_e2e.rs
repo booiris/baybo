@@ -6047,15 +6047,7 @@ impl Tool for FanOutProbe {
                 })
             }),
         };
-        match baybo_tools::background::run(
-            ctx,
-            &FAN_OUT_PROBE_BACKGROUND,
-            &request,
-            Duration::from_secs(60),
-            job,
-        )
-        .await
-        {
+        match baybo_tools::background::run(ctx, &request, Duration::from_secs(60), job).await {
             baybo_tools::background::Ran::Backgrounded(backgrounded) => Ok(ToolOutput::Text(
                 baybo_tools::background::ack(&backgrounded, &[]),
             )),

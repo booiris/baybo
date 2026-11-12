@@ -601,7 +601,6 @@ impl Tool for SpawnSubagentTool {
         let job = subagent_job(run, subagent_type.clone(), task_summary);
         let result = match baybo_tools::background::run(
             ctx,
-            &SPAWN_BACKGROUND,
             &background,
             crate::spawner::SUBAGENT_FOREGROUND_WAIT,
             job,
@@ -1659,9 +1658,7 @@ mod tests {
         )
         .unwrap()
         .background;
-        assert!(!bare.start_detached);
-        assert_eq!(bare.on_timeout, OnTimeout::Background);
-        assert!(bare.group.is_none());
+        assert_eq!(bare, BackgroundRequest::Wait(OnTimeout::Background));
 
         let sent = parse_spawn_request(
             &json!({
@@ -1676,9 +1673,13 @@ mod tests {
         )
         .unwrap()
         .background;
-        assert!(sent.start_detached, "still honoured at the door");
-        assert_eq!(sent.on_timeout, OnTimeout::Kill);
-        assert!(sent.group.is_some());
+        assert_eq!(
+            sent,
+            BackgroundRequest::Detach {
+                group: Some("batch".into())
+            },
+            "still honoured at the door"
+        );
         // `background::run` is where an ineligible turn ignores all three; the
         // parser stays a parser.
     }
@@ -1692,7 +1693,7 @@ mod tests {
             "prompt": "x",
         });
         let req = parse_spawn_request(&v, &reg).unwrap().background;
-        assert_eq!(req.on_timeout, OnTimeout::Background);
+        assert_eq!(req, BackgroundRequest::Wait(OnTimeout::Background));
     }
 
     #[test]
@@ -1705,7 +1706,7 @@ mod tests {
             "on_timeout": "kill",
         });
         let req = parse_spawn_request(&v, &reg).unwrap().background;
-        assert_eq!(req.on_timeout, OnTimeout::Kill);
+        assert_eq!(req, BackgroundRequest::Wait(OnTimeout::Kill));
     }
 
     #[test]
@@ -1730,9 +1731,11 @@ mod tests {
             "group": "research",
         });
         let req = parse_spawn_request(&v, &reg).unwrap().background;
-        assert_eq!(req.group.as_deref(), Some("research"));
-        assert!(
-            req.start_detached,
+        assert_eq!(
+            req,
+            BackgroundRequest::Detach {
+                group: Some("research".into())
+            },
             "a grouped subagent must run in the background"
         );
     }
@@ -1747,8 +1750,11 @@ mod tests {
             "group": "   ",
         });
         let req = parse_spawn_request(&v, &reg).unwrap().background;
-        assert_eq!(req.group, None);
-        assert!(!req.start_detached, "blank group must not force background");
+        assert_eq!(
+            req,
+            BackgroundRequest::default(),
+            "blank group must not force background"
+        );
     }
 
     #[test]

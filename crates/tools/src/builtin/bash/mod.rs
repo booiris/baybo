@@ -951,7 +951,7 @@ impl Tool for BashTool {
         // `secret_env` does not block detach. Background output files and
         // completion tails are raw; if secrets were injected, the background
         // arm below records that risk before handing the child to the sink.
-        if background.on_timeout == baybo_model::OnTimeout::Background
+        if background.backgrounds_on_timeout()
             && ctx.can_hand_over_background()
             && let Some(detached_route) = detached_route
             && let Some(output) = run_detached(
@@ -1276,7 +1276,7 @@ async fn run_detached(
         into_result,
     };
 
-    match crate::background::run(ctx, &BASH_BACKGROUND, request, timeout, job).await {
+    match crate::background::run(ctx, request, timeout, job).await {
         crate::background::Ran::Cancelled(_) => {
             let _ = tokio::fs::remove_file(&stdout_path).await;
             let _ = tokio::fs::remove_file(&stderr_path).await;

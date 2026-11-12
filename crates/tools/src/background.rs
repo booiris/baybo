@@ -161,7 +161,7 @@ pub(crate) fn withhold_options(schema: &mut Value, support: &BackgroundSupport) 
     }
 }
 
-/// The background options of one call, as the tool's caller sent them.
+/// What one call asked for, as the tool's caller sent it.
 ///
 /// Parsed even where the session cannot run background work — a withheld
 /// option sent anyway still parses — and resolved against eligibility by
@@ -169,13 +169,27 @@ pub(crate) fn withhold_options(schema: &mut Value, support: &BackgroundSupport) 
 /// could not hand the work over anyway: when
 /// [`ToolContext::can_hand_over_background`] is false, or the call asked for
 /// `on_timeout = kill`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BackgroundRequest {
-    pub on_timeout: OnTimeout,
-    /// Start detached at once. Implied by a group.
-    pub start_detached: bool,
-    /// The barrier cohort, trimmed; a blank name is no group.
-    pub group: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundRequest {
+    /// Wait out the foreground window, then do what `on_timeout` says.
+    Wait(OnTimeout),
+    /// Hand the work over at once (`background: true`, or a `group`, which
+    /// implies it). `group` is the barrier cohort, trimmed; blank is none.
+    Detach { group: Option<String> },
+}
+
+impl Default for BackgroundRequest {
+    fn default() -> Self {
+        Self::Wait(OnTimeout::Background)
+    }
+}
+
+impl BackgroundRequest {
+    /// Whether an overrun of the window hands the work over rather than
+    /// killing it. A detached request is handed over before any window.
+    pub fn backgrounds_on_timeout(&self) -> bool {
+        !matches!(self, Self::Wait(OnTimeout::Kill))
+    }
 }
 
 impl BackgroundRequest {
@@ -202,10 +216,7 @@ impl BackgroundRequest {
             Some(other) => return Err(format!("{ON_TIMEOUT_PARAM} must be a string, got {other}")),
         };
         if !support.start_detached {
-            return Ok(Self {
-                on_timeout,
-                ..Self::default()
-            });
+            return Ok(Self::Wait(on_timeout));
         }
         let group = match params.get(GROUP_PARAM) {
             None | Some(Value::Null) => None,
@@ -221,10 +232,10 @@ impl BackgroundRequest {
                 return Err(format!("{BACKGROUND_PARAM} must be a boolean, got {other}"));
             }
         };
-        Ok(Self {
-            on_timeout,
-            start_detached: background || group.is_some(),
-            group,
+        Ok(if background || group.is_some() {
+            Self::Detach { group }
+        } else {
+            Self::Wait(on_timeout)
         })
     }
 }
@@ -336,8 +347,7 @@ impl DispatchRecord {
 ///
 /// - The session cannot run background work (or no sink is wired): wait for
 ///   the job with no window at all, stopping it with the turn.
-/// - The call asked to start detached and the tool supports that: hand it
-///   over at once.
+/// - The call asked to start detached: hand it over at once.
 /// - Otherwise wait up to `window`; then `on_timeout` either hands it over or
 ///   cancels it.
 ///
@@ -350,7 +360,6 @@ impl DispatchRecord {
 /// is handed over, dropping this future cancels it.
 pub async fn run<T: Send + 'static>(
     ctx: &ToolContext,
-    support: &BackgroundSupport,
     request: &BackgroundRequest,
     window: Duration,
     job: Job<T>,
@@ -393,19 +402,23 @@ pub async fn run<T: Send + 'static>(
         stop_if_abandoned.disarm();
         return ran;
     };
-    if support.start_detached && request.start_detached {
-        let group = request.group.clone();
-        if let Some(group) = &group {
-            ctx.background_dispatch.record_group(group.clone());
+    let on_timeout = match request {
+        BackgroundRequest::Wait(on_timeout) => *on_timeout,
+        BackgroundRequest::Detach { group } => {
+            if let Some(group) = group {
+                ctx.background_dispatch.record_group(group.clone());
+            }
+            let cohort = group
+                .as_deref()
+                .map(|g| BackgroundNotificationGroup::cohort_key(ctx.turn_id, g));
+            sink.adopt(detached(work, cohort)).await;
+            stop_if_abandoned.disarm();
+            return Ran::Backgrounded(Backgrounded {
+                handle,
+                how: BackgroundedHow::Dispatched,
+            });
         }
-        let cohort = group.map(|g| BackgroundNotificationGroup::cohort_key(ctx.turn_id, &g));
-        sink.adopt(detached(work, cohort)).await;
-        stop_if_abandoned.disarm();
-        return Ran::Backgrounded(Backgrounded {
-            handle,
-            how: BackgroundedHow::Dispatched,
-        });
-    }
+    };
 
     let ran = tokio::select! {
         biased;
@@ -414,7 +427,7 @@ pub async fn run<T: Send + 'static>(
             Ran::Cancelled(work.await)
         }
         done = &mut work => Ran::Finished(done),
-        _ = tokio::time::sleep(window) => match request.on_timeout {
+        _ = tokio::time::sleep(window) => match on_timeout {
             OnTimeout::Kill => {
                 cancel.cancel();
                 Ran::TimedOut(work.await)
@@ -542,13 +555,16 @@ mod tests {
         );
         let killed =
             BackgroundRequest::parse(&json!({"on_timeout": " Kill "}), &SPAWN_LIKE).unwrap();
-        assert_eq!(killed.on_timeout, OnTimeout::Kill);
+        assert_eq!(killed, BackgroundRequest::Wait(OnTimeout::Kill));
         let grouped = BackgroundRequest::parse(&json!({"group": " fan "}), &SPAWN_LIKE).unwrap();
-        assert!(grouped.start_detached);
-        assert_eq!(grouped.group.as_deref(), Some("fan"));
+        assert_eq!(
+            grouped,
+            BackgroundRequest::Detach {
+                group: Some("fan".into())
+            }
+        );
         let blank = BackgroundRequest::parse(&json!({"group": "  "}), &SPAWN_LIKE).unwrap();
-        assert!(!blank.start_detached);
-        assert_eq!(blank.group, None);
+        assert_eq!(blank, BackgroundRequest::default());
     }
 
     /// The ack carries the yield rule verbatim. This is the only place it
@@ -669,7 +685,7 @@ mod tests {
             let (ctx, sink) = ctx(true);
             let (job, finish, _) = job();
             finish.send(()).unwrap();
-            let ran = run(&ctx, &CONVERTS, &BackgroundRequest::default(), WINDOW, job).await;
+            let ran = run(&ctx, &BackgroundRequest::default(), WINDOW, job).await;
             assert!(matches!(ran, Ran::Finished("done")));
             assert!(sink.0.lock().is_empty());
         }
@@ -678,7 +694,7 @@ mod tests {
         async fn an_overrun_moves_to_the_background_and_still_delivers() {
             let (ctx, sink) = ctx(true);
             let (job, finish, _) = job();
-            let ran = run(&ctx, &CONVERTS, &BackgroundRequest::default(), WINDOW, job).await;
+            let ran = run(&ctx, &BackgroundRequest::default(), WINDOW, job).await;
             let Ran::Backgrounded(backgrounded) = ran else {
                 panic!("an overrun converts");
             };
@@ -695,11 +711,8 @@ mod tests {
         async fn kill_cancels_the_work_at_the_window() {
             let (ctx, sink) = ctx(true);
             let (job, _finish, cancel) = job();
-            let kill = BackgroundRequest {
-                on_timeout: OnTimeout::Kill,
-                ..Default::default()
-            };
-            let ran = run(&ctx, &CONVERTS, &kill, WINDOW, job).await;
+            let kill = BackgroundRequest::Wait(OnTimeout::Kill);
+            let ran = run(&ctx, &kill, WINDOW, job).await;
             assert!(matches!(ran, Ran::TimedOut("cancelled")));
             assert!(cancel.is_cancelled());
             assert!(sink.0.lock().is_empty());
@@ -711,16 +724,10 @@ mod tests {
         async fn an_ineligible_session_waits_past_the_window() {
             let (ctx, sink) = ctx(false);
             let (job, finish, _) = job();
-            let waiting = tokio::spawn(async move {
-                run(
-                    &ctx,
-                    &STARTS_DETACHED,
-                    &BackgroundRequest::default(),
-                    WINDOW,
-                    job,
-                )
-                .await
-            });
+            let waiting =
+                tokio::spawn(
+                    async move { run(&ctx, &BackgroundRequest::default(), WINDOW, job).await },
+                );
             tokio::time::advance(WINDOW * 3).await;
             assert!(
                 !waiting.is_finished(),
@@ -736,7 +743,7 @@ mod tests {
             let (ctx, sink) = ctx(true);
             let (job, _finish, cancel) = job();
             ctx.cancellation_token.cancel();
-            let ran = run(&ctx, &CONVERTS, &BackgroundRequest::default(), WINDOW, job).await;
+            let ran = run(&ctx, &BackgroundRequest::default(), WINDOW, job).await;
             assert!(matches!(ran, Ran::Cancelled("cancelled")));
             assert!(cancel.is_cancelled());
             assert!(sink.0.lock().is_empty());
@@ -748,7 +755,7 @@ mod tests {
             let (job, _finish, _) = job();
             let grouped =
                 BackgroundRequest::parse(&json!({"group": "g"}), &STARTS_DETACHED).unwrap();
-            let ran = run(&ctx, &STARTS_DETACHED, &grouped, WINDOW, job).await;
+            let ran = run(&ctx, &grouped, WINDOW, job).await;
             let Ran::Backgrounded(backgrounded) = ran else {
                 panic!("a group starts detached");
             };
@@ -802,7 +809,7 @@ mod tests {
                 }),
             };
             let call = tokio::spawn(async move {
-                run(&ctx, &CONVERTS, &BackgroundRequest::default(), WINDOW, job).await;
+                run(&ctx, &BackgroundRequest::default(), WINDOW, job).await;
             });
             tokio::task::yield_now().await;
             call.abort();
@@ -814,23 +821,6 @@ mod tests {
                 cancel.is_cancelled(),
                 "abandoning the call stopped the work"
             );
-        }
-
-        /// A tool that cannot start detached ignores a `background` / `group`
-        /// sent anyway, rather than handing over work that has not started.
-        #[tokio::test(start_paused = true)]
-        async fn start_detached_needs_the_tool_to_support_it() {
-            let (ctx, sink) = ctx(true);
-            let (job, finish, _) = job();
-            finish.send(()).unwrap();
-            let grouped = BackgroundRequest {
-                start_detached: true,
-                ..Default::default()
-            };
-            let ran = run(&ctx, &CONVERTS, &grouped, WINDOW, job).await;
-            assert!(matches!(ran, Ran::Finished("done")));
-            assert!(sink.0.lock().is_empty());
-            assert_eq!(ctx.background_dispatch.take_group(), None);
         }
     }
 }

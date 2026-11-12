@@ -481,8 +481,9 @@ tool can name things after it before the work starts), a kind and summary for
 `PendingBackgroundResult` — and calls `background::run`, which owns:
 
 - **The window.** An ineligible session (or no sink wired) waits with no
-  window at all. A call asking to start detached (`background` / `group`, only
-  for a tool whose support says `start_detached`) is handed over at once.
+  window at all. A `BackgroundRequest::Detach` (`background` / `group`, which
+  `BackgroundRequest::parse` reads only for a tool whose support says
+  `start_detached`) is handed over at once.
   Otherwise the job runs up to the window; then `on_timeout` either hands it
   over or cancels it. The turn's own stop cancels a job only while it is in
   the foreground.
