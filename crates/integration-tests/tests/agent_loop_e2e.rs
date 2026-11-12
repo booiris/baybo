@@ -1792,7 +1792,7 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
             kind: "command".into(),
             summary: "python -m http.server 8877".into(),
             session: None,
-            group: None,
+            cohort: None,
             cancel,
             result: Box::pin(result),
         })
@@ -4817,7 +4817,7 @@ async fn grouped_subagents_deliver_one_merged_notification() {
     let groups = sink.groups();
     assert_eq!(groups.len(), 2, "both grouped calls went to the background");
     // The cohort is keyed by the dispatching turn's `turn_id`
-    // (`BackgroundNotificationGroup::cohort_key`); the runtime stamps that key
+    // (`CohortKey::new`); the runtime stamps that key
     // on each handed-over job, and a delivered member carries it back.
     let cohort_group = groups[0]
         .clone()
@@ -4978,7 +4978,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
     harness.stub_llm.push_stream(notif("A complete"));
     harness.stub_llm.push_stream(notif("B complete"));
 
-    let finish = |handle: &str, group: String| {
+    let finish = |handle: &str, group: baybo_model::CohortKey| {
         let mut pending = PendingBackgroundResult::subagent(
             handle,
             "general-purpose",
@@ -6022,7 +6022,7 @@ impl Tool for FanOutProbe {
             baybo_tools::background::BackgroundRequest::parse(&params, &FAN_OUT_PROBE_BACKGROUND)
                 .map_err(baybo_tools::ToolError::InvalidParams)?;
         let task = params["task"].as_str().unwrap_or_default().to_string();
-        let handle = baybo_model::new_background_handle();
+        let handle = baybo_model::BackgroundHandle::new();
         let cancel = CancellationToken::new();
         let job = baybo_tools::background::Job {
             handle: handle.clone(),
@@ -6062,8 +6062,8 @@ impl Tool for FanOutProbe {
 struct HoldingSink(parking_lot::Mutex<Vec<DetachedJob>>);
 
 impl HoldingSink {
-    fn groups(&self) -> Vec<Option<String>> {
-        self.0.lock().iter().map(|job| job.group.clone()).collect()
+    fn groups(&self) -> Vec<Option<baybo_model::CohortKey>> {
+        self.0.lock().iter().map(|job| job.cohort.clone()).collect()
     }
 }
 

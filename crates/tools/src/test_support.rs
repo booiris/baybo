@@ -128,7 +128,7 @@ impl RecordingTool {
 
     /// The `turn_id` of the most recent `execute()` call — lets a test
     /// reconstruct the per-turn cohort key
-    /// (`BackgroundNotificationGroup::cohort_key`) that a
+    /// (`CohortKey::new`) that a
     /// grouped `spawn_subagent` running in that turn would have produced.
     pub fn last_turn_id(&self) -> Option<baybo_model::TurnId> {
         *self.last_turn_id.lock()

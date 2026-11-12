@@ -27,7 +27,7 @@ pub struct ActorHandle {
 pub struct InFlightJob {
     /// The user-facing handle (`bg-…`) the model, `JobList` / `JobStop` and
     /// the notification share.
-    pub handle: String,
+    pub handle: baybo_model::BackgroundHandle,
     /// What's running: a subagent's profile name, or `"command"` for a
     /// detached `Bash` command.
     pub kind: String,
@@ -63,7 +63,8 @@ pub struct InFlightJob {
 pub struct AgentSupervisor {
     actors: Arc<DashMap<SessionId, ActorHandle>>,
     response_tx: mpsc::Sender<AgentOutput>,
-    in_flight_background_jobs: Arc<DashMap<SessionId, HashMap<String, InFlightJob>>>,
+    in_flight_background_jobs:
+        Arc<DashMap<SessionId, HashMap<baybo_model::BackgroundHandle, InFlightJob>>>,
 }
 
 impl AgentSupervisor {
@@ -89,7 +90,11 @@ impl AgentSupervisor {
     /// job's record, dropping the parent's entry when its last job clears so
     /// the map doesn't accumulate stale keys. A no-op if `/stop` already
     /// drained it (see [`Self::take_in_flight_background_jobs`]).
-    pub fn note_background_job_finished(&self, parent_session_id: &SessionId, handle: &str) {
+    pub fn note_background_job_finished(
+        &self,
+        parent_session_id: &SessionId,
+        handle: &baybo_model::BackgroundHandle,
+    ) {
         use dashmap::mapref::entry::Entry;
         // Hold the parent `Entry` guard across the remove + emptiness check so
         // a concurrent `started` can't re-insert into a map we then delete
@@ -110,7 +115,11 @@ impl AgentSupervisor {
     /// calls this BEFORE delivering its result: a `false` means `/stop`
     /// already drained the entry, so the delivery must be suppressed (a
     /// user-stopped result must not repopulate the notification buffer).
-    pub fn is_background_job_in_flight(&self, parent_session_id: &SessionId, handle: &str) -> bool {
+    pub fn is_background_job_in_flight(
+        &self,
+        parent_session_id: &SessionId,
+        handle: &baybo_model::BackgroundHandle,
+    ) -> bool {
         self.in_flight_background_jobs
             .get(parent_session_id)
             .is_some_and(|m| m.contains_key(handle))
@@ -817,7 +826,7 @@ mod tests {
         sup.note_background_job_started(
             &id,
             InFlightJob {
-                handle: "bg-c1".to_string(),
+                handle: "bg-c1".into(),
                 kind: "explorer".to_string(),
                 task_summary: "find X".to_string(),
                 session: Some(c1.clone()),
@@ -827,7 +836,7 @@ mod tests {
         sup.note_background_job_started(
             &id,
             InFlightJob {
-                handle: "bg-c2".to_string(),
+                handle: "bg-c2".into(),
                 kind: "planner".to_string(),
                 task_summary: "draft Y".to_string(),
                 session: Some(c2.clone()),
@@ -835,14 +844,14 @@ mod tests {
             },
         );
         assert!(sup.has_in_flight_background_jobs(&id));
-        assert!(sup.is_background_job_in_flight(&id, "bg-c1"));
-        sup.note_background_job_finished(&id, "bg-c1");
+        assert!(sup.is_background_job_in_flight(&id, &"bg-c1".into()));
+        sup.note_background_job_finished(&id, &"bg-c1".into());
         assert!(
             sup.has_in_flight_background_jobs(&id),
             "still one in-flight after one finished"
         );
-        assert!(!sup.is_background_job_in_flight(&id, "bg-c1"));
-        sup.note_background_job_finished(&id, "bg-c2");
+        assert!(!sup.is_background_job_in_flight(&id, &"bg-c1".into()));
+        sup.note_background_job_finished(&id, &"bg-c2".into());
         assert!(
             !sup.has_in_flight_background_jobs(&id),
             "map must clear once every dispatch finishes"
@@ -863,7 +872,7 @@ mod tests {
         sup.note_background_job_started(
             &id,
             InFlightJob {
-                handle: "bg-c1".to_string(),
+                handle: "bg-c1".into(),
                 kind: "explorer".to_string(),
                 task_summary: "find X".to_string(),
                 session: Some(c1.clone()),
@@ -873,7 +882,7 @@ mod tests {
         sup.note_background_job_started(
             &id,
             InFlightJob {
-                handle: "bg-c2".to_string(),
+                handle: "bg-c2".into(),
                 kind: "planner".to_string(),
                 task_summary: "draft Y".to_string(),
                 session: Some(c2.clone()),
@@ -894,10 +903,10 @@ mod tests {
             "/stop stops the child via its stored token"
         );
         assert!(!sup.has_in_flight_background_jobs(&id));
-        assert!(!sup.is_background_job_in_flight(&id, "bg-c1"));
+        assert!(!sup.is_background_job_in_flight(&id, &"bg-c1".into()));
         // A second drain is empty (idempotent), and `finished` is a no-op.
         assert!(sup.take_in_flight_background_jobs(&id).is_empty());
-        sup.note_background_job_finished(&id, "bg-c1");
+        sup.note_background_job_finished(&id, &"bg-c1".into());
     }
 
     #[test]
@@ -906,7 +915,7 @@ mod tests {
         // Removing without a prior start must not panic — the escort's
         // `finished` is unconditional, so this edge case is reachable if the
         // spawn path bailed before registering (or `/stop` already drained).
-        sup.note_background_job_finished(&SessionId::from("ghost"), "bg-ghost");
+        sup.note_background_job_finished(&SessionId::from("ghost"), &"bg-ghost".into());
         assert!(!sup.has_in_flight_background_jobs(&SessionId::from("ghost")));
     }
 
@@ -921,7 +930,7 @@ mod tests {
         sup.note_background_job_started(
             &parent,
             InFlightJob {
-                handle: "bg-handle-1".to_string(),
+                handle: "bg-handle-1".into(),
                 kind: "explorer".to_string(),
                 task_summary: "find X".to_string(),
                 session: Some(child.clone()),
@@ -948,7 +957,7 @@ mod tests {
         sup.note_background_job_started(
             &p1,
             InFlightJob {
-                handle: "bg-1".to_string(),
+                handle: "bg-1".into(),
                 kind: "explorer".to_string(),
                 task_summary: "a".to_string(),
                 session: Some(SessionId::from("c1").clone()),
@@ -958,7 +967,7 @@ mod tests {
         sup.note_background_job_started(
             &p1,
             InFlightJob {
-                handle: "bg-2".to_string(),
+                handle: "bg-2".into(),
                 kind: "planner".to_string(),
                 task_summary: "b".to_string(),
                 session: Some(SessionId::from("c2").clone()),
@@ -968,7 +977,7 @@ mod tests {
         sup.note_background_job_started(
             &p2,
             InFlightJob {
-                handle: "bg-3".to_string(),
+                handle: "bg-3".into(),
                 kind: "reviewer".to_string(),
                 task_summary: "c".to_string(),
                 session: Some(SessionId::from("c3").clone()),
@@ -1016,7 +1025,7 @@ mod tests {
         supervisor.note_background_job_started(
             &parent.id,
             InFlightJob {
-                handle: "bg-child".to_string(),
+                handle: "bg-child".into(),
                 kind: "explorer".to_string(),
                 task_summary: "task".to_string(),
                 session: Some(child.clone()),
@@ -1030,7 +1039,7 @@ mod tests {
         assert!(mailbox_rx.try_recv().is_err(), "no Shutdown queued");
 
         // Once the subagent finishes, the reaper proceeds on the next tick.
-        supervisor.note_background_job_finished(&parent.id, "bg-child");
+        supervisor.note_background_job_finished(&parent.id, &"bg-child".into());
         let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
         assert_eq!(reaped, 1, "parent must be reaped after subagent clears");
         assert!(matches!(mailbox_rx.try_recv(), Ok(AgentMessage::ActorStop)));

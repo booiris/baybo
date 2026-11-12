@@ -901,14 +901,14 @@ mod tests {
         // Background tasks listed by type + summary.
         let bg = vec![
             InFlightJob {
-                handle: "bg-c1".to_string(),
+                handle: "bg-c1".into(),
                 kind: "explorer".to_string(),
                 task_summary: "find X".to_string(),
                 session: Some(SessionId::from("c1")),
                 cancel_token: CancellationToken::new(),
             },
             InFlightJob {
-                handle: "bg-c2".to_string(),
+                handle: "bg-c2".into(),
                 kind: "planner".to_string(),
                 task_summary: "draft Y".to_string(),
                 session: Some(SessionId::from("c2")),

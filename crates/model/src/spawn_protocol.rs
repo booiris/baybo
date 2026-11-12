@@ -35,17 +35,6 @@ pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 /// in-flight handles.
 pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
 
-/// Mint a fresh background-job handle (`bg-…`) — the single id shared by a
-/// detached command's (or background subagent's) output, its dispatch ack, and
-/// its completion notification. One source of truth for the handle shape so the
-/// dispatch, conversion, and bash-detach sites can't drift.
-pub fn new_background_handle() -> String {
-    format!(
-        "{BACKGROUND_SUBAGENT_HANDLE_PREFIX}{}",
-        uuid::Uuid::new_v4()
-    )
-}
-
 /// Shared tail of every "moved to the background" answer
 /// (`baybo_tools::background::ack`, for every tool and both ways work gets
 /// there). Tells the parent LLM the one thing it needs to hear when its work
@@ -200,7 +189,7 @@ pub enum SubagentExitStatus {
 /// report of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingBackgroundResult {
-    pub handle_id: String,
+    pub handle_id: crate::BackgroundHandle,
     pub label: String,
     pub summary_text: String,
     pub status: SubagentExitStatus,
@@ -210,7 +199,7 @@ pub struct PendingBackgroundResult {
     /// their group is ready (sealed + all members terminal) or its group
     /// timeout dissolves it. `None` for ungrouped jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    pub group: Option<crate::CohortKey>,
 }
 
 /// Which kind of background job a [`PendingBackgroundResult`] reports.
@@ -241,7 +230,7 @@ pub enum BackgroundJobKind {
 impl PendingBackgroundResult {
     /// Build a result for a finished background subagent.
     pub fn subagent(
-        handle_id: impl Into<String>,
+        handle_id: impl Into<crate::BackgroundHandle>,
         subagent_type: impl Into<String>,
         task_summary: impl Into<String>,
         child_session_id: SessionId,
@@ -263,7 +252,7 @@ impl PendingBackgroundResult {
 
     /// Build a result for a finished detached command.
     pub fn command(
-        handle_id: impl Into<String>,
+        handle_id: impl Into<crate::BackgroundHandle>,
         command: impl Into<String>,
         exit_code: i32,
         output_path: impl Into<String>,

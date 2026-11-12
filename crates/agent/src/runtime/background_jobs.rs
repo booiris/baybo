@@ -144,7 +144,7 @@ async fn escort(supervisor: AgentSupervisor, shutdown: CancellationToken, job: D
     let DetachedJob {
         handle,
         parent,
-        group,
+        cohort,
         cancel,
         result,
         ..
@@ -187,7 +187,7 @@ async fn escort(supervisor: AgentSupervisor, shutdown: CancellationToken, job: D
         );
         return;
     }
-    pending.group = group;
+    pending.group = cohort;
     let delivered = supervisor
         .route(
             &parent,
@@ -247,7 +247,10 @@ mod tests {
 
     /// A job whose result is ready once `finish` fires — or, being cancelled,
     /// once its token does.
-    fn job(parent: &SessionId, group: Option<&str>) -> (DetachedJob, oneshot::Sender<()>) {
+    fn job(
+        parent: &SessionId,
+        cohort: Option<baybo_model::CohortKey>,
+    ) -> (DetachedJob, oneshot::Sender<()>) {
         let (finish, finished) = oneshot::channel::<()>();
         let cancel = CancellationToken::new();
         let result = {
@@ -274,7 +277,7 @@ mod tests {
             kind: "command".into(),
             summary: "make".into(),
             session: None,
-            group: group.map(str::to_string),
+            cohort,
             cancel,
             result,
         };
@@ -294,11 +297,15 @@ mod tests {
     #[tokio::test]
     async fn a_finished_job_is_delivered_to_its_parent_with_its_cohort() {
         let mut fx = fixture();
-        let (job, finish) = job(&fx.parent, Some("turn::g"));
+        let cohort = baybo_model::CohortKey::new(
+            baybo_model::TurnId::new(),
+            &baybo_model::BackgroundGroupName::parse("g").unwrap(),
+        );
+        let (job, finish) = job(&fx.parent, Some(cohort.clone()));
         fx.manager.adopt(job).await;
         assert!(
             fx.supervisor
-                .is_background_job_in_flight(&fx.parent, "bg-1")
+                .is_background_job_in_flight(&fx.parent, &"bg-1".into())
         );
 
         finish.send(()).unwrap();
@@ -307,7 +314,7 @@ mod tests {
             panic!("the result reaches the parent's mailbox");
         };
         assert_eq!(pending.handle_id, "bg-1");
-        assert_eq!(pending.group.as_deref(), Some("turn::g"));
+        assert_eq!(pending.group, Some(cohort));
     }
 
     /// A job whose work panics still leaves the registry, so its parent is

@@ -19,7 +19,7 @@ The durable state is one aggregate on `SessionState`:
 
 ```rust
 BackgroundNotificationState {
-    groups: HashMap<String, BackgroundNotificationGroup>,
+    groups: HashMap<CohortKey, BackgroundNotificationGroup>,
     buffered_results: Vec<PendingBackgroundResult>,
     active_delivery: Option<BackgroundNotificationDelivery>,
 }

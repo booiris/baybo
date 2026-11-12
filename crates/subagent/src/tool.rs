@@ -655,7 +655,7 @@ fn subagent_job(
     subagent_type: String,
     task_summary: String,
 ) -> Job<SubagentResult> {
-    let handle = baybo_model::new_background_handle();
+    let handle = baybo_model::BackgroundHandle::new();
     let SubagentRun {
         child_session_id,
         cancel,
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(jobs.len(), 1, "the child went to the background");
         assert_eq!(jobs[0].kind, "general-purpose");
         assert_eq!(jobs[0].session, Some(baybo_model::SessionId::from("child")));
-        assert!(text.contains(&jobs[0].handle), "{text}");
+        assert!(text.contains(jobs[0].handle.as_str()), "{text}");
         let (_, parent) = captured.lock().take().expect("spawner saw a request");
         assert!(
             parent.background_eligible,
@@ -1676,7 +1676,7 @@ mod tests {
         assert_eq!(
             sent,
             BackgroundRequest::Detach {
-                group: Some("batch".into())
+                group: baybo_model::BackgroundGroupName::parse("batch")
             },
             "still honoured at the door"
         );
@@ -1734,7 +1734,7 @@ mod tests {
         assert_eq!(
             req,
             BackgroundRequest::Detach {
-                group: Some("research".into())
+                group: baybo_model::BackgroundGroupName::parse("research")
             },
             "a grouped subagent must run in the background"
         );

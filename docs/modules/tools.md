@@ -474,7 +474,7 @@ rewords it to say reaching it terminates the command.
 ### Background jobs as a capability
 
 The lifecycle is shared too. A tool turns its slow work into a
-`background::Job<T>` — a handle (minted with `new_background_handle`, so a
+`background::Job<T>` — a handle (minted with `BackgroundHandle::new`, so a
 tool can name things after it before the work starts), a kind and summary for
 `JobList` / `/stop`, the session the work runs in if any, a cancel token, the
 `terminal` future, and `into_result` turning its outcome into a

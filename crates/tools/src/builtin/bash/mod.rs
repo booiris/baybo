@@ -60,7 +60,7 @@ use super::paths::require_absolute;
 use super::permission::{LivePermissionMode, PermissionMode};
 use std::sync::Arc;
 
-use baybo_model::new_background_handle;
+use baybo_model::BackgroundHandle;
 
 use futures::FutureExt;
 
@@ -1199,7 +1199,7 @@ async fn run_detached(
 
     // One id shared by the output files, the handle returned to the LLM, and
     // the eventual completion notification.
-    let handle_id = new_background_handle();
+    let handle_id = BackgroundHandle::new();
     let bg_dir = background_output_dir(&ctx.workspace_paths);
     let _ = tokio::fs::create_dir_all(&bg_dir).await;
     let stdout_path = bg_dir.join(format!("{handle_id}.out"));
@@ -3626,7 +3626,7 @@ mod tests {
     /// handed-over job — cancelling it kills the child and drains its copy
     /// tasks — so the test doesn't leak it.
     struct RecordingSink {
-        seen: Arc<Mutex<Option<(String, String)>>>,
+        seen: Arc<Mutex<Option<(BackgroundHandle, String)>>>,
     }
 
     #[async_trait]
@@ -4090,7 +4090,7 @@ mod tests {
     /// A ctx whose `workspace_paths` point at a unique temp dir (so
     /// `logs_dir()/background` is writable) with a recording sink wired in.
     #[allow(clippy::type_complexity)]
-    fn ctx_for_detached() -> (ToolContext, Arc<Mutex<Option<(String, String)>>>) {
+    fn ctx_for_detached() -> (ToolContext, Arc<Mutex<Option<(BackgroundHandle, String)>>>) {
         let tmp = std::env::temp_dir().join(format!("baybo-bgtest-{}", uuid::Uuid::new_v4()));
         // `run_detached` detaches through `ctx.sandbox`; the fake spawns the
         // command directly so the test needs no real OS sandbox.

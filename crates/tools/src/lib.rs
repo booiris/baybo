@@ -909,7 +909,7 @@ pub trait RunningChild: Send {
 
 /// One in-flight background job, as surfaced by the `JobList` tool.
 pub struct BackgroundJobInfo {
-    pub handle: String,
+    pub handle: baybo_model::BackgroundHandle,
     /// Subagent profile name, or `"command"` for a detached `Bash` command.
     pub kind: String,
     /// The task summary (subagent) or the command line (command).

@@ -1660,7 +1660,7 @@ impl AgentLoop {
             // namespaced by this turn's `turn_id`, which the result's own
             // cohort key carries too, so a group name reused in a later turn
             // opens a fresh cohort.
-            if let Some(group) = executed.background_group.as_deref() {
+            if let Some(group) = executed.background_group.as_ref() {
                 session
                     .state
                     .background_notifications

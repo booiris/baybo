@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_model::{
-    BACKGROUND_DISPATCH_YIELD_GUIDANCE, BackgroundNotificationGroup, OnTimeout,
-    PendingBackgroundResult, SessionId,
+    BACKGROUND_DISPATCH_YIELD_GUIDANCE, BackgroundGroupName, BackgroundHandle, CohortKey,
+    OnTimeout, PendingBackgroundResult, SessionId,
 };
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -175,7 +175,7 @@ pub enum BackgroundRequest {
     Wait(OnTimeout),
     /// Hand the work over at once (`background: true`, or a `group`, which
     /// implies it). `group` is the barrier cohort, trimmed; blank is none.
-    Detach { group: Option<String> },
+    Detach { group: Option<BackgroundGroupName> },
 }
 
 impl Default for BackgroundRequest {
@@ -220,9 +220,7 @@ impl BackgroundRequest {
         }
         let group = match params.get(GROUP_PARAM) {
             None | Some(Value::Null) => None,
-            Some(Value::String(raw)) => Some(raw.trim())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+            Some(Value::String(raw)) => BackgroundGroupName::parse(raw),
             Some(other) => return Err(format!("{GROUP_PARAM} must be a string, got {other}")),
         };
         let background = match params.get(BACKGROUND_PARAM) {
@@ -244,10 +242,10 @@ impl BackgroundRequest {
 /// or `cancel` fires, whether or not the turn that started it is still there.
 pub struct Job<T> {
     /// The id the model, `JobList` / `JobStop` and the eventual notification
-    /// share. Minted by the tool with [`baybo_model::new_background_handle`],
+    /// share. Minted by the tool with [`BackgroundHandle::new`],
     /// because a tool may need it before the work starts (Bash names its
     /// output files after it).
-    pub handle: String,
+    pub handle: BackgroundHandle,
     /// What kind of job this is, as `JobList` and `/stop` name it: a subagent
     /// profile, or `"command"`.
     pub kind: String,
@@ -285,7 +283,7 @@ pub enum Ran<T> {
 /// A job that now runs in the background.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backgrounded {
-    pub handle: String,
+    pub handle: BackgroundHandle,
     pub how: BackgroundedHow,
 }
 
@@ -299,15 +297,15 @@ pub enum BackgroundedHow {
 
 /// A job handed to the runtime to escort past its turn.
 pub struct DetachedJob {
-    pub handle: String,
+    pub handle: BackgroundHandle,
     /// The session whose actor receives the result.
     pub parent: SessionId,
     pub kind: String,
     pub summary: String,
     pub session: Option<SessionId>,
-    /// The turn-namespaced cohort key the result is held under, for a job
-    /// started as part of a group.
-    pub group: Option<String>,
+    /// The cohort the result is held under, for a job started as part of a
+    /// group.
+    pub cohort: Option<CohortKey>,
     pub cancel: CancellationToken,
     pub result: BoxFuture<'static, PendingBackgroundResult>,
 }
@@ -330,15 +328,15 @@ pub trait BackgroundJobSink: Send + Sync {
 /// agent loop can count a grouped call into its cohort. Filled by [`run`],
 /// read once the call returns.
 #[derive(Debug, Default)]
-pub struct DispatchRecord(parking_lot::Mutex<Option<String>>);
+pub struct DispatchRecord(parking_lot::Mutex<Option<BackgroundGroupName>>);
 
 impl DispatchRecord {
     /// The raw group of the job this call started detached, if it had one.
-    pub fn take_group(&self) -> Option<String> {
+    pub fn take_group(&self) -> Option<BackgroundGroupName> {
         self.0.lock().take()
     }
 
-    fn record_group(&self, group: String) {
+    fn record_group(&self, group: BackgroundGroupName) {
         *self.0.lock() = Some(group);
     }
 }
@@ -375,13 +373,13 @@ pub async fn run<T: Send + 'static>(
     } = job;
     let stop_if_abandoned = cancel.clone().drop_guard();
     let mut work: BoxFuture<'static, T> = tokio::spawn(terminal).map(joined).boxed();
-    let detached = |work: BoxFuture<'static, T>, group| DetachedJob {
+    let detached = |work: BoxFuture<'static, T>, cohort| DetachedJob {
         handle: handle.clone(),
         parent: ctx.session_id.clone(),
         kind,
         summary,
         session,
-        group,
+        cohort,
         cancel: cancel.clone(),
         result: work.then(into_result).boxed(),
     };
@@ -408,9 +406,7 @@ pub async fn run<T: Send + 'static>(
             if let Some(group) = group {
                 ctx.background_dispatch.record_group(group.clone());
             }
-            let cohort = group
-                .as_deref()
-                .map(|g| BackgroundNotificationGroup::cohort_key(ctx.turn_id, g));
+            let cohort = group.as_ref().map(|g| CohortKey::new(ctx.turn_id, g));
             sink.adopt(detached(work, cohort)).await;
             stop_if_abandoned.disarm();
             return Ran::Backgrounded(Backgrounded {
@@ -560,7 +556,7 @@ mod tests {
         assert_eq!(
             grouped,
             BackgroundRequest::Detach {
-                group: Some("fan".into())
+                group: BackgroundGroupName::parse("fan")
             }
         );
         let blank = BackgroundRequest::parse(&json!({"group": "  "}), &SPAWN_LIKE).unwrap();
@@ -702,7 +698,7 @@ mod tests {
             let adopted = sink.0.lock().pop().expect("handed to the sink");
             assert_eq!(adopted.handle, "bg-1");
             assert_eq!(adopted.parent, ctx.session_id);
-            assert_eq!(adopted.group, None, "a converted job is never grouped");
+            assert_eq!(adopted.cohort, None, "a converted job is never grouped");
             finish.send(()).unwrap();
             assert_eq!(adopted.result.await.summary_text, "done");
         }
@@ -760,11 +756,14 @@ mod tests {
                 panic!("a group starts detached");
             };
             assert_eq!(backgrounded.how, BackgroundedHow::Dispatched);
-            assert_eq!(ctx.background_dispatch.take_group().as_deref(), Some("g"));
+            assert_eq!(
+                ctx.background_dispatch.take_group(),
+                BackgroundGroupName::parse("g")
+            );
             let adopted = sink.0.lock().pop().expect("handed to the sink");
             assert_eq!(
-                adopted.group,
-                Some(BackgroundNotificationGroup::cohort_key(ctx.turn_id, "g"))
+                adopted.cohort,
+                BackgroundGroupName::parse("g").map(|g| CohortKey::new(ctx.turn_id, &g))
             );
         }
 

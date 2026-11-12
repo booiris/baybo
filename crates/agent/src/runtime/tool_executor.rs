@@ -376,7 +376,7 @@ pub struct ExecutedTool {
     pub approval: Option<ApprovalDecision>,
     /// The raw group of the job this call started detached, if it was part
     /// of one — the agent loop counts it into the turn's cohort.
-    pub background_group: Option<String>,
+    pub background_group: Option<baybo_model::BackgroundGroupName>,
 }
 
 /// The out-of-band media blocks a `WithAttachments` / `MultiModalText` result
@@ -729,7 +729,8 @@ impl ToolExecutor {
         // die with the closure.
         let approval_slot: Arc<Mutex<Option<ApprovalDecision>>> = Arc::new(Mutex::new(None));
         let approval_sink = Arc::clone(&approval_slot);
-        let group_slot: Arc<parking_lot::Mutex<Option<String>>> = Arc::default();
+        let group_slot: Arc<parking_lot::Mutex<Option<baybo_model::BackgroundGroupName>>> =
+            Arc::default();
         let group_sink = Arc::clone(&group_slot);
 
         // Open the tool span up front so denials and approval failures still
