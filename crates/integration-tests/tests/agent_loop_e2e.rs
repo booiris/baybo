@@ -5980,7 +5980,6 @@ const FAN_OUT_PROBE_BACKGROUND: baybo_tools::background::BackgroundSupport =
     baybo_tools::background::BackgroundSupport {
         window: baybo_tools::background::ForegroundWindow::Fixed(Duration::from_secs(60)),
         start_detached: true,
-        background_hint: "",
     };
 
 impl FanOutProbe {

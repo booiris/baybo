@@ -440,7 +440,6 @@ const SPAWN_BACKGROUND: baybo_tools::background::BackgroundSupport =
             crate::spawner::SUBAGENT_FOREGROUND_WAIT,
         ),
         start_detached: true,
-        background_hint: "Any backend; best for long external (claude/codex) runs.",
     };
 
 /// `registered` is the live profile list, so the model gets the legal names as

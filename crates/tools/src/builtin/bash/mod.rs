@@ -104,7 +104,6 @@ const BASH_BACKGROUND: crate::background::BackgroundSupport =
     crate::background::BackgroundSupport {
         window: crate::background::ForegroundWindow::Param(TIMEOUT_PARAM),
         start_detached: false,
-        background_hint: "",
     };
 
 /// One-line, log-safe digest of a shell command for a structured log

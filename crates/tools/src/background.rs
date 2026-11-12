@@ -68,9 +68,6 @@ pub struct BackgroundSupport {
     /// starting detached at once, alone or as a merged cohort. Only work that
     /// can be handed over before it has produced anything qualifies.
     pub start_detached: bool,
-    /// Tool-specific advice appended to the `background` option's
-    /// description (e.g. which runs it suits best).
-    pub background_hint: &'static str,
 }
 
 impl BackgroundSupport {
@@ -128,16 +125,11 @@ fn insert_options(props: &mut Map<String, Value>, support: &BackgroundSupport) {
         }),
     );
     if support.start_detached {
-        let hint = if support.background_hint.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", support.background_hint)
-        };
         props.insert(
             BACKGROUND_PARAM.to_string(),
             json!({
                 "type": "boolean",
-                "description": format!("Return a handle immediately instead of blocking; the result arrives in a later turn.{hint}"),
+                "description": "Return a handle immediately instead of blocking; the result arrives in a later turn.",
             }),
         );
         props.insert(
@@ -479,12 +471,10 @@ mod tests {
     const COMMAND_LIKE: BackgroundSupport = BackgroundSupport {
         window: ForegroundWindow::Param("timeout_ms"),
         start_detached: false,
-        background_hint: "",
     };
     const SPAWN_LIKE: BackgroundSupport = BackgroundSupport {
         window: ForegroundWindow::Fixed(Duration::from_secs(120)),
         start_detached: true,
-        background_hint: "Best for long runs.",
     };
 
     fn props(schema: &Value) -> Vec<String> {
@@ -527,12 +517,6 @@ mod tests {
             .unwrap();
         assert!(described.starts_with("After a 2-minute foreground wait:"));
         assert!(described.ends_with("Ignored when background=true."));
-        assert!(
-            spawn["properties"]["background"]["description"]
-                .as_str()
-                .unwrap()
-                .ends_with("Best for long runs.")
-        );
     }
 
     #[test]
@@ -624,7 +608,6 @@ mod tests {
         const CONVERTS: BackgroundSupport = BackgroundSupport {
             window: ForegroundWindow::Fixed(WINDOW),
             start_detached: false,
-            background_hint: "",
         };
         const STARTS_DETACHED: BackgroundSupport = BackgroundSupport {
             start_detached: true,
