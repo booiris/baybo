@@ -489,11 +489,8 @@ final class ComposerStaging: ObservableObject {
         do {
             let blobId = try await client.blobUploadFile(
                 path: url.path, mimeType: item.mime,
-                progress: BlobProgressForwarder { [weak self] sent, _ in
-                    self?.update(id) {
-                        guard $0.state.isUploading else { return }
-                        $0.state = .uploading(sent: sent)
-                    }
+                progress: BlobProgressForwarder { [weak self] sent, total in
+                    self?.update(id) { $0.state.progressed(sent: sent, total: total) }
                 })
             update(id) { $0.state = .ready(blobId: blobId) }
         } catch {

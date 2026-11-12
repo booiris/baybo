@@ -103,6 +103,10 @@ fn offer(reuse: Option<TunnelReuse>, state: LegState) -> Option<TunnelReuse> {
 }
 const TUNNEL_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TUNNEL_UPLOAD_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often an upload that set `report_progress` hears how much has landed.
+/// The client coalesces its own ticks to 100ms, and over the relay every frame
+/// is metered, so there is nothing to gain from reporting faster.
+const TUNNEL_UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const HEADER_CONTENT_LENGTH: &str = "content-length";
 const TUNNEL_HTTP_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const FORBIDDEN_HEADERS: &[&str] = &[
@@ -125,6 +129,7 @@ struct RequestHead {
     path: String,
     headers: Vec<TunnelHeader>,
     body_len: Option<u64>,
+    report_progress: bool,
 }
 
 pub(crate) async fn run_api_tunnel_over_relay(
@@ -233,6 +238,7 @@ pub(crate) async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
                 path,
                 headers,
                 body_len,
+                report_progress,
             } => {
                 last_id = request_id;
                 RequestHead {
@@ -241,6 +247,7 @@ pub(crate) async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
                     path,
                     headers,
                     body_len,
+                    report_progress,
                 }
             }
             // A late frame for a request already answered. Its only sources are a
@@ -442,6 +449,7 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
     let mut answered = None;
     let drain = {
         let body = stream_forward_body(
+            sink,
             source,
             transport,
             reassembler,
@@ -449,6 +457,7 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
             tx,
             request_id,
             declared_len,
+            head.report_progress,
         );
         tokio::pin!(body);
         loop {
@@ -544,7 +553,16 @@ fn build_forward_request(
     Ok(req)
 }
 
-async fn stream_forward_body<So: BinarySource>(
+/// Feed the request body into the router as it arrives, reporting how much has
+/// landed when the client asked for it.
+///
+/// `received` counts bytes handed to the router's body channel, which holds a
+/// few chunks at most: it is what the gateway really has, and it is the only
+/// honest number the client can show. Its own count is just what it handed to
+/// its socket, and over the relay most of the file is still queued in buffers.
+#[allow(clippy::too_many_arguments)]
+async fn stream_forward_body<Si: BinarySink, So: BinarySource>(
+    sink: &mut Si,
     source: &mut So,
     transport: &mut TransportState,
     reassembler: &mut FrameReassembler,
@@ -552,10 +570,19 @@ async fn stream_forward_body<So: BinarySource>(
     tx: tokio::sync::mpsc::Sender<io::Result<Bytes>>,
     request_id: u64,
     declared_len: u64,
+    report_progress: bool,
 ) -> Result<BodyDrain, (u16, String)> {
     if declared_len == 0 {
         drop(tx);
         return Ok(BodyDrain::Drained);
+    }
+
+    // The opening report tells the client at once that this gateway speaks
+    // progress, before its own count of buffered bytes runs far ahead.
+    let mut last_report = tokio::time::Instant::now();
+    if report_progress && let Err(reason) = send_progress(sink, transport, request_id, 0).await {
+        close_forward_body(tx, reason.clone()).await;
+        return Err((400, reason));
     }
 
     let mut received = 0u64;
@@ -616,6 +643,16 @@ async fn stream_forward_body<So: BinarySource>(
                     return Ok(BodyDrain::Abandoned);
                 }
                 received = next_received;
+                if report_progress
+                    && (last || last_report.elapsed() >= TUNNEL_UPLOAD_PROGRESS_INTERVAL)
+                {
+                    last_report = tokio::time::Instant::now();
+                    if let Err(reason) = send_progress(sink, transport, request_id, received).await
+                    {
+                        close_forward_body(tx, reason.clone()).await;
+                        return Err((400, reason));
+                    }
+                }
                 if last {
                     break;
                 }
@@ -636,6 +673,23 @@ async fn stream_forward_body<So: BinarySource>(
 
     drop(tx);
     Ok(BodyDrain::Drained)
+}
+
+async fn send_progress<S: BinarySink>(
+    sink: &mut S,
+    transport: &mut TransportState,
+    request_id: u64,
+    received: u64,
+) -> Result<(), String> {
+    send_response(
+        sink,
+        transport,
+        &TunnelResponse::Progress {
+            request_id,
+            received,
+        },
+    )
+    .await
 }
 
 async fn close_forward_body(
@@ -947,6 +1001,7 @@ mod tests {
             path: "/v1/chat/sessions".into(),
             headers,
             body_len: None,
+            report_progress: false,
         }
     }
 
@@ -1089,6 +1144,7 @@ mod session_tests {
                 path: path.into(),
                 headers: vec![],
                 body_len: None,
+                report_progress: false,
             })
             .await;
             self.read_response(id).await
@@ -1213,6 +1269,85 @@ mod session_tests {
         }
     }
 
+    /// Stream `data` as a blob upload in `chunk`-byte body frames, and collect
+    /// every `Progress` the gateway sends before its answer.
+    async fn upload_blob(
+        phone: &mut Phone,
+        data: &[u8],
+        chunk: usize,
+        report_progress: bool,
+    ) -> (Vec<u64>, TunnelResponse) {
+        phone
+            .send(&TunnelRequest::Head {
+                request_id: 1,
+                method: "POST".into(),
+                path: "/v1/blobs".into(),
+                headers: vec![TunnelHeader::new(
+                    "content-type",
+                    "application/octet-stream",
+                )],
+                body_len: Some(data.len() as u64),
+                report_progress,
+            })
+            .await;
+        let mut offset = 0;
+        for piece in data.chunks(chunk) {
+            phone
+                .send(&TunnelRequest::Body {
+                    request_id: 1,
+                    offset: offset as u64,
+                    data: piece.to_vec(),
+                    last: offset + piece.len() == data.len(),
+                })
+                .await;
+            offset += piece.len();
+        }
+        let mut progress = Vec::new();
+        loop {
+            match phone.recv().await.expect("the gateway must answer") {
+                TunnelResponse::Progress {
+                    request_id,
+                    received,
+                } => {
+                    assert_eq!(request_id, 1);
+                    progress.push(received);
+                }
+                head => return (progress, head),
+            }
+        }
+    }
+
+    /// An upload that asked for progress hears it: at once (so the client knows
+    /// this gateway speaks it before its own count runs ahead), and once more
+    /// at the full length, all before the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_that_asks_for_progress_hears_what_has_landed() {
+        let mut phone = connect(LegClass::Blob).await;
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+
+        let (progress, head) = upload_blob(&mut phone, &data, 1_000, true).await;
+
+        assert_eq!(status_of(&head), 201);
+        assert_eq!(progress.first(), Some(&0), "{progress:?}");
+        assert_eq!(progress.last(), Some(&(data.len() as u64)), "{progress:?}");
+        assert!(
+            progress.windows(2).all(|w| w[0] <= w[1]),
+            "a count never goes back: {progress:?}"
+        );
+    }
+
+    /// Every client shipped before `report_progress` decodes an unknown frame as
+    /// a dead leg, so a head that did not ask must never get one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_that_does_not_ask_hears_no_progress() {
+        let mut phone = connect(LegClass::Blob).await;
+
+        let (progress, head) = upload_blob(&mut phone, &[7u8; 3_000], 1_000, false).await;
+
+        assert_eq!(status_of(&head), 201);
+        assert!(progress.is_empty(), "{progress:?}");
+    }
+
     /// THE point of the change: one handshake, two requests. Each response answers
     /// its own id, and both advertise the reuse budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1275,6 +1410,7 @@ mod session_tests {
                 path: "/v1/chat/sessions".into(),
                 headers: vec![TunnelHeader::new("content-type", "application/json")],
                 body_len: Some(0),
+                report_progress: false,
             })
             .await;
         phone
@@ -1316,6 +1452,7 @@ mod session_tests {
                 path: "/v1/definitely-not-a-route".into(),
                 headers: vec![TunnelHeader::new("content-type", "application/json")],
                 body_len: Some(CHUNKS),
+                report_progress: false,
             })
             .await;
         for offset in 0..CHUNKS {
@@ -1357,6 +1494,7 @@ mod session_tests {
                 path: "/internal/metrics".into(), // not under /v1
                 headers: vec![],
                 body_len: None,
+                report_progress: false,
             })
             .await;
 
@@ -1408,6 +1546,7 @@ mod session_tests {
                 path: "/v1/chat/sessions".into(),
                 headers: vec![],
                 body_len: None,
+                report_progress: false,
             })
             .await;
 
