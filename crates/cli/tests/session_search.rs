@@ -20,6 +20,7 @@ const TERM: &str = "迁移";
 struct Fixture {
     _tmpdir: tempfile::TempDir,
     ctx: CommandContext,
+    manager: Arc<SessionManager>,
     owner: SessionId,
     telegram: SessionId,
     hidden: SessionId,
@@ -125,6 +126,7 @@ async fn seeded() -> Fixture {
     Fixture {
         _tmpdir: tmpdir,
         ctx,
+        manager,
         owner,
         telegram,
         hidden,
@@ -312,7 +314,8 @@ async fn limit_knobs_reach_the_search_and_the_output_says_what_was_cut() {
     );
 
     // A wide scan with a tight session cap: the cap, not the window, is
-    // what cut the list, and the header says so.
+    // what cut the list, and the header says so. Newest first, so the cap
+    // keeps the telegram session, whose one match was written last.
     let out = run_search(
         &fx.ctx,
         SessionSearchArgs {
@@ -325,15 +328,50 @@ async fn limit_knobs_reach_the_search_and_the_output_says_what_was_cut() {
     let data = out.data.clone().unwrap();
     assert_eq!(data["truncated"], false, "{data}");
     assert_eq!(data["sessions_matched"], 2);
-    assert_eq!(session_ids(&data), [fx.owner.as_str()], "{data}");
-    assert_eq!(data["groups"][0]["total_hits"], 3);
-    assert_eq!(data["groups"][0]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(session_ids(&data), [fx.telegram.as_str()], "{data}");
+    assert_eq!(data["groups"][0]["total_hits"], 1);
     assert!(
         out.human.contains("showing 1 of 2: raise -n"),
         "{}",
         out.human
     );
+
+    let out = run_search(
+        &fx.ctx,
+        SessionSearchArgs {
+            per_session: 1,
+            ..args(&[TERM])
+        },
+    )
+    .await;
+    let data = out.data.clone().unwrap();
+    assert_eq!(data["groups"][1]["session_id"], fx.owner.as_str(), "{data}");
+    assert_eq!(data["groups"][1]["total_hits"], 3);
+    assert_eq!(data["groups"][1]["hits"].as_array().unwrap().len(), 1);
     assert!(out.human.contains("… and 2 more"), "{}", out.human);
+}
+
+/// Newest first, at both levels: conversations by their newest match, and
+/// the hits inside one conversation newest first.
+#[tokio::test]
+async fn results_are_newest_first() {
+    let fx = seeded().await;
+    let data = search(&fx.ctx, args(&[TERM])).await;
+    assert_eq!(
+        session_ids(&data),
+        [fx.telegram.as_str(), fx.owner.as_str()],
+        "{data}"
+    );
+    let ordinals: Vec<i64> = data["groups"][1]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["ordinal"].as_i64().unwrap())
+        .collect();
+    let mut newest_first = ordinals.clone();
+    newest_first.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(ordinals, newest_first, "{data}");
+    assert!(ordinals.len() > 1, "{data}");
 }
 
 #[tokio::test]
@@ -451,4 +489,62 @@ async fn argv_light_boot_reports_the_missing_service() {
     .await
     .expect_err("no search service wired");
     assert!(matches!(err, CliError::Manager(_)), "{err}");
+}
+
+#[tokio::test]
+async fn titles_match_and_keep_the_session_scope() {
+    let fx = seeded().await;
+    fx.manager
+        .set_title(&fx.telegram, Some("停机窗口 迁移计划"))
+        .await
+        .unwrap();
+    fx.manager
+        .set_title(&fx.hidden, Some("停机窗口 也藏了"))
+        .await
+        .unwrap();
+
+    let data = search(&fx.ctx, args(&[TERM])).await;
+    assert_eq!(
+        session_ids(&data),
+        [fx.telegram.as_str(), fx.owner.as_str()],
+        "{data}"
+    );
+    let titled = &data["groups"][0];
+    assert_eq!(titled["title_match"], true);
+    assert_eq!(titled["session_title"], "停机窗口 迁移计划");
+    assert_eq!(titled["total_hits"], 1, "message hits ride along: {data}");
+    assert_eq!(data["groups"][1]["title_match"], false);
+    assert_eq!(data["sessions_matched"], 2);
+
+    let out = run_search(&fx.ctx, args(&["窗口"])).await;
+    let data = out.data.clone().unwrap();
+    assert_eq!(session_ids(&data), [fx.telegram.as_str()], "{data}");
+    let group = &data["groups"][0];
+    assert_eq!(group["title_match"], true);
+    assert_eq!(group["channel"], "telegram");
+    assert_eq!(group["total_hits"], 0);
+    assert!(group["hits"].as_array().unwrap().is_empty());
+    assert!(out.human.contains("[title match]\n"), "{}", out.human);
+    assert!(!out.human.contains("  #"), "{}", out.human);
+
+    let data = search(
+        &fx.ctx,
+        SessionSearchArgs {
+            include_hidden: true,
+            ..args(&["窗口"])
+        },
+    )
+    .await;
+    assert_eq!(
+        sorted(session_ids(&data)),
+        sorted(vec![fx.telegram.as_str(), fx.hidden.as_str()]),
+        "{data}"
+    );
+
+    fx.manager.set_title(&fx.telegram, None).await.unwrap();
+    let data = search(&fx.ctx, args(&["窗口"])).await;
+    assert!(
+        session_ids(&data).is_empty(),
+        "a cleared title unindexes: {data}"
+    );
 }

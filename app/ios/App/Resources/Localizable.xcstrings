@@ -443,6 +443,23 @@
         }
       }
     },
+    "attach.finishingUpload": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Finishing…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在完成…"
+          }
+        }
+      }
+    },
     "attach.remove": {
       "extractionState": "stale",
       "localizations": {

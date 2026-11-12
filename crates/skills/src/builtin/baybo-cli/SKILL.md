@@ -60,7 +60,7 @@ absolute path to the running binary, baked in at boot time.
 | "What's the metadata for session X?" | `{{BAYBO_BIN}} session show <id>` |
 | "What did the user/agent say?" | `{{BAYBO_BIN}} session history <id>` |
 | "What got dropped by compaction?" | `{{BAYBO_BIN}} session history <id> --include-superseded` (or `--superseded-only`) |
-| "Where did we talk about X? / which session mentioned X?" | `{{BAYBO_BIN}} session search <words…>` (grouped by session, best match first; `--all` also reaches hidden, archived and cron-workspace sessions) |
+| "Where did we talk about X? / which session mentioned X? / find the chat titled X" | `{{BAYBO_BIN}} session search <words…>` (searches session titles and messages, grouped by session, newest first; title matches are marked `[title match]`; `--all` also reaches hidden, archived and cron-workspace sessions) |
 | "Did this chat mention X?" | `{{BAYBO_BIN}} session search <words…> --session <id>` |
 | "What LLM calls / tool calls happened?" | `{{BAYBO_BIN}} session export <id>` (full JSON tree) |
 | "Which turns are in-flight / failed?" | `{{BAYBO_BIN}} turn list [--status in-progress \| failed \| stuck]` |
@@ -111,8 +111,10 @@ absolute path to the running binary, baked in at boot time.
   Prefer `{{BAYBO_BIN}} cost show --session <id>` over piping
   `session export` through `jq`, and `{{BAYBO_BIN}} session search
   <words…>` over grepping `session history` dumps session by session.
-  A hit prints `#<ordinal>`; read the whole row with
+  A message hit prints `#<ordinal>`; read the whole row with
   `{{BAYBO_BIN}} session history <id> --include-superseded --json`.
+  A `[title match]` group with no hit lines matched on its title
+  alone — read it with `{{BAYBO_BIN}} session history <id>`.
 
 ## When in doubt
 

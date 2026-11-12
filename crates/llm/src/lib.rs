@@ -5,6 +5,8 @@ mod error;
 pub mod guard;
 pub mod json_extract;
 pub mod media_probe;
+#[cfg(test)]
+mod mock_http;
 pub mod multimodal;
 pub mod openrouter;
 pub mod providers;
@@ -1120,13 +1122,17 @@ impl LlmStream {
     /// `cached_input_tokens` at 0; this wrapper reads
     /// `usage_metadata.cached_content_token_count` straight off the raw
     /// `Final` payload so prompt-cache hits land in cost_records. Drop
-    /// once rig upstream fixes the impl.
+    /// once rig upstream fixes the impl. It also adopts each tool call and
+    /// reasoning block for `model`
+    /// ([`crate::providers::gemini::adopt_stream_event`]): rig's name-as-id
+    /// becomes a unique id, and signatures are stamped with their issuer.
     fn from_gemini_stream(
         rig_stream: streaming::StreamingCompletionResponse<
             gemini::streaming::StreamingCompletionResponse,
         >,
+        model: String,
     ) -> Self {
-        let mapped = rig_stream.filter_map(|result| {
+        let mapped = rig_stream.filter_map(move |result| {
             futures::future::ready(match result {
                 Err(e) => Some(Err(rig_completion_to_error(e))),
                 Ok(StreamedAssistantContent::Final(r)) => {
@@ -1140,7 +1146,10 @@ impl LlmStream {
                         cache_creation_input_tokens: usage.cache_creation_input_tokens as usize,
                     })))
                 }
-                Ok(event) => convert_stream_event(event),
+                Ok(mut event) => {
+                    crate::providers::gemini::adopt_stream_event(&mut event, &model);
+                    convert_stream_event(event)
+                }
             })
         });
         Self {
@@ -1215,6 +1224,14 @@ pub(crate) enum AnyCompletionModel {
     Opencode(crate::providers::opencode::OpencodeCompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
+    /// OpenCode's Gemini surface, reached only through
+    /// [`OpencodeCompletionModel::for_session`](crate::providers::opencode::OpencodeCompletionModel::for_session).
+    /// Its HTTP client repairs the `usageMetadata` rig 0.37 cannot parse.
+    OpencodeGemini(
+        gemini::completion::CompletionModel<
+            crate::providers::opencode::gemini_usage::GeminiUsageClient,
+        >,
+    ),
     /// DeepSeek's dedicated provider — round-trips `reasoning_content`
     /// on assistant tool-call turns, which thinking mode requires.
     DeepSeek(deepseek::CompletionModel),
@@ -1246,9 +1263,8 @@ pub(crate) enum AnyCompletionModel {
 }
 
 /// Erase a provider `CompletionResponse<R>`'s raw-response payload for the
-/// agent loop. For OpenAI-compatible rig providers that need no per-field
-/// usage massaging (unlike Anthropic's cache folding / Gemini's cache
-/// re-derivation).
+/// agent loop. For rig providers whose `Usage` needs no per-field
+/// massaging (unlike Anthropic's cache folding).
 fn repack_completion<R>(
     resp: completion::CompletionResponse<R>,
 ) -> completion::CompletionResponse<()> {
@@ -1275,7 +1291,7 @@ impl AnyCompletionModel {
             Self::OpenAI(_) => openai_model_accepts_audio(model_id),
             // Every Gemini chat model rig can build is natively
             // multimodal over audio; the text-only 1.0 line is retired.
-            Self::Gemini(_) => true,
+            Self::Gemini(_) | Self::OpencodeGemini(_) => true,
             Self::Opencode(model) => model.accepts_audio_content(),
             _ => false,
         }
@@ -1304,7 +1320,7 @@ impl AnyCompletionModel {
             return false;
         }
         let priced = match self {
-            Self::Gemini(_) => gemini_image_tokens(width, height),
+            Self::Gemini(_) | Self::OpencodeGemini(_) => gemini_image_tokens(width, height),
             Self::OpenAI(_) | Self::OpenAiSubscription(_) => openai_image_tokens(width, height),
             Self::OpenAIResponses(_) => openai_image_tokens(width, height),
             Self::Opencode(model) => model.image_tokens(width, height),
@@ -1328,6 +1344,7 @@ impl AnyCompletionModel {
             self,
             Self::Anthropic(_)
                 | Self::Gemini(_)
+                | Self::OpencodeGemini(_)
                 | Self::OpenAiSubscription(_)
                 | Self::OpenAIResponses(_)
         )
@@ -1383,24 +1400,20 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
-            Self::Gemini(m) => {
-                let resp = m.completion(request).await?;
-                // rig 0.34's Gemini path leaves `cached_input_tokens` at 0
-                // even when the response carries `cachedContentTokenCount`.
-                // Re-derive it from the raw `usage_metadata` so prompt-cache
-                // hits land in cost_records correctly. Drop this once rig
-                // upstream populates the field itself.
-                let mut usage = resp.usage;
-                if let Some(meta) = resp.raw_response.usage_metadata.as_ref() {
-                    usage.cached_input_tokens = meta.cached_content_token_count.unwrap_or(0) as u64;
-                }
-                Ok(completion::CompletionResponse {
-                    choice: resp.choice,
-                    usage,
-                    raw_response: (),
-                    message_id: resp.message_id,
-                })
-            }
+            Self::Gemini(m) => Ok(crate::providers::gemini::adopt_response(
+                repack_completion(
+                    m.completion(crate::providers::gemini::prepare_request(request, &m.model))
+                        .await?,
+                ),
+                &m.model,
+            )),
+            Self::OpencodeGemini(m) => Ok(crate::providers::gemini::adopt_response(
+                repack_completion(
+                    m.completion(crate::providers::gemini::prepare_request(request, &m.model))
+                        .await?,
+                ),
+                &m.model,
+            )),
             Self::DeepSeek(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Xai(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Mistral(m) => Ok(repack_completion(m.completion(request).await?)),
@@ -1453,10 +1466,16 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_anthropic_stream(stream))
             }
-            Self::Gemini(m) => {
-                let stream = m.stream(request).await?;
-                Ok(LlmStream::from_gemini_stream(stream))
-            }
+            Self::Gemini(m) => Ok(LlmStream::from_gemini_stream(
+                m.stream(crate::providers::gemini::prepare_request(request, &m.model))
+                    .await?,
+                m.model.clone(),
+            )),
+            Self::OpencodeGemini(m) => Ok(LlmStream::from_gemini_stream(
+                m.stream(crate::providers::gemini::prepare_request(request, &m.model))
+                    .await?,
+                m.model.clone(),
+            )),
             Self::DeepSeek(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Xai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Mistral(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
@@ -1717,6 +1736,9 @@ impl LlmClient {
     async fn build_completion_request(&self, request: &ChatRequest) -> CompletionRequest {
         let mut system_parts = Vec::new();
         let mut chat_messages: Vec<Message> = Vec::new();
+        // Whether the last message on the wire holds only tool results, so
+        // the next tool message's results join it (see `Role::Tool` below).
+        let mut open_tool_results = false;
 
         for msg in &request.messages {
             match msg.role {
@@ -1735,6 +1757,7 @@ impl LlmClient {
                             content.push(part);
                         }
                         chat_messages.push(Message::User { content });
+                        open_tool_results = false;
                     }
                 }
                 baybo_model::Role::Assistant => {
@@ -1776,8 +1799,17 @@ impl LlmClient {
                             content.push(part);
                         }
                         chat_messages.push(Message::Assistant { id: None, content });
+                        open_tool_results = false;
                     }
                 }
+                // baybo stores one row per tool result, but the results
+                // answering one assistant turn go out as ONE user message:
+                // Gemini rejects a model turn with N function calls unless
+                // the next content holds all N responses, and every other
+                // converter splits a merged message back into per-result
+                // items. Only results merge, and only with results directly
+                // before them on the wire, so an interjected user message
+                // or a legacy plain-text tool row is never folded in.
                 baybo_model::Role::Tool => {
                     let mut parts: Vec<UserContent> = Vec::new();
                     for block in &msg.content {
@@ -1808,14 +1840,28 @@ impl LlmClient {
                             _ => {}
                         }
                     }
-                    if !parts.is_empty() {
-                        let first = parts.remove(0);
-                        let mut content = OneOrMany::one(first);
-                        for part in parts {
-                            content.push(part);
-                        }
-                        chat_messages.push(Message::User { content });
+                    if parts.is_empty() {
+                        continue;
                     }
+                    let only_results = parts
+                        .iter()
+                        .all(|part| matches!(part, UserContent::ToolResult(_)));
+                    match chat_messages.last_mut() {
+                        Some(Message::User { content }) if open_tool_results && only_results => {
+                            for part in parts {
+                                content.push(part);
+                            }
+                        }
+                        _ => {
+                            let first = parts.remove(0);
+                            let mut content = OneOrMany::one(first);
+                            for part in parts {
+                                content.push(part);
+                            }
+                            chat_messages.push(Message::User { content });
+                        }
+                    }
+                    open_tool_results = only_results;
                 }
             }
         }
@@ -4501,5 +4547,204 @@ mod effort_wiring_tests {
             Some(json!({"reasoning_effort": "ultra"}))
         );
         assert_eq!(client.effective_effort(None).as_deref(), Some("ultra"));
+    }
+}
+
+#[cfg(test)]
+mod tool_result_grouping_tests {
+    use baybo_model::{ChatMessage, ContentBlock};
+    use rig::message::UserContent;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::mock_http::endpoint;
+    use crate::registry::{LlmProviderConfig, LlmProviderRegistry};
+
+    fn client(provider: &str, model: &str, base_url: Option<String>) -> LlmClient {
+        LlmProviderRegistry::with_default_providers()
+            .build_client(&LlmProviderConfig {
+                provider: provider.into(),
+                api_key: Some("test-key".into()),
+                base_url,
+                model: model.into(),
+                supports_vision: None,
+                context_window: None,
+                pricing: None,
+                reasoning_effort: None,
+                vault: None,
+                proxy: None,
+            })
+            .unwrap()
+    }
+
+    fn calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage::assistant(
+            ids.iter()
+                .map(|id| ContentBlock::ToolUse {
+                    id: (*id).into(),
+                    name: "read_file".into(),
+                    input: json!({}),
+                    signature: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn result(id: &str) -> ChatMessage {
+        ChatMessage::tool_result_with_meta(id.into(), format!("output of {id}"), None)
+    }
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage::user(vec![ContentBlock::Text(text.into())])
+    }
+
+    /// Each wire message as a role tag plus, for a user message, the ids
+    /// of its tool results (`text` for any other part).
+    async fn wire_shape(messages: Vec<ChatMessage>) -> Vec<(&'static str, Vec<String>)> {
+        let request = ChatRequest {
+            messages,
+            ..Default::default()
+        };
+        client("openai", "gpt-4o", None)
+            .build_completion_request(&request)
+            .await
+            .chat_history
+            .iter()
+            .map(|message| match message {
+                Message::User { content } => (
+                    "user",
+                    content
+                        .iter()
+                        .map(|part| match part {
+                            UserContent::ToolResult(r) => r.id.clone(),
+                            _ => "text".to_string(),
+                        })
+                        .collect(),
+                ),
+                Message::Assistant { .. } => ("assistant", Vec::new()),
+                Message::System { .. } => ("system", Vec::new()),
+            })
+            .collect()
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// Stored rows hold one tool result each; the wire answers one
+    /// assistant turn with one user message, results in stored order.
+    #[tokio::test]
+    async fn consecutive_tool_results_share_one_user_message() {
+        let shape = wire_shape(vec![
+            user("go"),
+            calls(&["a", "b", "c"]),
+            result("a"),
+            result("b"),
+            result("c"),
+            calls(&["d"]),
+            result("d"),
+        ])
+        .await;
+        assert_eq!(
+            shape,
+            [
+                ("user", ids(&["text"])),
+                ("assistant", vec![]),
+                ("user", ids(&["a", "b", "c"])),
+                ("assistant", vec![]),
+                ("user", ids(&["d"])),
+            ]
+        );
+    }
+
+    /// A user message between two results is a turn of its own: neither
+    /// side is folded into it, and results after it start a new message.
+    #[tokio::test]
+    async fn results_never_merge_across_a_user_message() {
+        let shape = wire_shape(vec![
+            calls(&["a", "b"]),
+            result("a"),
+            user("wait"),
+            result("b"),
+        ])
+        .await;
+        assert_eq!(
+            shape,
+            [
+                ("assistant", vec![]),
+                ("user", ids(&["a"])),
+                ("user", ids(&["text"])),
+                ("user", ids(&["b"])),
+            ]
+        );
+    }
+
+    /// A legacy plain-text tool row keeps its own message — OpenAI's
+    /// converter drops text that shares a message with tool results — and
+    /// nothing merges into it either.
+    #[tokio::test]
+    async fn a_plain_text_tool_row_keeps_its_own_message() {
+        let shape = wire_shape(vec![
+            calls(&["a", "b"]),
+            result("a"),
+            ChatMessage::tool(vec![ContentBlock::Text("legacy".into())]),
+            result("b"),
+        ])
+        .await;
+        assert_eq!(
+            shape,
+            [
+                ("assistant", vec![]),
+                ("user", ids(&["a"])),
+                ("user", ids(&["text"])),
+                ("user", ids(&["b"])),
+            ]
+        );
+    }
+
+    /// A system message goes to the preamble, not the history, so it does
+    /// not separate the results around it on the wire.
+    #[tokio::test]
+    async fn a_system_message_does_not_split_results() {
+        let shape = wire_shape(vec![
+            calls(&["a", "b"]),
+            result("a"),
+            ChatMessage::system(vec![ContentBlock::Text("note".into())]),
+            result("b"),
+        ])
+        .await;
+        assert_eq!(shape, [("assistant", vec![]), ("user", ids(&["a", "b"]))]);
+    }
+
+    /// OpenAI Chat Completions — the wire most rig hosts share — still
+    /// gets one `tool` message per result from a merged message.
+    #[tokio::test]
+    async fn openai_chat_sends_one_tool_message_per_merged_result() {
+        let reply = json!({"id":"c1","object":"chat.completion","created":0,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        let (origin, mut captured) =
+            endpoint(vec![(200, "application/json", reply.to_string())]).await;
+        client("openai", "gpt-4o", Some(origin))
+            .chat(&ChatRequest {
+                messages: vec![user("go"), calls(&["a", "b"]), result("a"), result("b")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let body = captured.recv().await.unwrap().body;
+        let tool_ids: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_ids, ["a", "b"], "{body}");
+        let roles: Vec<&Value> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| &m["role"])
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool"], "{body}");
     }
 }

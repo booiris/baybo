@@ -1138,8 +1138,16 @@ final class AppStore: ObservableObject {
     /// it stack. `ChatScreen` consumes the entry when it appears — re-issuing on
     /// appear, rather than calling the bridge here, is also what survives the
     /// `TranscriptHost` being rebuilt between this call and the screen mounting.
-    func openSearchResult(sessionId: String, ordinal: Int64) {
-        pendingJump[sessionId] = ordinal
+    ///
+    /// `ordinal == nil` is a title match: the conversation opens where it
+    /// normally would, with no jump. It CLEARS any entry rather than leaving it,
+    /// so a jump left unconsumed for this session cannot fire in its place.
+    func openSearchResult(sessionId: String, ordinal: Int64?) {
+        if let ordinal {
+            pendingJump[sessionId] = ordinal
+        } else {
+            pendingJump.removeValue(forKey: sessionId)
+        }
         Task {
             await activateSession(
                 sessionId, ensureListed: true, appendToPath: true, keepTab: true)

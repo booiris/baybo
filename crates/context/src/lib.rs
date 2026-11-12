@@ -1989,7 +1989,21 @@ impl ContextManager {
                     fills,
                     orphan_result_ids,
                     duplicate_result_ids,
+                    renamed_call_ids,
                 } = transcript_repair::repair_tool_pairing(messages, &parked);
+                if !renamed_call_ids.is_empty() {
+                    let renamed_call_id_sample: Vec<&str> = renamed_call_ids
+                        .iter()
+                        .take(MAX_LOGGED_PROTOCOL_CALL_IDS)
+                        .map(String::as_str)
+                        .collect();
+                    warn!(
+                        session_id = %session_id,
+                        renamed_calls = renamed_call_ids.len(),
+                        ?renamed_call_id_sample,
+                        "hydration: gave repeated tool_use ids unique ids in the LLM window"
+                    );
+                }
                 if !orphan_result_ids.is_empty() || !duplicate_result_ids.is_empty() {
                     let orphan_result_id_sample: Vec<&str> = orphan_result_ids
                         .iter()
@@ -3254,6 +3268,96 @@ mod tests {
             matches!(&again.messages()[1].content[0], ContentBlock::ToolResult { tool_use_id, .. }
                 if tool_use_id == "call_dangling"),
             "persisted fill must be repositioned adjacent on rehydration"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_disambiguates_repeated_tool_ids_without_rewriting_rows() {
+        fn search(id: &str) -> ContentBlock {
+            ContentBlock::ToolUse {
+                id: id.into(),
+                name: "web_search".into(),
+                input: serde_json::Value::Null,
+                signature: None,
+            }
+        }
+        fn tool_ids(messages: &[ChatMessage]) -> Vec<String> {
+            messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(format!("use:{id}")),
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        Some(format!("res:{tool_use_id}"))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        let sessions = test_sessions();
+        let stored = vec![
+            make_msg(Role::User, "question"),
+            ChatMessage::assistant(vec![search("web_search"), search("web_search")]),
+            ChatMessage::tool_result_with_meta("web_search".into(), "first".into(), None),
+            ChatMessage::tool_result_with_meta("web_search".into(), "second".into(), None),
+            make_msg(Role::User, "follow-up"),
+            ChatMessage::assistant(vec![search("web_search"), search("web_search")]),
+            ChatMessage::tool_result_with_meta("web_search".into(), "third".into(), None),
+            make_msg(Role::User, "resume"),
+        ];
+        for message in &stored {
+            sessions
+                .append_session_message(&test_session_id(), message)
+                .await
+                .expect("persist row");
+        }
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+        let window = restored.messages().to_vec();
+        assert_eq!(
+            tool_ids(&window),
+            vec![
+                "use:web_search",
+                "use:web_search_2",
+                "res:web_search",
+                "res:web_search_2",
+                "use:web_search_3",
+                "use:web_search_4",
+                "res:web_search_3",
+                "res:web_search_4",
+            ]
+        );
+        let results: Vec<&str> = window
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(&results[..3], ["first", "second", "third"]);
+        assert!(results[3].contains("interrupted"), "{}", results[3]);
+
+        let durable = sessions
+            .load_active_session_messages(&test_session_id())
+            .await
+            .expect("load durable transcript");
+        assert_eq!(durable.len(), stored.len() + 1, "only the fill is written");
+        assert_eq!(durable[..stored.len()], stored[..], "stored rows untouched");
+        assert!(matches!(&durable[stored.len()].content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "web_search_4"));
+
+        let mut again = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        again.restore_from_store().await;
+        assert_eq!(again.messages(), &window[..], "identical on every load");
+        assert_eq!(
+            sessions
+                .load_active_session_messages(&test_session_id())
+                .await
+                .expect("reload durable transcript"),
+            durable,
+            "a second load writes nothing"
         );
     }
 

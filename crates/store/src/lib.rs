@@ -42,7 +42,7 @@ pub use deck::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapsh
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use human_ask::{HumanAskRow, HumanAskStore};
-pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
+pub use message_search::{MessageSearchStore, SearchHit, SearchScope, TitleHit};
 pub use project::{
     IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueRun,
     ProjectRow, ProjectStore, ProjectUpdate, RunStatus, RunTrigger,

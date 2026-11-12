@@ -1,6 +1,7 @@
 [
   {
     "name": "single CJK term, whole text fits",
+    "fn": "snippet",
     "text": "先说说数据库的事情",
     "query": "数据库",
     "segments": [
@@ -20,6 +21,7 @@
   },
   {
     "name": "two terms both in window",
+    "fn": "snippet",
     "text": "聊聊数据库的迁移方案",
     "query": "数据库 迁移",
     "segments": [
@@ -47,6 +49,7 @@
   },
   {
     "name": "anchors on the earliest term, not the first typed",
+    "fn": "snippet",
     "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx迁移yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy数据库",
     "query": "数据库 迁移",
     "segments": [
@@ -74,6 +77,7 @@
   },
   {
     "name": "case-insensitive, original casing preserved",
+    "fn": "snippet",
     "text": "The Session started",
     "query": "session",
     "segments": [
@@ -93,6 +97,7 @@
   },
   {
     "name": "repeats of one term",
+    "fn": "snippet",
     "text": "foo and foo again",
     "query": "foo",
     "segments": [
@@ -116,6 +121,7 @@
   },
   {
     "name": "prefix widening still locates the typed prefix",
+    "fn": "snippet",
     "text": "list the sessions please",
     "query": "session",
     "segments": [
@@ -135,6 +141,7 @@
   },
   {
     "name": "no locatable term falls back to the head",
+    "fn": "snippet",
     "text": "résumé of the work",
     "query": "resume",
     "segments": [
@@ -146,6 +153,7 @@
   },
   {
     "name": "head fallback elides when longer than the head budget",
+    "fn": "snippet",
     "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "query": "zzz",
     "segments": [
@@ -157,6 +165,7 @@
   },
   {
     "name": "interior window elides both ends",
+    "fn": "snippet",
     "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa检索bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "query": "检索",
     "segments": [
@@ -184,6 +193,7 @@
   },
   {
     "name": "punctuation-only query yields the head",
+    "fn": "snippet",
     "text": "some text",
     "query": "---",
     "segments": [
@@ -195,6 +205,7 @@
   },
   {
     "name": "empty query yields the head",
+    "fn": "snippet",
     "text": "some text",
     "query": "",
     "segments": [
@@ -206,6 +217,7 @@
   },
   {
     "name": "empty text",
+    "fn": "snippet",
     "text": "",
     "query": "foo",
     "segments": [
@@ -217,6 +229,7 @@
   },
   {
     "name": "ZWJ emoji sits exactly on the leading window edge",
+    "fn": "snippet",
     "text": "👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦检索",
     "query": "检索",
     "segments": [
@@ -236,6 +249,7 @@
   },
   {
     "name": "ZWJ emoji sits exactly on the trailing window edge",
+    "fn": "snippet",
     "text": "检索👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦",
     "query": "检索",
     "segments": [
@@ -255,6 +269,7 @@
   },
   {
     "name": "surrogate-pair flags around a match",
+    "fn": "snippet",
     "text": "🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳🇨🇳检索🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵",
     "query": "检索",
     "segments": [
@@ -282,6 +297,7 @@
   },
   {
     "name": "emoji inside the matched term",
+    "fn": "snippet",
     "text": "说说 🎉派对 的事",
     "query": "🎉派对",
     "segments": [
@@ -301,6 +317,7 @@
   },
   {
     "name": "decomposed combining mark (e+U+0301) stays with its base",
+    "fn": "snippet",
     "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé检索",
     "query": "检索",
     "segments": [
@@ -317,5 +334,64 @@
         "match": true
       }
     ]
+  },
+  {
+    "name": "title: a match past the excerpt lead window keeps the whole name",
+    "fn": "highlightAll",
+    "text": "Weekly review of the database migration plan",
+    "query": "plan",
+    "segments": [
+      {
+        "text": "Weekly review of the database migration ",
+        "match": false
+      },
+      {
+        "text": "plan",
+        "match": true
+      }
+    ]
+  },
+  {
+    "name": "title: every term marked, no ellipsis",
+    "fn": "highlightAll",
+    "text": "长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长数据库尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾迁移",
+    "query": "数据库 迁移",
+    "segments": [
+      {
+        "text": "长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长",
+        "match": false
+      },
+      {
+        "text": "数据库",
+        "match": true
+      },
+      {
+        "text": "尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾尾",
+        "match": false
+      },
+      {
+        "text": "迁移",
+        "match": true
+      }
+    ]
+  },
+  {
+    "name": "title: no locatable term is the whole title, unmarked",
+    "fn": "highlightAll",
+    "text": "résumé of the work",
+    "query": "resume",
+    "segments": [
+      {
+        "text": "résumé of the work",
+        "match": false
+      }
+    ]
+  },
+  {
+    "name": "title: empty title",
+    "fn": "highlightAll",
+    "text": "",
+    "query": "foo",
+    "segments": []
   }
 ]

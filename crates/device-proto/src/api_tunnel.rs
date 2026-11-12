@@ -44,6 +44,17 @@ pub enum TunnelRequest {
         headers: Vec<TunnelHeader>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body_len: Option<u64>,
+        /// The client asking to be told, while it streams this request's body,
+        /// how much of it the gateway has taken in — see
+        /// [`TunnelResponse::Progress`].
+        ///
+        /// A typed field rather than a request header for the same reason
+        /// [`TunnelReuse`] is one: it is a protocol capability, not something to
+        /// forward into the router. Both skew directions are safe: an old gateway
+        /// decodes the msgpack map without `deny_unknown_fields` and never sends a
+        /// `Progress`, and an old client never sets it, so it never receives one.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        report_progress: bool,
     },
     Body {
         request_id: u64,
@@ -105,6 +116,13 @@ pub enum TunnelResponse {
         status: u16,
         reason: String,
     },
+    /// How many bytes of `request_id`'s body the gateway has taken off the leg,
+    /// sent only for a request whose head set `report_progress`.
+    ///
+    /// An unknown `type` tag fails the decode and kills the leg, so this variant
+    /// may only ever reach a client that asked for it. It arrives while the body
+    /// is still streaming, always before that request's response head.
+    Progress { request_id: u64, received: u64 },
 }
 
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtoError> {
@@ -127,10 +145,82 @@ mod tests {
             path: "/v1/blobs/sha256:abc.token".into(),
             headers: vec![TunnelHeader::new("range", "bytes=10-")],
             body_len: None,
+            report_progress: false,
         };
 
         let bytes = encode(&msg).unwrap();
         assert_eq!(decode::<TunnelRequest>(&bytes).unwrap(), msg);
+    }
+
+    /// The request head as every gateway before `report_progress` decodes it.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyRequest {
+        Head {
+            request_id: u64,
+            body_len: Option<u64>,
+        },
+    }
+
+    /// New client, old gateway: the opt-in is a key the old decoder skips, so the
+    /// upload goes through exactly as it did, with no progress coming back.
+    #[test]
+    fn an_old_gateway_reads_a_progress_opt_in_as_an_ordinary_head() {
+        let msg = TunnelRequest::Head {
+            request_id: 3,
+            method: "POST".into(),
+            path: "/v1/blobs".into(),
+            headers: vec![],
+            body_len: Some(20),
+            report_progress: true,
+        };
+
+        let LegacyRequest::Head {
+            request_id,
+            body_len,
+        } = decode::<LegacyRequest>(&encode(&msg).unwrap()).unwrap();
+        assert_eq!((request_id, body_len), (3, Some(20)));
+        assert_eq!(
+            decode::<TunnelRequest>(&encode(&msg).unwrap()).unwrap(),
+            msg
+        );
+    }
+
+    /// Old client, new gateway: a head without the key never asked for progress.
+    #[test]
+    fn a_head_without_the_opt_in_asks_for_no_progress() {
+        let legacy = TunnelRequest::Head {
+            request_id: 1,
+            method: "POST".into(),
+            path: "/v1/blobs".into(),
+            headers: vec![],
+            body_len: Some(5),
+            report_progress: false,
+        };
+        let bytes = encode(&legacy).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("report_progress"),
+            "an opted-out head must stay byte-identical to the old shape"
+        );
+        assert!(matches!(
+            decode::<TunnelRequest>(&bytes).unwrap(),
+            TunnelRequest::Head {
+                report_progress: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn progress_round_trips() {
+        let msg = TunnelResponse::Progress {
+            request_id: 1,
+            received: 1 << 40,
+        };
+        assert_eq!(
+            decode::<TunnelResponse>(&encode(&msg).unwrap()).unwrap(),
+            msg
+        );
     }
 
     #[test]

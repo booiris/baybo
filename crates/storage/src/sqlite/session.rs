@@ -587,10 +587,16 @@ impl SessionStore for SqliteSessionStore {
         let affected = self
             .pool
             .interact_write("sessions.set_title", move |conn| {
-                Ok(conn.execute(
+                let tx = conn.transaction()?;
+                let affected = tx.execute(
                     "UPDATE sessions SET title = ?2 WHERE id = ?1",
                     rusqlite::params![sid, value],
-                )?)
+                )?;
+                if affected > 0 {
+                    super::search::index_title(&tx, &sid, value.as_deref())?;
+                }
+                tx.commit()?;
+                Ok(affected)
             })
             .await?;
         Ok(affected > 0)
@@ -602,10 +608,16 @@ impl SessionStore for SqliteSessionStore {
         let affected = self
             .pool
             .interact_write("sessions.set_title_if_absent", move |conn| {
-                Ok(conn.execute(
+                let tx = conn.transaction()?;
+                let affected = tx.execute(
                     "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title IS NULL",
                     rusqlite::params![sid, value],
-                )?)
+                )?;
+                if affected > 0 {
+                    super::search::index_title(&tx, &sid, Some(&value))?;
+                }
+                tx.commit()?;
+                Ok(affected)
             })
             .await?;
         Ok(affected > 0)

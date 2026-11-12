@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { queryChunks, snippet, type Segment } from './searchSnippet';
+import { highlightAll, queryChunks, snippet, type Segment } from './searchSnippet';
 import vectors from './searchSnippetVectors.json';
 
 const plain = (segs: Segment[]) => segs.map((s) => s.text).join('');
 const matched = (segs: Segment[]) => segs.filter((s) => s.match).map((s) => s.text);
+const run = (v: { fn: string; text: string; query: string }) =>
+  v.fn === 'highlightAll' ? highlightAll(v.text, v.query) : snippet(v.text, v.query);
 
 describe('queryChunks', () => {
   it('splits on whitespace, the way the server ANDs the query', () => {
@@ -105,6 +107,30 @@ describe('snippet', () => {
   });
 });
 
+describe('highlightAll', () => {
+  // A title is the card's name. `snippet`'s 12-cluster lead window cut it to
+  // `…igration plan`.
+  it('keeps the whole title when the match sits past the lead window', () => {
+    const title = 'Weekly review of the database migration plan';
+    const segs = highlightAll(title, 'plan');
+    expect(plain(segs)).toBe(title);
+    expect(matched(segs)).toEqual(['plan']);
+  });
+
+  it('marks every term anywhere in the text, with no ellipsis', () => {
+    const text = `${'a'.repeat(300)}数据库${'b'.repeat(300)}迁移`;
+    const segs = highlightAll(text, '数据库 迁移');
+    expect(plain(segs)).toBe(text);
+    expect(matched(segs)).toEqual(['数据库', '迁移']);
+  });
+
+  it('returns the title unmarked when no term can be located', () => {
+    expect(highlightAll('résumé of the work', 'resume')).toEqual([
+      { text: 'résumé of the work', match: false },
+    ]);
+  });
+});
+
 // The cross-end gate. `searchSnippetVectors.json` is the ONE contract the Swift
 // port (`app/ios/App/Core/SearchSnippet.swift`, checked by
 // `SearchSnippetVectorTests`) is held to, and this suite is what keeps the file
@@ -125,7 +151,7 @@ describe('shared vectors (see app/ios SearchSnippetVectorTests)', () => {
 
   for (const vector of vectors) {
     it(`matches the vector: ${vector.name}`, () => {
-      expect(snippet(vector.text, vector.query)).toEqual(vector.segments);
+      expect(run(vector)).toEqual(vector.segments);
     });
   }
 
@@ -134,7 +160,7 @@ describe('shared vectors (see app/ios SearchSnippetVectorTests)', () => {
   // is exactly the shape of the bug that bit the message index.
   it('never emits a lone surrogate', () => {
     for (const vector of vectors) {
-      const joined = plain(snippet(vector.text, vector.query));
+      const joined = plain(run(vector));
       for (const ch of joined) {
         const cp = ch.codePointAt(0) ?? 0;
         expect(cp >= 0xd800 && cp <= 0xdfff).toBe(false);

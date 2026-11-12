@@ -503,6 +503,8 @@ struct WireSearchGroup {
     #[serde(default)]
     session_title: Option<String>,
     #[serde(default)]
+    title_match: bool,
+    #[serde(default)]
     hits: Vec<WireSearchHit>,
     #[serde(default)]
     total_hits: i64,
@@ -1171,7 +1173,8 @@ pub(crate) async fn lookup_message<C: GatewayJsonClient + Sync>(
     client.get_json(&path).await
 }
 
-/// Full-text search over the owner's transcripts (`GET /v1/chat/search`).
+/// Full-text search over the owner's conversation titles and transcripts
+/// (`GET /v1/chat/search`).
 ///
 /// Only `q` is sent, so the gateway's defaults stand: no hidden sessions (the
 /// user asked to lose those), no archived ones, and no cron workspaces. That is
@@ -1195,6 +1198,7 @@ pub(crate) async fn search_messages<C: GatewayJsonClient + Sync>(
             .map(|group| ChatSearchGroup {
                 session_id: group.session_id,
                 session_title: group.session_title,
+                title_match: group.title_match,
                 total_hits: group.total_hits,
                 hits: group
                     .hits
@@ -2920,7 +2924,7 @@ mod tests {
     async fn a_search_carries_every_group_field_through() {
         let client = RecordingClient::new(
             r#"{"groups":[{"session_id":"s1","session_title":"迁移计划",
-                 "total_hits":7,
+                 "title_match":true,"total_hits":7,
                  "hits":[{"ordinal":12,"role":"user","text":"数据库迁移怎么做",
                           "created_at":"2026-08-12T03:04:05Z","superseded_by":40},
                          {"ordinal":13,"role":"assistant","text":"先备份",
@@ -2933,6 +2937,7 @@ mod tests {
         let group = &results.groups[0];
         assert_eq!(group.session_id, "s1");
         assert_eq!(group.session_title.as_deref(), Some("迁移计划"));
+        assert!(group.title_match);
         assert_eq!(group.total_hits, 7);
         assert_eq!(group.hits.len(), 2);
         assert_eq!(group.hits[0].ordinal, 12);
@@ -2956,9 +2961,27 @@ mod tests {
         assert!(!results.truncated);
         let group = &results.groups[0];
         assert_eq!(group.session_title, None);
+        assert!(!group.title_match);
         assert_eq!(group.total_hits, 0);
         assert_eq!(group.hits[0].text, "");
         assert_eq!(group.hits[0].superseded_by, None);
+    }
+
+    /// A title-only group (no message hits) must decode as an empty,
+    /// title-matched group, not be dropped for having nothing to show.
+    #[tokio::test]
+    async fn a_search_carries_a_title_only_group() {
+        let client = RecordingClient::new(
+            r#"{"groups":[{"session_id":"s2","session_title":"Release plan",
+                 "title_match":true,"hits":[],"total_hits":0}]}"#,
+        );
+        let results = search_messages(&client, "release").await.expect("search");
+
+        let group = &results.groups[0];
+        assert_eq!(group.session_id, "s2");
+        assert!(group.title_match);
+        assert!(group.hits.is_empty());
+        assert_eq!(group.total_hits, 0);
     }
 
     #[tokio::test]

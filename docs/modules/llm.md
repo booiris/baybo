@@ -95,6 +95,20 @@ registrations; plan-specific routing stays inside that module.
 The native Responses adapter preserves both tool item and call ids in an
 opaque transcript tool handle, so the next request can reconstruct both.
 
+OpenCode's Gemini surface emits `usageMetadata` objects without
+`totalTokenCount` (often `{}`) on content chunks, a field rig 0.37 requires in
+both the streaming and unary response types; rig then discards those SSE
+events, text and function calls included, and rejects such a unary body. The
+Gemini route therefore builds rig's Gemini client over
+`opencode::gemini_usage::GeminiUsageClient`, an `HttpClientExt` around the
+shared `reqwest::Client` that fills a missing total in (sum of the prompt,
+candidates, thoughts and tool-use prompt counts) on every SSE `data:` payload
+and unary JSON body before rig parses it, leaving everything else as sent.
+Because that changes rig's client type parameter, the per-call model is the
+`AnyCompletionModel::OpencodeGemini` variant; it shares the native `Gemini`
+variant's completion and stream handling, and the native `gemini` provider
+still uses plain `reqwest`.
+
 Every request identifies itself as `baybo/<version>` and sends
 `x-opencode-session`. Billed calls use their session cache key; calls without
 one use a stable client-local id. Headers are constructed per call while the
@@ -110,6 +124,96 @@ prices: Go uses zero per-call pricing, and Zen also defaults to zero until
 the operator sets per-model `pricing`. Set those overrides when monetary
 budget enforcement is needed for Zen. Real token counts are recorded on
 both providers.
+
+### Gemini tool-call ids
+
+Gemini's function calls carry no id, and rig 0.37 fills a call's id with the
+function name in both its streaming and unary paths, then sends a tool
+result's id back as `functionResponse.name`. Left alone, two calls to one tool
+share an id in the transcript, and a conversation moved to or from another
+provider breaks on ids that mean something else there. Both Gemini variants
+(`Gemini` and `OpencodeGemini`) therefore adjust ids at the dispatch in
+`AnyCompletionModel`, through `providers/gemini.rs`:
+
+- **Inbound**: every tool call, streamed or unary, gets a fresh id of nine
+  ASCII alphanumerics; the thought signature stays on the call (stamped, see
+  below). Nine alphanumerics is Mistral's required shape, the strictest of the
+  providers a conversation can move to, and also fits Anthropic's
+  `^[a-zA-Z0-9_-]{1,64}$` and OpenAI's 40-character limit.
+- **Outbound**: before rig builds the Gemini body, each tool result's id is
+  replaced by the (sanitised) function name of the nearest preceding call with
+  that id, so `functionResponse.name` names the function whatever provider
+  minted the id. A result with no such call is left as is. rig sends only a
+  call's name and arguments, so call ids never reach Gemini.
+
+No other provider's request or response is touched. Transcripts written
+before this fix can still hold repeated ids; context hydration disambiguates
+them (see [`context.md`](context.md)).
+
+### Gemini thought signatures
+
+Gemini signs a turn's function calls (and thinking) with an opaque
+`thoughtSignature` that must be replayed with the history, and it validates
+the signatures it is sent. Measured against OpenCode's Gemini surface:
+
+| Signature on a replayed function call | older turn | current turn |
+|---|---|---|
+| issued by this model | accepted | accepted |
+| issued by another model | `Invalid thought signature` | `Invalid thought signature` |
+| none | accepted | `Function call is missing a thought_signature` |
+| `skip_thought_signature_validator` | accepted | accepted |
+
+So a signature is only ever replayed to the model that issued it, and the
+same two dispatch arms enforce that through `providers/gemini.rs`:
+
+- **Inbound**: every signature on a tool call or reasoning block is stamped
+  with the producing model, `baybo:gemini-sig:v1:<model>|<signature>`, before
+  it reaches the transcript. Only the Gemini path writes or reads this format;
+  other providers' converters ignore tool-call signatures.
+- **Outbound**: a stamped signature whose model matches the request's model is
+  unwrapped to the raw value. Any other tool-call signature, from another model
+  or stored before stamping existed, becomes the placeholder
+  `skip_thought_signature_validator`, and a model turn left with no signed call
+  (one written by another provider, say) gets the placeholder on its first
+  call. Thinking with a foreign signature is not sent; if it is the turn's only
+  part it is sent unsigned.
+
+This is what lets a conversation switch Gemini models, or fall back from a
+pinned model that no longer exists, without every later request failing.
+Stored rows are not rewritten; the decision is made per request.
+
+### Tool results on the wire
+
+baybo stores every tool result as its own `Role::Tool` row. The shared
+request builder (`LlmClient::build_completion_request`, used by every
+provider) sends a run of consecutive tool rows as **one** rig
+`Message::User` holding all their `ToolResult` parts in stored order; the
+rows themselves are not changed. Gemini requires it: a model content with N
+`functionCall` parts must be followed by one content with exactly N
+`functionResponse` parts, and rig 0.37 maps each message to one `Content`
+with no merging, so one message per result was a `400 INVALID_ARGUMENT` on
+every turn after a parallel call.
+
+Only rows that hold nothing but tool results merge, and only with results
+directly before them on the wire. A user message (an interjection) or an
+assistant message between two results starts a new message, and so does a
+legacy plain-text tool row — OpenAI's converter drops text that shares a
+message with tool results. A system message goes to the preamble, not the
+history, so it does not separate the results around it.
+
+Every other converter already accepts several results in one message
+(rig 0.37 unless noted):
+
+| Path | Merged message becomes |
+|------|------------------------|
+| OpenAI Chat Completions (`OpenAI`, Z.ai, XiaomiMiMo, Moonshot, Groq, Together, Hyperbolic, llamafile, OpenCode chat models) | one `tool` message per result |
+| DeepSeek, Mistral, Cohere, Ollama, HuggingFace | one tool message per result |
+| OpenAI Responses (`OpenAIResponses`, OpenCode Responses models) | one `function_call_output` per result |
+| `OpenAiSubscription` (baybo's own converter) | one `function_call_output` per result |
+| Anthropic, MiniMax, OpenCode Messages models | one user message with N `tool_result` blocks |
+| Gemini, OpenCode Gemini | one user content with N `functionResponse` parts |
+| xAI | one `function_call_output` per result — but rig requires a `call_id` on every tool call and result, which the builder never sets, so xAI rejects any tool history in either shape |
+| Perplexity | rejects tool results in any shape |
 
 ### Multimodal support
 
@@ -164,6 +268,8 @@ Because that gate is per-provider, the ESTIMATE caps at the ceiling rather than 
 ### Error handling
 
 Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Turn monitoring can mark long-running calls as `Stuck`.
+
+`llm` only classifies: `LlmError::is_retriable` is true for `Transient` and `RateLimited` alone. `status_to_error` maps a status to a variant — 408 and 5xx → `Transient`, 429 → `RateLimited`, 401/403 → `Auth`, any other 4xx → `BadRequest`. `rig_completion_to_error` routes rig's statused HTTP errors through it. rig's `ProviderError` carries no status: Gemini (and other rig converters) put a non-2xx body there on a unary call, and rig's stream adapters wrap the `Invalid status code …` error there when a stream fails to open — bare from the Gemini adapter, behind an `SSE Error: ` prefix from the Anthropic one (Anthropic, MiniMax, OpenCode Messages models). `provider_error_status` reads the status back from either shape — rig's status display (with or without that prefix), or a JSON body whose `error.code` is an HTTP status (Google's `{"error":{"code":400,"status":"INVALID_ARGUMENT"}}`, bare or in a one-element array) — and routes it through `status_to_error`, so a Gemini 400 surfaces at once instead of being retried ten times. A `ProviderError` with no readable status stays `Transient`, so an unrecognised 5xx still retries.
 
 ## Constraints
 

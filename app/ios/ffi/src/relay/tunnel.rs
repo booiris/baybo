@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use device_proto::noise::StaticKeypair;
+use futures_util::FutureExt;
 
 use super::carrier;
 use super::dial::dial_content_join;
@@ -96,6 +97,10 @@ pub(crate) trait TunnelFrames: Send {
         request: &TunnelRequest,
     ) -> impl std::future::Future<Output = Result<(), LegError>> + Send;
 
+    /// Must be cancel safe: [`LegIo::drain_ready_progress`] polls it once and
+    /// drops it when nothing is there yet. `NoiseFrames` is, because the socket
+    /// read under it is (see `LegReader::next`) and the decrypt after it is
+    /// synchronous.
     fn recv(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Vec<TunnelResponse>, LegError>> + Send;
@@ -216,7 +221,72 @@ impl<F: TunnelFrames> LegIo<F> {
         &mut self,
         request_id: u64,
     ) -> Result<ResponseHead, LegError> {
-        match self.next_response().await? {
+        let response = self.next_response().await?;
+        self.head_of(response, request_id)
+    }
+
+    /// [`Self::expect_response_head`] for a request that set `report_progress`:
+    /// the gateway's `Progress` frames for it come first, and each one goes to
+    /// `on_progress`.
+    ///
+    /// It loops, unlike the plain version, but only over `Progress` frames
+    /// carrying this request's id. Every other frame gets exactly the plain
+    /// version's judgment, so a stray body still fails rather than being
+    /// skipped.
+    pub(crate) async fn expect_upload_response_head(
+        &mut self,
+        request_id: u64,
+        mut on_progress: impl FnMut(u64),
+    ) -> Result<ResponseHead, LegError> {
+        loop {
+            match self.next_response().await? {
+                TunnelResponse::Progress {
+                    request_id: id,
+                    received,
+                } => {
+                    self.check_id(id, request_id)?;
+                    on_progress(received);
+                }
+                response => return self.head_of(response, request_id),
+            }
+        }
+    }
+
+    /// Hand `request_id`'s `Progress` frames that have ALREADY arrived to
+    /// `on_progress`, without waiting for more.
+    ///
+    /// An uploader calls this between body chunks. While it is writing it reads
+    /// nothing, and the progress queued up behind it would otherwise only surface
+    /// once the last chunk is out. Anything that is not a `Progress` frame (an
+    /// early answer, say) stays queued for the head read to judge.
+    pub(crate) fn drain_ready_progress(
+        &mut self,
+        request_id: u64,
+        mut on_progress: impl FnMut(u64),
+    ) -> Result<(), LegError> {
+        loop {
+            match self.pending.front() {
+                Some(TunnelResponse::Progress {
+                    request_id: id,
+                    received,
+                }) => {
+                    let (id, received) = (*id, *received);
+                    self.check_id(id, request_id)?;
+                    self.pending.pop_front();
+                    self.saw_response = true;
+                    on_progress(received);
+                }
+                Some(_) => return Ok(()),
+                None => match self.frames.recv().now_or_never() {
+                    Some(frames) => self.pending.extend(frames?),
+                    None => return Ok(()),
+                },
+            }
+        }
+    }
+
+    fn head_of(&self, response: TunnelResponse, request_id: u64) -> Result<ResponseHead, LegError> {
+        match response {
             TunnelResponse::Head {
                 request_id: id,
                 status,
@@ -241,6 +311,12 @@ impl<F: TunnelFrames> LegIo<F> {
                 self.check_id(id, request_id)?;
                 Err(LegError::dead(
                     "tunnel body arrived before its response head".to_string(),
+                ))
+            }
+            TunnelResponse::Progress { request_id: id, .. } => {
+                self.check_id(id, request_id)?;
+                Err(LegError::dead(
+                    "upload progress for a request that did not ask for it".to_string(),
                 ))
             }
         }
@@ -284,6 +360,12 @@ impl<F: TunnelFrames> LegIo<F> {
                     self.check_id(id, request_id)?;
                     return Err(LegError::dead(
                         "a second response head arrived mid-body".to_string(),
+                    ));
+                }
+                TunnelResponse::Progress { request_id: id, .. } => {
+                    self.check_id(id, request_id)?;
+                    return Err(LegError::dead(
+                        "upload progress arrived after the response head".to_string(),
                     ));
                 }
             }
@@ -499,6 +581,13 @@ pub(crate) mod testing {
         }
     }
 
+    pub(crate) fn progress(request_id: u64, received: u64) -> TunnelResponse {
+        TunnelResponse::Progress {
+            request_id,
+            received,
+        }
+    }
+
     pub(crate) fn body(request_id: u64, data: &[u8]) -> TunnelResponse {
         TunnelResponse::Body {
             request_id,
@@ -513,6 +602,100 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// The gateway reports an upload's progress ahead of its answer, and the
+    /// wait for that answer is where a relay upload spends most of its time.
+    #[tokio::test]
+    async fn an_upload_head_wait_reports_progress_on_the_way() {
+        let mut leg = LegIo::new(ScriptedFrames::new(vec![
+            vec![progress(1, 0), progress(1, 40)],
+            vec![progress(1, 100), head(1, 201, 2)],
+        ]));
+        let mut seen = Vec::new();
+
+        let id = leg.claim_request_id();
+        let response = leg
+            .expect_upload_response_head(id, |received| seen.push(received))
+            .await
+            .expect("head");
+
+        assert_eq!(response.status, 201);
+        assert_eq!(seen, [0, 40, 100]);
+    }
+
+    /// A progress frame is still a frame for SOME request, and one carrying
+    /// another id means the framing is not what we think — same as a stray body.
+    #[tokio::test]
+    async fn progress_for_another_request_is_a_desync() {
+        let mut leg = LegIo::new(ScriptedFrames::new(vec![vec![
+            progress(2, 10),
+            head(1, 201, 2),
+        ]]));
+
+        let id = leg.claim_request_id();
+        assert!(leg.expect_upload_response_head(id, |_| {}).await.is_err());
+    }
+
+    /// Only a request that set `report_progress` may be sent a `Progress`. One
+    /// anywhere else is a gateway we no longer understand.
+    #[tokio::test]
+    async fn unrequested_progress_kills_the_leg() {
+        let mut leg = LegIo::new(ScriptedFrames::new(vec![vec![
+            progress(1, 10),
+            head(1, 200, 2),
+        ]]));
+
+        let id = leg.claim_request_id();
+        assert!(leg.expect_response_head(id).await.is_err());
+
+        let mut leg = LegIo::new(ScriptedFrames::new(vec![vec![
+            head(1, 200, 2),
+            progress(1, 10),
+        ]]));
+        let id = leg.claim_request_id();
+        let response = leg.expect_response_head(id).await.expect("head");
+        assert!(
+            leg.collect_response_body(id, response.body_len)
+                .await
+                .is_err(),
+            "progress never follows the head"
+        );
+    }
+
+    /// Between chunks the uploader takes what has already arrived and no more,
+    /// and leaves an early answer queued for the head read to judge.
+    #[tokio::test]
+    async fn draining_progress_takes_only_what_is_ready_and_keeps_the_head() {
+        let mut leg = LegIo::new(ScriptedFrames::new(vec![vec![
+            progress(1, 10),
+            progress(1, 20),
+            head(1, 413, 0),
+        ]]));
+        let mut seen = Vec::new();
+
+        let id = leg.claim_request_id();
+        leg.drain_ready_progress(id, |received| seen.push(received))
+            .expect("drain");
+        assert_eq!(seen, [10, 20]);
+        assert!(leg.saw_response(), "the gateway has spoken");
+
+        let response = leg
+            .expect_upload_response_head(id, |_| panic!("no progress left"))
+            .await
+            .expect("the early answer is still there");
+        assert_eq!(response.status, 413);
+    }
+
+    /// Nothing on the wire yet: the drain must return at once, not wait.
+    #[tokio::test]
+    async fn draining_progress_never_waits_for_the_gateway() {
+        let mut leg = LegIo::new(ScriptedFrames::silent());
+
+        let id = leg.claim_request_id();
+        leg.drain_ready_progress(id, |_| panic!("nothing arrived"))
+            .expect("an idle leg is not an error");
+        assert!(!leg.saw_response());
+    }
 
     /// One wire message can decode to several frames. The reader took the first and
     /// dropped the rest — safe only for as long as the gateway happened to seal one

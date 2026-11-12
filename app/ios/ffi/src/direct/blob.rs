@@ -84,13 +84,12 @@ async fn upload_file_with_client(
 ) -> Result<String, String> {
     let source = Path::new(&path);
     let digest = blob_helper::hash_upload_file(source).await?;
-    let ticker = blob_helper::UploadTicker::new(progress, digest.len);
     let tee = blob_helper::UploadCacheTee::open(&digest.hex).await;
     let reader = blob_helper::UploadReader::open(
         source,
         digest.len,
         blob_helper::FILE_READ_CHUNK_BYTES,
-        ticker.clone(),
+        progress,
         tee.clone(),
     )
     .await?;
@@ -125,7 +124,6 @@ async fn upload_file_with_client(
     if !resp.status().is_success() {
         return Err(format!("upload failed: HTTP {}", resp.status().as_u16()));
     }
-    ticker.finish();
     let parsed: BlobIdResp = resp
         .json()
         .await

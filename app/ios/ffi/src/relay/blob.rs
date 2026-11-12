@@ -47,6 +47,7 @@ async fn download_to_path(
         path: format!("{PATH_BLOBS}/{blob_id}"),
         headers,
         body_len: None,
+        report_progress: false,
     })
     .await?;
 
@@ -112,6 +113,11 @@ async fn download_to_path(
                 return Err(format!("download failed: HTTP {status}: {reason}"));
             }
             TunnelResponse::Head { .. } => {}
+            TunnelResponse::Progress { .. } => {
+                drop(file);
+                blob_helper::remove_part(entry).await;
+                return Err("upload progress on a download".into());
+            }
         }
     }
 }
@@ -135,11 +141,11 @@ async fn upload_bytes_over_tunnel(
     deck_card: Option<&str>,
 ) -> Result<String, String> {
     let size = bytes.len() as u64;
-    let mut leg = open_upload_leg(mime_type, expected_hex, size, deck_card).await?;
+    let mut leg = open_upload_leg(mime_type, expected_hex, size, deck_card, false).await?;
     for frame in body_frames(BLOB_REQUEST_ID, bytes) {
         leg.send(&frame).await?;
     }
-    finish_upload(leg, expected_hex).await
+    finish_upload(leg, expected_hex, |_| {}).await
 }
 
 async fn upload_file(
@@ -162,26 +168,25 @@ async fn upload_file_over_tunnel(
 ) -> Result<String, String> {
     // The head declares the digest, so the file is hashed BEFORE a byte of it
     // is dialed for — hence the second read here rather than one streaming pass.
-    let ticker = blob_helper::UploadTicker::new(progress, digest.len);
     let tee = blob_helper::UploadCacheTee::open(&digest.hex).await;
     let mut reader = blob_helper::UploadReader::open(
         source,
         digest.len,
         crate::core::MAX_TUNNEL_CHUNK,
-        ticker.clone(),
+        progress,
         tee.clone(),
     )
     .await?;
-    let mut leg = open_upload_leg(mime_type, &digest.hex, digest.len, deck_card).await?;
+    let mut leg = open_upload_leg(mime_type, &digest.hex, digest.len, deck_card, true).await?;
     let mut offset = 0u64;
     while let Some(chunk) = reader.next_chunk().await? {
         let len = chunk.len() as u64;
         leg.send(&body_frame(BLOB_REQUEST_ID, offset, digest.len, chunk))
             .await?;
         offset += len;
+        leg.drain_ready_progress(BLOB_REQUEST_ID, |received| reader.acknowledged(received))?;
     }
-    ticker.finish();
-    let blob_id = finish_upload(leg, &digest.hex).await?;
+    let blob_id = finish_upload(leg, &digest.hex, |received| reader.acknowledged(received)).await?;
     tee.publish().await;
     Ok(blob_id)
 }
@@ -191,6 +196,7 @@ async fn open_upload_leg(
     expected_hex: &str,
     size: u64,
     deck_card: Option<&str>,
+    report_progress: bool,
 ) -> Result<LegIo, String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
@@ -214,13 +220,24 @@ async fn open_upload_leg(
         path: PATH_BLOBS.into(),
         headers,
         body_len: Some(size),
+        report_progress,
     })
     .await?;
     Ok(leg)
 }
 
-async fn finish_upload(mut leg: LegIo, expected_hex: &str) -> Result<String, String> {
-    let head = leg.expect_response_head(BLOB_REQUEST_ID).await?;
+/// Wait out the gateway's answer to an upload. Most of a relay upload's time is
+/// spent HERE, not in the send loop: the socket accepts the whole body long
+/// before the relay lets it through, so `on_progress` is what keeps the count
+/// moving while the gateway takes the rest in.
+async fn finish_upload(
+    mut leg: LegIo,
+    expected_hex: &str,
+    on_progress: impl FnMut(u64),
+) -> Result<String, String> {
+    let head = leg
+        .expect_upload_response_head(BLOB_REQUEST_ID, on_progress)
+        .await?;
     let body = leg
         .collect_response_body(BLOB_REQUEST_ID, head.body_len)
         .await?;
