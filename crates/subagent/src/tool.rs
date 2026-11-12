@@ -538,7 +538,7 @@ impl Tool for SpawnSubagentTool {
             request,
             background,
         } = parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
-        let run_time = baybo_tools::background::requested_run_time(&params, ctx)
+        let run_time = baybo_tools::background::requested_run_time(&params, &background, ctx)
             .map_err(ToolError::InvalidParams)?;
 
         let LineageGateInputs {

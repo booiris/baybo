@@ -772,7 +772,7 @@ impl Tool for BashTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let background = crate::background::BackgroundRequest::parse(&params, &BASH_BACKGROUND)
             .map_err(ToolError::InvalidParams)?;
-        let run_time = crate::background::requested_run_time(&params, ctx)
+        let run_time = crate::background::requested_run_time(&params, &background, ctx)
             .map_err(ToolError::InvalidParams)?;
         let mut p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;

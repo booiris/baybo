@@ -6285,7 +6285,7 @@ impl Tool for FanOutProbe {
         let request =
             baybo_tools::background::BackgroundRequest::parse(&params, &FAN_OUT_PROBE_BACKGROUND)
                 .map_err(baybo_tools::ToolError::InvalidParams)?;
-        let run_time = baybo_tools::background::requested_run_time(&params, ctx)
+        let run_time = baybo_tools::background::requested_run_time(&params, &request, ctx)
             .map_err(baybo_tools::ToolError::InvalidParams)?;
         let task = params["task"].as_str().unwrap_or_default().to_string();
         let handle = baybo_model::BackgroundHandle::new();

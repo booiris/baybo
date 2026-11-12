@@ -464,8 +464,10 @@ options to its schema with `background::declare_options`: `timeout_ms` and
 `on_timeout` always, plus `background` and `group` when it can start detached.
 `background::requested_run_time` and `BackgroundRequest::parse` are the one,
 strict reading of them (an unknown `on_timeout` is an error, never a silent
-default). `timeout_ms` is how long the call may run in the foreground:
-`FOREGROUND_WINDOW` (10 minutes) by default, at most `MAX_RUN_TIME` (1 hour).
+default). `timeout_ms` is how long the call may run in the foreground, at most
+`MAX_RUN_TIME` (1 hour). Its default follows what an overrun would do:
+`DEFAULT_BACKGROUND_TIMEOUT` (2 minutes) where the call would move to the
+background, `DEFAULT_KILL_TIMEOUT` (10 minutes) where it would be killed.
 The registry narrows the declared options in `tool_definition_offered`
 wherever the session is not `background_eligible`, so no tool does it by hand:
 ineligible sessions, including subagents with a user trigger, are offered none
@@ -487,10 +489,8 @@ tool can name things after it before the work starts), a kind and summary for
   background work. Otherwise the job runs in the foreground for up to its run
   time. Where `ToolContext::overrun_moves_to_background` says an overrun moves
   to the background (`on_timeout = background`, a `background_eligible`
-  session, a sink wired, and a turn that is not a cron fire's own), the wait is
-  also capped at `FOREGROUND_WINDOW` and the job is handed over; otherwise it
-  is cancelled when its run time elapses — so a call that cannot go to the
-  background runs at most an hour. The turn's own stop cancels a job only
+  session, a sink wired, and a turn that is not a cron fire's own), the job is
+  handed over when its run time elapses; otherwise it is cancelled then. The turn's own stop cancels a job only
   while it is in the foreground.
 - **The hand-over** to the `BackgroundJobSink` (`ToolContext::background_jobs`,
   `baybo_agent::BackgroundJobManager` in production): one in-flight registry
@@ -520,7 +520,7 @@ Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self
 
 Current overrides:
 
-- `BashTool` → 1 h (`background::MAX_RUN_TIME`) — builds, test suites, and migrations regularly run for minutes; the per-call `timeout_ms` (10 minutes by default) bounds each command inside the tool.
+- `BashTool` → 1 h (`background::MAX_RUN_TIME`) — builds, test suites, and migrations regularly run for minutes; the per-call `timeout_ms` (2 minutes by default where an overrun moves to the background, 10 where it kills) bounds each command inside the tool.
 - `WebFetchTool` → 120 s — slow upstreams need headroom, but a stuck host shouldn't pin a turn forever; `connect_timeout` independently caps the connect phase at 10 s.
 - `SkillInstallTool` → 120 s — risk-assessor LLM call + recursive directory copy + registry hot-reload, against bundles that may carry templates + scripts + reference docs.
 - `GlobTool`, `GrepTool`, `AttachFileTool`, `PutBlobTool`, `SkillTool`, `McpTool` → 60 s — recursive walks against large monorepos (`Glob`, `Grep`), 100-MiB file streams into the blob store (`AttachFile`, `PutBlob`), the per-call risk-assessor LLM round-trip (`Skill`), and arbitrary upstream MCP servers (`McpTool`) all routinely overflow the 30 s default.

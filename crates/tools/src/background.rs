@@ -54,13 +54,18 @@ const ON_TIMEOUT_KILL: &str = "kill";
 /// Parameter bounding how long the call runs in the foreground, in
 /// milliseconds.
 pub const TIMEOUT_PARAM: &str = "timeout_ms";
-/// A call's run time when it names none, and the longest it waits in the
-/// foreground before it may move to the background.
-pub const FOREGROUND_WINDOW: Duration = Duration::from_millis(FOREGROUND_WINDOW_MS);
+/// A call's run time when it names none and an overrun would move it to the
+/// background: short, since running on costs the turn nothing.
+pub const DEFAULT_BACKGROUND_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_BACKGROUND_TIMEOUT_MS);
+/// A call's run time when it names none and an overrun would kill it: long,
+/// since the work is lost when it elapses.
+pub const DEFAULT_KILL_TIMEOUT: Duration = Duration::from_millis(DEFAULT_KILL_TIMEOUT_MS);
 /// The longest a call may ask to run in the foreground.
 pub const MAX_RUN_TIME: Duration = Duration::from_millis(MAX_RUN_TIME_MS);
 
-const FOREGROUND_WINDOW_MS: u64 = 10 * 60 * 1000;
+const DEFAULT_BACKGROUND_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+const DEFAULT_KILL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const MAX_RUN_TIME_MS: u64 = 60 * 60 * 1000;
 
 /// A tool's declaration that it can run work past the turn that started it.
@@ -103,18 +108,11 @@ fn timeout_option(description: String) -> Value {
     })
 }
 
-fn run_time_bounds() -> String {
-    format!(
-        "Default (and `0`): {FOREGROUND_WINDOW_MS} (10 minutes); at most {MAX_RUN_TIME_MS} (1 hour)."
-    )
-}
-
 fn insert_options(props: &mut Map<String, Value>, support: &BackgroundSupport) {
     props.insert(
         TIMEOUT_PARAM.to_string(),
         timeout_option(format!(
-            "Milliseconds the call may run. {} With on_timeout='background' it moves to the background once this elapses, and no later than 10 minutes in.",
-            run_time_bounds()
+            "Milliseconds the call may run in the foreground before on_timeout applies; at most {MAX_RUN_TIME_MS} (1 hour). Default (and `0`): {DEFAULT_BACKGROUND_TIMEOUT_MS} (2 minutes) when it would move to the background, {DEFAULT_KILL_TIMEOUT_MS} (10 minutes) with on_timeout='kill'."
         )),
     );
     let ignored_when_detached = if support.start_detached {
@@ -163,18 +161,23 @@ pub(crate) fn withhold_options(schema: &mut Value, support: &BackgroundSupport) 
         props.insert(
             TIMEOUT_PARAM.to_string(),
             timeout_option(format!(
-                "Milliseconds the call may run before it is terminated. {}",
-                run_time_bounds()
+                "Milliseconds the call may run before it is terminated. Default (and `0`): {DEFAULT_KILL_TIMEOUT_MS} (10 minutes); at most {MAX_RUN_TIME_MS} (1 hour)."
             )),
         );
     }
 }
 
 /// How long the call in `params` may run in the foreground: its `timeout_ms`,
-/// [`FOREGROUND_WINDOW`] when it names none (or `0`), never more than
-/// [`MAX_RUN_TIME`] — nor than the context's own budget
-/// ([`ToolContext::timeout`]), which is what keeps a test context fast.
-pub fn requested_run_time(params: &Value, ctx: &ToolContext) -> Result<Duration, String> {
+/// never more than [`MAX_RUN_TIME`] — nor than the context's own budget
+/// ([`ToolContext::timeout`]), which is what keeps a test context fast. When it
+/// names none (or `0`), the default follows what an overrun would do to
+/// `request`'s call: [`DEFAULT_BACKGROUND_TIMEOUT`] where it moves to the
+/// background, [`DEFAULT_KILL_TIMEOUT`] where it is killed.
+pub fn requested_run_time(
+    params: &Value,
+    request: &BackgroundRequest,
+    ctx: &ToolContext,
+) -> Result<Duration, String> {
     let requested = match params.get(TIMEOUT_PARAM) {
         None | Some(Value::Null) => None,
         Some(value) => match value.as_u64() {
@@ -187,8 +190,13 @@ pub fn requested_run_time(params: &Value, ctx: &ToolContext) -> Result<Duration,
             }
         },
     };
+    let default = if ctx.overrun_moves_to_background(request) {
+        DEFAULT_BACKGROUND_TIMEOUT
+    } else {
+        DEFAULT_KILL_TIMEOUT
+    };
     Ok(requested
-        .unwrap_or(FOREGROUND_WINDOW)
+        .unwrap_or(default)
         .min(MAX_RUN_TIME)
         .min(ctx.timeout))
 }
@@ -378,10 +386,9 @@ impl DispatchRecord {
 /// - The call asked to start detached, and the session can take background
 ///   work: hand it over at once.
 /// - Otherwise run it in the foreground for up to `run_time` (from
-///   [`requested_run_time`]). Where [`ToolContext::overrun_moves_to_background`]
-///   says a job still running then moves to the background, the wait is also
-///   capped at [`FOREGROUND_WINDOW`] and the job is handed over; otherwise it is
-///   cancelled once `run_time` elapses.
+///   [`requested_run_time`]). A job still running then moves to the
+///   background where [`ToolContext::overrun_moves_to_background`] says so,
+///   and is cancelled otherwise.
 ///
 /// The turn's own cancellation reaches the job only while it runs in the
 /// foreground — once handed over it is stopped through `JobStop` / `/stop`.
@@ -436,11 +443,6 @@ pub async fn run<T: Send + 'static>(
         });
     }
     let overrun_sink = sink.filter(|_| ctx.overrun_moves_to_background(request));
-    let window = if overrun_sink.is_some() {
-        run_time.min(FOREGROUND_WINDOW)
-    } else {
-        run_time
-    };
 
     let ran = tokio::select! {
         biased;
@@ -449,12 +451,12 @@ pub async fn run<T: Send + 'static>(
             Ran::Cancelled(work.await)
         }
         done = &mut work => Ran::Finished(done),
-        _ = tokio::time::sleep(window) => match overrun_sink {
+        _ = tokio::time::sleep(run_time) => match overrun_sink {
             Some(sink) => {
                 let handle = handle.clone();
                 sink.adopt(detached(work, None)).await;
                 ctx.background_dispatch.record(HandedOver { handle: handle.clone(), group: None });
-                Ran::Backgrounded(Backgrounded { handle, how: BackgroundedHow::Converted(window) })
+                Ran::Backgrounded(Backgrounded { handle, how: BackgroundedHow::Converted(run_time) })
             }
             None => {
                 cancel.cancel();
@@ -561,22 +563,60 @@ mod tests {
         assert!(!described.contains("background"), "{described}");
     }
 
+    /// The default follows what an overrun would do: two minutes where it
+    /// moves to the background, ten where it is killed. A named run time is
+    /// taken as asked, up to an hour.
     #[test]
-    fn the_run_time_defaults_to_ten_minutes_and_caps_at_an_hour() {
+    fn the_default_run_time_follows_what_an_overrun_does() {
+        struct Unused;
+        #[async_trait]
+        impl BackgroundJobSink for Unused {
+            async fn adopt(&self, _job: DetachedJob) {}
+        }
         let mut ctx = ToolContext::for_test();
         ctx.timeout = Duration::from_secs(24 * 60 * 60);
-        let run_time = |params: Value| requested_run_time(&params, &ctx);
-        assert_eq!(run_time(json!({})), Ok(FOREGROUND_WINDOW));
-        assert_eq!(run_time(json!({"timeout_ms": 0})), Ok(FOREGROUND_WINDOW));
+        ctx.background_jobs =
+            Some(std::sync::Arc::new(Unused) as std::sync::Arc<dyn BackgroundJobSink>);
+        let background = BackgroundRequest::default();
+        let kill = BackgroundRequest::Wait(OnTimeout::Kill);
+        let run_time = |params: Value, request: &BackgroundRequest, ctx: &ToolContext| {
+            requested_run_time(&params, request, ctx)
+        };
+
         assert_eq!(
-            run_time(json!({"timeout_ms": 1500})),
+            run_time(json!({}), &background, &ctx),
+            Ok(DEFAULT_BACKGROUND_TIMEOUT)
+        );
+        assert_eq!(
+            run_time(json!({"timeout_ms": 0}), &background, &ctx),
+            Ok(DEFAULT_BACKGROUND_TIMEOUT)
+        );
+        assert_eq!(run_time(json!({}), &kill, &ctx), Ok(DEFAULT_KILL_TIMEOUT));
+        ctx.overrun_to_background = false;
+        assert_eq!(
+            run_time(json!({}), &background, &ctx),
+            Ok(DEFAULT_KILL_TIMEOUT),
+            "a fire's own turn kills overruns"
+        );
+        ctx.overrun_to_background = true;
+        ctx.background_eligible = false;
+        assert_eq!(
+            run_time(json!({}), &background, &ctx),
+            Ok(DEFAULT_KILL_TIMEOUT)
+        );
+
+        assert_eq!(
+            run_time(json!({"timeout_ms": 1500}), &background, &ctx),
             Ok(Duration::from_millis(1500))
         );
-        assert_eq!(run_time(json!({"timeout_ms": 7_200_000})), Ok(MAX_RUN_TIME));
-        assert!(run_time(json!({"timeout_ms": "soon"})).is_err());
+        assert_eq!(
+            run_time(json!({"timeout_ms": 7_200_000}), &kill, &ctx),
+            Ok(MAX_RUN_TIME)
+        );
+        assert!(run_time(json!({"timeout_ms": "soon"}), &kill, &ctx).is_err());
         ctx.timeout = Duration::from_secs(5);
         assert_eq!(
-            requested_run_time(&json!({}), &ctx),
+            run_time(json!({}), &kill, &ctx),
             Ok(Duration::from_secs(5)),
             "the context's own budget bounds it too"
         );
@@ -780,10 +820,9 @@ mod tests {
             assert!(sink.0.lock().is_empty());
         }
 
-        /// A long run time does not hold a call that may move to the
-        /// background in the foreground past the window.
+        /// A named run time is honoured as asked, even past the defaults.
         #[tokio::test(start_paused = true)]
-        async fn an_overrun_moves_to_the_background_no_later_than_the_window() {
+        async fn an_overrun_moves_to_the_background_at_its_own_run_time() {
             let (ctx, sink) = ctx(true);
             let (job, _finish, _) = job();
             let started = tokio::time::Instant::now();
@@ -791,11 +830,8 @@ mod tests {
             let Ran::Backgrounded(backgrounded) = ran else {
                 panic!("the overrun moves to the background");
             };
-            assert_eq!(started.elapsed(), FOREGROUND_WINDOW);
-            assert_eq!(
-                backgrounded.how,
-                BackgroundedHow::Converted(FOREGROUND_WINDOW)
-            );
+            assert_eq!(started.elapsed(), MAX_RUN_TIME);
+            assert_eq!(backgrounded.how, BackgroundedHow::Converted(MAX_RUN_TIME));
             assert_eq!(sink.0.lock().len(), 1);
         }
 
