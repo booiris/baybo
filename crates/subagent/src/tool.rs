@@ -436,9 +436,6 @@ const PROMPT_FIELD_DESCRIPTION: &str = r#"Self-contained brief the subagent sees
 /// its foreground wait.
 const SPAWN_BACKGROUND: baybo_tools::background::BackgroundSupport =
     baybo_tools::background::BackgroundSupport {
-        window: baybo_tools::background::ForegroundWindow::Fixed(
-            crate::spawner::SUBAGENT_FOREGROUND_WAIT,
-        ),
         start_detached: true,
     };
 
@@ -541,6 +538,8 @@ impl Tool for SpawnSubagentTool {
             request,
             background,
         } = parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
+        let run_time = baybo_tools::background::requested_run_time(&params, &background, ctx)
+            .map_err(ToolError::InvalidParams)?;
 
         let LineageGateInputs {
             depth,
@@ -598,14 +597,7 @@ impl Tool for SpawnSubagentTool {
 
         let child_session_id = run.child_session_id.clone();
         let job = subagent_job(run, subagent_type.clone(), task_summary);
-        let result = match baybo_tools::background::run(
-            ctx,
-            &background,
-            crate::spawner::SUBAGENT_FOREGROUND_WAIT,
-            job,
-        )
-        .await
-        {
+        let result = match baybo_tools::background::run(ctx, &background, run_time, job).await {
             Ran::Finished(result) => result,
             Ran::Cancelled(_) => SubagentResult {
                 child_session_id,

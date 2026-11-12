@@ -82,6 +82,20 @@ const NOTIFICATION_BLANK_BODY: &str = "It ran, but produced no output.";
 /// Body used when a failed fire left no error detail to quote.
 const NOTIFICATION_FAILURE_UNKNOWN: &str = "No error detail was recorded.";
 
+/// Body of the failure a recurring fire reports when reviewing the background
+/// work it started kept failing: the user was promised a report, so they hear
+/// that it is not coming.
+pub const NOTIFICATION_FOLLOW_UP_FAILED_BODY: &str = "Its background work finished, but reviewing the results failed repeatedly, so no report is available.";
+
+/// Header title for a fire whose job title was never recorded (a session
+/// persisted before the snapshot existed).
+pub const UNTITLED_JOB: &str = "scheduled task";
+
+/// Body used when a recurring fire produced no text but started background
+/// work: its result is not "nothing", it is still on the way.
+pub const NOTIFICATION_BACKGROUND_PENDING_BODY: &str =
+    "It started work that is still running in the background; the results will follow.";
+
 /// The leading text block of a one-shot cron notification: a header naming the
 /// job, followed by `body` (the fire's reply text, a blank-run fallback, or the
 /// failure reason). The caller appends any non-text blocks of the fire's reply

@@ -69,6 +69,18 @@ The fire still ran and its reply row and transcript survive in the (hidden) sess
 
 **Visibility scope, not just a runtime no-op.** The tool is omitted from the LLM's tool list outside a recurring fire, via a trigger-scope axis on `ToolRegistry::tool_definitions_for_session` (`Tool::trigger_scope` → `ToolTriggerScope::CronConversation`, keyed on `is_cron_conversation()`) that mirrors the manifest's `channels` axis. Both the channel and the trigger are fixed for a session's whole life, so the tool list stays byte-stable within a session and the prompt cache holds. The effect guard is separate: the fire's `NotifySilence` handle (`ToolContext::notify_silence`) is present only on a recurring fire turn, so a call on a user reply in a cron conversation — where the tool is visible for cache-stability but should not act — is a no-op.
 
+### A recurring fire can move its work to the background
+
+A recurring fire's own turn may start slow work in the background (`Session::can_host_background_jobs`), as a chat turn can: it reports what it has, ends, and the analysed result arrives later as a background-notification turn in the same conversation. Only work started detached on purpose (`background` / `group`) goes there — a call that merely overruns its `timeout_ms` in the fire's own turn is killed, since moving it would push "results will follow" and then the result. That follow-up is the fire's real report, so it is treated like the fire:
+
+- **Which follow-ups count.** The agent loop records the handles each turn hands over; after the fire turn — even one that went on to fail — the actor stores them as `BackgroundNotificationState::cron_report_handles`, and a fire report's own hand-overs join them. A notification batch carrying only those handles is the fire's report. A batch with any work a user started by replying reports like any chat's, so the user's own result can never be silenced.
+- **Silence.** The follow-up turn gets a `CronReportTurn` (`baybo-agent::runtime::cron_report_turn`) like the fire's own, carrying its `NotifySilence`, so `report_nothing` silences it exactly as it could the fire. Like the fire, it does not stream, so a silenced follow-up shows nothing live.
+- **Visibility.** A follow-up with something to say un-hides the conversation (a silenced fire hid it), and pushes through a zero-inference `CronNotification` turn completed on its reply row — background notification turns themselves never push.
+- **Failure.** A follow-up whose review keeps failing would otherwise settle passively, into a conversation that may be hidden. Instead the conversation is un-hidden and a framed failure notice is posted, as for a failed fire.
+- **A blank fire.** A fire whose reply is blank but that started background work reports "results will follow" instead of "produced no output".
+
+A one-shot fire runs no background work: its workspace is private and its actor stops after the fire, so a command or subagent that overruns its window is killed.
+
 ### Jobs the runtime owns
 
 `BuiltinCronJob` names the jobs the runtime owns — today only
