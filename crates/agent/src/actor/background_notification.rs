@@ -618,13 +618,13 @@ impl AgentActor {
                 reason,
                 "background notification delivery kept failing; degrading to passive delivery"
             );
-            let fire_report = self.delivery_reports_fire_work();
+            let is_cron_report = self.delivering_cron_report();
             self.durable
                 .session
                 .state
                 .background_notifications
                 .active_delivery = None;
-            if fire_report {
+            if is_cron_report {
                 // Passive delivery waits for the user to come back to a
                 // conversation that may be hidden and was promised a report;
                 // a scheduled task must never end in silence, so say it failed.
@@ -649,14 +649,14 @@ impl AgentActor {
     }
 
     /// Whether the batch being delivered is a recurring cron fire's report
-    /// (see `BackgroundNotificationState::fire_handles`).
-    fn delivery_reports_fire_work(&self) -> bool {
+    /// (see `BackgroundNotificationState::cron_report_handles`).
+    fn delivering_cron_report(&self) -> bool {
         let notifications = &self.durable.session.state.background_notifications;
         self.durable.session.trigger.is_cron_conversation()
             && notifications
                 .active_delivery
                 .as_ref()
-                .is_some_and(|delivery| notifications.reports_fire_work(&delivery.handle_ids))
+                .is_some_and(|delivery| notifications.is_cron_report(&delivery.handle_ids))
     }
 
     async fn drive_background_notification_turn(&mut self, content: Vec<ContentBlock>) {
@@ -664,14 +664,14 @@ impl AgentActor {
         // real report: `report_nothing` may silence it exactly as it could the
         // fire, and it pushes. Work a user started by replying there reports
         // like any chat's.
-        let fire_report = self.delivery_reports_fire_work();
+        let is_cron_report = self.delivering_cron_report();
         // The persisted/public turn kind retains its historical name for data
         // compatibility; this path now covers every background-turn kind. Its
         // delta sink exposes reasoning, tool progress, and answer prose before
         // the canonical final Message — except for a fire's report, which,
         // like the fire turn itself, does not stream: it may yet decide to
         // stay silent.
-        let response_tx = (!fire_report).then(|| self.volatile.response_tx.clone());
+        let response_tx = (!is_cron_report).then(|| self.volatile.response_tx.clone());
         // Arm the request-time retry cue for the duration of the turn. It rides
         // a request only while the transcript tail is an assistant row (a prior
         // attempt's cancelled salvage) — so the fresh path, where the tail is
@@ -680,7 +680,8 @@ impl AgentActor {
         // This single arm covers every entry (fresh drain, timer retry, crash
         // replay), so no caller has to reason about the tail.
         self.volatile.agent_loop.set_notification_cue(true);
-        let fire = fire_report.then(crate::runtime::fire_turn::FireTurn::new);
+        let cron_report =
+            is_cron_report.then(crate::runtime::cron_report_turn::CronReportTurn::new);
         let result = self
             .run_agent_loop(
                 TurnInput::SubagentNotification { content },
@@ -688,21 +689,23 @@ impl AgentActor {
                 response_tx,
                 None,
                 None,
-                fire.clone(),
+                cron_report.clone(),
                 None,
             )
             .await;
         self.volatile.agent_loop.set_notification_cue(false);
-        let silenced = fire.as_ref().is_some_and(|f| f.silence.requested());
-        if let Some(fire) = &fire {
+        let silenced = cron_report
+            .as_ref()
+            .is_some_and(|turn| turn.silence.requested());
+        if let Some(cron_report) = &cron_report {
             // Work the fire's report hands over in turn is still the fire's:
             // its own follow-up is the next part of the same report.
-            let handed_over = fire.handed_over();
+            let handed_over = cron_report.handed_over();
             self.durable
                 .session
                 .state
                 .background_notifications
-                .fire_handles
+                .cron_report_handles
                 .extend(handed_over);
         }
 
@@ -758,7 +761,7 @@ impl AgentActor {
                     return;
                 }
                 let reply = (response.ordinal, response.content.clone());
-                if fire_report {
+                if is_cron_report {
                     // A silenced fire hid this conversation; a follow-up with
                     // something to say is exactly what makes it relevant again,
                     // and its push deep-links here.
@@ -766,7 +769,7 @@ impl AgentActor {
                 }
                 self.send_response(response.into(), "background_notification")
                     .await;
-                if fire_report && let (Some(ordinal), content) = reply {
+                if is_cron_report && let (Some(ordinal), content) = reply {
                     self.push_cron_follow_up(content, ordinal).await;
                 }
             }

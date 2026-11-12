@@ -8,14 +8,14 @@ use baybo_model::BackgroundHandle;
 /// report's turn — and by no other. The actor owns it, so what the turn
 /// records stays readable even when the turn itself fails.
 #[derive(Clone, Default)]
-pub struct FireTurn {
+pub struct CronReportTurn {
     /// Flipped by `report_nothing` to silence the turn.
     pub silence: baybo_tools::NotifySilence,
     /// Every job the turn hands to the background, recorded as it happens.
     handed_over: Arc<parking_lot::Mutex<Vec<BackgroundHandle>>>,
 }
 
-impl FireTurn {
+impl CronReportTurn {
     pub fn new() -> Self {
         Self::default()
     }

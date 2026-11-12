@@ -6002,7 +6002,7 @@ impl Tool for FollowUpSilenceProbe {
 /// [`finished_build_check`]), as the actor records when that turn ends.
 fn cron_fire_session(conversation: bool, hidden: bool) -> baybo_model::Session {
     let mut session = SessionBuilder::new().build();
-    session.state.background_notifications.fire_handles = vec!["bg-7".into()];
+    session.state.background_notifications.cron_report_handles = vec!["bg-7".into()];
     session.trigger = TriggerSource::Cron {
         cron_job_id: "cj-watch".into(),
         origin_session_id: Some(SessionId::from("sess-origin")),
@@ -6102,7 +6102,7 @@ async fn a_recurring_fires_follow_up_reports_and_unhides_its_conversation() {
 #[tokio::test(start_paused = true)]
 async fn a_users_background_work_in_a_cron_conversation_reports_like_chat() {
     let mut session = cron_fire_session(true, true);
-    session.state.background_notifications.fire_handles = vec!["bg-fire".into()];
+    session.state.background_notifications.cron_report_handles = vec!["bg-fire".into()];
     let fire_session_id = session.id.clone();
     let manifest = baybo_tools::ToolManifest {
         name: "report_nothing".into(),
@@ -6357,7 +6357,11 @@ impl BackgroundJobSink for HoldingSink {
 #[tokio::test]
 async fn a_recurring_fires_own_turn_kills_an_overrun() {
     let mut session = cron_fire_session(true, false);
-    session.state.background_notifications.fire_handles.clear();
+    session
+        .state
+        .background_notifications
+        .cron_report_handles
+        .clear();
     let fire_session_id = session.id.clone();
     let sink = Arc::new(HoldingSink::default());
     let probe = Arc::new(FanOutProbe);
@@ -6424,7 +6428,7 @@ async fn a_recurring_fires_own_turn_kills_an_overrun() {
         stored
             .state
             .background_notifications
-            .fire_handles
+            .cron_report_handles
             .is_empty()
     );
 
@@ -6434,7 +6438,11 @@ async fn a_recurring_fires_own_turn_kills_an_overrun() {
 #[tokio::test(start_paused = true)]
 async fn a_recurring_fires_own_turn_records_the_work_it_hands_over() {
     let mut session = cron_fire_session(true, false);
-    session.state.background_notifications.fire_handles.clear();
+    session
+        .state
+        .background_notifications
+        .cron_report_handles
+        .clear();
     let fire_session_id = session.id.clone();
     let sink = Arc::new(HoldingSink::default());
     let probe = Arc::new(FanOutProbe);
@@ -6494,7 +6502,7 @@ async fn a_recurring_fires_own_turn_records_the_work_it_hands_over() {
         .unwrap()
         .expect("fire session");
     assert_eq!(
-        stored.state.background_notifications.fire_handles, handed_over,
+        stored.state.background_notifications.cron_report_handles, handed_over,
         "the fire's hand-over is recorded as the fire's"
     );
     assert!(
@@ -6517,7 +6525,11 @@ async fn a_recurring_fires_own_turn_records_the_work_it_hands_over() {
 #[tokio::test(start_paused = true)]
 async fn a_fire_that_fails_after_handing_work_over_still_records_it() {
     let mut session = cron_fire_session(true, false);
-    session.state.background_notifications.fire_handles.clear();
+    session
+        .state
+        .background_notifications
+        .cron_report_handles
+        .clear();
     let fire_session_id = session.id.clone();
     let sink = Arc::new(HoldingSink::default());
     let probe = Arc::new(FanOutProbe);
@@ -6566,7 +6578,7 @@ async fn a_fire_that_fails_after_handing_work_over_still_records_it() {
         .unwrap()
         .expect("fire session");
     assert_eq!(
-        stored.state.background_notifications.fire_handles,
+        stored.state.background_notifications.cron_report_handles,
         handed_over
     );
 
@@ -6618,7 +6630,7 @@ async fn work_a_fires_report_hands_over_joins_the_fires_work() {
         .unwrap()
         .expect("fire session");
     assert_eq!(
-        stored.state.background_notifications.fire_handles,
+        stored.state.background_notifications.cron_report_handles,
         vec!["bg-7".into(), second[0].clone()]
     );
 

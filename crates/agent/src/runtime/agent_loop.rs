@@ -858,10 +858,10 @@ impl AgentLoop {
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
         // A recurring cron fire's turn — its own, or its report's — passes
-        // its `FireTurn` here: `report_nothing` silences it, and every job the
+        // its `CronReportTurn` here: `report_nothing` silences it, and every job the
         // turn hands to the background is recorded on it. `None` for every
         // other turn (see `AgentActor::dispatch_cron_prompt`).
-        fire: Option<crate::runtime::fire_turn::FireTurn>,
+        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.run_with_optional_inherited_context(
             session,
@@ -872,7 +872,7 @@ impl AgentLoop {
             delta_tx,
             cancel_token,
             interjections,
-            fire,
+            cron_report,
             None,
         )
         .await
@@ -892,7 +892,7 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
-        fire: Option<crate::runtime::fire_turn::FireTurn>,
+        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
         inherited_context: InheritedToolContext,
     ) -> anyhow::Result<OutgoingMessage> {
         self.run_with_optional_inherited_context(
@@ -904,7 +904,7 @@ impl AgentLoop {
             delta_tx,
             cancel_token,
             interjections,
-            fire,
+            cron_report,
             Some(inherited_context),
         )
         .await
@@ -921,7 +921,7 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
-        fire: Option<crate::runtime::fire_turn::FireTurn>,
+        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
@@ -965,11 +965,14 @@ impl AgentLoop {
                         interjections,
                         memory_query,
                         turn_kind,
-                        fire.clone(),
+                        cron_report.clone(),
                         inherited_context.clone(),
                     )
                     .await?;
-                let output = if fire.as_ref().is_some_and(|f| f.silence.requested()) {
+                let output = if cron_report
+                    .as_ref()
+                    .is_some_and(|turn| turn.silence.requested())
+                {
                     // A recurring cron fire called `report_nothing`: complete
                     // with a reply-less structured result so the Completed edge
                     // carries no reply ordinal and the push dispatcher skips it
@@ -1023,7 +1026,7 @@ impl AgentLoop {
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
         turn_kind: TurnInputKind,
-        fire: Option<crate::runtime::fire_turn::FireTurn>,
+        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
@@ -1214,7 +1217,7 @@ impl AgentLoop {
                         &cancel_token,
                         &mut turn_attachments,
                         background,
-                        fire.clone(),
+                        cron_report.clone(),
                         inherited_context.clone(),
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
@@ -1339,7 +1342,7 @@ impl AgentLoop {
         // What this turn lets its calls leave running past it — computed once
         // per turn in `run_inner`.
         background: crate::runtime::tool_executor::TurnBackground,
-        fire: Option<crate::runtime::fire_turn::FireTurn>,
+        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
         inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
@@ -1519,7 +1522,7 @@ impl AgentLoop {
                 .record_prompt_delivered(&path, fingerprint);
         }
         let read_tracker_for_calls = self.read_tracker.clone();
-        let notify_silence_for_calls = fire.as_ref().map(|f| f.silence.clone());
+        let notify_silence_for_calls = cron_report.as_ref().map(|turn| turn.silence.clone());
         let inherited_context_for_calls = inherited_context.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response
@@ -1672,8 +1675,8 @@ impl AgentLoop {
                         .background_notifications
                         .register_group_member(turn_id, group);
                 }
-                if let Some(fire) = &fire {
-                    fire.record_hand_over(handed_over.handle.clone());
+                if let Some(cron_report) = &cron_report {
+                    cron_report.record_hand_over(handed_over.handle.clone());
                 }
             }
 

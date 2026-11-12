@@ -599,7 +599,7 @@ impl AgentActor {
         // A recurring cron fire's turn (its own, or its report's): the
         // `report_nothing` silence and the record of what it hands to the
         // background. `None` for every other turn. See `dispatch_cron_prompt`.
-        fire: Option<crate::runtime::fire_turn::FireTurn>,
+        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
         // Transient authority supplied by the turn dispatcher. It is not
         // reconstructed from persistent session metadata on later turns.
         inherited_context: Option<baybo_model::InheritedToolContext>,
@@ -627,7 +627,7 @@ impl AgentActor {
                         delta_tx,
                         turn_token.clone(),
                         interjections,
-                        fire,
+                        cron_report,
                         context,
                     )
                     .await
@@ -644,7 +644,7 @@ impl AgentActor {
                         delta_tx,
                         turn_token.clone(),
                         interjections,
-                        fire,
+                        cron_report,
                     )
                     .await
             }
@@ -745,9 +745,9 @@ impl AgentActor {
         // Only a recurring fire (which owns a listed conversation) can be
         // silenced by `report_nothing` or leave work in the background; a
         // one-shot always reports back and its workspace hosts no background
-        // work, so it gets no `FireTurn`.
-        let fire = matches!(delivery, CronDelivery::Channel)
-            .then(crate::runtime::fire_turn::FireTurn::new);
+        // work, so it gets no `CronReportTurn`.
+        let cron_report = matches!(delivery, CronDelivery::Channel)
+            .then(crate::runtime::cron_report_turn::CronReportTurn::new);
         let ran = self
             .run_agent_loop(
                 turn_input,
@@ -755,18 +755,23 @@ impl AgentActor {
                 None,
                 None,
                 None,
-                fire.clone(),
+                cron_report.clone(),
                 Some(baybo_model::InheritedToolContext),
             )
             .await;
         // Recorded whether or not the turn went on to fail: work it handed
         // over runs on, and its follow-up is the fire's report either way.
-        let started_background = match &fire {
-            Some(fire) => self.record_fire_handles(fire.handed_over()).await,
+        let started_background = match &cron_report {
+            Some(cron_report) => {
+                self.record_cron_report_handles(cron_report.handed_over())
+                    .await
+            }
             None => false,
         };
         let response = ran?;
-        let silenced = fire.as_ref().is_some_and(|f| f.silence.requested());
+        let silenced = cron_report
+            .as_ref()
+            .is_some_and(|turn| turn.silence.requested());
         match delivery {
             CronDelivery::OriginSession => {}
             CronDelivery::Channel if silenced => {
@@ -802,9 +807,12 @@ impl AgentActor {
 
     /// Record the background jobs the fire turn that just ended handed over,
     /// so their follow-up is recognised as the fire's report (see
-    /// `BackgroundNotificationState::fire_handles`). Returns whether there
+    /// `BackgroundNotificationState::cron_report_handles`). Returns whether there
     /// were any.
-    async fn record_fire_handles(&mut self, handles: Vec<baybo_model::BackgroundHandle>) -> bool {
+    async fn record_cron_report_handles(
+        &mut self,
+        handles: Vec<baybo_model::BackgroundHandle>,
+    ) -> bool {
         if handles.is_empty() {
             return false;
         }
@@ -812,7 +820,7 @@ impl AgentActor {
             .session
             .state
             .background_notifications
-            .fire_handles = handles;
+            .cron_report_handles = handles;
         self.persist_session_state_with_activity("cron_fire_background_handles")
             .await;
         true

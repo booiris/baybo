@@ -415,7 +415,7 @@ impl Session {
     ///
     /// That includes a recurring fire's own turn: it reports what it has,
     /// and the result arrives as a follow-up (see
-    /// [`BackgroundNotificationState::fire_handles`]). Fixed for the
+    /// [`BackgroundNotificationState::cron_report_handles`]). Fixed for the
     /// session's life, which keeps the offered tool schemas — and so the
     /// prompt-cache prefix — stable across its turns.
     pub fn can_host_background_jobs(&self) -> bool {
@@ -634,16 +634,19 @@ pub struct BackgroundNotificationState {
     /// `report_nothing`, and it pushes — whereas work a user later starts by
     /// replying in the same conversation reports like any chat's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fire_handles: Vec<crate::BackgroundHandle>,
+    pub cron_report_handles: Vec<crate::BackgroundHandle>,
 }
 
 impl BackgroundNotificationState {
     /// Whether a batch settling `handle_ids` reports only work the cron fire
-    /// started (see [`Self::fire_handles`]). A batch that also carries work a
+    /// started (see [`Self::cron_report_handles`]). A batch that also carries work a
     /// user started reports like any chat's: treating it as the fire's would
     /// let `report_nothing` silence the user's own result.
-    pub fn reports_fire_work(&self, handle_ids: &[crate::BackgroundHandle]) -> bool {
-        !handle_ids.is_empty() && handle_ids.iter().all(|id| self.fire_handles.contains(id))
+    pub fn is_cron_report(&self, handle_ids: &[crate::BackgroundHandle]) -> bool {
+        !handle_ids.is_empty()
+            && handle_ids
+                .iter()
+                .all(|id| self.cron_report_handles.contains(id))
     }
 
     /// Whether the actor must stay on its notification timer path.
