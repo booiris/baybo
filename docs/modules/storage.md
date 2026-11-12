@@ -249,8 +249,8 @@ Every prompt the agent hands to a human — a tool approval today, an `AskUser`
 question later — is a `human_asks` row written **before** it is shown, served
 by `SqliteHumanAskStore` over the `HumanAskStore` trait (see
 [`human-ask.md`](human-ask.md)). Columns: `ask_id` (primary key),
-`session_id`, `channel` (the channel whose queue shows the ask),
-`tool_call_id` (the blocked `tool_use`; not unique), `kind` and
+`session_id`, `channel` (the queue a pending row reloads into after a
+restart), `tool_call_id` (the blocked `tool_use`; not unique), `kind` and
 `phase` (`AskKind` / `AskPhase::as_str()`), `request` (`AskRequest` JSON),
 and three µs timestamps plus the `resolution` JSON. A row is *pending* while
 `resolved_at` is NULL, *resolved* once decided, *applied* once a turn

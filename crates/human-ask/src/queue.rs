@@ -1,9 +1,10 @@
 //! [`AskQueue`]: the in-memory read model of a channel's pending asks.
 //!
-//! One queue per channel, not per session. Holds an entry for every ask a
-//! tool future in this process is parked on: each **live** entry carries the
-//! oneshot its waiter waits on. Display-only mirrors (the TUI, `baybo
-//! prompt`) are **dead** entries that carry none.
+//! One queue per channel, not per session. Holds an entry for every
+//! `pending` ledger row the process knows about: **live** entries carry the
+//! oneshot a parked tool future waits on, **dead** entries (after a restart,
+//! or once the waiter is gone) carry none and are still shown and
+//! answerable. Display-only mirrors (the TUI) are dead entries too.
 //!
 //! The queue never touches the ledger. Watchers are sync, run outside the
 //! queue lock in mutation order, and must not block.
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use baybo_model::approval::{ApprovalDecision, ApprovalRequest};
 use baybo_model::human_ask::{
-    ASK_USER_TOOL_NAME, AskId, AskKind, AskPhase, AskRequest, AskResolution,
+    ASK_USER_TOOL_NAME, AskId, AskKind, AskPhase, AskRequest, AskResolution, resumable,
 };
 use baybo_model::{ChannelType, SessionId};
 use baybo_store::HumanAskRow;
@@ -58,10 +59,14 @@ impl PendingAsk {
             AskRequest::Question(_) => None,
         }
     }
+
+    pub fn is_resumable(&self) -> bool {
+        resumable(self.kind, self.phase)
+    }
 }
 
 /// A queue slot: the ask plus, while a tool future waits on it, its oneshot.
-/// `None` is a display-only mirror.
+/// `None` is a dead ask or a display-only mirror.
 struct Entry {
     ask: PendingAsk,
     responder: Option<oneshot::Sender<AskResolution>>,
@@ -343,8 +348,8 @@ impl AskQueue {
         self.push(ask, Some(responder));
     }
 
-    /// Enqueue an ask no tool future waits on (a display mirror).
-    fn push_dead(&self, ask: PendingAsk) {
+    /// Enqueue an ask no tool future waits on (boot reload).
+    pub(crate) fn push_dead(&self, ask: PendingAsk) {
         self.push(ask, None);
     }
 
@@ -394,11 +399,26 @@ impl AskQueue {
         self.resolve(ask_id, AskResolution::Abandoned)
     }
 
-    /// A waiter went away without a resolution. Nothing could apply an
-    /// answer any more, so the ask leaves the queue with an `Abandoned`
-    /// edge; its row is closed by the turn's cancel claim or the next boot.
+    /// A waiter went away without a resolution. A resumable ask stays queued
+    /// as a dead entry with no edge — the row is still pending and the ask
+    /// still answerable. A non-resumable one is useless without its tool
+    /// future, so it is removed with an `Abandoned` edge; its row is
+    /// reconciled later by the manager.
     pub fn orphan(&self, ask_id: &AskId) {
-        let _ = self.remove(ask_id, PendingEdge::Abandoned, AskResolution::Abandoned);
+        let resumable_found = {
+            let mut q = self.inner.lock();
+            match q.iter_mut().find(|e| &e.ask.ask_id == ask_id) {
+                Some(entry) if entry.ask.is_resumable() => {
+                    entry.responder = None;
+                    true
+                }
+                Some(_) => false,
+                None => return,
+            }
+        };
+        if !resumable_found {
+            let _ = self.remove(ask_id, PendingEdge::Abandoned, AskResolution::Abandoned);
+        }
     }
 
     /// Snapshot of every queued ask, in insertion order.
@@ -486,10 +506,10 @@ fn mirror_id(call_id: &str) -> AskId {
     call_id.parse().unwrap_or_else(|_| AskId::new())
 }
 
-/// One [`AskQueue`] per channel. The eager boot install and the lazy install
-/// of a sidecar's channel both go through [`Self::get_or_create`], and the
-/// manager finds a channel's queue here. A few operations per boot or
-/// connect — a plain mutex.
+/// One [`AskQueue`] per channel. The channel install and the boot reload both
+/// go through [`Self::get_or_create`], so a reload for a channel whose
+/// sidecar has not connected yet creates the queue the later install
+/// attaches to. A few operations per boot or connect — a plain mutex.
 #[derive(Clone, Default)]
 pub struct AskQueues {
     inner: Arc<Mutex<HashMap<ChannelType, AskQueue>>>,
@@ -658,15 +678,25 @@ mod tests {
     }
 
     #[test]
-    fn orphan_drops_the_entry_with_an_abandoned_edge() {
+    fn orphan_keeps_a_resumable_entry_dead_and_silent() {
         let (queue, seen) = watched_queue();
         let (tx, _rx) = oneshot::channel();
         queue.push_live(ask("c1", "s1", AskPhase::BeforeExecute), tx);
         assert_eq!(queue.liveness(&id("c1")), Some(true));
         assert!(queue.has_live(&SessionId::from("s1")));
         queue.orphan(&id("c1"));
-        assert!(queue.is_empty());
+        assert_eq!(queue.liveness(&id("c1")), Some(false), "dead, still queued");
         assert!(!queue.has_live(&SessionId::from("s1")));
+        assert_eq!(*seen.lock(), vec![("s1".into(), raised("c1"))], "no edge");
+    }
+
+    #[test]
+    fn orphan_drops_a_non_resumable_entry_with_an_abandoned_edge() {
+        let (queue, seen) = watched_queue();
+        let (tx, _rx) = oneshot::channel();
+        queue.push_live(ask("c1", "s1", AskPhase::DuringExecute), tx);
+        queue.orphan(&id("c1"));
+        assert!(queue.is_empty());
         assert_eq!(
             *seen.lock(),
             vec![

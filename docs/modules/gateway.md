@@ -297,8 +297,8 @@ over the channel's `AskQueue` (the `AskSurface` on
 `crates/channels/src/channel.rs`), built in `src/channel/boot.rs::
 build_channel`. `install_channels` / `install_channel` / `build_channel` take
 the shared `Arc<AskCore>` + `AskQueues` and **fetch** the channel's queue via
-`queues.get_or_create(channel_type)`, so the channel and
-`HumanAskManager` meet on one queue; the lazy install of an out-of-tree channel
+`queues.get_or_create(channel_type)`, so a queue the boot reload already filled
+is the one the channel attaches to; the lazy install of an out-of-tree channel
 (`resolve_or_install_channel`) reads both off `WsChannelState`, which copies
 them from `GatewayDeps`. When a tool call hits the gate the ask is written to
 the `human_asks` ledger and pushed on the queue. Frames come from the queue
@@ -313,18 +313,17 @@ broadcasts the `SessionPatch.awaiting_human` list mark. The client echoes a
 is on this connection's channel queue and calls `HumanAskManager::resolve`,
 which claims the decision in the ledger first and then removes the entry
 (the watchers do the broadcast). There is no timeout: an ask waits until a
-human answers it or a verb abandons it (`/stop`, a card close). An ask whose
-waiter is gone leaves the queue and an answer to it is refused (`NotLive`); a
-process exit leaves its row pending, and the next boot closes it before any
-channel starts (`HumanAskManager::close_stale_asks`, see
-[`human-ask.md`](human-ask.md#restart-survival)). The board's
+human answers it or a verb abandons it (`/stop`, a card close, a new message
+past a dead ask); a process exit leaves it pending for the next boot, whose
+reload re-queues it (see [`human-ask.md`](human-ask.md)). The board's
 `POST /projects/{id}/issues/{n}/approvals/{call_id}` resolves through the
 same verb, for a pending `Approval` row raised by that issue's session.
 
 The ask push relay (`push/ask.rs`, `AskPushRelay`) is built in
-`build_managers` and installed on the `owner` channel before any ask can
-park; `gateway_cmd` takes its stream off `ManagerGraph.ask_push_stream` when
-it spawns the push task.
+`build_managers` and installed on the `owner` channel before the boot
+reload, so a re-queued dead ask pushes once for a session nobody has open;
+`gateway_cmd` takes its stream off `ManagerGraph.ask_push_stream` when it
+spawns the push task.
 
 Approvals resolve through the **channel-level** gate (`ApprovalGateMap`
 keyed by `ChannelType`), with a second **session-level** tier
@@ -1035,8 +1034,8 @@ The full frame set (see `crates/wire/src/lib.rs`):
 - **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
   client), `ResolveApproval` (client → server); the on-subscribe
   authoritative set rides `SubscribeState.pending_approvals`. Approvals
-  never time out; a gateway restart abandons them (the boot closes their
-  `human_asks` rows). `AskResolved { ask_id, outcome }` (server →
+  never time out and survive a restart (the boot reload re-queues them from
+  the `human_asks` ledger). `AskResolved { ask_id, outcome }` (server →
   client, session-less, `outcome` ∈ `answered | declined | abandoned`) is
   sent on every close of any ask kind — the only frame that retires an
   approval nobody decided. `ResolveApproval` resolves through

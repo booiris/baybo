@@ -191,8 +191,8 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
 }
 
 /// A multiplexed channel has no `SubscribeState` catch-up, so a sidecar that
-/// connects after an ask was raised — a raise during a reconnect — is told
-/// about every pending approval on its queue.
+/// connects after an ask was raised — the boot reload's dead asks, or a raise
+/// during a reconnect — is told about every pending approval on its queue.
 async fn announce_pending_asks(sidecar: &Sidecar) {
     let Some(queue) = sidecar.channel.ask_queue() else {
         return;
@@ -216,7 +216,8 @@ async fn announce_pending_asks(sidecar: &Sidecar) {
 }
 
 /// A client answered an approval card. Scoped to this connection's channel:
-/// only an ask on its own queue is answerable from here. The manager claims the decision in the ledger first; the queue
+/// only an ask on its own queue (live, or dead after a restart) is answerable
+/// from here. The manager claims the decision in the ledger first; the queue
 /// watchers then dispatch `ApprovalResolved` + `AskResolved` to every client.
 async fn resolve_approval(
     state: &WsChannelState,

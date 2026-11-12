@@ -13,11 +13,6 @@ pub enum HumanAskError {
     #[error("ask {ask_id} is already closed")]
     AskClosed { ask_id: AskId },
 
-    /// The ask is still pending but no tool future in this process waits on
-    /// it, so an answer has nothing to apply to.
-    #[error("no tool call is waiting on ask {ask_id}")]
-    NotLive { ask_id: AskId },
-
     /// The resolution does not fit the ask's kind (an approval decision for a
     /// question, or answers for an approval).
     #[error("ask {ask_id} is a {kind:?} ask; that resolution does not apply to it")]

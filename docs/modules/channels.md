@@ -308,8 +308,8 @@ SessionId)` entry (used by the one-shot `baybo prompt` path) wins over the
 channel-type gate, and lookup fails closed to `AutoDenyGate`.
 
 Each channel's gate is a `baybo_human_ask::ChannelAskGate` over the
-channel's `AskQueue` (fetched from the shared `AskQueues`, the same queues
-`HumanAskManager` resolves on); the
+channel's `AskQueue` (fetched from the shared `AskQueues`, so a queue the
+boot reload already filled is the one the channel attaches to); the
 channel's `AskSurface` bundles the two. The gate writes the ask to the
 `human_asks` ledger before enqueueing it and never times out. Frames are
 dispatched by queue watchers the gateway installs in `build_channel`, not by

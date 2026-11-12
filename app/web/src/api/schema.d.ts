@@ -1959,8 +1959,9 @@ export interface components {
              *     knows which conversation to open; the ask itself is only answerable
              *     inside the conversation.
              *
-             *     Read from the in-memory ask queues. A gateway restart abandons every
-             *     pending ask, so the mark does not outlive one. Absent when false.
+             *     Read from the in-memory ask queues, which the boot reload refills from
+             *     the ask ledger, so a pending ask keeps its mark across a restart.
+             *     Absent when false.
              */
             awaiting_human?: boolean;
             /** Format: date-time */
@@ -2731,7 +2732,10 @@ export interface components {
             assignee?: string | null;
             /** @description Files hung on the description. */
             attachments?: components["schemas"]["IssueAttachmentDto"][];
-            /** @description True only while this card has an answerable ask in the queue. */
+            /**
+             * @description True only while this card has an answerable ask in the queue — live,
+             *     or reloaded from the ask ledger after a restart.
+             */
             awaiting_human: boolean;
             /**
              * @description Why work stopped. A badge on the card — blocked work stays in
@@ -3796,7 +3800,7 @@ export interface components {
          * @description Wire mirror of [`baybo_turn::TurnInputKind`] — what payload fed the turn.
          * @enum {string}
          */
-        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification" | "issue_run";
+        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification" | "issue_run" | "resume";
         /**
          * @description Wire mirror of a turn's origin (the owning session's root trigger,
          *     [`baybo_model::TriggerKind`]).
@@ -8069,7 +8073,10 @@ export interface operations {
                             assignee?: string | null;
                             /** @description Files hung on the description. */
                             attachments?: components["schemas"]["IssueAttachmentDto"][];
-                            /** @description True only while this card has an answerable ask in the queue. */
+                            /**
+                             * @description True only while this card has an answerable ask in the queue — live,
+                             *     or reloaded from the ask ledger after a restart.
+                             */
                             awaiting_human: boolean;
                             /**
                              * @description Why work stopped. A badge on the card — blocked work stays in

@@ -8,8 +8,8 @@
 //! waiting for them.
 //!
 //! Each channel is born with its own [`ChannelAskGate`] over the channel's
-//! [`AskQueue`], fetched from the shared [`AskQueues`] so the channel and
-//! the ask manager meet on one queue. Frames are
+//! [`AskQueue`], fetched from the shared [`AskQueues`] so a queue the boot
+//! reload already filled is the one the channel attaches to. Frames are
 //! dispatched by queue watchers installed here, not by the gate: an ask
 //! entering the queue becomes
 //! [`SessionEvent::ApprovalRequested`](baybo_channels::SessionEvent::ApprovalRequested),
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn install_attaches_to_a_queue_that_already_exists() {
+    fn install_attaches_to_the_queue_a_reload_already_created() {
         let queues = AskQueues::new();
         let preloaded = queues.get_or_create(&ChannelType::owner());
         let reg = Arc::new(ChannelRegistry::new());
@@ -314,7 +314,11 @@ mod tests {
             .expect("subscribed")
             .subscribe(conn.id(), session.into())
             .expect("subscribe");
-        let asks = HumanAskManager::from_config(HumanAskManagerConfig { core, queues });
+        let asks = HumanAskManager::from_config(HumanAskManagerConfig {
+            core,
+            queues,
+            resume_sink: Arc::new(baybo_human_ask::test_support::NoResume),
+        });
         Wired {
             channel,
             asks,

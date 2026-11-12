@@ -812,9 +812,8 @@ pub enum Frame {
     /// channel's user to approve or deny. Clients with an approval UX
     /// should echo a [`Frame::ResolveApproval`] back; clients without
     /// one can ignore it. The prompt never times out: it stays pending
-    /// until a client answers it or the turn moves on, and
-    /// [`Frame::AskResolved`] retires it either way. A gateway restart
-    /// abandons it.
+    /// (across a gateway restart too) until a client answers it or the
+    /// turn moves on, and [`Frame::AskResolved`] retires it either way.
     ApprovalRequested {
         call_id: String,
         /// `call_id` of the TOOL call this prompt blocks (the id

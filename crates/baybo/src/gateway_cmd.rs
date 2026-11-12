@@ -544,16 +544,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         shutdown.clone(),
         Arc::clone(&leak_detector),
         embedded_mcp_servers,
+        baybo_human_ask::ReloadScope::ResumeAnswered,
     )
     .await?;
-    // No ask survives a restart yet: close what the previous process left
-    // pending before any channel can show or answer it. Hydration then
-    // fills each dangling call as interrupted, as for any crash.
-    match graph.human_asks.close_stale_asks().await {
-        Ok(abandoned) => tracing::info!(abandoned, "closed stale human asks"),
-        Err(e) => tracing::warn!(error = %e, "failed to close stale human asks"),
-    }
-    let run_handle = runtime::wire_router(&mut graph).await;
+    let run_handle = runtime::wire_router(&mut graph).await?;
 
     // WS-backed sidecars register themselves from the route task when a
     // client connects; nothing to pre-register here.
@@ -658,7 +652,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         // the lifecycle bus while it waits — the turn has not completed, and
         // never will unless the user answers — so the ask queue needs its own
         // path to the dispatcher. The relay itself is built in
-        // `build_managers`, before any ask can park.
+        // `build_managers`, ahead of the boot reload whose edges it must see.
         let ask_stream = graph.ask_push_stream.take();
         let ask_pushes = ask_stream.is_some();
         let push_shutdown = shutdown.clone();

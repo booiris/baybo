@@ -105,8 +105,9 @@ shape as its input.
 
 The server's pending set is the truth on both sides. On the board that matters
 more, because the pending set is *replayed from history*. Prompts no longer
-time out, but a prompt can still close without a decision — a `/stop`, a
-settled run, a gateway restart — so an entry can name a prompt nothing is
+time out and survive a gateway restart (the gateway re-queues them from its
+ask ledger), but a prompt can still close without a decision — a `/stop`, a
+settled run, the user moving on — so an entry can name a prompt nothing is
 waiting for, which is why answering one tolerates a 404 and reads it as
 "already closed". The card's `approval_pending` flag (the gateway's REST twin
 of `awaiting_human`, until PR 3 of the human-ask rollout moves the app onto

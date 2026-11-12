@@ -775,7 +775,7 @@ fn member(name: &str) -> baybo_project::NewTeamMember {
 
 mod approvals {
     use super::*;
-    use baybo_human_ask::test_support::MemoryHumanAskStore;
+    use baybo_human_ask::test_support::{MemoryHumanAskStore, NoResume};
     use baybo_human_ask::{
         AskCore, AskQueues, ChannelAskGate, HumanAskManager, HumanAskManagerConfig,
     };
@@ -795,6 +795,7 @@ mod approvals {
         let asks = Arc::new(HumanAskManager::from_config(HumanAskManagerConfig {
             core: Arc::clone(&core),
             queues: queues.clone(),
+            resume_sink: Arc::new(NoResume),
         }));
         baybo_project::install_ask_bridge(
             &core,

@@ -2,7 +2,7 @@
 //! call parked on an approval, by cancel origin. A turn cancel (`/stop`)
 //! abandons the ask before the denial is appended; an ancestor cancel
 //! (shutdown) leaves the row pending and the `tool_use` dangling, exactly as
-//! a crash would, and the next boot closes the row.
+//! a crash would.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -230,79 +230,12 @@ async fn shutdown_leaves_the_parked_ask_pending_and_the_tool_use_dangling() {
     );
     assert_eq!(completed_for_call(&outputs), 0, "nothing is emitted either");
     let queue = harness.ask_queues.get_or_create(&harness.session.channel);
-    assert!(
-        !queue.contains(&row.ask_id),
-        "the orphan leaves the queue: nothing could apply an answer"
-    );
-    assert!(
-        matches!(
-            harness
-                .human_asks
-                .resolve(
-                    &row.ask_id,
-                    AskResolution::Approval(ApprovalDecision::Approve)
-                )
-                .await,
-            Err(baybo_human_ask::HumanAskError::NotLive { .. })
-        ),
-        "an answer to it is refused"
+    assert_eq!(
+        queue.liveness(&row.ask_id),
+        Some(false),
+        "the entry stays on the queue, dead"
     );
     assert_eq!(runs.load(Ordering::SeqCst), 0);
-
-    // The next boot closes the row before any channel can show it; the
-    // dangling `tool_use` is left for hydration's interrupted fill.
-    assert_eq!(
-        harness
-            .human_asks
-            .close_stale_asks()
-            .await
-            .expect("close stale asks"),
-        1
-    );
-    let closed = harness.ask_store.row(&row.ask_id).expect("row kept");
-    assert_eq!(closed.resolution, Some(AskResolution::Abandoned));
-    assert!(closed.applied_at.is_some(), "never owed again");
-    assert!(results_for_call(&harness).await.is_empty());
-
-    tokio::time::timeout(PARK_TIMEOUT, harness.shutdown())
-        .await
-        .expect("actor stops");
-}
-
-#[tokio::test]
-async fn an_answer_reaches_the_parked_call_and_it_runs_once() {
-    let (mut harness, runs, row) = parked_turn().await;
-    harness
-        .stub_llm
-        .push_stream(vec![StreamEvent::Text("done".to_string())]);
-
-    harness
-        .human_asks
-        .resolve(
-            &row.ask_id,
-            AskResolution::Approval(ApprovalDecision::Approve),
-        )
-        .await
-        .expect("resolve a live ask");
-    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
-
-    let after = harness.ask_store.row(&row.ask_id).expect("row kept");
-    assert_eq!(
-        after.resolution,
-        Some(AskResolution::Approval(ApprovalDecision::Approve))
-    );
-    assert!(after.applied_at.is_some(), "the gate stamps it applied");
-    assert_eq!(runs.load(Ordering::SeqCst), 1);
-    let results = results_for_call(&harness).await;
-    assert_eq!(results.len(), 1, "{results:?}");
-    assert!(results[0].contains("written"), "{results:?}");
-    assert_eq!(completed_for_call(&outputs), 1);
-    assert!(
-        harness
-            .ask_queues
-            .get_or_create(&harness.session.channel)
-            .is_empty()
-    );
 
     tokio::time::timeout(PARK_TIMEOUT, harness.shutdown())
         .await

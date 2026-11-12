@@ -631,8 +631,9 @@ Dispatch triggers — there are **two**, and only the first is a turn ending:
 
 **A tool call parking on an ask.** Nothing reaches the lifecycle bus
 while a prompt waits — the turn has not ended, and never will unless the user
-answers. Asks never time out, so the relay is built in `build_managers`,
-before any ask can park. The relay
+answers. Asks never time out and survive a restart, so the relay is built in
+`build_managers` ahead of the boot reload, and a dead ask re-queued at boot
+pushes once for a session with no subscriber. The relay
 (`crates/gateway/src/push/ask.rs`, `AskPushRelay`) therefore watches the ask queue's
 per-session edges directly, on the `owner` channel only (a prompt parked on the
 TUI's or Telegram's queue is one the app could not answer even after opening

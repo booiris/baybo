@@ -37,10 +37,10 @@ impl ChannelAskGate {
     /// On a turn cancel the arm returns at once without awaiting anything:
     /// the loop drops the tool future the moment this yields `Pending`, so a
     /// write started there would be torn. The write-ahead insert itself can
-    /// outlive a dropped future and commit after the loop's cancel fill,
-    /// leaving a pending row no queue shows; the next boot closes it. On an
-    /// ancestor cancel (process shutdown) it never returns: the row stays
-    /// pending, and the next boot closes it.
+    /// outlive a dropped future and commit after the loop's cancel fill; the
+    /// settlement skips a call that already has a result. On an ancestor cancel (process
+    /// shutdown) it never returns, leaving the ask pending for the next
+    /// process.
     async fn park(&self, row: HumanAskRow, cancel: AskCancel) -> Option<AskResolution> {
         if let Err(e) = self.core.store().create(&row).await {
             tracing::warn!(
@@ -170,7 +170,7 @@ fn approval_row(req: ApprovalRequest, site: AskSite) -> Option<HumanAskRow> {
     })
 }
 
-/// A dropped waiter takes its ask off the queue; it never resolves it.
+/// A dropped waiter orphans its ask; it never resolves it.
 struct OrphanOnDrop {
     queue: AskQueue,
     ask_id: AskId,
