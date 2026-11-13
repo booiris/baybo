@@ -35,7 +35,7 @@ mod markdown;
 pub mod smoke_contract;
 pub mod transport;
 
-pub use baybo_tools::ApprovalQueue;
+pub use baybo_human_ask::AskQueue;
 pub use event::{LogLevel, LogRecord, TuiLogSink};
 pub use transport::{TransportEvent, TransportEventStream};
 
@@ -104,7 +104,7 @@ pub struct TuiAdapter {
     on_exit: Option<OnExit>,
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>,
-    approval_queue: ApprovalQueue,
+    approval_queue: AskQueue,
     transport: Arc<WsTransport>,
 }
 
@@ -207,7 +207,7 @@ struct LoopCtx {
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     model_label: Option<String>,
     on_exit: Option<OnExit>,
-    approval_queue: ApprovalQueue,
+    approval_queue: AskQueue,
 }
 
 async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sender<AppEvent>) {

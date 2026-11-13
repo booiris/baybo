@@ -10,8 +10,9 @@
 
 use std::sync::Arc;
 
+use baybo_human_ask::{AskQueue, PendingWatcher};
 use baybo_model::{ChannelType, ResourceAccess, SessionId};
-use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest, PendingWatcher};
+use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -41,7 +42,7 @@ pub type DispatchObserver = Arc<dyn for<'a> Fn(&SessionEvent, SubscribedView<'a>
 /// addressable from the channel.
 pub struct ApprovalSurface {
     pub gate: Arc<dyn ApprovalGate>,
-    pub queue: ApprovalQueue,
+    pub queue: AskQueue,
 }
 
 /// Live protocol surface. One per [`ChannelType`]. Created eagerly at
@@ -301,7 +302,7 @@ impl Channel {
     pub fn dispatch_approval_requested(
         &self,
         call_id: String,
-        tool_call_id: Option<String>,
+        tool_call_id: String,
         session_id: SessionId,
         user_id: String,
         tool: String,

@@ -7,16 +7,14 @@ use parking_lot::Mutex;
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
 #[cfg(test)]
 use baybo_model::TrustLevel;
-use baybo_model::{
-    ContentBlock, InheritedToolContext, ParallelGroup, SessionId, SpanId, TurnId, User,
-};
+use baybo_model::{ContentBlock, ParallelGroup, SessionId, SpanId, TurnId, User};
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalHandle, ApprovalOutcome,
-    ApprovalRequest, ApprovedResource, AutoDenyGate, ExecSandbox, ReadTracker, ResourceAccess,
-    ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry,
-    VirtualReadResolver, approval::preview_params, refusal_reason,
+    ApprovalRequest, ApprovedResource, ExecSandbox, ReadTracker, ResourceAccess, ToolCapability,
+    ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry, VirtualReadResolver,
+    approval::preview_params, refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
@@ -427,6 +425,8 @@ pub struct BoardStores {
 pub struct ToolExecutor {
     tool_registry: Arc<ToolRegistry>,
     gate_map: Arc<ApprovalGateMap>,
+    /// The gate every ask of an unattended turn goes to, in both phases.
+    policy_deny: Arc<dyn ApprovalGate>,
     security_gateway: Arc<SecurityGateway>,
     /// Sandbox FS scope (= `<workspace>/work/`). Forwarded to
     /// [`ToolContext::workspace_root`].
@@ -478,10 +478,12 @@ impl ToolExecutor {
         background_jobs: Option<Arc<dyn baybo_tools::background::BackgroundJobSink>>,
         background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
         board: Option<BoardStores>,
+        policy_deny: Arc<dyn ApprovalGate>,
     ) -> Self {
         Self {
             tool_registry,
             gate_map,
+            policy_deny,
             security_gateway,
             workspace_root,
             workspace_paths,
@@ -679,10 +681,10 @@ impl ToolExecutor {
         // Handle a cron-fire tool (`report_nothing`) flips to suppress this
         // fire's notification. `None` for every turn that cannot be silenced.
         notify_silence: Option<baybo_tools::NotifySilence>,
-        // Transient authority attached to this execution lineage. In-process
-        // subagents inherit it unchanged; independent turns do not reconstruct
-        // it from persistent session state.
-        inherited_context: Option<InheritedToolContext>,
+        // Whether a human can answer this turn's asks — computed once per turn
+        // by the agent loop from the turn's kind. Unattended calls send every
+        // ask, in both phases, to the policy-deny gate. Tools never see it.
+        attended: bool,
         // True when the agent loop unwrapped this call from a `ToolInvoke`
         // envelope. The model wrote these params from a `ToolSearch` result
         // rather than a provider-enforced schema, so the executor
@@ -742,6 +744,11 @@ impl ToolExecutor {
         // the cancel-aware close-on-Err path.
         let cancel_for_close = cancel_token.clone();
         let cancel_for_gate = cancel_token.clone();
+        let gate: Arc<dyn ApprovalGate> = if attended {
+            self.gate_map.get(&user.channel, session_id)
+        } else {
+            Arc::clone(&self.policy_deny)
+        };
 
         // The call's approval decision, written from inside the span body and
         // read back after it — including on the paths where the body returns
@@ -833,34 +840,9 @@ impl ToolExecutor {
                 }
 
                 if !uncovered.is_empty() {
-                    if inherited_context.is_some() {
-                        *approval_sink.lock() = Some(ApprovalDecision::Deny);
-                        for access in &uncovered {
-                            let _ = recorder
-                                .emit_event(
-                                    span_handle.span_id,
-                                    event_seq,
-                                    SpanEventKind::Approval {
-                                        decision: ApprovalDecision::Deny,
-                                        resource: access.clone(),
-                                    },
-                                )
-                                .await;
-                            event_seq += 1;
-                        }
-                        return Err(anyhow::Error::new(ToolError::Denied {
-                            tool: tool_name_owned.clone(),
-                            reason: String::from(
-                                "this execution runs unattended and cannot raise an approval \
-                                 prompt for the resources this call requires; run this operation \
-                                 from an interactive user session",
-                            ),
-                        }));
-                    }
-                    let gate = self.gate_map.get(&user.channel, session_id);
                     let request = gate.request(ApprovalRequest {
                         call_id: Uuid::new_v4().to_string(),
-                        tool_call_id: Some(tool_use_id.clone()),
+                        tool_call_id: tool_use_id.clone(),
                         session_id: session_id.clone(),
                         user_id: user.id.clone(),
                         tool: tool_name_owned.clone(),
@@ -986,15 +968,10 @@ impl ToolExecutor {
                 // Mid-execution approval handle. The probe clone shares the
                 // handle's decision cell, so after the tool returns we can
                 // read back what any mid-call prompt decided.
-                let approval_gate: Arc<dyn ApprovalGate> = if inherited_context.is_some() {
-                    Arc::new(AutoDenyGate)
-                } else {
-                    self.gate_map.get(&user.channel, session_id)
-                };
                 let approval = ApprovalHandle::new(
-                    approval_gate,
+                    Arc::clone(&gate),
                     Arc::clone(approved_resources),
-                    Some(tool_use_id.clone()),
+                    tool_use_id.clone(),
                 );
                 let approval_probe = approval.clone();
 
@@ -1054,7 +1031,6 @@ impl ToolExecutor {
                     // interactive agent loop, so `Edit`/`Write` enforce the
                     // contract here (unlike the background-summary pass).
                     read_tracker: Some(read_tracker),
-                    inherited_context: inherited_context.clone(),
                     background_eligible: background.eligible,
                     overrun_to_background: background.overrun_to_background,
                     background_jobs: self.background_jobs.clone(),
@@ -1459,7 +1435,6 @@ mod tests {
         ExecutedTool, InvokeValidatorCache, ToolExecutor, admits_repo, admits_worktree,
         permissive_scope,
     };
-    use baybo_model::InheritedToolContext;
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1979,6 +1954,7 @@ mod tests {
                 )),
                 agents: Arc::clone(&store.agent_profile),
             }),
+            Arc::new(baybo_human_ask::PolicyDenyGate::new()),
         );
 
         IssueRunFixture {
@@ -2053,7 +2029,7 @@ mod tests {
                 TurnBackground::NONE,
                 ReadTracker::default(),
                 None,
-                None,
+                true,
                 false,
             )
             .await;
@@ -2385,7 +2361,7 @@ mod tests {
         tool: Arc<dyn baybo_tools::Tool>,
         gate: Arc<dyn baybo_tools::ApprovalGate>,
         approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
-        inherited_context: Option<InheritedToolContext>,
+        attended: bool,
     ) -> ExecutedTool {
         let tool_name = tool.name().to_string();
         let mut registry = ToolRegistry::new();
@@ -2395,7 +2371,7 @@ mod tests {
             tool_name,
             gate,
             approved_resources,
-            inherited_context,
+            attended,
             None,
         )
         .await
@@ -2417,7 +2393,7 @@ mod tests {
         tool_name: String,
         gate: Arc<dyn baybo_tools::ApprovalGate>,
         approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
-        inherited_context: Option<InheritedToolContext>,
+        attended: bool,
         after_authorization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> ExecutedTool {
         let home = tempfile::tempdir().expect("tempdir");
@@ -2448,12 +2424,13 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(baybo_human_ask::PolicyDenyGate::new()),
         );
         if let Some(hook) = after_authorization_hook {
             executor = executor.with_after_authorization_hook(hook);
         }
 
-        let session_id = SessionId::from("sess-inherited-authorization");
+        let session_id = SessionId::from("sess-authorization");
         let recorder = Arc::new(SpanRecorder::new(
             session_id.clone(),
             "u1".to_string(),
@@ -2482,7 +2459,7 @@ mod tests {
                 &recorder,
                 &step,
                 None,
-                "tool-use-inherited-context".to_string(),
+                "tool-use-authorization".to_string(),
                 None,
                 None,
                 CancellationToken::new(),
@@ -2491,7 +2468,7 @@ mod tests {
                 TurnBackground::NONE,
                 ReadTracker::default(),
                 None,
-                inherited_context,
+                attended,
                 false,
             )
             .await
@@ -2506,7 +2483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inherited_context_runs_zero_access_mcp_tool_without_any_gate() {
+    async fn an_unattended_turn_runs_a_zero_access_mcp_tool_without_any_gate() {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
         let executed = execute_authorization_tool(
@@ -2518,7 +2495,7 @@ mod tests {
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext),
+            false,
         )
         .await;
 
@@ -2574,7 +2551,7 @@ mod tests {
             SELECTED_MCP_TOOL.to_string(),
             gate,
             Arc::clone(&approved),
-            None,
+            true,
             Some(hook),
         )
         .await;
@@ -2595,23 +2572,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inherited_context_denies_uncovered_access_without_prompting() {
+    async fn an_unattended_turn_policy_denies_uncovered_access_without_prompting() {
         let (gate_calls, gate) = counting_gate();
         let executed = execute_authorization_tool(
             Arc::new(GatedTool),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            Some(InheritedToolContext),
+            false,
         )
         .await;
 
         let error = executed.output.expect_err("uncovered access must fail");
-        assert!(error.to_string().contains("runs unattended"), "{error}");
+        assert!(
+            error.to_string().contains(baybo_tools::refusal_reason(
+                baybo_tools::ApprovalResolution::Policy
+            )),
+            "{error}"
+        );
         assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn inherited_context_auto_denies_access_discovered_during_mcp_execution() {
+    async fn an_unattended_turn_policy_denies_access_discovered_during_execution() {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
         let approved = Arc::new(Mutex::new(Vec::new()));
@@ -2624,7 +2606,7 @@ mod tests {
             }),
             gate,
             Arc::clone(&approved),
-            Some(InheritedToolContext),
+            false,
         )
         .await;
 
@@ -2651,7 +2633,7 @@ mod tests {
             }),
             gate,
             Arc::new(Mutex::new(Vec::new())),
-            None,
+            true,
         )
         .await;
 
@@ -2708,6 +2690,7 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(baybo_human_ask::PolicyDenyGate::new()),
         );
 
         let session_id = SessionId::from("sess-gate");
@@ -2748,7 +2731,7 @@ mod tests {
                 TurnBackground::NONE,
                 ReadTracker::default(),
                 None,
-                None,
+                true,
                 false,
             )
             .await;

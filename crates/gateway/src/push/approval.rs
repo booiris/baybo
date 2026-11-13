@@ -25,8 +25,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use baybo_channels::Channel;
+use baybo_human_ask::PendingEdge;
 use baybo_model::SessionId;
-use baybo_tools::PendingEdge;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 

@@ -784,7 +784,6 @@ impl AgentActor {
                 None,
                 None,
                 cron_report.clone(),
-                None,
             )
             .await;
         self.volatile.agent_loop.set_notification_cue(false);

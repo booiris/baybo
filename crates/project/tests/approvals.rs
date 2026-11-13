@@ -248,7 +248,7 @@ fn new_member(name: &str) -> baybo_project::NewTeamMember {
 fn request(session_id: &SessionId, call_id: &str) -> ApprovalRequest {
     ApprovalRequest {
         call_id: call_id.to_owned(),
-        tool_call_id: None,
+        tool_call_id: String::new(),
         session_id: session_id.clone(),
         user_id: "u".to_owned(),
         tool: "Bash".to_owned(),

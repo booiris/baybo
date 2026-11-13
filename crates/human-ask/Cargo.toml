@@ -1,0 +1,18 @@
+[package]
+name = "baybo-human-ask"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+baybo-model = { workspace = true }
+baybo-tools = { workspace = true }
+
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

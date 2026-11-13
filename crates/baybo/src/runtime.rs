@@ -840,6 +840,7 @@ pub async fn build_managers(
             projects: Arc::clone(&project_manager) as Arc<dyn baybo_project::ProjectRepo>,
             agents: stores.agent_profile.clone(),
         }),
+        Arc::new(baybo_human_ask::PolicyDenyGate::new()),
     ));
 
     // --- per-actor parent token. The spawner factory derives each

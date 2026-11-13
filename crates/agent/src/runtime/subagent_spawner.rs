@@ -171,7 +171,6 @@ impl ActorSubagentSpawner {
         let SubagentParentContext {
             turn_id: parent_turn_id,
             span_id: parent_span_id,
-            inherited_context,
             ..
         } = parent_ctx;
         let child_session = match self
@@ -241,7 +240,6 @@ impl ActorSubagentSpawner {
                     .send(AgentMessage::SubagentSpawned {
                         initial_message: Box::new(incoming),
                         parent_turn_id,
-                        inherited_context,
                     })
                     .await
                 {

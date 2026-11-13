@@ -59,6 +59,7 @@ baybo-skills = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-store = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-trace = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 

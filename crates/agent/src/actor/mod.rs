@@ -134,10 +134,6 @@ pub enum AgentMessage {
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_turn_id: baybo_model::TurnId,
-        /// Transient tool authority inherited from the dispatching execution.
-        /// It follows in-process delegation, but is never reconstructed from
-        /// the persistent child session.
-        inherited_context: Option<baybo_model::InheritedToolContext>,
     },
     /// A detached subagent or `Bash` command reached a terminal state. The
     /// completion enters `session.state.background_notifications`, where it
@@ -551,10 +547,9 @@ impl AgentActor {
             AgentMessage::SubagentSpawned {
                 initial_message,
                 parent_turn_id,
-                inherited_context,
             } => {
                 if let Err(e) = self
-                    .handle_subagent_spawned(*initial_message, parent_turn_id, inherited_context)
+                    .handle_subagent_spawned(*initial_message, parent_turn_id)
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -622,11 +617,8 @@ impl AgentActor {
         // `report_nothing` silence and the record of what it hands to the
         // background. `None` for every other turn. See `dispatch_cron_prompt`.
         cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
-        // Transient authority supplied by the turn dispatcher. It is not
-        // reconstructed from persistent session metadata on later turns.
-        inherited_context: Option<baybo_model::InheritedToolContext>,
     ) -> anyhow::Result<OutgoingMessage> {
-        let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
+        let is_user_turn = turn_input.input_kind().is_user_facing();
         // Kept so the error path below can tell a user `/stop` (token
         // tripped via the turn cancel) apart from a genuine failure.
         let turn_token = self.volatile.actor_token.child_token();
@@ -636,41 +628,21 @@ impl AgentActor {
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
-        let result = match inherited_context {
-            Some(context) => {
-                self.volatile
-                    .agent_loop
-                    .run_with_inherited_context(
-                        &mut self.durable.session,
-                        turn_input,
-                        &self.volatile.turn_lifecycle,
-                        &self.volatile.span_recorder,
-                        parent_turn_id,
-                        delta_tx,
-                        turn_token.clone(),
-                        interjections,
-                        cron_report,
-                        context,
-                    )
-                    .await
-            }
-            None => {
-                self.volatile
-                    .agent_loop
-                    .run(
-                        &mut self.durable.session,
-                        turn_input,
-                        &self.volatile.turn_lifecycle,
-                        &self.volatile.span_recorder,
-                        parent_turn_id,
-                        delta_tx,
-                        turn_token.clone(),
-                        interjections,
-                        cron_report,
-                    )
-                    .await
-            }
-        };
+        let result = self
+            .volatile
+            .agent_loop
+            .run(
+                &mut self.durable.session,
+                turn_input,
+                &self.volatile.turn_lifecycle,
+                &self.volatile.span_recorder,
+                parent_turn_id,
+                delta_tx,
+                turn_token.clone(),
+                interjections,
+                cron_report,
+            )
+            .await;
         let cancelled = turn_token.is_cancelled();
         if let Some(out) = stopped_out {
             *out = cancelled;
@@ -726,7 +698,7 @@ impl AgentActor {
             .agent_loop
             .append_issue_brief(number, checkout, brief, &files)
             .await?;
-        self.run_agent_loop(turn_input, None, None, None, None, None, None)
+        self.run_agent_loop(turn_input, None, None, None, None, None)
             .await?;
         Ok(())
     }
@@ -771,15 +743,7 @@ impl AgentActor {
         let cron_report = matches!(delivery, CronDelivery::Channel)
             .then(crate::runtime::cron_report_turn::CronReportTurn::new);
         let ran = self
-            .run_agent_loop(
-                turn_input,
-                None,
-                None,
-                None,
-                None,
-                cron_report.clone(),
-                Some(baybo_model::InheritedToolContext),
-            )
+            .run_agent_loop(turn_input, None, None, None, None, cron_report.clone())
             .await;
         // Recorded whether or not the turn went on to fail: work it handed
         // over runs on, and its follow-up is the fire's report either way.
@@ -1278,7 +1242,6 @@ impl AgentActor {
                 None,
                 None,
                 None,
-                None,
             )
             .await?;
         self.send_user_reply(response).await;
@@ -1340,7 +1303,6 @@ impl AgentActor {
                 Some(response_tx),
                 Some(&mut interjections),
                 Some(&mut stopped),
-                None,
                 None,
             )
             .await;
@@ -1576,7 +1538,6 @@ impl AgentActor {
         &mut self,
         incoming: IncomingMessage,
         parent_turn_id: baybo_model::TurnId,
-        inherited_context: Option<baybo_model::InheritedToolContext>,
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let response_tx = self.volatile.response_tx.clone();
@@ -1594,7 +1555,6 @@ impl AgentActor {
                 None,
                 None,
                 None,
-                inherited_context,
             )
             .await?;
         self.send_response(response.into(), "subagent").await;

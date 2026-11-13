@@ -8,8 +8,8 @@ use baybo_llm::{
 };
 use baybo_memory::{Memory, MemoryContext, MemoryScope};
 use baybo_model::{
-    ChatMessage, ContentBlock, InheritedToolContext, LlmEntryName, MessageSource,
-    TOOL_DENIED_INFIX, TOOL_DENIED_PREFIX, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TurnId,
+    ChatMessage, ContentBlock, LlmEntryName, MessageSource, TOOL_DENIED_INFIX, TOOL_DENIED_PREFIX,
+    TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TurnId,
 };
 use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
@@ -863,67 +863,6 @@ impl AgentLoop {
         // other turn (see `AgentActor::dispatch_cron_prompt`).
         cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<OutgoingMessage> {
-        self.run_with_optional_inherited_context(
-            session,
-            turn_input,
-            turn_lifecycle,
-            span_recorder,
-            parent_turn_id,
-            delta_tx,
-            cancel_token,
-            interjections,
-            cron_report,
-            None,
-        )
-        .await
-    }
-
-    /// Run a turn with transient tool authority inherited from its dispatching
-    /// execution. The context follows in-process delegation, but is never
-    /// reconstructed from persistent session state on an independent turn.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_with_inherited_context(
-        &mut self,
-        session: &mut Session,
-        turn_input: TurnInput,
-        turn_lifecycle: &Arc<TurnLifecycle>,
-        span_recorder: &Arc<SpanRecorder>,
-        parent_turn_id: Option<TurnId>,
-        delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        cancel_token: CancellationToken,
-        interjections: Option<&mut dyn InterjectionSource>,
-        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
-        inherited_context: InheritedToolContext,
-    ) -> anyhow::Result<OutgoingMessage> {
-        self.run_with_optional_inherited_context(
-            session,
-            turn_input,
-            turn_lifecycle,
-            span_recorder,
-            parent_turn_id,
-            delta_tx,
-            cancel_token,
-            interjections,
-            cron_report,
-            Some(inherited_context),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_with_optional_inherited_context(
-        &mut self,
-        session: &mut Session,
-        turn_input: TurnInput,
-        turn_lifecycle: &Arc<TurnLifecycle>,
-        span_recorder: &Arc<SpanRecorder>,
-        parent_turn_id: Option<TurnId>,
-        delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        cancel_token: CancellationToken,
-        interjections: Option<&mut dyn InterjectionSource>,
-        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
-        inherited_context: Option<InheritedToolContext>,
-    ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
         // Memory recall query (and write eligibility) for this turn — `None`
         // for kinds that don't participate (Spawned / notification).
@@ -966,7 +905,6 @@ impl AgentLoop {
                         memory_query,
                         turn_kind,
                         cron_report.clone(),
-                        inherited_context.clone(),
                     )
                     .await?;
                 let output = if cron_report
@@ -1027,7 +965,6 @@ impl AgentLoop {
         memory_query: Option<Vec<ContentBlock>>,
         turn_kind: TurnInputKind,
         cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
-        inherited_context: Option<InheritedToolContext>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
         // A cron fire that overran would push "results will follow" and then
@@ -1036,6 +973,7 @@ impl AgentLoop {
             eligible: session.can_host_background_jobs(),
             overrun_to_background: !matches!(turn_kind, TurnInputKind::Cron),
         };
+        let attended = turn_kind.is_attended();
         self.context_manager.ensure_seeded().await?;
         // Churn and repeated failure are within-turn properties. Editing a
         // file back to how it was is exactly what "undo that" means when the
@@ -1218,7 +1156,7 @@ impl AgentLoop {
                         &mut turn_attachments,
                         background,
                         cron_report.clone(),
-                        inherited_context.clone(),
+                        attended,
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
@@ -1343,7 +1281,9 @@ impl AgentLoop {
         // per turn in `run_inner`.
         background: crate::runtime::tool_executor::TurnBackground,
         cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
-        inherited_context: Option<InheritedToolContext>,
+        // Whether a human can answer this turn's asks — computed once per
+        // turn in `run_inner`.
+        attended: bool,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
@@ -1523,7 +1463,6 @@ impl AgentLoop {
         }
         let read_tracker_for_calls = self.read_tracker.clone();
         let notify_silence_for_calls = cron_report.as_ref().map(|turn| turn.silence.clone());
-        let inherited_context_for_calls = inherited_context.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response
             .tool_calls
@@ -1532,7 +1471,6 @@ impl AgentLoop {
             .map(|(tc, dispatch)| {
                 let executor = Arc::clone(&executor);
                 let notify_silence = notify_silence_for_calls.clone();
-                let inherited_context = inherited_context_for_calls.clone();
                 let session_id = session_id_for_calls.clone();
                 let session_trigger = session_trigger_for_calls.clone();
                 let agent_id = agent_for_calls.clone();
@@ -1591,7 +1529,7 @@ impl AgentLoop {
                             background,
                             read_tracker,
                             notify_silence,
-                            inherited_context,
+                            attended,
                             via_invoke,
                         )
                         .await

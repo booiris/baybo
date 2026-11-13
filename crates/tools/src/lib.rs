@@ -19,10 +19,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{
-    AgentHandle, AgentProfileId, InheritedToolContext, SessionId, SpanId, TriggerSource, TurnId,
-    User,
-};
+use baybo_model::{AgentHandle, AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -30,9 +27,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub use approval::{
-    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalOutcome, ApprovalQueue,
-    ApprovalRequest, ApprovalResolution, ApprovedResource, AutoDenyGate, ChannelApprovalGate,
-    HostPattern, PendingEdge, PendingWatcher, ResourceAccess, refusal_reason,
+    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalOutcome, ApprovalRequest,
+    ApprovalResolution, ApprovedResource, AutoDenyGate, HostPattern, ResourceAccess,
+    refusal_reason,
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::paths::shell_reachable_workspace_roots;
@@ -443,12 +440,6 @@ pub struct ToolContext {
     /// for the interactive agent loop**; argv-mode / test call sites leave it
     /// `None`, which disables the contract. See [`ReadTracker`].
     pub read_tracker: Option<ReadTracker>,
-    /// Transient tool authority inherited by this execution. `Some`, including
-    /// `Some(default())`, makes the executor fail closed instead of prompting,
-    /// and `spawn_subagent` forwards it unchanged to in-process children. It
-    /// is not persistent session state, so a later independent turn receives
-    /// `None`.
-    pub inherited_context: Option<InheritedToolContext>,
     /// Whether this call may **create** background work: a `Bash` command
     /// that converts to background on timeout, or a subagent that converts
     /// (or is dispatched) instead of blocking: whether the session is
@@ -567,7 +558,6 @@ impl ToolContext {
             secrets: None,
             virtual_reads: None,
             read_tracker: None,
-            inherited_context: None,
             // Inert on its own — nothing backgrounds until a test also wires
             // `background_jobs`, so defaulting to eligible keeps a fixture
             // that wires the sink meaning what it says.
@@ -706,9 +696,8 @@ pub struct ApprovalHandle {
     /// pre-execute prompts use a single source of truth.
     approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
     /// `tool_use_id` of the call this handle serves, stamped onto every
-    /// [`ApprovalRequest`] so clients can badge the right work step. `None`
-    /// for handles built outside a tool-call context (tests).
-    tool_call_id: Option<String>,
+    /// [`ApprovalRequest`] so clients can badge the right work step.
+    tool_call_id: String,
     /// Last decision an ACTUAL prompt returned (cache short-circuits never
     /// record). Shared across clones so the executor reads back what
     /// mid-execution prompts decided after the tool returns.
@@ -719,7 +708,7 @@ impl ApprovalHandle {
     pub fn new(
         gate: Arc<dyn ApprovalGate>,
         approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
-        tool_call_id: Option<String>,
+        tool_call_id: String,
     ) -> Self {
         Self {
             gate,
@@ -1238,11 +1227,7 @@ mod approval_handle_tests {
     #[async_trait]
     impl ApprovalGate for FixedGate {
         async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
-            assert_eq!(
-                req.tool_call_id.as_deref(),
-                Some("use-1"),
-                "prompt carries the tool call id"
-            );
+            assert_eq!(req.tool_call_id, "use-1", "prompt carries the tool call id");
             ApprovalOutcome::answered(self.0)
         }
     }
@@ -1251,7 +1236,7 @@ mod approval_handle_tests {
         ApprovalHandle::new(
             Arc::new(FixedGate(decision)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
-            Some("use-1".into()),
+            "use-1".into(),
         )
     }
 
@@ -1316,7 +1301,7 @@ mod approval_handle_tests {
         let h = ApprovalHandle::new(
             Arc::new(FixedGate(ApprovalDecision::Deny)),
             cache,
-            Some("use-1".into()),
+            "use-1".into(),
         );
         let out = h
             .request(

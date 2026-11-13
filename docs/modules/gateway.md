@@ -292,8 +292,8 @@ running against a peer that is gone.
 
 ### Tool approval over the sidecar WS
 
-Each `Channel` is born at boot with its own `ChannelApprovalGate` +
-`ApprovalQueue` (the `ApprovalSurface` on
+Each `Channel` is born at boot with its own `baybo_human_ask::ChannelAskGate` +
+`AskQueue` (the `ApprovalSurface` on
 `crates/channels/src/channel.rs`), built in `src/channel/boot.rs::
 build_channel`. When a tool call hits the gate the entry is pushed on
 the queue and the waker dispatches a `SessionEvent::ApprovalRequested`

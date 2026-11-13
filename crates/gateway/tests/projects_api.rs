@@ -1672,7 +1672,7 @@ async fn park_through(
         async move {
             gate.request(baybo_tools::ApprovalRequest {
                 call_id,
-                tool_call_id: None,
+                tool_call_id: String::new(),
                 session_id: session,
                 user_id: "owner".to_owned(),
                 tool: "Bash".to_owned(),

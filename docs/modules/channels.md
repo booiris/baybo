@@ -176,7 +176,7 @@ methods on `Channel`:
 | Method                          | Origin                                       | Event constructed              |
 | ------------------------------- | -------------------------------------------- | ------------------------------ |
 | `dispatch_agent(output)`        | Agent router (per-turn assistant output)     | `SessionEvent::Agent(_)`       |
-| `dispatch_approval_requested(…)`| `ChannelApprovalGate` waker, when a tool call blocks | `SessionEvent::ApprovalRequested {..}` |
+| `dispatch_approval_requested(…)`| `ChannelAskGate` waker, when a tool call blocks | `SessionEvent::ApprovalRequested {..}` |
 | `dispatch_approval_resolved(…)` | Connection sent `Frame::ResolveApproval` first; the resolver fans out so concurrent UIs drop the prompt | `SessionEvent::ApprovalResolved {..}` |
 
 Plus one Subscribed-exclusive method on the view:
@@ -598,6 +598,7 @@ deliberately.
 | ---------- | ----------------------------------------------------------------------------------------------------------------- |
 | `model`    | Provides `ContentBlock`, `ChannelType`, `SessionId`, `ResourceAccess`, `User`                      |
 | `agent`    | Router owns the registry and calls `Channel::dispatch_agent` (and the approval-dispatch helpers) by `ChannelType` |
-| `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `ApprovalQueue` backs `ApprovalSurface`       |
+| `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry |
+| `human-ask` | `AskQueue` backs `ApprovalSurface` |
 | `gateway`  | Hosts the in-tree transports (`/v1/channel-ws` and the paired-device Noise relay leg); installs channels at boot from config and lazily on any uninstalled type's first connect, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |
 | `security` | Inbound user messages go to `SecurityGateway` first after entering the system                                     |

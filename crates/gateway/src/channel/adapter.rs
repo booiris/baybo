@@ -423,7 +423,7 @@ async fn session_event_to_frame(
             description,
         } => Frame::ApprovalRequested {
             call_id,
-            tool_call_id,
+            tool_call_id: Some(tool_call_id),
             session_id,
             user_id,
             tool,

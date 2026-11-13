@@ -24,6 +24,7 @@ baybo-model = { workspace = true }
 baybo-channels = { workspace = true }
 baybo-llm = { workspace = true }
 baybo-tools = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 baybo-context = { workspace = true }
 baybo-turn = { workspace = true }

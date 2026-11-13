@@ -499,6 +499,7 @@ impl AgentTestHarnessBuilder {
             self.background_jobs,
             None,
             None,
+            Arc::new(baybo_human_ask::PolicyDenyGate::new()),
         ));
 
         let tokenizer = Arc::new(HeuristicTokenizer);
