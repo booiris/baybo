@@ -828,6 +828,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         "gateway start: all components initialized"
     );
 
+    // Before the router takes traffic, so no background job can be in flight:
+    // a recurring cron fire still waiting on one lost it to the restart.
+    run_handle.router.report_lost_cron_background_work().await;
+
     let admin_shutdown = shutdown.clone();
     let channel_shutdown = shutdown.clone();
     let router_shutdown = shutdown.clone();

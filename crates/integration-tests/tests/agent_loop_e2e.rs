@@ -6522,6 +6522,10 @@ async fn a_recurring_fires_own_turn_records_the_work_it_hands_over() {
         stored.state.background_notifications.cron_report_handles, handed_over,
         "the fire's hand-over is recorded as the fire's"
     );
+    assert_eq!(
+        stored.state.background_notifications.cron_report_awaited, handed_over,
+        "and its report is owed until it arrives"
+    );
     assert!(
         outs.iter().any(|o| match &o.event {
             AgentEvent::Message(m) => m.content.iter().any(|b| matches!(
@@ -6532,6 +6536,169 @@ async fn a_recurring_fires_own_turn_records_the_work_it_hands_over() {
             _ => false,
         }),
         "a blank fire that started work says results will follow: {outs:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// Whether any dispatched message carries the "background work was
+/// interrupted" failure notice.
+fn reports_interrupted_work(outs: &[AgentOutput]) -> bool {
+    outs.iter().any(|o| match &o.event {
+        AgentEvent::Message(m) => m.content.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::Text(t)
+                    if t.contains(baybo_context::prompts::cron::NOTIFICATION_BACKGROUND_INTERRUPTED_BODY)
+            )
+        }),
+        _ => false,
+    })
+}
+
+/// A recurring fire whose background job died with the previous process was
+/// last heard promising a report. At the next start it says the report is not
+/// coming — in a conversation `report_nothing` may have hidden, so it is
+/// un-hidden and pushed like any failed fire — and says it only once.
+#[tokio::test(start_paused = true)]
+async fn a_fire_whose_background_work_was_lost_to_a_restart_says_so_once() {
+    let mut session = cron_fire_session(true, true);
+    session.state.background_notifications.cron_report_awaited = vec!["bg-7".into()];
+    let fire_session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder().session(session).build();
+
+    harness
+        .mailbox
+        .send(AgentMessage::CronBackgroundWorkLost)
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        reports_interrupted_work(&outs),
+        "the lost work is reported: {outs:?}"
+    );
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session");
+    assert!(!stored.hidden, "the notice un-hides the conversation");
+    assert!(
+        !stored.state.background_notifications.awaits_cron_reports(),
+        "a reported loss is no longer awaited"
+    );
+    assert_eq!(
+        cron_notification_turns(&harness, &fire_session_id)
+            .await
+            .len(),
+        1,
+        "one push edge for the notice"
+    );
+
+    harness
+        .mailbox
+        .send(AgentMessage::CronBackgroundWorkLost)
+        .await
+        .unwrap();
+    let again = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(sent_messages(&again), 0, "said once: {again:?}");
+
+    harness.shutdown().await;
+}
+
+/// A job that crashes is reported at once, and only the report it owed is
+/// settled: the fire's other work is still awaited.
+#[tokio::test(start_paused = true)]
+async fn a_fires_crashed_background_job_is_reported_at_once() {
+    let mut session = cron_fire_session(true, false);
+    session.state.background_notifications.cron_report_awaited =
+        vec!["bg-7".into(), "bg-other".into()];
+    let fire_session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder().session(session).build();
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobLost("bg-7".into()))
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(reports_interrupted_work(&outs), "reported: {outs:?}");
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session");
+    assert_eq!(
+        stored.state.background_notifications.cron_report_awaited,
+        vec![baybo_model::BackgroundHandle::from("bg-other")],
+        "the other job's report is still owed"
+    );
+
+    // A crashed job nobody was waiting on — a chat's, or one already
+    // reported — says nothing.
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobLost("bg-7".into()))
+        .await
+        .unwrap();
+    let again = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(sent_messages(&again), 0, "said once: {again:?}");
+
+    harness.shutdown().await;
+}
+
+/// A result that arrived, and a job the user stopped, are not lost work: a
+/// restart after either must not announce an interruption.
+#[tokio::test(start_paused = true)]
+async fn arrived_and_stopped_background_work_is_not_reported_lost() {
+    let mut session = cron_fire_session(true, false);
+    session.state.background_notifications.cron_report_handles =
+        vec!["bg-7".into(), "bg-stopped".into()];
+    session.state.background_notifications.cron_report_awaited =
+        vec!["bg-7".into(), "bg-stopped".into()];
+    let fire_session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder().session(session).build();
+    harness
+        .stub_llm
+        .push_response(reply("The build broke: 3 tests red.", vec![]));
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobStopped("bg-stopped".into()))
+        .await
+        .unwrap();
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            finished_build_check(),
+        )))
+        .await
+        .unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session");
+    assert!(
+        !stored.state.background_notifications.awaits_cron_reports(),
+        "nothing is owed once one arrived and the other was stopped"
+    );
+
+    harness
+        .mailbox
+        .send(AgentMessage::CronBackgroundWorkLost)
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert!(
+        !reports_interrupted_work(&outs),
+        "nothing was lost: {outs:?}"
     );
 
     harness.shutdown().await;
