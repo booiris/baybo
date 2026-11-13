@@ -13,21 +13,18 @@
 //! dispatched by queue watchers installed here, not by the gate: an ask
 //! entering the queue becomes
 //! [`SessionEvent::ApprovalRequested`](baybo_channels::SessionEvent::ApprovalRequested),
-//! and every ask leaving it — answered or abandoned — becomes
+//! and every ask leaving it — answered or abandoned — becomes one
 //! [`SessionEvent::AskResolved`](baybo_channels::SessionEvent::AskResolved),
-//! plus [`SessionEvent::ApprovalResolved`](baybo_channels::SessionEvent::ApprovalResolved)
-//! when a human decided an approval.
+//! carrying the decision when a human decided an approval.
 
 use std::sync::Arc;
 
 use std::sync::Weak;
 
-use baybo_channels::wire::AskOutcomeKind;
 use baybo_channels::{AskSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult};
 use baybo_config::ChannelsConfig;
 use baybo_human_ask::{AskCore, AskQueue, AskQueueEvent, AskQueues, ChannelAskGate, PendingAsk};
 use baybo_model::ChannelType;
-use baybo_model::human_ask::AskResolution;
 use baybo_tools::ApprovalGate;
 
 use super::session_pulse::SessionPulse;
@@ -142,16 +139,7 @@ pub(crate) fn build_channel(
                 ask_id,
                 outcome,
                 ..
-            } => {
-                if let AskResolution::Approval(decision) = outcome {
-                    channel.dispatch_approval_resolved(
-                        ask_id.clone(),
-                        session_id.clone(),
-                        decision,
-                    );
-                }
-                channel.dispatch_ask_resolved(session_id, ask_id, AskOutcomeKind::from(&outcome));
-            }
+            } => channel.dispatch_ask_resolved(session_id, ask_id, &outcome),
         }
     }));
     install_session_mark(&queue, weak);
@@ -222,6 +210,8 @@ pub(crate) fn test_ask_core() -> Arc<AskCore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_channels::wire::AskOutcomeKind;
+    use baybo_model::human_ask::AskResolution;
 
     fn core() -> Arc<AskCore> {
         test_ask_core()
@@ -391,13 +381,18 @@ mod tests {
             ApprovalOutcome::answered(ApprovalDecision::Approve)
         );
         let events = w.seen.events.lock();
-        assert!(matches!(
-            &events[1..],
-            [
-                SessionEvent::ApprovalResolved { ask_id: resolved, decision: ApprovalDecision::Approve, .. },
-                SessionEvent::AskResolved { ask_id: closed, outcome: AskOutcomeKind::Answered, .. },
-            ] if resolved == "c1" && closed == "c1"
-        ));
+        assert!(
+            matches!(
+                &events[1..],
+                [SessionEvent::AskResolved {
+                    ask_id,
+                    outcome: AskOutcomeKind::Answered,
+                    decision: Some(ApprovalDecision::Approve),
+                    ..
+                }] if ask_id == "c1"
+            ),
+            "one close frame, carrying the decision"
+        );
         assert_eq!(marks(&w.seen), vec![Some(true), Some(false)]);
     }
 
@@ -417,16 +412,17 @@ mod tests {
         );
         let events = w.seen.events.lock();
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, SessionEvent::ApprovalResolved { .. })),
-            "nobody decided, so there is no decision to broadcast"
+            matches!(
+                &events[1..],
+                [SessionEvent::AskResolved {
+                    ask_id,
+                    outcome: AskOutcomeKind::Abandoned,
+                    decision: None,
+                    ..
+                }] if ask_id == "c2"
+            ),
+            "nobody decided, so the close carries no decision"
         );
-        assert!(matches!(
-            events.last(),
-            Some(SessionEvent::AskResolved { ask_id, outcome: AskOutcomeKind::Abandoned, .. })
-                if ask_id.as_str() == "c2"
-        ));
         assert_eq!(marks(&w.seen), vec![Some(true), Some(false)]);
     }
 

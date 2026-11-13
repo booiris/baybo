@@ -110,21 +110,21 @@ export class TelegramApprovals
 
   async onResolved(
     askId: string,
-    decision: ApprovalDecision,
+    decision: ApprovalDecision | undefined,
   ): Promise<void> {
     const entry = this.pending.get(askId);
     if (!entry) return;
     this.pending.delete(askId);
-    entry.resolve(decision);
+    entry.resolve(decision ?? "deny");
+    const text =
+      decision === undefined
+        ? UNDECIDED_LABEL
+        : `${decisionIcon(decision)} ${decisionLabel(decision)}`;
     try {
       // editMessageText identifies the target by (chat_id, message_id);
       // thread is already encoded in the original message, so no
       // message_thread_id is needed here.
-      await entry.handle.api.editMessageText(
-        entry.chat.chatId,
-        entry.messageId,
-        `${decisionIcon(decision)} ${decisionLabel(decision)}`,
-      );
+      await entry.handle.api.editMessageText(entry.chat.chatId, entry.messageId, text);
     } catch (err) {
       this.logger.debug("edit approval prompt on resolve failed", err);
     }
@@ -183,6 +183,9 @@ function toDecision(action: string): ApprovalDecision | null {
   }
   return null;
 }
+
+/** The prompt closed with nobody deciding: stopped, expired, or moved past. */
+const UNDECIDED_LABEL = "⏹ Closed without a decision";
 
 function decisionLabel(decision: ApprovalDecision): string {
   switch (decision) {

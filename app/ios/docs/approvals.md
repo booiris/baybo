@@ -36,12 +36,12 @@ off the bottom. Unmeasured reads as 140. `ApprovalDetailCapTests` pins the curve
 
 - **`approval_requested`** — deduped, because the gate's waker re-fires on the
   newest queue entry.
-- **`approval_resolved`** — broadcast to EVERY session's sink, so it is matched
-  by prompt id, never by session.
+- **`ask_resolved`** — sent on every close, decided or not; broadcast to EVERY
+  session's sink, so it is matched by prompt id, never by session.
 - **`subscribe_state.pending_approvals`** — the authoritative set, REPLACES the
   queue.
-- **`tool_completed`** — a **timed-out** gate broadcasts NO resolution, so the
-  completion is the only signal that retires the card.
+- **`tool_completed`** — the backstop for a close this device missed while its
+  leg was down.
 
 Answering dismisses optimistically and echoes `Frame::ResolveApproval` over the
 FFI `chat_resolve_approval` (leg-generic; both legs share the outbound pump); a

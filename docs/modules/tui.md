@@ -219,7 +219,7 @@ Typing while the agent is busy no longer parks the message in a hidden queue wit
 - Approval requests render **inline** (no overlay modal): while pending, as a live prompt in the bottom region driven by `AppState.pending_approval: Option<ApprovalChatEntry>`; once resolved, as a committed scrollback line (see below).
 - When pending, the entry is expanded: tool name, resource accesses, params preview, and three selectable options (`Approve` / `Always approve` / `Deny`). The user navigates options with `Up`/`Down` (or `k`/`j`) and confirms with `Enter`, or presses a direct shortcut (`a`/`A`/`d`).
 - After resolution the entry collapses to a single dot-led line with the decision, tool name, and the first resource access detail — e.g. `● approved: Bash (echo hello)` or `● denied: Read (/etc/shadow)`. Because the tool's scrollback block is deferred until completion, this line is **buffered onto its `RunningTool`** (matched by the approval's `tool_call_id`, via `AppState::buffer_approval_line`) rather than committed immediately, so it lands between the tool's `●` and `⎿` when the block commits. If no in-flight tool matches (shouldn't happen), it's committed standalone so the decision isn't lost. Normal input resumes immediately.
-- Approvals originate on the gateway. The WS transport observes `Frame::ApprovalRequested` and mirrors the entry into a *local* `AskQueue` (`baybo_human_ask`, through its approval-typed wrappers `enqueue_mirror` / `peek_head_approval` / `resolve_head` / `drop_call`) so the existing TUI modal logic picks it up unchanged. The queue's resolver callback (installed by `WsTransport::connect`) wraps the TUI's "approve/deny" decision in a `Frame::ResolveApproval` echoed back over the same socket, so the gateway-side gate unblocks. Inbound `Frame::ApprovalResolved` frames drop any stale local mirror — useful when a second frontend resolves the same entry.
+- Approvals originate on the gateway. The WS transport observes `Frame::ApprovalRequested` and mirrors the entry into a *local* `AskQueue` (`baybo_human_ask`, through its approval-typed wrappers `enqueue_mirror` / `peek_head_approval` / `resolve_head` / `drop_ask`) so the existing TUI modal logic picks it up unchanged. The queue's resolver callback (installed by `WsTransport::connect`) wraps the TUI's "approve/deny" decision in a `Frame::ResolveApproval` echoed back over the same socket, so the gateway-side gate unblocks. Inbound `Frame::AskResolved` frames drop any stale local mirror — useful when a second frontend resolves the same entry, or the ask closes undecided.
 - Dropping the responder (e.g. loop shutdown) still surfaces as `ApprovalDecision::Deny` on the local side. The server side does not time out (only a during-execute approval expires, after 30 min): the gateway's ask stays pending (durably, across a restart) until someone answers it or the turn moves on, and `Frame::AskResolved` drops the local mirror whichever way it closes.
 - If multiple approvals are queued (concurrent tool calls), resolving one auto-surfaces the next into the scrollback.
 
@@ -415,7 +415,7 @@ concrete transport used by the TUI. The adapter holds an
   the same WS for the currently pinned session (the pump re-reads the
   pin on every frame, so a `/new`-driven `switch_session(new_id)` rolls
   over without a stream restart) and translate them into
-  `TransportEvent::{StreamDelta, ToolStarted, ToolCompleted, Status, Response, Notice, ApprovalRequested, ApprovalResolved}`. `Frame::Reasoning` is dropped (no variant) — the TUI shows a working indicator instead of the thinking trace.
+  `TransportEvent::{StreamDelta, ToolStarted, ToolCompleted, Status, Response, Notice, ApprovalRequested}`. `Frame::Reasoning` is dropped (no variant) — the TUI shows a working indicator instead of the thinking trace.
 - `approval_queue()` — returns the transport's local `AskQueue`.
   On construction, `WsTransport::connect` installs a resolver so
   `queue.resolve_head(decision)` also sends a
@@ -437,7 +437,7 @@ does not need to know about the transport:
 - `ToolStarted { call_id, tool, label }` / `ToolCompleted { call_id, status, summary }` → the matching `AppEvent` variants. `ToolStarted` records a live `RunningTool` (working-zone row) and commits nothing; `ToolCompleted` pops it and commits the whole `● tool` + (buffered approval) + `⎿ summary` block as one unit, so results stay under their tool across concurrent calls — see [Chat](#chat). `Frame::Reasoning` has no `TransportEvent`/`AppEvent` mapping — the pump drops it (the working indicator stands in for the thinking trace).
 - `Response(blocks)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. Finalises the response via `finalize_stream` (commit the trailing partial + non-text extras, or render the body from blocks when nothing streamed — see [Chat](#chat)), then clears `AppState.streaming`.
 - `Notice { level, text }` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log surface.
-- `ApprovalRequested` / `ApprovalResolved` — see [Inline approval prompt](#inline-approval-prompt).
+- `ApprovalRequested` / `AskResolved` — see [Inline approval prompt](#inline-approval-prompt).
 
 Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS frames are fed in.
 

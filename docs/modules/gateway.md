@@ -305,9 +305,9 @@ the `human_asks` ledger and pushed on the queue. Frames come from the queue
 watchers `build_channel` installs, not from the gate: `AskRaised` dispatches
 `SessionEvent::ApprovalRequested` through the channel's fan-out so every
 subscriber of the call's session sees it; every `AskClosed` dispatches
-`SessionEvent::AskResolved` (→ `Frame::AskResolved`), plus
-`SessionEvent::ApprovalResolved` when a human decided an approval, so all
-frontends drop the card however it closed. A per-session pending-edge watcher
+`SessionEvent::AskResolved` (→ `Frame::AskResolved`), carrying the
+`decision` when a human decided an approval, so all frontends drop the card
+however it closed and can label the step with what was decided. A per-session pending-edge watcher
 broadcasts the `SessionPatch.awaiting_human` list mark. The client echoes a
 `ResolveApproval { ask_id, decision }` frame; the inbound loop checks the ask
 is on this connection's channel queue and calls `HumanAskManager::resolve`,
@@ -1031,14 +1031,14 @@ The full frame set (see `crates/wire/src/lib.rs`):
   the `SubscribeState` bundle instead. Streaming clients (TUI / web)
   render these live; clients without a partial surface drop them.
   See [`docs/turn-progress-events.md`](../turn-progress-events.md).
-- **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
-  client), `ResolveApproval` (client → server); the on-subscribe
+- **Approvals:** `ApprovalRequested` (server → client), `ResolveApproval`
+  (client → server); the on-subscribe
   authoritative set rides `SubscribeState.pending_approvals`. Approvals
   survive a restart (the boot reload re-queues them from the `human_asks`
-  ledger) and never time out, except a during-execute approval (30 min). `AskResolved { ask_id, outcome }` (server →
+  ledger) and never time out, except a during-execute approval (30 min). `AskResolved { ask_id, outcome, decision? }` (server →
   client, session-less, `outcome` ∈ `answered | declined | abandoned`) is
-  sent on every close of any ask kind — the only frame that retires an
-  approval nobody decided. `ResolveApproval` resolves through
+  sent once on every close of any ask kind; `decision` is set only when a
+  human decided an approval. It is the one close frame. `ResolveApproval` resolves through
   `HumanAskManager::resolve`, and only for an ask on the connection's own
   channel queue. A multiplexed sidecar is re-sent every pending approval on
   its channel's queue right after it registers, since it has no

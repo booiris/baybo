@@ -218,7 +218,7 @@ async fn announce_pending_asks(sidecar: &Sidecar) {
 /// A client answered an approval card. Scoped to this connection's channel:
 /// only an ask on its own queue (live, or dead after a restart) is answerable
 /// from here. The manager claims the decision in the ledger first; the queue
-/// watchers then dispatch `ApprovalResolved` + `AskResolved` to every client.
+/// watchers then dispatch `AskResolved`, with the decision, to every client.
 async fn resolve_approval(
     state: &WsChannelState,
     sidecar: &Sidecar,
@@ -723,7 +723,7 @@ async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session
     // Do every `.await` FIRST, then snapshot the REPLACE-sets (work steps +
     // pending approvals) and send with NO suspension in between. These two are
     // authoritative replacements on the client, so a live `ApprovalRequested` /
-    // `ApprovalResolved` / work frame broadcast during a suspension between the
+    // `AskResolved` / work frame broadcast during a suspension between the
     // snapshot read and the send could reach the client first and then be
     // overwritten by the stale bundle. Reading them adjacent to the send keeps
     // the window to a non-await span and preserves the "live frame after the

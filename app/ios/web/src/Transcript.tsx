@@ -1546,10 +1546,9 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
     if (r.role === "work") {
       if (!Array.isArray(r.steps) || r.steps.length === 0) continue;
       // A prompt that was still up when we persisted is NOT still up now: it
-      // was answered, cancelled, or (after 5 minutes) denied by the gate itself
-      // while the app was closed — and none of those signals is redeliverable
-      // (`approval_resolved` isn't even broadcast for a timeout, and the
-      // clearing `tool_completed` is a live-only frame). The pending set is
+      // was answered, cancelled or expired while the app was closed — and none
+      // of those signals is redeliverable (`ask_resolved` and the clearing
+      // `tool_completed` are live-only frames). The pending set is
       // re-derived from the authoritative `subscribe_state.pending_approvals` on
       // the next subscribe, so drop the badge rather than let it strand as a
       // permanent "waiting for approval" on a step nothing can ever clear.
@@ -2626,7 +2625,7 @@ export function Transcript({
 
   // Rewrite the tail work block's tool steps IN PLACE. Unlike `withOpenWork`
   // this never OPENS a block: an approval frame is not a work frame, and
-  // `approval_resolved` is broadcast connection-wide (it carries no session), so
+  // `ask_resolved` is broadcast connection-wide (it carries no session), so
   // a session with no block open would otherwise sprout an empty "Working" card
   // every time some other conversation answered a prompt.
   const rewriteToolSteps = useCallback(
@@ -2644,7 +2643,7 @@ export function Transcript({
   // A prompt opened on `toolCallId`: badge that step as waiting. Keyed by the
   // TOOL call's id (`tool_call_id`), which is what the step carries — the
   // prompt's own `ask_id` is a fresh id per prompt and is only stashed so the
-  // matching `approval_resolved` can find the step again.
+  // matching `ask_resolved` can find the step again.
   const markStepAwaitingApproval = useCallback(
     (toolCallId: string, promptId: string) => {
       rewriteToolSteps((s) =>
@@ -2654,16 +2653,16 @@ export function Transcript({
     [rewriteToolSteps],
   );
 
-  // A prompt was answered: clear the waiting badge and label the step with the
-  // decision. Matched by PROMPT id, because that is all `approval_resolved`
-  // carries. The label is provisional until the call completes and the server's
-  // own `approval` lands on it — identical value, but that one is the persisted
+  // A prompt closed: clear the waiting badge, and label the step when a human
+  // decided. Matched by PROMPT id, because that is all `ask_resolved` carries.
+  // The label is provisional until the call completes and the server's own
+  // `approval` lands on it — identical value, but that one is the persisted
   // twin that survives a reload.
   const resolveStepApproval = useCallback(
-    (promptId: string, decision: string) => {
+    (promptId: string, decision: string | undefined) => {
       rewriteToolSteps((s) =>
         s.kind === "tool" && s.awaitingApproval === promptId
-          ? { ...s, awaitingApproval: undefined, approval: decision }
+          ? { ...s, awaitingApproval: undefined, approval: decision ?? s.approval }
           : s,
       );
     },
@@ -3329,8 +3328,7 @@ export function Transcript({
                 status: frame.status,
                 summary: frame.summary || undefined,
                 // The call is done, so nothing is waiting on the user any more —
-                // even when the gate TIMED OUT (no `approval_resolved` is
-                // broadcast for that; the completion is the only signal).
+                // a backstop for an `ask_resolved` this page missed.
                 awaitingApproval: undefined,
                 approval: frame.approval || s.approval,
               };
@@ -3355,10 +3353,10 @@ export function Transcript({
         // so the user can see WHICH call the card is asking about.
         if (frame.tool_call_id) markStepAwaitingApproval(frame.tool_call_id, frame.ask_id);
         break;
-      case "approval_resolved":
-        // Answered (here, or on another client). The decision lands on the step
-        // right away rather than waiting for the call to finish — an approved
-        // call keeps running, sometimes for minutes.
+      case "ask_resolved":
+        // Closed (here, or on another client), decided or not. A decision lands
+        // on the step right away rather than waiting for the call to finish — an
+        // approved call keeps running, sometimes for minutes.
         resolveStepApproval(frame.ask_id, frame.decision);
         break;
       case "turn_state":

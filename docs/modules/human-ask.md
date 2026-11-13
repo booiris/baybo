@@ -818,14 +818,15 @@ attachments are staged and a question is pending.
 
 ### Wire surface
 
-Approval frames are kept **byte for byte** (`ApprovalRequested`,
-`ApprovalResolved`, `ResolveApproval`, `ApprovalCard`,
-`SubscribeState.pending_approvals`): the TUI arms, the iOS native card and
-the iOS web sentinel's dropped-key check all pin them. New frames:
+The approval frames keep their shape (`ApprovalRequested`, `ResolveApproval`,
+`ApprovalCard`, `SubscribeState.pending_approvals`), with the prompt's id
+named `ask_id`. `ApprovalResolved` is gone: its decision rides
+`AskResolved.decision`, so one frame closes every card. New frames:
 
 ```rust
 Frame::QuestionAsked   { ask_id, tool_call_id: String, session_id, user_id, questions: Vec<WireQuestion> }  // session-scoped
-Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | abandoned */ }            // session-less, any kind
+Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | abandoned */,
+                         decision: Option<ApprovalDecision> /* a human's, on an approval */ }              // session-less, any kind
 Frame::AnswerQuestion  { ask_id, reply: QuestionReply /* Answered { answers: Vec<WireAnswer> } | Declined */ } // client → server
 Frame::ToolCompleted   { …, ask: Option<AskStepSummary> }                                                   // additive optional field
 SubscribeState { …, pending_questions: Vec<QuestionCard> }   // #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -833,26 +834,24 @@ WireWorkStep   { …, ask: Option<AskStepSummary> }
 SessionPatch   { …, awaiting_human: Option<bool> }           // renamed from approval_pending; any pending ask kind
 ```
 
-- `AskResolved` is kind-agnostic on purpose: it is the only way to drop an
-  **approval** card on abandon. `ApprovalResolved` carries an
-  `ApprovalDecision`, which must not be widened, and today an abandoned
-  approval broadcasts nothing — the web clears the card only on
-  `approval_resolved` (`ChatPage.tsx:4239-4245`), so after `/stop` or
-  "moved on" every open tab would keep an answerable card whose
+- `AskResolved` is kind-agnostic on purpose: it is the one close frame, and
+  the only way to drop an **approval** card on abandon. On master,
+  `ApprovalResolved` was sent only for a decided approval, so after `/stop`
+  or "moved on" every open tab kept an answerable card whose
   `ResolveApproval` the manager rejects. `AskResolved` is emitted on every
-  `AskClosed` event; `ApprovalResolved` is still emitted for an answered
-  approval as today. Clients drop the card with the same `ask_id`. iOS drops
-  nothing on it until PR 3 (stale card after an abandon — listed under
-  Deferred).
+  `AskClosed` event and carries the `decision` when a human decided an
+  approval, which is what a client labels the work step with; the separate
+  `ApprovalResolved` frame was folded into it. Clients drop the card with
+  the same `ask_id`.
 - Frames are dispatched by **queue watchers the gateway installs** in
   `build_channel`, the same place the `SessionPatch` watcher lives today
   (`boot.rs:184-200`): `AskRaised(entry)` → `SessionEvent::ApprovalRequested` /
   `QuestionAsked`, `AskClosed { session_id, ask_id, kind, outcome }` →
-  `SessionEvent::AskResolved { session_id, ask_id, outcome }` (+
-  `ApprovalResolved` when answered). The `SessionEvent` keeps the session so
+  `SessionEvent::AskResolved { session_id, ask_id, outcome, decision }`. The
+  `SessionEvent` keeps the session so
   `session_id()` stays infallible (`types.rs:306-313`) and Subscribed
   delivery can find its subscribers; `session_event_to_frame`
-  (`adapter.rs:394-437`) drops it, as it does for `ApprovalResolved` today.
+  (`adapter.rs:394-437`) drops it.
   That gives raise and resolve one dispatch home, lets the settlement's
   abandons reach open tabs without the agent crate knowing channels, and
   removes the manual `broadcast_approval_resolved` from the `route.rs` arm.
@@ -1015,8 +1014,8 @@ denial, and the next idle tick reaps it — see
 - **TUI**: `map_frame` gets `Frame::QuestionAsked` in the silent-drop group
   with `// TODO(human-ask): render AskUser questions inline like ApprovalChatEntry`
   (the `tui` channel never receives it — `AskUser` is owner-only), but
-  `Frame::AskResolved { ask_id, .. }` is handled: `queue.drop_call(&ask_id)`
-  beside the `ApprovalResolved` arm, because the TUI mirrors every approval
+  `Frame::AskResolved { ask_id, .. }` is handled: `queue.drop_ask(&ask_id)`,
+  because the TUI mirrors every approval
   card (`transport.rs:343-354, :390-402`) and an approval abandoned by
   another client would otherwise stay on screen with nothing to clear it
   now that the self-deny is gone. `ask: None` in the two `ToolCompleted`
@@ -1182,7 +1181,7 @@ Where the code differs from the sketch above, and why:
   `ResolveApproval` arm checks the ask is on the connection's own channel
   queue (least privilege: a TUI connection cannot answer an owner ask) and
   calls `HumanAskManager::resolve`; the queue watchers dispatch
-  `ApprovalResolved` + `AskResolved`. The board's
+  `AskResolved` with the decision. The board's
   `POST …/approvals/{ask_id}` reads the ledger row and answers only a
   pending `Approval` row whose session's trigger is that issue, mapping
   `AskClosed` / `NotFound` to 404.
@@ -1287,7 +1286,7 @@ Where the code differs from the sketch above, and why:
 3. user clicks → `Frame::ResolveApproval` → `route.rs` arm →
    `manager.resolve(ask_id, Approval(decision))`: claim → observer
    `Resolved` → remove entry → `Answered` edge + `AskClosed` watcher (gateway
-   dispatches `ApprovalResolved` + `AskResolved`) → oneshot
+   dispatches `AskResolved` with the decision) → oneshot
 4. the gate stamps `mark_applied` as the oneshot yields, then returns the
    outcome; executor continues as today
 

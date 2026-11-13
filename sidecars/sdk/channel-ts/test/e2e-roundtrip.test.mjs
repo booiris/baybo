@@ -71,13 +71,22 @@ function startFixture() {
                 params_preview: "{}",
               }),
             );
-            // Echo an approval_resolved for the same ask_id so we
-            // exercise the `approve_always` pass-through on inbound.
+            // Echo an ask_resolved for the same ask_id so we
+            // exercise the `approve_always` pass-through on inbound, then an
+            // undecided close, which reaches the hook with no decision.
             ws.send(
               encodeFrame({
-                kind: "approval_resolved",
+                kind: "ask_resolved",
                 ask_id: "call-2",
+                outcome: "answered",
                 decision: "approve_always",
+              }),
+            );
+            ws.send(
+              encodeFrame({
+                kind: "ask_resolved",
+                ask_id: "call-3",
+                outcome: "abandoned",
               }),
             );
             ws.send(
@@ -252,6 +261,7 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   // approve_always survives the string-encoded hop in both directions.
   assert.deepEqual(gotApprovalResolved.calls, [
     { askId: "call-2", decision: "approve_always" },
+    { askId: "call-3", decision: undefined },
   ]);
 
   // ---- Client → server -------------------------------------------

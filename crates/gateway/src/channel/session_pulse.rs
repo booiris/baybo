@@ -90,9 +90,7 @@ impl SessionPulse {
             // Asks already have their own dedicated frames (and the
             // `awaiting_human` patch for the sidebar). Re-emitting as
             // activity would double-signal without buying anything new.
-            SessionEvent::ApprovalRequested { .. }
-            | SessionEvent::ApprovalResolved { .. }
-            | SessionEvent::AskResolved { .. } => {
+            SessionEvent::ApprovalRequested { .. } | SessionEvent::AskResolved { .. } => {
                 return;
             }
         };

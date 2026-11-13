@@ -1116,7 +1116,7 @@ impl BayboClient {
     /// `approval_requested` frame, or a `subscribe_state` bundle's
     /// `pending_approvals` card). Fire-and-forget on the active binding's chat
     /// leg: the gateway resolves the gate — releasing the blocked tool call —
-    /// and broadcasts `approval_resolved`, which arrives back on the frame
+    /// and broadcasts `ask_resolved`, which arrives back on the frame
     /// sink. A decision the leg can't deliver errors here; the prompt stays
     /// pending on the gateway and can be answered again.
     pub async fn chat_resolve_approval(

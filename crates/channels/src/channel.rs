@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use baybo_human_ask::{AskQueue, PendingWatcher};
-use baybo_model::human_ask::AskId;
+use baybo_model::human_ask::{AskId, AskResolution};
 use baybo_model::{ChannelType, ResourceAccess, SessionId};
-use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalRequest};
+use baybo_tools::{ApprovalGate, ApprovalRequest};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -317,33 +317,24 @@ impl Channel {
         });
     }
 
-    /// Publish an `ApprovalResolved` event so concurrent UIs drop the
-    /// prompt. Called by the ask watcher once the queue entry is gone.
-    pub fn dispatch_approval_resolved(
-        &self,
-        ask_id: AskId,
-        session_id: SessionId,
-        decision: ApprovalDecision,
-    ) {
-        self.dispatch_event(SessionEvent::ApprovalResolved {
-            ask_id,
-            session_id,
-            decision,
-        });
-    }
-
     /// Publish an `AskResolved` event: an ask of any kind left the queue,
-    /// answered or not, so every client showing it drops the card.
+    /// answered or not, so every client showing it drops the card. Called by
+    /// the ask watcher once the queue entry is gone.
     pub fn dispatch_ask_resolved(
         &self,
         session_id: SessionId,
         ask_id: AskId,
-        outcome: wire::AskOutcomeKind,
+        resolution: &AskResolution,
     ) {
+        let decision = match resolution {
+            AskResolution::Approval(decision) => Some(*decision),
+            _ => None,
+        };
         self.dispatch_event(SessionEvent::AskResolved {
             session_id,
             ask_id,
-            outcome,
+            outcome: wire::AskOutcomeKind::from(resolution),
+            decision,
         });
     }
 
@@ -370,8 +361,7 @@ impl Channel {
 
     /// Internal event fan-out — the raw broadcast/subscription
     /// machinery. External callers go through [`Self::dispatch_agent`]
-    /// / [`Self::dispatch_approval_requested`] /
-    /// [`Self::dispatch_approval_resolved`] / [`Self::dispatch_ask_resolved`]
+    /// / [`Self::dispatch_approval_requested`] / [`Self::dispatch_ask_resolved`]
     /// (kind-agnostic) or
     /// through [`SubscribedView::echo_inbound`]
     /// (Subscribed-exclusive). Non-blocking. Drops the event for any

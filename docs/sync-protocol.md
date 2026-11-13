@@ -292,7 +292,7 @@ This replaces the current four-frame drizzle (`TurnState`, `WorkSnapshot`,
 atomic REPLACE. `pending_approvals` is the **authoritative replacement set**
 — full cards, built from one atomic queue read — which closes the documented
 approval-snapshot race window (`wire/src/lib.rs:666-671`); a live
-`ApprovalRequested`/`ApprovalResolved` arriving after the snapshot wins over
+`ApprovalRequested`/`AskResolved` arriving after the snapshot wins over
 it (normal frame order on one connection). `as_of_ordinal` stamps the
 snapshot's transcript position, but the normative staleness test for the
 `turn`/`work_steps` halves is **turn identity, not ordinal arithmetic** —

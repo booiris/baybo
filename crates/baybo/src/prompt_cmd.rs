@@ -222,8 +222,7 @@ async fn consume_ws_turn(
             TransportEvent::Notice { level, text } => eprint_notice(level, &text),
             TransportEvent::ToolStarted { .. }
             | TransportEvent::ToolCompleted { .. }
-            | TransportEvent::Status { .. }
-            | TransportEvent::ApprovalResolved { .. } => {}
+            | TransportEvent::Status { .. } => {}
         }
     }
     writer.finish_incomplete()

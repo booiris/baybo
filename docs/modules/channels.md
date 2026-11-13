@@ -77,7 +77,7 @@ impl Channel {
     // Kind-agnostic dispatch surface — agent + tool path calls.
     pub fn dispatch_agent(&self, output: AgentOutput);
     pub fn dispatch_approval_requested(&self, ask_id, tool_call_id, session_id, user_id, tool, accesses, params_preview, description);
-    pub fn dispatch_approval_resolved(&self, ask_id, session_id, decision);
+    pub fn dispatch_ask_resolved(&self, session_id, ask_id, resolution: &AskResolution);
 
     // Transport lifecycle — gateway WS route calls these.
     pub fn attach(&self, conn: Arc<Connection>);
@@ -179,7 +179,7 @@ methods on `Channel`:
 | ------------------------------- | -------------------------------------------- | ------------------------------ |
 | `dispatch_agent(output)`        | Agent router (per-turn assistant output)     | `SessionEvent::Agent(_)`       |
 | `dispatch_approval_requested(…)`| The queue's `AskRaised` watcher (installed in `build_channel`), when a tool call parks on an approval | `SessionEvent::ApprovalRequested {..}` |
-| `dispatch_approval_resolved(…)` | The queue's `AskClosed` watcher, when a human decided an approval (via `HumanAskManager::resolve`) | `SessionEvent::ApprovalResolved {..}` |
+| `dispatch_ask_resolved(…)` | The queue's `AskClosed` watcher, for every close of any ask | `SessionEvent::AskResolved {..}`, with `decision` set when a human decided an approval |
 | `dispatch_ask_resolved(…)`      | The queue's `AskClosed` watcher, on every close — answered or abandoned — so concurrent UIs drop the card | `SessionEvent::AskResolved {..}` |
 
 Plus one Subscribed-exclusive method on the view:
@@ -235,7 +235,7 @@ agent / tool path           channel / connection
 itself emits (`AnswerDelta`, `Reasoning`, `ToolStarted`/`ToolCompleted`,
 `Status`, `Progress`, `TaskList`, `TurnState`, `Message`, `Notice`).
 [`SessionEvent`] wraps that plus the
-channel-side events (`UserEcho`, `ApprovalRequested`, `ApprovalResolved`)
+channel-side events (`UserEcho`, `ApprovalRequested`, `AskResolved`)
 so the agent's output surface stays statically narrow. The gateway's
 per-connection translator converts each `SessionEvent` to the matching
 [`wire::Frame`] before serialisation. Wire-format knowledge stays in
@@ -315,8 +315,8 @@ channel's `AskSurface` bundles the two. The gate writes the ask to the
 times out (`DURING_EXECUTE_APPROVAL_TIMEOUT`, 30 min). Frames are
 dispatched by queue watchers the gateway installs in `build_channel`, not by
 the gate: `AskRaised` → `SessionEvent::ApprovalRequested`, and every
-`AskClosed` → `SessionEvent::AskResolved { session_id, ask_id, outcome }`
-plus `SessionEvent::ApprovalResolved` when a human decided an approval. So
+`AskClosed` → `SessionEvent::AskResolved { session_id, ask_id, outcome,
+decision }`, `decision` set when a human decided an approval. So
 concurrent TUI / web tabs drop their card on any close — answered by one of
 them, or abandoned by `/stop`, a card close or the user moving on. A
 `ResolveApproval` frame resolves through `HumanAskManager::resolve` (ledger

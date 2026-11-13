@@ -170,7 +170,7 @@ export class WeixinApprovals
 
   async onResolved(
     askId: string,
-    decision: ApprovalDecision,
+    decision: ApprovalDecision | undefined,
   ): Promise<void> {
     // Find the entry by askId (we key by user, not askId). If it's
     // still pending at this point the user never replied in time;
@@ -188,7 +188,9 @@ export class WeixinApprovals
     // Only resolve the promise if it hasn't already been (race with a
     // user reply). The promise is idempotent via closure; calling
     // resolve twice is a no-op in JS.
-    matched.entry.resolve(decision);
+    matched.entry.resolve(decision ?? "deny");
+    // An undecided close needs no new message: the prompt is simply over.
+    if (decision === undefined) return;
     try {
       await this.sendDecisionEcho(matched.entry, decision);
     } catch (err) {

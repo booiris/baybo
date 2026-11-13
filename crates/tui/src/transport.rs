@@ -9,7 +9,6 @@ use std::pin::Pin;
 
 use baybo_channels::{NoticeLevel, Result};
 use baybo_model::ContentBlock;
-use baybo_tools::ApprovalDecision;
 use futures::Stream;
 
 /// Event shape surfaced by [`crate::client::WsTransport::subscribe`].
@@ -44,12 +43,6 @@ pub enum TransportEvent {
     /// [`baybo_human_ask::AskQueue`]; the loop should refresh the
     /// approval UI.
     ApprovalRequested,
-    /// An approval was resolved remotely (by another client); the loop
-    /// should drop any pending UI entry for `ask_id`.
-    ApprovalResolved {
-        ask_id: baybo_model::human_ask::AskId,
-        decision: ApprovalDecision,
-    },
 }
 
 /// Stream of [`TransportEvent`]s produced by [`crate::client::WsTransport::subscribe`].

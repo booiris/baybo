@@ -170,7 +170,14 @@ export type WireFrame =
     }
   // Someone answered (this device, or another client). Broadcast to every
   // session's sink, so it is matched by prompt id, never by session.
-  | { kind: "approval_resolved"; ask_id: string; decision: string }
+  // Any ask closed, decided or not. `decision` is set only when a human
+  // decided an approval.
+  | {
+      kind: "ask_resolved";
+      ask_id: string;
+      outcome: "answered" | "declined" | "abandoned";
+      decision?: string;
+    }
   // `started_at` is present iff `active` — it is the turn's identity for the
   // SubscribeState staleness test and for re-opening a restored work block.
   | { kind: "turn_state"; active: boolean; started_at?: string }
@@ -330,7 +337,7 @@ export type WorkStep =
       summary?: string;
       /// Prompt id, set while this call is blocked on the user's decision — the
       /// step renders "waiting for approval" and clears when the matching
-      /// `approval_resolved` (or the call's completion) lands.
+      /// `ask_resolved` (or the call's completion) lands.
       awaitingApproval?: string;
       /// `"approve"` / `"approve_always"` / `"deny"` once the user judged it.
       /// Survives reload (persisted on the tool result).

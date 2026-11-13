@@ -705,7 +705,7 @@
         /// observer and the web reducer are the production ones; only the leg is
         /// fake — `resolveDemoApprovalIfRequested` answers the card in-process
         /// (there is no `chatResolveApproval` to call without a binding) by
-        /// pushing exactly the frames the gateway would: `approval_resolved`, then
+        /// pushing exactly the frames the gateway would: `ask_resolved`, then
         /// the tool's completion carrying the decision.
         ///
         /// Two prompts open at once (a parallel tool pair) so the queue counter
@@ -762,8 +762,8 @@
                 }
             Task { @MainActor in
                 pushDemo([
-                    "kind": "approval_resolved", "ask_id": approval.askId,
-                    "decision": decisionText,
+                    "kind": "ask_resolved", "ask_id": approval.askId,
+                    "outcome": "answered", "decision": decisionText,
                 ])
                 try? await Task.sleep(for: .milliseconds(decision == .deny ? 300 : 1400))
                 pushDemo([

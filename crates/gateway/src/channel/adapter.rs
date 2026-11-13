@@ -411,12 +411,16 @@ async fn session_event_to_frame(
             params_preview,
             description,
         },
-        SessionEvent::ApprovalResolved {
-            ask_id, decision, ..
-        } => Frame::ApprovalResolved { ask_id, decision },
         SessionEvent::AskResolved {
-            ask_id, outcome, ..
-        } => Frame::AskResolved { ask_id, outcome },
+            ask_id,
+            outcome,
+            decision,
+            ..
+        } => Frame::AskResolved {
+            ask_id,
+            outcome,
+            decision,
+        },
     }
 }
 
@@ -837,6 +841,7 @@ mod tests {
             session_id: "s1".into(),
             ask_id: "c1".parse().expect("ask id"),
             outcome: baybo_channels::wire::AskOutcomeKind::Abandoned,
+            decision: None,
         };
         let blobs = MemoryBlobStore::new();
         let frame = super::session_event_to_frame(event, &ChannelType::owner(), &blobs).await;
@@ -845,6 +850,7 @@ mod tests {
             Frame::AskResolved {
                 ask_id: "c1".parse().unwrap(),
                 outcome: baybo_channels::wire::AskOutcomeKind::Abandoned,
+                decision: None,
             }
         );
     }

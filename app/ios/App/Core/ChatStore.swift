@@ -1410,7 +1410,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         pendingApprovals = approvals.cards
     }
 
-    /// The user answered. Dismiss optimistically (the server's `approval_resolved`
+    /// The user answered. Dismiss optimistically (the server's `ask_resolved`
     /// fan-out confirms it, and re-adding the card on the frame's return would
     /// flash a prompt they just answered), then echo the decision on the live
     /// leg. A leg that can't carry it surfaces a notice: the decision is lost and
