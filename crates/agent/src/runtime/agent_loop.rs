@@ -582,7 +582,7 @@ pub struct AgentLoop {
     progress_monitor: TurnProgressMonitor,
     /// The session's asks, for the cancelled-batch path: a turn cancel claims
     /// `Abandoned` on a call's asks before appending its result.
-    asks: Arc<dyn crate::runtime::asks::TurnAsks>,
+    asks: Arc<baybo_human_ask::HumanAskManager>,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -615,8 +615,8 @@ pub struct AgentLoopConfig {
     pub task_store: Arc<dyn baybo_store::TaskStore>,
     /// Live-title broadcaster. `None` disables title generation.
     pub title_sink: Option<Arc<dyn crate::runtime::title::SessionTitleSink>>,
-    /// Port onto the human-ask ledger (see [`AgentLoop::asks`]).
-    pub asks: Arc<dyn crate::runtime::asks::TurnAsks>,
+    /// The human-ask verbs (see [`AgentLoop::asks`]).
+    pub asks: Arc<baybo_human_ask::HumanAskManager>,
 }
 
 /// Task-reminder throttle (mirrors Claude Code's `TODO_REMINDER_CONFIG`): the
@@ -1282,9 +1282,20 @@ impl AgentLoop {
         if origin == Some(CancelOrigin::Ancestor) {
             return false;
         }
-        self.asks
+        // Only logged: the caller appends the call's result either way, since a
+        // dangling `tool_use` would wedge the session's next LLM call.
+        if let Err(e) = self
+            .asks
             .abandon_for_tool_call(&session.id, tool_use_id)
-            .await;
+            .await
+        {
+            warn!(
+                session_id = %session.id,
+                tool_use_id,
+                error = %e,
+                "could not abandon the asks of a cancelled tool call; appending its result"
+            );
+        }
         true
     }
 

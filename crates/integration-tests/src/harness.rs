@@ -87,7 +87,7 @@ pub struct AgentTestHarness {
     /// result to this session. Exposed so a test can seed an execution and
     /// assert the delivery resolved it.
     pub cron_store: Arc<baybo_cron::test_support::InMemoryCronStore>,
-    /// The ask ledger behind the loop's `TurnAsks` port and, with
+    /// The ask ledger behind the loop's `HumanAskManager` and, with
     /// [`AgentTestHarnessBuilder::with_channel_ask_gate`], the session
     /// channel's gate.
     pub ask_store: Arc<MemoryHumanAskStore>,

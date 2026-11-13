@@ -223,8 +223,8 @@ pub struct ManagerGraph {
     pub ask_core: Arc<baybo_human_ask::AskCore>,
     /// One ask queue per channel; the lazy install fetches from it too.
     pub ask_queues: baybo_human_ask::AskQueues,
-    /// The verbs over the ask ledger. Every actor's loop gets it as its
-    /// `TurnAsks` port; the gateway's resolve doors call it, and
+    /// The verbs over the ask ledger. Every actor's loop holds it; the
+    /// gateway's resolve doors call it, and
     /// `gateway_cmd` closes the stale asks with it at boot.
     pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
     /// Pushes for asks parked on the owner queue, drained by the gateway's
@@ -1044,7 +1044,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         // below; `None` keeps the no-op path (every memory hook skipped,
         // nothing billed).
         let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
-        let turn_asks: Arc<dyn baybo_agent::runtime::asks::TurnAsks> = graph.human_asks.clone();
+        let human_asks = Arc::clone(&graph.human_asks);
         // Shared across every actor: the title pass notifies this sink once it
         // has persisted a generated title, and it fans a `SessionUpdated` patch
         // out to every Subscribed channel so the owning surface updates live.
@@ -1118,7 +1118,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     memory: memory.clone(),
                     task_store: task_store.clone(),
                     title_sink: title_sink.clone(),
-                    asks: Arc::clone(&turn_asks),
+                    asks: Arc::clone(&human_asks),
                 });
 
                 let span_recorder = Arc::new(SpanRecorder::new(
