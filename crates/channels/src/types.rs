@@ -274,8 +274,8 @@ pub enum SessionEvent {
         call_id: String,
         /// `call_id` of the TOOL call the prompt blocks (the id
         /// `ToolStarted`/`ToolCompleted` carry) — see
-        /// [`baybo_tools::ApprovalRequest::tool_call_id`].
-        tool_call_id: Option<String>,
+        /// [`baybo_model::approval::ApprovalRequest::tool_call_id`].
+        tool_call_id: String,
         session_id: SessionId,
         user_id: String,
         tool: String,

@@ -302,7 +302,7 @@ impl Channel {
     pub fn dispatch_approval_requested(
         &self,
         call_id: String,
-        tool_call_id: Option<String>,
+        tool_call_id: String,
         session_id: SessionId,
         user_id: String,
         tool: String,
