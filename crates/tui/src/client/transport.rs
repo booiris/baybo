@@ -102,15 +102,14 @@ impl WsTransport {
             let AskResolution::Approval(decision) = resolution else {
                 return;
             };
-            let call_id = ask_id.into_inner();
             let client = Arc::clone(&client_for_resolver);
             tokio::spawn(async move {
                 let frame = Frame::ResolveApproval {
-                    call_id: call_id.clone(),
+                    ask_id: ask_id.clone(),
                     decision,
                 };
                 if let Err(e) = client.send_raw(&frame).await {
-                    warn!(call_id, "approval resolution failed: {e}");
+                    warn!(%ask_id, "approval resolution failed: {e}");
                 }
             });
         }));
@@ -324,7 +323,7 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             Some(TransportEvent::Notice { level, text })
         }
         Frame::ApprovalRequested {
-            call_id,
+            ask_id,
             tool_call_id,
             session_id,
             user_id,
@@ -335,16 +334,16 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
         } => {
             if &session_id != target_session {
                 debug!(
-                    call_id,
+                    %ask_id,
                     tool,
                     other = %session_id,
                     "approval from other session; ignoring"
                 );
                 return None;
             }
-            debug!(call_id, tool, "approval added from gateway");
+            debug!(%ask_id, tool, "approval added from gateway");
             queue.enqueue_mirror(ApprovalRequest {
-                call_id,
+                ask_id,
                 tool_call_id: tool_call_id.unwrap_or_default(),
                 session_id,
                 user_id,
@@ -355,16 +354,16 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             });
             Some(TransportEvent::ApprovalRequested)
         }
-        Frame::ApprovalResolved { call_id, decision } => {
-            let _ = queue.drop_call(&call_id);
-            Some(TransportEvent::ApprovalResolved { call_id, decision })
+        Frame::ApprovalResolved { ask_id, decision } => {
+            let _ = queue.drop_ask(&ask_id);
+            Some(TransportEvent::ApprovalResolved { ask_id, decision })
         }
         // Kind-agnostic close: the only signal that retires an approval
         // another client abandoned (`/stop`, a card close), now that nothing
         // self-denies. A no-op when `ApprovalResolved` already dropped it.
         // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
         Frame::AskResolved { ask_id, .. } => {
-            let _ = queue.drop_call(&ask_id);
+            let _ = queue.drop_ask(&ask_id);
             None
         }
         Frame::Reasoning { .. } => {
@@ -400,9 +399,9 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
                 return None;
             }
             for card in pending_approvals {
-                queue.drop_call(&card.call_id);
+                queue.drop_ask(&card.ask_id);
                 queue.enqueue_mirror(ApprovalRequest {
-                    call_id: card.call_id,
+                    ask_id: card.ask_id,
                     tool_call_id: card.tool_call_id.unwrap_or_default(),
                     session_id: session_id.clone(),
                     user_id: card.user_id,

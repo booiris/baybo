@@ -671,7 +671,7 @@ function dispatchFrame(
         return;
       }
       void safeInvoke(
-        () => channel.onApprovalResolved!(frame.call_id, decision),
+        () => channel.onApprovalResolved!(frame.ask_id, decision),
         "onApprovalResolved",
         logger,
       );
@@ -824,7 +824,7 @@ async function handleApproval(
   let decision: ApprovalDecision;
   try {
     decision = await channel.onApprovalRequested({
-      callId: frame.call_id,
+      askId: frame.ask_id,
       sessionId: frame.session_id,
       userId: frame.user_id ?? "",
       tool: frame.tool,
@@ -841,7 +841,7 @@ async function handleApproval(
     ws.send(
       encodeFrame({
         kind: "resolve_approval",
-        call_id: frame.call_id,
+        ask_id: frame.ask_id,
         decision,
       }),
     );

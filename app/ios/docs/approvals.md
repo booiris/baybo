@@ -50,7 +50,7 @@ the gate will deny on its own.
 
 ## Two ids, don't confuse them
 
-- **`call_id`** is minted per prompt (one call can prompt more than once via the
+- **`ask_id`** is minted per prompt (one call can prompt more than once via the
   mid-call `ApprovalHandle`) and is what a resolve answers with.
 - **`tool_call_id`** is the BLOCKED TOOL CALL — the id `tool_started` /
   `tool_completed` carry — and is what the work block badges.
@@ -87,7 +87,7 @@ this code. The two differ in every layer:
 | | Chat | Board |
 |---|---|---|
 | transport | live frames on the device channel | REST (`POST …/issues/{n}/approval`) |
-| where the pending set comes from | `ChatStore.approvalObserveFrame` on the frame stream | replaying the card's `events` by `call_id` |
+| where the pending set comes from | `ChatStore.approvalObserveFrame` on the frame stream | replaying the card's `events` by `ask_id` |
 | answers offered | approve / **approve-always** / deny | approve / deny only |
 | where it is shown | the composer dock's `ApprovalCardView` | the board's Waiting strip, and the card's own dock |
 
@@ -98,7 +98,7 @@ card offers three and not four.
 
 The types are separate on purpose: `PendingApproval` is the chat's (it carries
 a `toolCallId`, a params preview and the resource lines the frame supplies),
-`IssueApprovalPrompt` is the board's (a `call_id`, a tool, a summary and who
+`IssueApprovalPrompt` is the board's (an `ask_id`, a tool, a summary and who
 asked — everything a timeline entry has). They are genuinely different planes,
 not two spellings of one, and `ApprovalCardView` is shared by taking the chat's
 shape as its input.

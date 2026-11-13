@@ -63,7 +63,7 @@ function startFixture() {
             ws.send(
               encodeFrame({
                 kind: "approval_requested",
-                call_id: "call-1",
+                ask_id: "call-1",
                 session_id: "sess-1",
                 user_id: "tg_42",
                 tool: "fs.read",
@@ -71,12 +71,12 @@ function startFixture() {
                 params_preview: "{}",
               }),
             );
-            // Echo an approval_resolved for the same call_id so we
+            // Echo an approval_resolved for the same ask_id so we
             // exercise the `approve_always` pass-through on inbound.
             ws.send(
               encodeFrame({
                 kind: "approval_resolved",
-                call_id: "call-2",
+                ask_id: "call-2",
                 decision: "approve_always",
               }),
             );
@@ -167,8 +167,8 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
       approvalResolver(req);
       return "approve_always";
     },
-    async onApprovalResolved(callId, decision) {
-      gotApprovalResolved.calls.push({ callId, decision });
+    async onApprovalResolved(askId, decision) {
+      gotApprovalResolved.calls.push({ askId, decision });
     },
     async *inbound(signal) {
       yield {
@@ -200,7 +200,7 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   // Wait for the approval to hit the stub so we know the server fully
   // flushed its batch of frames.
   const approvalReq = await approvalSeen;
-  assert.equal(approvalReq.callId, "call-1");
+  assert.equal(approvalReq.askId, "call-1");
 
   // Give the event loop a beat so inbound deliveries + outbound sends
   // settle before we inspect.
@@ -251,7 +251,7 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
 
   // approve_always survives the string-encoded hop in both directions.
   assert.deepEqual(gotApprovalResolved.calls, [
-    { callId: "call-2", decision: "approve_always" },
+    { askId: "call-2", decision: "approve_always" },
   ]);
 
   // ---- Client → server -------------------------------------------
@@ -271,7 +271,7 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     fixture.recorded.resolveApproval,
     "server received resolve_approval frame",
   );
-  assert.equal(fixture.recorded.resolveApproval.call_id, "call-1");
+  assert.equal(fixture.recorded.resolveApproval.ask_id, "call-1");
   assert.equal(
     fixture.recorded.resolveApproval.decision,
     "approve_always",

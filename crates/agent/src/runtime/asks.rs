@@ -1,71 +1,18 @@
-//! The agent's ports onto the human-ask ledger: the verbs a turn needs (not
-//! the manager), the hydration probe, and the router door a dead ask's answer
-//! comes back through. Implemented over [`HumanAskManager`].
+//! The agent's adapters onto the human-ask ledger: the hydration probe and
+//! the router door a dead ask's answer comes back through. Both are
+//! implemented over [`HumanAskManager`].
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_channels::RouterInbound;
-use baybo_human_ask::{HumanAskManager, ResumeSink, Settled};
-use baybo_model::human_ask::{AskId, ResumeRequest};
+use baybo_human_ask::{HumanAskManager, ResumeSink};
+use baybo_model::human_ask::ResumeRequest;
 use baybo_model::{SessionId, TriggerSource};
-use baybo_store::HumanAskRow;
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::SessionManager;
-
-/// What a turn may do to its session's asks.
-#[async_trait]
-pub trait TurnAsks: Send + Sync {
-    /// Claim `Abandoned` for the unapplied asks a cancelled call raised, and
-    /// stamp them applied, right before the loop appends that call's result.
-    /// The loop appends whatever this finds; a store failure is only logged,
-    /// because a dangling `tool_use` would wedge the session's next LLM call.
-    async fn abandon_for_tool_call(&self, session: &SessionId, tool_use_id: &str);
-
-    /// The session's asks not yet applied to its transcript.
-    async fn unapplied(&self, session: &SessionId) -> anyhow::Result<Vec<HumanAskRow>>;
-
-    /// Abandon the session's dead pending asks and report what each
-    /// unapplied ask needs appended — see [`HumanAskManager::settle_unapplied`].
-    async fn settle_unapplied(&self, session: &SessionId) -> anyhow::Result<Vec<Settled>>;
-
-    /// Stamp an ask applied; `false` when something else already did.
-    async fn mark_applied(&self, ask_id: &AskId) -> anyhow::Result<bool>;
-
-    async fn get(&self, ask_id: &AskId) -> anyhow::Result<Option<HumanAskRow>>;
-}
-
-#[async_trait]
-impl TurnAsks for HumanAskManager {
-    async fn abandon_for_tool_call(&self, session: &SessionId, tool_use_id: &str) {
-        if let Err(e) = HumanAskManager::abandon_for_tool_call(self, session, tool_use_id).await {
-            warn!(
-                session_id = %session,
-                tool_use_id,
-                error = %e,
-                "could not abandon the asks of a cancelled tool call; appending its result"
-            );
-        }
-    }
-
-    async fn unapplied(&self, session: &SessionId) -> anyhow::Result<Vec<HumanAskRow>> {
-        Ok(self.unapplied_for_session(session).await?)
-    }
-
-    async fn settle_unapplied(&self, session: &SessionId) -> anyhow::Result<Vec<Settled>> {
-        Ok(HumanAskManager::settle_unapplied(self, session).await?)
-    }
-
-    async fn mark_applied(&self, ask_id: &AskId) -> anyhow::Result<bool> {
-        Ok(HumanAskManager::mark_applied(self, ask_id).await?)
-    }
-
-    async fn get(&self, ask_id: &AskId) -> anyhow::Result<Option<HumanAskRow>> {
-        Ok(HumanAskManager::get(self, ask_id).await?)
-    }
-}
 
 /// Hydration's [`baybo_context::PendingToolCalls`] probe, answered from the
 /// ledger. Lives here so `baybo-human-ask` needs no edge to `baybo-context`.
@@ -132,6 +79,7 @@ impl ResumeSink for RouterResumeSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_model::human_ask::AskId;
     use baybo_model::{ChannelType, User};
     use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
 

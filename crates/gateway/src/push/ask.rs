@@ -234,9 +234,9 @@ impl AskPushRelay {
 mod tests {
     use super::*;
 
-    fn raised(call_id: &str, tool: &str) -> PendingEdge {
+    fn raised(ask_id: &str, tool: &str) -> PendingEdge {
         PendingEdge::Raised {
-            ask_id: call_id.parse().expect("ask id"),
+            ask_id: ask_id.parse().expect("ask id"),
             kind: AskKind::Approval,
             tool: tool.into(),
         }

@@ -321,7 +321,7 @@ async fn an_approval_survives_a_restart_and_its_answer_resumes_the_turn() {
 
     let cards = node.owner.pending_approvals(&session.id);
     assert_eq!(cards.len(), 1, "SubscribeState carries the card");
-    assert_eq!(cards[0].call_id, ask_id.to_string());
+    assert_eq!(cards[0].ask_id, ask_id);
     assert_eq!(cards[0].tool_call_id, CALL_ID);
     assert!(
         node.owner.pending_approval_sessions().contains(&session.id),

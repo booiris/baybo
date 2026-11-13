@@ -21,7 +21,7 @@
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
-use baybo_model::human_ask::AskResolution;
+use baybo_model::human_ask::{AskId, AskResolution};
 use baybo_model::{ApprovalDecision, ChannelType, ResourceAccess, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -530,7 +530,8 @@ pub struct TurnSnapshot {
     ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct ApprovalCard {
-    pub call_id: String,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+    pub ask_id: AskId,
     /// `call_id` of the TOOL call the prompt blocks — see
     /// [`Frame::ApprovalRequested::tool_call_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -815,10 +816,11 @@ pub enum Frame {
     /// (across a gateway restart too) until a client answers it or the
     /// turn moves on, and [`Frame::AskResolved`] retires it either way.
     ApprovalRequested {
-        call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
         /// `call_id` of the TOOL call this prompt blocks (the id
         /// `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
-        /// `call_id`, which is minted per prompt). Lets clients badge
+        /// `ask_id`, which is minted per prompt). Lets clients badge
         /// the exact work step that is waiting. The gateway always sends
         /// it; optional only so a client still parses an older gateway's
         /// frames, which omitted it.
@@ -841,23 +843,26 @@ pub enum Frame {
     /// approval — drop the prompt from the local UI so concurrent
     /// frontends stay consistent.
     ApprovalResolved {
-        call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
     },
     /// Server → client: a pending ask of any kind left the pending set —
     /// answered, declined, or abandoned. Clients drop the card whose
-    /// `call_id` equals `ask_id`. Emitted on every close, beside
+    /// `ask_id` equals this frame's `ask_id`. Emitted on every close, beside
     /// [`Frame::ApprovalResolved`] for an answered approval; it is the only
     /// frame that retires an approval nobody decided.
     AskResolved {
-        ask_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
         outcome: AskOutcomeKind,
     },
     /// Client → server: resolve a pending approval the client
     /// previously saw in an [`Frame::ApprovalRequested`].
     ResolveApproval {
-        call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
     },
@@ -1353,7 +1358,7 @@ mod tests {
                 WireWorkStep::tool(Some("c1".into()), Some("edit".into()), None),
             ],
             pending_approvals: vec![ApprovalCard {
-                call_id: "c1".into(),
+                ask_id: "c1".parse().unwrap(),
                 tool_call_id: Some("t-use-1".into()),
                 user_id: "u1".into(),
                 tool: "fs.read".into(),
@@ -1560,7 +1565,7 @@ mod tests {
     fn round_trip_approval_requested() {
         use std::path::PathBuf;
         let frame = Frame::ApprovalRequested {
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             tool_call_id: Some("t-use-1".into()),
             session_id: "s1".into(),
             user_id: "u1".into(),
@@ -1577,7 +1582,7 @@ mod tests {
     #[test]
     fn round_trip_approval_resolved() {
         let frame = Frame::ApprovalResolved {
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             decision: ApprovalDecision::Approve,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1591,7 +1596,7 @@ mod tests {
             AskOutcomeKind::Abandoned,
         ] {
             let frame = Frame::AskResolved {
-                ask_id: "c1".into(),
+                ask_id: "c1".parse().unwrap(),
                 outcome,
             };
             assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1632,7 +1637,7 @@ mod tests {
     #[test]
     fn round_trip_resolve_approval() {
         let frame = Frame::ResolveApproval {
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             decision: ApprovalDecision::Deny,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());

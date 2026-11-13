@@ -393,7 +393,7 @@ async fn session_event_to_frame(
             })
         }
         SessionEvent::ApprovalRequested {
-            call_id,
+            ask_id,
             tool_call_id,
             session_id,
             user_id,
@@ -402,7 +402,7 @@ async fn session_event_to_frame(
             params_preview,
             description,
         } => Frame::ApprovalRequested {
-            call_id,
+            ask_id,
             tool_call_id: Some(tool_call_id),
             session_id,
             user_id,
@@ -412,14 +412,11 @@ async fn session_event_to_frame(
             description,
         },
         SessionEvent::ApprovalResolved {
-            call_id, decision, ..
-        } => Frame::ApprovalResolved { call_id, decision },
+            ask_id, decision, ..
+        } => Frame::ApprovalResolved { ask_id, decision },
         SessionEvent::AskResolved {
             ask_id, outcome, ..
-        } => Frame::AskResolved {
-            ask_id: ask_id.to_string(),
-            outcome,
-        },
+        } => Frame::AskResolved { ask_id, outcome },
     }
 }
 
@@ -846,7 +843,7 @@ mod tests {
         assert_eq!(
             frame,
             Frame::AskResolved {
-                ask_id: "c1".into(),
+                ask_id: "c1".parse().unwrap(),
                 outcome: baybo_channels::wire::AskOutcomeKind::Abandoned,
             }
         );
@@ -1043,7 +1040,7 @@ mod tests {
 
     fn approval_on_lazy_channel(ask_id: &str) -> baybo_tools::ApprovalRequest {
         baybo_tools::ApprovalRequest {
-            call_id: ask_id.to_string(),
+            ask_id: ask_id.parse().unwrap(),
             tool_call_id: format!("use-{ask_id}"),
             session_id: baybo_model::SessionId::from("sess-lazy"),
             user_id: "u".to_string(),
@@ -1158,7 +1155,7 @@ mod tests {
                 .expect("lazy install");
         let cards = channel.pending_approvals(&session);
         assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].call_id, "lazy-dead");
+        assert_eq!(cards[0].ask_id, "lazy-dead");
 
         asks.manager
             .resolve(

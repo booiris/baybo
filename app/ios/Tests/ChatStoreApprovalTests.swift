@@ -54,13 +54,13 @@ struct ChatStoreApprovalTests {
     /// are the contract with the gateway, and a test that reused the app's own
     /// spelling of a key would sail straight through a rename that breaks it.
     private static let requestedFrame = """
-        {"kind":"approval_requested","session_id":"s-1","call_id":"\(promptId)",
+        {"kind":"approval_requested","session_id":"s-1","ask_id":"\(promptId)",
          "tool_call_id":"\(toolCallId)","tool":"Bash",
          "params_preview":"{\\"command\\":\\"rm -rf /tmp/x\\"}","accesses":[]}
         """
 
     private static let resolvedFrame = """
-        {"kind":"approval_resolved","session_id":"s-1","call_id":"\(promptId)"}
+        {"kind":"approval_resolved","session_id":"s-1","ask_id":"\(promptId)"}
         """
 
     private static let toolCompletedFrame = """
@@ -75,7 +75,7 @@ struct ChatStoreApprovalTests {
 
         #expect(await waitUntil { store.pendingApprovals.count == 1 })
         let card = store.pendingApprovals.first
-        #expect(card?.callId == Self.promptId)
+        #expect(card?.askId == Self.promptId)
         #expect(card?.toolCallId == Self.toolCallId)
         #expect(card?.tool == "Bash")
     }
@@ -121,7 +121,7 @@ struct ChatStoreApprovalTests {
         #expect(await waitUntil { !client.approvalCalls.isEmpty })
         #expect(
             client.approvalCalls == [
-                FakeBayboClient.ApprovalCall(callId: Self.promptId, decision: .approve)
+                FakeBayboClient.ApprovalCall(askId: Self.promptId, decision: .approve)
             ])
     }
 
@@ -205,7 +205,7 @@ struct ChatStoreApprovalTests {
         deliver(Self.requestedFrame)
 
         #expect(await waitUntil { store.pendingApprovals.count == 1 })
-        #expect(store.pendingApprovals.first?.callId == Self.promptId)
+        #expect(store.pendingApprovals.first?.askId == Self.promptId)
     }
 
     /// The fold's `-> Bool` is load-bearing: `pushFrame` runs it on EVERY frame,

@@ -1144,7 +1144,7 @@ export interface paths {
         patch: operations["update_issue"];
         trace?: never;
     };
-    "/v1/projects/{project_id}/issues/{number}/approvals/{call_id}": {
+    "/v1/projects/{project_id}/issues/{number}/approvals/{ask_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -2912,19 +2912,19 @@ export interface components {
             kind: "worktree_kept";
             reason: string;
         } | {
+            ask_id: string;
             /**
              * Format: int64
              * @description Which run is parked, by attempt number. Absent when the card was
              *     not recording it yet, or when no run owns the prompt.
              */
             attempt?: number | null;
-            call_id: string;
             /** @enum {string} */
             kind: "approval_requested";
             summary: string;
             tool: string;
         } | {
-            call_id: string;
+            ask_id: string;
             decision: components["schemas"]["ApprovalDecisionDto"];
             /** @enum {string} */
             kind: "approval_resolved";
@@ -8366,8 +8366,8 @@ export interface operations {
                 project_id: string;
                 /** @description Issue number within the project */
                 number: number;
-                /** @description The approval's call id, from its timeline entry */
-                call_id: string;
+                /** @description The approval's ask id, from its timeline entry */
+                ask_id: string;
             };
             cookie?: never;
         };
@@ -8393,7 +8393,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Unknown project or issue, or this card has no prompt waiting on that call */
+            /** @description Unknown project or issue, or this card has no prompt waiting on that ask */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -38,7 +38,7 @@ struct IssueMirrorTests {
         fake.stubIssueDetail = issue(41)
         fake.stubIssueEventsJson = """
             {"items":[{"id":"e1","number":41,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},
-             "created_at_ms":1,"body":{"kind":"approval_requested","call_id":"c1","tool":"exec","summary":"cargo test"}}]}
+             "created_at_ms":1,"body":{"kind":"approval_requested","ask_id":"c1","tool":"exec","summary":"cargo test"}}]}
             """
         fake.stubRunLog = IssueRunLog(
             runs: [run(settled: nil)], totalCostMicros: 0, totalInputTokens: 0,
@@ -226,7 +226,7 @@ struct IssueMirrorTests {
         fake.stubIssueDetail = issue(41, approvalPending: false)
         fake.stubIssueEventsJson = """
             {"items":[{"id":"e1","number":41,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},
-             "created_at_ms":1,"body":{"kind":"approval_requested","call_id":"dead","tool":"exec","summary":"old"}}]}
+             "created_at_ms":1,"body":{"kind":"approval_requested","ask_id":"dead","tool":"exec","summary":"old"}}]}
             """
         let store = IssueStore(
             projectId: "p1", number: 41, client: fake, supportDirectory: dir.url)
@@ -243,20 +243,20 @@ struct IssueMirrorTests {
         fake.stubIssueEventsJson = """
             {"items":[
               {"id":"e1","number":41,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},"created_at_ms":1,
-               "body":{"kind":"approval_requested","call_id":"gone","tool":"exec","summary":"old"}},
+               "body":{"kind":"approval_requested","ask_id":"gone","tool":"exec","summary":"old"}},
               {"id":"e2","number":41,"actor":{"kind":"agent","id":"a-dev","handle":"dev-1"},"created_at_ms":2,
-               "body":{"kind":"approval_requested","call_id":"live","tool":"exec","summary":"new"}}
+               "body":{"kind":"approval_requested","ask_id":"live","tool":"exec","summary":"new"}}
             ]}
             """
         let store = IssueStore(
             projectId: "p1", number: 41, client: fake, supportDirectory: dir.url)
         await store.refresh()
-        #expect(store.pendingApprovals.map(\.callId) == ["gone", "live"])
+        #expect(store.pendingApprovals.map(\.askId) == ["gone", "live"])
 
         fake.approvalResolveError = BayboError.Other(message: "404 approval call not found")
-        store.resolveApproval(callId: "gone", decision: .deny)
+        store.resolveApproval(askId: "gone", decision: .deny)
 
-        #expect(store.pendingApprovals.map(\.callId) == ["live"])
+        #expect(store.pendingApprovals.map(\.askId) == ["live"])
         #expect(await waitUntil { fake.approvalsResolved.count == 1 })
         #expect(await waitUntil { fake.issueDetailCalls >= 2 }, "a gone call triggers reconciliation")
         #expect(store.writeError == nil, "a dead historical call is retired, not raised as a write failure")

@@ -151,8 +151,8 @@ and emits nothing for a call that never finished or whose ask came back
 abandoned — the transcript is left as a crash would leave it, the ask row
 stays pending, and hydration repairs the siblings. On `Turn` (`/stop`, board
 stop, operator cancel), before appending such a call's result it claims
-`TurnAsks::abandon_for_tool_call(session, tool_use_id)` (a narrow port over
-`HumanAskManager`, an `AgentLoopConfig` field), which also stamps applied an
+`HumanAskManager::abandon_for_tool_call(session, tool_use_id)` (the manager is
+an `AgentLoopConfig` field; a failure is only logged), which also stamps applied an
 answer that landed in the same instant — the tool future is gone, so the
 loop's append is the call's one result. `ExecutedTool.abandoned` marks a call whose last ask was
 torn down undecided.

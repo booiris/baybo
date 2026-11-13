@@ -219,7 +219,7 @@ async fn tool_call(
 
 fn approval_request(sid: &SessionId) -> Frame {
     Frame::ApprovalRequested {
-        call_id: "c-appr".to_string(),
+        ask_id: "c-appr".parse().unwrap(),
         tool_call_id: None,
         session_id: sid.clone(),
         user_id: String::new(),

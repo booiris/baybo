@@ -33,7 +33,7 @@ struct IssueDock: View {
             if let prompt = store.pendingApprovals.first {
                 approvalCard(prompt)
                     .padding(.horizontal, Self.rowGutter)
-                    .id(prompt.callId)
+                    .id(prompt.askId)
             }
             if !staging.staged.isEmpty {
                 StagedStrip(
@@ -69,7 +69,7 @@ struct IssueDock: View {
     private func approvalCard(_ prompt: IssueApprovalPrompt) -> some View {
         ApprovalCardView(
             approval: PendingApproval(
-                callId: prompt.callId,
+                askId: prompt.askId,
                 toolCallId: nil,
                 tool: prompt.tool,
                 description: prompt.summary,
@@ -79,7 +79,7 @@ struct IssueDock: View {
             maxDetailHeight: approvalDetailCap,
             onDecide: { decision in
                 store.resolveApproval(
-                    callId: prompt.callId,
+                    askId: prompt.askId,
                     decision: decision == .deny ? .deny : .approve)
             })
     }

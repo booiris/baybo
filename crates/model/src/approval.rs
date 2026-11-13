@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::SessionId;
+use crate::human_ask::AskId;
 
 /// One approval prompt: which tool call wants which resources.
 ///
@@ -20,8 +21,8 @@ use crate::SessionId;
 /// re-exports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
-    /// This prompt's own id — a fresh UUID per prompt, the ask's `AskId`.
-    pub call_id: String,
+    /// This prompt's own id, which is also the id of the ask it raises.
+    pub ask_id: AskId,
     /// LLM `tool_use_id` of the tool call this prompt blocks — what
     /// `ToolStarted`/`ToolCompleted` events carry. Not unique per prompt: one
     /// call can prompt more than once. Defaults to empty for input written

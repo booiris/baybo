@@ -145,7 +145,7 @@ pub(crate) fn build_channel(
             } => {
                 if let AskResolution::Approval(decision) = outcome {
                     channel.dispatch_approval_resolved(
-                        ask_id.to_string(),
+                        ask_id.clone(),
                         session_id.clone(),
                         decision,
                     );
@@ -199,7 +199,7 @@ fn announce(channel: &Channel, ask: PendingAsk) {
         return;
     };
     channel.dispatch_approval_requested(
-        entry.call_id,
+        entry.ask_id,
         entry.tool_call_id,
         entry.session_id,
         entry.user_id,
@@ -242,7 +242,7 @@ mod tests {
         let reg = Arc::new(ChannelRegistry::new());
         install_channels(&reg, &ChannelsConfig::default(), &core(), &queues).expect("install");
         preloaded.enqueue_mirror(baybo_tools::ApprovalRequest {
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             tool_call_id: "use-1".into(),
             session_id: "s1".into(),
             user_id: "u".into(),
@@ -326,10 +326,10 @@ mod tests {
         }
     }
 
-    fn ask_request(call_id: &str, session: &str) -> ApprovalRequest {
+    fn ask_request(ask_id: &str, session: &str) -> ApprovalRequest {
         ApprovalRequest {
-            call_id: call_id.into(),
-            tool_call_id: format!("use-{call_id}"),
+            ask_id: ask_id.parse().unwrap(),
+            tool_call_id: format!("use-{ask_id}"),
             session_id: session.into(),
             user_id: "u".into(),
             tool: "Bash".into(),
@@ -339,14 +339,14 @@ mod tests {
         }
     }
 
-    async fn raise(w: &Wired, call_id: &str) -> tokio::task::JoinHandle<ApprovalOutcome> {
+    async fn raise(w: &Wired, ask_id: &str) -> tokio::task::JoinHandle<ApprovalOutcome> {
         let gate = w.channel.approval_gate().expect("gate");
-        let req = ask_request(call_id, "s1");
+        let req = ask_request(ask_id, "s1");
         let task = tokio::spawn(async move {
             gate.request(req, AskSite::for_test(), AskCancel::never())
                 .await
         });
-        let ask_id: AskId = call_id.parse().expect("ask id");
+        let ask_id: AskId = ask_id.parse().expect("ask id");
         while !w
             .channel
             .ask_queue()
@@ -374,8 +374,8 @@ mod tests {
         let parked = raise(&w, "c1").await;
         assert!(matches!(
             w.seen.events.lock().as_slice(),
-            [SessionEvent::ApprovalRequested { call_id, tool_call_id, .. }]
-                if call_id == "c1" && tool_call_id == "use-c1"
+            [SessionEvent::ApprovalRequested { ask_id, tool_call_id, .. }]
+                if ask_id == "c1" && tool_call_id == "use-c1"
         ));
         assert_eq!(marks(&w.seen), vec![Some(true)]);
 
@@ -394,9 +394,9 @@ mod tests {
         assert!(matches!(
             &events[1..],
             [
-                SessionEvent::ApprovalResolved { call_id, decision: ApprovalDecision::Approve, .. },
-                SessionEvent::AskResolved { ask_id, outcome: AskOutcomeKind::Answered, .. },
-            ] if call_id == "c1" && ask_id.as_str() == "c1"
+                SessionEvent::ApprovalResolved { ask_id: resolved, decision: ApprovalDecision::Approve, .. },
+                SessionEvent::AskResolved { ask_id: closed, outcome: AskOutcomeKind::Answered, .. },
+            ] if resolved == "c1" && closed == "c1"
         ));
         assert_eq!(marks(&w.seen), vec![Some(true), Some(false)]);
     }

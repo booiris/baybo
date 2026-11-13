@@ -86,9 +86,7 @@ impl ApprovalGate for ChannelAskGate {
         site: AskSite,
         cancel: AskCancel,
     ) -> ApprovalOutcome {
-        let Some(row) = approval_row(req, site) else {
-            return ApprovalOutcome::abandoned();
-        };
+        let row = approval_row(req, site);
         let ask_id = row.ask_id.clone();
         match self.park(row, cancel).await {
             Some(AskResolution::Approval(decision)) => ApprovalOutcome::answered(decision),
@@ -124,9 +122,7 @@ impl ApprovalGate for PolicyDenyGate {
         _cancel: AskCancel,
     ) -> ApprovalOutcome {
         let denied = ApprovalOutcome::policy(ApprovalDecision::Deny);
-        let Some(mut row) = approval_row(req, site) else {
-            return denied;
-        };
+        let mut row = approval_row(req, site);
         let now = Utc::now();
         row.resolved_at = Some(now);
         row.resolution = Some(AskResolution::PolicyDenied);
@@ -145,18 +141,10 @@ impl ApprovalGate for PolicyDenyGate {
     }
 }
 
-/// The pending ledger row for an approval. `None` (logged) when the request
-/// carries no usable ask id.
-fn approval_row(req: ApprovalRequest, site: AskSite) -> Option<HumanAskRow> {
-    let ask_id: AskId = match req.call_id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(tool = %req.tool, error = %e, "approval request has no ask id");
-            return None;
-        }
-    };
-    Some(HumanAskRow {
-        ask_id,
+/// The pending ledger row for an approval.
+fn approval_row(req: ApprovalRequest, site: AskSite) -> HumanAskRow {
+    HumanAskRow {
+        ask_id: req.ask_id.clone(),
         session_id: req.session_id.clone(),
         channel: site.channel,
         tool_call_id: req.tool_call_id.clone(),
@@ -167,7 +155,7 @@ fn approval_row(req: ApprovalRequest, site: AskSite) -> Option<HumanAskRow> {
         resolved_at: None,
         resolution: None,
         applied_at: None,
-    })
+    }
 }
 
 /// A dropped waiter orphans its ask; it never resolves it.

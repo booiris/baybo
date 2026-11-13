@@ -192,10 +192,10 @@ async fn run_pump(
                         let frame = user_frame(&session_id, &text, &msg_id, attachments);
                         (frame, format!("send session={session_id} msg_id={msg_id}"))
                     }
-                    Some(OutboundCmd::ResolveApproval { call_id, decision }) => {
+                    Some(OutboundCmd::ResolveApproval { ask_id, decision }) => {
                         (
-                            resolve_approval_frame(&call_id, decision),
-                            format!("resolve_approval call_id={call_id}"),
+                            resolve_approval_frame(&ask_id, decision),
+                            format!("resolve_approval ask_id={ask_id}"),
                         )
                     }
                     None => {

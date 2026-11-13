@@ -93,21 +93,21 @@ describe("the field names the reducers read off a parsed frame", () => {
     expect(frame.platform_msg_id).toBe("pm-1");
   });
 
-  it("approval_requested: tool_call_id badges the step, call_id answers the prompt — two ids, not one", () => {
+  it("approval_requested: tool_call_id badges the step, ask_id answers the prompt — two ids, not one", () => {
     const frame = JSON.parse(
-      r(`{"kind":"approval_requested","call_id":"prompt-1","tool_call_id":"call-9","tool":"Bash"}`),
+      r(`{"kind":"approval_requested","ask_id":"prompt-1","tool_call_id":"call-9","tool":"Bash"}`),
     ) as Extract<WireFrame, { kind: "approval_requested" }>;
 
-    expect(frame.call_id).toBe("prompt-1");
+    expect(frame.ask_id).toBe("prompt-1");
     expect(frame.tool_call_id).toBe("call-9");
-    expect(frame.call_id).not.toBe(frame.tool_call_id);
+    expect(frame.ask_id).not.toBe(frame.tool_call_id);
   });
 
   it("subscribe_state: pending_approvals carry the tool_call_id the work step is keyed by", () => {
     const frame = JSON.parse(
       r(`{"kind":"subscribe_state","session_id":"s1","turn":{"active":true,"started_at":"2026-07-12T10:00:00Z"},
           "work_steps":[{"kind":"tool","call_id":"call-9","tool":"Bash"}],
-          "pending_approvals":[{"call_id":"prompt-1","tool_call_id":"call-9","tool":"Bash","params_preview":"ls"}]}`),
+          "pending_approvals":[{"ask_id":"prompt-1","tool_call_id":"call-9","tool":"Bash","params_preview":"ls"}]}`),
     ) as Extract<WireFrame, { kind: "subscribe_state" }>;
 
     const step = wireStepToWork((frame.work_steps ?? [])[0]);

@@ -637,7 +637,7 @@ mod tests {
         let q = AskQueue::new();
         q.enqueue_mirror(ApprovalRequest {
             tool_call_id: String::new(),
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             session_id: SessionId::from("s1"),
             user_id: String::new(),
             tool: "BashTool".into(),

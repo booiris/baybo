@@ -17,11 +17,12 @@ use crate::approval::{ApprovalDecision, ApprovalRequest};
 pub const ASK_USER_TOOL_NAME: &str = "AskUser";
 
 /// Identity of one ask. A UUID v4 when minted here; an ask raised through the
-/// approval path reuses the [`ApprovalRequest::call_id`] it was raised with.
+/// approval path reuses the [`ApprovalRequest::ask_id`] it was raised with.
 /// One tool call can raise several asks, so this — not the `tool_call_id` —
-/// is the unique key.
+/// is the unique key. Serialized as a bare string; deserializing an empty one
+/// fails.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct AskId(String);
 
 /// An empty string is not an ask id.
@@ -55,14 +56,40 @@ impl fmt::Display for AskId {
     }
 }
 
+impl TryFrom<String> for AskId {
+    type Error = InvalidAskId;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.is_empty() {
+            return Err(InvalidAskId);
+        }
+        Ok(Self(s))
+    }
+}
+
+impl From<AskId> for String {
+    fn from(id: AskId) -> Self {
+        id.0
+    }
+}
+
+impl PartialEq<str> for AskId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for AskId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 impl FromStr for AskId {
     type Err = InvalidAskId;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Err(InvalidAskId);
-        }
-        Ok(Self(s.to_owned()))
+        Self::try_from(s.to_owned())
     }
 }
 
@@ -272,7 +299,7 @@ mod tests {
     #[test]
     fn approval_request_reads_input_without_tool_call_id() {
         let req: ApprovalRequest = serde_json::from_value(serde_json::json!({
-            "call_id": "c",
+            "ask_id": "c",
             "session_id": "s",
             "tool": "Bash",
             "accesses": [],

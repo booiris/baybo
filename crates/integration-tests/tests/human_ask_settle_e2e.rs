@@ -98,7 +98,7 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
     let ask_id = AskId::new();
     let request = match kind {
         AskKind::Approval => AskRequest::Approval(ApprovalRequest {
-            call_id: ask_id.to_string(),
+            ask_id: ask_id.clone(),
             tool_call_id: CALL_ID.to_string(),
             session_id: session.id.clone(),
             user_id: session.user.id.clone(),

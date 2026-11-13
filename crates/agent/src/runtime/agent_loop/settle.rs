@@ -44,11 +44,11 @@ impl AgentLoop {
         &self,
         session: &baybo_model::SessionId,
     ) -> anyhow::Result<Vec<HumanAskRow>> {
-        self.asks.unapplied(session).await
+        Ok(self.asks.unapplied_for_session(session).await?)
     }
 
     pub async fn ask(&self, ask_id: &AskId) -> anyhow::Result<Option<HumanAskRow>> {
-        self.asks.get(ask_id).await
+        Ok(self.asks.get(ask_id).await?)
     }
 
     /// Run `turn_input` (a `Resume`) as a turn whose whole body is the

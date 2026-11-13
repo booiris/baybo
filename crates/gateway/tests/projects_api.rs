@@ -1431,15 +1431,12 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         .into_iter()
         .find(|e| e["body"]["kind"] == "approval_requested")
         .expect("the gate put the prompt on the card that raised it");
-    assert_eq!(asked["body"]["call_id"], "c-real");
-    let call_id = asked["body"]["call_id"]
-        .as_str()
-        .expect("call id")
-        .to_owned();
+    assert_eq!(asked["body"]["ask_id"], "c-real");
+    let ask_id = asked["body"]["ask_id"].as_str().expect("ask id").to_owned();
 
     post(
         &router,
-        &format!("/v1/projects/{other}/issues/1/approvals/{call_id}"),
+        &format!("/v1/projects/{other}/issues/1/approvals/{ask_id}"),
         json!({ "decision": "approve" }),
         StatusCode::NOT_FOUND,
     )
@@ -1451,7 +1448,7 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     );
     post(
         &router,
-        &format!("/v1/projects/{p}/issues/2/approvals/{call_id}"),
+        &format!("/v1/projects/{p}/issues/2/approvals/{ask_id}"),
         json!({ "decision": "approve" }),
         StatusCode::NOT_FOUND,
     )
@@ -1464,7 +1461,7 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
 
     post(
         &router,
-        &format!("/v1/projects/{p}/issues/1/approvals/{call_id}"),
+        &format!("/v1/projects/{p}/issues/1/approvals/{ask_id}"),
         json!({ "decision": "approve" }),
         StatusCode::NO_CONTENT,
     )
@@ -1665,11 +1662,11 @@ async fn park_through(
         .expect("owner channel");
     let blocked = tokio::spawn({
         let session = session.clone();
-        let call_id = call_id.to_owned();
+        let ask_id: baybo_model::human_ask::AskId = call_id.parse().unwrap();
         async move {
             gate.request(
                 baybo_tools::ApprovalRequest {
-                    call_id,
+                    ask_id,
                     tool_call_id: String::new(),
                     session_id: session,
                     user_id: "owner".to_owned(),

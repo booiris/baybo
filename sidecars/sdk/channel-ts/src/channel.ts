@@ -118,7 +118,7 @@ export interface UserInbound {
 }
 
 export interface ApprovalRequest {
-  callId: string;
+  askId: string;
   sessionId: string;
   /**
    * Baybo user id (`<channelType>_<id>` — e.g. `telegram_<...>` — matching the inbound
@@ -214,7 +214,7 @@ export interface Channel {
    */
   onApprovalRequested?(req: ApprovalRequest): Promise<ApprovalDecision>;
 
-  onApprovalResolved?(callId: string, decision: ApprovalDecision): Promise<void>;
+  onApprovalResolved?(askId: string, decision: ApprovalDecision): Promise<void>;
 
   /**
    * Control-plane: gateway-authored slash-command manifest. Pushed

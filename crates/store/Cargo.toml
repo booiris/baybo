@@ -22,6 +22,9 @@ tokio = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [features]
 # In-memory store fakes (`test_support`) for downstream crates' tests.
 test-support = []
