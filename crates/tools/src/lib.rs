@@ -703,6 +703,8 @@ pub struct ApprovalHandle {
     /// `tool_use_id` of the call this handle serves, stamped onto every
     /// [`ApprovalRequest`] so clients can badge the right work step.
     tool_call_id: String,
+    /// The turn the call runs in, recorded on every ask the handle raises.
+    turn_id: TurnId,
     /// Last outcome an ACTUAL prompt returned (cache short-circuits never
     /// record). Shared across clones so the executor reads back what
     /// mid-execution prompts decided after the tool returns.
@@ -716,6 +718,7 @@ impl ApprovalHandle {
         gate: Arc<dyn ApprovalGate>,
         approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
         tool_call_id: String,
+        turn_id: TurnId,
         park: ParkGauge,
         cancel: AskCancel,
     ) -> Self {
@@ -723,6 +726,7 @@ impl ApprovalHandle {
             gate,
             approved_cache,
             tool_call_id,
+            turn_id,
             last_outcome: Arc::new(parking_lot::Mutex::new(None)),
             park,
             cancel,
@@ -734,6 +738,7 @@ impl ApprovalHandle {
     async fn raise(&self, req: ApprovalRequest, channel: ChannelType) -> ApprovalOutcome {
         let site = AskSite {
             channel,
+            turn_id: self.turn_id,
             phase: AskPhase::DuringExecute,
         };
         let outcome = {
@@ -1272,6 +1277,7 @@ mod approval_handle_tests {
             Arc::new(FixedGate(decision)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
             "use-1".into(),
+            TurnId::default(),
             ParkGauge::new(),
             AskCancel::never(),
         )
@@ -1339,6 +1345,7 @@ mod approval_handle_tests {
             Arc::new(FixedGate(ApprovalDecision::Deny)),
             cache,
             "use-1".into(),
+            TurnId::default(),
             ParkGauge::new(),
             AskCancel::never(),
         );

@@ -914,6 +914,7 @@ impl ToolExecutor {
                             },
                             AskSite {
                                 channel: user.channel.clone(),
+                                turn_id,
                                 phase: AskPhase::BeforeExecute,
                             },
                             ask_cancel.clone(),
@@ -1032,6 +1033,7 @@ impl ToolExecutor {
                     Arc::clone(&gate),
                     Arc::clone(approved_resources),
                     tool_use_id.clone(),
+                    turn_id,
                     park_gauge.clone(),
                     ask_cancel.clone(),
                 );

@@ -23,8 +23,8 @@ impl SqliteHumanAskStore {
     }
 }
 
-const SELECT_COLS: &str = "ask_id, session_id, channel, tool_call_id, kind, phase, request, \
-     created_at, resolved_at, resolution, applied_at";
+const SELECT_COLS: &str = "ask_id, session_id, channel, tool_call_id, turn_id, kind, phase, \
+     request, created_at, resolved_at, resolution, applied_at";
 
 /// One row's columns as sqlite returned them, before any domain decoding, so
 /// a row this build cannot interpret is skipped instead of failing the query.
@@ -33,6 +33,7 @@ struct RawRow {
     session_id: String,
     channel: String,
     tool_call_id: String,
+    turn_id: String,
     kind: String,
     phase: String,
     request: String,
@@ -48,13 +49,14 @@ fn read_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         session_id: row.get(1)?,
         channel: row.get(2)?,
         tool_call_id: row.get(3)?,
-        kind: row.get(4)?,
-        phase: row.get(5)?,
-        request: row.get(6)?,
-        created_at: row.get(7)?,
-        resolved_at: row.get(8)?,
-        resolution: row.get(9)?,
-        applied_at: row.get(10)?,
+        turn_id: row.get(4)?,
+        kind: row.get(5)?,
+        phase: row.get(6)?,
+        request: row.get(7)?,
+        created_at: row.get(8)?,
+        resolved_at: row.get(9)?,
+        resolution: row.get(10)?,
+        applied_at: row.get(11)?,
     })
 }
 
@@ -105,6 +107,10 @@ fn decode(raw: RawRow) -> Option<HumanAskRow> {
             }
         },
     };
+    let Ok(turn_id) = raw.turn_id.parse() else {
+        tracing::warn!(ask_id = id, "skipping human_asks row: bad turn_id");
+        return None;
+    };
     let Some(created_at) = super::time::from_us(raw.created_at) else {
         tracing::warn!(ask_id = id, "skipping human_asks row: bad created_at");
         return None;
@@ -116,6 +122,7 @@ fn decode(raw: RawRow) -> Option<HumanAskRow> {
         session_id: SessionId::from(raw.session_id),
         channel: ChannelType::from(raw.channel),
         tool_call_id: raw.tool_call_id,
+        turn_id,
         kind,
         phase,
         request,
@@ -154,6 +161,7 @@ impl HumanAskStore for SqliteHumanAskStore {
         let session_id = row.session_id.as_str().to_owned();
         let channel = row.channel.to_string();
         let tool_call_id = row.tool_call_id.clone();
+        let turn_id = row.turn_id.to_string();
         let kind = row.kind.as_str();
         let phase = row.phase.as_str();
         let request = to_json("request", &row.request)?;
@@ -169,15 +177,16 @@ impl HumanAskStore for SqliteHumanAskStore {
             .interact_write("human_asks.create", move |conn| {
                 conn.execute(
                     "INSERT INTO human_asks \
-                         (ask_id, session_id, channel, tool_call_id, kind, phase, request, \
-                          created_at, resolved_at, resolution, applied_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                         (ask_id, session_id, channel, tool_call_id, turn_id, kind, phase, \
+                          request, created_at, resolved_at, resolution, applied_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                      ON CONFLICT(ask_id) DO NOTHING",
                     rusqlite::params![
                         ask_id,
                         session_id,
                         channel,
                         tool_call_id,
+                        turn_id,
                         kind,
                         phase,
                         request,
@@ -319,6 +328,7 @@ mod tests {
             session_id: SessionId::from(session),
             channel: ChannelType::from("web"),
             tool_call_id: format!("tu-{ask}"),
+            turn_id: baybo_model::TurnId::default(),
             kind: AskKind::Approval,
             phase: AskPhase::BeforeExecute,
             request: AskRequest::Approval(ApprovalRequest {
@@ -466,9 +476,10 @@ mod tests {
             .unwrap();
         pool.interact_write("test.insert_future_kind", |conn| {
             conn.execute(
-                "INSERT INTO human_asks (ask_id, session_id, channel, tool_call_id, kind, \
-                 phase, request, created_at) \
-                 VALUES ('future', 's1', 'web', 'tu', 'telepathy', 'before_execute', '{}', 1000)",
+                "INSERT INTO human_asks (ask_id, session_id, channel, tool_call_id, turn_id, \
+                 kind, phase, request, created_at) \
+                 VALUES ('future', 's1', 'web', 'tu', 'turn', 'telepathy', 'before_execute', \
+                 '{}', 1000)",
                 [],
             )?;
             Ok(())

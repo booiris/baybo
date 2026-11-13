@@ -148,6 +148,7 @@ fn approval_row(req: ApprovalRequest, site: AskSite) -> HumanAskRow {
         session_id: req.session_id.clone(),
         channel: site.channel,
         tool_call_id: req.tool_call_id.clone(),
+        turn_id: site.turn_id,
         kind: AskKind::Approval,
         phase: site.phase,
         request: AskRequest::Approval(req),

@@ -3596,6 +3596,7 @@ mod tests {
             gate,
             cache,
             String::new(),
+            baybo_model::TurnId::default(),
             crate::ParkGauge::new(),
             crate::AskCancel::never(),
         ));
@@ -4868,6 +4869,7 @@ mod tests {
             gate.clone(),
             cache,
             String::new(),
+            baybo_model::TurnId::default(),
             crate::ParkGauge::new(),
             crate::AskCancel::never(),
         ));

@@ -114,9 +114,14 @@ fn req(ask_id: &str, session_id: &str) -> ApprovalRequest {
     }
 }
 
+/// The one turn every test ask is raised in.
+static TURN: std::sync::LazyLock<baybo_model::TurnId> =
+    std::sync::LazyLock::new(baybo_model::TurnId::new);
+
 fn site(phase: AskPhase) -> AskSite {
     AskSite {
         channel: ChannelType::owner(),
+        turn_id: *TURN,
         phase,
     }
 }
@@ -134,6 +139,7 @@ fn row(ask_id: &str, session_id: &str, phase: AskPhase) -> HumanAskRow {
         session_id: session_id.into(),
         channel: ChannelType::owner(),
         tool_call_id: format!("use-{ask_id}"),
+        turn_id: *TURN,
         kind: AskKind::Approval,
         phase,
         request: AskRequest::Approval(req(ask_id, session_id)),
@@ -183,6 +189,7 @@ async fn write_ahead_row_and_observer_precede_the_queue_push() {
     let stored = h.store.row(&id("a")).expect("row written");
     assert!(stored.is_pending());
     assert_eq!(stored.channel, ChannelType::owner());
+    assert_eq!(stored.turn_id, *TURN, "the row records the raising turn");
     assert_eq!(stored.phase, AskPhase::BeforeExecute);
     assert_eq!(
         h.observer.seen.lock()[0],

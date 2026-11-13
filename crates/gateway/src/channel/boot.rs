@@ -7,9 +7,11 @@
 //! processes, telegram bot subprocesses) but the channel sits there
 //! waiting for them.
 //!
-//! Each channel is born with its own [`ChannelAskGate`] over the channel's
-//! [`AskQueue`], fetched from the shared [`AskQueues`] so the channel and
-//! the ask manager meet on one queue. Frames are
+//! Each channel is born with its own
+//! [`ChannelAskGate`](baybo_human_ask::ChannelAskGate) over the channel's
+//! [`AskQueue`], both from
+//! [`AskChannels::for_channel`](baybo_human_ask::AskChannels::for_channel),
+//! which fetches the queue the ask manager also reaches. Frames are
 //! dispatched by queue watchers installed here, not by the gate: an ask
 //! entering the queue becomes
 //! [`SessionEvent::ApprovalRequested`](baybo_channels::SessionEvent::ApprovalRequested),

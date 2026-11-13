@@ -1091,6 +1091,7 @@ mod tests {
                 req,
                 baybo_tools::AskSite {
                     channel: lazy_channel(),
+                    turn_id: baybo_model::TurnId::default(),
                     phase: baybo_model::human_ask::AskPhase::BeforeExecute,
                 },
                 baybo_tools::AskCancel::never(),
