@@ -2966,7 +2966,7 @@ export function ChatPage() {
       const current = views[sessionId]?.pendingApproval;
       if (!current) return;
       wsRef.current.resolveApproval(current.askId, decision);
-      // Optimistic dismissal — the server's ApprovalResolved fan-out
+      // Optimistic dismissal — the server's `ask_resolved` fan-out
       // will also clear it via routeInboundFrame, harmless if it
       // arrives second.
       setViews((prev) => mergeView(prev, sessionId, { pendingApproval: null }));
