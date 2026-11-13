@@ -145,7 +145,7 @@ pub(crate) fn build_channel(
             } => {
                 if let AskResolution::Approval(decision) = outcome {
                     channel.dispatch_approval_resolved(
-                        ask_id.to_string(),
+                        ask_id.clone(),
                         session_id.clone(),
                         decision,
                     );
@@ -242,7 +242,7 @@ mod tests {
         let reg = Arc::new(ChannelRegistry::new());
         install_channels(&reg, &ChannelsConfig::default(), &core(), &queues).expect("install");
         preloaded.enqueue_mirror(baybo_tools::ApprovalRequest {
-            call_id: "c1".into(),
+            call_id: "c1".parse().unwrap(),
             tool_call_id: "use-1".into(),
             session_id: "s1".into(),
             user_id: "u".into(),
@@ -324,7 +324,7 @@ mod tests {
 
     fn ask_request(call_id: &str, session: &str) -> ApprovalRequest {
         ApprovalRequest {
-            call_id: call_id.into(),
+            call_id: call_id.parse().unwrap(),
             tool_call_id: format!("use-{call_id}"),
             session_id: session.into(),
             user_id: "u".into(),

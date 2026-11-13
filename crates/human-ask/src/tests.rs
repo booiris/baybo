@@ -103,7 +103,7 @@ fn id(s: &str) -> AskId {
 
 fn req(call_id: &str, session_id: &str) -> ApprovalRequest {
     ApprovalRequest {
-        call_id: call_id.into(),
+        call_id: id(call_id),
         tool_call_id: format!("use-{call_id}"),
         session_id: session_id.into(),
         user_id: "u".into(),

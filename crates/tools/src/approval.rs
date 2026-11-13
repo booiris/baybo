@@ -246,7 +246,7 @@ mod tests {
             .request(
                 ApprovalRequest {
                     tool_call_id: String::new(),
-                    call_id: "x".into(),
+                    call_id: "x".parse().unwrap(),
                     session_id: "s".into(),
                     user_id: "u".into(),
                     tool: "t".into(),

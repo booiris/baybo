@@ -102,7 +102,7 @@ impl WsTransport {
             let AskResolution::Approval(decision) = resolution else {
                 return;
             };
-            let call_id = ask_id.into_inner();
+            let call_id = ask_id;
             let client = Arc::clone(&client_for_resolver);
             tokio::spawn(async move {
                 let frame = Frame::ResolveApproval {
@@ -110,7 +110,7 @@ impl WsTransport {
                     decision,
                 };
                 if let Err(e) = client.send_raw(&frame).await {
-                    warn!(call_id, "approval resolution failed: {e}");
+                    warn!(%call_id, "approval resolution failed: {e}");
                 }
             });
         }));
@@ -335,14 +335,14 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
         } => {
             if &session_id != target_session {
                 debug!(
-                    call_id,
+                    %call_id,
                     tool,
                     other = %session_id,
                     "approval from other session; ignoring"
                 );
                 return None;
             }
-            debug!(call_id, tool, "approval added from gateway");
+            debug!(%call_id, tool, "approval added from gateway");
             queue.enqueue_mirror(ApprovalRequest {
                 call_id,
                 tool_call_id: tool_call_id.unwrap_or_default(),

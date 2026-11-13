@@ -53,7 +53,7 @@ pub(super) enum OutboundCmd {
     /// the gateway answers by resolving the gate and broadcasting
     /// `ApprovalResolved`, which arrives on the inbound frame path.
     ResolveApproval {
-        call_id: String,
+        call_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
     },
 }
@@ -80,7 +80,7 @@ pub(super) enum Msg {
         reply: Reply,
     },
     ResolveApproval {
-        call_id: String,
+        call_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
         reply: Reply,
     },
@@ -531,7 +531,12 @@ impl Supervisor {
         }
     }
 
-    fn resolve_approval(&mut self, call_id: String, decision: WireApprovalDecision, reply: Reply) {
+    fn resolve_approval(
+        &mut self,
+        call_id: baybo_model::human_ask::AskId,
+        decision: WireApprovalDecision,
+        reply: Reply,
+    ) {
         let Leg::Live {
             leg_id,
             outbound_tx,

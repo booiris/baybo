@@ -1665,7 +1665,7 @@ async fn park_through(
         .expect("owner channel");
     let blocked = tokio::spawn({
         let session = session.clone();
-        let call_id = call_id.to_owned();
+        let call_id: baybo_model::human_ask::AskId = call_id.parse().unwrap();
         async move {
             gate.request(
                 baybo_tools::ApprovalRequest {

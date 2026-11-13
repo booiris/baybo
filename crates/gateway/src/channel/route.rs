@@ -221,27 +221,23 @@ async fn announce_pending_asks(sidecar: &Sidecar) {
 async fn resolve_approval(
     state: &WsChannelState,
     sidecar: &Sidecar,
-    call_id: &str,
+    ask_id: &AskId,
     decision: baybo_tools::ApprovalDecision,
 ) {
-    let Ok(ask_id) = call_id.parse::<AskId>() else {
-        tracing::debug!(%call_id, "ResolveApproval with an empty call_id; ignored");
-        return;
-    };
     if !sidecar
         .channel
         .ask_queue()
-        .is_some_and(|queue| queue.contains(&ask_id))
+        .is_some_and(|queue| queue.contains(ask_id))
     {
-        tracing::debug!(%call_id, "ResolveApproval for an ask not pending here; ignored");
+        tracing::debug!(%ask_id, "ResolveApproval for an ask not pending here; ignored");
         return;
     }
     if let Err(e) = state
         .human_asks
-        .resolve(&ask_id, AskResolution::Approval(decision))
+        .resolve(ask_id, AskResolution::Approval(decision))
         .await
     {
-        tracing::debug!(%call_id, error = %e, "ResolveApproval not applied");
+        tracing::debug!(%ask_id, error = %e, "ResolveApproval not applied");
     }
 }
 

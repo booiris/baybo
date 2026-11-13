@@ -25,7 +25,6 @@ use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
 
 pub use approval::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalOutcome, ApprovalRequest,
@@ -798,7 +797,7 @@ impl ApprovalHandle {
         description: Option<String>,
     ) -> ApprovalOutcome {
         let req = ApprovalRequest {
-            call_id: Uuid::new_v4().to_string(),
+            call_id: baybo_model::human_ask::AskId::new(),
             tool_call_id: self.tool_call_id.clone(),
             session_id: session_id.clone(),
             user_id: user.id.clone(),
@@ -845,7 +844,7 @@ impl ApprovalHandle {
         }
 
         let req = ApprovalRequest {
-            call_id: Uuid::new_v4().to_string(),
+            call_id: baybo_model::human_ask::AskId::new(),
             tool_call_id: self.tool_call_id.clone(),
             session_id: session_id.clone(),
             user_id: user.id.clone(),

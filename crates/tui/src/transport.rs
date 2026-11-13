@@ -47,7 +47,7 @@ pub enum TransportEvent {
     /// An approval was resolved remotely (by another client); the loop
     /// should drop any pending UI entry for `call_id`.
     ApprovalResolved {
-        call_id: String,
+        call_id: baybo_model::human_ask::AskId,
         decision: ApprovalDecision,
     },
 }

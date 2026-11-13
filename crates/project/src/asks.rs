@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn the_summary_prefers_the_tools_own_label() {
         let base = ApprovalRequest {
-            call_id: "c".into(),
+            call_id: "c".parse().unwrap(),
             tool_call_id: String::new(),
             session_id: SessionId::from("s".to_owned()),
             user_id: "u".into(),

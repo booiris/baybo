@@ -416,10 +416,7 @@ async fn session_event_to_frame(
         } => Frame::ApprovalResolved { call_id, decision },
         SessionEvent::AskResolved {
             ask_id, outcome, ..
-        } => Frame::AskResolved {
-            ask_id: ask_id.to_string(),
-            outcome,
-        },
+        } => Frame::AskResolved { ask_id, outcome },
     }
 }
 
@@ -846,7 +843,7 @@ mod tests {
         assert_eq!(
             frame,
             Frame::AskResolved {
-                ask_id: "c1".into(),
+                ask_id: "c1".parse().unwrap(),
                 outcome: baybo_channels::wire::AskOutcomeKind::Abandoned,
             }
         );
@@ -1043,7 +1040,7 @@ mod tests {
 
     fn approval_on_lazy_channel(ask_id: &str) -> baybo_tools::ApprovalRequest {
         baybo_tools::ApprovalRequest {
-            call_id: ask_id.to_string(),
+            call_id: ask_id.parse().unwrap(),
             tool_call_id: format!("use-{ask_id}"),
             session_id: baybo_model::SessionId::from("sess-lazy"),
             user_id: "u".to_string(),

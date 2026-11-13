@@ -24,7 +24,6 @@ use baybo_trace::{
 };
 use serde_json::Value;
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use baybo_project::worktree::{self, Checkout, ProjectRepo};
 use baybo_store::agent_profile::AgentProfileStore;
@@ -901,7 +900,7 @@ impl ToolExecutor {
                     let outcome = gate
                         .request(
                             ApprovalRequest {
-                                call_id: Uuid::new_v4().to_string(),
+                                call_id: baybo_model::human_ask::AskId::new(),
                                 tool_call_id: tool_use_id.clone(),
                                 session_id: session_id.clone(),
                                 user_id: user.id.clone(),

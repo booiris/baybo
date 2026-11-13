@@ -427,7 +427,7 @@ impl SessionRegistry {
     /// and the gate times out server-side (fail-closed).
     pub(crate) async fn resolve_approval(
         &self,
-        call_id: String,
+        call_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
     ) -> Result<(), TransportError> {
         self.request(|reply| Msg::ResolveApproval {
@@ -535,6 +535,9 @@ pub(crate) async fn resolve_approval<L: SessionLeg>(
     call_id: String,
     decision: WireApprovalDecision,
 ) -> Result<(), String> {
+    let call_id = call_id
+        .parse()
+        .map_err(|e: baybo_model::human_ask::InvalidAskId| e.to_string())?;
     leg.registry()
         .resolve_approval(call_id, decision)
         .await

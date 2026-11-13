@@ -429,7 +429,7 @@ impl AskQueue {
     /// `call_id`.
     pub fn enqueue_mirror(&self, req: ApprovalRequest) {
         let ask = PendingAsk {
-            ask_id: mirror_id(&req.call_id),
+            ask_id: req.call_id.clone(),
             session_id: req.session_id.clone(),
             tool_call_id: req.tool_call_id.clone(),
             kind: AskKind::Approval,
@@ -467,10 +467,10 @@ impl AskQueue {
         true
     }
 
-    /// Remove the entry with `call_id` without deciding it — another client
+    /// Remove the entry with `ask_id` without deciding it — another client
     /// resolved it. `false` when no such entry is queued.
-    pub fn drop_call(&self, call_id: &str) -> bool {
-        self.abandon(&mirror_id(call_id)).is_some()
+    pub fn drop_call(&self, ask_id: &AskId) -> bool {
+        self.abandon(ask_id).is_some()
     }
 }
 
@@ -478,12 +478,6 @@ impl Default for AskQueue {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A mirror's ask id is its wire `call_id`. An empty one (never sent in
-/// practice) gets a fresh id, so it can be shown but not dropped by id.
-fn mirror_id(call_id: &str) -> AskId {
-    call_id.parse().unwrap_or_else(|_| AskId::new())
 }
 
 /// One [`AskQueue`] per channel. The eager boot install and the lazy install
@@ -551,7 +545,7 @@ mod tests {
     fn mirror_req(call_id: &str, session_id: &str) -> ApprovalRequest {
         ApprovalRequest {
             tool_call_id: String::new(),
-            call_id: call_id.into(),
+            call_id: id(call_id),
             session_id: session_id.into(),
             user_id: "u".into(),
             tool: "Bash".into(),
@@ -591,10 +585,10 @@ mod tests {
         );
 
         seen.lock().clear();
-        assert!(queue.drop_call("a1"));
+        assert!(queue.drop_call(&id("a1")));
         assert!(seen.lock().is_empty(), "s1 still has a parked prompt");
 
-        assert!(queue.drop_call("a2"));
+        assert!(queue.drop_call(&id("a2")));
         assert_eq!(*seen.lock(), vec![("s1".into(), PendingEdge::Abandoned)]);
     }
 
@@ -608,7 +602,7 @@ mod tests {
             queue.pending_sessions(),
             HashSet::from([SessionId::from("s1"), SessionId::from("s2")])
         );
-        queue.drop_call("b1");
+        queue.drop_call(&id("b1"));
         assert_eq!(
             queue.pending_sessions(),
             HashSet::from([SessionId::from("s1")])
@@ -709,7 +703,7 @@ mod tests {
         queue.enqueue_mirror(mirror_req("m1", "s1"));
         assert_eq!(
             queue.peek_head_approval().map(|r| r.call_id),
-            Some("m1".into())
+            Some(id("m1"))
         );
         assert!(queue.resolve_head(ApprovalDecision::Deny));
         assert_eq!(
@@ -730,7 +724,7 @@ mod tests {
 
         queue.enqueue_mirror(mirror_req("a1", "s1"));
         assert_eq!(*seen.lock(), vec![(SessionId::from("s1"), 1, 1)]);
-        assert!(queue.drop_call("a1"));
+        assert!(queue.drop_call(&id("a1")));
         assert_eq!(seen.lock().len(), 2);
         assert_eq!(seen.lock()[1], (SessionId::from("s1"), 0, 0));
     }
@@ -753,7 +747,7 @@ mod tests {
                     let q = queue.clone();
                     std::thread::spawn(move || {
                         q.enqueue_mirror(mirror_req(call_id, "s1"));
-                        q.drop_call(call_id);
+                        q.drop_call(&id(call_id));
                     })
                 })
                 .collect();
@@ -813,7 +807,7 @@ mod tests {
         };
         spin_until(&parked);
 
-        assert!(queue.drop_call("x"));
+        assert!(queue.drop_call(&id("x")));
         queue.enqueue_mirror(mirror_req("y", "s1"));
         release.store(true, Ordering::SeqCst);
         raiser.join().expect("raiser");
@@ -855,7 +849,7 @@ mod tests {
         assert!(raised.is_err(), "the watcher was supposed to panic");
         assert!(log.lock().is_empty(), "…and to publish nothing");
 
-        assert!(queue.drop_call("x"));
+        assert!(queue.drop_call(&id("x")));
         assert_eq!(
             *log.lock(),
             vec![PendingEdge::Abandoned],
@@ -881,7 +875,7 @@ mod tests {
         let queue = AskQueue::new();
         queue.enqueue_mirror(mirror_req("a1", "s1"));
         assert_eq!(queue.len(), 1);
-        assert!(queue.drop_call("a1"));
+        assert!(queue.drop_call(&id("a1")));
         assert!(queue.is_empty());
     }
 

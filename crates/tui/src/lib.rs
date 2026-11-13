@@ -672,7 +672,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             && let Some(req) = queue.peek_head_approval()
                         {
                             state.set_pending_approval(ApprovalChatEntry {
-                                call_id: req.call_id,
+                                tool_call_id: req.tool_call_id,
                                 tool: req.tool,
                                 accesses: req.accesses,
                                 params_preview: req.params_preview,
@@ -1607,7 +1607,7 @@ async fn interrupt_turn(
 
 /// Record the resolved approval. The decision sits between its tool's `●` and
 /// `⎿`, but that block is deferred until `ToolCompleted`, so buffer the line
-/// onto the in-flight tool (matched by `call_id`) and let it commit with the
+/// onto the in-flight tool (matched by `tool_call_id`) and let it commit with the
 /// block. If the tool isn't tracked (shouldn't happen), commit it standalone so
 /// the decision isn't lost.
 fn resolve_approval(
@@ -1619,7 +1619,7 @@ fn resolve_approval(
         return Ok(());
     };
     let lines = chat::render_approval_resolved_lines(&outcome.resolved);
-    if let Err(lines) = state.buffer_approval_line(&outcome.resolved.call_id, lines) {
+    if let Err(lines) = state.buffer_approval_line(&outcome.resolved.tool_call_id, lines) {
         flush_answer_boundary(state, terminal)?;
         commit_tool_lines(state, terminal, lines)?;
     }
