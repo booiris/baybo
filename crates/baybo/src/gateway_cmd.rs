@@ -743,8 +743,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         relay_dialer: baybo_gateway::relay::dial::RelayDialer::new(boot::proxy_settings(
             &graph.config,
         )),
-        ask_core: Arc::clone(&graph.ask_core),
-        ask_queues: graph.ask_queues.clone(),
+        ask_channels: baybo_human_ask::AskChannels::new(
+            Arc::clone(&graph.ask_core),
+            graph.ask_queues.clone(),
+        ),
         human_asks: Arc::clone(&graph.human_asks),
     };
 

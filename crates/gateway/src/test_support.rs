@@ -268,8 +268,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         stores.session.clone(),
     );
     let deps = GatewayDeps {
-        ask_core,
-        ask_queues,
+        ask_channels: baybo_human_ask::AskChannels::new(ask_core, ask_queues),
         human_asks,
         config,
         config_path: None,

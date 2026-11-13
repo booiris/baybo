@@ -62,8 +62,7 @@ async fn approved_device_authenticates_channel_ws_upgrade() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &ChannelsConfig::default(),
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install");
     tg.deps
@@ -106,8 +105,7 @@ async fn revoked_device_token_is_rejected_on_channel_ws() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &ChannelsConfig::default(),
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install");
     let mut revoked = approved_device("revoked-token");

@@ -182,8 +182,7 @@ pub(crate) async fn run_content_session<Si: BinarySink, So: BinarySource>(
     let channel = super::adapter::resolve_or_install_channel(
         &state.registry,
         &channel_type,
-        &state.ask_core,
-        &state.ask_queues,
+        &state.ask_channels,
     )
     .map_err(|e| format!("resolve device channel: {e}"))?;
 
@@ -580,8 +579,7 @@ mod tests {
         crate::channel::boot::install_channel(
             &tg.deps.channel_registry,
             ChannelType::owner(),
-            &tg.deps.ask_core,
-            &tg.deps.ask_queues,
+            &tg.deps.ask_channels,
         )
         .expect("install owner channel");
         let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)

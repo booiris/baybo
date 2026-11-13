@@ -267,8 +267,7 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
     crate::channel::boot::install_channel(
         &tg.deps.channel_registry,
         ChannelType::owner(),
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install owner channel");
     let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
@@ -579,8 +578,7 @@ impl DirectRig {
         crate::channel::boot::install_channel(
             &gateway.deps.channel_registry,
             ChannelType::owner(),
-            &gateway.deps.ask_core,
-            &gateway.deps.ask_queues,
+            &gateway.deps.ask_channels,
         )
         .expect("install owner channel");
         let device = StaticKeypair::generate().unwrap();

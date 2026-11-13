@@ -169,3 +169,39 @@ impl Drop for OrphanOnDrop {
         self.queue.orphan(&self.ask_id);
     }
 }
+
+/// What a channel install needs from the ask domain: the channel's queue and
+/// a gate over it, both built on the one ledger core. The gateway holds this
+/// instead of the core and the queues, so it can build a channel's asks and
+/// nothing else.
+#[derive(Clone)]
+pub struct AskChannels {
+    core: Arc<AskCore>,
+    queues: crate::queue::AskQueues,
+}
+
+/// One channel's ask queue and the gate that parks asks on it.
+pub struct ChannelAsks {
+    pub queue: AskQueue,
+    pub gate: Arc<ChannelAskGate>,
+}
+
+impl AskChannels {
+    pub fn new(core: Arc<AskCore>, queues: crate::queue::AskQueues) -> Self {
+        Self { core, queues }
+    }
+
+    /// The queue for `channel` — the same one the manager and the boot
+    /// reload reach — and a gate over it.
+    pub fn for_channel(&self, channel: &baybo_model::ChannelType) -> ChannelAsks {
+        let queue = self.queues.get_or_create(channel);
+        let gate = Arc::new(ChannelAskGate::new(queue.clone(), Arc::clone(&self.core)));
+        ChannelAsks { queue, gate }
+    }
+
+    /// `channel`'s queue alone, for a test that builds its own gate over it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn queue(&self, channel: &baybo_model::ChannelType) -> AskQueue {
+        self.queues.get_or_create(channel)
+    }
+}

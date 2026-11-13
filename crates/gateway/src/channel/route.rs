@@ -94,8 +94,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     let channel = match super::adapter::resolve_or_install_channel(
         &state.registry,
         &channel_type,
-        &state.ask_core,
-        &state.ask_queues,
+        &state.ask_channels,
     ) {
         Ok(ch) => ch,
         Err(err) => {

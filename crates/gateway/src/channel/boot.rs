@@ -23,7 +23,7 @@ use std::sync::Weak;
 
 use baybo_channels::{AskSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult};
 use baybo_config::ChannelsConfig;
-use baybo_human_ask::{AskCore, AskQueue, AskQueueEvent, AskQueues, ChannelAskGate, PendingAsk};
+use baybo_human_ask::{AskQueue, AskQueueEvent, ChannelAsks, PendingAsk};
 use baybo_model::ChannelType;
 use baybo_tools::ApprovalGate;
 
@@ -54,20 +54,19 @@ fn kind_for(channel_type: &ChannelType) -> ChannelKind {
 pub fn install_channels(
     registry: &Arc<ChannelRegistry>,
     config: &ChannelsConfig,
-    core: &Arc<AskCore>,
-    queues: &AskQueues,
+    asks: &baybo_human_ask::AskChannels,
 ) -> ChannelResult<()> {
     if config.cli.enabled {
-        install_channel(registry, ChannelType::tui(), core, queues)?;
+        install_channel(registry, ChannelType::tui(), asks)?;
     }
     if config.telegram.as_ref().is_some_and(|c| c.enabled) {
-        install_channel(registry, ChannelType::telegram(), core, queues)?;
+        install_channel(registry, ChannelType::telegram(), asks)?;
     }
     if config.discord.as_ref().is_some_and(|c| c.enabled) {
-        install_channel(registry, ChannelType::discord(), core, queues)?;
+        install_channel(registry, ChannelType::discord(), asks)?;
     }
     if config.weixin.as_ref().is_some_and(|c| c.enabled) {
-        install_channel(registry, ChannelType::weixin(), core, queues)?;
+        install_channel(registry, ChannelType::weixin(), asks)?;
     }
     // The single owner chat channel serves both the web dashboard and the
     // mobile app (both register as `owner`; see `docs/modules/channels.md`),
@@ -75,7 +74,7 @@ pub fn install_channels(
     // + in-flight buffer. Always installed — it has no operator-facing knobs,
     // and the device-auth gate (an approved `auth_token`) is what admits a
     // device connection.
-    install_channel(registry, ChannelType::owner(), core, queues)?;
+    install_channel(registry, ChannelType::owner(), asks)?;
     Ok(())
 }
 
@@ -91,12 +90,10 @@ pub fn install_channels(
 pub(crate) fn install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: ChannelType,
-    core: &Arc<AskCore>,
-    queues: &AskQueues,
+    asks: &baybo_human_ask::AskChannels,
 ) -> ChannelResult<()> {
     let kind = kind_for(&channel_type);
-    let queue = queues.get_or_create(&channel_type);
-    let channel = build_channel(channel_type.clone(), kind, queue, Arc::clone(core));
+    let channel = build_channel(channel_type.clone(), kind, asks.for_channel(&channel_type));
     let wants_pulse = channel_type == ChannelType::owner();
     registry.install(channel)?;
     if wants_pulse
@@ -108,15 +105,15 @@ pub(crate) fn install_channel(
     Ok(())
 }
 
-/// Build a `Channel` with an ask gate over `queue` and the queue watchers that
+/// Build a `Channel` over its ask queue and gate, with the queue watchers that
 /// turn its asks into frames. Returns an `Arc<Channel>` ready to install.
 pub(crate) fn build_channel(
     channel_type: ChannelType,
     kind: ChannelKind,
-    queue: AskQueue,
-    core: Arc<AskCore>,
+    asks: ChannelAsks,
 ) -> Arc<Channel> {
-    let approval_gate: Arc<dyn ApprovalGate> = Arc::new(ChannelAskGate::new(queue.clone(), core));
+    let ChannelAsks { queue, gate } = asks;
+    let approval_gate: Arc<dyn ApprovalGate> = gate;
     let approvals = AskSurface {
         approval_gate,
         queue: queue.clone(),
@@ -201,10 +198,17 @@ fn announce(channel: &Channel, ask: PendingAsk) {
 /// An ask core over an in-memory ledger, for unit tests that install
 /// channels without a sqlite store.
 #[cfg(test)]
-pub(crate) fn test_ask_core() -> Arc<AskCore> {
-    Arc::new(AskCore::new(
+pub(crate) fn test_ask_core() -> Arc<baybo_human_ask::AskCore> {
+    Arc::new(baybo_human_ask::AskCore::new(
         baybo_human_ask::test_support::MemoryHumanAskStore::new(),
     ))
+}
+
+/// [`AskChannels`](baybo_human_ask::AskChannels) over a fresh in-memory core
+/// and fresh queues.
+#[cfg(test)]
+pub(crate) fn test_ask_channels() -> baybo_human_ask::AskChannels {
+    baybo_human_ask::AskChannels::new(test_ask_core(), baybo_human_ask::AskQueues::new())
 }
 
 #[cfg(test)]
@@ -212,6 +216,8 @@ mod tests {
     use super::*;
     use baybo_channels::wire::AskOutcomeKind;
     use baybo_model::human_ask::AskResolution;
+
+    use baybo_human_ask::{AskChannels, AskCore, AskQueues};
 
     fn core() -> Arc<AskCore> {
         test_ask_core()
@@ -221,7 +227,7 @@ mod tests {
     fn install_defaults_creates_tui_channel() {
         let cfg = ChannelsConfig::default(); // cli.enabled = true
         let reg = Arc::new(ChannelRegistry::new());
-        install_channels(&reg, &cfg, &core(), &AskQueues::new()).expect("install");
+        install_channels(&reg, &cfg, &test_ask_channels()).expect("install");
         assert!(reg.get(&ChannelType::tui()).is_some());
     }
 
@@ -230,7 +236,12 @@ mod tests {
         let queues = AskQueues::new();
         let preloaded = queues.get_or_create(&ChannelType::owner());
         let reg = Arc::new(ChannelRegistry::new());
-        install_channels(&reg, &ChannelsConfig::default(), &core(), &queues).expect("install");
+        install_channels(
+            &reg,
+            &ChannelsConfig::default(),
+            &AskChannels::new(core(), queues.clone()),
+        )
+        .expect("install");
         preloaded.enqueue_mirror(baybo_tools::ApprovalRequest {
             ask_id: "c1".parse().unwrap(),
             tool_call_id: "use-1".into(),
@@ -293,8 +304,7 @@ mod tests {
         let channel = build_channel(
             ChannelType::owner(),
             ChannelKind::Subscribed,
-            queues.get_or_create(&ChannelType::owner()),
-            Arc::clone(&core),
+            AskChannels::new(Arc::clone(&core), queues.clone()).for_channel(&ChannelType::owner()),
         );
         let seen = Arc::new(Recorded::default());
         let conn = Arc::new(Connection::new(Arc::new(RecordingSink(Arc::clone(&seen)))));
@@ -427,8 +437,7 @@ mod tests {
         let ch = build_channel(
             ChannelType::owner(),
             ChannelKind::Subscribed,
-            AskQueue::new(),
-            core(),
+            test_ask_channels().for_channel(&ChannelType::owner()),
         );
         assert!(ch.approval_gate().is_some());
     }

@@ -522,8 +522,7 @@ pub async fn build_managers(
     baybo_gateway::channel::boot::install_channels(
         &channels_registry,
         &config.channels,
-        &ask_core,
-        &ask_queues,
+        &baybo_human_ask::AskChannels::new(Arc::clone(&ask_core), ask_queues.clone()),
     )?;
 
     // The ask push relay watches the owner queue's edges, so it must exist
