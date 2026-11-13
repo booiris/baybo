@@ -15,6 +15,7 @@ use std::sync::Arc;
 use baybo_channels::wire::{Frame, Message as WireMessage};
 use baybo_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
 use baybo_human_ask::AskQueue;
+use baybo_model::human_ask::AskResolution;
 use baybo_model::{ChannelType, ContentBlock, SessionId};
 use baybo_tools::ApprovalRequest;
 use parking_lot::RwLock;
@@ -96,15 +97,19 @@ impl WsTransport {
         // as a ResolveApproval frame so the tool gate releases
         // server-side.
         let client_for_resolver: Arc<WsClient> = Arc::clone(&client);
-        approval_queue.set_resolver(Arc::new(move |call_id, decision| {
+        approval_queue.set_resolver(Arc::new(move |ask_id, resolution| {
+            // The TUI only mirrors approval cards.
+            let AskResolution::Approval(decision) = resolution else {
+                return;
+            };
             let client = Arc::clone(&client_for_resolver);
             tokio::spawn(async move {
                 let frame = Frame::ResolveApproval {
-                    call_id: call_id.clone(),
+                    ask_id: ask_id.clone(),
                     decision,
                 };
                 if let Err(e) = client.send_raw(&frame).await {
-                    warn!(call_id, "approval resolution failed: {e}");
+                    warn!(%ask_id, "approval resolution failed: {e}");
                 }
             });
         }));
@@ -318,7 +323,7 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             Some(TransportEvent::Notice { level, text })
         }
         Frame::ApprovalRequested {
-            call_id,
+            ask_id,
             tool_call_id,
             session_id,
             user_id,
@@ -329,16 +334,16 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
         } => {
             if &session_id != target_session {
                 debug!(
-                    call_id,
+                    %ask_id,
                     tool,
                     other = %session_id,
                     "approval from other session; ignoring"
                 );
                 return None;
             }
-            debug!(call_id, tool, "approval added from gateway");
+            debug!(%ask_id, tool, "approval added from gateway");
             queue.enqueue_mirror(ApprovalRequest {
-                call_id,
+                ask_id,
                 tool_call_id: tool_call_id.unwrap_or_default(),
                 session_id,
                 user_id,
@@ -349,9 +354,12 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             });
             Some(TransportEvent::ApprovalRequested)
         }
-        Frame::ApprovalResolved { call_id, decision } => {
-            let _ = queue.drop_call(&call_id);
-            Some(TransportEvent::ApprovalResolved { call_id, decision })
+        // Every close, answered elsewhere or not: drop the mirrored card. A
+        // no-op when this client's own answer already removed it.
+        // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
+        Frame::AskResolved { ask_id, .. } => {
+            let _ = queue.drop_ask(&ask_id);
+            None
         }
         Frame::Reasoning { .. } => {
             // The TUI surfaces an animated "working" indicator instead of
@@ -386,9 +394,9 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
                 return None;
             }
             for card in pending_approvals {
-                queue.drop_call(&card.call_id);
+                queue.drop_ask(&card.ask_id);
                 queue.enqueue_mirror(ApprovalRequest {
-                    call_id: card.call_id,
+                    ask_id: card.ask_id,
                     tool_call_id: card.tool_call_id.unwrap_or_default(),
                     session_id: session_id.clone(),
                     user_id: card.user_id,

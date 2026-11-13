@@ -29,7 +29,8 @@ const HISTORY_CAP: usize = 500;
 /// committed as a one-line summary to scrollback (once resolved).
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovalChatEntry {
-    pub call_id: String,
+    /// The blocked tool call, which keys its in-flight [`RunningTool`].
+    pub tool_call_id: String,
     pub tool: String,
     pub accesses: Vec<ResourceAccess>,
     pub params_preview: String,
@@ -374,15 +375,19 @@ impl AppState {
     }
 
     /// Buffer a resolved-approval summary onto its in-flight tool (matched by
-    /// `call_id`) so it commits between that tool's `●` and `⎿`. Returns the
+    /// the tool's `call_id`, which is the approval's `tool_call_id`) so it commits between that tool's `●` and `⎿`. Returns the
     /// lines back as `Err` when no such tool is tracked, so the caller can
     /// commit them standalone instead.
     pub(crate) fn buffer_approval_line(
         &mut self,
-        call_id: &str,
+        tool_call_id: &str,
         lines: Vec<Line<'static>>,
     ) -> Result<(), Vec<Line<'static>>> {
-        match self.running_tools.iter_mut().find(|t| t.call_id == call_id) {
+        match self
+            .running_tools
+            .iter_mut()
+            .find(|t| t.call_id == tool_call_id)
+        {
             Some(rt) => {
                 rt.approval_lines.extend(lines);
                 Ok(())
@@ -515,9 +520,9 @@ impl AppState {
 
         if let Some(queue) = self.approval.as_ref() {
             queue.resolve_head(decision);
-            if let Some(req) = queue.peek_head() {
+            if let Some(req) = queue.peek_head_approval() {
                 self.pending_approval = Some(ApprovalChatEntry {
-                    call_id: req.call_id,
+                    tool_call_id: req.tool_call_id,
                     tool: req.tool,
                     accesses: req.accesses,
                     params_preview: req.params_preview,
@@ -1201,7 +1206,7 @@ mod tests {
         app.note_response_pending();
         assert!(app.show_working());
         app.set_pending_approval(ApprovalChatEntry {
-            call_id: "call-1".into(),
+            tool_call_id: "use-1".into(),
             tool: "Bash".into(),
             accesses: Vec::new(),
             params_preview: String::new(),

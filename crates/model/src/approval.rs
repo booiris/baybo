@@ -12,16 +12,17 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::SessionId;
+use crate::human_ask::AskId;
 
 /// One approval prompt: which tool call wants which resources.
 ///
-/// Lives in `baybo-model` so crates below `baybo-tools` (the ask queue in
-/// `baybo-human-ask`) can name it without depending on the tool layer;
-/// `baybo-tools` re-exports it.
+/// Lives in `baybo-model` so the `human_asks` ledger (`baybo-store`) can type
+/// its persisted payload without depending on `baybo-tools`; `baybo-tools`
+/// re-exports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
-    /// This prompt's own id — a fresh UUID per prompt.
-    pub call_id: String,
+    /// This prompt's own id, which is also the id of the ask it raises.
+    pub ask_id: AskId,
     /// LLM `tool_use_id` of the tool call this prompt blocks — what
     /// `ToolStarted`/`ToolCompleted` events carry. Not unique per prompt: one
     /// call can prompt more than once. Defaults to empty for input written
@@ -99,7 +100,8 @@ pub enum ApprovalResolution {
     /// rows written before this distinction existed read as answered.
     #[default]
     Answered,
-    /// Nobody answered within the gate's window; denied by default.
+    /// Historical: gates used to deny themselves after a fixed window.
+    /// Nothing produces this any more; it stays so old span events decode.
     TimedOut,
     /// The prompt went away undecided — its turn was cancelled or its
     /// process shut down. Denied by default.

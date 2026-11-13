@@ -8,7 +8,7 @@ import Testing
         try! IssueEvent.decodeList("{\"items\":[\(items)]}")
     }
 
-    private func requested(_ id: String, callId: String, by handle: String? = "dev-1", at: Int = 0)
+    private func requested(_ id: String, askId: String, by handle: String? = "dev-1", at: Int = 0)
         -> String
     {
         let actor =
@@ -16,26 +16,26 @@ import Testing
             ?? "{\"kind\":\"user\"}"
         return """
             {"id":"\(id)","number":1,"actor":\(actor),"created_at_ms":\(at),
-             "body":{"kind":"approval_requested","call_id":"\(callId)","tool":"exec_command","summary":"cargo test"}}
+             "body":{"kind":"approval_requested","ask_id":"\(askId)","tool":"exec_command","summary":"cargo test"}}
             """
     }
 
-    private func resolved(_ id: String, callId: String) -> String {
+    private func resolved(_ id: String, askId: String) -> String {
         """
         {"id":"\(id)","number":1,"actor":{"kind":"system"},"created_at_ms":9,
-         "body":{"kind":"approval_resolved","call_id":"\(callId)","decision":"approve","resolution":"answered"}}
+         "body":{"kind":"approval_resolved","ask_id":"\(askId)","decision":"approve","resolution":"answered"}}
         """
     }
 
     @Test func aResolutionRetiresItsOwnPromptAndLeavesTheRest() {
         let timeline = events(
             [
-                requested("e1", callId: "c1"),
-                requested("e2", callId: "c2"),
-                resolved("e3", callId: "c1"),
+                requested("e1", askId: "c1"),
+                requested("e2", askId: "c2"),
+                resolved("e3", askId: "c1"),
             ].joined(separator: ","))
         let pending = IssueTimeline.pendingApprovals(in: timeline)
-        #expect(pending.map(\.callId) == ["c2"])
+        #expect(pending.map(\.askId) == ["c2"])
         #expect(pending.first?.tool == "exec_command")
         #expect(pending.first?.askedBy == "dev-1")
     }
@@ -43,11 +43,11 @@ import Testing
     @Test func aReRequestReopensThePrompt() {
         let timeline = events(
             [
-                requested("e1", callId: "c1"),
-                resolved("e2", callId: "c1"),
-                requested("e3", callId: "c1", at: 20),
+                requested("e1", askId: "c1"),
+                resolved("e2", askId: "c1"),
+                requested("e3", askId: "c1", at: 20),
             ].joined(separator: ","))
-        #expect(IssueTimeline.pendingApprovals(in: timeline).map(\.callId) == ["c1"])
+        #expect(IssueTimeline.pendingApprovals(in: timeline).map(\.askId) == ["c1"])
     }
 
     @Test func onlyAnAgentAuthoredBlockIsAQuestion() {

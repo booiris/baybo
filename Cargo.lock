@@ -749,9 +749,14 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "baybo-model",
+ "baybo-store",
  "baybo-tools",
+ "chrono",
  "parking_lot",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -933,6 +938,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "baybo-human-ask",
  "baybo-model",
  "baybo-session",
  "baybo-storage",
@@ -1172,6 +1178,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
@@ -7174,6 +7181,7 @@ dependencies = [
  "chrono",
  "rmp-serde",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "ts-rs",
 ]

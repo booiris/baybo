@@ -421,17 +421,17 @@ impl SessionRegistry {
     }
 
     /// Queue the user's answer to a pending approval prompt. Unlike
-    /// [`Self::send`] this takes no session: the prompt's `call_id` is what the
+    /// [`Self::send`] this takes no session: the prompt's `ask_id` is what the
     /// gateway keys on, and the frame carries no session binding. It still
     /// needs the leg to be live — a decision made after the pump died is lost,
-    /// and the gate times out server-side (fail-closed).
+    /// and the prompt stays pending on the gateway.
     pub(crate) async fn resolve_approval(
         &self,
-        call_id: String,
+        ask_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
     ) -> Result<(), TransportError> {
         self.request(|reply| Msg::ResolveApproval {
-            call_id,
+            ask_id,
             decision,
             reply,
         })
@@ -532,11 +532,14 @@ pub(crate) async fn send<L: SessionLeg>(
 /// Echo the user's approval decision back on `leg`'s live pump.
 pub(crate) async fn resolve_approval<L: SessionLeg>(
     leg: &L,
-    call_id: String,
+    ask_id: String,
     decision: WireApprovalDecision,
 ) -> Result<(), String> {
+    let ask_id = ask_id
+        .parse()
+        .map_err(|e: baybo_model::human_ask::InvalidAskId| e.to_string())?;
     leg.registry()
-        .resolve_approval(call_id, decision)
+        .resolve_approval(ask_id, decision)
         .await
         .map_err(|e| e.to_string())
 }

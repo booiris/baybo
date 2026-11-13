@@ -1,12 +1,14 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **PR 1a landed; PR 1b/1c, 2 and 3 pending** — on master today,
-> `baybo-human-ask` holds the moved approval queue (`AskQueue`,
-> `ChannelAskGate`, still with the 300 s timeout) and `PolicyDenyGate`, and
-> attendedness (`TurnInputKind::is_attended`) replaces
-> `InheritedToolContext`. The ledger, `AskCore`, `HumanAskManager`, the
-> restart path and everything else under
-> [Implementation notes](#implementation-notes-pr-1) arrive with PR 1b/1c.
+> Status: **PR 1 in part; PR 2/3 pending** — PR 1 lands in three steps.
+> The refactor (1a) and durable approvals on the live path with no timeout
+> (1b: `baybo-human-ask` queue, core, gates and the manager's live verbs, the
+> ledger, the `tools::ask` ports, the agent's live path, the gateway doors,
+> frames, the project bridge) exist. Restart survival (1c: everything under
+> [Restart survival](#restart-survival) — reload, the turn prelude, the Resume
+> turn, the hydration skip) does not; until it lands a restart closes every
+> pending ask (see the 1b interim note there). The
+> [Implementation notes](#implementation-notes-pr-1) describe the full PR 1.
 > `AskUser` + web (PR 2) and iOS (PR 3) are not started. This document is the spec the three
 > PRs described in [PR plan](#pr-plan) are built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
@@ -51,10 +53,10 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-store` (`store::human_ask`) | `HumanAskRow` + the `HumanAskStore` port. No delete method. |
 | `baybo-storage` (`sqlite/human_ask.rs`) | `SqliteHumanAskStore` over the `human_asks` table. DDL in `sqlite/mod.rs` like every other table. |
 | `baybo-tools` (`tools::approval`, new `tools::ask`) | The **tool-facing ports** only: `ApprovalGate`, `ApprovalGateMap`, `AutoDenyGate`, `ApprovalHandle`, `ApprovalOutcome`, `refusal_reason`; new `QuestionGate`, `QuestionHandle`, `AskCancel`, `ParkGauge`, `ToolContext.question`, `Tool::sole_call()`. Never depends on `baybo-human-ask`. |
-| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
+| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`, `RouterInbound::ResumeAsk`. |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
-| `baybo-gateway`, `baybo-agent`, `baybo-project`, `baybo-tui` | Consumers that receive `Arc<AskCore>` / `Arc<HumanAskManager>` / `AskQueues`, never the store. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. `tui`: compile-only arms + TODO. |
+| `baybo-gateway`, `baybo-agent`, `baybo-project`, `baybo-tui` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. `tui`: compile-only arms + TODO. |
 
 Dependency edges, all acyclic: `human-ask → model, store, tools`;
 `channels → tools, human-ask`; `project → human-ask`;
@@ -66,8 +68,8 @@ the router) arrives as a port it defines.
 
 ## Vocabulary
 
-- **Ask** — one prompt to a human. Keyed by `AskId` (UUID, today's
-  `ApprovalRequest.call_id`). One tool call can raise more than one ask over
+- **Ask** — one prompt to a human. Keyed by `AskId` (a UUID; an approval
+  carries it as `ApprovalRequest.ask_id`, formerly `call_id`). One tool call can raise more than one ask over
   its life, so `tool_call_id` is **not** unique; `ask_id` is.
 - **`AskKind`** — `Approval | Question`.
 - **`AskPhase`** — `BeforeExecute` (the executor's pre-execute gate) or
@@ -289,7 +291,7 @@ survives the generalization.
 `Q11` of the design interview grouped project runs with cron as "unattended".
 The code says otherwise: issue runs prompt through `TimelineApprovalGate`
 (`crates/project/src/approvals.rs`), the board renders `attention().approvals`,
-`POST /projects/{id}/issues/{n}/approvals/{call_id}` answers them, and
+`POST /projects/{id}/issues/{n}/approvals/{ask_id}` answers them, and
 `Timeline.tsx` has the buttons. Auto-denying would retire a working feature.
 
 Decision: `IssueRun` is attended for approvals and keeps its whole surface;
@@ -472,6 +474,19 @@ to close. Asks are meant to still be open after the process comes back.
 
 ### Restart survival
 
+> **Interim (PR 1b only — replaced by this section in 1c).** 1b ships none of
+> what follows: no reload, no Resume turn, no turn prelude, no hydration
+> skip. Instead `gateway_cmd`, right after `build_managers` and before any
+> channel starts, calls `HumanAskManager::close_stale_asks` once: every
+> unapplied row a previous process left is claimed `Abandoned` if still
+> pending (observers, so the card timeline, hear it) and stamped applied, so
+> 1c's settlement never picks up a 1b-era row. The dangling `tool_use` then
+> gets hydration's interrupted fill — the user-visible result of a restart
+> before durable asks. Within one process a dropped waiter takes its ask off
+> the queue (`AskQueue::orphan` removes every kind), and `resolve` of a
+> pending ask no tool future waits on returns `NotLive` and leaves the row
+> alone. `baybo prompt` does not call it; the gateway's next boot does.
+
 Boot order in `runtime.rs::build_managers`, new steps in **bold**, in the
 order the code can actually have:
 
@@ -496,8 +511,8 @@ order the code can actually have:
    the store and the queue, never on the manager. The same three functions
    serve the **lazy** install of an out-of-tree `baybo.json` channel on its
    first WS connection (`resolve_or_install_channel`, `adapter.rs:193-206`,
-   from `route.rs:93`), so `GatewayDeps` and `WsChannelState` carry
-   `Arc<AskCore>` + `AskQueues` for it. A queue created by the reload for a
+   from `route.rs:93`), so `GatewayDeps` and `WsChannelState` carry an
+   `AskChannels` for it (`for_channel` → the channel's queue and gate). A queue created by the reload for a
    channel whose sidecar has not reconnected yet is simply the queue the
    later install attaches its gate and watchers to; the watcher install
    re-announces the entries already on it, since a multiplexed channel has no
@@ -815,14 +830,15 @@ attachments are staged and a question is pending.
 
 ### Wire surface
 
-Approval frames are kept **byte for byte** (`ApprovalRequested`,
-`ApprovalResolved`, `ResolveApproval`, `ApprovalCard`,
-`SubscribeState.pending_approvals`): the TUI arms, the iOS native card and
-the iOS web sentinel's dropped-key check all pin them. New frames:
+The approval frames keep their shape (`ApprovalRequested`, `ResolveApproval`,
+`ApprovalCard`, `SubscribeState.pending_approvals`), with the prompt's id
+named `ask_id`. `ApprovalResolved` is gone: its decision rides
+`AskResolved.decision`, so one frame closes every card. New frames:
 
 ```rust
 Frame::QuestionAsked   { ask_id, tool_call_id: String, session_id, user_id, questions: Vec<WireQuestion> }  // session-scoped
-Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | abandoned */ }            // session-less, any kind
+Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | abandoned */,
+                         decision: Option<ApprovalDecision> /* a human's, on an approval */ }              // session-less, any kind
 Frame::AnswerQuestion  { ask_id, reply: QuestionReply /* Answered { answers: Vec<WireAnswer> } | Declined */ } // client → server
 Frame::ToolCompleted   { …, ask: Option<AskStepSummary> }                                                   // additive optional field
 SubscribeState { …, pending_questions: Vec<QuestionCard> }   // #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -830,26 +846,24 @@ WireWorkStep   { …, ask: Option<AskStepSummary> }
 SessionPatch   { …, awaiting_human: Option<bool> }           // renamed from approval_pending; any pending ask kind
 ```
 
-- `AskResolved` is kind-agnostic on purpose: it is the only way to drop an
-  **approval** card on abandon. `ApprovalResolved` carries an
-  `ApprovalDecision`, which must not be widened, and today an abandoned
-  approval broadcasts nothing — the web clears the card only on
-  `approval_resolved` (`ChatPage.tsx:4239-4245`), so after `/stop` or
-  "moved on" every open tab would keep an answerable card whose
+- `AskResolved` is kind-agnostic on purpose: it is the one close frame, and
+  the only way to drop an **approval** card on abandon. On master,
+  `ApprovalResolved` was sent only for a decided approval, so after `/stop`
+  or "moved on" every open tab kept an answerable card whose
   `ResolveApproval` the manager rejects. `AskResolved` is emitted on every
-  `AskClosed` event; `ApprovalResolved` is still emitted for an answered
-  approval as today. Clients drop the card by `ask_id == call_id`. iOS drops
-  nothing on it until PR 3 (stale card after an abandon — listed under
-  Deferred).
+  `AskClosed` event and carries the `decision` when a human decided an
+  approval, which is what a client labels the work step with; the separate
+  `ApprovalResolved` frame was folded into it. Clients drop the card with
+  the same `ask_id`.
 - Frames are dispatched by **queue watchers the gateway installs** in
   `build_channel`, the same place the `SessionPatch` watcher lives today
   (`boot.rs:184-200`): `AskRaised(entry)` → `SessionEvent::ApprovalRequested` /
   `QuestionAsked`, `AskClosed { session_id, ask_id, kind, outcome }` →
-  `SessionEvent::AskResolved { session_id, ask_id, outcome }` (+
-  `ApprovalResolved` when answered). The `SessionEvent` keeps the session so
+  `SessionEvent::AskResolved { session_id, ask_id, outcome, decision }`. The
+  `SessionEvent` keeps the session so
   `session_id()` stays infallible (`types.rs:306-313`) and Subscribed
   delivery can find its subscribers; `session_event_to_frame`
-  (`adapter.rs:394-437`) drops it, as it does for `ApprovalResolved` today.
+  (`adapter.rs:394-437`) drops it.
   That gives raise and resolve one dispatch home, lets the settlement's
   abandons reach open tabs without the agent crate knowing channels, and
   removes the manual `broadcast_approval_resolved` from the `route.rs` arm.
@@ -995,8 +1009,8 @@ session is just a dead ask, which the Resume door and the prelude handle.
 - **TUI**: `map_frame` gets `Frame::QuestionAsked` in the silent-drop group
   with `// TODO(human-ask): render AskUser questions inline like ApprovalChatEntry`
   (the `tui` channel never receives it — `AskUser` is owner-only), but
-  `Frame::AskResolved { ask_id, .. }` is handled: `queue.drop_call(&ask_id)`
-  beside the `ApprovalResolved` arm, because the TUI mirrors every approval
+  `Frame::AskResolved { ask_id, .. }` is handled: `queue.drop_ask(&ask_id)`,
+  because the TUI mirrors every approval
   card (`transport.rs:343-354, :390-402`) and an approval abandoned by
   another client would otherwise stay on screen with nothing to clear it
   now that the self-deny is gone. `ask: None` in the two `ToolCompleted`
@@ -1115,7 +1129,7 @@ dispatch_approval_*` get kind-aware siblings.
 The TUI and `baybo prompt` use `AskQueue` as a display mirror of approval
 cards. Its approval-typed surface survives as wrappers on the re-typed queue,
 importing from `baybo_human_ask`: `enqueue_mirror(ApprovalRequest)`
-(synthesizes `PendingAsk { ask_id: call_id, kind: Approval, phase: BeforeExecute, responder: None }`),
+(synthesizes `PendingAsk { ask_id, kind: Approval, phase: BeforeExecute, responder: None }`),
 `peek_head_approval() -> Option<ApprovalRequest>` (projects
 `AskRequest::Approval`, `None` for another kind), `list_approvals()`,
 `resolve_head(ApprovalDecision)`
@@ -1162,8 +1176,8 @@ Where the code differs from the sketch above, and why:
   `ResolveApproval` arm checks the ask is on the connection's own channel
   queue (least privilege: a TUI connection cannot answer an owner ask) and
   calls `HumanAskManager::resolve`; the queue watchers dispatch
-  `ApprovalResolved` + `AskResolved`. The board's
-  `POST …/approvals/{call_id}` reads the ledger row and answers only a
+  `AskResolved` with the decision. The board's
+  `POST …/approvals/{ask_id}` reads the ledger row and answers only a
   pending `Approval` row whose session's trigger is that issue, mapping
   `AskClosed` / `NotFound` to 404.
 - **The card bridge.** `CardPromptCloser`'s one method is
@@ -1269,7 +1283,7 @@ Where the code differs from the sketch above, and why:
 3. user clicks → `Frame::ResolveApproval` → `route.rs` arm →
    `manager.resolve(ask_id, Approval(decision))`: claim → observer
    `Resolved` → remove entry → `Answered` edge + `AskClosed` watcher (gateway
-   dispatches `ApprovalResolved` + `AskResolved`) → oneshot
+   dispatches `AskResolved` with the decision) → oneshot
 4. the gate stamps `mark_applied` as the oneshot yields, then returns the
    outcome; executor continues as today
 
@@ -1322,10 +1336,6 @@ user turn. See [above](#a-new-message-while-a-dead-ask-is-pending).
 no wait. Identical for `BeforeExecute` and `DuringExecute`.
 
 ## PR plan
-
-PR 1 is delivered as three stacked PRs: **1a** refactor (queue move,
-`ApprovalRequest` move, attendedness), **1b** durable live path (ledger,
-gates, manager, no timeout), **1c** restart resume (prelude, Resume turn).
 
 Three draft PRs, in order, each green on `cargo clippy --all --benches --tests
 --examples --all-features`, `scripts/check-rustdoc.sh`,

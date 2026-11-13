@@ -1144,7 +1144,7 @@ export interface paths {
         patch: operations["update_issue"];
         trace?: never;
     };
-    "/v1/projects/{project_id}/issues/{number}/approvals/{call_id}": {
+    "/v1/projects/{project_id}/issues/{number}/approvals/{ask_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -1940,14 +1940,10 @@ export interface components {
         };
         ChatSessionSummary: {
             /**
-             * @description True while a tool call in this session is parked on the approval gate,
-             *     waiting for the user to approve or deny it. The client marks the row so
-             *     the user knows which conversation to open; the prompt itself is only
-             *     answerable inside the conversation.
-             *
-             *     Derived from live in-memory gate state, never the store: a parked turn
-             *     dies with the gateway process, so reading `false` after a restart is
-             *     correct rather than stale. Absent when false.
+             * @deprecated
+             * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
+             *     clients that predate the rename; removed in PR 3 of the human-ask
+             *     rollout (`docs/modules/human-ask.md`).
              */
             approval_pending?: boolean;
             /**
@@ -1957,6 +1953,16 @@ export interface components {
              *     row; set via `PUT /v1/chat/sessions/{id}/archive`.
              */
             archived: boolean;
+            /**
+             * @description True while an ask of any kind in this session is waiting on the user
+             *     — a tool approval, or a question. The client marks the row so the user
+             *     knows which conversation to open; the ask itself is only answerable
+             *     inside the conversation.
+             *
+             *     Read from the in-memory ask queues. A gateway restart abandons every
+             *     pending ask, so the mark does not outlive one. Absent when false.
+             */
+            awaiting_human?: boolean;
             /** Format: date-time */
             created_at: string;
             /**
@@ -2714,12 +2720,19 @@ export interface components {
             filename?: string | null;
         };
         IssueDto: {
-            /** @description True only while this card has an answerable prompt in the live queue. */
+            /**
+             * @deprecated
+             * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
+             *     clients that predate the rename; removed in PR 3 of the human-ask
+             *     rollout (`docs/modules/human-ask.md`).
+             */
             approval_pending: boolean;
             /** @description The agent on it, if any. In Progress always has one. */
             assignee?: string | null;
             /** @description Files hung on the description. */
             attachments?: components["schemas"]["IssueAttachmentDto"][];
+            /** @description True only while this card has an answerable ask in the queue. */
+            awaiting_human: boolean;
             /**
              * @description Why work stopped. A badge on the card — blocked work stays in
              *     whichever column it was in.
@@ -2895,19 +2908,19 @@ export interface components {
             kind: "worktree_kept";
             reason: string;
         } | {
+            ask_id: string;
             /**
              * Format: int64
              * @description Which run is parked, by attempt number. Absent when the card was
              *     not recording it yet, or when no run owns the prompt.
              */
             attempt?: number | null;
-            call_id: string;
             /** @enum {string} */
             kind: "approval_requested";
             summary: string;
             tool: string;
         } | {
-            call_id: string;
+            ask_id: string;
             decision: components["schemas"]["ApprovalDecisionDto"];
             /** @enum {string} */
             kind: "approval_resolved";
@@ -8045,12 +8058,19 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
-                            /** @description True only while this card has an answerable prompt in the live queue. */
+                            /**
+                             * @deprecated
+                             * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
+                             *     clients that predate the rename; removed in PR 3 of the human-ask
+                             *     rollout (`docs/modules/human-ask.md`).
+                             */
                             approval_pending: boolean;
                             /** @description The agent on it, if any. In Progress always has one. */
                             assignee?: string | null;
                             /** @description Files hung on the description. */
                             attachments?: components["schemas"]["IssueAttachmentDto"][];
+                            /** @description True only while this card has an answerable ask in the queue. */
+                            awaiting_human: boolean;
                             /**
                              * @description Why work stopped. A badge on the card — blocked work stays in
                              *     whichever column it was in.
@@ -8339,8 +8359,8 @@ export interface operations {
                 project_id: string;
                 /** @description Issue number within the project */
                 number: number;
-                /** @description The approval's call id, from its timeline entry */
-                call_id: string;
+                /** @description The approval's ask id, from its timeline entry */
+                ask_id: string;
             };
             cookie?: never;
         };
@@ -8366,7 +8386,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Unknown project or issue, or this card has no prompt waiting on that call */
+            /** @description Unknown project or issue, or this card has no prompt waiting on that ask */
             404: {
                 headers: {
                     [name: string]: unknown;

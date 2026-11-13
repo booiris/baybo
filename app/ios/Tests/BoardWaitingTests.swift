@@ -18,9 +18,9 @@ import Testing
             cancelledAtMs: cancelled ? 1 : nil, createdAtMs: 0, updatedAtMs: 0)
     }
 
-    private func prompt(_ callId: String) -> IssueApprovalPrompt {
+    private func prompt(_ askId: String) -> IssueApprovalPrompt {
         IssueApprovalPrompt(
-            callId: callId, tool: "exec_command", summary: "cargo test", askedBy: "dev-1",
+            askId: askId, tool: "exec_command", summary: "cargo test", askedBy: "dev-1",
             askedAtMs: 1)
     }
 

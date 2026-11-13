@@ -24,7 +24,7 @@ import type { WeixinBotHandle, WeixinChat } from "./types.js";
 const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface PendingEntry {
-  readonly callId: string;
+  readonly askId: string;
   readonly botId: string;
   readonly handle: WeixinBotHandle;
   readonly chat: WeixinChat;
@@ -115,7 +115,7 @@ export class WeixinApprovals
   ): Promise<ApprovalDecision> {
     if (!route) {
       this.logger.warn(
-        `weixin approval: no route for callId=${req.callId}; auto-denying`,
+        `weixin approval: no route for askId=${req.askId}; auto-denying`,
       );
       return "deny";
     }
@@ -129,7 +129,7 @@ export class WeixinApprovals
     const prev = this.pending.get(key);
     if (prev) {
       this.logger.warn(
-        `weixin approval: superseding pending callId=${prev.callId} for ${key}`,
+        `weixin approval: superseding pending askId=${prev.askId} for ${key}`,
       );
       clearTimeout(prev.timeout);
       this.pending.delete(key);
@@ -139,16 +139,16 @@ export class WeixinApprovals
     const promise = new Promise<ApprovalDecision>((resolve) => {
       const timeout = setTimeout(() => {
         const entry = this.pending.get(key);
-        if (!entry || entry.callId !== req.callId) return;
+        if (!entry || entry.askId !== req.askId) return;
         this.pending.delete(key);
         this.logger.warn(
-          `weixin approval: timed out callId=${req.callId} for ${key}; auto-denying`,
+          `weixin approval: timed out askId=${req.askId} for ${key}; auto-denying`,
         );
         resolve("deny");
       }, APPROVAL_TIMEOUT_MS);
 
       this.pending.set(key, {
-        callId: req.callId,
+        askId: req.askId,
         botId: route.botId,
         handle: route.handle,
         chat: route.chat,
@@ -169,15 +169,15 @@ export class WeixinApprovals
   }
 
   async onResolved(
-    callId: string,
-    decision: ApprovalDecision,
+    askId: string,
+    decision: ApprovalDecision | undefined,
   ): Promise<void> {
-    // Find the entry by callId (we key by user, not callId). If it's
+    // Find the entry by askId (we key by user, not askId). If it's
     // still pending at this point the user never replied in time;
     // resolve it with the decision baybo handed us.
     let matched: { key: string; entry: PendingEntry } | null = null;
     for (const [key, entry] of this.pending) {
-      if (entry.callId === callId) {
+      if (entry.askId === askId) {
         matched = { key, entry };
         break;
       }
@@ -188,7 +188,9 @@ export class WeixinApprovals
     // Only resolve the promise if it hasn't already been (race with a
     // user reply). The promise is idempotent via closure; calling
     // resolve twice is a no-op in JS.
-    matched.entry.resolve(decision);
+    matched.entry.resolve(decision ?? "deny");
+    // An undecided close needs no new message: the prompt is simply over.
+    if (decision === undefined) return;
     try {
       await this.sendDecisionEcho(matched.entry, decision);
     } catch (err) {

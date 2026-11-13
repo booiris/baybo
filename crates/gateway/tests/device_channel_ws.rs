@@ -59,7 +59,12 @@ async fn upgrade_accepted(port: u16, token: &str) -> bool {
 async fn approved_device_authenticates_channel_ws_upgrade() {
     let (_dir, pf) = port_file();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default()).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &ChannelsConfig::default(),
+        &tg.deps.ask_channels,
+    )
+    .expect("install");
     tg.deps
         .stores
         .device
@@ -97,7 +102,12 @@ async fn approved_device_authenticates_channel_ws_upgrade() {
 async fn revoked_device_token_is_rejected_on_channel_ws() {
     let (_dir, pf) = port_file();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default()).expect("install");
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &ChannelsConfig::default(),
+        &tg.deps.ask_channels,
+    )
+    .expect("install");
     let mut revoked = approved_device("revoked-token");
     revoked.status = DeviceStatus::Revoked;
     tg.deps.stores.device.create(&revoked).await.unwrap();

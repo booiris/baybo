@@ -118,7 +118,7 @@ export interface UserInbound {
 }
 
 export interface ApprovalRequest {
-  callId: string;
+  askId: string;
   sessionId: string;
   /**
    * Baybo user id (`<channelType>_<id>` — e.g. `telegram_<...>` — matching the inbound
@@ -214,7 +214,12 @@ export interface Channel {
    */
   onApprovalRequested?(req: ApprovalRequest): Promise<ApprovalDecision>;
 
-  onApprovalResolved?(callId: string, decision: ApprovalDecision): Promise<void>;
+  /**
+   * An approval this channel was shown closed. `decision` is what a human
+   * decided; `undefined` when it closed undecided (the turn was stopped, the
+   * prompt expired, the user moved on) — drop the prompt either way.
+   */
+  onApprovalResolved?(askId: string, decision: ApprovalDecision | undefined): Promise<void>;
 
   /**
    * Control-plane: gateway-authored slash-command manifest. Pushed

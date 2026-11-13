@@ -7,23 +7,23 @@ use parking_lot::Mutex;
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
 #[cfg(test)]
 use baybo_model::TrustLevel;
+use baybo_model::human_ask::AskPhase;
 use baybo_model::{ContentBlock, ParallelGroup, SessionId, SpanId, TurnId, User};
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalHandle, ApprovalOutcome,
-    ApprovalRequest, ApprovedResource, ExecSandbox, ReadTracker, ResourceAccess, ToolCapability,
-    ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry, VirtualReadResolver,
-    approval::preview_params, refusal_reason,
+    ApprovalRequest, ApprovalResolution, ApprovedResource, AskCancel, AskSite, ExecSandbox,
+    ParkGauge, ReadTracker, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest,
+    ToolOutput, ToolRegistry, TurnTokens, VirtualReadResolver, approval::preview_params,
+    refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
     StepHandle, ToolCallBegin, ToolCallOrigin, ToolCallOutput, ToolCallResult, ToolEventPayload,
 };
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use baybo_project::worktree::{self, Checkout, ProjectRepo};
 use baybo_store::agent_profile::AgentProfileStore;
@@ -110,13 +110,56 @@ async fn board_handle(
 /// Preview length used when rendering parameters inside an approval prompt.
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
 
-/// Headroom added to the per-tool outer timeout so a slow user
-/// approval (handled mid-execution via [`baybo_tools::ApprovalHandle`])
-/// cannot kill the tool while it is legitimately blocked on a modal.
-/// Tracks the channel gate's own `APPROVAL_TIMEOUT` in
-/// `crates/gateway/src/channel/adapter.rs`; if you change one, change
-/// the other.
-const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
+/// Slack the outer tool deadline gives a tool past its own `ctx.timeout`, so
+/// work a tool does after its inner deadline fires (Bash detaching a timed-out
+/// command into the background) is not raced by the executor's timer. Time a
+/// call spends parked on an ask is not counted at all; see
+/// [`PausableDeadline`].
+pub(crate) const TOOL_DEADLINE_GRACE: Duration = Duration::from_secs(15);
+
+/// How often [`PausableDeadline`] re-reads the call's [`ParkGauge`]. Bounds
+/// how far a park transition can be misattributed.
+const PARK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The wall-clock budget of one tool body. Elapsed time accrues only while
+/// the call's [`ParkGauge`] reads zero, so a tool parked on a human (an
+/// approval raised mid-execution) can wait indefinitely without being killed.
+struct PausableDeadline {
+    budget: Duration,
+    gauge: ParkGauge,
+}
+
+impl PausableDeadline {
+    fn new(budget: Duration, gauge: ParkGauge) -> Self {
+        Self { budget, gauge }
+    }
+
+    /// Resolves once `budget` of un-parked time has passed.
+    async fn expired(self) {
+        let mut spent = Duration::ZERO;
+        let mut last = tokio::time::Instant::now();
+        loop {
+            let remaining = self.budget.saturating_sub(spent);
+            if remaining.is_zero() {
+                return;
+            }
+            tokio::time::sleep(remaining.min(PARK_POLL_INTERVAL)).await;
+            let now = tokio::time::Instant::now();
+            if !self.gauge.is_parked() {
+                spent += now - last;
+            }
+            last = now;
+        }
+    }
+
+    /// Run `fut` under the deadline; `None` when it expired first.
+    async fn run<F: std::future::Future>(self, fut: F) -> Option<F::Output> {
+        tokio::select! {
+            out = fut => Some(out),
+            () = self.expired() => None,
+        }
+    }
+}
 
 /// Cap on the failure-reason string we copy out of a `ToolOutput::Error`
 /// payload. This bound governs only the row-level reason label; the body
@@ -372,6 +415,10 @@ pub struct ExecutedTool {
     /// ungated tool). When a call prompts more than once, the LAST decision
     /// wins — it is the one that shaped the outcome.
     pub approval: Option<ApprovalDecision>,
+    /// The call's last ask came back torn down undecided
+    /// ([`ApprovalResolution::Abandoned`]): its result is a cancel artefact,
+    /// and the loop must claim the ask before appending it.
+    pub abandoned: bool,
     /// The job this call handed to the background, if any — the agent loop
     /// counts a grouped one into the turn's cohort and records it as started
     /// by the turn.
@@ -425,7 +472,8 @@ pub struct BoardStores {
 pub struct ToolExecutor {
     tool_registry: Arc<ToolRegistry>,
     gate_map: Arc<ApprovalGateMap>,
-    /// The gate every ask of an unattended turn goes to, in both phases.
+    /// The gate every ask of an unattended turn goes to, in both phases:
+    /// denies by policy and records the denial on the ledger.
     policy_deny: Arc<dyn ApprovalGate>,
     security_gateway: Arc<SecurityGateway>,
     /// Sandbox FS scope (= `<workspace>/work/`). Forwarded to
@@ -669,22 +717,25 @@ impl ToolExecutor {
         tool_use_id: String,
         parallel_group: Option<ParallelGroup>,
         _parent_turn_for_log: Option<TurnId>,
-        cancel_token: CancellationToken,
+        // This call's cancel token (`turn`, a child of the turn's) and the
+        // actor's (`actor`). A parked ask reads both to tell a turn cancel
+        // from process shutdown.
+        tokens: TurnTokens,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.lite_llm` is unset (argv-mode / older tests).
         bind_source: Option<&Arc<BillableLlm>>,
         // What this turn lets its calls leave running past it.
         background: TurnBackground,
+        // Whether a human can answer this turn's asks — computed once per turn
+        // by the agent loop from the turn's kind. Unattended calls send every
+        // ask, in both phases, to the policy-deny gate. Tools never see it.
+        attended: bool,
         // Per-session read-before-write tracker. `Read` records into it;
         // `Edit`/`Write` enforce against it. Cheap to clone (one `Arc`).
         read_tracker: ReadTracker,
         // Handle a cron-fire tool (`report_nothing`) flips to suppress this
         // fire's notification. `None` for every turn that cannot be silenced.
         notify_silence: Option<baybo_tools::NotifySilence>,
-        // Whether a human can answer this turn's asks — computed once per turn
-        // by the agent loop from the turn's kind. Unattended calls send every
-        // ask, in both phases, to the policy-deny gate. Tools never see it.
-        attended: bool,
         // True when the agent loop unwrapped this call from a `ToolInvoke`
         // envelope. The model wrote these params from a `ToolSearch` result
         // rather than a provider-enforced schema, so the executor
@@ -701,6 +752,7 @@ impl ToolExecutor {
                 return ExecutedTool {
                     output: Err(e),
                     approval: None,
+                    abandoned: false,
                     handed_over: None,
                 };
             }
@@ -715,6 +767,7 @@ impl ToolExecutor {
                         user.channel.as_str()
                     )),
                     approval: None,
+                    abandoned: false,
                     handed_over: None,
                 };
             }
@@ -729,6 +782,7 @@ impl ToolExecutor {
                     tool_name
                 )),
                 approval: None,
+                abandoned: false,
                 handed_over: None,
             };
         }
@@ -742,19 +796,22 @@ impl ToolExecutor {
         // Reborrow the cancel token so the closure can move its
         // ownership into `ctx` while `with_span` keeps a borrow for
         // the cancel-aware close-on-Err path.
+        let cancel_token = tokens.turn.clone();
         let cancel_for_close = cancel_token.clone();
         let cancel_for_gate = cancel_token.clone();
+        let ask_cancel = AskCancel::new(tokens);
+        let park_gauge = ParkGauge::new();
         let gate: Arc<dyn ApprovalGate> = if attended {
             self.gate_map.get(&user.channel, session_id)
         } else {
             Arc::clone(&self.policy_deny)
         };
 
-        // The call's approval decision, written from inside the span body and
+        // The call's approval outcome, written from inside the span body and
         // read back after it — including on the paths where the body returns
-        // `Err` (denial, tool error, timeout) and the decision would otherwise
+        // `Err` (denial, tool error, timeout) and the outcome would otherwise
         // die with the closure.
-        let approval_slot: Arc<Mutex<Option<ApprovalDecision>>> = Arc::new(Mutex::new(None));
+        let approval_slot: Arc<Mutex<Option<ApprovalOutcome>>> = Arc::new(Mutex::new(None));
         let approval_sink = Arc::clone(&approval_slot);
         let handed_over_slot: Arc<parking_lot::Mutex<Option<baybo_tools::background::HandedOver>>> =
             Arc::default();
@@ -840,30 +897,34 @@ impl ToolExecutor {
                 }
 
                 if !uncovered.is_empty() {
-                    let request = gate.request(ApprovalRequest {
-                        call_id: Uuid::new_v4().to_string(),
-                        tool_call_id: tool_use_id.clone(),
-                        session_id: session_id.clone(),
-                        user_id: user.id.clone(),
-                        tool: tool_name_owned.clone(),
-                        accesses: uncovered.clone(),
-                        params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
-                        description: call_label.clone(),
-                    });
-                    // A prompt parks the turn for up to the gate's timeout, so
-                    // it MUST answer to `/stop` — otherwise cancelling a turn
-                    // that is waiting on the user hangs until the gate denies
-                    // itself minutes later, and the client keeps showing a card
-                    // for a turn that is already unwinding. Dropping the request
-                    // future also unqueues it (the gate's RAII cleanup), so the
-                    // prompt disappears everywhere rather than lingering.
-                    let outcome = tokio::select! {
-                        outcome = request => outcome,
-                        // Cancellation abandons the unanswered prompt.
-                        _ = cancel_for_gate.cancelled() => ApprovalOutcome::abandoned(),
-                    };
+                    let outcome = gate
+                        .request(
+                            ApprovalRequest {
+                                ask_id: baybo_model::human_ask::AskId::new(),
+                                tool_call_id: tool_use_id.clone(),
+                                session_id: session_id.clone(),
+                                user_id: user.id.clone(),
+                                tool: tool_name_owned.clone(),
+                                accesses: uncovered.clone(),
+                                params_preview: preview_params(
+                                    &params,
+                                    APPROVAL_PARAMS_PREVIEW_LEN,
+                                ),
+                                description: call_label.clone(),
+                            },
+                            AskSite {
+                                channel: user.channel.clone(),
+                                turn_id,
+                                phase: AskPhase::BeforeExecute,
+                            },
+                            ask_cancel.clone(),
+                        )
+                        // The gate itself answers `/stop` (it races the call's
+                        // `AskCancel`); a shutdown leaves it parked until the loop
+                        // drops this future.
+                        .await;
                     let decision = outcome.decision;
-                    *approval_sink.lock() = Some(decision);
+                    *approval_sink.lock() = Some(outcome);
                     for access in &uncovered {
                         let _ = recorder
                             .emit_event(
@@ -899,8 +960,8 @@ impl ToolExecutor {
                         }
                     }
                     // Approved — but the turn may have been cancelled WHILE the
-                    // prompt was up (the select above only fires when the token
-                    // trips before the answer). Running now would execute a
+                    // prompt was up (the gate only abandons when the token trips
+                    // before the answer). Running now would execute a
                     // side-effecting call on behalf of a turn the user already
                     // stopped.
                     if cancel_for_gate.is_cancelled() {
@@ -972,6 +1033,9 @@ impl ToolExecutor {
                     Arc::clone(&gate),
                     Arc::clone(approved_resources),
                     tool_use_id.clone(),
+                    turn_id,
+                    park_gauge.clone(),
+                    ask_cancel.clone(),
                 );
                 let approval_probe = approval.clone();
 
@@ -1055,14 +1119,15 @@ impl ToolExecutor {
                 // Execute with timeout enforcement. A `Read` of a virtual path
                 // (e.g. the session transcript) is served inside `ReadTool` from
                 // `ctx.virtual_reads` before it touches the filesystem.
-                let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
+                let deadline =
+                    PausableDeadline::new(ctx.timeout + TOOL_DEADLINE_GRACE, park_gauge.clone());
                 let execution = async {
                     let tool = pinned_tool.as_ref().ok_or_else(|| {
                         ToolError::NotFound(format!("tool not found: {tool_name_owned}"))
                     })?;
                     tool.execute(params_revealed, &ctx).await
                 };
-                let result = tokio::time::timeout(outer_deadline, execution).await;
+                let result = deadline.run(execution).await;
 
                 // A tool can raise its own prompts mid-execution (through
                 // `ctx.approval`), and those come AFTER the pre-execute gate —
@@ -1070,8 +1135,8 @@ impl ToolExecutor {
                 // of the arms below can return early: a mid-call denial reaches
                 // the loop as the tool's own error, and without this the verdict
                 // would be indistinguishable from a crash.
-                if let Some(decision) = approval_probe.last_decision() {
-                    *approval_sink.lock() = Some(decision);
+                if let Some(outcome) = approval_probe.last_outcome() {
+                    *approval_sink.lock() = Some(outcome);
                 }
                 *handed_over_sink.lock() = ctx.background_dispatch.take();
 
@@ -1096,7 +1161,7 @@ impl ToolExecutor {
                 }
 
                 match result {
-                    Ok(Ok(mut output)) => {
+                    Some(Ok(mut output)) => {
                         // Defensive sanitize before result flows into
                         // trace / memory / next LLM call.
                         let span_id = span_handle.span_id.to_string();
@@ -1179,7 +1244,7 @@ impl ToolExecutor {
                             output,
                         ))
                     }
-                    Ok(Err(e)) => {
+                    Some(Err(e)) => {
                         // Surface the *sanitized* message: this Err
                         // bubbles into `with_span`, which writes
                         // `e.to_string()` into the span's
@@ -1198,7 +1263,7 @@ impl ToolExecutor {
                             .unwrap_or(raw);
                         Err(anyhow::anyhow!(sanitized))
                     }
-                    Err(_) => Err(anyhow::anyhow!(
+                    None => Err(anyhow::anyhow!(
                         "tool '{}' exceeded timeout ({:?})",
                         tool_name_owned,
                         ctx.timeout
@@ -1208,9 +1273,11 @@ impl ToolExecutor {
         )
         .await;
 
+        let outcome = *approval_slot.lock();
         ExecutedTool {
             output,
-            approval: *approval_slot.lock(),
+            approval: outcome.map(|o| o.decision),
+            abandoned: outcome.is_some_and(|o| o.resolution == ApprovalResolution::Abandoned),
             handed_over: handed_over_slot.lock().take(),
         }
     }
@@ -1432,12 +1499,32 @@ fn compose_invoke_rejection(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutedTool, InvokeValidatorCache, ToolExecutor, admits_repo, admits_worktree,
-        permissive_scope,
+        ExecutedTool, InvokeValidatorCache, PausableDeadline, TOOL_DEADLINE_GRACE, ToolExecutor,
+        admits_repo, admits_worktree, permissive_scope,
     };
+    use baybo_human_ask::test_support::MemoryHumanAskStore;
+    use baybo_human_ask::{AskCore, PolicyDenyGate};
+    use baybo_model::human_ask::{AskKind, AskPhase, AskResolution};
+    use baybo_tools::{ParkGauge, TurnTokens};
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    /// Tokens nobody trips: the call runs to completion.
+    fn idle_tokens() -> TurnTokens {
+        TurnTokens {
+            turn: CancellationToken::new(),
+            actor: CancellationToken::new(),
+        }
+    }
+
+    /// The production policy-deny gate over an in-memory ledger.
+    fn policy_deny_gate() -> (Arc<MemoryHumanAskStore>, Arc<dyn baybo_tools::ApprovalGate>) {
+        let store = MemoryHumanAskStore::new();
+        let core = Arc::new(AskCore::new(store.clone()));
+        (store, Arc::new(PolicyDenyGate::new(core)))
+    }
 
     #[test]
     fn invoke_params_validation_reports_schema_and_skips_uncompilable() {
@@ -1954,7 +2041,7 @@ mod tests {
                 )),
                 agents: Arc::clone(&store.agent_profile),
             }),
-            Arc::new(baybo_human_ask::PolicyDenyGate::new()),
+            policy_deny_gate().1,
         );
 
         IssueRunFixture {
@@ -2023,13 +2110,13 @@ mod tests {
                 "tool-use-1".to_owned(),
                 None,
                 None,
-                CancellationToken::new(),
+                idle_tokens(),
                 None,
                 None,
                 TurnBackground::NONE,
+                true,
                 ReadTracker::default(),
                 None,
-                true,
                 false,
             )
             .await;
@@ -2261,7 +2348,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl baybo_tools::ApprovalGate for FixedOutcomeGate {
-        async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+        async fn request(
+            &self,
+            _req: ApprovalRequest,
+            _site: AskSite,
+            _cancel: AskCancel,
+        ) -> ApprovalOutcome {
             self.0
         }
     }
@@ -2272,7 +2364,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl baybo_tools::ApprovalGate for CountingApproveGate {
-        async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+        async fn request(
+            &self,
+            _req: ApprovalRequest,
+            _site: AskSite,
+            _cancel: AskCancel,
+        ) -> ApprovalOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ApprovalOutcome::answered(ApprovalDecision::Approve)
         }
@@ -2362,7 +2459,7 @@ mod tests {
         gate: Arc<dyn baybo_tools::ApprovalGate>,
         approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
         attended: bool,
-    ) -> ExecutedTool {
+    ) -> (ExecutedTool, Arc<MemoryHumanAskStore>) {
         let tool_name = tool.name().to_string();
         let mut registry = ToolRegistry::new();
         registry.register(tool, authorization_manifest(&tool_name));
@@ -2395,7 +2492,7 @@ mod tests {
         approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
         attended: bool,
         after_authorization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) -> ExecutedTool {
+    ) -> (ExecutedTool, Arc<MemoryHumanAskStore>) {
         let home = tempfile::tempdir().expect("tempdir");
         let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
         std::fs::create_dir_all(paths.work_dir()).expect("work dir");
@@ -2412,6 +2509,7 @@ mod tests {
                 Arc::new(baybo_security::test_support::MemorySecretStore::new()),
             )),
         ));
+        let (ledger, policy_deny) = policy_deny_gate();
         let mut executor = ToolExecutor::new(
             registry,
             Arc::new(gates),
@@ -2424,7 +2522,7 @@ mod tests {
             None,
             None,
             None,
-            Arc::new(baybo_human_ask::PolicyDenyGate::new()),
+            policy_deny,
         );
         if let Some(hook) = after_authorization_hook {
             executor = executor.with_after_authorization_hook(hook);
@@ -2447,7 +2545,7 @@ mod tests {
             channel: baybo_model::ChannelType::tui(),
         };
 
-        executor
+        let executed = executor
             .execute(
                 &tool_name,
                 json!({}),
@@ -2459,20 +2557,23 @@ mod tests {
                 &recorder,
                 &step,
                 None,
-                "tool-use-authorization".to_string(),
+                AUTHORIZATION_TOOL_USE_ID.to_string(),
                 None,
                 None,
-                CancellationToken::new(),
+                idle_tokens(),
                 None,
                 None,
                 TurnBackground::NONE,
+                attended,
                 ReadTracker::default(),
                 None,
-                attended,
                 false,
             )
-            .await
+            .await;
+        (executed, ledger)
     }
+
+    const AUTHORIZATION_TOOL_USE_ID: &str = "tool-use-authorization";
 
     fn counting_gate() -> (Arc<AtomicUsize>, Arc<dyn baybo_tools::ApprovalGate>) {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2486,7 +2587,7 @@ mod tests {
     async fn an_unattended_turn_runs_a_zero_access_mcp_tool_without_any_gate() {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
-        let executed = execute_authorization_tool(
+        let (executed, ledger) = execute_authorization_tool(
             Arc::new(McpShapedTool {
                 namespaced_name: SELECTED_MCP_TOOL,
                 declares_access: false,
@@ -2503,6 +2604,7 @@ mod tests {
         assert_eq!(executed.approval, None);
         assert!(ran.load(Ordering::SeqCst));
         assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert!(ledger.rows().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2554,7 +2656,8 @@ mod tests {
             true,
             Some(hook),
         )
-        .await;
+        .await
+        .0;
         replacement_task.await.expect("replacement task");
 
         assert!(executed.output.is_ok(), "{:?}", executed.output.err());
@@ -2571,10 +2674,23 @@ mod tests {
         assert!(approved.lock().is_empty());
     }
 
+    /// The one ledger row an unattended call leaves: already resolved
+    /// `PolicyDenied` and applied, in the phase that raised it.
+    fn assert_one_policy_denial(ledger: &MemoryHumanAskStore, phase: AskPhase) {
+        let rows = ledger.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.kind, AskKind::Approval);
+        assert_eq!(row.phase, phase);
+        assert_eq!(row.tool_call_id, AUTHORIZATION_TOOL_USE_ID);
+        assert_eq!(row.resolution, Some(AskResolution::PolicyDenied));
+        assert!(row.resolved_at.is_some() && row.applied_at.is_some());
+    }
+
     #[tokio::test]
     async fn an_unattended_turn_policy_denies_uncovered_access_without_prompting() {
         let (gate_calls, gate) = counting_gate();
-        let executed = execute_authorization_tool(
+        let (executed, ledger) = execute_authorization_tool(
             Arc::new(GatedTool),
             gate,
             Arc::new(Mutex::new(Vec::new())),
@@ -2584,12 +2700,15 @@ mod tests {
 
         let error = executed.output.expect_err("uncovered access must fail");
         assert!(
-            error.to_string().contains(baybo_tools::refusal_reason(
-                baybo_tools::ApprovalResolution::Policy
-            )),
+            error
+                .to_string()
+                .contains(refusal_reason(ApprovalResolution::Policy)),
             "{error}"
         );
+        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
+        assert!(!executed.abandoned);
         assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert_one_policy_denial(&ledger, AskPhase::BeforeExecute);
     }
 
     #[tokio::test]
@@ -2597,7 +2716,7 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
         let approved = Arc::new(Mutex::new(Vec::new()));
-        let executed = execute_authorization_tool(
+        let (executed, ledger) = execute_authorization_tool(
             Arc::new(McpShapedTool {
                 namespaced_name: SELECTED_MCP_TOOL,
                 declares_access: false,
@@ -2618,13 +2737,14 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst));
         assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
         assert!(approved.lock().is_empty());
+        assert_one_policy_denial(&ledger, AskPhase::DuringExecute);
     }
 
     #[tokio::test]
-    async fn later_reply_in_a_cron_session_uses_ordinary_approval() {
+    async fn an_attended_turn_asks_the_channel_gate() {
         let ran = Arc::new(AtomicBool::new(false));
         let (gate_calls, gate) = counting_gate();
-        let executed = execute_authorization_tool(
+        let (executed, ledger) = execute_authorization_tool(
             Arc::new(McpShapedTool {
                 namespaced_name: SELECTED_MCP_TOOL,
                 declares_access: true,
@@ -2641,9 +2761,34 @@ mod tests {
         assert_eq!(executed.approval, Some(ApprovalDecision::Approve));
         assert!(ran.load(Ordering::SeqCst));
         assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert!(ledger.rows().is_empty(), "policy gate untouched");
     }
 
-    async fn gated_call_error(outcome: ApprovalOutcome) -> String {
+    #[tokio::test]
+    async fn an_attended_turn_asks_the_channel_gate_mid_execution() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let (executed, ledger) = execute_authorization_tool(
+            Arc::new(McpShapedTool {
+                namespaced_name: SELECTED_MCP_TOOL,
+                declares_access: false,
+                mid_execution_access: true,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            true,
+        )
+        .await;
+
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert_eq!(executed.approval, Some(ApprovalDecision::Approve));
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert!(ledger.rows().is_empty());
+    }
+
+    async fn gated_call_error(outcome: ApprovalOutcome) -> (String, bool) {
         let home = tempfile::tempdir().expect("tempdir");
         let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
         std::fs::create_dir_all(paths.work_dir()).expect("work dir");
@@ -2690,7 +2835,7 @@ mod tests {
             None,
             None,
             None,
-            Arc::new(baybo_human_ask::PolicyDenyGate::new()),
+            policy_deny_gate().1,
         );
 
         let session_id = SessionId::from("sess-gate");
@@ -2725,36 +2870,134 @@ mod tests {
                 "tool-use-1".to_owned(),
                 None,
                 None,
-                CancellationToken::new(),
+                idle_tokens(),
                 None,
                 None,
                 TurnBackground::NONE,
+                true,
                 ReadTracker::default(),
                 None,
-                true,
                 false,
             )
             .await;
-        executed
+        let abandoned = executed.abandoned;
+        let msg = executed
             .output
             .expect_err("a denied gate must not let the tool run")
-            .to_string()
+            .to_string();
+        (msg, abandoned)
     }
 
     #[tokio::test]
-    async fn a_timed_out_gate_is_not_reported_to_the_model_as_a_human_no() {
-        let msg = gated_call_error(ApprovalOutcome::timed_out()).await;
-        assert!(msg.contains("expired"), "got {msg}");
+    async fn an_abandoned_gate_is_not_reported_to_the_model_as_a_human_no() {
+        let (msg, abandoned) = gated_call_error(ApprovalOutcome::abandoned()).await;
+        assert!(abandoned, "the loop must claim the ask before appending");
+        assert!(msg.contains("withdrawn"), "got {msg}");
         assert!(!msg.contains("said no"), "got {msg}");
         assert!(!msg.contains("user denied approval"), "got {msg}");
     }
 
     #[tokio::test]
     async fn a_human_no_still_reads_as_a_human_no() {
-        let msg = gated_call_error(ApprovalOutcome::answered(ApprovalDecision::Deny)).await;
+        let (msg, abandoned) =
+            gated_call_error(ApprovalOutcome::answered(ApprovalDecision::Deny)).await;
+        assert!(!abandoned);
         assert!(
             msg.contains("a human saw this prompt and said no"),
             "got {msg}"
         );
+    }
+
+    const DEADLINE_BUDGET: Duration = Duration::from_secs(10);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_call_outlives_its_deadline() {
+        let gauge = ParkGauge::new();
+        let parked = gauge.clone();
+        let out = PausableDeadline::new(DEADLINE_BUDGET, gauge)
+            .run(async move {
+                let _guard = parked.park();
+                tokio::time::sleep(DEADLINE_BUDGET * 100).await;
+                "answered"
+            })
+            .await;
+        assert_eq!(out, Some("answered"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unparked_call_still_expires() {
+        let out = PausableDeadline::new(DEADLINE_BUDGET, ParkGauge::new())
+            .run(tokio::time::sleep(DEADLINE_BUDGET * 2))
+            .await;
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_unparked_time_is_charged_to_the_budget() {
+        async fn work_park_work(gauge: ParkGauge, work: Duration) {
+            tokio::time::sleep(work).await;
+            {
+                let _guard = gauge.park();
+                tokio::time::sleep(DEADLINE_BUDGET * 10).await;
+            }
+            tokio::time::sleep(work).await;
+        }
+        let gauge = ParkGauge::new();
+        let within = PausableDeadline::new(DEADLINE_BUDGET, gauge.clone())
+            .run(work_park_work(gauge, DEADLINE_BUDGET * 4 / 10))
+            .await;
+        assert_eq!(within, Some(()), "0.8 of the budget unparked fits");
+
+        let gauge = ParkGauge::new();
+        let over = PausableDeadline::new(DEADLINE_BUDGET, gauge.clone())
+            .run(work_park_work(gauge, DEADLINE_BUDGET * 6 / 10))
+            .await;
+        assert_eq!(over, None, "1.2 of the budget unparked does not");
+    }
+
+    /// Sleeps through its own `max_timeout`, then does a short step — the
+    /// shape of Bash detaching a timed-out command.
+    struct OverrunningTool;
+
+    const OVERRUNNING_TOOL: &str = "overrunning";
+    const OVERRUNNING_TIMEOUT: Duration = Duration::from_millis(50);
+
+    #[async_trait::async_trait]
+    impl baybo_tools::Tool for OverrunningTool {
+        fn name(&self) -> &str {
+            OVERRUNNING_TOOL
+        }
+        fn description(&self) -> String {
+            "overruns its own deadline briefly".to_owned()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn max_timeout(&self) -> Duration {
+            OVERRUNNING_TIMEOUT
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            tokio::time::sleep(ctx.timeout).await;
+            tokio::time::sleep(OVERRUNNING_TIMEOUT * 4).await;
+            Ok(ToolOutput::Text("handed off".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_overruns_its_timeout_briefly_completes_within_the_grace() {
+        assert!(OVERRUNNING_TIMEOUT * 5 < TOOL_DEADLINE_GRACE);
+        let (_, gate) = counting_gate();
+        let (executed, _) = execute_authorization_tool(
+            Arc::new(OverrunningTool),
+            gate,
+            Arc::new(Mutex::new(Vec::new())),
+            true,
+        )
+        .await;
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
     }
 }

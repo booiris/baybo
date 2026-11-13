@@ -666,9 +666,9 @@ export function IssueDetailPage() {
   );
 
   const answerApproval = useCallback(
-    async (callId: string, decision: 'approve' | 'approve_always' | 'deny') => {
+    async (askId: string, decision: 'approve' | 'approve_always' | 'deny') => {
       setSaving(true);
-      const outcome = await resolveApproval(client, projectId, number, callId, decision);
+      const outcome = await resolveApproval(client, projectId, number, askId, decision);
       setSaving(false);
       if (outcome.kind === 'unauthorized') {
         logout();
@@ -1076,8 +1076,8 @@ export function IssueDetailPage() {
               }}
               team={agents}
               portrait={portrait}
-              onResolveApproval={(callId, decision) => {
-                void answerApproval(callId, decision);
+              onResolveApproval={(askId, decision) => {
+                void answerApproval(askId, decision);
               }}
             />
           </IssueRefScope>

@@ -110,7 +110,7 @@ export function turnLabel(attempt: number): string {
 }
 
 export type PendingApproval = {
-  callId: string;
+  askId: string;
   tool: string;
   summary: string;
   /// Which run is parked. Absent on prompts recorded before the card
@@ -127,8 +127,8 @@ export function approvalAsks(events: IssueEvent[]): Map<string, PendingApproval>
   const asks = new Map<string, PendingApproval>();
   for (const event of events) {
     if (event.body.kind !== 'approval_requested') continue;
-    asks.set(event.body.call_id, {
-      callId: event.body.call_id,
+    asks.set(event.body.ask_id, {
+      askId: event.body.ask_id,
       tool: event.body.tool,
       summary: event.body.summary,
       attempt: event.body.attempt ?? null,
@@ -141,14 +141,14 @@ export function pendingApprovals(events: IssueEvent[]): PendingApproval[] {
   const open = new Map<string, PendingApproval>();
   for (const event of events) {
     if (event.body.kind === 'approval_requested') {
-      open.set(event.body.call_id, {
-        callId: event.body.call_id,
+      open.set(event.body.ask_id, {
+        askId: event.body.ask_id,
         tool: event.body.tool,
         summary: event.body.summary,
         attempt: event.body.attempt ?? null,
       });
     } else if (event.body.kind === 'approval_resolved') {
-      open.delete(event.body.call_id);
+      open.delete(event.body.ask_id);
     }
   }
   return [...open.values()];

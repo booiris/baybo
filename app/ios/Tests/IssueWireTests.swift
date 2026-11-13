@@ -35,7 +35,7 @@ import Testing
         let wire = IssueWire.card(issue())
         for key in [
             "number", "project_id", "title", "description", "status", "priority", "position",
-            "pinned", "stage", "unread", "last_run_failed", "approval_pending",
+            "pinned", "stage", "unread", "last_run_failed", "awaiting_human", "approval_pending",
             "opened_by_agent", "created_at_ms", "updated_at_ms", "assignee", "branch", "parent",
             "filed_from", "sub_issues",
         ] {

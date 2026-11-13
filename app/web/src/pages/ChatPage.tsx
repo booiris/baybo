@@ -111,7 +111,7 @@ export interface WorkStep {
   toolStatus?: 'running' | 'ok' | 'error' | 'denied';
   toolSummary?: string;
   /** Prompt id, set while this call is blocked on the user's approval — the
-   *  step reads "waiting for approval" until the matching `approval_resolved`
+   *  step reads "waiting for approval" until the matching `ask_resolved`
    *  (or the call's own completion) lands. */
   awaitingApproval?: string;
   /** The decision the user gave. Persisted with the tool result, so a reload
@@ -199,7 +199,7 @@ export interface TranscriptRow {
 }
 
 interface PendingApproval {
-  callId: string;
+  askId: string;
   sessionId: string;
   tool: string;
   description: string | null;
@@ -2965,8 +2965,8 @@ export function ChatPage() {
       if (!sessionId || !wsRef.current) return;
       const current = views[sessionId]?.pendingApproval;
       if (!current) return;
-      wsRef.current.resolveApproval(current.callId, decision);
-      // Optimistic dismissal — the server's ApprovalResolved fan-out
+      wsRef.current.resolveApproval(current.askId, decision);
+      // Optimistic dismissal — the server's `ask_resolved` fan-out
       // will also clear it via routeInboundFrame, harmless if it
       // arrives second.
       setViews((prev) => mergeView(prev, sessionId, { pendingApproval: null }));
@@ -4206,10 +4206,10 @@ export function routeInboundFrame(
           [sid]: {
             ...view,
             transcript: frame.tool_call_id
-              ? markStepAwaitingApproval(view.transcript, frame.tool_call_id, frame.call_id)
+              ? markStepAwaitingApproval(view.transcript, frame.tool_call_id, frame.ask_id)
               : view.transcript,
             pendingApproval: {
-              callId: frame.call_id,
+              askId: frame.ask_id,
               sessionId: sid,
               tool: frame.tool,
               description: frame.description ?? null,
@@ -4226,17 +4226,19 @@ export function routeInboundFrame(
       });
       return;
     }
-    case 'approval_resolved': {
+    case 'ask_resolved': {
+      // Every close, decided or not: `/stop`, a closed card or an expired
+      // during-execute approval retire the card as surely as an answer.
       setViews((prev) => {
         // Walk every session bucket since we don't know which one
-        // the call_id belongs to. Map is small (~tabs visited), so
+        // the ask_id belongs to. Map is small (~tabs visited), so
         // this is cheap. Return `prev` unchanged when no card matches
-        // — the call_id may belong to an already-resolved session, and
+        // — the ask_id may belong to an already-resolved session, and
         // a fresh object would force every SessionRow to re-render.
         let next: Record<string, SessionView> | null = null;
         for (const [sid, view] of Object.entries(prev)) {
-          const transcript = resolveStepApproval(view.transcript, frame.call_id, frame.decision);
-          const card = view.pendingApproval?.callId === frame.call_id;
+          const transcript = resolveStepApproval(view.transcript, frame.ask_id, frame.decision);
+          const card = view.pendingApproval?.askId === frame.ask_id;
           if (!card && transcript === view.transcript) continue;
           next ??= { ...prev };
           next[sid] = {
@@ -4528,9 +4530,8 @@ export function applyToolCompletedStep(
       ...nextSteps[sIdx],
       toolStatus,
       toolSummary: summary,
-      // The call is done, so nothing waits on the user any more — including
-      // when the gate TIMED OUT, which broadcasts no `approval_resolved` and
-      // would otherwise strand the badge.
+      // The call is done, so nothing waits on the user any more — a backstop
+      // for an `ask_resolved` this client missed.
       awaitingApproval: undefined,
       approval: approval ?? nextSteps[sIdx].approval,
     };
@@ -4567,29 +4568,33 @@ function approvalFromWire(decision: string | undefined): WorkStep['approval'] {
 export function markStepAwaitingApproval(
   prev: TranscriptRow[],
   toolCallId: string,
-  promptId: string,
+  askId: string,
 ): TranscriptRow[] {
-  return rewriteToolStep(prev, (s) => (s.toolCallId === toolCallId ? { ...s, awaitingApproval: promptId } : s));
+  return rewriteToolStep(prev, (s) => (s.toolCallId === toolCallId ? { ...s, awaitingApproval: askId } : s));
 }
 
-/** A prompt was answered (here or on another client): clear the badge and
- *  label the step. Matched by PROMPT id — that is all `approval_resolved`
- *  carries. The label is provisional until the call's own completion brings
- *  the persisted twin. */
+/** A prompt closed (here or on another client): clear the badge, and label
+ *  the step when a human decided. Matched by PROMPT id — that is all
+ *  `ask_resolved` carries. The label is provisional until the call's own
+ *  completion brings the persisted twin. */
 export function resolveStepApproval(
   prev: TranscriptRow[],
-  promptId: string,
-  decision: string,
+  askId: string,
+  decision: string | undefined,
 ): TranscriptRow[] {
   return rewriteToolStep(prev, (s) =>
-    s.awaitingApproval === promptId
-      ? { ...s, awaitingApproval: undefined, approval: approvalFromWire(decision) }
+    s.awaitingApproval === askId
+      ? {
+          ...s,
+          awaitingApproval: undefined,
+          approval: decision === undefined ? s.approval : approvalFromWire(decision),
+        }
       : s,
   );
 }
 
 /** Rewrite every tool step of the newest work block in place. Returns `prev`
- *  UNCHANGED when nothing matched — `approval_resolved` is broadcast to every
+ *  UNCHANGED when nothing matched — `ask_resolved` is broadcast to every
  *  session bucket, and minting a fresh array per bucket would re-render every
  *  open thread on a decision that belongs to exactly one of them. */
 function rewriteToolStep(
@@ -5677,7 +5682,7 @@ export function applySyncReplace(
 
 function approvalFromCard(sessionId: string, card: WireApprovalCard): PendingApproval {
   return {
-    callId: card.call_id,
+    askId: card.ask_id,
     sessionId,
     tool: card.tool,
     description: card.description ?? null,
@@ -5809,7 +5814,7 @@ export function applySubscribeState(
     // re-derived from the authoritative pending set: the `approval_requested`
     // frame that first set them may predate this connection.
     const awaitingByCall = new Map(
-      cards.filter((c) => c.tool_call_id).map((c) => [c.tool_call_id as string, c.call_id]),
+      cards.filter((c) => c.tool_call_id).map((c) => [c.tool_call_id as string, c.ask_id]),
     );
     const bundle = (frame.work_steps ?? []).map(workStepFromWire).map((step) =>
       step.kind === 'tool' &&
@@ -7352,7 +7357,7 @@ function ApprovalCard({
         <span className="font-bold uppercase tracking-wider text-sm break-words [overflow-wrap:anywhere]">
           Approval needed: {approval.tool}
         </span>
-        <span className="text-ink-soft font-mono text-xs shrink-0">{approval.callId.slice(0, 8)}</span>
+        <span className="text-ink-soft font-mono text-xs shrink-0">{approval.askId.slice(0, 8)}</span>
       </div>
       {approval.description ? (
         <div className="text-sm font-mono text-ink-soft break-words [overflow-wrap:anywhere]">

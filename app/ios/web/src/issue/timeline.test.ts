@@ -70,23 +70,23 @@ describe("activity fold", () => {
 describe("pending approvals", () => {
   it("a resolution retires its own prompt and leaves the rest", () => {
     const open = pendingApprovals([
-      event("e1", "approval_requested", { call_id: "c1", tool: "exec_command" }),
-      event("e2", "approval_requested", { call_id: "c2", tool: "exec_command" }),
-      event("e3", "approval_resolved", { call_id: "c1", decision: "approve" }),
+      event("e1", "approval_requested", { ask_id: "c1", tool: "exec_command" }),
+      event("e2", "approval_requested", { ask_id: "c2", tool: "exec_command" }),
+      event("e3", "approval_resolved", { ask_id: "c1", decision: "approve" }),
     ]);
-    expect(open.map((e) => e.body.call_id)).toEqual(["c2"]);
+    expect(open.map((e) => e.body.ask_id)).toEqual(["c2"]);
   });
 
   it("a re-request after a resolution reopens the prompt", () => {
     const open = pendingApprovals([
-      event("e1", "approval_requested", { call_id: "c1" }),
-      event("e2", "approval_resolved", { call_id: "c1" }),
-      event("e3", "approval_requested", { call_id: "c1" }),
+      event("e1", "approval_requested", { ask_id: "c1" }),
+      event("e2", "approval_resolved", { ask_id: "c1" }),
+      event("e3", "approval_requested", { ask_id: "c1" }),
     ]);
     expect(open.map((e) => e.id)).toEqual(["e3"]);
   });
 
-  it("an entry with no call id is not a prompt", () => {
+  it("an entry with no ask id is not a prompt", () => {
     expect(pendingApprovals([event("e1", "approval_requested", {})])).toEqual([]);
   });
 });

@@ -132,7 +132,7 @@ export type CompactionPoint = {
 /// mirror of the Rust `wire::ApprovalCard`. The transcript uses only
 /// `tool_call_id` (which work step is waiting); the rest drives the native card.
 export type WireApprovalCard = {
-  call_id: string;
+  ask_id: string;
   tool_call_id?: string;
   tool: string;
   params_preview: string;
@@ -158,19 +158,26 @@ export type WireFrame =
       // prompted. Persisted server-side, so a reload re-labels the same step.
       approval?: string;
     }
-  // A tool call is blocked on this user's decision. `call_id` is the PROMPT's id
+  // A tool call is blocked on this user's decision. `ask_id` is the PROMPT's id
   // (what a resolve answers with); `tool_call_id` is the blocked TOOL call — the
   // work step to badge. The card itself is NATIVE (see ChatStore.pendingApprovals);
   // the transcript only marks the step as waiting.
   | {
       kind: "approval_requested";
-      call_id: string;
+      ask_id: string;
       tool_call_id?: string;
       tool: string;
     }
   // Someone answered (this device, or another client). Broadcast to every
   // session's sink, so it is matched by prompt id, never by session.
-  | { kind: "approval_resolved"; call_id: string; decision: string }
+  // Any ask closed, decided or not. `decision` is set only when a human
+  // decided an approval.
+  | {
+      kind: "ask_resolved";
+      ask_id: string;
+      outcome: "answered" | "declined" | "abandoned";
+      decision?: string;
+    }
   // `started_at` is present iff `active` — it is the turn's identity for the
   // SubscribeState staleness test and for re-opening a restored work block.
   | { kind: "turn_state"; active: boolean; started_at?: string }
@@ -330,7 +337,7 @@ export type WorkStep =
       summary?: string;
       /// Prompt id, set while this call is blocked on the user's decision — the
       /// step renders "waiting for approval" and clears when the matching
-      /// `approval_resolved` (or the call's completion) lands.
+      /// `ask_resolved` (or the call's completion) lands.
       awaitingApproval?: string;
       /// `"approve"` / `"approve_always"` / `"deny"` once the user judged it.
       /// Survives reload (persisted on the tool result).

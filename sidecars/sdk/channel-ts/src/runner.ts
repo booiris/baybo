@@ -663,15 +663,19 @@ function dispatchFrame(
       void handleApproval(frame, channel, ws, logger);
       return;
     }
-    case "approval_resolved": {
+    case "ask_resolved": {
       if (!channel.onApprovalResolved) return;
-      const decision = normalizeDecision(frame.decision);
-      if (!decision) {
-        logger.warn("unknown approval decision", frame.decision);
-        return;
+      let decision: ApprovalDecision | undefined;
+      if (frame.decision != null) {
+        const known = normalizeDecision(frame.decision);
+        if (!known) {
+          logger.warn("unknown approval decision", frame.decision);
+          return;
+        }
+        decision = known;
       }
       void safeInvoke(
-        () => channel.onApprovalResolved!(frame.call_id, decision),
+        () => channel.onApprovalResolved!(frame.ask_id, decision),
         "onApprovalResolved",
         logger,
       );
@@ -824,7 +828,7 @@ async function handleApproval(
   let decision: ApprovalDecision;
   try {
     decision = await channel.onApprovalRequested({
-      callId: frame.call_id,
+      askId: frame.ask_id,
       sessionId: frame.session_id,
       userId: frame.user_id ?? "",
       tool: frame.tool,
@@ -841,7 +845,7 @@ async function handleApproval(
     ws.send(
       encodeFrame({
         kind: "resolve_approval",
-        call_id: frame.call_id,
+        ask_id: frame.ask_id,
         decision,
       }),
     );
@@ -851,7 +855,7 @@ async function handleApproval(
 }
 
 /**
- * Exposed for the package's own tests — the WS `approval_resolved`
+ * Exposed for the package's own tests — the WS `ask_resolved`
  * frame carries `decision: string` because the wire schema stays
  * untyped across languages. `normalizeDecision` is the sole check
  * that the value is one of the three Rust variants before the runner

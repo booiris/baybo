@@ -129,6 +129,10 @@ pub struct WsChannelState {
     pub inbound_dedup: Arc<InboundDedup>,
     /// Dials the relay control connection and its data legs.
     pub relay_dialer: RelayDialer,
+    /// What a lazily installed channel builds its ask queue and gate from.
+    pub ask_channels: baybo_human_ask::AskChannels,
+    /// The resolve door for `ResolveApproval`.
+    pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
 }
 
 impl WsChannelState {
@@ -169,6 +173,8 @@ impl WsChannelState {
             },
             inbound_dedup: Arc::clone(&deps.inbound_dedup),
             relay_dialer: deps.relay_dialer.clone(),
+            ask_channels: deps.ask_channels.clone(),
+            human_asks: Arc::clone(&deps.human_asks),
         }
     }
 }

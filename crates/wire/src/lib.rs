@@ -21,6 +21,7 @@
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
+use baybo_model::human_ask::{AskId, AskResolution};
 use baybo_model::{ApprovalDecision, ChannelType, ResourceAccess, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,34 @@ pub enum MessageRole {
     User,
     #[default]
     Assistant,
+}
+
+/// How an ask left the pending set, on [`Frame::AskResolved`]. Kind-agnostic:
+/// an approval a human decided and a question they answered are both
+/// `Answered`; an approval's decision rides beside it in
+/// [`Frame::AskResolved::decision`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub enum AskOutcomeKind {
+    Answered,
+    Declined,
+    /// Nobody decided: `/stop`, a card close, or the user moved on.
+    Abandoned,
+}
+
+impl From<&AskResolution> for AskOutcomeKind {
+    fn from(resolution: &AskResolution) -> Self {
+        match resolution {
+            AskResolution::Approval(_) | AskResolution::Answered(_) => Self::Answered,
+            AskResolution::Declined | AskResolution::PolicyDenied => Self::Declined,
+            AskResolution::Abandoned => Self::Abandoned,
+        }
+    }
 }
 
 /// Error surface for frame encode/decode.
@@ -502,7 +531,8 @@ pub struct TurnSnapshot {
     ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct ApprovalCard {
-    pub call_id: String,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+    pub ask_id: AskId,
     /// `call_id` of the TOOL call the prompt blocks — see
     /// [`Frame::ApprovalRequested::tool_call_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,7 +610,7 @@ pub enum Frame {
     /// against sync pages, but staleness of the turn/work halves is
     /// judged by turn identity ([`TurnSnapshot::started_at`]), never by
     /// ordinal arithmetic. Live `TurnState` / `TaskList` /
-    /// `ApprovalRequested` / `ApprovalResolved` frames arriving after
+    /// `ApprovalRequested` / `AskResolved` frames arriving after
     /// this bundle win by normal frame order.
     SubscribeState {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
@@ -783,12 +813,16 @@ pub enum Frame {
     /// Server → client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX
     /// should echo a [`Frame::ResolveApproval`] back; clients without
-    /// one can ignore, and the gate will time out server-side.
+    /// one can ignore it. The prompt never times out: it stays pending
+    /// until a client answers it or the turn moves on, and
+    /// [`Frame::AskResolved`] retires it either way. A gateway restart
+    /// abandons it.
     ApprovalRequested {
-        call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
         /// `call_id` of the TOOL call this prompt blocks (the id
         /// `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
-        /// `call_id`, which is minted per prompt). Lets clients badge
+        /// `ask_id`, which is minted per prompt). Lets clients badge
         /// the exact work step that is waiting. The gateway always sends
         /// it; optional only so a client still parses an older gateway's
         /// frames, which omitted it.
@@ -807,18 +841,25 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
-    /// Server → client: any subscriber (including ours) resolved the
-    /// approval — drop the prompt from the local UI so concurrent
-    /// frontends stay consistent.
-    ApprovalResolved {
-        call_id: String,
+    /// Server → client: a pending ask of any kind left the pending set —
+    /// answered, declined, or abandoned. Emitted once for every close, so
+    /// every client showing the card drops it, however it closed.
+    AskResolved {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        decision: ApprovalDecision,
+        ask_id: AskId,
+        outcome: AskOutcomeKind,
+        /// What a human decided, when this was an approval somebody
+        /// answered — what a client labels the blocked work step with.
+        /// Absent for questions and for every undecided close.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+        decision: Option<ApprovalDecision>,
     },
     /// Client → server: resolve a pending approval the client
     /// previously saw in an [`Frame::ApprovalRequested`].
     ResolveApproval {
-        call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
     },
@@ -1027,7 +1068,7 @@ impl Frame {
             Frame::Messages { messages } => messages.first().map(|message| &message.session_id),
             Frame::Register { .. }
             | Frame::RegisterAck { .. }
-            | Frame::ApprovalResolved { .. }
+            | Frame::AskResolved { .. }
             | Frame::ResolveApproval { .. }
             | Frame::StartBot { .. }
             | Frame::StopBot { .. }
@@ -1110,9 +1151,9 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub title: Option<String>,
-    /// `true` while at least one tool call in this session is parked on the
-    /// approval gate; `false` the moment its LAST prompt is answered,
-    /// cancelled, or times out. Absent means no change.
+    /// `true` while at least one ask of any kind — a tool approval or a
+    /// question — is pending in this session; `false` the moment its LAST
+    /// one is answered or abandoned. Absent means no change.
     ///
     /// This rides a patch rather than [`Frame::ApprovalRequested`] because the
     /// prompt frame is dispatched only to connections **subscribed to that
@@ -1121,11 +1162,11 @@ pub struct SessionPatch {
     /// every connection on the channel, so the mark reaches a session the
     /// device has never opened.
     ///
-    /// Carries nothing about *what* the tool wants — a list row must not leak
-    /// a command line. Opening the conversation is what shows the prompt.
+    /// Carries nothing about *what* is asked — a list row must not leak a
+    /// command line. Opening the conversation is what shows the prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
-    pub approval_pending: Option<bool>,
+    pub awaiting_human: Option<bool>,
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -1313,7 +1354,7 @@ mod tests {
                 WireWorkStep::tool(Some("c1".into()), Some("edit".into()), None),
             ],
             pending_approvals: vec![ApprovalCard {
-                call_id: "c1".into(),
+                ask_id: "c1".parse().unwrap(),
                 tool_call_id: Some("t-use-1".into()),
                 user_id: "u1".into(),
                 tool: "fs.read".into(),
@@ -1520,7 +1561,7 @@ mod tests {
     fn round_trip_approval_requested() {
         use std::path::PathBuf;
         let frame = Frame::ApprovalRequested {
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             tool_call_id: Some("t-use-1".into()),
             session_id: "s1".into(),
             user_id: "u1".into(),
@@ -1535,18 +1576,62 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_approval_resolved() {
-        let frame = Frame::ApprovalResolved {
-            call_id: "c1".into(),
-            decision: ApprovalDecision::Approve,
+    fn round_trip_ask_resolved() {
+        for outcome in [
+            AskOutcomeKind::Answered,
+            AskOutcomeKind::Declined,
+            AskOutcomeKind::Abandoned,
+        ] {
+            let frame = Frame::AskResolved {
+                ask_id: "c1".parse().unwrap(),
+                outcome,
+                decision: None,
+            };
+            assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+            assert!(frame.routing_session_id().is_none());
+        }
+        let decided = Frame::AskResolved {
+            ask_id: "c1".parse().unwrap(),
+            outcome: AskOutcomeKind::Answered,
+            decision: Some(ApprovalDecision::ApproveAlways),
         };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+        assert_eq!(decided, decode(&encode(&decided).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn awaiting_human_is_the_patch_wire_key() {
+        let patch = SessionPatch {
+            awaiting_human: Some(true),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json, serde_json::json!({ "awaiting_human": true }));
+    }
+
+    #[test]
+    fn ask_outcome_kind_from_resolution() {
+        assert_eq!(
+            AskOutcomeKind::from(&AskResolution::Approval(ApprovalDecision::Deny)),
+            AskOutcomeKind::Answered
+        );
+        assert_eq!(
+            AskOutcomeKind::from(&AskResolution::Answered(Vec::new())),
+            AskOutcomeKind::Answered
+        );
+        assert_eq!(
+            AskOutcomeKind::from(&AskResolution::Declined),
+            AskOutcomeKind::Declined
+        );
+        assert_eq!(
+            AskOutcomeKind::from(&AskResolution::Abandoned),
+            AskOutcomeKind::Abandoned
+        );
     }
 
     #[test]
     fn round_trip_resolve_approval() {
         let frame = Frame::ResolveApproval {
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             decision: ApprovalDecision::Deny,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1632,7 +1717,7 @@ mod tests {
                 archived: Some(true),
                 folder_id: Some(FolderChange::Set { id: "f1".into() }),
                 title: Some("Reset password flow".into()),
-                approval_pending: Some(true),
+                awaiting_human: Some(true),
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1654,22 +1739,22 @@ mod tests {
                 archived: None,
                 folder_id: None,
                 title: None,
-                approval_pending: None,
+                awaiting_human: None,
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
 
     #[test]
-    fn round_trip_session_updated_approval_pending_only() {
-        // The approval-gate shape: a lone bool, both edges. The clear is the
-        // only signal a timed-out gate ever emits, so `Some(false)` must
+    fn round_trip_session_updated_awaiting_human_only() {
+        // The pending-ask shape: a lone bool, both edges. The clear is the
+        // only list-level signal an abandoned ask emits, so `Some(false)` must
         // survive the round trip distinctly from absent (no change).
         for pending in [true, false] {
             let frame = Frame::SessionUpdated {
                 session_id: "sess-abc".into(),
                 patch: SessionPatch {
-                    approval_pending: Some(pending),
+                    awaiting_human: Some(pending),
                     ..Default::default()
                 },
             };
@@ -1678,7 +1763,7 @@ mod tests {
             let Frame::SessionUpdated { patch, .. } = decoded else {
                 panic!("expected SessionUpdated");
             };
-            assert_eq!(patch.approval_pending, Some(pending));
+            assert_eq!(patch.awaiting_human, Some(pending));
             assert_eq!(patch.title, None, "a lone flag carries nothing else");
         }
     }

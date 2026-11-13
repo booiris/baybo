@@ -244,7 +244,7 @@ struct ChatStoreResyncTests {
         #expect(await waitUntil { store.connState == .connected })
         client.deliver(
             """
-            {"kind":"approval_requested","session_id":"s-1","call_id":"prompt-1",
+            {"kind":"approval_requested","session_id":"s-1","ask_id":"prompt-1",
              "tool_call_id":"toolcall-1","tool":"Bash","params_preview":"{}","accesses":[]}
             """,
             to: Self.sessionId)
@@ -252,7 +252,7 @@ struct ChatStoreResyncTests {
 
         store.resync(transcript: transcript)
 
-        #expect(store.pendingApprovals.map(\.callId) == ["prompt-1"])
+        #expect(store.pendingApprovals.map(\.askId) == ["prompt-1"])
     }
 
     // MARK: - The banner

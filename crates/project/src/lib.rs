@@ -2,8 +2,8 @@
 //! to satisfy before it reaches the store.
 
 mod actors;
-mod approvals;
 mod artifacts;
+mod asks;
 mod attachments;
 mod brief;
 mod budget;
@@ -22,8 +22,9 @@ mod timeline;
 pub mod tools;
 pub mod worktree;
 
-pub use approvals::{CardPromptCloser, TimelineApprovalGate};
 pub use artifacts::{BuildArtifacts, ReclaimedArtifacts};
+pub(crate) use asks::CardPromptCloser;
+pub use asks::install_ask_bridge;
 pub use attachments::{AttachmentRequest, MAX_ISSUE_ATTACHMENTS};
 pub use comments::CommentDelivery;
 pub use dispatch::{DispatchConfig, IssueRunEvent};

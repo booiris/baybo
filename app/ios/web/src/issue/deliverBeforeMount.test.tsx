@@ -20,6 +20,7 @@ const card: IssueDetail = {
   stage: 3,
   unread: 0,
   last_run_failed: false,
+  awaiting_human: false,
   approval_pending: false,
   opened_by_agent: false,
   branch: "issue-26",

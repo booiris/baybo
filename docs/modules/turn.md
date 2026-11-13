@@ -34,6 +34,7 @@ These are two different things, and the docs use the two names deliberately:
 | `SubagentNotification` | yes                        | yes                                 | no          |
 | `CronNotification`     | no                         | yes                                 | yes         |
 | `Compact`              | no                         | no                                  | no          |
+| `IssueRun`             | yes                        | yes                                 | no (issue runs report on their card) |
 
 - **Not "produces a reply".** `CronNotification` appends a durable assistant row
   into the conversation that scheduled the one-shot — a real, user-visible
@@ -100,11 +101,11 @@ A turn is described along two independent axes, each with one source of truth �
 ```rust
 // input kind — what payload fed the turn; a projection of TurnInput.
 // Display / the denormalised `turns.kind` column only.
-pub enum TurnInputKind { UserChat, Cron, CronNotification, Compact, Spawned, SubagentNotification }
+pub enum TurnInputKind { UserChat, Cron, CronNotification, Compact, Spawned, SubagentNotification, IssueRun }
 ```
 
-- **input kind** (`TurnInputKind`) — `Turn::input_kind()`, projected from `TurnInput`. `TurnInput` is a strongly typed payload enum whose variants line up 1:1 with `TurnInputKind`. `UserChat`, `Cron`, `Spawned`, and `SubagentNotification` are chat turns; `Compact` (a foreground maintenance command, no reply) and `CronNotification` (the delivery of a one-shot cron fire's result into the conversation that scheduled it) are not — see the subset table above. `CronNotification` still opens a real turn: its `Completed { reply_ordinal }` edge is what drives the push dispatcher off the row it just appended, exactly as a user turn does.
-- **origin** (`baybo_model::TriggerKind`, stored on `Turn.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: `/compact` can run inside a `User`-trigger session while carrying a `Compact` input. Subagent turns record `origin = Spawned` (their session's inherited root).
+- **input kind** (`TurnInputKind`) — `Turn::input_kind()`, projected from `TurnInput`. `TurnInput` is a strongly typed payload enum whose variants line up 1:1 with `TurnInputKind`. `UserChat`, `Cron`, `Spawned`, `SubagentNotification`, and `IssueRun` are chat turns; `Compact` (a foreground maintenance command, no reply) and `CronNotification` (the delivery of a one-shot cron fire's result into the conversation that scheduled it) are not — see the subset table above. `CronNotification` still opens a real turn: its `Completed { reply_ordinal }` edge is what drives the push dispatcher off the row it just appended, exactly as a user turn does.
+- **origin** (`baybo_model::TriggerKind`, stored on `Turn.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: `/compact` can run inside a `User`-trigger session while carrying a `Compact` input. Subagent turns record their session's inherited root (`TriggerSource` has no spawned variant, so `session.trigger.kind()` never yields `TriggerKind::Spawned`).
 
 ### Kind-level predicates
 
@@ -120,12 +121,12 @@ Three predicates live on `TurnInputKind`, each the one home for its question:
 | `CronNotification`     | no             | no            | no               |
 | `Spawned`              | yes            | no            | no               |
 
-- `is_attended` — a human can see and answer asks raised by the turn; the
-  executor sends every ask of an unattended turn to `PolicyDenyGate`. See
+- `is_attended` — a human can see and answer asks raised by the turn. See
   [`human-ask.md`](human-ask.md#attendedness) for why each kind sits where it
   does.
 - `is_user_facing` — the user is directly in the conversation, so a turn
   failure surfaces as a terminal error notice (`AgentActor::run_agent_loop`).
+  Title generation keys on `UserChat` directly.
 
 `TurnOutput` does not split this way — it has only `Message` and `Structured`, the two shapes any turn can produce.
 
