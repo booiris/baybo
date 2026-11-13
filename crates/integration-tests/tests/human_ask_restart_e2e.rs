@@ -366,6 +366,79 @@ async fn an_approval_survives_a_restart_and_its_answer_resumes_the_turn() {
     stop(node).await;
 }
 
+/// The idle reaper's eviction, without a restart: the parked turn is ended
+/// the way a shutdown ends it, the card stays answerable in the same
+/// process, and the answer resumes the turn through the Resume door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_parked_turn_is_resumed_by_its_answer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&dir.path().join(DB_FILE))
+        .await
+        .expect("open the database");
+    let session = owner_session(TriggerSource::User);
+    store
+        .session
+        .save(&session)
+        .await
+        .expect("save the session");
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut harness = builder(&session, store, &runs).with_resume_door().build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: CALL_ID.to_string(),
+            name: GATED_TOOL.to_string(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    harness.send_text("write it").await.expect("send");
+    let queue = harness.ask_queues.get_or_create(&session.channel);
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        while !harness.human_asks.has_live_pending_ask(&session.id) {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the call parks on an approval");
+    let ask_id = queue.list()[0].ask_id.clone();
+
+    assert!(harness.supervisor.release_parked_turn(&session.id));
+    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        completed_for_call(&outputs),
+        0,
+        "the release appends nothing"
+    );
+    assert_eq!(
+        queue.liveness(&ask_id),
+        Some(false),
+        "the card stays, with no waiter behind it"
+    );
+    assert!(row(&harness, &ask_id).await.is_pending());
+    assert!(
+        !harness.supervisor.release_parked_turn(&session.id),
+        "nothing is parked any more"
+    );
+
+    reply(&harness, "all done");
+    harness
+        .human_asks
+        .resolve(&ask_id, AskResolution::Approval(ApprovalDecision::Approve))
+        .await
+        .expect("answer the released ask");
+    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "executed exactly once");
+    assert!(adjacent_result(&harness).await.contains(WRITTEN));
+    assert_eq!(resume_turns(&harness).await, 1);
+    assert!(replied(&outputs, "all done"), "{outputs:#?}");
+    assert_eq!(harness.strict_rejections.load(Ordering::SeqCst), 0);
+    assert!(row(&harness, &ask_id).await.applied_at.is_some());
+    tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
+        .await
+        .expect("the actor quiesces");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answer_claimed_before_a_crash_is_redriven_by_the_next_boot() {
     let dir = tempfile::tempdir().expect("tempdir");

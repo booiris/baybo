@@ -24,10 +24,7 @@ impl AgentActor {
         let Some(turn_input) = self.resume_input(&head).await? else {
             return Ok(());
         };
-        let tokens = baybo_tools::TurnTokens {
-            turn: self.volatile.actor_token.child_token(),
-            actor: self.volatile.actor_token.clone(),
-        };
+        let (tokens, _release) = self.turn_tokens();
         let response_tx = self.volatile.response_tx.clone();
         self.volatile
             .agent_loop

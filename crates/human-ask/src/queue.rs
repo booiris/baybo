@@ -22,6 +22,8 @@ use baybo_store::HumanAskRow;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
+use crate::ports::ParkedOn;
+
 /// One pending ask as the queue (and its watchers) see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAsk {
@@ -293,10 +295,23 @@ impl AskQueue {
     /// Whether a tool future in this process is parked on an ask of
     /// `session_id`.
     pub fn has_live(&self, session_id: &SessionId) -> bool {
-        self.inner
-            .lock()
-            .iter()
-            .any(|e| &e.ask.session_id == session_id && e.responder.is_some())
+        self.parked_on(session_id) != ParkedOn::Nothing
+    }
+
+    /// What this queue's live asks for `session_id` would lose if their tool
+    /// futures went away.
+    pub fn parked_on(&self, session_id: &SessionId) -> ParkedOn {
+        let mut parked = ParkedOn::Nothing;
+        for entry in self.inner.lock().iter() {
+            if &entry.ask.session_id != session_id || entry.responder.is_none() {
+                continue;
+            }
+            if !entry.ask.is_resumable() {
+                return ParkedOn::NotResumable;
+            }
+            parked = ParkedOn::Resumable;
+        }
+        parked
     }
 
     /// `Some(true)` for a live entry, `Some(false)` for a dead one, `None`
@@ -668,6 +683,29 @@ mod tests {
             "an ask nobody answered is ABANDONED, not answered"
         );
         assert!(queue.pending_sessions().is_empty());
+    }
+
+    #[test]
+    fn parked_on_says_what_losing_the_waiter_would_cost() {
+        let queue = AskQueue::new();
+        let s1 = SessionId::from("s1");
+        assert_eq!(queue.parked_on(&s1), ParkedOn::Nothing);
+
+        let (tx, _before) = oneshot::channel();
+        queue.push_live(ask("b1", "s1", AskPhase::BeforeExecute), tx);
+        assert_eq!(queue.parked_on(&s1), ParkedOn::Resumable);
+
+        let (tx, _during) = oneshot::channel();
+        queue.push_live(ask("d1", "s1", AskPhase::DuringExecute), tx);
+        assert_eq!(queue.parked_on(&s1), ParkedOn::NotResumable);
+
+        queue.orphan(&id("d1"));
+        assert_eq!(
+            queue.parked_on(&s1),
+            ParkedOn::Resumable,
+            "a dead entry parks nothing"
+        );
+        assert_eq!(queue.parked_on(&SessionId::from("s2")), ParkedOn::Nothing);
     }
 
     #[test]

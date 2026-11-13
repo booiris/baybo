@@ -330,6 +330,30 @@ pub struct AgentActor {
 }
 
 impl AgentActor {
+    /// The tokens one turn runs under. Its `actor` side is a release token
+    /// below the actor's own: tripping it ends this turn the way a shutdown
+    /// would and leaves later turns alone. The supervisor holds it while the
+    /// guard lives, so the idle reaper can end a turn parked on resumable
+    /// asks.
+    fn turn_tokens(
+        &self,
+    ) -> (
+        baybo_tools::TurnTokens,
+        Option<supervisor::TurnReleaseGuard>,
+    ) {
+        let release = self.volatile.actor_token.child_token();
+        let guard = self
+            .volatile
+            .supervisor
+            .as_ref()
+            .map(|s| s.track_turn(&self.durable.session.id, release.clone()));
+        let tokens = baybo_tools::TurnTokens {
+            turn: release.child_token(),
+            actor: release,
+        };
+        (tokens, guard)
+    }
+
     /// Construct an actor from its durable and volatile halves.
     ///
     /// Production wiring goes through [`crate::actor::router::ActorSpawner`],
@@ -351,7 +375,7 @@ impl AgentActor {
         let _registry_guard = self
             .volatile
             .supervisor
-            .take()
+            .clone()
             .map(|s| ActorRegistryGuard::new(s, session_id.clone()));
 
         // Cold-start hydration: pull any persisted transcript out of
@@ -637,17 +661,14 @@ impl AgentActor {
         let is_user_turn = turn_input.input_kind().is_user_facing();
         // Kept so the error path below can tell a user `/stop` (token
         // tripped via the turn cancel) apart from a genuine failure.
-        let turn_token = self.volatile.actor_token.child_token();
         // The actor emits no `TurnState`: both edges are projected from the
         // turn store by `spawn_turn_state_projector` — the start edge from
         // this turn's turn `start()` (`Pending → InProgress`) inside
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
-        let tokens = baybo_tools::TurnTokens {
-            turn: turn_token.clone(),
-            actor: self.volatile.actor_token.clone(),
-        };
+        let (tokens, _release) = self.turn_tokens();
+        let turn_token = tokens.turn.clone();
         let result = self
             .volatile
             .agent_loop

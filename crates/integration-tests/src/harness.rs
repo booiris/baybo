@@ -112,6 +112,11 @@ pub struct AgentTestHarness {
     /// Parent of the actor's token. Cancelling it is what process shutdown
     /// does: every turn the actor runs reads the cancel as `Ancestor`.
     pub actor_parent_token: tokio_util::sync::CancellationToken,
+    /// The supervisor the actor registers each turn's release token with, so
+    /// a test can end a parked turn the way the idle reaper does
+    /// ([`baybo_agent::AgentSupervisor::release_parked_turn`]). The actor is
+    /// not in its registry: the harness routes to the mailbox directly.
+    pub supervisor: baybo_agent::AgentSupervisor,
     /// LLM requests the strict provider fake refused because a `tool_use`
     /// was not answered by the very next message. Stays 0 unless
     /// [`AgentTestHarnessBuilder::with_strict_tool_pairing`] is on.
@@ -766,6 +771,10 @@ impl AgentTestHarnessBuilder {
 
         let cron_store = Arc::new(baybo_cron::test_support::InMemoryCronStore::new());
         let turn_lifecycle_for_harness = Arc::clone(&turn_lifecycle);
+        let supervisor = baybo_agent::AgentSupervisor::new(
+            output_tx.clone(),
+            Arc::clone(&human_asks) as Arc<dyn baybo_human_ask::LivePendingAsks>,
+        );
         let actor = AgentActor::from_parts(
             baybo_agent::state::DurableActorState::new(session.clone()),
             baybo_agent::state::VolatileResources {
@@ -774,7 +783,7 @@ impl AgentTestHarnessBuilder {
                 turn_lifecycle,
                 span_recorder,
                 actor_token,
-                supervisor: None,
+                supervisor: Some(supervisor.clone()),
                 session_manager: Arc::clone(&session_manager),
                 cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
                 workspace: Arc::clone(&workspace),
@@ -806,6 +815,7 @@ impl AgentTestHarnessBuilder {
             ask_queues,
             human_asks,
             actor_parent_token,
+            supervisor,
             strict_rejections,
             mailbox: mailbox_tx,
             outputs: output_rx,

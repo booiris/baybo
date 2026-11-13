@@ -11,7 +11,7 @@ use chrono::Utc;
 
 use crate::core::{AskCore, AskEvent};
 use crate::error::{HumanAskError, Result};
-use crate::ports::{LivePendingAsks, ResumeSink};
+use crate::ports::{LivePendingAsks, ParkedOn, ResumeSink};
 use crate::queue::{AskQueues, PendingAsk};
 
 pub struct HumanAskManagerConfig {
@@ -286,10 +286,21 @@ impl HumanAskManager {
     }
 
     pub fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
+        self.parked_on(session_id) != ParkedOn::Nothing
+    }
+
+    /// What the session's live asks, across every channel queue, would lose
+    /// if its actor went away.
+    pub fn parked_on(&self, session_id: &SessionId) -> ParkedOn {
         self.queues
             .all()
             .iter()
-            .any(|queue| queue.has_live(session_id))
+            .map(|queue| queue.parked_on(session_id))
+            .fold(ParkedOn::Nothing, |acc, next| match (acc, next) {
+                (ParkedOn::NotResumable, _) | (_, ParkedOn::NotResumable) => ParkedOn::NotResumable,
+                (ParkedOn::Resumable, _) | (_, ParkedOn::Resumable) => ParkedOn::Resumable,
+                _ => ParkedOn::Nothing,
+            })
     }
 
     async fn unapplied(&self, session_id: &SessionId) -> Result<Vec<HumanAskRow>> {
@@ -371,8 +382,8 @@ impl HumanAskManager {
 }
 
 impl LivePendingAsks for HumanAskManager {
-    fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
-        HumanAskManager::has_live_pending_ask(self, session_id)
+    fn parked_on(&self, session_id: &SessionId) -> ParkedOn {
+        HumanAskManager::parked_on(self, session_id)
     }
 }
 

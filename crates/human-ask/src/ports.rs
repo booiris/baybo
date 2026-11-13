@@ -22,10 +22,24 @@ pub trait ResumeSink: Send + Sync {
     fn request_resume(&self, req: ResumeRequest);
 }
 
-/// "Is a tool future parked on an ask in this session right now?" — the idle
-/// reaper's probe, answered from memory.
+/// What a session's live asks — the ones a tool future is parked on right
+/// now — would lose if its actor went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkedOn {
+    /// No tool future is parked on an ask.
+    Nothing,
+    /// Only resumable asks: once the actor is gone each one stays pending,
+    /// and an answer resumes the session through the Resume door.
+    Resumable,
+    /// At least one ask is not resumable (a during-execute approval): the
+    /// actor going away abandons it.
+    NotResumable,
+}
+
+/// "What is this session's turn parked on right now?" — the idle reaper's
+/// probe, answered from memory.
 pub trait LivePendingAsks: Send + Sync {
-    fn has_live_pending_ask(&self, session_id: &SessionId) -> bool;
+    fn parked_on(&self, session_id: &SessionId) -> ParkedOn;
 }
 
 /// Told about asks raised and resolved through a verb. Runs on the verb's

@@ -973,11 +973,26 @@ fires for either kind.
 ### Idle reaper
 
 `AgentSupervisor::new` takes `Arc<dyn LivePendingAsks>`
-(`fn has_live_pending_ask(&self, &SessionId) -> bool`, over the in-memory
-queue). `reap_idle` skips such sessions beside the in-flight-subagent skip
-(`supervisor.rs:414-426`), keeping the actor warm so an answer hours later
-takes the live path. Correctness never depends on it: a reaped-then-answered
-session is just a dead ask, which the Resume door and the prelude handle.
+(`fn parked_on(&self, &SessionId) -> ParkedOn`, over the in-memory queues):
+`Nothing`, `Resumable` (every live ask is a question or a before-execute
+approval) or `NotResumable` (at least one during-execute approval).
+
+`ActorStop` is served between turns, so a turn parked on an ask would hold
+its actor — transcript, tool future and all — for as long as nobody answers.
+Each turn therefore runs under a **release token**: a child of the actor's
+token that is the turn's `TurnTokens.actor`, registered with the supervisor
+while the turn runs (`AgentSupervisor::track_turn`). For an idle session
+parked on `Resumable` asks, `reap_idle` queues `ActorStop` and then calls
+`release_parked_turn`, which cancels that token. The turn reads the cancel
+as `Ancestor`, exactly as at shutdown: nothing is appended, each ask's entry
+stays in the queue with no waiter, its row stays pending. The actor exits
+after the turn; an answer later goes through the Resume door, which spawns a
+fresh actor. The release token is per turn, so a message queued ahead of the
+lowest-priority `ActorStop` still runs normally.
+
+A `NotResumable` session is skipped: ending its turn would abandon the
+during-execute approval. That leaves those sessions unbounded in memory —
+see [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 ### Observability
 
@@ -1086,7 +1101,7 @@ pub struct ChannelAskGate { queue: AskQueue, core: Arc<AskCore> }   // impl Appr
 pub struct PolicyDenyGate { core: Arc<AskCore> }                    // impl ApprovalGate
 pub struct HumanAskManager;                     // from_config(HumanAskManagerConfig { core, queues: AskQueues, resume_sink: Arc<dyn ResumeSink> })
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
-                                                //        unapplied_tool_use_ids, has_live_pending_ask (LivePendingAsks impl)
+                                                //        unapplied_tool_use_ids, parked_on (LivePendingAsks impl)
 pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, kind, resolution } }
 pub enum ReloadScope { ResumeAnswered, LeaveAnswered }   // reload_pending: gateway vs one-shot `baybo prompt`
 pub struct ReloadReport { requeued, resumed, abandoned, applied }
@@ -1094,7 +1109,7 @@ pub struct ReloadReport { requeued, resumed, abandoned, applied }
     async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
     fn request_resume(&self, req: ResumeRequest);
 }
-pub trait LivePendingAsks { fn has_live_pending_ask(&self, session: &SessionId) -> bool; }
+pub trait LivePendingAsks { fn parked_on(&self, session: &SessionId) -> ParkedOn; }  // Nothing | Resumable | NotResumable
 #[async_trait] pub trait AskObserver { async fn on_event(&self, ask: &HumanAskRow, event: AskEvent); }
 pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>;
 pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<dyn Tool>, ToolManifest)>; }

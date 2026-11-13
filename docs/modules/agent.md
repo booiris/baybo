@@ -309,9 +309,12 @@ first) or not resolved; otherwise it runs `run_agent_loop(TurnInput::Resume)`,
 whose `run_inner` settles with `SettleMode::Continue` before the first LLM
 iteration, and sends the reply with `send_user_reply`.
 
-The idle reaper skips a session `LivePendingAsks::has_live_pending_ask`
-reports (`AgentSupervisor::new` takes the manager as that probe), so an answer
-hours later still takes the live path.
+The idle reaper asks `LivePendingAsks::parked_on` (`AgentSupervisor::new`
+takes the manager as that probe). A turn parked only on resumable asks is
+ended through its release token (`AgentSupervisor::release_parked_turn`) and
+the actor stopped; its answer later resumes the session through the Resume
+door. A turn parked on a during-execute approval keeps its actor warm. See
+"Idle reaper" in [`human-ask.md`](human-ask.md).
 
 ### Router's upstream responsibilities
 
