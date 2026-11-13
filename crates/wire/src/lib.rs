@@ -819,7 +819,9 @@ pub enum Frame {
         /// `call_id` of the TOOL call this prompt blocks (the id
         /// `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
         /// `call_id`, which is minted per prompt). Lets clients badge
-        /// the exact work step that is waiting.
+        /// the exact work step that is waiting. The gateway always sends
+        /// it; optional only so a client still parses an older gateway's
+        /// frames, which omitted it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-export", ts(optional))]
         tool_call_id: Option<String>,

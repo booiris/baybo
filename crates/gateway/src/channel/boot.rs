@@ -200,7 +200,7 @@ fn announce(channel: &Channel, ask: PendingAsk) {
     };
     channel.dispatch_approval_requested(
         entry.call_id,
-        Some(entry.tool_call_id),
+        entry.tool_call_id,
         entry.session_id,
         entry.user_id,
         entry.tool,
@@ -375,7 +375,7 @@ mod tests {
         assert!(matches!(
             w.seen.events.lock().as_slice(),
             [SessionEvent::ApprovalRequested { call_id, tool_call_id, .. }]
-                if call_id == "c1" && tool_call_id.as_deref() == Some("use-c1")
+                if call_id == "c1" && tool_call_id == "use-c1"
         ));
         assert_eq!(marks(&w.seen), vec![Some(true)]);
 
