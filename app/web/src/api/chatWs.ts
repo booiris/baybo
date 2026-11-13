@@ -264,7 +264,13 @@ export type Frame =
       params_preview: string;
       description?: string | null;
     }
-  | { kind: 'approval_resolved'; ask_id: string; decision: string }
+  | {
+      kind: 'ask_resolved';
+      ask_id: string;
+      outcome: 'answered' | 'declined' | 'abandoned';
+      /** Set when a human decided an approval; absent on every undecided close. */
+      decision?: string;
+    }
   | { kind: 'resolve_approval'; ask_id: string; decision: string }
   | { kind: 'history_append'; session_id: string; entry: string }
   | { kind: 'history_snapshot'; session_id: string; entries: string[] }

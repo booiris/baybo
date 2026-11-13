@@ -80,7 +80,13 @@ tool_call_id?: string, session_id: string, user_id?: string, tool: string, acces
  * Optional human-readable label the tool produced via
  * `Tool::call_label` (e.g. Bash's `description` parameter).
  */
-description?: string | null, } | { "kind": "approval_resolved", ask_id: string, decision: string, } | { "kind": "ask_resolved", ask_id: string, outcome: AskOutcomeKind, } | { "kind": "resolve_approval", ask_id: string, decision: string, } | { "kind": "history_append", session_id: string, entry: string, } | { "kind": "history_snapshot", session_id: string, entries: Array<string>, } | { "kind": "start_bot", bot_id: string, token: string, } | { "kind": "stop_bot", bot_id: string, } | { "kind": "bot_status", bot_id: string, ok: boolean, message?: string, } | { "kind": "slash_manifest", commands: Array<SlashCommandSpec>, } | { "kind": "folders_changed", folders: Array<FolderView>, } | { "kind": "session_updated", session_id: string, patch: SessionPatch, } | { "kind": "session_activity", session_id: string, 
+description?: string | null, } | { "kind": "ask_resolved", ask_id: string, outcome: AskOutcomeKind, 
+/**
+ * What a human decided, when this was an approval somebody
+ * answered — what a client labels the blocked work step with.
+ * Absent for questions and for every undecided close.
+ */
+decision?: string, } | { "kind": "resolve_approval", ask_id: string, decision: string, } | { "kind": "history_append", session_id: string, entry: string, } | { "kind": "history_snapshot", session_id: string, entries: Array<string>, } | { "kind": "start_bot", bot_id: string, token: string, } | { "kind": "stop_bot", bot_id: string, } | { "kind": "bot_status", bot_id: string, ok: boolean, message?: string, } | { "kind": "slash_manifest", commands: Array<SlashCommandSpec>, } | { "kind": "folders_changed", folders: Array<FolderView>, } | { "kind": "session_updated", session_id: string, patch: SessionPatch, } | { "kind": "session_activity", session_id: string, 
 /**
  * Renamed from the natural `kind` because `kind` is the
  * Frame-level serde discriminator — a same-named variant

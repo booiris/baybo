@@ -272,7 +272,6 @@ async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sende
                     message: text,
                 })),
                 TransportEvent::ApprovalRequested => Some(AppEvent::ApprovalRequested),
-                TransportEvent::ApprovalResolved { .. } => None,
             };
             if let Some(ev) = forwarded
                 && event_tx.send(ev).await.is_err()

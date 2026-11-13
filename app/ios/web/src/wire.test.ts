@@ -23,7 +23,7 @@ const WIRE_KINDS = [
   "tool_started",
   "tool_completed",
   "approval_requested",
-  "approval_resolved",
+  "ask_resolved",
   "turn_state",
   "subscribe_state",
   "gap",

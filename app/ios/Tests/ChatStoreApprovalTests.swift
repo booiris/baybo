@@ -60,7 +60,7 @@ struct ChatStoreApprovalTests {
         """
 
     private static let resolvedFrame = """
-        {"kind":"approval_resolved","session_id":"s-1","ask_id":"\(promptId)"}
+        {"kind":"ask_resolved","session_id":"s-1","ask_id":"\(promptId)","outcome":"answered"}
         """
 
     private static let toolCompletedFrame = """

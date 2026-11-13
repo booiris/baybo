@@ -3,6 +3,7 @@
 /**
  * How an ask left the pending set, on [`Frame::AskResolved`]. Kind-agnostic:
  * an approval a human decided and a question they answered are both
- * `Answered`; the decision itself rides [`Frame::ApprovalResolved`].
+ * `Answered`; an approval's decision rides beside it in
+ * [`Frame::AskResolved::decision`].
  */
 export type AskOutcomeKind = "answered" | "declined" | "abandoned";

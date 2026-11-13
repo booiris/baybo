@@ -354,13 +354,8 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             });
             Some(TransportEvent::ApprovalRequested)
         }
-        Frame::ApprovalResolved { ask_id, decision } => {
-            let _ = queue.drop_ask(&ask_id);
-            Some(TransportEvent::ApprovalResolved { ask_id, decision })
-        }
-        // Kind-agnostic close: the only signal that retires an approval
-        // another client abandoned (`/stop`, a card close), now that nothing
-        // self-denies. A no-op when `ApprovalResolved` already dropped it.
+        // Every close, answered elsewhere or not: drop the mirrored card. A
+        // no-op when this client's own answer already removed it.
         // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
         Frame::AskResolved { ask_id, .. } => {
             let _ = queue.drop_ask(&ask_id);

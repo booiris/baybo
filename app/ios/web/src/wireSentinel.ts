@@ -36,7 +36,7 @@ type MirroredKind =
   | "turn_state"
   | "subscribe_state"
   | "approval_requested"
-  | "approval_resolved"
+  | "ask_resolved"
   | "gap"
   | "notice"
   | "status"

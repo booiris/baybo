@@ -43,7 +43,7 @@ type InboundKind =
   | 'turn_state'
   | 'notice'
   | 'approval_requested'
-  | 'approval_resolved'
+  | 'ask_resolved'
   | 'history_append'
   | 'history_snapshot'
   | 'bot_status'

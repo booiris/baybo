@@ -1828,7 +1828,7 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
     );
 
     let mut closes = Vec::new();
-    while closes.len() < 2 {
+    while closes.is_empty() {
         match recv_frame_skip_activity(&mut client, Duration::from_secs(2))
             .await
             .expect("the close")
@@ -1839,16 +1839,11 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
     }
     assert_eq!(
         closes,
-        vec![
-            Frame::ApprovalResolved {
-                ask_id: "prompt-ws".parse().unwrap(),
-                decision: baybo_tools::ApprovalDecision::Approve,
-            },
-            Frame::AskResolved {
-                ask_id: "prompt-ws".parse().unwrap(),
-                outcome: wire::AskOutcomeKind::Answered,
-            },
-        ]
+        vec![Frame::AskResolved {
+            ask_id: "prompt-ws".parse().unwrap(),
+            outcome: wire::AskOutcomeKind::Answered,
+            decision: Some(baybo_tools::ApprovalDecision::Approve),
+        }]
     );
     let row = tg
         .deps

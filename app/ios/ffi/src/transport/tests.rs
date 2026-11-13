@@ -36,9 +36,9 @@ fn notice(session_id: &str, text: &str) -> Frame {
     ))
 }
 
-fn approval_resolved(ask_id: &str) -> Frame {
+fn ask_resolved(ask_id: &str) -> Frame {
     frame(&format!(
-        r#"{{"kind":"approval_resolved","ask_id":"{ask_id}","decision":"approve"}}"#
+        r#"{{"kind":"ask_resolved","ask_id":"{ask_id}","outcome":"answered","decision":"approve"}}"#
     ))
 }
 
@@ -521,10 +521,10 @@ async fn a_deck_frame_without_a_deck_sink_is_dropped_not_broadcast() {
 async fn a_session_less_non_deck_frame_still_broadcasts_past_the_deck_sink() {
     let (fixture, sinks) = Fixture::new(&["s1", "s2"]);
 
-    fixture.dispatch(approval_resolved("call-1")).await;
+    fixture.dispatch(ask_resolved("call-1")).await;
 
     for sink in &sinks {
-        assert_eq!(sink.kinds(), ["approval_resolved"]);
+        assert_eq!(sink.kinds(), ["ask_resolved"]);
     }
     assert!(fixture.deck.cards.lock().is_empty());
     assert_eq!(*fixture.deck.changed.lock(), 0);
@@ -608,10 +608,10 @@ async fn a_titleless_patch_fires_no_title_hop_but_still_routes() {
 async fn a_session_less_frame_broadcasts_to_every_sink() {
     let (fixture, sinks) = Fixture::new(&["s1", "s2", "s3"]);
 
-    fixture.dispatch(approval_resolved("call-1")).await;
+    fixture.dispatch(ask_resolved("call-1")).await;
 
     for sink in &sinks {
-        assert_eq!(sink.kinds(), ["approval_resolved"]);
+        assert_eq!(sink.kinds(), ["ask_resolved"]);
         let json: serde_json::Value = serde_json::from_str(&sink.frames()[0]).expect("parse frame");
         assert_eq!(json["ask_id"], "call-1");
     }

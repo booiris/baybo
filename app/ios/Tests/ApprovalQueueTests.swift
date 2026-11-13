@@ -5,9 +5,9 @@ import Testing
 
 /// The four frame inputs of the approval gate. Each arm below encodes a bug the
 /// feature shipped with: the waker's duplicate `approval_requested`, the
-/// broadcast `approval_resolved` (matched by PROMPT id, never by session), the
-/// `subscribe_state` snapshot that REPLACES rather than appends, and the
-/// timed-out gate that only `tool_completed` retires.
+/// broadcast `ask_resolved` (matched by PROMPT id, never by session), the
+/// `subscribe_state` snapshot that REPLACES rather than appends, and
+/// `tool_completed` as the backstop that retires a card whose close was missed.
 ///
 /// The frame literals are spelled out rather than built from app constants: they
 /// are the WIRE contract with the gateway, and a test that reused the app's own
@@ -41,7 +41,7 @@ struct ApprovalQueueTests {
     }
 
     private func resolved(askId: String, sessionId: String = "s-1") -> [String: Any] {
-        ["kind": "approval_resolved", "session_id": sessionId, "ask_id": askId]
+        ["kind": "ask_resolved", "session_id": sessionId, "ask_id": askId, "outcome": "answered"]
     }
 
     private func toolCompleted(callId: String) -> [String: Any] {
@@ -84,7 +84,7 @@ struct ApprovalQueueTests {
         #expect(queue.cards.isEmpty)
     }
 
-    /// `approval_resolved` is broadcast to EVERY session's sink, so the card is
+    /// `ask_resolved` is broadcast to EVERY session's sink, so the card is
     /// matched by prompt id alone. Filtering on `session_id` would strand a card
     /// another client already answered.
     @Test mutating func resolvedFromAnotherSessionStillRetiresTheCard() {
@@ -101,7 +101,7 @@ struct ApprovalQueueTests {
         #expect(queue.cards.count == 1)
     }
 
-    /// The id mixup, first direction. `approval_resolved.ask_id` is the PROMPT
+    /// The id mixup, first direction. `ask_resolved.ask_id` is the PROMPT
     /// id; matching it against `toolCallId` compiles, typechecks, and silently
     /// retires the wrong card.
     @Test mutating func resolvedDoesNotMatchTheToolCallId() {
@@ -111,10 +111,10 @@ struct ApprovalQueueTests {
         #expect(queue.cards.map(\.askId) == [Self.promptId])
     }
 
-    /// A gate that TIMES OUT denies server-side and broadcasts NO
-    /// `approval_resolved` — the tool's completion is the only signal that
-    /// retires the card. Its `call_id` is the BLOCKED TOOL CALL's id.
-    @Test mutating func toolCompletedRetiresATimedOutGate() {
+    /// A close this store missed (the leg was down when `ask_resolved` went out)
+    /// is retired by the tool's completion. Its `call_id` is the BLOCKED TOOL
+    /// CALL's id.
+    @Test mutating func toolCompletedRetiresAMissedClose() {
         _ = queue.apply(requested())
         let retired = queue.apply(toolCompleted(callId: Self.toolCallId))
         #expect(retired)
@@ -192,7 +192,7 @@ struct ApprovalQueueTests {
     }
 
     /// The optimistic dismiss when the user taps approve/deny — the server's
-    /// `approval_resolved` fan-out confirms it, and re-adding the card on the
+    /// `ask_resolved` fan-out confirms it, and re-adding the card on the
     /// frame's return would flash a prompt they just answered.
     @Test mutating func resolveByPromptIdIsTheOptimisticDismiss() {
         _ = queue.apply(requested())

@@ -270,8 +270,8 @@ pub enum SessionEvent {
     /// the channel's ask-queue watcher when the ask enters the queue, so every
     /// subscriber to the call's `session_id` can show the approval UI
     /// concurrently; the first `ResolveApproval` wins, and the channel
-    /// publishes [`SessionEvent::ApprovalResolved`] to dismiss the
-    /// prompt elsewhere.
+    /// publishes [`SessionEvent::AskResolved`] to dismiss the prompt
+    /// elsewhere.
     ApprovalRequested {
         ask_id: AskId,
         /// `call_id` of the TOOL call the prompt blocks (the id
@@ -285,14 +285,6 @@ pub enum SessionEvent {
         params_preview: String,
         description: Option<String>,
     },
-    /// Some subscriber resolved a pending approval; concurrent UIs
-    /// drop the prompt. `session_id` is carried so the channel can
-    /// fan out to the right subscriber set.
-    ApprovalResolved {
-        ask_id: AskId,
-        session_id: SessionId,
-        decision: ApprovalDecision,
-    },
     /// A pending ask of any kind closed — answered, declined or abandoned.
     /// Dispatched for every close the channel's ask queue publishes, so an
     /// approval nobody decided still leaves every open client. `session_id`
@@ -301,6 +293,8 @@ pub enum SessionEvent {
         session_id: SessionId,
         ask_id: AskId,
         outcome: AskOutcomeKind,
+        /// A human's decision on an approval; `None` otherwise.
+        decision: Option<ApprovalDecision>,
     },
 }
 
@@ -319,7 +313,6 @@ impl SessionEvent {
             SessionEvent::Agent(out) => &out.session_id,
             SessionEvent::UserEcho(m) => &m.message.session_id,
             SessionEvent::ApprovalRequested { session_id, .. } => session_id,
-            SessionEvent::ApprovalResolved { session_id, .. } => session_id,
             SessionEvent::AskResolved { session_id, .. } => session_id,
         }
     }
@@ -332,7 +325,7 @@ impl SessionEvent {
             SessionEvent::Agent(out) => &out.user_id,
             SessionEvent::UserEcho(m) => &m.message.sender.id,
             SessionEvent::ApprovalRequested { user_id, .. } => user_id,
-            SessionEvent::ApprovalResolved { .. } | SessionEvent::AskResolved { .. } => "",
+            SessionEvent::AskResolved { .. } => "",
         }
     }
 }

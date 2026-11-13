@@ -324,11 +324,12 @@ export interface PlatformApprovals<
   ): Promise<ApprovalDecision>;
 
   /**
-   * Baybo has resolved an approval it originally requested. Use this
+   * Baybo has closed an approval it originally requested. Use this
    * to update the platform-side UI (e.g. edit the prompt message to
-   * show the final decision).
+   * show the final decision). `decision` is `undefined` when it closed
+   * with nobody deciding.
    */
-  onResolved?(askId: string, decision: ApprovalDecision): Promise<void>;
+  onResolved?(askId: string, decision: ApprovalDecision | undefined): Promise<void>;
 
   /**
    * Register bot-specific handlers on a freshly-created bot before
@@ -827,7 +828,7 @@ export class BotChannel<BotHandle, ChatId>
 
   async onApprovalResolved(
     askId: string,
-    decision: ApprovalDecision,
+    decision: ApprovalDecision | undefined,
   ): Promise<void> {
     const fn = this.approvals?.onResolved;
     if (fn) await fn.call(this.approvals, askId, decision);

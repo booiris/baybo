@@ -111,7 +111,7 @@ export interface WorkStep {
   toolStatus?: 'running' | 'ok' | 'error' | 'denied';
   toolSummary?: string;
   /** Prompt id, set while this call is blocked on the user's approval — the
-   *  step reads "waiting for approval" until the matching `approval_resolved`
+   *  step reads "waiting for approval" until the matching `ask_resolved`
    *  (or the call's own completion) lands. */
   awaitingApproval?: string;
   /** The decision the user gave. Persisted with the tool result, so a reload
@@ -4226,12 +4226,14 @@ export function routeInboundFrame(
       });
       return;
     }
-    case 'approval_resolved': {
+    case 'ask_resolved': {
+      // Every close, decided or not: `/stop`, a closed card or an expired
+      // during-execute approval retire the card as surely as an answer.
       setViews((prev) => {
         // Walk every session bucket since we don't know which one
-        // the call_id belongs to. Map is small (~tabs visited), so
+        // the ask_id belongs to. Map is small (~tabs visited), so
         // this is cheap. Return `prev` unchanged when no card matches
-        // — the call_id may belong to an already-resolved session, and
+        // — the ask_id may belong to an already-resolved session, and
         // a fresh object would force every SessionRow to re-render.
         let next: Record<string, SessionView> | null = null;
         for (const [sid, view] of Object.entries(prev)) {
@@ -4528,9 +4530,8 @@ export function applyToolCompletedStep(
       ...nextSteps[sIdx],
       toolStatus,
       toolSummary: summary,
-      // The call is done, so nothing waits on the user any more — including
-      // when the gate TIMED OUT, which broadcasts no `approval_resolved` and
-      // would otherwise strand the badge.
+      // The call is done, so nothing waits on the user any more — a backstop
+      // for an `ask_resolved` this client missed.
       awaitingApproval: undefined,
       approval: approval ?? nextSteps[sIdx].approval,
     };
@@ -4572,24 +4573,28 @@ export function markStepAwaitingApproval(
   return rewriteToolStep(prev, (s) => (s.toolCallId === toolCallId ? { ...s, awaitingApproval: askId } : s));
 }
 
-/** A prompt was answered (here or on another client): clear the badge and
- *  label the step. Matched by PROMPT id — that is all `approval_resolved`
- *  carries. The label is provisional until the call's own completion brings
- *  the persisted twin. */
+/** A prompt closed (here or on another client): clear the badge, and label
+ *  the step when a human decided. Matched by PROMPT id — that is all
+ *  `ask_resolved` carries. The label is provisional until the call's own
+ *  completion brings the persisted twin. */
 export function resolveStepApproval(
   prev: TranscriptRow[],
   askId: string,
-  decision: string,
+  decision: string | undefined,
 ): TranscriptRow[] {
   return rewriteToolStep(prev, (s) =>
     s.awaitingApproval === askId
-      ? { ...s, awaitingApproval: undefined, approval: approvalFromWire(decision) }
+      ? {
+          ...s,
+          awaitingApproval: undefined,
+          approval: decision === undefined ? s.approval : approvalFromWire(decision),
+        }
       : s,
   );
 }
 
 /** Rewrite every tool step of the newest work block in place. Returns `prev`
- *  UNCHANGED when nothing matched — `approval_resolved` is broadcast to every
+ *  UNCHANGED when nothing matched — `ask_resolved` is broadcast to every
  *  session bucket, and minting a fresh array per bucket would re-render every
  *  open thread on a decision that belongs to exactly one of them. */
 function rewriteToolStep(

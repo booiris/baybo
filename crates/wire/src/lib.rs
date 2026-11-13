@@ -48,7 +48,8 @@ pub enum MessageRole {
 
 /// How an ask left the pending set, on [`Frame::AskResolved`]. Kind-agnostic:
 /// an approval a human decided and a question they answered are both
-/// `Answered`; the decision itself rides [`Frame::ApprovalResolved`].
+/// `Answered`; an approval's decision rides beside it in
+/// [`Frame::AskResolved::decision`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -609,7 +610,7 @@ pub enum Frame {
     /// against sync pages, but staleness of the turn/work halves is
     /// judged by turn identity ([`TurnSnapshot::started_at`]), never by
     /// ordinal arithmetic. Live `TurnState` / `TaskList` /
-    /// `ApprovalRequested` / `ApprovalResolved` frames arriving after
+    /// `ApprovalRequested` / `AskResolved` frames arriving after
     /// this bundle win by normal frame order.
     SubscribeState {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
@@ -840,24 +841,19 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
-    /// Server → client: any subscriber (including ours) resolved the
-    /// approval — drop the prompt from the local UI so concurrent
-    /// frontends stay consistent.
-    ApprovalResolved {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        ask_id: AskId,
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        decision: ApprovalDecision,
-    },
     /// Server → client: a pending ask of any kind left the pending set —
-    /// answered, declined, or abandoned. Clients drop the card whose
-    /// `ask_id` equals this frame's `ask_id`. Emitted on every close, beside
-    /// [`Frame::ApprovalResolved`] for an answered approval; it is the only
-    /// frame that retires an approval nobody decided.
+    /// answered, declined, or abandoned. Emitted once for every close, so
+    /// every client showing the card drops it, however it closed.
     AskResolved {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         ask_id: AskId,
         outcome: AskOutcomeKind,
+        /// What a human decided, when this was an approval somebody
+        /// answered — what a client labels the blocked work step with.
+        /// Absent for questions and for every undecided close.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+        decision: Option<ApprovalDecision>,
     },
     /// Client → server: resolve a pending approval the client
     /// previously saw in an [`Frame::ApprovalRequested`].
@@ -1072,7 +1068,6 @@ impl Frame {
             Frame::Messages { messages } => messages.first().map(|message| &message.session_id),
             Frame::Register { .. }
             | Frame::RegisterAck { .. }
-            | Frame::ApprovalResolved { .. }
             | Frame::AskResolved { .. }
             | Frame::ResolveApproval { .. }
             | Frame::StartBot { .. }
@@ -1581,15 +1576,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_approval_resolved() {
-        let frame = Frame::ApprovalResolved {
-            ask_id: "c1".parse().unwrap(),
-            decision: ApprovalDecision::Approve,
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
     fn round_trip_ask_resolved() {
         for outcome in [
             AskOutcomeKind::Answered,
@@ -1599,10 +1585,17 @@ mod tests {
             let frame = Frame::AskResolved {
                 ask_id: "c1".parse().unwrap(),
                 outcome,
+                decision: None,
             };
             assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
             assert!(frame.routing_session_id().is_none());
         }
+        let decided = Frame::AskResolved {
+            ask_id: "c1".parse().unwrap(),
+            outcome: AskOutcomeKind::Answered,
+            decision: Some(ApprovalDecision::ApproveAlways),
+        };
+        assert_eq!(decided, decode(&encode(&decided).unwrap()).unwrap());
     }
 
     #[test]

@@ -76,15 +76,15 @@ struct PendingApproval: Identifiable, Equatable {
 /// Four inputs, matching the four ways a prompt appears or goes away:
 /// * `approval_requested` — a new prompt. DEDUPED: the gate's waker re-fires on
 ///   the newest queue entry, so the same card legitimately arrives twice;
-/// * `approval_resolved` — someone answered (this device, or another client).
-///   It is broadcast to EVERY session's sink, so it is matched by PROMPT id and
-///   never by session;
+/// * `ask_resolved` — the prompt closed, answered (this device, or another
+///   client) or not (`/stop`, an expired during-execute approval). It is
+///   broadcast to EVERY session's sink, so it is matched by PROMPT id and never
+///   by session;
 /// * `subscribe_state.pending_approvals` — the authoritative set on
 ///   (re)subscribe, which REPLACES the queue (appending would resurrect a card
 ///   the user already answered);
-/// * `tool_completed` — the blocked call finished. A gate that TIMES OUT denies
-///   server-side and broadcasts NO `approval_resolved`, so this is the only
-///   signal that retires that card.
+/// * `tool_completed` — the blocked call finished; a backstop for an
+///   `ask_resolved` this store missed.
 struct ApprovalQueue {
     private(set) var cards: [PendingApproval] = []
 
@@ -100,7 +100,7 @@ struct ApprovalQueue {
             else { return false }
             cards.append(card)
             return true
-        case "approval_resolved":
+        case "ask_resolved":
             guard let askId = frame["ask_id"] as? String else { return false }
             return resolve(askId: askId)
         case "subscribe_state":
@@ -112,7 +112,7 @@ struct ApprovalQueue {
         case "tool_completed":
             // `call_id` here is the BLOCKED TOOL CALL's id, not the prompt's —
             // the same JSON key carries a different id on this frame than it
-            // does on `approval_resolved`, so this arm matches `toolCallId`.
+            // does on `approval_requested`, so this arm matches `toolCallId`.
             // Retiring by `askId` instead would silently retire the wrong card
             // (or none) and still compile.
             guard let toolCallId = frame["call_id"] as? String,
@@ -126,7 +126,7 @@ struct ApprovalQueue {
     }
 
     /// Retire a prompt by its own id — the optimistic dismiss when the user
-    /// answers, and the `approval_resolved` arm above.
+    /// answers, and the `ask_resolved` arm above.
     mutating func resolve(askId: String) -> Bool {
         guard cards.contains(where: { $0.askId == askId }) else { return false }
         cards.removeAll { $0.askId == askId }
