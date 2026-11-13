@@ -59,7 +59,8 @@ pub enum MessageRole {
 pub enum AskOutcomeKind {
     Answered,
     Declined,
-    /// Nobody decided: `/stop`, a card close, or the user moved on.
+    /// Nobody decided: `/stop`, a card close, the user moved on, or a
+    /// during-execute approval's deadline passed.
     Abandoned,
 }
 
@@ -68,7 +69,7 @@ impl From<&AskResolution> for AskOutcomeKind {
         match resolution {
             AskResolution::Approval(_) | AskResolution::Answered(_) => Self::Answered,
             AskResolution::Declined | AskResolution::PolicyDenied => Self::Declined,
-            AskResolution::Abandoned => Self::Abandoned,
+            AskResolution::Abandoned | AskResolution::TimedOut => Self::Abandoned,
         }
     }
 }
@@ -812,9 +813,10 @@ pub enum Frame {
     /// Server → client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX
     /// should echo a [`Frame::ResolveApproval`] back; clients without
-    /// one can ignore it. The prompt never times out: it stays pending
-    /// (across a gateway restart too) until a client answers it or the
-    /// turn moves on, and [`Frame::AskResolved`] retires it either way.
+    /// one can ignore it. The prompt stays pending (across a gateway
+    /// restart too) until a client answers it or the turn moves on — only a
+    /// during-execute approval expires, after 30 minutes — and
+    /// [`Frame::AskResolved`] retires it either way.
     ApprovalRequested {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         ask_id: AskId,

@@ -1,10 +1,11 @@
 //! The two [`ApprovalGate`] implementations backed by the ledger.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_model::approval::{ApprovalDecision, ApprovalRequest};
-use baybo_model::human_ask::{AskId, AskKind, AskRequest, AskResolution};
+use baybo_model::human_ask::{AskId, AskKind, AskRequest, AskResolution, resumable};
 use baybo_store::HumanAskRow;
 use baybo_tools::{ApprovalGate, ApprovalOutcome, AskCancel, AskSite, CancelOrigin};
 use chrono::Utc;
@@ -13,8 +14,16 @@ use tokio::sync::oneshot;
 use crate::core::{AskCore, AskEvent};
 use crate::queue::{AskQueue, PendingAsk};
 
+/// How long a non-resumable ask — a during-execute approval — waits for an
+/// answer. It cannot outlive its tool future, so without a deadline it would
+/// hold its turn in memory for as long as nobody answers; when the deadline
+/// passes the tool gets a timed-out denial and carries on. Resumable asks
+/// have no deadline. See `docs/todo/during-execute-approvals.md`.
+pub const DURING_EXECUTE_APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// A channel's gate: persist the ask, enqueue it, wait for a verb to resolve
-/// it. No timeout. Clients learn of the ask from the queue's
+/// it — with no timeout, except a non-resumable ask's
+/// [`DURING_EXECUTE_APPROVAL_TIMEOUT`]. Clients learn of the ask from the queue's
 /// [`AskQueueEvent::AskRaised`](crate::AskQueueEvent::AskRaised), which the
 /// channel's ask watcher turns into a frame.
 pub struct ChannelAskGate {
@@ -61,20 +70,61 @@ impl ChannelAskGate {
             ask_id: row.ask_id.clone(),
         };
 
-        tokio::select! {
-            biased;
-            answered = rx => {
-                let resolution = answered.unwrap_or(AskResolution::Abandoned);
-                if let Err(e) = self.core.mark_applied(&row.ask_id).await {
-                    tracing::warn!(ask_id = %row.ask_id, error = %e, "could not stamp ask applied");
-                }
-                Some(resolution)
+        let deadline = async {
+            if resumable(row.kind, row.phase) {
+                std::future::pending::<()>().await;
+            } else {
+                tokio::time::sleep(DURING_EXECUTE_APPROVAL_TIMEOUT).await;
             }
-            _ = cancel.tokens.turn.cancelled() => match cancel.origin() {
-                CancelOrigin::Turn => Some(AskResolution::Abandoned),
-                CancelOrigin::Ancestor => std::future::pending().await,
-            },
+        };
+        let mut rx = rx;
+        let resolution = tokio::select! {
+            biased;
+            answered = &mut rx => answered.unwrap_or(AskResolution::Abandoned),
+            _ = cancel.tokens.turn.cancelled() => {
+                return match cancel.origin() {
+                    CancelOrigin::Turn => Some(AskResolution::Abandoned),
+                    CancelOrigin::Ancestor => std::future::pending().await,
+                };
+            }
+            () = deadline => self.expire(&row, rx).await,
+        };
+        if let Err(e) = self.core.mark_applied(&row.ask_id).await {
+            tracing::warn!(ask_id = %row.ask_id, error = %e, "could not stamp ask applied");
         }
+        Some(resolution)
+    }
+
+    /// The deadline passed: claim `TimedOut` on the still-pending row and
+    /// close the card. A verb that claimed first wins, and its answer is
+    /// already on its way down `rx`. If the claim cannot be written the ask
+    /// still times out here; the row stays pending and is reconciled as a
+    /// dead non-resumable ask.
+    async fn expire(
+        &self,
+        row: &HumanAskRow,
+        rx: oneshot::Receiver<AskResolution>,
+    ) -> AskResolution {
+        let timed_out = AskResolution::TimedOut;
+        match self
+            .core
+            .store()
+            .resolve(&row.ask_id, &timed_out, Utc::now())
+            .await
+        {
+            Ok(true) => {
+                self.core
+                    .notify(row, AskEvent::Resolved(timed_out.clone()))
+                    .await;
+            }
+            Ok(false) => return rx.await.unwrap_or(AskResolution::Abandoned),
+            Err(e) => {
+                tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record an ask timing out");
+            }
+        }
+        tracing::info!(ask_id = %row.ask_id, "during-execute approval timed out");
+        let _ = self.queue.resolve(&row.ask_id, timed_out.clone());
+        timed_out
     }
 }
 
@@ -92,6 +142,7 @@ impl ApprovalGate for ChannelAskGate {
             Some(AskResolution::Approval(decision)) => ApprovalOutcome::answered(decision),
             Some(AskResolution::PolicyDenied) => ApprovalOutcome::policy(ApprovalDecision::Deny),
             Some(AskResolution::Abandoned) | None => ApprovalOutcome::abandoned(),
+            Some(AskResolution::TimedOut) => ApprovalOutcome::timed_out(),
             Some(other @ (AskResolution::Answered(_) | AskResolution::Declined)) => {
                 tracing::warn!(%ask_id, ?other, "approval ask resolved as a question; denying");
                 ApprovalOutcome::abandoned()

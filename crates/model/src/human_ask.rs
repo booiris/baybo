@@ -225,6 +225,9 @@ pub enum AskResolution {
     Abandoned,
     /// An unattended turn hit the gate; a standing rule denied it.
     PolicyDenied,
+    /// A during-execute approval nobody answered within its deadline. Only
+    /// a non-resumable ask can time out.
+    TimedOut,
 }
 
 /// "Open a turn that applies this resolved ask" — sent when a human answers

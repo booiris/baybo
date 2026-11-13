@@ -120,6 +120,7 @@ fn timeline_resolution(
     match resolution {
         AskResolution::Approval(decision) => Some((*decision, ApprovalResolution::Answered)),
         AskResolution::Abandoned => Some((ApprovalDecision::Deny, ApprovalResolution::Abandoned)),
+        AskResolution::TimedOut => Some((ApprovalDecision::Deny, ApprovalResolution::TimedOut)),
         AskResolution::PolicyDenied | AskResolution::Answered(_) | AskResolution::Declined => None,
     }
 }

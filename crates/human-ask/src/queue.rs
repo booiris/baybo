@@ -391,7 +391,10 @@ impl AskQueue {
     /// Remove an ask a human (or policy) decided and hand the decision to
     /// its waiter, if it has one. `None` when the ask is not queued.
     pub fn resolve(&self, ask_id: &AskId, resolution: AskResolution) -> Option<Removed> {
-        let edge = if resolution == AskResolution::Abandoned {
+        let edge = if matches!(
+            resolution,
+            AskResolution::Abandoned | AskResolution::TimedOut
+        ) {
             PendingEdge::Abandoned
         } else {
             PendingEdge::Answered

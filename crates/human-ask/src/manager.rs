@@ -393,5 +393,7 @@ fn fits(kind: AskKind, resolution: &AskResolution) -> bool {
         AskResolution::Approval(_) => kind == AskKind::Approval,
         AskResolution::Answered(_) | AskResolution::Declined => kind == AskKind::Question,
         AskResolution::Abandoned | AskResolution::PolicyDenied => true,
+        // Only the gate's own deadline produces it, never a verb.
+        AskResolution::TimedOut => false,
     }
 }

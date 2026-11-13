@@ -218,6 +218,7 @@ impl AgentLoop {
                     denied(&call, ApprovalResolution::Abandoned)
                 }
                 (AskResolution::PolicyDenied, _) => denied(&call, ApprovalResolution::Policy),
+                (AskResolution::TimedOut, _) => denied(&call, ApprovalResolution::TimedOut),
             };
             self.append_settled(
                 session,

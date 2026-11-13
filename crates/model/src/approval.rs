@@ -100,8 +100,8 @@ pub enum ApprovalResolution {
     /// rows written before this distinction existed read as answered.
     #[default]
     Answered,
-    /// Historical: gates used to deny themselves after a fixed window.
-    /// Nothing produces this any more; it stays so old span events decode.
+    /// Nobody answered a during-execute approval within its deadline
+    /// (`DURING_EXECUTE_APPROVAL_TIMEOUT` in `baybo-human-ask`). Denied.
     TimedOut,
     /// The prompt went away undecided — its turn was cancelled or its
     /// process shut down. Denied by default.

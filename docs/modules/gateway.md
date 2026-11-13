@@ -312,8 +312,8 @@ broadcasts the `SessionPatch.awaiting_human` list mark. The client echoes a
 `ResolveApproval { ask_id, decision }` frame; the inbound loop checks the ask
 is on this connection's channel queue and calls `HumanAskManager::resolve`,
 which claims the decision in the ledger first and then removes the entry
-(the watchers do the broadcast). There is no timeout: an ask waits until a
-human answers it or a verb abandons it (`/stop`, a card close, a new message
+(the watchers do the broadcast). An ask waits until a
+human answers it or a verb abandons it — except that a during-execute approval expires after `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min) — see [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md) — (`/stop`, a card close, a new message
 past a dead ask); a process exit leaves it pending for the next boot, whose
 reload re-queues it (see [`human-ask.md`](human-ask.md)). The board's
 `POST /projects/{id}/issues/{n}/approvals/{ask_id}` resolves through the
@@ -1034,8 +1034,8 @@ The full frame set (see `crates/wire/src/lib.rs`):
 - **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
   client), `ResolveApproval` (client → server); the on-subscribe
   authoritative set rides `SubscribeState.pending_approvals`. Approvals
-  never time out and survive a restart (the boot reload re-queues them from
-  the `human_asks` ledger). `AskResolved { ask_id, outcome }` (server →
+  survive a restart (the boot reload re-queues them from the `human_asks`
+  ledger) and never time out, except a during-execute approval (30 min). `AskResolved { ask_id, outcome }` (server →
   client, session-less, `outcome` ∈ `answered | declined | abandoned`) is
   sent on every close of any ask kind — the only frame that retires an
   approval nobody decided. `ResolveApproval` resolves through

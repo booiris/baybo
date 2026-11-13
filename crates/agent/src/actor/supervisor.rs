@@ -420,7 +420,8 @@ impl AgentSupervisor {
     /// ends as it would at shutdown (nothing appended, each ask left pending),
     /// and an answer later resumes the session through the Resume door. A
     /// turn parked on a during-execute approval is left alone — ending it
-    /// would abandon the prompt.
+    /// would abandon the prompt — until the approval's own deadline
+    /// (`DURING_EXECUTE_APPROVAL_TIMEOUT`) lets the turn finish.
     ///
     /// Returns the number of `ActorStop` sends attempted. Idle sessions
     /// that were not registered (cron / maintenance / subagent

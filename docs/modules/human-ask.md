@@ -49,7 +49,7 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-store` (`store::human_ask`) | `HumanAskRow` + the `HumanAskStore` port. No delete method. |
 | `baybo-storage` (`sqlite/human_ask.rs`) | `SqliteHumanAskStore` over the `human_asks` table. DDL in `sqlite/mod.rs` like every other table. |
 | `baybo-tools` (`tools::approval`, new `tools::ask`) | The **tool-facing ports** only: `ApprovalGate`, `ApprovalGateMap`, `AutoDenyGate`, `ApprovalHandle`, `ApprovalOutcome`, `refusal_reason`; new `QuestionGate`, `QuestionHandle`, `AskCancel`, `ParkGauge`, `ToolContext.question`, `Tool::sole_call()`. Never depends on `baybo-human-ask`. |
-| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
+| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`, `RouterInbound::ResumeAsk`. |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
 | `baybo-gateway`, `baybo-agent`, `baybo-project`, `baybo-tui` | Consumers that receive `Arc<AskCore>` / `Arc<HumanAskManager>` / `AskQueues`, never the store. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. `tui`: compile-only arms + TODO. |
@@ -272,11 +272,16 @@ call failed. The one deny that is *not* ledgered is `ApprovalGateMap`'s
 or a sidecar type that has not connected since boot; that is a
 misconfiguration guard, not a policy.
 
-**No timeout in attended turns.** `APPROVAL_TIMEOUT` (`boot.rs:33`),
-`ChannelApprovalGate.timeout`, `ApprovalOutcome::timed_out`,
-`REFUSAL_TIMED_OUT` and `APPROVAL_HEADROOM` (`tool_executor.rs:121`) are
-deleted. `ApprovalResolution::TimedOut` stays as a serde variant so old span
-events still decode, documented as historical.
+**No timeout in attended turns — except a during-execute approval.**
+`APPROVAL_TIMEOUT` (`boot.rs:33`), `ChannelApprovalGate.timeout` and
+`APPROVAL_HEADROOM` (`tool_executor.rs:121`) are deleted: a resumable ask
+waits until it is answered, and a dead one is answered through the Resume
+door. A during-execute approval cannot outlive its tool future, so it
+alone keeps a deadline, `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min): the gate
+claims `AskResolution::TimedOut`, closes the card, and the tool returns a
+`ApprovalResolution::TimedOut` denial (`REFUSAL_TIMED_OUT`) and carries on —
+nothing is replayed. See
+[`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 `baybo prompt` (`prompt_cmd.rs:258-264`) keeps working through the session
 tier of `ApprovalGateMap` (`AutoApprove`/`AutoDeny` per session); the tier
@@ -991,8 +996,10 @@ fresh actor. The release token is per turn, so a message queued ahead of the
 lowest-priority `ActorStop` still runs normally.
 
 A `NotResumable` session is skipped: ending its turn would abandon the
-during-execute approval. That leaves those sessions unbounded in memory —
-see [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
+during-execute approval. It is bounded by that approval's own deadline
+(`DURING_EXECUTE_APPROVAL_TIMEOUT`): the turn carries on with a timed-out
+denial, and the next idle tick reaps it — see
+[`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 ### Observability
 

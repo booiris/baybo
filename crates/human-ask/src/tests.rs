@@ -271,6 +271,87 @@ async fn live_resolve_persists_first_then_fires_and_the_gate_stamps_applied() {
     );
 }
 
+/// Past the deadline, plus a margin the paused clock skips over at once.
+const PAST_DEADLINE: Duration =
+    crate::gate::DURING_EXECUTE_APPROVAL_TIMEOUT.saturating_add(Duration::from_secs(1));
+
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_during_execute_approval_times_out() {
+    let h = harness();
+    let task = park(&h, "a", "s1", AskPhase::DuringExecute, tokens()).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert_eq!(task.await.expect("join"), ApprovalOutcome::timed_out());
+    let stored = h.store.row(&id("a")).expect("row");
+    assert_eq!(stored.resolution, Some(AskResolution::TimedOut));
+    assert!(
+        stored.applied_at.is_some(),
+        "the tool's own denial consumes it"
+    );
+    assert!(!h.queue.contains(&id("a")), "the card is closed");
+    assert_eq!(
+        h.edges.lock().last().map(|(_, e)| e.clone()),
+        Some(PendingEdge::Abandoned)
+    );
+    assert!(
+        h.observer
+            .seen
+            .lock()
+            .iter()
+            .any(|(ask, event, ..)| *ask == id("a")
+                && *event == AskEvent::Resolved(AskResolution::TimedOut)),
+        "observers hear the timeout"
+    );
+    assert!(
+        h.manager.resolve(&id("a"), APPROVE).await.is_err(),
+        "a late answer is refused"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn resumable_asks_have_no_deadline() {
+    let h = harness();
+    let before = park(&h, "b", "s1", AskPhase::BeforeExecute, tokens()).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert!(
+        h.queue.contains(&id("b")),
+        "a before-execute approval still waits"
+    );
+    assert!(h.store.row(&id("b")).expect("row").is_pending());
+    h.manager.resolve(&id("b"), APPROVE).await.expect("resolve");
+    assert_eq!(
+        before.await.expect("join"),
+        ApprovalOutcome::answered(ApprovalDecision::Approve)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_that_claims_first_beats_the_deadline() {
+    use baybo_store::HumanAskStore as _;
+    let h = harness();
+    let task = park(&h, "a", "s1", AskPhase::DuringExecute, tokens()).await;
+    // A verb's claim landed, but its queue resolve has not run yet.
+    assert!(
+        h.store
+            .resolve(&id("a"), &APPROVE, Utc::now())
+            .await
+            .expect("claim")
+    );
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert!(
+        !task.is_finished(),
+        "the gate waits for the answer it lost to"
+    );
+    h.queue.resolve(&id("a"), APPROVE);
+    assert_eq!(
+        task.await.expect("join"),
+        ApprovalOutcome::answered(ApprovalDecision::Approve)
+    );
+    assert_eq!(
+        h.store.row(&id("a")).expect("row").resolution,
+        Some(APPROVE)
+    );
+}
+
 #[tokio::test]
 async fn a_second_resolve_is_ask_closed() {
     let h = harness();
