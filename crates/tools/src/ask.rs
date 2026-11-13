@@ -9,8 +9,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use baybo_model::ChannelType;
 use baybo_model::human_ask::AskPhase;
+use baybo_model::{ChannelType, TurnId};
 use tokio_util::sync::CancellationToken;
 
 /// The two cancel tokens a turn runs under. `turn` trips on any cancel of the
@@ -71,11 +71,13 @@ impl AskCancel {
     }
 }
 
-/// Where an ask was raised: the channel whose queue holds it and the phase of
-/// the tool call it blocks. Written onto the ledger row.
+/// Where an ask was raised: the channel whose queue holds it, the turn that
+/// raised it, and the phase of the tool call it blocks. Written onto the
+/// ledger row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskSite {
     pub channel: ChannelType,
+    pub turn_id: TurnId,
     pub phase: AskPhase,
 }
 
@@ -85,6 +87,7 @@ impl AskSite {
     pub fn for_test() -> Self {
         Self {
             channel: ChannelType::owner(),
+            turn_id: TurnId::default(),
             phase: AskPhase::BeforeExecute,
         }
     }

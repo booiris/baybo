@@ -108,8 +108,7 @@ async fn chat_api_round_trip() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -245,8 +244,7 @@ async fn chat_rename_round_trips_and_validates() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -324,8 +322,7 @@ async fn chat_archive_round_trip() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -409,8 +406,7 @@ async fn chat_create_accepts_client_supplied_session_id() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -488,8 +484,7 @@ async fn chat_list_last_message_text_follows_latest_reply() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -529,8 +524,7 @@ async fn chat_list_last_message_text_skips_mid_turn_narration() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -588,8 +582,7 @@ async fn chat_list_last_message_text_strips_cancelled_marker() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -637,8 +630,7 @@ async fn chat_sync_difference_is_full_fidelity_with_coverage_watermark() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -707,8 +699,7 @@ async fn chat_sync_watermark_covers_invisible_tail() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -760,8 +751,7 @@ async fn chat_sync_baseline_and_rebase_replace_with_newest_page() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -816,8 +806,7 @@ async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -868,8 +857,7 @@ async fn chat_message_point_lookup_probes_durability() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -910,8 +898,7 @@ async fn chat_list_unread_count_reflects_read_cursor() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -996,8 +983,7 @@ async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &ChannelsConfig::default(),
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
     let state = build_admin_state(&tg);
@@ -1092,8 +1078,7 @@ async fn chat_list_returns_every_owner_session_for_a_device_caller() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1196,8 +1181,7 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1284,8 +1268,7 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1390,8 +1373,7 @@ async fn a_pre_snapshot_fire_whose_job_is_gone_has_no_group_label() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1443,8 +1425,7 @@ async fn marking_a_batch_read_clears_every_named_session() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1514,8 +1495,7 @@ async fn hiding_a_batch_removes_every_named_session_from_the_list() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1588,8 +1568,7 @@ async fn admin_device_header_creates_and_lists_device_sessions() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1729,8 +1708,7 @@ async fn approved_device_token_with_header_creates_device_session() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -1923,8 +1901,7 @@ async fn set_session_model_validates_persists_and_clears() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -2066,8 +2043,7 @@ async fn list_sessions_exposes_last_user_text_preview() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -2268,7 +2244,12 @@ fn owner_pool_channel_kind_is_subscribed() {
     let core = Arc::new(baybo_human_ask::AskCore::new(
         baybo_human_ask::test_support::MemoryHumanAskStore::new(),
     ));
-    boot::install_channels(&reg, &cfg, &core, &baybo_human_ask::AskQueues::new()).expect("install");
+    boot::install_channels(
+        &reg,
+        &cfg,
+        &baybo_human_ask::AskChannels::new(core, baybo_human_ask::AskQueues::new()),
+    )
+    .expect("install");
     let ch = reg
         .get(&baybo_model::ChannelType::owner())
         .expect("owner pool channel exists");
@@ -2389,8 +2370,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 
@@ -2515,8 +2495,7 @@ async fn a_cron_pin_reaches_across_the_owner_pool_but_not_outside_it() {
     boot::install_channels(
         &tg.deps.channel_registry,
         &http_config,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install channels");
 

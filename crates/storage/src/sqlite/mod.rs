@@ -895,6 +895,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     channel       TEXT NOT NULL,
                     -- The LLM tool_use id the ask blocks (not unique).
                     tool_call_id  TEXT NOT NULL,
+                    -- The turn that raised the ask.
+                    turn_id       TEXT NOT NULL,
                     -- AskKind::as_str(): 'approval' | 'question'.
                     kind          TEXT NOT NULL,
                     -- AskPhase::as_str(): 'before_execute' | 'during_execute'.

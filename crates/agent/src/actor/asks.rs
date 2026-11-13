@@ -2,7 +2,6 @@
 //! runs before its own append, and the Resume door an answered dead ask
 //! arrives through.
 
-use baybo_model::TurnId;
 use baybo_model::human_ask::AskId;
 use baybo_store::HumanAskRow;
 use baybo_turn::TurnInput;
@@ -21,9 +20,7 @@ impl AgentActor {
         let Some(head) = rows.into_iter().next() else {
             return Ok(());
         };
-        let Some(turn_input) = self.resume_input(&head).await? else {
-            return Ok(());
-        };
+        let turn_input = resume_input(&head);
         let (tokens, _release) = self.turn_tokens();
         let response_tx = self.volatile.response_tx.clone();
         self.volatile
@@ -51,46 +48,27 @@ impl AgentActor {
         if row.applied_at.is_some() || row.resolved_at.is_none() {
             return Ok(());
         }
-        let Some(turn_input) = self.resume_input(&row).await? else {
-            return Ok(());
-        };
         let response_tx = self.volatile.response_tx.clone();
         let response = self
-            .run_agent_loop(turn_input, None, Some(response_tx), None, None, None)
+            .run_agent_loop(
+                resume_input(&row),
+                None,
+                Some(response_tx),
+                None,
+                None,
+                None,
+            )
             .await?;
         self.send_user_reply(response).await;
         Ok(())
     }
+}
 
-    /// The Resume turn payload for `row`: the turn that raised it is the
-    /// session's newest turn created no later than the ask. `None` (logged)
-    /// when the session has no turns at all, which no raised ask can have.
-    async fn resume_input(&self, row: &HumanAskRow) -> anyhow::Result<Option<TurnInput>> {
-        let Some(resumed_turn_id) = self.raising_turn(row).await? else {
-            warn!(
-                session_id = %row.session_id,
-                ask_id = %row.ask_id,
-                "an unapplied ask with no turn on its session; leaving it"
-            );
-            return Ok(None);
-        };
-        Ok(Some(TurnInput::Resume {
-            resumed_turn_id,
-            ask_id: row.ask_id.clone(),
-            tool_use_id: row.tool_call_id.clone(),
-        }))
-    }
-
-    async fn raising_turn(&self, row: &HumanAskRow) -> anyhow::Result<Option<TurnId>> {
-        let turns = self
-            .volatile
-            .turn_lifecycle
-            .list_by_session(&row.session_id, None)
-            .await?;
-        Ok(turns
-            .iter()
-            .find(|turn| turn.created_at <= row.created_at)
-            .or_else(|| turns.first())
-            .map(|turn| turn.id))
+/// The Resume turn payload for `row`, naming the turn that raised it.
+fn resume_input(row: &HumanAskRow) -> TurnInput {
+    TurnInput::Resume {
+        resumed_turn_id: row.turn_id,
+        ask_id: row.ask_id.clone(),
+        tool_use_id: row.tool_call_id.clone(),
     }
 }

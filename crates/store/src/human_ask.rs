@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use baybo_model::human_ask::{AskId, AskKind, AskPhase, AskRequest, AskResolution};
-use baybo_model::{ChannelType, SessionId};
+use baybo_model::{ChannelType, SessionId, TurnId};
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -25,6 +25,9 @@ pub struct HumanAskRow {
     pub channel: ChannelType,
     /// LLM `tool_use_id` of the call the ask blocks. Not unique per row.
     pub tool_call_id: String,
+    /// The turn that raised the ask — with `tool_call_id`, which call of
+    /// which turn it blocks.
+    pub turn_id: TurnId,
     pub kind: AskKind,
     pub phase: AskPhase,
     pub request: AskRequest,

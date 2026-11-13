@@ -192,8 +192,7 @@ impl Drop for LegTeardown {
 pub(crate) fn resolve_or_install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: &ChannelType,
-    core: &Arc<baybo_human_ask::AskCore>,
-    queues: &baybo_human_ask::AskQueues,
+    asks: &baybo_human_ask::AskChannels,
 ) -> Result<Arc<Channel>, ChannelError> {
     if let Some(ch) = registry.get(channel_type) {
         return Ok(ch);
@@ -201,7 +200,7 @@ pub(crate) fn resolve_or_install_channel(
     // Miss: lazily install an out-of-tree sidecar channel (the `owner`/`tui`/
     // bot channels are all installed at boot, so this only fires for a custom
     // `baybo.json` channel on its first connection).
-    super::boot::install_channel(registry, channel_type.clone(), core, queues)?;
+    super::boot::install_channel(registry, channel_type.clone(), asks)?;
     registry.get(channel_type).ok_or_else(|| {
         ChannelError::Config(format!("channel '{channel_type}' missing after install"))
     })
@@ -718,8 +717,7 @@ mod tests {
         super::super::boot::install_channel(
             &registry,
             ChannelType::owner(),
-            &super::super::boot::test_ask_core(),
-            &baybo_human_ask::AskQueues::new(),
+            &super::super::boot::test_ask_channels(),
         )
         .expect("install");
         let before = registry.get(&ChannelType::owner()).expect("pre-installed");
@@ -727,8 +725,7 @@ mod tests {
         let resolved = resolve_or_install_channel(
             &registry,
             &ChannelType::owner(),
-            &super::super::boot::test_ask_core(),
-            &baybo_human_ask::AskQueues::new(),
+            &super::super::boot::test_ask_channels(),
         )
         .expect("resolve");
         assert!(
@@ -747,13 +744,9 @@ mod tests {
         let ct = ChannelType::from("custom-out-of-tree");
         assert!(registry.get(&ct).is_none(), "fixture must start empty");
 
-        let resolved = resolve_or_install_channel(
-            &registry,
-            &ct,
-            &super::super::boot::test_ask_core(),
-            &baybo_human_ask::AskQueues::new(),
-        )
-        .expect("lazy install");
+        let resolved =
+            resolve_or_install_channel(&registry, &ct, &super::super::boot::test_ask_channels())
+                .expect("lazy install");
         assert_eq!(resolved.channel_type().as_str(), "custom-out-of-tree");
         assert!(
             registry.get(&ct).is_some(),
@@ -798,8 +791,7 @@ mod tests {
         super::super::boot::install_channel(
             &registry,
             ChannelType::owner(),
-            &super::super::boot::test_ask_core(),
-            &baybo_human_ask::AskQueues::new(),
+            &super::super::boot::test_ask_channels(),
         )
         .expect("install");
         let channel = registry.get(&ChannelType::owner()).expect("channel");
@@ -1088,9 +1080,12 @@ mod tests {
     async fn a_lazy_channels_approval_resolves_through_the_manager() {
         let asks = asks();
         let registry = Arc::new(ChannelRegistry::new());
-        let channel =
-            resolve_or_install_channel(&registry, &lazy_channel(), &asks.core, &asks.queues)
-                .expect("lazy install");
+        let channel = resolve_or_install_channel(
+            &registry,
+            &lazy_channel(),
+            &baybo_human_ask::AskChannels::new(Arc::clone(&asks.core), asks.queues.clone()),
+        )
+        .expect("lazy install");
         let gate = channel.approval_gate().expect("gate");
         let req = approval_on_lazy_channel("lazy-live");
         let session = req.session_id.clone();
@@ -1099,6 +1094,7 @@ mod tests {
                 req,
                 baybo_tools::AskSite {
                     channel: lazy_channel(),
+                    turn_id: baybo_model::TurnId::default(),
                     phase: baybo_model::human_ask::AskPhase::BeforeExecute,
                 },
                 baybo_tools::AskCancel::never(),
@@ -1140,6 +1136,7 @@ mod tests {
             session_id: session.clone(),
             channel: lazy_channel(),
             tool_call_id: req.tool_call_id.clone(),
+            turn_id: baybo_model::TurnId::default(),
             kind: baybo_model::human_ask::AskKind::Approval,
             phase: baybo_model::human_ask::AskPhase::BeforeExecute,
             request: baybo_model::human_ask::AskRequest::Approval(req),
@@ -1156,9 +1153,12 @@ mod tests {
         assert_eq!(report.requeued, 1);
 
         let registry = Arc::new(ChannelRegistry::new());
-        let channel =
-            resolve_or_install_channel(&registry, &lazy_channel(), &asks.core, &asks.queues)
-                .expect("lazy install");
+        let channel = resolve_or_install_channel(
+            &registry,
+            &lazy_channel(),
+            &baybo_human_ask::AskChannels::new(Arc::clone(&asks.core), asks.queues.clone()),
+        )
+        .expect("lazy install");
         let cards = channel.pending_approvals(&session);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].ask_id, "lazy-dead");

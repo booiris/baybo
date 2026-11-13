@@ -118,8 +118,10 @@ async fn boot(
     boot::install_channels(
         &registry,
         &ChannelsConfig::default(),
-        &harness.ask_core,
-        &harness.ask_queues,
+        &baybo_human_ask::AskChannels::new(
+            Arc::clone(&harness.ask_core),
+            harness.ask_queues.clone(),
+        ),
     )
     .expect("install channels");
     let owner = registry.get(&ChannelType::owner()).expect("owner channel");

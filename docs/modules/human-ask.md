@@ -49,10 +49,10 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-store` (`store::human_ask`) | `HumanAskRow` + the `HumanAskStore` port. No delete method. |
 | `baybo-storage` (`sqlite/human_ask.rs`) | `SqliteHumanAskStore` over the `human_asks` table. DDL in `sqlite/mod.rs` like every other table. |
 | `baybo-tools` (`tools::approval`, new `tools::ask`) | The **tool-facing ports** only: `ApprovalGate`, `ApprovalGateMap`, `AutoDenyGate`, `ApprovalHandle`, `ApprovalOutcome`, `refusal_reason`; new `QuestionGate`, `QuestionHandle`, `AskCancel`, `ParkGauge`, `ToolContext.question`, `Tool::sole_call()`. Never depends on `baybo-human-ask`. |
-| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
+| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`, `RouterInbound::ResumeAsk`. |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
-| `baybo-gateway`, `baybo-agent`, `baybo-project`, `baybo-tui` | Consumers that receive `Arc<AskCore>` / `Arc<HumanAskManager>` / `AskQueues`, never the store. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. `tui`: compile-only arms + TODO. |
+| `baybo-gateway`, `baybo-agent`, `baybo-project`, `baybo-tui` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. `tui`: compile-only arms + TODO. |
 
 Dependency edges, all acyclic: `human-ask → model, store, tools`;
 `channels → tools, human-ask`; `project → human-ask`;
@@ -499,8 +499,8 @@ order the code can actually have:
    the store and the queue, never on the manager. The same three functions
    serve the **lazy** install of an out-of-tree `baybo.json` channel on its
    first WS connection (`resolve_or_install_channel`, `adapter.rs:193-206`,
-   from `route.rs:93`), so `GatewayDeps` and `WsChannelState` carry
-   `Arc<AskCore>` + `AskQueues` for it. A queue created by the reload for a
+   from `route.rs:93`), so `GatewayDeps` and `WsChannelState` carry an
+   `AskChannels` for it (`for_channel` → the channel's queue and gate). A queue created by the reload for a
    channel whose sidecar has not reconnected yet is simply the queue the
    later install attaches its gate and watchers to; the watcher install
    re-announces the entries already on it, since a multiplexed channel has no
@@ -1208,9 +1208,8 @@ Where the code differs from the sketch above, and why:
   `StepKind::LlmIteration` step that carries the tool span but no `LlmCall`
   span — no new step kind, so no trace-viewer mirror changes. A settle-only
   Resume turn completes with `TurnOutput::Structured { "settled_asks": n }`
-  (no reply ordinal, so no push). `resumed_turn_id` is derived as the
-  session's newest turn created no later than the ask (the row carries no
-  turn id); a session with no turns at all is logged and skipped. A
+  (no reply ordinal, so no push). `resumed_turn_id` is the row's own
+  `turn_id`, recorded when the ask was raised (`AskSite.turn_id`). A
   settlement error fails the door (the door's own append does not happen);
   the background-notification door logs and retries on its timer. The
   `AskUser` result envelope for `Answered` / `Declined` / an abandoned

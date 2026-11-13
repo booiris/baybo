@@ -122,6 +122,7 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
         session_id: session.id.clone(),
         channel: session.channel.clone(),
         tool_call_id: CALL_ID.to_string(),
+        turn_id: baybo_model::TurnId::new(),
         kind,
         phase: AskPhase::BeforeExecute,
         request,

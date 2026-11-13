@@ -1596,8 +1596,7 @@ fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
     baybo_gateway::channel::boot::install_channels(
         &tg.deps.channel_registry,
         &tg.deps.config.channels,
-        &tg.deps.ask_core,
-        &tg.deps.ask_queues,
+        &tg.deps.ask_channels,
     )
     .expect("install the owner channel");
 }
@@ -1704,8 +1703,8 @@ async fn answering_a_prompt_does_not_depend_on_its_timeline_entry() {
     let unobserved: std::sync::Arc<dyn baybo_tools::ApprovalGate> =
         std::sync::Arc::new(baybo_human_ask::ChannelAskGate::new(
             tg.deps
-                .ask_queues
-                .get_or_create(&baybo_model::ChannelType::owner()),
+                .ask_channels
+                .queue(&baybo_model::ChannelType::owner()),
             std::sync::Arc::new(baybo_human_ask::AskCore::new(
                 tg.deps.stores.human_ask.clone(),
             )),

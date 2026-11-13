@@ -264,6 +264,7 @@ mod tests {
                 },
                 AskSite {
                     channel: ChannelType::tui(),
+                    turn_id: baybo_model::TurnId::default(),
                     phase: AskPhase::BeforeExecute,
                 },
                 AskCancel::never(),
