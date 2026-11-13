@@ -68,19 +68,27 @@ impl ApprovalOutcome {
             resolution: ApprovalResolution::Abandoned,
         }
     }
+
+    /// Nobody answered before the prompt's deadline. Fail-closed.
+    pub fn timed_out() -> Self {
+        Self {
+            decision: ApprovalDecision::Deny,
+            resolution: ApprovalResolution::TimedOut,
+        }
+    }
 }
 
 const REFUSAL_ANSWERED: &str = r#"a human saw this prompt and said no"#;
 const REFUSAL_ABANDONED: &str = r#"this prompt was withdrawn before anyone decided it — the turn was stopped, or the user moved on without answering"#;
+const REFUSAL_TIMED_OUT: &str = r#"nobody answered this prompt before it expired, so it was denied — ask again if the action is still needed"#;
 const REFUSAL_POLICY: &str = r#"a standing policy denied this without asking anyone, because this session has no approval surface — every prompt here will be denied the same way"#;
 
 /// Explain the denial source without trailing punctuation.
 pub fn refusal_reason(resolution: ApprovalResolution) -> &'static str {
     match resolution {
         ApprovalResolution::Answered => REFUSAL_ANSWERED,
-        // `TimedOut` is historical: gates no longer expire, but old span
-        // events still carry it.
-        ApprovalResolution::Abandoned | ApprovalResolution::TimedOut => REFUSAL_ABANDONED,
+        ApprovalResolution::Abandoned => REFUSAL_ABANDONED,
+        ApprovalResolution::TimedOut => REFUSAL_TIMED_OUT,
         ApprovalResolution::Policy => REFUSAL_POLICY,
     }
 }
@@ -91,8 +99,8 @@ pub fn refusal_reason(resolution: ApprovalResolution) -> &'static str {
 /// independently.
 ///
 /// `site` says which channel's queue and which phase of the tool call the
-/// prompt belongs to; `cancel` is what a parked prompt races. A gate never
-/// times out on its own.
+/// prompt belongs to; `cancel` is what a parked prompt races. Only a
+/// non-resumable prompt (a during-execute approval) has a deadline of its own.
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
     async fn request(
@@ -271,6 +279,7 @@ mod tests {
             ApprovalResolution::Answered,
             ApprovalResolution::Abandoned,
             ApprovalResolution::Policy,
+            ApprovalResolution::TimedOut,
         ];
         let worded: Vec<&str> = all.into_iter().map(refusal_reason).collect();
         for (i, a) in worded.iter().enumerate() {
@@ -279,11 +288,6 @@ mod tests {
             }
             assert!(!a.ends_with('.'), "callers punctuate: {a}");
         }
-        assert_eq!(
-            refusal_reason(ApprovalResolution::TimedOut),
-            refusal_reason(ApprovalResolution::Abandoned),
-            "historical expiries read as torn down, never as a human refusal"
-        );
     }
 
     #[test]

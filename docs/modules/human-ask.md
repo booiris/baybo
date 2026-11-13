@@ -1,15 +1,11 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **PR 1 in part; PR 2/3 pending** — PR 1 lands in three steps.
-> The refactor (1a) and durable approvals on the live path with no timeout
-> (1b: `baybo-human-ask` queue, core, gates and the manager's live verbs, the
-> ledger, the `tools::ask` ports, the agent's live path, the gateway doors,
-> frames, the project bridge) exist. Restart survival (1c: everything under
-> [Restart survival](#restart-survival) — reload, the turn prelude, the Resume
-> turn, the hydration skip) does not; until it lands a restart closes every
-> pending ask (see the 1b interim note there). The
-> [Implementation notes](#implementation-notes-pr-1) describe the full PR 1.
-> `AskUser` + web (PR 2) and iOS (PR 3) are not started. This document is the spec the three
+> Status: **PR 1 implemented; PR 2/3 pending** — `baybo-human-ask` (queue,
+> core, gates, manager), the ledger, the `tools::ask` ports, the agent
+> live/restart paths, the gateway doors, frames and boot order, the project
+> bridge and the integration suites exist; see
+> [Implementation notes](#implementation-notes-pr-1). `AskUser` + web (PR 2)
+> and iOS (PR 3) are not started. This document is the spec the three
 > PRs described in [PR plan](#pr-plan) are built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
 > items will not.
@@ -53,7 +49,7 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-store` (`store::human_ask`) | `HumanAskRow` + the `HumanAskStore` port. No delete method. |
 | `baybo-storage` (`sqlite/human_ask.rs`) | `SqliteHumanAskStore` over the `human_asks` table. DDL in `sqlite/mod.rs` like every other table. |
 | `baybo-tools` (`tools::approval`, new `tools::ask`) | The **tool-facing ports** only: `ApprovalGate`, `ApprovalGateMap`, `AutoDenyGate`, `ApprovalHandle`, `ApprovalOutcome`, `refusal_reason`; new `QuestionGate`, `QuestionHandle`, `AskCancel`, `ParkGauge`, `ToolContext.question`, `Tool::sole_call()`. Never depends on `baybo-human-ask`. |
-| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
+| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`, `RouterInbound::ResumeAsk`. |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
 | `baybo-gateway`, `baybo-agent`, `baybo-project`, `baybo-tui` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. `tui`: compile-only arms + TODO. |
@@ -276,11 +272,16 @@ call failed. The one deny that is *not* ledgered is `ApprovalGateMap`'s
 or a sidecar type that has not connected since boot; that is a
 misconfiguration guard, not a policy.
 
-**No timeout in attended turns.** `APPROVAL_TIMEOUT` (`boot.rs:33`),
-`ChannelApprovalGate.timeout`, `ApprovalOutcome::timed_out`,
-`REFUSAL_TIMED_OUT` and `APPROVAL_HEADROOM` (`tool_executor.rs:121`) are
-deleted. `ApprovalResolution::TimedOut` stays as a serde variant so old span
-events still decode, documented as historical.
+**No timeout in attended turns — except a during-execute approval.**
+`APPROVAL_TIMEOUT` (`boot.rs:33`), `ChannelApprovalGate.timeout` and
+`APPROVAL_HEADROOM` (`tool_executor.rs:121`) are deleted: a resumable ask
+waits until it is answered, and a dead one is answered through the Resume
+door. A during-execute approval cannot outlive its tool future, so it
+alone keeps a deadline, `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min): the gate
+claims `AskResolution::TimedOut`, closes the card, and the tool returns a
+`ApprovalResolution::TimedOut` denial (`REFUSAL_TIMED_OUT`) and carries on —
+nothing is replayed. See
+[`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 `baybo prompt` (`prompt_cmd.rs:258-264`) keeps working through the session
 tier of `ApprovalGateMap` (`AutoApprove`/`AutoDeny` per session); the tier
@@ -474,19 +475,6 @@ to close. Asks are meant to still be open after the process comes back.
 
 ### Restart survival
 
-> **Interim (PR 1b only — replaced by this section in 1c).** 1b ships none of
-> what follows: no reload, no Resume turn, no turn prelude, no hydration
-> skip. Instead `gateway_cmd`, right after `build_managers` and before any
-> channel starts, calls `HumanAskManager::close_stale_asks` once: every
-> unapplied row a previous process left is claimed `Abandoned` if still
-> pending (observers, so the card timeline, hear it) and stamped applied, so
-> 1c's settlement never picks up a 1b-era row. The dangling `tool_use` then
-> gets hydration's interrupted fill — the user-visible result of a restart
-> before durable asks. Within one process a dropped waiter takes its ask off
-> the queue (`AskQueue::orphan` removes every kind), and `resolve` of a
-> pending ask no tool future waits on returns `NotLive` and leaves the row
-> alone. `baybo prompt` does not call it; the gateway's next boot does.
-
 Boot order in `runtime.rs::build_managers`, new steps in **bold**, in the
 order the code can actually have:
 
@@ -541,6 +529,17 @@ order the code can actually have:
    manager as the `LivePendingAsks` probe. `Arc<HumanAskManager>` rides
    `ManagerGraph` → `GatewayDeps` → `AdminState` / `WsChannelState` like
    `project_manager`, for the resolve doors.
+
+**Tool-use ids are made unique on append.** The ledger, the hydration skip
+and the settlement all find a call by its `tool_use` id, and providers do not
+promise those unique within a session. Hydration's repair renames a repeat
+with a suffix, but only in the window it loads — so a parked call that reused
+an earlier id would be renamed after a restart while its ask row kept the
+original, and the answer would find the earlier, already-answered call. The
+agent loop therefore renames a repeat before the assistant row is appended
+or dispatched (`ContextManager::unique_call_ids`, the same suffix rule the
+repair uses), and every row it writes stays a fixpoint of that repair. Each
+ask row also records the raising `turn_id`.
 
 `PendingToolCalls` is a narrow port defined in `baybo-context`:
 `#[async_trait] trait PendingToolCalls { async fn unapplied_tool_use_ids(&self, session: &SessionId) -> Vec<String>; }`,
@@ -989,11 +988,28 @@ fires for either kind.
 ### Idle reaper
 
 `AgentSupervisor::new` takes `Arc<dyn LivePendingAsks>`
-(`fn has_live_pending_ask(&self, &SessionId) -> bool`, over the in-memory
-queue). `reap_idle` skips such sessions beside the in-flight-subagent skip
-(`supervisor.rs:414-426`), keeping the actor warm so an answer hours later
-takes the live path. Correctness never depends on it: a reaped-then-answered
-session is just a dead ask, which the Resume door and the prelude handle.
+(`fn parked_on(&self, &SessionId) -> ParkedOn`, over the in-memory queues):
+`Nothing`, `Resumable` (every live ask is a question or a before-execute
+approval) or `NotResumable` (at least one during-execute approval).
+
+`ActorStop` is served between turns, so a turn parked on an ask would hold
+its actor — transcript, tool future and all — for as long as nobody answers.
+Each turn therefore runs under a **release token**: a child of the actor's
+token that is the turn's `TurnTokens.actor`, registered with the supervisor
+while the turn runs (`AgentSupervisor::track_turn`). For an idle session
+parked on `Resumable` asks, `reap_idle` queues `ActorStop` and then calls
+`release_parked_turn`, which cancels that token. The turn reads the cancel
+as `Ancestor`, exactly as at shutdown: nothing is appended, each ask's entry
+stays in the queue with no waiter, its row stays pending. The actor exits
+after the turn; an answer later goes through the Resume door, which spawns a
+fresh actor. The release token is per turn, so a message queued ahead of the
+lowest-priority `ActorStop` still runs normally.
+
+A `NotResumable` session is skipped: ending its turn would abandon the
+during-execute approval. It is bounded by that approval's own deadline
+(`DURING_EXECUTE_APPROVAL_TIMEOUT`): the turn carries on with a timed-out
+denial, and the next idle tick reaps it — see
+[`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 ### Observability
 
@@ -1102,7 +1118,7 @@ pub struct ChannelAskGate { queue: AskQueue, core: Arc<AskCore> }   // impl Appr
 pub struct PolicyDenyGate { core: Arc<AskCore> }                    // impl ApprovalGate
 pub struct HumanAskManager;                     // from_config(HumanAskManagerConfig { core, queues: AskQueues, resume_sink: Arc<dyn ResumeSink> })
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
-                                                //        unapplied_tool_use_ids, has_live_pending_ask (LivePendingAsks impl)
+                                                //        unapplied_tool_use_ids, parked_on (LivePendingAsks impl)
 pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, kind, resolution } }
 pub enum ReloadScope { ResumeAnswered, LeaveAnswered }   // reload_pending: gateway vs one-shot `baybo prompt`
 pub struct ReloadReport { requeued, resumed, abandoned, applied }
@@ -1110,7 +1126,7 @@ pub struct ReloadReport { requeued, resumed, abandoned, applied }
     async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
     fn request_resume(&self, req: ResumeRequest);
 }
-pub trait LivePendingAsks { fn has_live_pending_ask(&self, session: &SessionId) -> bool; }
+pub trait LivePendingAsks { fn parked_on(&self, session: &SessionId) -> ParkedOn; }  // Nothing | Resumable | NotResumable
 #[async_trait] pub trait AskObserver { async fn on_event(&self, ask: &HumanAskRow, event: AskEvent); }
 pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>;
 pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<dyn Tool>, ToolManifest)>; }
@@ -1196,17 +1212,15 @@ Where the code differs from the sketch above, and why:
 - **iOS.** The app's issue bridge (`IssueWire.swift`) also sends
   `awaiting_human` (from the REST twin) so the iOS web transcript's
   `IssueDetail` type stays pinned both ways to `IssueDto`.
-- **The settlement.** `TurnAsks` grew `unapplied`, `settle_unapplied`,
-  `mark_applied` and `get` (the manager gained the public
-  `unapplied_for_session` to answer the first). The approval re-execution
+- **The settlement.** The loop calls the manager's `unapplied_for_session`,
+  `settle_unapplied`, `mark_applied` and `get`. The approval re-execution
   passes `PreExecuteGate::PreDecided(decision)` to `ToolExecutor::execute`
   (`PreExecuteGate::Ask` everywhere else) and runs under a fresh
   `StepKind::LlmIteration` step that carries the tool span but no `LlmCall`
   span — no new step kind, so no trace-viewer mirror changes. A settle-only
   Resume turn completes with `TurnOutput::Structured { "settled_asks": n }`
-  (no reply ordinal, so no push). `resumed_turn_id` is derived as the
-  session's newest turn created no later than the ask (the row carries no
-  turn id); a session with no turns at all is logged and skipped. A
+  (no reply ordinal, so no push). `resumed_turn_id` is the row's own
+  `turn_id`, recorded when the ask was raised (`AskSite.turn_id`). A
   settlement error fails the door (the door's own append does not happen);
   the background-notification door logs and retries on its timer. The
   `AskUser` result envelope for `Answered` / `Declined` / an abandoned
@@ -1219,12 +1233,11 @@ Where the code differs from the sketch above, and why:
   delivered into its origin conversation, or a fire's own outcome row) also
   runs the prelude: it appends an assistant row, which after a dangling
   `tool_use` wedges the transcript just as a user row does.
-- **The loop's port.** The agent loop does not hold `Arc<HumanAskManager>`:
-  `AgentLoopConfig.asks` is `Arc<dyn baybo_agent::runtime::asks::TurnAsks>`,
-  a narrow port implemented for `HumanAskManager` in `baybo-agent`. It carries
-  `abandon_for_tool_call` and the settlement verbs listed above. The port's
-  `abandon_for_tool_call` returns nothing: the loop appends after it
-  whatever it found, and a store error is only logged
+- **The loop holds the manager.** `AgentLoopConfig.asks` is
+  `Arc<HumanAskManager>` — the manager already is the domain's verb surface,
+  and a port over it had one implementation and no fake. On a cancelled call
+  the loop appends after `abandon_for_tool_call` whatever it found, and a
+  store error is only logged
   (the result is appended, so the session's next LLM call is not wedged by a
   dangling `tool_use`). The cancelled-batch path decides per call from
   `ExecutedTool.abandoned` (the call's last ask resolved `Abandoned`, read

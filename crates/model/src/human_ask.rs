@@ -10,6 +10,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::SessionId;
 use crate::approval::{ApprovalDecision, ApprovalRequest};
 
 /// Name of the tool that raises question asks.
@@ -151,6 +152,14 @@ impl AskPhase {
     }
 }
 
+/// Whether an ask's answer can still be applied after the tool future that
+/// raised it is gone. A question has no state besides the wait; a
+/// before-execute approval can re-dispatch the persisted `tool_use`. A
+/// during-execute approval cannot: the command's partial state died with it.
+pub fn resumable(kind: AskKind, phase: AskPhase) -> bool {
+    kind == AskKind::Question || phase == AskPhase::BeforeExecute
+}
+
 /// The payload of one ask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -216,11 +225,30 @@ pub enum AskResolution {
     Abandoned,
     /// An unattended turn hit the gate; a standing rule denied it.
     PolicyDenied,
+    /// A during-execute approval nobody answered within its deadline. Only
+    /// a non-resumable ask can time out.
+    TimedOut,
+}
+
+/// "Open a turn that applies this resolved ask" — sent when a human answers
+/// an ask whose tool future no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeRequest {
+    pub session_id: SessionId,
+    pub ask_id: AskId,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumable_is_question_or_before_execute() {
+        assert!(resumable(AskKind::Question, AskPhase::DuringExecute));
+        assert!(resumable(AskKind::Question, AskPhase::BeforeExecute));
+        assert!(resumable(AskKind::Approval, AskPhase::BeforeExecute));
+        assert!(!resumable(AskKind::Approval, AskPhase::DuringExecute));
+    }
 
     #[test]
     fn storage_strings_round_trip_and_match_serde() {

@@ -9,7 +9,8 @@
 //!   asserted against the payload: a maintenance turn runs inside a
 //!   `User`-trigger session and records `origin = User` honestly.
 
-use baybo_model::ContentBlock;
+use baybo_model::human_ask::AskId;
+use baybo_model::{ContentBlock, TurnId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -27,6 +28,9 @@ pub enum TurnInputKind {
     SubagentNotification,
     /// One execution of a board issue by its assignee.
     IssueRun,
+    /// Continuation of a turn whose ask was answered after the asking actor
+    /// was gone.
+    Resume,
 }
 
 impl TurnInputKind {
@@ -41,7 +45,11 @@ impl TurnInputKind {
     /// A human can see and answer asks raised by this turn.
     pub fn is_attended(self) -> bool {
         match self {
-            Self::UserChat | Self::SubagentNotification | Self::Compact | Self::IssueRun => true,
+            Self::UserChat
+            | Self::SubagentNotification
+            | Self::Compact
+            | Self::Resume
+            | Self::IssueRun => true,
             Self::Cron | Self::CronNotification | Self::Spawned => false,
         }
     }
@@ -49,7 +57,7 @@ impl TurnInputKind {
     /// The user is directly in this conversation, so a failure surfaces to
     /// them as a notice.
     pub fn is_user_facing(self) -> bool {
-        matches!(self, Self::UserChat)
+        matches!(self, Self::UserChat | Self::Resume)
     }
 }
 
@@ -97,6 +105,14 @@ pub enum TurnInput {
         run_id: baybo_model::IssueRunId,
         brief: Vec<ContentBlock>,
     },
+    /// Continuation of `resumed_turn_id` after its ask `ask_id` (raised by
+    /// tool call `tool_use_id`) was answered with no live actor to receive
+    /// it.
+    Resume {
+        resumed_turn_id: TurnId,
+        ask_id: AskId,
+        tool_use_id: String,
+    },
 }
 
 impl TurnInput {
@@ -109,6 +125,7 @@ impl TurnInput {
             TurnInput::Spawned { .. } => TurnInputKind::Spawned,
             TurnInput::SubagentNotification { .. } => TurnInputKind::SubagentNotification,
             TurnInput::IssueRun { .. } => TurnInputKind::IssueRun,
+            TurnInput::Resume { .. } => TurnInputKind::Resume,
         }
     }
 }
@@ -161,6 +178,16 @@ mod tests {
 
         let i = TurnInput::SubagentNotification { content: vec![] };
         assert_eq!(i.input_kind(), TurnInputKind::SubagentNotification);
+
+        assert_eq!(resume_input().input_kind(), TurnInputKind::Resume);
+    }
+
+    fn resume_input() -> TurnInput {
+        TurnInput::Resume {
+            resumed_turn_id: TurnId::new(),
+            ask_id: AskId::new(),
+            tool_use_id: "toolu_1".into(),
+        }
     }
 
     #[test]
@@ -168,6 +195,7 @@ mod tests {
         use TurnInputKind::*;
         for (kind, attended, user_facing, chat) in [
             (UserChat, true, true, true),
+            (Resume, true, true, true),
             (SubagentNotification, true, false, true),
             (Compact, true, false, false),
             (IssueRun, true, false, true),
@@ -193,6 +221,7 @@ mod tests {
                 initial_prompt: vec![ContentBlock::Text("task".into())],
             },
             TurnInput::SubagentNotification { content: vec![] },
+            resume_input(),
         ] {
             let s = serde_json::to_string(&input).unwrap();
             let back: TurnInput = serde_json::from_str(&s).unwrap();

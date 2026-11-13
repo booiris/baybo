@@ -1050,6 +1050,7 @@ mod tests {
     }
 
     struct Asks {
+        store: Arc<baybo_human_ask::test_support::MemoryHumanAskStore>,
         core: Arc<baybo_human_ask::AskCore>,
         queues: baybo_human_ask::AskQueues,
         manager: baybo_human_ask::HumanAskManager,
@@ -1063,8 +1064,10 @@ mod tests {
             baybo_human_ask::HumanAskManager::from_config(baybo_human_ask::HumanAskManagerConfig {
                 core: Arc::clone(&core),
                 queues: queues.clone(),
+                resume_sink: Arc::new(baybo_human_ask::test_support::NoResume),
             });
         Asks {
+            store,
             core,
             queues,
             manager,
@@ -1117,5 +1120,65 @@ mod tests {
             baybo_tools::ApprovalOutcome::answered(baybo_tools::ApprovalDecision::Approve)
         );
         assert!(channel.pending_approvals(&session).is_empty());
+    }
+
+    /// After a restart the sidecar has not reconnected yet: the reload puts
+    /// its pending ask on a queue no channel holds, and the first connection's
+    /// lazy install attaches to that very queue.
+    #[tokio::test]
+    async fn a_reloaded_ask_waits_for_the_lazy_install() {
+        let asks = asks();
+        let req = approval_on_lazy_channel("lazy-dead");
+        let session = req.session_id.clone();
+        let ask_id: baybo_model::human_ask::AskId = "lazy-dead".parse().expect("ask id");
+        asks.store.insert(baybo_store::HumanAskRow {
+            ask_id: ask_id.clone(),
+            session_id: session.clone(),
+            channel: lazy_channel(),
+            tool_call_id: req.tool_call_id.clone(),
+            turn_id: baybo_model::TurnId::default(),
+            kind: baybo_model::human_ask::AskKind::Approval,
+            phase: baybo_model::human_ask::AskPhase::BeforeExecute,
+            request: baybo_model::human_ask::AskRequest::Approval(req),
+            created_at: chrono::Utc::now(),
+            resolved_at: None,
+            resolution: None,
+            applied_at: None,
+        });
+        let report = asks
+            .manager
+            .reload_pending(baybo_human_ask::ReloadScope::ResumeAnswered)
+            .await
+            .expect("reload");
+        assert_eq!(report.requeued, 1);
+
+        let registry = Arc::new(ChannelRegistry::new());
+        let channel = resolve_or_install_channel(
+            &registry,
+            &lazy_channel(),
+            &baybo_human_ask::AskChannels::new(Arc::clone(&asks.core), asks.queues.clone()),
+        )
+        .expect("lazy install");
+        let cards = channel.pending_approvals(&session);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].ask_id, "lazy-dead");
+
+        asks.manager
+            .resolve(
+                &ask_id,
+                baybo_model::human_ask::AskResolution::Approval(
+                    baybo_tools::ApprovalDecision::Deny,
+                ),
+            )
+            .await
+            .expect("resolve");
+        assert!(channel.pending_approvals(&session).is_empty());
+        let row = asks.store.row(&ask_id).expect("row kept");
+        assert_eq!(
+            row.resolution,
+            Some(baybo_model::human_ask::AskResolution::Approval(
+                baybo_tools::ApprovalDecision::Deny
+            ))
+        );
     }
 }

@@ -2,6 +2,7 @@ pub mod breakdown;
 pub mod budget;
 pub mod compressor;
 pub mod error;
+pub mod pending_tool_calls;
 pub mod prompts;
 pub mod tokenizer;
 mod transcript_repair;
@@ -10,6 +11,9 @@ pub use breakdown::{ContextBreakdown, ContextPart, ContextSegment, context_break
 pub use budget::TokenBudget;
 pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
+#[cfg(any(test, feature = "test-support"))]
+pub use pending_tool_calls::NoPendingToolCalls;
+pub use pending_tool_calls::PendingToolCalls;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
 pub use prompts::deferred_tools::DeferredServerNotice;
 pub use tokenizer::{HeuristicTokenizer, Tokenizer};
@@ -67,7 +71,7 @@ pub(crate) fn recent_slice_bounds(max_tokens: usize) -> (usize, usize, usize) {
 
 pub type Result<T> = std::result::Result<T, ContextError>;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -401,6 +405,8 @@ pub struct ContextManager {
     /// pre-filtered rows and reused verbatim by [`Self::ensure_seeded`] and
     /// the post-compaction trailer — byte-stable for the session's life.
     deferred_tool_notice: Option<String>,
+    /// See [`ContextManagerConfig::pending_tool_calls`].
+    pending_tool_calls: Arc<dyn PendingToolCalls>,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -456,6 +462,9 @@ pub struct ContextManagerConfig {
     /// reused verbatim by the seed and the post-compaction trailer —
     /// byte-stable for the session's whole life.
     pub deferred_tool_servers: Vec<crate::prompts::deferred_tools::DeferredServerNotice>,
+    /// Which dangling `tool_use` ids hydration must leave unfilled because a
+    /// human ask will settle them.
+    pub pending_tool_calls: Arc<dyn PendingToolCalls>,
 }
 
 fn explicit_message_ordinals(
@@ -514,6 +523,7 @@ impl ContextManager {
             notification_cue: None,
             system_prompt_version: None,
             skills_version: None,
+            pending_tool_calls: config.pending_tool_calls,
             deferred_tool_notice: (!config.deferred_tool_servers.is_empty()).then(|| {
                 crate::prompts::deferred_tools::render_deferred_tool_reminder(
                     &config.deferred_tool_servers,
@@ -558,6 +568,15 @@ impl ContextManager {
     /// Read-only access to the owned transcript.
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    /// The ids a new assistant row's tool calls should carry: `ids` made
+    /// unique against every `ToolUse` already in the window and each other,
+    /// by the rule load-time repair applies to repeats. Call before the row
+    /// is appended and dispatched, so the transcript, the executor and the
+    /// ask ledger all see the same id.
+    pub fn unique_call_ids<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        transcript_repair::unique_call_ids(self.messages(), ids)
     }
 
     fn needs_framing(&self) -> bool {
@@ -1968,13 +1987,19 @@ impl ContextManager {
                 let messages: Vec<ChatMessage> = rows.into_iter().map(|row| row.message).collect();
                 let original = messages.clone();
                 let mut durable = original.clone();
+                let parked: HashSet<String> = self
+                    .pending_tool_calls
+                    .unapplied_tool_use_ids(&session_id)
+                    .await
+                    .into_iter()
+                    .collect();
                 let transcript_repair::ToolPairingRepair {
                     messages: repaired,
                     fills,
                     orphan_result_ids,
                     duplicate_result_ids,
                     renamed_call_ids,
-                } = transcript_repair::repair_tool_pairing(messages);
+                } = transcript_repair::repair_tool_pairing(messages, &parked);
                 if !renamed_call_ids.is_empty() {
                     let renamed_call_id_sample: Vec<&str> = renamed_call_ids
                         .iter()
@@ -3107,6 +3132,7 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -3881,6 +3907,7 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -3957,6 +3984,7 @@ mod tests {
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -4012,6 +4040,7 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         })
     }
 
@@ -4184,6 +4213,7 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         })
         .resolve_system_prompt()
         .await;
@@ -4275,6 +4305,7 @@ mod tests {
                 name: "tencent-lighthouse".into(),
                 description: Some("Lighthouse VM management".into()),
             }],
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.ensure_seeded().await.unwrap();
 
@@ -4844,6 +4875,7 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -4926,6 +4958,7 @@ mod tests {
             sessions: Arc::clone(&sessions),
             subagent_profile: None,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -5930,6 +5963,7 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
+            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx

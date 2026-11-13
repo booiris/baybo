@@ -105,6 +105,8 @@ writable inside the `$HOME` bind. On top of that: the caller's own
 
 ### LLM-response defensive scrubbing
 
+Before the assistant row with tool calls is appended, `run_inner` renames any `tool_use` id an earlier call in the window already carries (`ContextManager::unique_call_ids`, the same suffix rule load-time repair applies), so the transcript, the executor, clients and the ask ledger all see one id per call.
+
 `AgentLoop` holds an `Arc<SecurityGateway>`. In `call_llm`, every `LlmResponse` — including `content`, `content_blocks` text, `thinking`, and `tool_calls[*].arguments` — is run through `SecurityGateway::sanitize_llm_response` *before* the response is recorded to the trace or appended to `session.messages`. This prevents LLM-fabricated secret-shaped strings from leaking into any downstream sink.
 
 ### Tool-result formatting into LLM context
@@ -128,7 +130,7 @@ See [trace.md](trace.md#toolcall-output-storage).
 1. Pick the gate once per call. The loop computes `attended = turn_kind.is_attended()` once per turn in `run_inner` (beside `background_eligible`) and hands it to `ToolExecutor::execute`; tools never see it. Attended → `gate_map.get(user.channel, session)`. Unattended (`Cron`, `CronNotification`, `Spawned`) → the executor's required `policy_deny: Arc<dyn ApprovalGate>`, a `baybo_human_ask::PolicyDenyGate` built once in `build_managers`. The same gate serves the pre-execute check and the call's `ApprovalHandle`, so a mid-execution ask in an unattended turn is denied the same way.
 2. Compute `ResourceAccess` list via the tool's `accessed_resources(params)`.
 3. Filter out entries covered by the snapshot of `SessionState::approved_resources` passed in from `AgentLoop`.
-4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. The gate returns an `ApprovalOutcome`, not a bare decision; on `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return) whose `reason` is worded from `baybo_tools::refusal_reason(outcome.resolution)`. That distinction is the point: a prompt torn down by a cancel and a standing policy are not a human refusal, and reporting them to the model as one teaches it to re-argue with somebody who was never there. Gates never time out. The executor does not race the gate against the cancel token: the gate races its own `AskCancel` (the call's `TurnTokens`) and returns `abandoned()` on a turn cancel, stays parked on an ancestor cancel (see "Cancelled batches" below). An approval that lands after the turn was cancelled is still refused by a post-approve re-check of the token.
+4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. The gate returns an `ApprovalOutcome`, not a bare decision; on `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return) whose `reason` is worded from `baybo_tools::refusal_reason(outcome.resolution)`. That distinction is the point: a prompt torn down by a cancel and a standing policy are not a human refusal, and reporting them to the model as one teaches it to re-argue with somebody who was never there. Only a during-execute approval (raised through `ApprovalHandle`) times out, after 30 minutes, as `TimedOut`; this pre-execute gate never does. The executor does not race the gate against the cancel token: the gate races its own `AskCancel` (the call's `TurnTokens`) and returns `abandoned()` on a turn cancel, stays parked on an ancestor cancel (see "Cancelled batches" below). An approval that lands after the turn was cancelled is still refused by a post-approve re-check of the token.
 5. On `ApproveAlways`, the executor de-dupes and pushes the newly-approved accesses directly into the shared `Mutex<Vec<ApprovedResource>>` passed by `AgentLoop`. After all tool calls complete, `AgentLoop` flushes the contents back into `session.state.approved_resources`, which persists through session save/restore because the types live in `baybo-model`.
 
 5. Unattended turns are policy-denied: `PolicyDenyGate` writes a `human_asks`
@@ -149,10 +151,10 @@ child of the turn token plus the actor token. After the batch the loop reads
 `CancelOrigin::of(tokens)` once. On `Ancestor` (process shutdown) it appends
 and emits nothing for a call that never finished or whose ask came back
 abandoned — the transcript is left as a crash would leave it, the ask row
-stays pending until the next boot closes it, and hydration fills the call. On `Turn` (`/stop`, board
+stays pending, and hydration repairs the siblings. On `Turn` (`/stop`, board
 stop, operator cancel), before appending such a call's result it claims
-`TurnAsks::abandon_for_tool_call(session, tool_use_id)` (a narrow port over
-`HumanAskManager`, an `AgentLoopConfig` field), which also stamps applied an
+`HumanAskManager::abandon_for_tool_call(session, tool_use_id)` (the manager is
+an `AgentLoopConfig` field; a failure is only logged), which also stamps applied an
 answer that landed in the same instant — the tool future is gone, so the
 loop's append is the call's one result. `ExecutedTool.abandoned` marks a call whose last ask was
 torn down undecided.
@@ -268,17 +270,53 @@ The streaming twin of the dangling-use guard is
 `salvage_partial_blocks`, which drops streamed-but-undispatched `ToolUse` on
 mid-stream cancel so the dangling row is never persisted in the first place.
 
-A `ToolUse` parked on a human ask when the process stopped is no exception:
-the gateway's boot closes its ledger row (`HumanAskManager::close_stale_asks`,
-see [`human-ask.md`](human-ask.md#restart-survival)) and hydration fills the
-call like any other.
+A `ToolUse` parked on a human ask is the one dangling id hydration leaves
+alone: the spawner hands every `ContextManager` a `PendingToolCalls` port
+(`runtime::asks::UnappliedAsks`, over `HumanAskManager::unapplied_tool_use_ids`,
+read from the ledger), and `repair_tool_pairing` neither fills nor quarantines
+those ids, so the real result can land adjacent later.
 
-### Asks and the idle reaper
+### Unapplied asks: the turn prelude and the Resume door
 
-The idle reaper skips a session `LivePendingAsks::has_live_pending_ask`
-reports (`AgentSupervisor::new` takes the manager as that probe): reaping the
-actor would drop the parked tool future, and nothing could apply an answer to
-its ask after that.
+Every door that appends to a transcript first calls
+`AgentActor::settle_unapplied_asks()` (`actor/asks.rs`): `handle_user_input`,
+`handle_merged_user_turn`, `dispatch_issue_run` (before `append_issue_brief`),
+`dispatch_cron_prompt` (before `append_cron_fire`), the background-notification
+delivery (before `append_background_notification_prompt_once`, on both the
+fresh and the retry stage), `/compact` (before `compact_now`) and
+`publish_cron_notification` (an assistant row after a dangling `tool_use`
+wedges the transcript just as a user row does). When the ledger has no
+unapplied ask for the session it returns without opening a turn; otherwise it
+runs a `TurnInput::Resume` turn through `AgentLoop::run_settlement_turn`, whose
+whole body is `AgentLoop::settle_unapplied_asks(…, SettleMode::SettleOnly, …)`
+(`runtime/agent_loop/settle.rs`). The settlement asks
+`HumanAskManager::settle_unapplied` and appends one result per `Settled`,
+through the same `append_executed_tool` post-processing the batch uses: a
+`ToolError::Denied` with `refusal_reason(Abandoned | Answered | Policy)` and
+`ToolResultMeta { approval: Some(Deny) }` for a refused approval, the
+`baybo_human_ask::result` envelope for a question, and for an approved call
+`mark_applied` **first**, then a re-execution under a fresh `LlmIteration`
+step with `ToolExecutor::execute(…, PreExecuteGate::PreDecided(decision))`, so
+the gate is not asked again (`ApproveAlways` still seeds the grants). The
+`resumed_turn_id` is the session's newest turn created no later than the ask.
+
+`RouterResumeSink` (`runtime::asks`) is the manager's `ResumeSink`: it sends
+`RouterInbound::ResumeAsk` on the router's intake (created in
+`build_managers` and carried on `ManagerGraph` for `wire_router` to take), and
+answers `resumes_on_answer = false` for issue sessions. The router routes it
+like `route_one_to_actor`, through `resolve_spawn_pins`, as
+`AgentMessage::ResumeAsk { ask_id }` at `Trigger` priority.
+`handle_resume_ask` returns when the row is already applied (a door got there
+first) or not resolved; otherwise it runs `run_agent_loop(TurnInput::Resume)`,
+whose `run_inner` settles with `SettleMode::Continue` before the first LLM
+iteration, and sends the reply with `send_user_reply`.
+
+The idle reaper asks `LivePendingAsks::parked_on` (`AgentSupervisor::new`
+takes the manager as that probe). A turn parked only on resumable asks is
+ended through its release token (`AgentSupervisor::release_parked_turn`) and
+the actor stopped; its answer later resumes the session through the Resume
+door. A turn parked on a during-execute approval keeps its actor warm. See
+"Idle reaper" in [`human-ask.md`](human-ask.md).
 
 ### Router's upstream responsibilities
 
@@ -331,7 +369,7 @@ Per-tool `max_timeout()`:
 | OpenViking memory store | 120s | `OpenVikingTimeouts::store_max` (default) in `memory/src/backends/openviking.rs` |
 | Subagent (in-process) | `TOOL_WAIT_BACKSTOP` = 30 days | `subagent/src/tool.rs` — effectively unbounded; the real bound is the caller's cancel / turn lineage |
 
-**Approval gate** — no timeout: a tool-approval prompt waits until a human answers it or the turn is cancelled (`docs/modules/human-ask.md`); the outer tool deadline pauses while it waits.
+**Approval gate** — a tool-approval prompt waits until a human answers it or the turn is cancelled (`docs/modules/human-ask.md`); the outer tool deadline pauses while it waits. A during-execute approval alone expires, after `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min).
 
 **Progress observer** (`runtime/progress_observer.rs`) — out-of-band status emitter for long UserChat turns:
 

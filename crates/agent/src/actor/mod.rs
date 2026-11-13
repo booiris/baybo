@@ -3,6 +3,7 @@
 //! routed to by [`Router`](crate::actor::router::Router), and
 //! checkpointed via [`DurableActorState`].
 
+mod asks;
 mod background_notification;
 pub mod mailbox;
 pub mod router;
@@ -170,6 +171,11 @@ pub enum AgentMessage {
         /// Persisted to `session.state.last_effort`.
         effort: Option<String>,
     },
+    /// A human answered an ask of this session whose tool future is gone:
+    /// apply the answer under a Resume turn and carry on from it.
+    ResumeAsk {
+        ask_id: baybo_model::human_ask::AskId,
+    },
     /// Stop this actor. Lowest mailbox priority — every queued
     /// `UserInput` / `BackgroundJobFinished` drains first, then the actor
     /// trips its `actor_token` and exits. (The session row lives on; only
@@ -200,6 +206,7 @@ impl mailbox::Prioritized for AgentMessage {
             | AgentMessage::CronTrigger { .. }
             | AgentMessage::IssueRun { .. }
             | AgentMessage::SubagentSpawned { .. }
+            | AgentMessage::ResumeAsk { .. }
             | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
             // Same tier as a finished background job: both are autonomous
             // deliveries that wait for a queued user turn but outrank a stop.
@@ -323,6 +330,30 @@ pub struct AgentActor {
 }
 
 impl AgentActor {
+    /// The tokens one turn runs under. Its `actor` side is a release token
+    /// below the actor's own: tripping it ends this turn the way a shutdown
+    /// would and leaves later turns alone. The supervisor holds it while the
+    /// guard lives, so the idle reaper can end a turn parked on resumable
+    /// asks.
+    fn turn_tokens(
+        &self,
+    ) -> (
+        baybo_tools::TurnTokens,
+        Option<supervisor::TurnReleaseGuard>,
+    ) {
+        let release = self.volatile.actor_token.child_token();
+        let guard = self
+            .volatile
+            .supervisor
+            .as_ref()
+            .map(|s| s.track_turn(&self.durable.session.id, release.clone()));
+        let tokens = baybo_tools::TurnTokens {
+            turn: release.child_token(),
+            actor: release,
+        };
+        (tokens, guard)
+    }
+
     /// Construct an actor from its durable and volatile halves.
     ///
     /// Production wiring goes through [`crate::actor::router::ActorSpawner`],
@@ -344,7 +375,7 @@ impl AgentActor {
         let _registry_guard = self
             .volatile
             .supervisor
-            .take()
+            .clone()
             .map(|s| ActorRegistryGuard::new(s, session_id.clone()));
 
         // Cold-start hydration: pull any persisted transcript out of
@@ -574,6 +605,15 @@ impl AgentActor {
             AgentMessage::SetModel { llm, model, effort } => {
                 self.handle_set_model(llm, model, effort);
             }
+            AgentMessage::ResumeAsk { ask_id } => {
+                if let Err(e) = self.handle_resume_ask(&ask_id).await {
+                    if is_turn_cancelled(&e) {
+                        info!(session_id = %session_id, %ask_id, "resume turn cancelled");
+                    } else {
+                        error!(session_id = %session_id, %ask_id, error = %e, "failed to resume an answered ask");
+                    }
+                }
+            }
             AgentMessage::UserInputBatch(_) => {
                 // The run loop owns `UserInputBatch` (it needs `&mut mailbox` to
                 // coalesce + run the merged turn); reaching here would be a
@@ -621,17 +661,14 @@ impl AgentActor {
         let is_user_turn = turn_input.input_kind().is_user_facing();
         // Kept so the error path below can tell a user `/stop` (token
         // tripped via the turn cancel) apart from a genuine failure.
-        let turn_token = self.volatile.actor_token.child_token();
         // The actor emits no `TurnState`: both edges are projected from the
         // turn store by `spawn_turn_state_projector` — the start edge from
         // this turn's turn `start()` (`Pending → InProgress`) inside
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
-        let tokens = baybo_tools::TurnTokens {
-            turn: turn_token.clone(),
-            actor: self.volatile.actor_token.clone(),
-        };
+        let (tokens, _release) = self.turn_tokens();
+        let turn_token = tokens.turn.clone();
         let result = self
             .volatile
             .agent_loop
@@ -698,6 +735,7 @@ impl AgentActor {
             // framed spelling of the same thing. Same ordering either way.
             brief: baybo_model::prose_with_media(brief.to_string(), &files),
         };
+        self.settle_unapplied_asks().await?;
         self.volatile
             .agent_loop
             .append_issue_brief(number, checkout, brief, &files)
@@ -736,6 +774,7 @@ impl AgentActor {
             }),
         };
         let prompt_context = builtin.map(|ctx| ctx.prompt_context);
+        self.settle_unapplied_asks().await?;
         self.volatile
             .agent_loop
             .append_cron_fire(job_id, prompt, prompt_context.as_deref())
@@ -942,6 +981,9 @@ impl AgentActor {
             return Ok(SessionMessageAppendOutcome::Existing { ordinal });
         }
 
+        // An assistant row after a dangling `tool_use` wedges the transcript
+        // just as a user row does.
+        self.settle_unapplied_asks().await?;
         let turn_lifecycle = Arc::clone(&self.volatile.turn_lifecycle);
         let origin = self.durable.session.trigger.kind();
         let append_outcome = crate::runtime::scope::with_turn(
@@ -1230,6 +1272,7 @@ impl AgentActor {
         // text deltas as `AgentEvent::AnswerDelta` while the final assembled
         // message still flows through the normal path.
         let response_tx = self.volatile.response_tx.clone();
+        self.settle_unapplied_asks().await?;
         self.volatile
             .agent_loop
             .append_user_message_with_platform_msg_id(content.clone(), platform_msg_id)
@@ -1276,6 +1319,7 @@ impl AgentActor {
             combined.extend(incoming.message.content.iter().cloned());
         }
         combined.extend(last.message.content.iter().cloned());
+        self.settle_unapplied_asks().await?;
         // Append every message as its own row ahead of the turn (the last
         // included) so the loop iterates the current context; the combined
         // content rides in `TurnInput` for the turn record only.
@@ -1478,6 +1522,9 @@ impl AgentActor {
         sent_at: chrono::DateTime<chrono::Utc>,
         platform_msg_id: String,
     ) -> anyhow::Result<()> {
+        // The summariser reads the transcript, so a dangling `tool_use` has
+        // to be answered first.
+        self.settle_unapplied_asks().await?;
         // `compact_now` mints its own maintenance turn and returns a control
         // notice; it does not emit a chat reply from the actor itself.
         let notice = self

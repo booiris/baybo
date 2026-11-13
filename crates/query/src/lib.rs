@@ -228,7 +228,7 @@ fn turn_input_text(input: &TurnInput) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .and_then(truncate_title_text);
         }
-        TurnInput::Compact => None,
+        TurnInput::Compact | TurnInput::Resume { .. } => None,
     }?;
 
     let text = blocks

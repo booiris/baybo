@@ -255,10 +255,12 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
 
     let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
     let ask_queues = baybo_human_ask::AskQueues::new();
+    // No router here, so an answer to a dead ask resumes nothing.
     let human_asks = Arc::new(baybo_human_ask::HumanAskManager::from_config(
         baybo_human_ask::HumanAskManagerConfig {
             core: Arc::clone(&ask_core),
             queues: ask_queues.clone(),
+            resume_sink: Arc::new(baybo_human_ask::test_support::NoResume),
         },
     ));
     baybo_project::install_ask_bridge(

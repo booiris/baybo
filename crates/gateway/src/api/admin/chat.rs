@@ -851,8 +851,9 @@ pub struct ChatSessionSummary {
     /// knows which conversation to open; the ask itself is only answerable
     /// inside the conversation.
     ///
-    /// Read from the in-memory ask queues. A gateway restart abandons every
-    /// pending ask, so the mark does not outlive one. Absent when false.
+    /// Read from the in-memory ask queues, which the boot reload refills from
+    /// the ask ledger, so a pending ask keeps its mark across a restart.
+    /// Absent when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub awaiting_human: bool,
     /// Deprecated twin of `awaiting_human`, always the same value. Kept for

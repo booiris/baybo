@@ -409,6 +409,17 @@ pub(crate) fn cap_trace_output_with_len(value: Value, full_len: usize) -> (Value
 /// [`baybo_tools::ApprovalHandle`] and turns the refusal into its own error) is
 /// exactly the case that loses its verdict otherwise: it reaches the loop as an
 /// untyped error, indistinguishable from a crash.
+/// How the pre-execute approval gate treats a call's uncovered accesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreExecuteGate {
+    /// Raise an ask on the turn's gate, as every live call does.
+    Ask,
+    /// A human already answered this call's ask and the turn prelude is
+    /// re-executing it: take `decision` as the gate's answer without raising
+    /// anything. `ApproveAlways` still seeds the session's grants.
+    PreDecided(ApprovalDecision),
+}
+
 pub struct ExecutedTool {
     pub output: anyhow::Result<ToolOutput>,
     /// `None` when the call never prompted (covered by a prior grant, or an
@@ -437,6 +448,19 @@ pub struct TurnBackground {
 }
 
 impl TurnBackground {
+    /// What a turn of `kind` in `session` lets its calls leave running. A cron
+    /// fire that overran would push "results will follow" and then the result,
+    /// so its overruns are killed instead.
+    pub(crate) fn for_turn(
+        session: &baybo_model::Session,
+        kind: baybo_turn::TurnInputKind,
+    ) -> Self {
+        Self {
+            eligible: session.can_host_background_jobs(),
+            overrun_to_background: !matches!(kind, baybo_turn::TurnInputKind::Cron),
+        }
+    }
+
     /// Nothing outlives the turn.
     #[cfg(test)]
     pub(crate) const NONE: Self = Self {
@@ -743,6 +767,7 @@ impl ToolExecutor {
         // failing call the schema back for self-correction. Every security
         // door above and below applies identically either way.
         via_invoke: bool,
+        pre_execute: PreExecuteGate,
     ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
@@ -897,32 +922,36 @@ impl ToolExecutor {
                 }
 
                 if !uncovered.is_empty() {
-                    let outcome = gate
-                        .request(
-                            ApprovalRequest {
-                                ask_id: baybo_model::human_ask::AskId::new(),
-                                tool_call_id: tool_use_id.clone(),
-                                session_id: session_id.clone(),
-                                user_id: user.id.clone(),
-                                tool: tool_name_owned.clone(),
-                                accesses: uncovered.clone(),
-                                params_preview: preview_params(
-                                    &params,
-                                    APPROVAL_PARAMS_PREVIEW_LEN,
-                                ),
-                                description: call_label.clone(),
-                            },
-                            AskSite {
-                                channel: user.channel.clone(),
-                                turn_id,
-                                phase: AskPhase::BeforeExecute,
-                            },
-                            ask_cancel.clone(),
-                        )
-                        // The gate itself answers `/stop` (it races the call's
-                        // `AskCancel`); a shutdown leaves it parked until the loop
-                        // drops this future.
-                        .await;
+                    let outcome = match pre_execute {
+                        PreExecuteGate::PreDecided(decision) => ApprovalOutcome::answered(decision),
+                        PreExecuteGate::Ask => {
+                            gate.request(
+                                ApprovalRequest {
+                                    ask_id: baybo_model::human_ask::AskId::new(),
+                                    tool_call_id: tool_use_id.clone(),
+                                    session_id: session_id.clone(),
+                                    user_id: user.id.clone(),
+                                    tool: tool_name_owned.clone(),
+                                    accesses: uncovered.clone(),
+                                    params_preview: preview_params(
+                                        &params,
+                                        APPROVAL_PARAMS_PREVIEW_LEN,
+                                    ),
+                                    description: call_label.clone(),
+                                },
+                                AskSite {
+                                    channel: user.channel.clone(),
+                                    turn_id,
+                                    phase: AskPhase::BeforeExecute,
+                                },
+                                ask_cancel.clone(),
+                            )
+                            // The gate itself answers `/stop` (it races the call's
+                            // `AskCancel`); a shutdown leaves it parked until the loop
+                            // drops this future.
+                            .await
+                        }
+                    };
                     let decision = outcome.decision;
                     *approval_sink.lock() = Some(outcome);
                     for access in &uncovered {
@@ -2118,6 +2147,7 @@ mod tests {
                 ReadTracker::default(),
                 None,
                 false,
+                PreExecuteGate::Ask,
             )
             .await;
         assert!(executed.output.is_ok(), "the capture tool ran");
@@ -2470,6 +2500,7 @@ mod tests {
             approved_resources,
             attended,
             None,
+            PreExecuteGate::Ask,
         )
         .await
     }
@@ -2492,6 +2523,7 @@ mod tests {
         approved_resources: Arc<Mutex<Vec<ApprovedResource>>>,
         attended: bool,
         after_authorization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+        pre_execute: PreExecuteGate,
     ) -> (ExecutedTool, Arc<MemoryHumanAskStore>) {
         let home = tempfile::tempdir().expect("tempdir");
         let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
@@ -2568,6 +2600,7 @@ mod tests {
                 ReadTracker::default(),
                 None,
                 false,
+                pre_execute,
             )
             .await;
         (executed, ledger)
@@ -2655,6 +2688,7 @@ mod tests {
             Arc::clone(&approved),
             true,
             Some(hook),
+            PreExecuteGate::Ask,
         )
         .await
         .0;
@@ -2762,6 +2796,68 @@ mod tests {
         assert!(ran.load(Ordering::SeqCst));
         assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
         assert!(ledger.rows().is_empty(), "policy gate untouched");
+    }
+
+    async fn pre_decided(
+        decision: ApprovalDecision,
+    ) -> (ExecutedTool, usize, bool, Vec<ApprovedResource>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate_calls, gate) = counting_gate();
+        let tool: Arc<dyn baybo_tools::Tool> = Arc::new(McpShapedTool {
+            namespaced_name: SELECTED_MCP_TOOL,
+            declares_access: true,
+            mid_execution_access: false,
+            ran: Arc::clone(&ran),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(tool, authorization_manifest(SELECTED_MCP_TOOL));
+        let approved = Arc::new(Mutex::new(Vec::new()));
+        let (executed, _ledger) = execute_authorization_registration(
+            Arc::new(registry),
+            SELECTED_MCP_TOOL.to_string(),
+            gate,
+            Arc::clone(&approved),
+            true,
+            None,
+            PreExecuteGate::PreDecided(decision),
+        )
+        .await;
+        let grants = approved.lock().clone();
+        (
+            executed,
+            gate_calls.load(Ordering::SeqCst),
+            ran.load(Ordering::SeqCst),
+            grants,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_pre_decided_approval_runs_without_raising_an_ask() {
+        let (executed, gate_calls, ran, grants) = pre_decided(ApprovalDecision::Approve).await;
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert_eq!(executed.approval, Some(ApprovalDecision::Approve));
+        assert!(ran);
+        assert_eq!(gate_calls, 0, "the gate is never asked");
+        assert!(grants.is_empty(), "Approve grants nothing beyond the call");
+    }
+
+    #[tokio::test]
+    async fn a_pre_decided_approve_always_seeds_the_grants() {
+        let (executed, gate_calls, ran, grants) =
+            pre_decided(ApprovalDecision::ApproveAlways).await;
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert!(ran);
+        assert_eq!(gate_calls, 0);
+        assert_eq!(grants, vec![McpShapedTool::declared_access().to_approved()]);
+    }
+
+    #[tokio::test]
+    async fn a_pre_decided_denial_does_not_run_the_tool() {
+        let (executed, gate_calls, ran, _) = pre_decided(ApprovalDecision::Deny).await;
+        assert!(executed.output.is_err());
+        assert_eq!(executed.approval, Some(ApprovalDecision::Deny));
+        assert!(!ran);
+        assert_eq!(gate_calls, 0);
     }
 
     #[tokio::test]
@@ -2878,6 +2974,7 @@ mod tests {
                 ReadTracker::default(),
                 None,
                 false,
+                PreExecuteGate::Ask,
             )
             .await;
         let abandoned = executed.abandoned;

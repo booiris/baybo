@@ -65,9 +65,26 @@ pub struct AgentSupervisor {
     response_tx: mpsc::Sender<AgentOutput>,
     in_flight_background_jobs:
         Arc<DashMap<SessionId, HashMap<baybo_model::BackgroundHandle, InFlightJob>>>,
-    /// The reaper keeps an actor whose turn is parked on an ask warm, so an
-    /// answer hours later takes the live path.
+    /// What an idle session's turn is parked on, which decides whether the
+    /// reaper may end that turn (see [`Self::reap_idle`]).
     live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
+    /// The release token of the turn each registered actor is running. The
+    /// reaper cancels it to end a turn parked on resumable asks; it is a
+    /// child of the actor's own token, so later turns are untouched.
+    turn_releases: Arc<DashMap<SessionId, CancellationToken>>,
+}
+
+/// Keeps a running turn's release token registered with the supervisor; the
+/// registration ends when the turn does.
+pub struct TurnReleaseGuard {
+    releases: Arc<DashMap<SessionId, CancellationToken>>,
+    session_id: SessionId,
+}
+
+impl Drop for TurnReleaseGuard {
+    fn drop(&mut self) {
+        self.releases.remove(&self.session_id);
+    }
 }
 
 impl AgentSupervisor {
@@ -80,6 +97,38 @@ impl AgentSupervisor {
             response_tx,
             in_flight_background_jobs: Arc::new(DashMap::new()),
             live_asks,
+            turn_releases: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// End `session_id`'s running turn the way a shutdown would, if every ask
+    /// it is parked on is resumable: nothing is appended, each ask stays
+    /// pending, and an answer resumes the session through the Resume door.
+    /// `false` (and nothing touched) when the turn is not parked, or is
+    /// parked on an ask that ending it would abandon.
+    pub fn release_parked_turn(&self, session_id: &SessionId) -> bool {
+        if self.live_asks.parked_on(session_id) != baybo_human_ask::ParkedOn::Resumable {
+            return false;
+        }
+        let Some(release) = self.turn_releases.get(session_id) else {
+            return false;
+        };
+        info!(%session_id, "ending a turn parked on resumable asks");
+        release.cancel();
+        true
+    }
+
+    /// Register the release token of the turn `session_id`'s actor is about
+    /// to run. Drop the guard when the turn ends.
+    pub fn track_turn(
+        &self,
+        session_id: &SessionId,
+        release: CancellationToken,
+    ) -> TurnReleaseGuard {
+        self.turn_releases.insert(session_id.clone(), release);
+        TurnReleaseGuard {
+            releases: Arc::clone(&self.turn_releases),
+            session_id: session_id.clone(),
         }
     }
 
@@ -365,6 +414,15 @@ impl AgentSupervisor {
     /// `actor_token`, and exits; the `ActorRegistryGuard` then removes the
     /// entry from `self.actors` on drop.
     ///
+    /// `ActorStop` is only served between turns, so a turn parked on an ask
+    /// would hold its actor forever. When every ask it is parked on is
+    /// resumable, the reaper also cancels that turn's release token: the turn
+    /// ends as it would at shutdown (nothing appended, each ask left pending),
+    /// and an answer later resumes the session through the Resume door. A
+    /// turn parked on a during-execute approval is left alone — ending it
+    /// would abandon the prompt — until the approval's own deadline
+    /// (`DURING_EXECUTE_APPROVAL_TIMEOUT`) lets the turn finish.
+    ///
     /// Returns the number of `ActorStop` sends attempted. Idle sessions
     /// that were not registered (cron / maintenance / subagent
     /// one-shots) are skipped — those manage their own lifetime.
@@ -397,8 +455,12 @@ impl AgentSupervisor {
                 );
                 continue;
             }
-            if self.live_asks.has_live_pending_ask(&session_id) {
-                debug!(%session_id, "idle reaper: skipping a session parked on an ask");
+            let parked = self.live_asks.parked_on(&session_id);
+            if parked == baybo_human_ask::ParkedOn::NotResumable {
+                debug!(
+                    %session_id,
+                    "idle reaper: skipping a session parked on a during-execute approval"
+                );
                 continue;
             }
             let Some(sender) = self.actors.get(&session_id).map(|e| e.sender.clone()) else {
@@ -406,6 +468,11 @@ impl AgentSupervisor {
             };
             match sender.try_send(AgentMessage::ActorStop) {
                 Ok(()) => {
+                    // After the stop is queued, so the actor is certain to exit
+                    // once the parked turn ends.
+                    if parked == baybo_human_ask::ParkedOn::Resumable {
+                        self.release_parked_turn(&session_id);
+                    }
                     debug!(%session_id, "idle reaper: sent Shutdown");
                     reaped += 1;
                 }
@@ -830,17 +897,21 @@ mod tests {
         assert!(fresh_rx.try_recv().is_err());
     }
 
-    /// A probe that reports one session as parked on a live ask.
-    struct ParkedOn(SessionId);
+    /// A probe that reports what each listed session is parked on.
+    struct Parked(Vec<(SessionId, baybo_human_ask::ParkedOn)>);
 
-    impl baybo_human_ask::LivePendingAsks for ParkedOn {
-        fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
-            *session_id == self.0
+    impl baybo_human_ask::LivePendingAsks for Parked {
+        fn parked_on(&self, session_id: &SessionId) -> baybo_human_ask::ParkedOn {
+            self.0
+                .iter()
+                .find(|(id, _)| id == session_id)
+                .map_or(baybo_human_ask::ParkedOn::Nothing, |(_, parked)| *parked)
         }
     }
 
     #[tokio::test]
-    async fn reap_idle_keeps_an_actor_parked_on_a_live_ask() {
+    async fn reap_idle_ends_a_resumable_park_and_keeps_a_during_execute_one() {
+        use baybo_human_ask::ParkedOn;
         use chrono::Utc;
 
         let session_store = Arc::new(MemorySessionStore::new());
@@ -851,34 +922,69 @@ mod tests {
             name: None,
             channel: ChannelType::tui(),
         };
-        let mut parked = sessions
-            .create_session(user.clone(), ChannelType::tui())
-            .await
-            .unwrap();
-        parked.last_active = Utc::now() - Duration::seconds(120);
-        session_store.save(&parked).await.unwrap();
-        let mut idle = sessions
-            .create_session(user, ChannelType::tui())
-            .await
-            .unwrap();
-        idle.last_active = Utc::now() - Duration::seconds(120);
-        session_store.save(&idle).await.unwrap();
+        let idle_session = || {
+            let sessions = &sessions;
+            let session_store = &session_store;
+            let user = user.clone();
+            async move {
+                let mut session = sessions
+                    .create_session(user, ChannelType::tui())
+                    .await
+                    .unwrap();
+                session.last_active = Utc::now() - Duration::seconds(120);
+                session_store.save(&session).await.unwrap();
+                session.id
+            }
+        };
+        let resumable = idle_session().await;
+        let during = idle_session().await;
 
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
-        let supervisor = AgentSupervisor::new(tx, Arc::new(ParkedOn(parked.id.clone())));
-        let (parked_tx, mut parked_rx) = mailbox::channel(8);
-        let (idle_tx, mut idle_rx) = mailbox::channel(8);
+        let supervisor = AgentSupervisor::new(
+            tx,
+            Arc::new(Parked(vec![
+                (resumable.clone(), ParkedOn::Resumable),
+                (during.clone(), ParkedOn::NotResumable),
+            ])),
+        );
+        let (resumable_tx, mut resumable_rx) = mailbox::channel(8);
+        let (during_tx, mut during_rx) = mailbox::channel(8);
         supervisor
-            .register_if_absent(parked.id.clone(), parked_tx)
+            .register_if_absent(resumable.clone(), resumable_tx)
             .expect("first insert");
         supervisor
-            .register_if_absent(idle.id.clone(), idle_tx)
+            .register_if_absent(during.clone(), during_tx)
             .expect("first insert");
+        let resumable_release = CancellationToken::new();
+        let during_release = CancellationToken::new();
+        let _resumable_turn = supervisor.track_turn(&resumable, resumable_release.clone());
+        let _during_turn = supervisor.track_turn(&during, during_release.clone());
 
         let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
         assert_eq!(reaped, 1);
-        assert!(parked_rx.try_recv().is_err(), "the parked actor stays warm");
-        assert!(matches!(idle_rx.try_recv(), Ok(AgentMessage::ActorStop)));
+        assert!(
+            resumable_release.is_cancelled(),
+            "the turn parked on resumable asks is ended"
+        );
+        assert!(matches!(
+            resumable_rx.try_recv(),
+            Ok(AgentMessage::ActorStop)
+        ));
+        assert!(
+            !during_release.is_cancelled(),
+            "a during-execute approval keeps its turn"
+        );
+        assert!(during_rx.try_recv().is_err(), "and its actor stays warm");
+    }
+
+    #[test]
+    fn a_turn_release_is_tracked_only_while_its_guard_lives() {
+        let sup = make_supervisor();
+        let id = SessionId::from("s");
+        let guard = sup.track_turn(&id, CancellationToken::new());
+        assert!(sup.turn_releases.contains_key(&id));
+        drop(guard);
+        assert!(!sup.turn_releases.contains_key(&id));
     }
 
     #[test]

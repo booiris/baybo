@@ -411,7 +411,8 @@ pub struct IssueDto {
     /// shows it, because a failure that leaves the card looking untouched
     /// is a badge pointing at something the operator cannot find.
     pub last_run_failed: bool,
-    /// True only while this card has an answerable ask in the queue.
+    /// True only while this card has an answerable ask in the queue — live,
+    /// or reloaded from the ask ledger after a restart.
     pub awaiting_human: bool,
     /// Deprecated twin of `awaiting_human`, always the same value. Kept for
     /// clients that predate the rename; removed in PR 3 of the human-ask

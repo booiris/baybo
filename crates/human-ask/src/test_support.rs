@@ -130,7 +130,20 @@ impl HumanAskStore for MemoryHumanAskStore {
 pub struct NoLivePendingAsks;
 
 impl crate::ports::LivePendingAsks for NoLivePendingAsks {
-    fn has_live_pending_ask(&self, _session_id: &SessionId) -> bool {
+    fn parked_on(&self, _session_id: &SessionId) -> crate::ports::ParkedOn {
+        crate::ports::ParkedOn::Nothing
+    }
+}
+
+/// A resume sink for fixtures with no router: an answer to a dead ask
+/// resumes nothing.
+pub struct NoResume;
+
+#[async_trait]
+impl crate::ports::ResumeSink for NoResume {
+    async fn resumes_on_answer(&self, _session_id: &SessionId) -> bool {
         false
     }
+
+    fn request_resume(&self, _req: baybo_model::human_ask::ResumeRequest) {}
 }

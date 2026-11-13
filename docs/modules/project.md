@@ -1836,15 +1836,16 @@ halves once at boot, after the ask manager and the `ProjectManager` exist:
   issue's unsettled run, read from `list_runs` at that moment) and
   `ApprovalResolved` on `AskEvent::Resolved` — `Answered` with the human's
   decision, or `Abandoned` / `Deny`. A policy denial is never on the card and
-  records nothing. Observers run from the ask verbs only; the boot's close of
-  a stale ask is one (`Resolved(Abandoned)`), and it may find no
-  unsettled-run attempt to carry, which `attempt: Option<i64>` allows. It holds the board as a
+  records nothing. Observers run from the ask verbs only, never on boot
+  reload, so a restart does not write a duplicate `approval_requested` row;
+  a `Resolved` after a restart simply finds no unsettled-run attempt to
+  carry, which `attempt: Option<i64>` allows. It holds the board as a
   `Weak<ProjectManager>`: `ProjectManager → closer → HumanAskManager →
   AskCore → observers` would otherwise be a strong cycle.
 - `AskCloser` — the `CardPromptCloser` the board holds. Its one method,
   `close_run_prompts(session_id)`, calls
-  `HumanAskManager::abandon_for_session` for the settled run's session: every
-  pending ask, each claimed in the ledger, so a parked tool sees
+  `HumanAskManager::abandon_for_session` for the settled run's session: live
+  and dead asks alike, each claimed in the ledger, so a parked tool sees
   `Abandoned` and the observer records the close.
 
 The gate map holds each channel's own gate; there is no wrapper, so the card
@@ -1876,10 +1877,11 @@ never opened reached no tool and raised no prompt.
 
 **Shutdown is not a close.** A process going down leaves its parked asks
 pending in the ledger (nothing awaits a close at shutdown any more); the next
-boot abandons them before any channel starts (the timeline records the
-abandon), and `resume_unsettled_runs` re-dispatches the run into the same
-session, where hydration fills the interrupted call and the model asks again,
-live, on the card.
+boot re-queues them, and `resume_unsettled_runs` re-dispatches the run into
+the same session, whose turn prelude applies an answer given meanwhile or
+abandons a still-pending ask so the model asks again, live, on the card.
+Answering a dead ask in an issue session therefore requests no chat Resume
+turn.
 
 `ApprovalResolved` carries the resolution as well as the decision, because a
 human's "no", an abandoned prompt and a standing policy are different facts
@@ -1888,7 +1890,8 @@ nothing times out any more.)
 
 Pending-ness is read, not stored, here: the board's attention badge and a
 card's `awaiting_human` bit count the channel's **ask queue**, passed into
-`attention()` because this crate must not know about channels. A card's
+`attention()` because this crate must not know about channels; after a
+restart the boot reload has refilled the queue from the ledger. A card's
 "answer this" list is derived from the **timeline** in the client
 (`pendingApprovals` in `app/web/src/pages/projects/timelineModel.ts`), which
 is where the call ids are; it is a view rather than an authority, since the
