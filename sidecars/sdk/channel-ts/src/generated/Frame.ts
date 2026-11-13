@@ -71,7 +71,9 @@ started_at?: string, } | { "kind": "approval_requested", call_id: string,
  * `call_id` of the TOOL call this prompt blocks (the id
  * `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
  * `call_id`, which is minted per prompt). Lets clients badge
- * the exact work step that is waiting.
+ * the exact work step that is waiting. The gateway always sends
+ * it; optional only so a client still parses an older gateway's
+ * frames, which omitted it.
  */
 tool_call_id?: string, session_id: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, 
 /**
