@@ -992,9 +992,8 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
     // session, but the client that needs to know which chat to open is the one
     // parked on its conversation list, subscribed to nothing at all.
     //
-    // And the clear must survive the case with no resolution event: an ask
-    // abandoned without an answer broadcasts no `ApprovalResolved`, so the
-    // queue's own edge is what retires the mark.
+    // And the clear must not depend on a decision: an ask abandoned without an
+    // answer carries none, so the queue's own edge is what retires the mark.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     boot::install_channels(
         &tg.deps.channel_registry,
@@ -1729,8 +1728,8 @@ async fn a_message_for_an_unsubscribed_session_is_nacked_with_a_notice() {
 
 /// A client answering a card goes through the ask manager: the decision is
 /// claimed in the ledger, the parked call gets it, and every subscriber —
-/// including the one that answered — receives `ApprovalResolved` followed by
-/// the kind-agnostic `AskResolved`.
+/// including the one that answered — receives one `AskResolved` carrying the
+/// decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_approval_frame_answers_through_the_ledger() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;

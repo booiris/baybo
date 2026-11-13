@@ -51,7 +51,7 @@ pub(super) enum OutboundCmd {
     },
     /// The user's answer to a pending tool-approval prompt. Fire-and-forget:
     /// the gateway answers by resolving the gate and broadcasting
-    /// `ApprovalResolved`, which arrives on the inbound frame path.
+    /// `AskResolved`, which arrives on the inbound frame path.
     ResolveApproval {
         ask_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
