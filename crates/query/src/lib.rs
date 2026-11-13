@@ -2014,6 +2014,11 @@ mod tests {
             out.sort_by_key(|s| std::cmp::Reverse(s.last_active));
             Ok(out)
         }
+        async fn list_awaiting_cron_reports(
+            &self,
+        ) -> std::result::Result<Vec<Session>, baybo_store::StorageError> {
+            Ok(Vec::new())
+        }
         async fn list_lineage_children(
             &self,
             parent: &SessionId,

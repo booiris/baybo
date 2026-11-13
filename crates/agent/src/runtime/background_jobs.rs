@@ -150,12 +150,17 @@ async fn escort(supervisor: AgentSupervisor, shutdown: CancellationToken, job: D
         return;
     };
     let Ok(mut pending) = outcome else {
-        supervisor.note_background_job_finished(&parent, &handle);
         warn!(
             parent_session_id = %parent,
             %handle,
             "background job panicked; nothing to deliver"
         );
+        // Told before the entry clears, like a result: the reaper must not
+        // take the parent in between.
+        supervisor
+            .route(&parent, AgentMessage::BackgroundJobLost(handle.clone()))
+            .await;
+        supervisor.note_background_job_finished(&parent, &handle);
         return;
     };
     if !supervisor.is_background_job_in_flight(&parent, &handle) {
@@ -164,6 +169,12 @@ async fn escort(supervisor: AgentSupervisor, shutdown: CancellationToken, job: D
             %handle,
             "background job was stopped; suppressing delivery"
         );
+        // No result is delivered, but the parent may be a cron fire waiting
+        // on this job's report: without this it would wait until a restart
+        // and then announce the job as lost.
+        supervisor
+            .route(&parent, AgentMessage::BackgroundJobStopped(handle))
+            .await;
         return;
     }
     pending.group = cohort;
@@ -309,6 +320,12 @@ mod tests {
         fx.manager.adopt(job).await;
 
         settle(&fx.supervisor, &fx.parent).await;
+        // No result, but the parent hears the job is gone: a cron fire
+        // waiting on its report must be able to say so.
+        let Ok(AgentMessage::BackgroundJobLost(handle)) = fx.mailbox.try_recv() else {
+            panic!("the parent hears the job was lost");
+        };
+        assert_eq!(handle, "bg-1");
         assert!(fx.mailbox.try_recv().is_err(), "nothing to deliver");
     }
 
@@ -325,6 +342,12 @@ mod tests {
         // The stop drained the entry at once; give the escort time to see the
         // cancelled job end and decide what to do with its result.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // What does reach the parent is that the job is over: a cron fire
+        // waiting on its report must stop waiting.
+        let Ok(AgentMessage::BackgroundJobStopped(handle)) = fx.mailbox.try_recv() else {
+            panic!("the parent hears the stopped job ended");
+        };
+        assert_eq!(handle, "bg-1");
         assert!(
             fx.mailbox.try_recv().is_err(),
             "a user-stopped result must not surface"

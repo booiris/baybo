@@ -30,8 +30,14 @@ BackgroundNotificationState {
     groups: HashMap<CohortKey, BackgroundNotificationGroup>,
     buffered_results: Vec<PendingBackgroundResult>,
     active_delivery: Option<BackgroundNotificationDelivery>,
+    cron_report_handles: Vec<BackgroundHandle>,
+    cron_report_awaited: Vec<BackgroundHandle>,
 }
 ```
+
+The last two exist only for a recurring cron fire: the jobs the fire started,
+and the subset whose result has not arrived yet (see
+[`modules/cron.md`](modules/cron.md)).
 
 The aggregate is `serde(flatten)`ed. Persisted session JSON therefore retains
 the historical keys `background_groups`, `pending_background_results`, and
@@ -93,6 +99,18 @@ cancels the job (a command's process group is killed), clears its registry
 entry, and never publishes `BackgroundJobFinished`. The partial stdout/stderr artifacts
 remain available for inspection. A command terminated by Baybo shutdown is not
 a failed task result owed to the user.
+
+A recurring cron fire is the exception to that last sentence, because nobody is
+watching it: its last word was a report or "results will follow". The in-flight
+registry is process-local, so the fire's session keeps its own durable record,
+`cron_report_awaited` — a handle joins it when the fire's turn hands the job
+over and leaves when the result is accepted here or when the escort reports a
+user-stopped job ended (`AgentMessage::BackgroundJobStopped`). Whatever is still
+there at the next gateway start is work the previous process took down, cleanly
+or by crashing, and each such conversation is told
+(`AgentMessage::CronBackgroundWorkLost`); a job that panics is told at once
+(`AgentMessage::BackgroundJobLost`). The notice is at-least-once: the handles
+are cleared only after it is stored. See [`modules/cron.md`](modules/cron.md).
 
 The actor deduplicates `handle_id` across all three durable collecting/delivery
 locations: buffered results, group members, and the active delivery's

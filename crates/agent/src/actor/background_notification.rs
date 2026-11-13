@@ -136,6 +136,12 @@ impl AgentActor {
             return;
         }
 
+        self.durable
+            .session
+            .state
+            .background_notifications
+            .settle_cron_report(&pending.handle_id);
+
         // No label: for a detached `Bash` job it is the command line verbatim
         // (`PendingBackgroundResult::command` stores `label: command.clone()`),
         // so it routinely carries credentials — and logs are served over an
@@ -174,6 +180,94 @@ impl AgentActor {
 
         self.release_ready_background_groups();
         self.persist_session_state_with_activity("background_result_finished")
+            .await;
+    }
+
+    /// A job the user stopped has ended. Its escort delivers no result, so
+    /// this is the only word the conversation gets that the report it may have
+    /// been waiting for is not owed any more.
+    pub(super) async fn handle_background_stopped(
+        &mut self,
+        handle: &baybo_model::BackgroundHandle,
+    ) {
+        let notifications = &mut self.durable.session.state.background_notifications;
+        if !notifications.cron_report_awaited.contains(handle) {
+            return;
+        }
+        notifications.settle_cron_report(handle);
+        self.persist_session_state_preserving_activity("cron_report_stopped")
+            .await;
+    }
+
+    /// A job crashed. Only a recurring fire waiting on its report has anyone
+    /// to tell: a chat's user is there to notice and ask again.
+    pub(super) async fn handle_background_lost(&mut self, handle: baybo_model::BackgroundHandle) {
+        let awaited = &self
+            .durable
+            .session
+            .state
+            .background_notifications
+            .cron_report_awaited;
+        if awaited.contains(&handle) {
+            self.report_lost_cron_reports(vec![handle]).await;
+        }
+    }
+
+    /// The process started with this fire still owed reports. Nothing was in
+    /// flight when the message was sent, so every one of them belongs to a
+    /// job the previous process took down, cleanly or by crashing.
+    pub(super) async fn handle_cron_background_work_lost(&mut self) {
+        let lost = self
+            .durable
+            .session
+            .state
+            .background_notifications
+            .cron_report_awaited
+            .clone();
+        self.report_lost_cron_reports(lost).await;
+    }
+
+    /// Tell a recurring fire's conversation that background work it was
+    /// waiting on is gone. Its last word on that work was a report or
+    /// "results will follow"; a scheduled task must never end in silence, so
+    /// the loss is reported the way a failed fire is — a framed row that
+    /// un-hides the conversation and pushes.
+    ///
+    /// The reports stay owed until the notice is durable: a publish that
+    /// fails, or a crash before the save below, repeats the notice at the
+    /// next start, where the other order would lose it.
+    async fn report_lost_cron_reports(&mut self, lost: Vec<baybo_model::BackgroundHandle>) {
+        if lost.is_empty() {
+            return;
+        }
+        warn!(
+            session_id = %self.durable.session.id,
+            lost = lost.len(),
+            "cron fire's background work will never report; saying so"
+        );
+        self.unhide_for_cron_notification().await;
+        let title = self
+            .durable
+            .session
+            .trigger
+            .cron_job_title()
+            .unwrap_or(baybo_context::prompts::cron::UNTITLED_JOB)
+            .to_string();
+        if !self
+            .report_cron_outcome(
+                &title,
+                true,
+                baybo_context::prompts::cron::NOTIFICATION_BACKGROUND_INTERRUPTED_BODY,
+            )
+            .await
+        {
+            return;
+        }
+        let notifications = &mut self.durable.session.state.background_notifications;
+        for handle in &lost {
+            notifications.settle_cron_report(handle);
+        }
+        self.persist_session_state_with_activity("cron_background_work_lost")
             .await;
     }
 
@@ -704,8 +798,7 @@ impl AgentActor {
                 .session
                 .state
                 .background_notifications
-                .cron_report_handles
-                .extend(handed_over);
+                .expect_cron_reports(handed_over);
         }
 
         match result {

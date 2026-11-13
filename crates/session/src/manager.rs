@@ -369,6 +369,15 @@ impl SessionManager {
         Ok(sessions)
     }
 
+    /// Recurring cron fires still owed a background report — see
+    /// `SessionStore::list_awaiting_cron_reports`.
+    pub async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>> {
+        self.store
+            .list_awaiting_cron_reports()
+            .await
+            .map_err(SessionError::from)
+    }
+
     /// Live sessions whose `channel` matches `channel`, newest-active
     /// first. Delegates to the store's `list_by_channel`, which
     /// pushes the predicate into SQL on the sqlite backend so a
