@@ -664,6 +664,18 @@ impl Router {
     #[must_use]
     async fn run_conversation_fire(&self, session: Session, trigger: AgentMessage) -> bool {
         let session_id = session.id.clone();
+        let routed = self.route_to_conversation(session, trigger).await;
+        if !routed {
+            warn!(session_id = %session_id, "failed to deliver cron trigger to its conversation");
+        }
+        routed
+    }
+
+    /// Hand `message` to the registered actor of a recurring fire's
+    /// conversation, hydrating one if the idle reaper (or a restart) left the
+    /// session without. Returns whether it reached a mailbox.
+    async fn route_to_conversation(&self, session: Session, message: AgentMessage) -> bool {
+        let session_id = session.id.clone();
         // A fresh cron session has no `last_llm` of its own, so without this
         // a bound agent's scheduled work runs on the pool default rather than
         // the model its profile pins.
@@ -671,9 +683,8 @@ impl Router {
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
-        let routed = self
-            .supervisor
-            .route_or_spawn(&session_id, trigger, || {
+        self.supervisor
+            .route_or_spawn(&session_id, message, || {
                 let actor_token = parent_token.child_token();
                 actor_spawner(
                     session,
@@ -684,11 +695,47 @@ impl Router {
                     actor_token,
                 )
             })
-            .await;
-        if !routed {
-            warn!(session_id = %session_id, "failed to deliver cron trigger to its conversation");
+            .await
+    }
+
+    /// Tell every recurring fire still owed a background report that it is
+    /// not coming. A background job lives in one process only, so at start —
+    /// before any live traffic, when nothing can be in flight — a report still
+    /// awaited belongs to a job the previous process took down, whether it
+    /// shut down cleanly or crashed.
+    ///
+    /// Not part of [`Self::run`]: only the long-lived gateway may call it. A
+    /// one-shot in-process `baybo prompt` runs a router over the same store,
+    /// with no push dispatcher and a lifetime of seconds — it would spend the
+    /// notice where nobody is told.
+    pub async fn report_lost_cron_background_work(&self) {
+        let awaiting = match self.session_manager.list_awaiting_cron_reports().await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                warn!(error = %e, "failed to scan for cron fires awaiting background reports");
+                return;
+            }
+        };
+        if awaiting.is_empty() {
+            return;
         }
-        routed
+        info!(
+            count = awaiting.len(),
+            "reporting cron background work lost to a restart"
+        );
+        for session in awaiting {
+            let session_id = session.id.clone();
+            if !self
+                .route_to_conversation(session, AgentMessage::CronBackgroundWorkLost)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    "could not tell a cron conversation its background work was lost; \
+                     the next start retries"
+                );
+            }
+        }
     }
 
     /// A **one-shot** fire: it runs in a private workspace nobody will ever
@@ -1444,6 +1491,38 @@ mod tests {
                 .pop()
                 .expect("the router must have spawned an actor for the fire")
         }
+    }
+
+    /// At start, a recurring fire still owed a background report is told the
+    /// report is lost — its actor hydrated for the purpose — and a
+    /// conversation owed nothing is left alone.
+    #[tokio::test]
+    async fn start_tells_only_fires_still_owed_a_report_that_it_is_lost() {
+        let h = RouterHarness::new();
+        let mut owed = h
+            .sessions
+            .get(&SessionId::from("sess-user"))
+            .await
+            .expect("read the seeded session")
+            .expect("seeded session");
+        owed.id = SessionId::from("sess-fire");
+        owed.state
+            .background_notifications
+            .expect_cron_reports(vec!["bg-1".into()]);
+        h.sessions.store().save(&owed).await.expect("save the fire");
+
+        h.router.report_lost_cron_background_work().await;
+
+        let (session_id, mut mailbox) = h.fire();
+        assert_eq!(session_id, SessionId::from("sess-fire"));
+        assert!(matches!(
+            mailbox.try_recv(),
+            Ok(AgentMessage::CronBackgroundWorkLost)
+        ));
+        assert!(
+            h.spawned.lock().is_empty(),
+            "a conversation owed nothing is not woken"
+        );
     }
 
     /// The event carries an origin the store does not have. Session rows are

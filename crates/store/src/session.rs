@@ -261,6 +261,12 @@ pub trait SessionStore: Send + Sync {
     /// Operator-facing: drives `baybo session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
 
+    /// Return the sessions of recurring cron fires that are still owed a
+    /// background report (`BackgroundNotificationState::awaits_cron_reports`).
+    /// Read once at boot, to tell each one whose job the previous process
+    /// took down that its report is not coming.
+    async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>>;
+
     /// Return live sessions whose `channel` equals `channel`,
     /// newest-active first. Used by the chat REST surface
     /// (`GET /v1/chat/sessions`) so a long-running gateway with

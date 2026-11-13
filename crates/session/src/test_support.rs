@@ -242,6 +242,16 @@ impl SessionStore for MemorySessionStore {
         Ok(self.data.lock().values().cloned().collect())
     }
 
+    async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>> {
+        Ok(self
+            .data
+            .lock()
+            .values()
+            .filter(|s| s.state.background_notifications.awaits_cron_reports())
+            .cloned()
+            .collect())
+    }
+
     async fn list_by_channel(&self, channel: &ChannelType) -> Result<Vec<Session>> {
         Ok(self
             .data
