@@ -1414,6 +1414,20 @@ impl AgentLoop {
                 .await);
         }
 
+        // Providers do not promise tool_use ids unique across a session; a
+        // repeat would let the ask ledger, hydration and the settlement find
+        // the wrong call. Rename it here, once, before anything records it.
+        let mut response = response;
+        let unique = self
+            .context_manager
+            .unique_call_ids(response.tool_calls.iter().map(|tc| tc.id.as_str()));
+        for (tc, id) in response.tool_calls.iter_mut().zip(unique) {
+            if tc.id != id {
+                debug!(original = %tc.id, renamed = %id, "renamed a repeated tool_use id");
+                tc.id = id;
+            }
+        }
+
         // Append assistant message including thinking and tool-call
         // blocks so the LLM sees its own prior reasoning and tool
         // invocations on the next turn.

@@ -530,6 +530,17 @@ order the code can actually have:
    `ManagerGraph` → `GatewayDeps` → `AdminState` / `WsChannelState` like
    `project_manager`, for the resolve doors.
 
+**Tool-use ids are made unique on append.** The ledger, the hydration skip
+and the settlement all find a call by its `tool_use` id, and providers do not
+promise those unique within a session. Hydration's repair renames a repeat
+with a suffix, but only in the window it loads — so a parked call that reused
+an earlier id would be renamed after a restart while its ask row kept the
+original, and the answer would find the earlier, already-answered call. The
+agent loop therefore renames a repeat before the assistant row is appended
+or dispatched (`ContextManager::unique_call_ids`, the same suffix rule the
+repair uses), and every row it writes stays a fixpoint of that repair. Each
+ask row also records the raising `turn_id`.
+
 `PendingToolCalls` is a narrow port defined in `baybo-context`:
 `#[async_trait] trait PendingToolCalls { async fn unapplied_tool_use_ids(&self, session: &SessionId) -> Vec<String>; }`,
 answered by the manager **over the store** (`list_unapplied_for_session`,

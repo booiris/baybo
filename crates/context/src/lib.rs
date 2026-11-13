@@ -570,6 +570,15 @@ impl ContextManager {
         &self.messages
     }
 
+    /// The ids a new assistant row's tool calls should carry: `ids` made
+    /// unique against every `ToolUse` already in the window and each other,
+    /// by the rule load-time repair applies to repeats. Call before the row
+    /// is appended and dispatched, so the transcript, the executor and the
+    /// ask ledger all see the same id.
+    pub fn unique_call_ids<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        transcript_repair::unique_call_ids(self.messages(), ids)
+    }
+
     fn needs_framing(&self) -> bool {
         self.messages.iter().any(|m| {
             matches!(

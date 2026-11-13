@@ -105,6 +105,8 @@ writable inside the `$HOME` bind. On top of that: the caller's own
 
 ### LLM-response defensive scrubbing
 
+Before the assistant row with tool calls is appended, `run_inner` renames any `tool_use` id an earlier call in the window already carries (`ContextManager::unique_call_ids`, the same suffix rule load-time repair applies), so the transcript, the executor, clients and the ask ledger all see one id per call.
+
 `AgentLoop` holds an `Arc<SecurityGateway>`. In `call_llm`, every `LlmResponse` — including `content`, `content_blocks` text, `thinking`, and `tool_calls[*].arguments` — is run through `SecurityGateway::sanitize_llm_response` *before* the response is recorded to the trace or appended to `session.messages`. This prevents LLM-fabricated secret-shaped strings from leaking into any downstream sink.
 
 ### Tool-result formatting into LLM context

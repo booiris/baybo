@@ -441,6 +441,121 @@ async fn a_released_parked_turn_is_resumed_by_its_answer() {
         .expect("the actor quiesces");
 }
 
+/// Wait until a tool future in `harness`'s session is parked on an ask, and
+/// return that ask's id.
+async fn parked_ask(harness: &AgentTestHarness) -> AskId {
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        while !harness.human_asks.has_live_pending_ask(&harness.session.id) {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the call parks on an approval");
+    let rows = harness
+        .ask_ledger
+        .list_unapplied_for_session(&harness.session.id)
+        .await
+        .expect("list asks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    rows[0].ask_id.clone()
+}
+
+fn call_gated_write(harness: &AgentTestHarness) {
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: CALL_ID.to_string(),
+            name: GATED_TOOL.to_string(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+}
+
+/// A provider may reuse a `tool_use` id within one session. The repeat is
+/// renamed before anything records it, so after a restart the answer finds
+/// the call it was asked for — not the earlier call that already has a
+/// result, which would leave the answer applied to nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_to_a_repeated_tool_use_id_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join(DB_FILE);
+    let session = owner_session(TriggerSource::User);
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let renamed = {
+        let store = Store::open(&db).await.expect("open the database");
+        store
+            .session
+            .save(&session)
+            .await
+            .expect("save the session");
+        let mut harness = builder(&session, store, &runs).build();
+        call_gated_write(&harness);
+        harness.send_text("write it").await.expect("send");
+        let first = parked_ask(&harness).await;
+        reply(&harness, "first done");
+        harness
+            .human_asks
+            .resolve(&first, AskResolution::Approval(ApprovalDecision::Approve))
+            .await
+            .expect("answer live");
+        harness.drain_outputs(DRAIN_TIMEOUT).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        call_gated_write(&harness);
+        harness.send_text("again").await.expect("send");
+        let second = parked_ask(&harness).await;
+        let renamed = row(&harness, &second).await.tool_call_id;
+        assert_ne!(
+            renamed, CALL_ID,
+            "the repeat is renamed before it is recorded"
+        );
+        harness.actor_parent_token.cancel();
+        harness.drain_outputs(DRAIN_TIMEOUT).await;
+        tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
+            .await
+            .expect("the actor quiesces");
+        (second, renamed)
+    };
+    let (second, renamed) = renamed;
+
+    let mut node = boot(&db, &session, &runs, true, |_| {}).await;
+    reply(&node.harness, "second done");
+    node.harness
+        .human_asks
+        .resolve(&second, AskResolution::Approval(ApprovalDecision::Approve))
+        .await
+        .expect("answer the dead ask");
+    let outputs = node.harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "the parked call ran");
+    let rows = transcript(&node.harness).await;
+    let at = rows
+        .iter()
+        .position(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if *id == renamed))
+        })
+        .expect("the renamed tool_use is persisted under its new id");
+    let result = rows[at + 1]
+        .content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if *tool_use_id == renamed => Some(content.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("its result is adjacent: {rows:#?}"));
+    assert!(result.contains(WRITTEN), "{result}");
+    assert!(replied(&outputs, "second done"), "{outputs:#?}");
+    assert_eq!(node.harness.strict_rejections.load(Ordering::SeqCst), 0);
+    stop(node).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answer_claimed_before_a_crash_is_redriven_by_the_next_boot() {
     let dir = tempfile::tempdir().expect("tempdir");

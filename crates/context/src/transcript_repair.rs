@@ -81,6 +81,37 @@ fn unused_repeat_id(original: &str, taken: &HashSet<String>) -> String {
         .unwrap_or_else(|| original.to_string())
 }
 
+/// The ids `ids` should take in a new assistant row appended after `window`:
+/// each keeps its own unless an earlier `ToolUse` in the window, or an earlier
+/// id in `ids`, already carries it, in which case it gets the suffix
+/// [`disambiguate_repeated_call_ids`] would give it on load. So a row made
+/// unique here is never renamed by that repair, and the id a ledger or a
+/// client recorded at runtime is the one the transcript keeps.
+pub(crate) fn unique_call_ids<'a>(
+    window: &[ChatMessage],
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut taken: HashSet<String> = window
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    ids.into_iter()
+        .map(|id| {
+            let unique = if taken.contains(id) {
+                unused_repeat_id(id, &taken)
+            } else {
+                id.to_string()
+            };
+            taken.insert(unique.clone());
+            unique
+        })
+        .collect()
+}
+
 /// The call a result with `id` answers. A synthetic fill was written under
 /// the window id of its call, which is unique across the transcript and may
 /// sit in any earlier turn (a fill lands at the tail when an earlier fill
@@ -356,6 +387,35 @@ pub(crate) fn repair_tool_pairing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_made_unique_on_append_are_left_alone_by_load_repair() {
+        let use_block = |id: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({}),
+            signature: None,
+        };
+        let window = vec![
+            ChatMessage::assistant(vec![use_block("call_0")]),
+            ChatMessage::tool_result_with_meta("call_0".into(), "ok".into(), None),
+            ChatMessage::assistant(vec![use_block("call_0_2")]),
+            ChatMessage::tool_result_with_meta("call_0_2".into(), "ok".into(), None),
+        ];
+        let ids = unique_call_ids(&window, ["call_0", "call_1", "call_1"]);
+        assert_eq!(ids, ["call_0_3", "call_1", "call_1_2"]);
+
+        let mut appended = window.clone();
+        appended.push(ChatMessage::assistant(
+            ids.iter().map(|id| use_block(id)).collect(),
+        ));
+        let (repaired, renamed) = disambiguate_repeated_call_ids(appended.clone());
+        assert!(
+            renamed.is_empty(),
+            "load repair renames nothing: {renamed:?}"
+        );
+        assert_eq!(repaired, appended);
+    }
     use baybo_model::Role;
 
     fn assistant_with_uses(ids: &[&str]) -> ChatMessage {
