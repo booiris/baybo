@@ -309,7 +309,7 @@ subscriber of the call's session sees it; every `AskClosed` dispatches
 `SessionEvent::ApprovalResolved` when a human decided an approval, so all
 frontends drop the card however it closed. A per-session pending-edge watcher
 broadcasts the `SessionPatch.awaiting_human` list mark. The client echoes a
-`ResolveApproval { call_id, decision }` frame; the inbound loop checks the ask
+`ResolveApproval { ask_id, decision }` frame; the inbound loop checks the ask
 is on this connection's channel queue and calls `HumanAskManager::resolve`,
 which claims the decision in the ledger first and then removes the entry
 (the watchers do the broadcast). There is no timeout: an ask waits until a
@@ -318,7 +318,7 @@ waiter is gone leaves the queue and an answer to it is refused (`NotLive`); a
 process exit leaves its row pending, and the next boot closes it before any
 channel starts (`HumanAskManager::close_stale_asks`, see
 [`human-ask.md`](human-ask.md#restart-survival)). The board's
-`POST /projects/{id}/issues/{n}/approvals/{call_id}` resolves through the
+`POST /projects/{id}/issues/{n}/approvals/{ask_id}` resolves through the
 same verb, for a pending `Approval` row raised by that issue's session.
 
 The ask push relay (`push/ask.rs`, `AskPushRelay`) is built in
@@ -863,7 +863,7 @@ POST   /v1/projects/:project_id/issues/:number/runs/cancel  ask the board to cal
 POST   /v1/projects/:project_id/issues/:number/runs/retry   run the card again → 201 the new run
 GET    /v1/projects/:project_id/issues/:number/events   the card's timeline, oldest first
 POST   /v1/projects/:project_id/issues/:number/comments  record a comment → the timeline entry it became; optional client_msg_id UUID makes retries return the original row without repeating side effects
-POST   /v1/projects/:project_id/issues/:number/approvals/:call_id  answer the prompt parked on that call; 204
+POST   /v1/projects/:project_id/issues/:number/approvals/:ask_id   answer the prompt with that ask id; 204
 POST   /v1/projects/:project_id/issues/:number/read     this card's unread count resets; 204
 POST   /v1/projects/:project_id/read    every card on the board reads zero; 204
 GET    /v1/projects/:project_id/feed    ?before_ms=&limit=  the board's activity, newest first

@@ -76,8 +76,8 @@ impl Channel {
 
     // Kind-agnostic dispatch surface — agent + tool path calls.
     pub fn dispatch_agent(&self, output: AgentOutput);
-    pub fn dispatch_approval_requested(&self, call_id, session_id, user_id, tool, accesses, params_preview, description);
-    pub fn dispatch_approval_resolved(&self, call_id, session_id, decision);
+    pub fn dispatch_approval_requested(&self, ask_id, tool_call_id, session_id, user_id, tool, accesses, params_preview, description);
+    pub fn dispatch_approval_resolved(&self, ask_id, session_id, decision);
 
     // Transport lifecycle — gateway WS route calls these.
     pub fn attach(&self, conn: Arc<Connection>);

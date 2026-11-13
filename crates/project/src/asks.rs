@@ -90,10 +90,10 @@ impl AskObserver for TimelineAskObserver {
         let Some((project, number, actor)) = self.asker(&ask.session_id).await else {
             return;
         };
-        let call_id = ask.ask_id.to_string();
+        let ask_id = ask.ask_id.clone();
         let body = match body {
             Some((decision, resolution)) => IssueEventBody::ApprovalResolved {
-                call_id,
+                ask_id,
                 decision,
                 resolution,
             },
@@ -101,7 +101,7 @@ impl AskObserver for TimelineAskObserver {
             // issue in flight, so "the unsettled one" is unambiguous — the
             // same reasoning the run waiter relies on.
             None => IssueEventBody::ApprovalRequested {
-                call_id,
+                ask_id,
                 attempt: unsettled_attempt(&manager, &project, number).await,
                 tool: req.tool.clone(),
                 summary: summarise(req),
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn the_summary_prefers_the_tools_own_label() {
         let base = ApprovalRequest {
-            call_id: "c".parse().unwrap(),
+            ask_id: "c".parse().unwrap(),
             tool_call_id: String::new(),
             session_id: SessionId::from("s".to_owned()),
             user_id: "u".into(),

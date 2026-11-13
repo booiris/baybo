@@ -535,7 +535,9 @@ pub enum IssueEventBody {
     /// the prompt is answered, so the card shows work that is *waiting on
     /// a person* rather than work that has mysteriously stopped.
     ApprovalRequested {
-        call_id: String,
+        /// The ask's id. Entries written before the rename carry `call_id`.
+        #[serde(alias = "call_id")]
+        ask_id: baybo_model::human_ask::AskId,
         /// Which run is parked, by its attempt number — the same address
         /// the execution log uses. Absent on entries written before the
         /// card started recording it, and on a prompt raised outside any
@@ -549,12 +551,12 @@ pub enum IssueEventBody {
         /// has one, else a truncated parameter preview.
         summary: String,
     },
-    /// …and what was decided. Also written when nobody decided: the gate
-    /// denies on timeout, the prompt dies with its run, and a card that
-    /// stops explaining itself at the prompt is the worst version of this
-    /// feature.
+    /// …and what was decided. Also written when nobody decided: the prompt
+    /// is abandoned with its run, and a card that stops explaining itself at
+    /// the prompt is the worst version of this feature.
     ApprovalResolved {
-        call_id: String,
+        #[serde(alias = "call_id")]
+        ask_id: baybo_model::human_ask::AskId,
         decision: baybo_model::ApprovalDecision,
         /// *How* it resolved — a decision, a timeout, an abandoned prompt.
         /// Defaulted so entries written before the distinction existed read
@@ -1114,8 +1116,8 @@ impl RunStatus {
 pub struct AttentionCounts {
     /// Tool calls parked on an approval prompt. Filled from the channel's
     /// live queue rather than from the timeline — the queue cannot show a
-    /// prompt that already timed out, and pairing request/resolution by
-    /// `call_id` in SQL would scan a table that grows forever.
+    /// prompt that already closed, and pairing request/resolution by
+    /// `ask_id` in SQL would scan a table that grows forever.
     pub approvals: usize,
     /// The sum of every card's [`CardSignals::unread`] on this board.
     /// Unlike the other two this is time-based, because reading an
@@ -1327,6 +1329,33 @@ pub struct NewIssueRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_entries_stored_under_call_id_still_read() {
+        let requested: IssueEventBody = serde_json::from_value(serde_json::json!({
+            "kind": "approval_requested",
+            "call_id": "c1",
+            "tool": "Bash",
+            "summary": "ls",
+        }))
+        .expect("old approval_requested row");
+        assert!(
+            matches!(requested, IssueEventBody::ApprovalRequested { ask_id, .. } if ask_id == "c1")
+        );
+        let resolved: IssueEventBody = serde_json::from_value(serde_json::json!({
+            "kind": "approval_resolved",
+            "call_id": "c1",
+            "decision": "approve",
+        }))
+        .expect("old approval_resolved row");
+        assert!(
+            matches!(&resolved, IssueEventBody::ApprovalResolved { ask_id, .. } if ask_id == "c1")
+        );
+        assert_eq!(
+            serde_json::to_value(&resolved).expect("serialize")["ask_id"],
+            "c1"
+        );
+    }
 
     #[test]
     fn every_actor_round_trips_through_storage() {

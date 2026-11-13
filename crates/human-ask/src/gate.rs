@@ -144,7 +144,7 @@ impl ApprovalGate for PolicyDenyGate {
 /// The pending ledger row for an approval.
 fn approval_row(req: ApprovalRequest, site: AskSite) -> HumanAskRow {
     HumanAskRow {
-        ask_id: req.call_id.clone(),
+        ask_id: req.ask_id.clone(),
         session_id: req.session_id.clone(),
         channel: site.channel,
         tool_call_id: req.tool_call_id.clone(),

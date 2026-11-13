@@ -900,7 +900,7 @@ impl ToolExecutor {
                     let outcome = gate
                         .request(
                             ApprovalRequest {
-                                call_id: baybo_model::human_ask::AskId::new(),
+                                ask_id: baybo_model::human_ask::AskId::new(),
                                 tool_call_id: tool_use_id.clone(),
                                 session_id: session_id.clone(),
                                 user_id: user.id.clone(),

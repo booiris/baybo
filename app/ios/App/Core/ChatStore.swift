@@ -1416,7 +1416,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// leg. A leg that can't carry it surfaces a notice: the decision is lost and
     /// the gate will deny on its own timeout, so the user has to know.
     func resolveApproval(_ approval: PendingApproval, decision: ApprovalDecision) {
-        dropApproval(callId: approval.callId)
+        dropApproval(askId: approval.askId)
         Haptics.tap()
         #if DEBUG
             if resolveDemoApprovalIfRequested(approval, decision: decision) { return }
@@ -1424,15 +1424,15 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         Task {
             do {
                 try await client.chatResolveApproval(
-                    callId: approval.callId, decision: decision)
+                    askId: approval.askId, decision: decision)
             } catch {
                 notice = Lang.shared.t("chat.approvalFailed", bayboErrorText(error))
             }
         }
     }
 
-    private func dropApproval(callId: String) {
-        guard approvals.resolve(callId: callId) else { return }
+    private func dropApproval(askId: String) {
+        guard approvals.resolve(askId: askId) else { return }
         pendingApprovals = approvals.cards
     }
 

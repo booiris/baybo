@@ -53,7 +53,7 @@ pub(super) enum OutboundCmd {
     /// the gateway answers by resolving the gate and broadcasting
     /// `ApprovalResolved`, which arrives on the inbound frame path.
     ResolveApproval {
-        call_id: baybo_model::human_ask::AskId,
+        ask_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
     },
 }
@@ -80,7 +80,7 @@ pub(super) enum Msg {
         reply: Reply,
     },
     ResolveApproval {
-        call_id: baybo_model::human_ask::AskId,
+        ask_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
         reply: Reply,
     },
@@ -308,10 +308,10 @@ impl Supervisor {
                 reply,
             } => self.send_user_message(session_id, text, msg_id, attachments, reply),
             Msg::ResolveApproval {
-                call_id,
+                ask_id,
                 decision,
                 reply,
-            } => self.resolve_approval(call_id, decision, reply),
+            } => self.resolve_approval(ask_id, decision, reply),
             Msg::Preconnect { reply } => self.preconnect(reply),
             Msg::Disconnect { reply } => self.disconnect(reply).await,
             Msg::Unsubscribe { session_id, reply } => {
@@ -533,7 +533,7 @@ impl Supervisor {
 
     fn resolve_approval(
         &mut self,
-        call_id: baybo_model::human_ask::AskId,
+        ask_id: baybo_model::human_ask::AskId,
         decision: WireApprovalDecision,
         reply: Reply,
     ) {
@@ -548,7 +548,7 @@ impl Supervisor {
         };
         let leg_id = *leg_id;
         let sent = outbound_tx
-            .send(OutboundCmd::ResolveApproval { call_id, decision })
+            .send(OutboundCmd::ResolveApproval { ask_id, decision })
             .is_ok();
         self.last_command = Instant::now();
         if sent {

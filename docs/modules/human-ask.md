@@ -68,8 +68,8 @@ the router) arrives as a port it defines.
 
 ## Vocabulary
 
-- **Ask** — one prompt to a human. Keyed by `AskId` (UUID, today's
-  `ApprovalRequest.call_id`). One tool call can raise more than one ask over
+- **Ask** — one prompt to a human. Keyed by `AskId` (a UUID; an approval
+  carries it as `ApprovalRequest.ask_id`, formerly `call_id`). One tool call can raise more than one ask over
   its life, so `tool_call_id` is **not** unique; `ask_id` is.
 - **`AskKind`** — `Approval | Question`.
 - **`AskPhase`** — `BeforeExecute` (the executor's pre-execute gate) or
@@ -291,7 +291,7 @@ survives the generalization.
 `Q11` of the design interview grouped project runs with cron as "unattended".
 The code says otherwise: issue runs prompt through `TimelineApprovalGate`
 (`crates/project/src/approvals.rs`), the board renders `attention().approvals`,
-`POST /projects/{id}/issues/{n}/approvals/{call_id}` answers them, and
+`POST /projects/{id}/issues/{n}/approvals/{ask_id}` answers them, and
 `Timeline.tsx` has the buttons. Auto-denying would retire a working feature.
 
 Decision: `IssueRun` is attended for approvals and keeps its whole surface;
@@ -853,7 +853,7 @@ SessionPatch   { …, awaiting_human: Option<bool> }           // renamed from a
   "moved on" every open tab would keep an answerable card whose
   `ResolveApproval` the manager rejects. `AskResolved` is emitted on every
   `AskClosed` event; `ApprovalResolved` is still emitted for an answered
-  approval as today. Clients drop the card by `ask_id == call_id`. iOS drops
+  approval as today. Clients drop the card with the same `ask_id`. iOS drops
   nothing on it until PR 3 (stale card after an abandon — listed under
   Deferred).
 - Frames are dispatched by **queue watchers the gateway installs** in
@@ -1130,7 +1130,7 @@ dispatch_approval_*` get kind-aware siblings.
 The TUI and `baybo prompt` use `AskQueue` as a display mirror of approval
 cards. Its approval-typed surface survives as wrappers on the re-typed queue,
 importing from `baybo_human_ask`: `enqueue_mirror(ApprovalRequest)`
-(synthesizes `PendingAsk { ask_id: call_id, kind: Approval, phase: BeforeExecute, responder: None }`),
+(synthesizes `PendingAsk { ask_id, kind: Approval, phase: BeforeExecute, responder: None }`),
 `peek_head_approval() -> Option<ApprovalRequest>` (projects
 `AskRequest::Approval`, `None` for another kind), `list_approvals()`,
 `resolve_head(ApprovalDecision)`
@@ -1178,7 +1178,7 @@ Where the code differs from the sketch above, and why:
   queue (least privilege: a TUI connection cannot answer an owner ask) and
   calls `HumanAskManager::resolve`; the queue watchers dispatch
   `ApprovalResolved` + `AskResolved`. The board's
-  `POST …/approvals/{call_id}` reads the ledger row and answers only a
+  `POST …/approvals/{ask_id}` reads the ledger row and answers only a
   pending `Approval` row whose session's trigger is that issue, mapping
   `AskClosed` / `NotFound` to 404.
 - **The card bridge.** `CardPromptCloser`'s one method is

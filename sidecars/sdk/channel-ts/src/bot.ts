@@ -328,7 +328,7 @@ export interface PlatformApprovals<
    * to update the platform-side UI (e.g. edit the prompt message to
    * show the final decision).
    */
-  onResolved?(callId: string, decision: ApprovalDecision): Promise<void>;
+  onResolved?(askId: string, decision: ApprovalDecision): Promise<void>;
 
   /**
    * Register bot-specific handlers on a freshly-created bot before
@@ -812,7 +812,7 @@ export class BotChannel<BotHandle, ChatId>
     if (!this.approvals) {
       this.logger.warn(
         "approval request received but no approvals hook is configured; auto-denying",
-        req.callId,
+        req.askId,
       );
       this.statusCondenser?.onApprovalSettled(req.userId);
       return "deny";
@@ -826,11 +826,11 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   async onApprovalResolved(
-    callId: string,
+    askId: string,
     decision: ApprovalDecision,
   ): Promise<void> {
     const fn = this.approvals?.onResolved;
-    if (fn) await fn.call(this.approvals, callId, decision);
+    if (fn) await fn.call(this.approvals, askId, decision);
   }
 
   async onStartBot(cmd: StartBotCommand): Promise<BotStatusReport> {

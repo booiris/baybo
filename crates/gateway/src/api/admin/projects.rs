@@ -762,7 +762,7 @@ pub enum IssueEventBodyDto {
         reason: String,
     },
     ApprovalRequested {
-        call_id: String,
+        ask_id: String,
         /// Which run is parked, by attempt number. Absent when the card was
         /// not recording it yet, or when no run owns the prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -771,7 +771,7 @@ pub enum IssueEventBodyDto {
         summary: String,
     },
     ApprovalResolved {
-        call_id: String,
+        ask_id: String,
         decision: ApprovalDecisionDto,
         resolution: ApprovalResolutionDto,
     },
@@ -803,22 +803,22 @@ impl IssueEventBodyDto {
     fn with_handles(body: IssueEventBody, handles: &ActorHandles) -> Self {
         match body {
             IssueEventBody::ApprovalRequested {
-                call_id,
+                ask_id,
                 attempt,
                 tool,
                 summary,
             } => Self::ApprovalRequested {
-                call_id,
+                ask_id: ask_id.into_inner(),
                 attempt,
                 tool,
                 summary,
             },
             IssueEventBody::ApprovalResolved {
-                call_id,
+                ask_id,
                 decision,
                 resolution,
             } => Self::ApprovalResolved {
-                call_id,
+                ask_id: ask_id.into_inner(),
                 decision: decision.into(),
                 resolution: resolution.into(),
             },
@@ -1724,24 +1724,24 @@ pub struct ResolveApprovalRequest {
 
 #[utoipa::path(
     post,
-    path = "/projects/{project_id}/issues/{number}/approvals/{call_id}",
+    path = "/projects/{project_id}/issues/{number}/approvals/{ask_id}",
     tag = "projects",
     params(
         ("project_id" = String, Path, description = "Project id"),
         ("number" = i64, Path, description = "Issue number within the project"),
-        ("call_id" = String, Path, description = "The approval's call id, from its timeline entry"),
+        ("ask_id" = String, Path, description = "The approval's ask id, from its timeline entry"),
     ),
     request_body = ResolveApprovalRequest,
     responses(
         (status = 204, description = "The prompt was answered"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 404, description = "Unknown project or issue, or this card has no prompt waiting on that call", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue, or this card has no prompt waiting on that ask", body = ErrorBody),
         (status = 409, description = "The project is archived", body = ErrorBody),
     )
 )]
 async fn resolve_approval(
     State(state): State<AdminState>,
-    Path((project_id, number, call_id)): Path<(String, i64, String)>,
+    Path((project_id, number, ask_id)): Path<(String, i64, String)>,
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode> {
     let id = parse_project_id(&project_id)?;
@@ -1750,8 +1750,8 @@ async fn resolve_approval(
         .approvable_issue(&id, number)
         .await
         .map_err(project_err)?;
-    let not_waiting = || GatewayError::NotFound(format!("no approval waiting on call {call_id}"));
-    let ask_id: baybo_model::human_ask::AskId = call_id.parse().map_err(|_| not_waiting())?;
+    let not_waiting = || GatewayError::NotFound(format!("no approval waiting on ask {ask_id}"));
+    let ask_id: baybo_model::human_ask::AskId = ask_id.parse().map_err(|_| not_waiting())?;
     let row = state
         .human_asks
         .get(&ask_id)

@@ -132,7 +132,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
     private var refreshGeneration: UInt64 = 0
     /// Locally answered historical call ids stay retired until a live refresh
     /// proves what is still answerable.
-    @Published private var retiredApprovalCallIds: Set<String> = []
+    @Published private var retiredApprovalAskIds: Set<String> = []
     /// The card is stamped read once its timeline has rendered, and once —
     /// re-stamping per delivery would spend a round trip per comment.
     private var stampedRead = false
@@ -527,20 +527,20 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         persistMirror()
     }
 
-    func resolveApproval(callId: String, decision: IssueApprovalDecision) {
-        retiredApprovalCallIds.insert(callId)
+    func resolveApproval(askId: String, decision: IssueApprovalDecision) {
+        retiredApprovalAskIds.insert(askId)
         writeError = nil
         Task {
             do {
                 try await client.projectIssueApprovalResolve(
-                    projectId: projectId, number: number, callId: callId, decision: decision)
+                    projectId: projectId, number: number, askId: askId, decision: decision)
                 await refresh()
             } catch {
                 let message = ProjectsStore.message(from: error)
                 if ProjectsStore.readsAsGone(message) {
                     await refresh()
                 } else {
-                    retiredApprovalCallIds.remove(callId)
+                    retiredApprovalAskIds.remove(askId)
                     writeError = message
                 }
             }
@@ -671,7 +671,7 @@ final class IssueStore: ObservableObject, WebMediaTarget {
         // Timeline replay is historical; the live card bit authorizes the action.
         guard issueIsLive, timelineIsLive, issue?.approvalPending == true else { return [] }
         return IssueTimeline.pendingApprovals(in: events).filter {
-            !retiredApprovalCallIds.contains($0.callId)
+            !retiredApprovalAskIds.contains($0.askId)
         }
     }
 

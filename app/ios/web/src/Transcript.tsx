@@ -2643,7 +2643,7 @@ export function Transcript({
 
   // A prompt opened on `toolCallId`: badge that step as waiting. Keyed by the
   // TOOL call's id (`tool_call_id`), which is what the step carries — the
-  // prompt's own `call_id` is a fresh id per prompt and is only stashed so the
+  // prompt's own `ask_id` is a fresh id per prompt and is only stashed so the
   // matching `approval_resolved` can find the step again.
   const markStepAwaitingApproval = useCallback(
     (toolCallId: string, promptId: string) => {
@@ -2749,7 +2749,7 @@ export function Transcript({
       const awaitingByCall = new Map(
         pendingApprovals
           .filter((c) => c.tool_call_id)
-          .map((c) => [c.tool_call_id as string, c.call_id]),
+          .map((c) => [c.tool_call_id as string, c.ask_id]),
       );
       const steps = wireSteps.map(wireStepToWork).map((s) =>
         s.kind === "tool" && awaitingByCall.has(s.callId)
@@ -3353,13 +3353,13 @@ export function Transcript({
         // A tool call is blocked on the user. The prompt itself is NATIVE (the
         // composer's card); the transcript only badges the step that is waiting,
         // so the user can see WHICH call the card is asking about.
-        if (frame.tool_call_id) markStepAwaitingApproval(frame.tool_call_id, frame.call_id);
+        if (frame.tool_call_id) markStepAwaitingApproval(frame.tool_call_id, frame.ask_id);
         break;
       case "approval_resolved":
         // Answered (here, or on another client). The decision lands on the step
         // right away rather than waiting for the call to finish — an approved
         // call keeps running, sometimes for minutes.
-        resolveStepApproval(frame.call_id, frame.decision);
+        resolveStepApproval(frame.ask_id, frame.decision);
         break;
       case "turn_state":
         setTurnActive(frame.active);

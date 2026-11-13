@@ -882,13 +882,12 @@ impl BayboClient {
         self: Arc<Self>,
         project_id: String,
         number: i64,
-        call_id: String,
+        ask_id: String,
         decision: IssueApprovalDecision,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
             let client = self.gateway_client()?;
-            gateway_api::resolve_issue_approval(&client, project_id, number, call_id, decision)
-                .await
+            gateway_api::resolve_issue_approval(&client, project_id, number, ask_id, decision).await
         })
         .await
     }
@@ -1113,16 +1112,16 @@ impl BayboClient {
         .await
     }
 
-    /// Answer a pending tool-approval prompt (`call_id` from the
+    /// Answer a pending tool-approval prompt (`ask_id` from the
     /// `approval_requested` frame, or a `subscribe_state` bundle's
     /// `pending_approvals` card). Fire-and-forget on the active binding's chat
     /// leg: the gateway resolves the gate — releasing the blocked tool call —
     /// and broadcasts `approval_resolved`, which arrives back on the frame
-    /// sink. A decision the leg can't deliver errors here; the server-side gate
-    /// then times out and denies (fail-closed).
+    /// sink. A decision the leg can't deliver errors here; the prompt stays
+    /// pending on the gateway and can be answered again.
     pub async fn chat_resolve_approval(
         self: Arc<Self>,
-        call_id: String,
+        ask_id: String,
         decision: ApprovalDecision,
     ) -> Result<(), BayboError> {
         let this = self;
@@ -1130,10 +1129,10 @@ impl BayboClient {
             let decision = decision.into();
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    transport::resolve_approval(&this.relay, call_id, decision).await
+                    transport::resolve_approval(&this.relay, ask_id, decision).await
                 }
                 ActiveLeg::Direct => {
-                    transport::resolve_approval(&this.direct, call_id, decision).await
+                    transport::resolve_approval(&this.direct, ask_id, decision).await
                 }
             }
         })

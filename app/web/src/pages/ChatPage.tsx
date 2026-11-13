@@ -199,7 +199,7 @@ export interface TranscriptRow {
 }
 
 interface PendingApproval {
-  callId: string;
+  askId: string;
   sessionId: string;
   tool: string;
   description: string | null;
@@ -2965,7 +2965,7 @@ export function ChatPage() {
       if (!sessionId || !wsRef.current) return;
       const current = views[sessionId]?.pendingApproval;
       if (!current) return;
-      wsRef.current.resolveApproval(current.callId, decision);
+      wsRef.current.resolveApproval(current.askId, decision);
       // Optimistic dismissal — the server's ApprovalResolved fan-out
       // will also clear it via routeInboundFrame, harmless if it
       // arrives second.
@@ -4206,10 +4206,10 @@ export function routeInboundFrame(
           [sid]: {
             ...view,
             transcript: frame.tool_call_id
-              ? markStepAwaitingApproval(view.transcript, frame.tool_call_id, frame.call_id)
+              ? markStepAwaitingApproval(view.transcript, frame.tool_call_id, frame.ask_id)
               : view.transcript,
             pendingApproval: {
-              callId: frame.call_id,
+              askId: frame.ask_id,
               sessionId: sid,
               tool: frame.tool,
               description: frame.description ?? null,
@@ -4235,8 +4235,8 @@ export function routeInboundFrame(
         // a fresh object would force every SessionRow to re-render.
         let next: Record<string, SessionView> | null = null;
         for (const [sid, view] of Object.entries(prev)) {
-          const transcript = resolveStepApproval(view.transcript, frame.call_id, frame.decision);
-          const card = view.pendingApproval?.callId === frame.call_id;
+          const transcript = resolveStepApproval(view.transcript, frame.ask_id, frame.decision);
+          const card = view.pendingApproval?.askId === frame.ask_id;
           if (!card && transcript === view.transcript) continue;
           next ??= { ...prev };
           next[sid] = {
@@ -4567,9 +4567,9 @@ function approvalFromWire(decision: string | undefined): WorkStep['approval'] {
 export function markStepAwaitingApproval(
   prev: TranscriptRow[],
   toolCallId: string,
-  promptId: string,
+  askId: string,
 ): TranscriptRow[] {
-  return rewriteToolStep(prev, (s) => (s.toolCallId === toolCallId ? { ...s, awaitingApproval: promptId } : s));
+  return rewriteToolStep(prev, (s) => (s.toolCallId === toolCallId ? { ...s, awaitingApproval: askId } : s));
 }
 
 /** A prompt was answered (here or on another client): clear the badge and
@@ -4578,11 +4578,11 @@ export function markStepAwaitingApproval(
  *  the persisted twin. */
 export function resolveStepApproval(
   prev: TranscriptRow[],
-  promptId: string,
+  askId: string,
   decision: string,
 ): TranscriptRow[] {
   return rewriteToolStep(prev, (s) =>
-    s.awaitingApproval === promptId
+    s.awaitingApproval === askId
       ? { ...s, awaitingApproval: undefined, approval: approvalFromWire(decision) }
       : s,
   );
@@ -5677,7 +5677,7 @@ export function applySyncReplace(
 
 function approvalFromCard(sessionId: string, card: WireApprovalCard): PendingApproval {
   return {
-    callId: card.call_id,
+    askId: card.ask_id,
     sessionId,
     tool: card.tool,
     description: card.description ?? null,
@@ -5809,7 +5809,7 @@ export function applySubscribeState(
     // re-derived from the authoritative pending set: the `approval_requested`
     // frame that first set them may predate this connection.
     const awaitingByCall = new Map(
-      cards.filter((c) => c.tool_call_id).map((c) => [c.tool_call_id as string, c.call_id]),
+      cards.filter((c) => c.tool_call_id).map((c) => [c.tool_call_id as string, c.ask_id]),
     );
     const bundle = (frame.work_steps ?? []).map(workStepFromWire).map((step) =>
       step.kind === 'tool' &&
@@ -7352,7 +7352,7 @@ function ApprovalCard({
         <span className="font-bold uppercase tracking-wider text-sm break-words [overflow-wrap:anywhere]">
           Approval needed: {approval.tool}
         </span>
-        <span className="text-ink-soft font-mono text-xs shrink-0">{approval.callId.slice(0, 8)}</span>
+        <span className="text-ink-soft font-mono text-xs shrink-0">{approval.askId.slice(0, 8)}</span>
       </div>
       {approval.description ? (
         <div className="text-sm font-mono text-ink-soft break-words [overflow-wrap:anywhere]">

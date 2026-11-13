@@ -322,7 +322,7 @@ mod tests {
             kind: AskKind::Approval,
             phase: AskPhase::BeforeExecute,
             request: AskRequest::Approval(ApprovalRequest {
-                call_id: ask.parse().unwrap(),
+                ask_id: ask.parse().unwrap(),
                 tool_call_id: format!("tu-{ask}"),
                 session_id: SessionId::from(session),
                 user_id: "u".into(),

@@ -114,8 +114,8 @@ describe('describeEvent', () => {
       { kind: 'cancelled' },
       { kind: 'worktree_reclaimed', branch_deleted: true },
       { kind: 'worktree_kept', reason: 'contains modified or untracked files' },
-      { kind: 'approval_requested', call_id: 'c1', tool: 'Bash', summary: 'rm -rf build' },
-      { kind: 'approval_resolved', call_id: 'c1', decision: 'approve', resolution: 'answered' },
+      { kind: 'approval_requested', ask_id: 'c1', tool: 'Bash', summary: 'rm -rf build' },
+      { kind: 'approval_resolved', ask_id: 'c1', decision: 'approve', resolution: 'answered' },
       { kind: 'stage_completed', stage: 1 },
       { kind: 'filed', number: 13 },
       { kind: 'budget_exhausted', spent_micros: 5_000_000, limit_micros: 5_000_000 },
@@ -161,12 +161,12 @@ describe('eventTone', () => {
     expect(eventTone({ kind: 'run_settled', attempt: 1, status: 'failed' })).toBe('err');
     expect(eventTone({ kind: 'run_settled', attempt: 1, status: 'cancelled' })).toBe('muted');
     expect(eventTone({ kind: 'blocked', reason: 'waiting on the API' })).toBe('warn');
-    expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'deny', resolution: 'answered' })).toBe('err');
-    expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'approve', resolution: 'answered' })).toBe('ok');
+    expect(eventTone({ kind: 'approval_resolved', ask_id: 'c', decision: 'deny', resolution: 'answered' })).toBe('err');
+    expect(eventTone({ kind: 'approval_resolved', ask_id: 'c', decision: 'approve', resolution: 'answered' })).toBe('ok');
     // Nobody saying no is not a refusal: an expired window warns, a prompt
     // that died with its run is background noise.
-    expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'deny', resolution: 'timed_out' })).toBe('warn');
-    expect(eventTone({ kind: 'approval_resolved', call_id: 'c', decision: 'deny', resolution: 'abandoned' })).toBe('muted');
+    expect(eventTone({ kind: 'approval_resolved', ask_id: 'c', decision: 'deny', resolution: 'timed_out' })).toBe('warn');
+    expect(eventTone({ kind: 'approval_resolved', ask_id: 'c', decision: 'deny', resolution: 'abandoned' })).toBe('muted');
     // Warn, not the `default:` arm's muted. This switch has no `never` stop,
     // so a new kind compiles green and reads as background noise — which is
     // the wrong answer for a card that records a change nothing acted on.
@@ -180,14 +180,14 @@ describe('eventTone', () => {
 
 describe('approvalAsks', () => {
   it('keeps the command of a settled prompt, so the frozen card can show it', () => {
-    const ask = { kind: 'approval_requested' as const, call_id: 'c1', tool: 'Bash', summary: 'git push' };
+    const ask = { kind: 'approval_requested' as const, ask_id: 'c1', tool: 'Bash', summary: 'git push' };
     const asks = approvalAsks([
       { id: 'e1', number: 1, actor: { kind: 'user' }, body: ask, created_at_ms: 0 },
       {
         id: 'e2',
         number: 1,
         actor: { kind: 'user' },
-        body: { kind: 'approval_resolved', call_id: 'c1', decision: 'approve', resolution: 'answered' },
+        body: { kind: 'approval_resolved', ask_id: 'c1', decision: 'approve', resolution: 'answered' },
         created_at_ms: 1,
       },
     ] as unknown as Parameters<typeof approvalAsks>[0]);

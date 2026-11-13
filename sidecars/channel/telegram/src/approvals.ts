@@ -59,17 +59,17 @@ export class TelegramApprovals
       this.logger.warn(
         "approval request with no routable chat; auto-denying",
         req.userId,
-        req.callId,
+        req.askId,
       );
       return "deny";
     }
 
     const text = formatPrompt(req);
     const keyboard = new InlineKeyboard()
-      .text("Approve", `${CALLBACK_PREFIX}approve:${req.callId}`)
-      .text("Approve always", `${CALLBACK_PREFIX}approve_always:${req.callId}`)
+      .text("Approve", `${CALLBACK_PREFIX}approve:${req.askId}`)
+      .text("Approve always", `${CALLBACK_PREFIX}approve_always:${req.askId}`)
       .row()
-      .text("Deny", `${CALLBACK_PREFIX}deny:${req.callId}`);
+      .text("Deny", `${CALLBACK_PREFIX}deny:${req.askId}`);
 
     let messageId: number;
     try {
@@ -90,7 +90,7 @@ export class TelegramApprovals
     }
 
     return new Promise<ApprovalDecision>((resolve) => {
-      this.pending.set(req.callId, {
+      this.pending.set(req.askId, {
         botId: route.botId,
         handle: route.handle,
         chat: route.chat,
@@ -101,20 +101,20 @@ export class TelegramApprovals
   }
 
   onBotStopped(botId: string): void {
-    for (const [callId, entry] of this.pending) {
+    for (const [askId, entry] of this.pending) {
       if (entry.botId !== botId) continue;
-      this.pending.delete(callId);
+      this.pending.delete(askId);
       entry.resolve("deny");
     }
   }
 
   async onResolved(
-    callId: string,
+    askId: string,
     decision: ApprovalDecision,
   ): Promise<void> {
-    const entry = this.pending.get(callId);
+    const entry = this.pending.get(askId);
     if (!entry) return;
-    this.pending.delete(callId);
+    this.pending.delete(askId);
     entry.resolve(decision);
     try {
       // editMessageText identifies the target by (chat_id, message_id);
@@ -147,20 +147,20 @@ export class TelegramApprovals
       return;
     }
     const action = rest.slice(0, colon);
-    const callId = rest.slice(colon + 1);
+    const askId = rest.slice(colon + 1);
     const decision = toDecision(action);
     if (!decision) {
       await ctx.answerCallbackQuery({ text: "invalid action" });
       return;
     }
 
-    const entry = this.pending.get(callId);
+    const entry = this.pending.get(askId);
     if (!entry) {
       await ctx.answerCallbackQuery({ text: "already resolved" });
       return;
     }
 
-    this.pending.delete(callId);
+    this.pending.delete(askId);
     entry.resolve(decision);
     await ctx.answerCallbackQuery({ text: decisionLabel(decision) });
     try {

@@ -833,7 +833,7 @@ mod approvals {
         for _ in 0..200 {
             let timeline = manager.timeline(project, number).await.expect("timeline");
             if timeline.iter().any(|e| {
-                matches!(&e.body, IssueEventBody::ApprovalRequested { call_id: c, .. } if c == call_id)
+                matches!(&e.body, IssueEventBody::ApprovalRequested { ask_id: c, .. } if c == call_id)
             }) {
                 return;
             }
@@ -844,7 +844,7 @@ mod approvals {
 
     fn request(session: &SessionId, call_id: &str) -> ApprovalRequest {
         ApprovalRequest {
-            call_id: call_id.parse().unwrap(),
+            ask_id: call_id.parse().unwrap(),
             tool_call_id: String::new(),
             session_id: session.clone(),
             user_id: "owner".to_owned(),
@@ -977,12 +977,12 @@ mod approvals {
             .iter()
             .find_map(|e| match &e.body {
                 IssueEventBody::ApprovalRequested {
-                    call_id,
+                    ask_id,
                     tool,
                     summary,
                     ..
                 } => Some((
-                    call_id.clone(),
+                    ask_id.clone(),
                     tool.clone(),
                     summary.clone(),
                     e.actor.clone(),
@@ -1000,8 +1000,8 @@ mod approvals {
         );
         assert!(timeline.iter().any(|e| matches!(
             &e.body,
-            IssueEventBody::ApprovalResolved { call_id, decision, resolution }
-                if call_id == "c1"
+            IssueEventBody::ApprovalResolved { ask_id, decision, resolution }
+                if ask_id == "c1"
                     && *decision == ApprovalDecision::Deny
                     && *resolution == baybo_model::ApprovalResolution::Answered
         )));
@@ -1074,8 +1074,8 @@ mod approvals {
             timeline.iter().any(|e| {
                 matches!(
                     &e.body,
-                    IssueEventBody::ApprovalResolved { call_id, decision, resolution }
-                        if call_id == "c7"
+                    IssueEventBody::ApprovalResolved { ask_id, decision, resolution }
+                        if ask_id == "c7"
                             && *decision == ApprovalDecision::Deny
                             && *resolution == baybo_model::ApprovalResolution::Abandoned
                 )

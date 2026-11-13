@@ -365,8 +365,8 @@ struct ProjectBoardScreen: View {
             if !waiting.isEmpty {
                 BoardWaitingStrip(
                     items: waiting,
-                    onApprove: { number, callId, decision in
-                        answer(number: number, callId: callId, decision: decision)
+                    onApprove: { number, askId, decision in
+                        answer(number: number, askId: askId, decision: decision)
                     },
                     onOpen: { number in
                         appStore.openProjectIssue(project: projectId, number: number)
@@ -780,11 +780,11 @@ struct ProjectBoardScreen: View {
         }
     }
 
-    private func answer(number: Int64, callId: String, decision: IssueApprovalDecision) {
+    private func answer(number: Int64, askId: String, decision: IssueApprovalDecision) {
         Haptics.tap()
         Task {
             await projects.resolveApproval(
-                board: projectId, issue: number, callId: callId, decision: decision)
+                board: projectId, issue: number, askId: askId, decision: decision)
             await projects.refreshApprovalPrompts(board: projectId)
         }
     }

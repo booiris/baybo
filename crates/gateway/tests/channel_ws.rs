@@ -1033,7 +1033,7 @@ async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
         .await
         .expect("persist the session");
     let req = baybo_tools::ApprovalRequest {
-        call_id: "prompt-1".parse().unwrap(),
+        ask_id: "prompt-1".parse().unwrap(),
         tool_call_id: String::new(),
         session_id: "sess-blocked".into(),
         user_id: String::new(),
@@ -1780,7 +1780,7 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
         .approval_gate()
         .expect("gate");
     let req = baybo_tools::ApprovalRequest {
-        call_id: "prompt-ws".parse().unwrap(),
+        ask_id: "prompt-ws".parse().unwrap(),
         tool_call_id: "use-ws".into(),
         session_id: session.id.clone(),
         user_id: WEB_OPERATOR_USER_ID.into(),
@@ -1804,8 +1804,8 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
             .await
             .expect("the raise")
         {
-            Frame::ApprovalRequested { call_id, .. } => {
-                assert_eq!(call_id, "prompt-ws");
+            Frame::ApprovalRequested { ask_id, .. } => {
+                assert_eq!(ask_id, "prompt-ws");
                 saw_request = true;
             }
             Frame::SessionUpdated { .. } => {}
@@ -1816,7 +1816,7 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
     send_frame(
         &mut client,
         Frame::ResolveApproval {
-            call_id: "prompt-ws".parse().unwrap(),
+            ask_id: "prompt-ws".parse().unwrap(),
             decision: baybo_tools::ApprovalDecision::Approve,
         },
     )
@@ -1841,7 +1841,7 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
         closes,
         vec![
             Frame::ApprovalResolved {
-                call_id: "prompt-ws".parse().unwrap(),
+                ask_id: "prompt-ws".parse().unwrap(),
                 decision: baybo_tools::ApprovalDecision::Approve,
             },
             Frame::AskResolved {

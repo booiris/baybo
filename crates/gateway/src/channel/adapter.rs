@@ -393,7 +393,7 @@ async fn session_event_to_frame(
             })
         }
         SessionEvent::ApprovalRequested {
-            call_id,
+            ask_id,
             tool_call_id,
             session_id,
             user_id,
@@ -402,7 +402,7 @@ async fn session_event_to_frame(
             params_preview,
             description,
         } => Frame::ApprovalRequested {
-            call_id,
+            ask_id,
             tool_call_id: Some(tool_call_id),
             session_id,
             user_id,
@@ -412,8 +412,8 @@ async fn session_event_to_frame(
             description,
         },
         SessionEvent::ApprovalResolved {
-            call_id, decision, ..
-        } => Frame::ApprovalResolved { call_id, decision },
+            ask_id, decision, ..
+        } => Frame::ApprovalResolved { ask_id, decision },
         SessionEvent::AskResolved {
             ask_id, outcome, ..
         } => Frame::AskResolved { ask_id, outcome },
@@ -1040,7 +1040,7 @@ mod tests {
 
     fn approval_on_lazy_channel(ask_id: &str) -> baybo_tools::ApprovalRequest {
         baybo_tools::ApprovalRequest {
-            call_id: ask_id.parse().unwrap(),
+            ask_id: ask_id.parse().unwrap(),
             tool_call_id: format!("use-{ask_id}"),
             session_id: baybo_model::SessionId::from("sess-lazy"),
             user_id: "u".to_string(),

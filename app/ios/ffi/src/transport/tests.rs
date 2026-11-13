@@ -36,9 +36,9 @@ fn notice(session_id: &str, text: &str) -> Frame {
     ))
 }
 
-fn approval_resolved(call_id: &str) -> Frame {
+fn approval_resolved(ask_id: &str) -> Frame {
     frame(&format!(
-        r#"{{"kind":"approval_resolved","call_id":"{call_id}","decision":"approve"}}"#
+        r#"{{"kind":"approval_resolved","ask_id":"{ask_id}","decision":"approve"}}"#
     ))
 }
 
@@ -613,7 +613,7 @@ async fn a_session_less_frame_broadcasts_to_every_sink() {
     for sink in &sinks {
         assert_eq!(sink.kinds(), ["approval_resolved"]);
         let json: serde_json::Value = serde_json::from_str(&sink.frames()[0]).expect("parse frame");
-        assert_eq!(json["call_id"], "call-1");
+        assert_eq!(json["ask_id"], "call-1");
     }
 }
 

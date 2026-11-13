@@ -16,7 +16,7 @@ use crate::approval::{ApprovalDecision, ApprovalRequest};
 pub const ASK_USER_TOOL_NAME: &str = "AskUser";
 
 /// Identity of one ask. A UUID v4 when minted here; an ask raised through the
-/// approval path reuses the [`ApprovalRequest::call_id`] it was raised with.
+/// approval path reuses the [`ApprovalRequest::ask_id`] it was raised with.
 /// One tool call can raise several asks, so this — not the `tool_call_id` —
 /// is the unique key. Serialized as a bare string; deserializing an empty one
 /// fails.
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn approval_request_reads_input_without_tool_call_id() {
         let req: ApprovalRequest = serde_json::from_value(serde_json::json!({
-            "call_id": "c",
+            "ask_id": "c",
             "session_id": "s",
             "tool": "Bash",
             "accesses": [],

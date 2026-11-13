@@ -730,7 +730,7 @@
                     ])
                     pushDemo([
                         "kind": "approval_requested",
-                        "call_id": "demo-prompt-\(call)",
+                        "ask_id": "demo-prompt-\(call)",
                         "tool_call_id": call,
                         "session_id": sessionId,
                         "tool": "Bash",
@@ -752,7 +752,7 @@
             _ approval: PendingApproval, decision: ApprovalDecision
         ) -> Bool {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-approval"),
-                approval.callId.hasPrefix("demo-prompt-"),
+                approval.askId.hasPrefix("demo-prompt-"),
                 let toolCallId = approval.toolCallId
             else { return false }
             let decisionText =
@@ -762,7 +762,7 @@
                 }
             Task { @MainActor in
                 pushDemo([
-                    "kind": "approval_resolved", "call_id": approval.callId,
+                    "kind": "approval_resolved", "ask_id": approval.askId,
                     "decision": decisionText,
                 ])
                 try? await Task.sleep(for: .milliseconds(decision == .deny ? 300 : 1400))

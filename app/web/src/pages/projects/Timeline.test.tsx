@@ -165,7 +165,7 @@ describe('pending approvals', () => {
         events={[
           entry({
             kind: 'approval_requested',
-            call_id: 'c1',
+            ask_id: 'c1',
             tool: 'Bash',
             summary: 'rm -rf build',
             attempt: 4,
@@ -195,7 +195,7 @@ describe('pending approvals', () => {
       <Timeline
         events={[
           entry({ kind: 'moved', from: 'todo', to: 'in_progress' }),
-          entry({ kind: 'approval_requested', call_id: 'c2', tool: 'Bash', summary: 'git push' }),
+          entry({ kind: 'approval_requested', ask_id: 'c2', tool: 'Bash', summary: 'git push' }),
         ]}
         issue={ISSUE}
         onComment={vi.fn()}
@@ -214,13 +214,13 @@ describe('pending approvals', () => {
         events={[
           entry({
             kind: 'approval_requested',
-            call_id: 'c1',
+            ask_id: 'c1',
             tool: 'Bash',
             summary: 'rm -rf build',
           }),
           entry({
             kind: 'approval_resolved',
-            call_id: 'c1',
+            ask_id: 'c1',
             decision: 'deny',
             resolution: 'answered',
           }),

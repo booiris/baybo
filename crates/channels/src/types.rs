@@ -273,7 +273,7 @@ pub enum SessionEvent {
     /// publishes [`SessionEvent::ApprovalResolved`] to dismiss the
     /// prompt elsewhere.
     ApprovalRequested {
-        call_id: AskId,
+        ask_id: AskId,
         /// `call_id` of the TOOL call the prompt blocks (the id
         /// `ToolStarted`/`ToolCompleted` carry) — see
         /// [`baybo_model::approval::ApprovalRequest::tool_call_id`].
@@ -289,7 +289,7 @@ pub enum SessionEvent {
     /// drop the prompt. `session_id` is carried so the channel can
     /// fan out to the right subscriber set.
     ApprovalResolved {
-        call_id: AskId,
+        ask_id: AskId,
         session_id: SessionId,
         decision: ApprovalDecision,
     },

@@ -797,7 +797,7 @@ impl ApprovalHandle {
         description: Option<String>,
     ) -> ApprovalOutcome {
         let req = ApprovalRequest {
-            call_id: baybo_model::human_ask::AskId::new(),
+            ask_id: baybo_model::human_ask::AskId::new(),
             tool_call_id: self.tool_call_id.clone(),
             session_id: session_id.clone(),
             user_id: user.id.clone(),
@@ -844,7 +844,7 @@ impl ApprovalHandle {
         }
 
         let req = ApprovalRequest {
-            call_id: baybo_model::human_ask::AskId::new(),
+            ask_id: baybo_model::human_ask::AskId::new(),
             tool_call_id: self.tool_call_id.clone(),
             session_id: session_id.clone(),
             user_id: user.id.clone(),

@@ -88,14 +88,14 @@ pub fn subscribe_frame(session_id: &str) -> Frame {
     }
 }
 
-/// The user's answer to a pending approval prompt. `call_id` is the prompt's
+/// The user's answer to a pending approval prompt. `ask_id` is the prompt's
 /// own id (from `Frame::ApprovalRequested`), not the tool call's.
 pub fn resolve_approval_frame(
-    call_id: &baybo_model::human_ask::AskId,
+    ask_id: &baybo_model::human_ask::AskId,
     decision: WireApprovalDecision,
 ) -> Frame {
     Frame::ResolveApproval {
-        call_id: call_id.clone(),
+        ask_id: ask_id.clone(),
         decision,
     }
 }

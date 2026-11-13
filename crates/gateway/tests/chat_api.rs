@@ -1035,7 +1035,7 @@ async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
         .expect("owner channel");
     let gate = channel.approval_gate().expect("owner channel has a gate");
     let req = baybo_tools::ApprovalRequest {
-        call_id: "prompt-1".parse().unwrap(),
+        ask_id: "prompt-1".parse().unwrap(),
         tool_call_id: String::new(),
         session_id: SessionId::from(blocked.as_str()),
         user_id: String::new(),

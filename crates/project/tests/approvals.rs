@@ -221,10 +221,10 @@ impl Fixture {
             .into_iter()
             .filter_map(|row| match row.body {
                 IssueEventBody::ApprovalResolved {
-                    call_id,
+                    ask_id,
                     decision,
                     resolution,
-                } => Some((call_id, decision, resolution)),
+                } => Some((ask_id.into_inner(), decision, resolution)),
                 _ => None,
             })
             .collect()
@@ -237,7 +237,7 @@ impl Fixture {
             .expect("timeline")
             .into_iter()
             .filter_map(|row| match row.body {
-                IssueEventBody::ApprovalRequested { call_id, .. } => Some(call_id),
+                IssueEventBody::ApprovalRequested { ask_id, .. } => Some(ask_id.into_inner()),
                 _ => None,
             })
             .collect()
@@ -255,7 +255,7 @@ fn new_member(name: &str) -> baybo_project::NewTeamMember {
 
 fn request(session_id: &SessionId, call_id: &str) -> ApprovalRequest {
     ApprovalRequest {
-        call_id: call_id.parse().unwrap(),
+        ask_id: call_id.parse().unwrap(),
         tool_call_id: String::new(),
         session_id: session_id.clone(),
         user_id: "u".to_owned(),

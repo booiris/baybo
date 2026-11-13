@@ -531,7 +531,7 @@ pub struct TurnSnapshot {
 )]
 pub struct ApprovalCard {
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-    pub call_id: AskId,
+    pub ask_id: AskId,
     /// `call_id` of the TOOL call the prompt blocks — see
     /// [`Frame::ApprovalRequested::tool_call_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -818,10 +818,10 @@ pub enum Frame {
     /// abandons it.
     ApprovalRequested {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        call_id: AskId,
+        ask_id: AskId,
         /// `call_id` of the TOOL call this prompt blocks (the id
         /// `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
-        /// `call_id`, which is minted per prompt). Lets clients badge
+        /// `ask_id`, which is minted per prompt). Lets clients badge
         /// the exact work step that is waiting. The gateway always sends
         /// it; optional only so a client still parses an older gateway's
         /// frames, which omitted it.
@@ -845,13 +845,13 @@ pub enum Frame {
     /// frontends stay consistent.
     ApprovalResolved {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        call_id: AskId,
+        ask_id: AskId,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
     },
     /// Server → client: a pending ask of any kind left the pending set —
     /// answered, declined, or abandoned. Clients drop the card whose
-    /// `call_id` equals `ask_id`. Emitted on every close, beside
+    /// `ask_id` equals this frame's `ask_id`. Emitted on every close, beside
     /// [`Frame::ApprovalResolved`] for an answered approval; it is the only
     /// frame that retires an approval nobody decided.
     AskResolved {
@@ -863,7 +863,7 @@ pub enum Frame {
     /// previously saw in an [`Frame::ApprovalRequested`].
     ResolveApproval {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        call_id: AskId,
+        ask_id: AskId,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
     },
@@ -1359,7 +1359,7 @@ mod tests {
                 WireWorkStep::tool(Some("c1".into()), Some("edit".into()), None),
             ],
             pending_approvals: vec![ApprovalCard {
-                call_id: "c1".parse().unwrap(),
+                ask_id: "c1".parse().unwrap(),
                 tool_call_id: Some("t-use-1".into()),
                 user_id: "u1".into(),
                 tool: "fs.read".into(),
@@ -1566,7 +1566,7 @@ mod tests {
     fn round_trip_approval_requested() {
         use std::path::PathBuf;
         let frame = Frame::ApprovalRequested {
-            call_id: "c1".parse().unwrap(),
+            ask_id: "c1".parse().unwrap(),
             tool_call_id: Some("t-use-1".into()),
             session_id: "s1".into(),
             user_id: "u1".into(),
@@ -1583,7 +1583,7 @@ mod tests {
     #[test]
     fn round_trip_approval_resolved() {
         let frame = Frame::ApprovalResolved {
-            call_id: "c1".parse().unwrap(),
+            ask_id: "c1".parse().unwrap(),
             decision: ApprovalDecision::Approve,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1638,7 +1638,7 @@ mod tests {
     #[test]
     fn round_trip_resolve_approval() {
         let frame = Frame::ResolveApproval {
-            call_id: "c1".parse().unwrap(),
+            ask_id: "c1".parse().unwrap(),
             decision: ApprovalDecision::Deny,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());

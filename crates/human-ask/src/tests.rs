@@ -101,10 +101,10 @@ fn id(s: &str) -> AskId {
     s.parse().expect("ask id")
 }
 
-fn req(call_id: &str, session_id: &str) -> ApprovalRequest {
+fn req(ask_id: &str, session_id: &str) -> ApprovalRequest {
     ApprovalRequest {
-        call_id: id(call_id),
-        tool_call_id: format!("use-{call_id}"),
+        ask_id: id(ask_id),
+        tool_call_id: format!("use-{ask_id}"),
         session_id: session_id.into(),
         user_id: "u".into(),
         tool: "Bash".into(),
@@ -128,15 +128,15 @@ fn tokens() -> TurnTokens {
     }
 }
 
-fn row(call_id: &str, session_id: &str, phase: AskPhase) -> HumanAskRow {
+fn row(ask_id: &str, session_id: &str, phase: AskPhase) -> HumanAskRow {
     HumanAskRow {
-        ask_id: id(call_id),
+        ask_id: id(ask_id),
         session_id: session_id.into(),
         channel: ChannelType::owner(),
-        tool_call_id: format!("use-{call_id}"),
+        tool_call_id: format!("use-{ask_id}"),
         kind: AskKind::Approval,
         phase,
-        request: AskRequest::Approval(req(call_id, session_id)),
+        request: AskRequest::Approval(req(ask_id, session_id)),
         created_at: Utc::now(),
         resolved_at: None,
         resolution: None,
@@ -153,25 +153,25 @@ fn resolved(mut row: HumanAskRow, resolution: AskResolution) -> HumanAskRow {
 /// Spawn a gate request and wait until it is parked on the queue.
 async fn park(
     h: &Harness,
-    call_id: &str,
+    ask_id: &str,
     session_id: &str,
     phase: AskPhase,
     tokens: TurnTokens,
 ) -> tokio::task::JoinHandle<ApprovalOutcome> {
     let gate = Arc::clone(&h.gate);
-    let request = req(call_id, session_id);
+    let request = req(ask_id, session_id);
     let task = tokio::spawn(async move {
         gate.request(request, site(phase), AskCancel::new(tokens))
             .await
     });
-    let ask_id = id(call_id);
+    let ask_id = id(ask_id);
     for _ in 0..1000 {
         if h.queue.contains(&ask_id) {
             return task;
         }
         tokio::task::yield_now().await;
     }
-    panic!("gate never parked {call_id}");
+    panic!("gate never parked {ask_id}");
 }
 
 const APPROVE: AskResolution = AskResolution::Approval(ApprovalDecision::Approve);

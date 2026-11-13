@@ -5732,7 +5732,7 @@
         }
       }
     },
-    "/v1/projects/{project_id}/issues/{number}/approvals/{call_id}": {
+    "/v1/projects/{project_id}/issues/{number}/approvals/{ask_id}": {
       "post": {
         "tags": [
           "projects"
@@ -5759,9 +5759,9 @@
             }
           },
           {
-            "name": "call_id",
+            "name": "ask_id",
             "in": "path",
-            "description": "The approval's call id, from its timeline entry",
+            "description": "The approval's ask id, from its timeline entry",
             "required": true,
             "schema": {
               "type": "string"
@@ -5793,7 +5793,7 @@
             }
           },
           "404": {
-            "description": "Unknown project or issue, or this card has no prompt waiting on that call",
+            "description": "Unknown project or issue, or this card has no prompt waiting on that ask",
             "content": {
               "application/json": {
                 "schema": {
@@ -10090,12 +10090,15 @@
           {
             "type": "object",
             "required": [
-              "call_id",
+              "ask_id",
               "tool",
               "summary",
               "kind"
             ],
             "properties": {
+              "ask_id": {
+                "type": "string"
+              },
               "attempt": {
                 "type": [
                   "integer",
@@ -10103,9 +10106,6 @@
                 ],
                 "format": "int64",
                 "description": "Which run is parked, by attempt number. Absent when the card was\nnot recording it yet, or when no run owns the prompt."
-              },
-              "call_id": {
-                "type": "string"
               },
               "kind": {
                 "type": "string",
@@ -10124,13 +10124,13 @@
           {
             "type": "object",
             "required": [
-              "call_id",
+              "ask_id",
               "decision",
               "resolution",
               "kind"
             ],
             "properties": {
-              "call_id": {
+              "ask_id": {
                 "type": "string"
               },
               "decision": {

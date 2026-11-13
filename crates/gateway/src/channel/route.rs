@@ -199,7 +199,7 @@ async fn announce_pending_asks(sidecar: &Sidecar) {
     };
     for req in queue.list_approvals() {
         let frame = Frame::ApprovalRequested {
-            call_id: req.call_id,
+            ask_id: req.ask_id,
             tool_call_id: Some(req.tool_call_id),
             session_id: req.session_id,
             user_id: req.user_id,
@@ -576,8 +576,8 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                     break;
                 }
             }
-            Frame::ResolveApproval { call_id, decision } => {
-                resolve_approval(state, sidecar, &call_id, decision).await;
+            Frame::ResolveApproval { ask_id, decision } => {
+                resolve_approval(state, sidecar, &ask_id, decision).await;
             }
             Frame::HistoryAppend { session_id, entry } => {
                 if channel_type.as_str() != ChannelType::TUI {
@@ -748,7 +748,7 @@ async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session
         .pending_approvals(session_id)
         .into_iter()
         .map(|req| ApprovalCard {
-            call_id: req.call_id,
+            ask_id: req.ask_id,
             tool_call_id: Some(req.tool_call_id),
             user_id: req.user_id,
             tool: req.tool,

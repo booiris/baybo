@@ -798,7 +798,7 @@ announces which of these will happen before sending.
      — including an abandoned prompt (asks no longer time out), because the
      prompt is exactly where a reader would go looking. Pending-ness is derived (a request with no resolution on the
      same `call_id`), never a stored flag, on both sides of the wire.
-     Answering rides `POST …/issues/{n}/approvals/{call_id}`, which
+     Answering rides `POST …/issues/{n}/approvals/{ask_id}`, which
      resolves the **card** before touching the queue: the queue is keyed by
      call id alone, so that check is the only thing stopping one board from
      answering another's prompt.

@@ -425,11 +425,10 @@ impl AskQueue {
 
     // --- approval-typed surface for display mirrors (TUI, `baybo prompt`) ---
 
-    /// Append a display-only approval card. The ask id is the request's
-    /// `call_id`.
+    /// Append a display-only approval card, keyed by the request's `ask_id`.
     pub fn enqueue_mirror(&self, req: ApprovalRequest) {
         let ask = PendingAsk {
-            ask_id: req.call_id.clone(),
+            ask_id: req.ask_id.clone(),
             session_id: req.session_id.clone(),
             tool_call_id: req.tool_call_id.clone(),
             kind: AskKind::Approval,
@@ -469,7 +468,7 @@ impl AskQueue {
 
     /// Remove the entry with `ask_id` without deciding it — another client
     /// resolved it. `false` when no such entry is queued.
-    pub fn drop_call(&self, ask_id: &AskId) -> bool {
+    pub fn drop_ask(&self, ask_id: &AskId) -> bool {
         self.abandon(ask_id).is_some()
     }
 }
@@ -524,9 +523,9 @@ mod tests {
         s.parse().expect("ask id")
     }
 
-    fn raised(call_id: &str) -> PendingEdge {
+    fn raised(ask_id: &str) -> PendingEdge {
         PendingEdge::Raised {
-            ask_id: id(call_id),
+            ask_id: id(ask_id),
             kind: AskKind::Approval,
             tool: "Bash".into(),
         }
@@ -542,10 +541,10 @@ mod tests {
         (queue, seen)
     }
 
-    fn mirror_req(call_id: &str, session_id: &str) -> ApprovalRequest {
+    fn mirror_req(ask_id: &str, session_id: &str) -> ApprovalRequest {
         ApprovalRequest {
             tool_call_id: String::new(),
-            call_id: id(call_id),
+            ask_id: id(ask_id),
             session_id: session_id.into(),
             user_id: "u".into(),
             tool: "Bash".into(),
@@ -555,14 +554,14 @@ mod tests {
         }
     }
 
-    fn ask(call_id: &str, session_id: &str, phase: AskPhase) -> PendingAsk {
+    fn ask(ask_id: &str, session_id: &str, phase: AskPhase) -> PendingAsk {
         PendingAsk {
-            ask_id: id(call_id),
+            ask_id: id(ask_id),
             session_id: session_id.into(),
-            tool_call_id: format!("use-{call_id}"),
+            tool_call_id: format!("use-{ask_id}"),
             kind: AskKind::Approval,
             phase,
-            request: AskRequest::Approval(mirror_req(call_id, session_id)),
+            request: AskRequest::Approval(mirror_req(ask_id, session_id)),
         }
     }
 
@@ -585,10 +584,10 @@ mod tests {
         );
 
         seen.lock().clear();
-        assert!(queue.drop_call(&id("a1")));
+        assert!(queue.drop_ask(&id("a1")));
         assert!(seen.lock().is_empty(), "s1 still has a parked prompt");
 
-        assert!(queue.drop_call(&id("a2")));
+        assert!(queue.drop_ask(&id("a2")));
         assert_eq!(*seen.lock(), vec![("s1".into(), PendingEdge::Abandoned)]);
     }
 
@@ -602,7 +601,7 @@ mod tests {
             queue.pending_sessions(),
             HashSet::from([SessionId::from("s1"), SessionId::from("s2")])
         );
-        queue.drop_call(&id("b1"));
+        queue.drop_ask(&id("b1"));
         assert_eq!(
             queue.pending_sessions(),
             HashSet::from([SessionId::from("s1")])
@@ -701,10 +700,7 @@ mod tests {
             *sink.lock() = Some((ask_id, resolution));
         }));
         queue.enqueue_mirror(mirror_req("m1", "s1"));
-        assert_eq!(
-            queue.peek_head_approval().map(|r| r.call_id),
-            Some(id("m1"))
-        );
+        assert_eq!(queue.peek_head_approval().map(|r| r.ask_id), Some(id("m1")));
         assert!(queue.resolve_head(ApprovalDecision::Deny));
         assert_eq!(
             *got.lock(),
@@ -724,7 +720,7 @@ mod tests {
 
         queue.enqueue_mirror(mirror_req("a1", "s1"));
         assert_eq!(*seen.lock(), vec![(SessionId::from("s1"), 1, 1)]);
-        assert!(queue.drop_call(&id("a1")));
+        assert!(queue.drop_ask(&id("a1")));
         assert_eq!(seen.lock().len(), 2);
         assert_eq!(seen.lock()[1], (SessionId::from("s1"), 0, 0));
     }
@@ -743,11 +739,11 @@ mod tests {
 
             let threads: Vec<_> = ["x", "y"]
                 .into_iter()
-                .map(|call_id| {
+                .map(|ask_id| {
                     let q = queue.clone();
                     std::thread::spawn(move || {
-                        q.enqueue_mirror(mirror_req(call_id, "s1"));
-                        q.drop_call(&id(call_id));
+                        q.enqueue_mirror(mirror_req(ask_id, "s1"));
+                        q.drop_ask(&id(ask_id));
                     })
                 })
                 .collect();
@@ -807,7 +803,7 @@ mod tests {
         };
         spin_until(&parked);
 
-        assert!(queue.drop_call(&id("x")));
+        assert!(queue.drop_ask(&id("x")));
         queue.enqueue_mirror(mirror_req("y", "s1"));
         release.store(true, Ordering::SeqCst);
         raiser.join().expect("raiser");
@@ -849,7 +845,7 @@ mod tests {
         assert!(raised.is_err(), "the watcher was supposed to panic");
         assert!(log.lock().is_empty(), "…and to publish nothing");
 
-        assert!(queue.drop_call(&id("x")));
+        assert!(queue.drop_ask(&id("x")));
         assert_eq!(
             *log.lock(),
             vec![PendingEdge::Abandoned],
@@ -875,7 +871,7 @@ mod tests {
         let queue = AskQueue::new();
         queue.enqueue_mirror(mirror_req("a1", "s1"));
         assert_eq!(queue.len(), 1);
-        assert!(queue.drop_call(&id("a1")));
+        assert!(queue.drop_ask(&id("a1")));
         assert!(queue.is_empty());
     }
 

@@ -296,7 +296,7 @@ impl Channel {
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_approval_requested(
         &self,
-        call_id: AskId,
+        ask_id: AskId,
         tool_call_id: String,
         session_id: SessionId,
         user_id: String,
@@ -306,7 +306,7 @@ impl Channel {
         description: Option<String>,
     ) {
         self.dispatch_event(SessionEvent::ApprovalRequested {
-            call_id,
+            ask_id,
             tool_call_id,
             session_id,
             user_id,
@@ -321,12 +321,12 @@ impl Channel {
     /// prompt. Called by the ask watcher once the queue entry is gone.
     pub fn dispatch_approval_resolved(
         &self,
-        call_id: AskId,
+        ask_id: AskId,
         session_id: SessionId,
         decision: ApprovalDecision,
     ) {
         self.dispatch_event(SessionEvent::ApprovalResolved {
-            call_id,
+            ask_id,
             session_id,
             decision,
         });
