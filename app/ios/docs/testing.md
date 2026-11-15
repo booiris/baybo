@@ -294,13 +294,23 @@ job is filtered to the change it actually answers for.
   contract lives. Its first step, `scripts/ci-boot-sim.sh`, starts the
   simulator booting in the background so the ~2.5 min cold boot overlaps the
   build, and pins every xcodebuild to that device's UDID.
-- `ios-ui-smokes` (macos-26, after `ios-sim`, ~35 min) — `BayboUITests`,
-  **non-gating** (job-level `continue-on-error`, so a failure shows red without
-  failing the run). It runs the build products `ios-sim` uploaded
-  (`ios-build-products`, a tarball because artifacts drop file modes), so it
-  pays no Rust or Xcode build. It used to be the tail of `ios-sim`, which kept
-  the gating check open for the whole ~35 min; chained with `needs`, the two
-  never overlap, so it still holds one macOS slot at a time.
+- `ios-ui-smokes` (macos-26, after `ios-sim`, three shards of ~20-25 min) —
+  `BayboUITests`, **non-gating** (job-level `continue-on-error`, so a failure
+  shows red without failing the run). It runs the build products `ios-sim`
+  uploaded (`ios-build-products`, a tarball because artifacts drop file modes),
+  so it pays no Rust or Xcode build. It used to be the tail of `ios-sim`, which
+  kept the gating check open until the smokes ended.
+  - **Gated on `ios_ui`, narrower than `ios_native`:** only `App/`, `UITests/`,
+    `NotificationExtension/`, `project.yml`, `web/`, `ffi/`, `bindgen/` and
+    `scripts/ci-boot-sim.sh`. A PR confined to `crates/` or `remote-host/`
+    gets the `ios-sim` compile + unit gate but no smokes — they run on demo
+    fixtures with no gateway. What that gives up: a root-crate change that only
+    misbehaves at runtime in the app is not smoked on its own PR.
+  - **Sharded by test class** (`projects`, `media`, `rest`), the lists living
+    in the job's `SHARD_*` env. `rest` is everything the other two do not
+    name, so **a new test class needs no CI edit** — it lands in `rest`. The
+    shards run at the same time, so a smoke run holds up to three of the five
+    macOS slots; each shard still runs serially on one simulator.
 
 Two things a green CI does **not** mean:
 
@@ -313,7 +323,7 @@ Two things a green CI does **not** mean:
   have run. It waits on those required checks only, so the UI smokes never hold
   a merge.
 
-Because the repo is public, workflow logs and the `ios-xcresult` (UI) and
+Because the repo is public, workflow logs and the `ios-xcresult-<shard>` (UI) and
 `ios-unit-xcresult` artifacts are readable by anyone. The xcresult carries UI-test screenshots — of demo fixtures
 today, so nothing sensitive, but that is a fact to re-check before pointing a
 test at real data.
