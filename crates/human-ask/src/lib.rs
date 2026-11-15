@@ -26,7 +26,6 @@ pub use manager::{HumanAskManager, HumanAskManagerConfig, ReloadReport, ReloadSc
 pub use ports::{AskObserver, LivePendingAsks, ParkedOn, ResumeSink};
 pub use queue::{
     AskQueue, AskQueueEvent, AskQueues, AskWatcher, PendingAsk, PendingEdge, PendingWatcher,
-    ResolveFn,
 };
 
 #[cfg(test)]

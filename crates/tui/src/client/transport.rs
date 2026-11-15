@@ -1,21 +1,19 @@
 //! WebSocket + MessagePack-backed TUI transport.
 //!
-//! Wraps [`WsClient`] and a local [`AskQueue`]. User input is
+//! Wraps [`WsClient`] and the client's [`PendingApprovals`]. User input is
 //! sent as [`wire::Message`](baybo_channels::wire::Message) frames; streaming deltas, final responses,
 //! notices, and approval events flow back as typed [`wire::Frame`](baybo_channels::wire::Frame)s
 //! and are mapped onto the TUI's [`TransportEvent`].
 //!
 //! Outbound approvals — driven by the TUI's modal — travel over the
-//! same socket as [`wire::Frame::ResolveApproval`](baybo_channels::wire::Frame::ResolveApproval) so the gateway's
-//! per-connection approval gate releases the pending tool call.
+//! same socket as [`wire::Frame::ResolveApproval`](baybo_channels::wire::Frame::ResolveApproval), and the gateway
+//! hands the decision to the parked tool call.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use baybo_channels::wire::{Frame, Message as WireMessage};
 use baybo_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
-use baybo_human_ask::AskQueue;
-use baybo_model::human_ask::AskResolution;
 use baybo_model::{ChannelType, ContentBlock, SessionId};
 use baybo_tools::ApprovalRequest;
 use parking_lot::RwLock;
@@ -23,6 +21,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
+use super::approvals::{ApprovalAnswer, PendingApprovals};
 use super::ws::{WsClient, WsClientError};
 use crate::transport::{TransportEvent, TransportEventStream};
 
@@ -42,7 +41,7 @@ const HTTP_FORBIDDEN: u16 = 403;
 /// process — the TUI multiplexes all sessions over it.
 pub struct WsTransport {
     client: Arc<WsClient>,
-    approval_queue: AskQueue,
+    approvals: PendingApprovals,
     // Hold subscribe()'s pump handles so a second subscribe on a new
     // session doesn't race the previous one on the shared source.
     subscribe_lock: Arc<Mutex<()>>,
@@ -92,31 +91,12 @@ impl WsTransport {
         })?;
         let client = Arc::new(client);
 
-        let approval_queue = AskQueue::new();
-        // Local resolver: echo the modal's decision back to the gateway
-        // as a ResolveApproval frame so the tool gate releases
-        // server-side.
-        let client_for_resolver: Arc<WsClient> = Arc::clone(&client);
-        approval_queue.set_resolver(Arc::new(move |ask_id, resolution| {
-            // The TUI only mirrors approval cards.
-            let AskResolution::Approval(decision) = resolution else {
-                return;
-            };
-            let client = Arc::clone(&client_for_resolver);
-            tokio::spawn(async move {
-                let frame = Frame::ResolveApproval {
-                    ask_id: ask_id.clone(),
-                    decision,
-                };
-                if let Err(e) = client.send_raw(&frame).await {
-                    warn!(%ask_id, "approval resolution failed: {e}");
-                }
-            });
-        }));
+        let (approvals, answers) = PendingApprovals::new();
+        tokio::spawn(send_answers(Arc::clone(&client), answers));
 
         Ok(Self {
             client,
-            approval_queue,
+            approvals,
             subscribe_lock: Arc::new(Mutex::new(())),
             session_pin: Arc::new(RwLock::new(session_id)),
             initial_history: Mutex::new(Some(initial_history)),
@@ -172,7 +152,7 @@ impl WsTransport {
     pub async fn subscribe(&self) -> Result<TransportEventStream> {
         let (tx, rx) = mpsc::channel::<Result<TransportEvent>>(EVENT_CHAN_CAPACITY);
         let client: Arc<WsClient> = Arc::clone(&self.client);
-        let queue = self.approval_queue.clone();
+        let approvals = self.approvals.clone();
         let target = Arc::clone(&self.session_pin);
         let subscribe_lock = Arc::clone(&self.subscribe_lock);
 
@@ -196,7 +176,7 @@ impl WsTransport {
                     }
                 };
                 let target_snapshot = target.read().clone();
-                if let Some(event) = map_frame(frame, &target_snapshot, &queue)
+                if let Some(event) = map_frame(frame, &target_snapshot, &approvals)
                     && tx.send(Ok(event)).await.is_err()
                 {
                     return;
@@ -245,11 +225,10 @@ impl WsTransport {
         Ok(())
     }
 
-    /// Shared approval queue. The TUI renders pending entries from it
-    /// and the modal resolver echoes decisions back as
-    /// [`Frame::ResolveApproval`].
-    pub fn approval_queue(&self) -> AskQueue {
-        self.approval_queue.clone()
+    /// The approval cards the gateway asked this client to show. The TUI
+    /// renders the head; an answer goes back as [`Frame::ResolveApproval`].
+    pub fn approvals(&self) -> PendingApprovals {
+        self.approvals.clone()
     }
 
     /// Consume the one-shot history ring the gateway pushed right after
@@ -275,7 +254,25 @@ impl WsTransport {
     }
 }
 
-fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Option<TransportEvent> {
+/// Send each answer the UI gives as a [`Frame::ResolveApproval`], in order,
+/// until every [`PendingApprovals`] handle is gone.
+async fn send_answers(client: Arc<WsClient>, mut answers: mpsc::UnboundedReceiver<ApprovalAnswer>) {
+    while let Some((ask_id, decision)) = answers.recv().await {
+        let frame = Frame::ResolveApproval {
+            ask_id: ask_id.clone(),
+            decision,
+        };
+        if let Err(e) = client.send_raw(&frame).await {
+            warn!(%ask_id, "approval answer not sent: {e}");
+        }
+    }
+}
+
+fn map_frame(
+    frame: Frame,
+    target_session: &SessionId,
+    approvals: &PendingApprovals,
+) -> Option<TransportEvent> {
     match frame {
         Frame::AnswerDelta {
             session_id, text, ..
@@ -342,7 +339,7 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
                 return None;
             }
             debug!(%ask_id, tool, "approval added from gateway");
-            queue.enqueue_mirror(ApprovalRequest {
+            approvals.show(ApprovalRequest {
                 ask_id,
                 tool_call_id: tool_call_id.unwrap_or_default(),
                 session_id,
@@ -354,11 +351,11 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             });
             Some(TransportEvent::ApprovalRequested)
         }
-        // Every close, answered elsewhere or not: drop the mirrored card. A
-        // no-op when this client's own answer already removed it.
+        // Every close, answered elsewhere or not: drop the card. A no-op
+        // when this client's own answer already removed it.
         // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
         Frame::AskResolved { ask_id, .. } => {
-            let _ = queue.drop_ask(&ask_id);
+            approvals.close(&ask_id);
             None
         }
         Frame::Reasoning { .. } => {
@@ -387,15 +384,14 @@ fn map_frame(frame: Frame, target_session: &SessionId, queue: &AskQueue) -> Opti
             // The subscribe-time state bundle. The TUI tracks turn
             // activity locally and renders neither work steps nor the
             // task checklist, so only the pending-approval half matters:
-            // mirror each card into the local queue (drop-then-enqueue
-            // keeps a re-subscribe idempotent) so a prompt raised while
-            // this client was away still renders.
+            // show each card (a re-sent one replaces itself, so a
+            // re-subscribe is idempotent) so a prompt raised while this
+            // client was away still renders.
             if &session_id != target_session || pending_approvals.is_empty() {
                 return None;
             }
             for card in pending_approvals {
-                queue.drop_ask(&card.ask_id);
-                queue.enqueue_mirror(ApprovalRequest {
+                approvals.show(ApprovalRequest {
                     ask_id: card.ask_id,
                     tool_call_id: card.tool_call_id.unwrap_or_default(),
                     session_id: session_id.clone(),
@@ -515,14 +511,14 @@ mod tests {
 
     #[test]
     fn map_frame_forwards_delta_for_pinned_session() {
-        let queue = AskQueue::new();
+        let (approvals, _answers) = PendingApprovals::new();
         let target = sid("alpha");
         let frame = Frame::AnswerDelta {
             session_id: target.clone(),
             user_id: String::new(),
             text: "tick".into(),
         };
-        match map_frame(frame, &target, &queue) {
+        match map_frame(frame, &target, &approvals) {
             Some(TransportEvent::StreamDelta(text)) => assert_eq!(text, "tick"),
             other => panic!("expected StreamDelta, got {other:?}"),
         }
@@ -534,14 +530,14 @@ mod tests {
         // more Deltas for the old session id before our Unsubscribe
         // reaches it; the pump's filter must drop them rather than
         // leak old-session output into the new transcript.
-        let queue = AskQueue::new();
+        let (approvals, _answers) = PendingApprovals::new();
         let target = sid("beta");
         let frame = Frame::AnswerDelta {
             session_id: sid("alpha"),
             user_id: String::new(),
             text: "stale".into(),
         };
-        assert!(map_frame(frame, &target, &queue).is_none());
+        assert!(map_frame(frame, &target, &approvals).is_none());
     }
 
     #[test]
@@ -550,18 +546,18 @@ mod tests {
         // (including the `/new`-driven re-subscribe). Input history is
         // global to the TUI process, so the resend carries nothing the
         // pump cares about — it must be dropped, not warned about.
-        let queue = AskQueue::new();
+        let (approvals, _answers) = PendingApprovals::new();
         let target = sid("alpha");
         let frame = Frame::HistorySnapshot {
             session_id: target.clone(),
             entries: vec!["echo".into()],
         };
-        assert!(map_frame(frame, &target, &queue).is_none());
+        assert!(map_frame(frame, &target, &approvals).is_none());
     }
 
     #[test]
     fn map_frame_forwards_tool_lifecycle_for_pinned_session() {
-        let queue = AskQueue::new();
+        let (approvals, _answers) = PendingApprovals::new();
         let target = sid("alpha");
         match map_frame(
             Frame::ToolStarted {
@@ -572,7 +568,7 @@ mod tests {
                 label: Some("foo.rs".into()),
             },
             &target,
-            &queue,
+            &approvals,
         ) {
             Some(TransportEvent::ToolStarted {
                 call_id,
@@ -595,7 +591,7 @@ mod tests {
                 approval: None,
             },
             &target,
-            &queue,
+            &approvals,
         ) {
             Some(TransportEvent::ToolCompleted {
                 call_id,
@@ -615,14 +611,14 @@ mod tests {
         // The TUI renders an animated working indicator instead of the
         // reasoning trace, so a Reasoning frame is dropped unconditionally
         // — including one addressed to the pinned session.
-        let queue = AskQueue::new();
+        let (approvals, _answers) = PendingApprovals::new();
         let target = sid("alpha");
         let frame = Frame::Reasoning {
             session_id: target.clone(),
             user_id: String::new(),
             text: "a thought".into(),
         };
-        assert!(map_frame(frame, &target, &queue).is_none());
+        assert!(map_frame(frame, &target, &approvals).is_none());
     }
 
     #[test]
@@ -630,7 +626,7 @@ mod tests {
         // Subscribed-kind channels echo inbound to every subscriber —
         // including the sender. The TUI already rendered its own
         // prompt locally, so the echo must not duplicate the row.
-        let queue = AskQueue::new();
+        let (approvals, _answers) = PendingApprovals::new();
         let target = sid("alpha");
         let echo = Frame::Message(WireMessage {
             content: "hi".into(),
@@ -643,6 +639,6 @@ mod tests {
             role: MessageRole::User,
             ordinal: None,
         });
-        assert!(map_frame(echo, &target, &queue).is_none());
+        assert!(map_frame(echo, &target, &approvals).is_none());
     }
 }

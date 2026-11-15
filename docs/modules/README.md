@@ -110,12 +110,12 @@ pairing   ──► model, store (owns PairingService + code generator; consumes
 sandbox   ──► (no internal deps; OS sandbox runner consumed by agent — Bash tool)
 subagent  ──► model, session, tools (typed subagents + spawn_subagent tool; owns its Tool like skills/cron; profiles from <workspace>/agents/)
 task      ──► model, store, tools (planning-checklist Task* tools over the TaskStore trait; owns its Tool like cron/skills/subagent)
-human-ask ──► model, store, tools (durable approval/question asks — AskQueue/AskQueues, AskCore, ChannelAskGate/PolicyDenyGate, HumanAskManager; the AskUser tool lands in the AskUser stage; channels/gateway/tui/project/agent consume it; tools never depends back)
+human-ask ──► model, store, tools (durable approval/question asks — AskQueue/AskQueues, AskCore, ChannelAskGate/PolicyDenyGate, HumanAskManager; the AskUser tool lands in the AskUser stage; channels/gateway/project/agent consume it; tools never depends back)
 deck      ──► model, store, security, tools (card bundles + dry-run install gate + supervised host bun service runtime, unsandboxed; owns the DeckCardCreate/DeckCardUpdate tools; gateway consumes DeckManager)
 project   ──► model, store, tools, turn, workspace, human-ask (kanban boards: the ProjectManager write surface, the pure run/comment/stage/budget rules, per-issue git worktrees, the ask bridge (timeline observer + run-settle closer), the IssueRunStopper port that stops the turn under a live run, and the seven board tools; agent executes the runs it records, gateway serves the board)
 agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, turn, memory, cost, cron, project, security, sandbox, store, storage, channels
 gateway   ──► agent, channels, config, context, cron, cost, deck, human-ask, llm, model, pairing, project, query, security, session, skills, storage, store, tools, trace, turn, workspace
-tui       ──► channels, human-ask, model, tools (trait defs + shared types; talks to gateway over WS+MessagePack)
+tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over WS+MessagePack)
 setup     ──► agent, channels, config, gateway, llm, model, security, storage, store, workspace (interactive first-run wizard; baybo-cli's llm-add/channel-add wrap its flow primitives)
 bootstrap ──► config + all domain crates it assembles (entry point only)
 ```

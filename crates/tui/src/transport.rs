@@ -39,9 +39,9 @@ pub enum TransportEvent {
     Response(Vec<ContentBlock>),
     /// Out-of-band notice surfaced by the agent.
     Notice { level: NoticeLevel, text: String },
-    /// A new tool-call approval was queued on the shared
-    /// [`baybo_human_ask::AskQueue`]; the loop should refresh the
-    /// approval UI.
+    /// A new approval card is on the shared
+    /// [`PendingApprovals`](crate::client::PendingApprovals); the loop
+    /// should refresh the approval UI.
     ApprovalRequested,
 }
 

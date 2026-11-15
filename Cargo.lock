@@ -1309,7 +1309,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "baybo-channels",
- "baybo-human-ask",
  "baybo-model",
  "baybo-term-harness",
  "baybo-tools",
