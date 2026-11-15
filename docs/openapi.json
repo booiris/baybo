@@ -5341,7 +5341,7 @@
                         "properties": {
                           "approval_pending": {
                             "type": "boolean",
-                            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in PR 3 of the human-ask\nrollout (`docs/modules/human-ask.md`).",
+                            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in the iOS stage of the\nhuman-ask rollout (`docs/modules/human-ask.md`).",
                             "deprecated": true
                           },
                           "assignee": {
@@ -8371,7 +8371,7 @@
         "properties": {
           "approval_pending": {
             "type": "boolean",
-            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in PR 3 of the human-ask\nrollout (`docs/modules/human-ask.md`).",
+            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in the iOS stage of the\nhuman-ask rollout (`docs/modules/human-ask.md`).",
             "deprecated": true
           },
           "archived": {
@@ -9598,7 +9598,7 @@
         "properties": {
           "approval_pending": {
             "type": "boolean",
-            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in PR 3 of the human-ask\nrollout (`docs/modules/human-ask.md`).",
+            "description": "Deprecated twin of `awaiting_human`, always the same value. Kept for\nclients that predate the rename; removed in the iOS stage of the\nhuman-ask rollout (`docs/modules/human-ask.md`).",
             "deprecated": true
           },
           "assignee": {

@@ -1942,8 +1942,8 @@ export interface components {
             /**
              * @deprecated
              * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
-             *     clients that predate the rename; removed in PR 3 of the human-ask
-             *     rollout (`docs/modules/human-ask.md`).
+             *     clients that predate the rename; removed in the iOS stage of the
+             *     human-ask rollout (`docs/modules/human-ask.md`).
              */
             approval_pending?: boolean;
             /**
@@ -2724,8 +2724,8 @@ export interface components {
             /**
              * @deprecated
              * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
-             *     clients that predate the rename; removed in PR 3 of the human-ask
-             *     rollout (`docs/modules/human-ask.md`).
+             *     clients that predate the rename; removed in the iOS stage of the
+             *     human-ask rollout (`docs/modules/human-ask.md`).
              */
             approval_pending: boolean;
             /** @description The agent on it, if any. In Progress always has one. */
@@ -8065,8 +8065,8 @@ export interface operations {
                             /**
                              * @deprecated
                              * @description Deprecated twin of `awaiting_human`, always the same value. Kept for
-                             *     clients that predate the rename; removed in PR 3 of the human-ask
-                             *     rollout (`docs/modules/human-ask.md`).
+                             *     clients that predate the rename; removed in the iOS stage of the
+                             *     human-ask rollout (`docs/modules/human-ask.md`).
                              */
                             approval_pending: boolean;
                             /** @description The agent on it, if any. In Progress always has one. */

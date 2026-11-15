@@ -1,6 +1,6 @@
 //! Ask push relay.
 //!
-//! A tool call parked on an ask — an approval, or (from PR 2) a question —
+//! A tool call parked on an ask — an approval, or (once the `AskUser` stage lands) a question —
 //! waits until somebody answers it.
 //! Nothing on the [`TurnLifecycle`](baybo_turn::TurnLifecycle)
 //! bus fires while it waits — that bus only speaks in completed turns — so the
