@@ -2,8 +2,8 @@
 //!
 //! One queue per channel, not per session. Holds an entry for every ask a
 //! tool future in this process is parked on: each **live** entry carries the
-//! oneshot its waiter waits on. Display-only mirrors (the TUI, `baybo
-//! prompt`) are **dead** entries that carry none.
+//! oneshot its waiter waits on. The queue is the gateway's alone: a client
+//! that only shows cards (the TUI, `baybo prompt`) keeps its own list.
 //!
 //! The queue never touches the ledger. Watchers are sync, run outside the
 //! queue lock in mutation order, and must not block.
@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use baybo_model::approval::{ApprovalDecision, ApprovalRequest};
+use baybo_model::approval::ApprovalRequest;
 use baybo_model::human_ask::{
     ASK_USER_TOOL_NAME, AskId, AskKind, AskPhase, AskRequest, AskResolution,
 };
@@ -61,16 +61,11 @@ impl PendingAsk {
 }
 
 /// A queue slot: the ask plus, while a tool future waits on it, its oneshot.
-/// `None` is a display-only mirror.
+/// `None` is a dead ask, one no tool future waits on.
 struct Entry {
     ask: PendingAsk,
     responder: Option<oneshot::Sender<AskResolution>>,
 }
-
-/// Callback fired when a dead entry is resolved locally through
-/// [`AskQueue::resolve_head`]. The TUI installs one so its local resolution
-/// also reaches the gateway. Runs synchronously; spawn for async work.
-pub type ResolveFn = Arc<dyn Fn(AskId, AskResolution) + Send + Sync>;
 
 /// Which way a session crossed the "has at least one pending ask" boundary,
 /// and — on the way out — whether a human was behind it.
@@ -159,7 +154,6 @@ pub struct Removed {
 #[derive(Clone)]
 pub struct AskQueue {
     inner: Arc<Mutex<VecDeque<Entry>>>,
-    resolver: Arc<Mutex<Option<ResolveFn>>>,
     pending_watchers: Arc<Mutex<Arc<Vec<PendingWatcher>>>>,
     ask_watchers: Arc<Mutex<Arc<Vec<AskWatcher>>>>,
     /// Publications awaiting the drain, in the order their mutations
@@ -175,7 +169,6 @@ impl AskQueue {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
-            resolver: Arc::new(Mutex::new(None)),
             pending_watchers: Arc::new(Mutex::new(Arc::new(Vec::new()))),
             ask_watchers: Arc::new(Mutex::new(Arc::new(Vec::new()))),
             outbox: Arc::new(Mutex::new(VecDeque::new())),
@@ -308,16 +301,6 @@ impl AskQueue {
         self.liveness(ask_id).is_some()
     }
 
-    /// Install the callback [`Self::resolve_head`] runs for a dead entry.
-    /// Replaces any previous one.
-    pub fn set_resolver(&self, resolver: ResolveFn) {
-        *self.resolver.lock() = Some(resolver);
-    }
-
-    fn resolver(&self) -> Option<ResolveFn> {
-        self.resolver.lock().clone()
-    }
-
     fn push(&self, ask: PendingAsk, responder: Option<oneshot::Sender<AskResolution>>) {
         let session_id = ask.session_id.clone();
         let raised = PendingEdge::Raised {
@@ -343,7 +326,8 @@ impl AskQueue {
         self.push(ask, Some(responder));
     }
 
-    /// Enqueue an ask no tool future waits on (a display mirror).
+    /// Enqueue an ask no tool future waits on.
+    #[cfg(test)]
     fn push_dead(&self, ask: PendingAsk) {
         self.push(ask, None);
     }
@@ -422,55 +406,6 @@ impl AskQueue {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    // --- approval-typed surface for display mirrors (TUI, `baybo prompt`) ---
-
-    /// Append a display-only approval card, keyed by the request's `ask_id`.
-    pub fn enqueue_mirror(&self, req: ApprovalRequest) {
-        let ask = PendingAsk {
-            ask_id: req.ask_id.clone(),
-            session_id: req.session_id.clone(),
-            tool_call_id: req.tool_call_id.clone(),
-            kind: AskKind::Approval,
-            phase: AskPhase::BeforeExecute,
-            request: AskRequest::Approval(req),
-        };
-        self.push_dead(ask);
-    }
-
-    /// The head entry's approval request, `None` when the queue is empty or
-    /// the head is another kind.
-    pub fn peek_head_approval(&self) -> Option<ApprovalRequest> {
-        self.inner
-            .lock()
-            .front()
-            .and_then(|e| e.ask.approval().cloned())
-    }
-
-    /// Resolve the head entry with an approval decision. A live head's waiter
-    /// receives it; a dead head goes to the installed [`ResolveFn`]. `false`
-    /// when the queue is empty.
-    pub fn resolve_head(&self, decision: ApprovalDecision) -> bool {
-        let Some(head) = self.inner.lock().front().map(|e| e.ask.ask_id.clone()) else {
-            return false;
-        };
-        let resolution = AskResolution::Approval(decision);
-        let Some(removed) = self.resolve(&head, resolution.clone()) else {
-            return false;
-        };
-        if !removed.delivered
-            && let Some(resolver) = self.resolver()
-        {
-            resolver(removed.ask.ask_id, resolution);
-        }
-        true
-    }
-
-    /// Remove the entry with `ask_id` without deciding it — another client
-    /// resolved it. `false` when no such entry is queued.
-    pub fn drop_ask(&self, ask_id: &AskId) -> bool {
-        self.abandon(ask_id).is_some()
-    }
 }
 
 impl Default for AskQueue {
@@ -514,6 +449,8 @@ impl AskQueues {
 mod tests {
     use std::time::Duration;
 
+    use baybo_model::approval::ApprovalDecision;
+
     use super::*;
 
     /// Every `(session, edge)` the queue published, in order.
@@ -541,7 +478,7 @@ mod tests {
         (queue, seen)
     }
 
-    fn mirror_req(ask_id: &str, session_id: &str) -> ApprovalRequest {
+    fn approval_req(ask_id: &str, session_id: &str) -> ApprovalRequest {
         ApprovalRequest {
             tool_call_id: String::new(),
             ask_id: id(ask_id),
@@ -561,22 +498,16 @@ mod tests {
             tool_call_id: format!("use-{ask_id}"),
             kind: AskKind::Approval,
             phase,
-            request: AskRequest::Approval(mirror_req(ask_id, session_id)),
+            request: AskRequest::Approval(approval_req(ask_id, session_id)),
         }
-    }
-
-    #[test]
-    fn resolve_head_on_empty_is_noop() {
-        let queue = AskQueue::new();
-        assert!(!queue.resolve_head(ApprovalDecision::Approve));
     }
 
     #[test]
     fn pending_edges_fire_once_per_session_boundary_not_once_per_prompt() {
         let (queue, seen) = watched_queue();
-        queue.enqueue_mirror(mirror_req("a1", "s1"));
-        queue.enqueue_mirror(mirror_req("a2", "s1"));
-        queue.enqueue_mirror(mirror_req("b1", "s2"));
+        queue.push_dead(ask("a1", "s1", AskPhase::BeforeExecute));
+        queue.push_dead(ask("a2", "s1", AskPhase::BeforeExecute));
+        queue.push_dead(ask("b1", "s2", AskPhase::BeforeExecute));
         assert_eq!(
             *seen.lock(),
             vec![("s1".into(), raised("a1")), ("s2".into(), raised("b1"))],
@@ -584,24 +515,24 @@ mod tests {
         );
 
         seen.lock().clear();
-        assert!(queue.drop_ask(&id("a1")));
+        assert!(queue.abandon(&id("a1")).is_some());
         assert!(seen.lock().is_empty(), "s1 still has a parked prompt");
 
-        assert!(queue.drop_ask(&id("a2")));
+        assert!(queue.abandon(&id("a2")).is_some());
         assert_eq!(*seen.lock(), vec![("s1".into(), PendingEdge::Abandoned)]);
     }
 
     #[test]
     fn pending_sessions_dedupes_and_tracks_removal() {
         let (queue, _) = watched_queue();
-        queue.enqueue_mirror(mirror_req("a1", "s1"));
-        queue.enqueue_mirror(mirror_req("a2", "s1"));
-        queue.enqueue_mirror(mirror_req("b1", "s2"));
+        queue.push_dead(ask("a1", "s1", AskPhase::BeforeExecute));
+        queue.push_dead(ask("a2", "s1", AskPhase::BeforeExecute));
+        queue.push_dead(ask("b1", "s2", AskPhase::BeforeExecute));
         assert_eq!(
             queue.pending_sessions(),
             HashSet::from([SessionId::from("s1"), SessionId::from("s2")])
         );
-        queue.drop_ask(&id("b1"));
+        queue.abandon(&id("b1"));
         assert_eq!(
             queue.pending_sessions(),
             HashSet::from([SessionId::from("s1")])
@@ -692,23 +623,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_head_on_a_mirror_runs_the_resolver() {
-        let queue = AskQueue::new();
-        let got = Arc::new(Mutex::new(None));
-        let sink = Arc::clone(&got);
-        queue.set_resolver(Arc::new(move |ask_id, resolution| {
-            *sink.lock() = Some((ask_id, resolution));
-        }));
-        queue.enqueue_mirror(mirror_req("m1", "s1"));
-        assert_eq!(queue.peek_head_approval().map(|r| r.ask_id), Some(id("m1")));
-        assert!(queue.resolve_head(ApprovalDecision::Deny));
-        assert_eq!(
-            *got.lock(),
-            Some((id("m1"), AskResolution::Approval(ApprovalDecision::Deny)))
-        );
-    }
-
-    #[test]
     fn a_watcher_may_read_the_queue_without_deadlocking() {
         let queue = AskQueue::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -718,9 +632,9 @@ mod tests {
                 .push((session_id, probe.pending_sessions().len(), probe.len()));
         }));
 
-        queue.enqueue_mirror(mirror_req("a1", "s1"));
+        queue.push_dead(ask("a1", "s1", AskPhase::BeforeExecute));
         assert_eq!(*seen.lock(), vec![(SessionId::from("s1"), 1, 1)]);
-        assert!(queue.drop_ask(&id("a1")));
+        assert!(queue.abandon(&id("a1")).is_some());
         assert_eq!(seen.lock().len(), 2);
         assert_eq!(seen.lock()[1], (SessionId::from("s1"), 0, 0));
     }
@@ -742,8 +656,8 @@ mod tests {
                 .map(|ask_id| {
                     let q = queue.clone();
                     std::thread::spawn(move || {
-                        q.enqueue_mirror(mirror_req(ask_id, "s1"));
-                        q.drop_ask(&id(ask_id));
+                        q.push_dead(ask(ask_id, "s1", AskPhase::BeforeExecute));
+                        q.abandon(&id(ask_id));
                     })
                 })
                 .collect();
@@ -799,12 +713,12 @@ mod tests {
 
         let raiser = {
             let q = queue.clone();
-            std::thread::spawn(move || q.enqueue_mirror(mirror_req("x", "s1")))
+            std::thread::spawn(move || q.push_dead(ask("x", "s1", AskPhase::BeforeExecute)))
         };
         spin_until(&parked);
 
-        assert!(queue.drop_ask(&id("x")));
-        queue.enqueue_mirror(mirror_req("y", "s1"));
+        assert!(queue.abandon(&id("x")).is_some());
+        queue.push_dead(ask("y", "s1", AskPhase::BeforeExecute));
         release.store(true, Ordering::SeqCst);
         raiser.join().expect("raiser");
 
@@ -839,13 +753,13 @@ mod tests {
         let raised = {
             let q = queue.clone();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                q.enqueue_mirror(mirror_req("x", "s1"))
+                q.push_dead(ask("x", "s1", AskPhase::BeforeExecute))
             }))
         };
         assert!(raised.is_err(), "the watcher was supposed to panic");
         assert!(log.lock().is_empty(), "…and to publish nothing");
 
-        assert!(queue.drop_ask(&id("x")));
+        assert!(queue.abandon(&id("x")).is_some());
         assert_eq!(
             *log.lock(),
             vec![PendingEdge::Abandoned],
@@ -869,9 +783,9 @@ mod tests {
     #[test]
     fn a_queue_with_no_watcher_installed_still_mutates() {
         let queue = AskQueue::new();
-        queue.enqueue_mirror(mirror_req("a1", "s1"));
+        queue.push_dead(ask("a1", "s1", AskPhase::BeforeExecute));
         assert_eq!(queue.len(), 1);
-        assert!(queue.drop_ask(&id("a1")));
+        assert!(queue.abandon(&id("a1")).is_some());
         assert!(queue.is_empty());
     }
 
@@ -880,7 +794,7 @@ mod tests {
         let queues = AskQueues::new();
         assert!(queues.get(&ChannelType::owner()).is_none());
         let a = queues.get_or_create(&ChannelType::owner());
-        a.enqueue_mirror(mirror_req("a1", "s1"));
+        a.push_dead(ask("a1", "s1", AskPhase::BeforeExecute));
         let b = queues.get_or_create(&ChannelType::owner());
         assert_eq!(b.len(), 1, "same queue, not a fresh one");
         assert!(queues.get_or_create(&ChannelType::tui()).is_empty());

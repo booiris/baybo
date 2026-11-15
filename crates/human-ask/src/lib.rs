@@ -24,7 +24,6 @@ pub use manager::{HumanAskManager, HumanAskManagerConfig};
 pub use ports::{AskObserver, LivePendingAsks};
 pub use queue::{
     AskQueue, AskQueueEvent, AskQueues, AskWatcher, PendingAsk, PendingEdge, PendingWatcher,
-    ResolveFn,
 };
 
 #[cfg(test)]

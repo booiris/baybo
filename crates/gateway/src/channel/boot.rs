@@ -234,8 +234,8 @@ mod tests {
         assert!(reg.get(&ChannelType::tui()).is_some());
     }
 
-    #[test]
-    fn install_attaches_to_a_queue_that_already_exists() {
+    #[tokio::test]
+    async fn install_attaches_to_a_queue_that_already_exists() {
         let queues = AskQueues::new();
         let preloaded = queues.get_or_create(&ChannelType::owner());
         let reg = Arc::new(ChannelRegistry::new());
@@ -245,18 +245,24 @@ mod tests {
             &AskChannels::new(core(), queues.clone()),
         )
         .expect("install");
-        preloaded.enqueue_mirror(baybo_tools::ApprovalRequest {
-            ask_id: "c1".parse().unwrap(),
-            tool_call_id: "use-1".into(),
-            session_id: "s1".into(),
-            user_id: "u".into(),
-            tool: "Bash".into(),
-            accesses: vec![],
-            params_preview: "{}".into(),
-            description: None,
+        let gate = reg
+            .get(&ChannelType::owner())
+            .expect("owner")
+            .approval_gate()
+            .expect("gate");
+        let parked = tokio::spawn(async move {
+            gate.request(
+                ask_request("c1", "s1"),
+                AskSite::for_test(),
+                AskCancel::never(),
+            )
+            .await
         });
-        let owner = reg.get(&ChannelType::owner()).expect("owner");
-        assert_eq!(owner.pending_approvals(&"s1".into()).len(), 1);
+        let ask_id: AskId = "c1".parse().expect("ask id");
+        while !preloaded.contains(&ask_id) {
+            tokio::task::yield_now().await;
+        }
+        parked.abort();
     }
 
     #[test]

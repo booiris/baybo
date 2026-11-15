@@ -58,11 +58,11 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`, `RouterInbound::ResumeAsk`. |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
-| `baybo-gateway`, `baybo-agent`, `baybo-project`, `baybo-tui` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. `tui`: compile-only arms + TODO. |
+| `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingApprovals` and does not depend on this crate.) |
 
 Dependency edges, all acyclic: `human-ask → model, store, tools`;
 `channels → tools, human-ask`; `project → human-ask`;
-`agent, gateway, tui, baybo → human-ask`. `tools` never depends on
+`agent, gateway, baybo → human-ask`. `tools` never depends on
 `human-ask` (the "`baybo-tools` carries only generic ports" rule in
 `CLAUDE.md`), and `human-ask` never depends on `channels` — everything it
 needs from the channel layer (which queue, how to wake a client, how to reach
@@ -117,9 +117,9 @@ approval-typed is the payload surface — the oneshot and `ResolveFn`
 (`:274`) carry `ApprovalDecision`, `peek_head`/`enqueue_mirror` trade in
 `ApprovalRequest`, `push` reads `req.call_id`/`req.tool`. They move to
 `baybo_human_ask::queue` as `AskQueue` / `PendingAsk` with the oneshot and
-resolver carrying `AskResolution` and entries carrying `AskRequest`; the
-approval-typed surface the TUI and `baybo prompt` use survives as thin
-wrappers (see [Data model](#data-model)). What stays approval-specific stays where it
+resolver carrying `AskResolution` and entries carrying `AskRequest`. The
+approval-typed surface only the TUI and `baybo prompt` used leaves the queue
+altogether (see [Data model](#data-model)). What stays approval-specific stays where it
 is: `ApprovalRequest` (payload, moves to `baybo-model` so the store can type
 it), `ApprovalDecision`, `ApprovalOutcome`, `refusal_reason`, `ApprovalHandle`,
 `ApprovalGateMap` and the `ApprovalGate` trait (ports in `baybo-tools`).
@@ -139,8 +139,8 @@ The invariants the queue already carries and which the move must keep
   it, in mutation order. **Watchers run inline on the parked tool's future and
   must not block** — no sqlite write inside a watcher. The write-ahead insert
   happens in the async gate, *before* `push`.
-- `PendingAsk.responder: Option<oneshot::Sender<_>>` — `None` already models a
-  display-only mirror entry (TUI). Dead asks reuse this shape.
+- `PendingAsk.responder: Option<oneshot::Sender<_>>` — `None` is a dead ask,
+  one no tool future waits on.
 
 `tool_call_id` becomes a plain `String` everywhere the design touches:
 `ApprovalRequest`, `ApprovalHandle::new`, `QuestionHandle`, the row, the new
@@ -1011,17 +1011,16 @@ session is just a dead ask, which the Resume door and the prelude handle.
 - **TUI**: `map_frame` gets `Frame::QuestionAsked` in the silent-drop group
   with `// TODO(human-ask): render AskUser questions inline like ApprovalChatEntry`
   (the `tui` channel never receives it — `AskUser` is owner-only), but
-  `Frame::AskResolved { ask_id, .. }` is handled: `queue.drop_ask(&ask_id)`,
-  because the TUI mirrors every approval
+  `Frame::AskResolved { ask_id, .. }` is handled: `approvals.close(&ask_id)`,
+  because the TUI shows every approval
   card (`transport.rs:343-354, :390-402`) and an approval abandoned by
   another client would otherwise stay on screen with nothing to clear it
   now that the self-deny is gone. `ask: None` in the two `ToolCompleted`
   literals. No `TransportEvent` / `AppEvent` variants. The six approval-queue
   call sites (`app.rs:516-522`, `lib.rs:672-679`, `transport.rs:98-108, :343, :393`,
-  `prompt_cmd.rs:212-213, :621`) adapt to the re-typed queue through the
-  approval wrappers in [Data model](#data-model); `crates/tui/src/lib.rs:38`'s
-  `pub use baybo_tools::ApprovalQueue` and the fully-qualified rustdoc link
-  at `transport.rs:44` repoint to `baybo_human_ask::AskQueue`.
+  `prompt_cmd.rs:212-213, :621`) move onto the TUI's own `PendingApprovals`
+  (see [Data model](#data-model)), and `crates/tui/src/lib.rs:38`'s
+  `pub use baybo_tools::ApprovalQueue` goes.
 - **iOS**: compiles (`pump.rs:373` and the three `SessionPatch` test literals
   at `transport/tests.rs:261,284,309` follow the `awaiting_human` rename;
   `SessionListSink::on_approval_pending` keeps its name — it is a Swift
@@ -1129,16 +1128,13 @@ the `AskUser` stage);
 `Channel::pending_approvals / pending_approval_sessions / resolve_approval /
 dispatch_approval_*` get kind-aware siblings.
 
-The TUI and `baybo prompt` use `AskQueue` as a display mirror of approval
-cards. Its approval-typed surface survives as wrappers on the re-typed queue,
-importing from `baybo_human_ask`: `enqueue_mirror(ApprovalRequest)`
-(synthesizes `PendingAsk { ask_id, kind: Approval, phase: BeforeExecute, responder: None }`),
-`peek_head_approval() -> Option<ApprovalRequest>` (projects
-`AskRequest::Approval`, `None` for another kind), `list_approvals()`,
-`resolve_head(ApprovalDecision)`
-(wraps into `AskResolution::Approval`), `set_resolver` with
-`ResolveFn = Fn(AskId, AskResolution)` (the TUI resolver matches
-`Approval(d)` and ignores other variants), `drop_call`, `new`.
+`AskQueue` is the gateway's alone. The TUI and `baybo prompt` used to borrow
+`ApprovalQueue` as a display mirror (mirror entries with no waiter, a
+`ResolveFn` callback that turned a local resolve into a `ResolveApproval`
+frame); they keep their own list instead, `baybo_tui::client::PendingApprovals`
+(`show` / `close` / `head` / `answer_head`), whose answers a task on the
+transport sends as `ResolveApproval` frames. `baybo-tui` no longer depends on
+`baybo-human-ask`.
 
 ### Implementation notes (foundation stage)
 
@@ -1396,9 +1392,9 @@ leaves draft.
   → manager verb, filtered to `Approval`; `Arc<HumanAskManager>` on
   `ManagerGraph` / `GatewayDeps` / `AdminState` / `WsChannelState`; OpenAPI +
   `schema.d.ts` regen + the 13 `Issue` fixtures.
-- `baybo-tui`, `app/ios`: the six approval-queue call sites adapt to the
-  wrappers, `AskResolved` drops the mirror, rename follow-ups, re-exports and
-  rustdoc links; no new behaviour.
+- `baybo-tui`, `app/ios`: the six approval-queue call sites move onto the
+  TUI's own `PendingApprovals`, `AskResolved` closes the card, rename
+  follow-ups and rustdoc links; no new behaviour.
 - Docs: this file; `agent.md` (`:124-144`, `:241-254`, `:290`, `:307`),
   `turn.md` (kind table, descriptors, recovery, queue policy; fix the
   `origin = Spawned` claim at `:107`), `context.md:17`,

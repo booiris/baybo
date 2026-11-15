@@ -12,6 +12,8 @@
 //!   `/v1/channel-ws` (PSK-authenticated).
 //! * [`WsTransport`] — the TUI transport driven by the channel WS,
 //!   surfacing [`crate::transport::TransportEvent`]s to the run loop.
+//! * [`PendingApprovals`] — the approval cards the gateway asked this
+//!   client to show, and the door its answers go back through.
 //! * [`TuiSlashHandler`] — slash commands that the WS surface can
 //!   satisfy (`/clear`, `/quit`, dashboard shortcuts); other slashes
 //!   pass through to the agent. Tool approvals are handled by the
@@ -19,11 +21,13 @@
 //! * [`TuiDashboardProvider`] — dashboard views rendered as admin-only
 //!   placeholders, so keybindings keep working without misleading data.
 
+pub mod approvals;
 pub mod dashboard;
 pub mod slash;
 pub mod transport;
 pub mod ws;
 
+pub use approvals::PendingApprovals;
 pub use dashboard::TuiDashboardProvider;
 pub use slash::TuiSlashHandler;
 pub use transport::WsTransport;
