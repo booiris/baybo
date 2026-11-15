@@ -113,7 +113,7 @@
                     Self.demoBoardId: [
                         41: [
                             IssueApprovalPrompt(
-                                callId: "call-1", tool: "exec_command",
+                                askId: "call-1", tool: "exec_command",
                                 summary: "cargo test -p baybo-relay",
                                 askedBy: "dev-1", askedAtMs: Self.nowMs - 120_000)
                         ]

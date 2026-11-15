@@ -5,9 +5,9 @@ import Testing
 
 /// The four frame inputs of the approval gate. Each arm below encodes a bug the
 /// feature shipped with: the waker's duplicate `approval_requested`, the
-/// broadcast `approval_resolved` (matched by PROMPT id, never by session), the
-/// `subscribe_state` snapshot that REPLACES rather than appends, and the
-/// timed-out gate that only `tool_completed` retires.
+/// broadcast `ask_resolved` (matched by PROMPT id, never by session), the
+/// `subscribe_state` snapshot that REPLACES rather than appends, and
+/// `tool_completed` as the backstop that retires a card whose close was missed.
 ///
 /// The frame literals are spelled out rather than built from app constants: they
 /// are the WIRE contract with the gateway, and a test that reused the app's own
@@ -23,7 +23,7 @@ struct ApprovalQueueTests {
     private var queue = ApprovalQueue()
 
     private func requested(
-        callId: String = promptId,
+        askId: String = promptId,
         toolCallId: String? = ApprovalQueueTests.toolCallId,
         tool: String = "Bash",
         accesses: [[String: Any]] = []
@@ -31,7 +31,7 @@ struct ApprovalQueueTests {
         var frame: [String: Any] = [
             "kind": "approval_requested",
             "session_id": "s-1",
-            "call_id": callId,
+            "ask_id": askId,
             "tool": tool,
             "params_preview": #"{"command":"rm -rf /tmp/x"}"#,
             "accesses": accesses,
@@ -40,8 +40,8 @@ struct ApprovalQueueTests {
         return frame
     }
 
-    private func resolved(callId: String, sessionId: String = "s-1") -> [String: Any] {
-        ["kind": "approval_resolved", "session_id": sessionId, "call_id": callId]
+    private func resolved(askId: String, sessionId: String = "s-1") -> [String: Any] {
+        ["kind": "ask_resolved", "session_id": sessionId, "ask_id": askId, "outcome": "answered"]
     }
 
     private func toolCompleted(callId: String) -> [String: Any] {
@@ -55,7 +55,7 @@ struct ApprovalQueueTests {
     @Test mutating func requestedFrameQueuesACard() {
         let queued = queue.apply(requested())
         #expect(queued)
-        #expect(queue.cards.map(\.callId) == [Self.promptId])
+        #expect(queue.cards.map(\.askId) == [Self.promptId])
         #expect(queue.cards.first?.toolCallId == Self.toolCallId)
         #expect(queue.cards.first?.tool == "Bash")
         #expect(queue.cards.first?.paramsPreview == #"{"command":"rm -rf /tmp/x"}"#)
@@ -72,49 +72,49 @@ struct ApprovalQueueTests {
     }
 
     @Test mutating func distinctPromptsQueueOldestFirst() {
-        _ = queue.apply(requested(callId: "p-1", toolCallId: "t-1"))
-        _ = queue.apply(requested(callId: "p-2", toolCallId: "t-2"))
-        #expect(queue.cards.map(\.callId) == ["p-1", "p-2"])
+        _ = queue.apply(requested(askId: "p-1", toolCallId: "t-1"))
+        _ = queue.apply(requested(askId: "p-2", toolCallId: "t-2"))
+        #expect(queue.cards.map(\.askId) == ["p-1", "p-2"])
     }
 
     @Test mutating func resolvedRetiresThePromptById() {
         _ = queue.apply(requested())
-        let retired = queue.apply(resolved(callId: Self.promptId))
+        let retired = queue.apply(resolved(askId: Self.promptId))
         #expect(retired)
         #expect(queue.cards.isEmpty)
     }
 
-    /// `approval_resolved` is broadcast to EVERY session's sink, so the card is
+    /// `ask_resolved` is broadcast to EVERY session's sink, so the card is
     /// matched by prompt id alone. Filtering on `session_id` would strand a card
     /// another client already answered.
     @Test mutating func resolvedFromAnotherSessionStillRetiresTheCard() {
         _ = queue.apply(requested())
-        let retired = queue.apply(resolved(callId: Self.promptId, sessionId: "other-session"))
+        let retired = queue.apply(resolved(askId: Self.promptId, sessionId: "other-session"))
         #expect(retired)
         #expect(queue.cards.isEmpty)
     }
 
     @Test mutating func resolvedForAnUnknownPromptChangesNothing() {
         _ = queue.apply(requested())
-        let changed = queue.apply(resolved(callId: "never-heard-of-it"))
+        let changed = queue.apply(resolved(askId: "never-heard-of-it"))
         #expect(changed == false)
         #expect(queue.cards.count == 1)
     }
 
-    /// The id mixup, first direction. `approval_resolved.call_id` is the PROMPT
+    /// The id mixup, first direction. `ask_resolved.ask_id` is the PROMPT
     /// id; matching it against `toolCallId` compiles, typechecks, and silently
     /// retires the wrong card.
     @Test mutating func resolvedDoesNotMatchTheToolCallId() {
         _ = queue.apply(requested())
-        let changed = queue.apply(resolved(callId: Self.toolCallId))
+        let changed = queue.apply(resolved(askId: Self.toolCallId))
         #expect(changed == false)
-        #expect(queue.cards.map(\.callId) == [Self.promptId])
+        #expect(queue.cards.map(\.askId) == [Self.promptId])
     }
 
-    /// A gate that TIMES OUT denies server-side and broadcasts NO
-    /// `approval_resolved` — the tool's completion is the only signal that
-    /// retires the card. Its `call_id` is the BLOCKED TOOL CALL's id.
-    @Test mutating func toolCompletedRetiresATimedOutGate() {
+    /// A close this store missed (the leg was down when `ask_resolved` went out)
+    /// is retired by the tool's completion. Its `call_id` is the BLOCKED TOOL
+    /// CALL's id.
+    @Test mutating func toolCompletedRetiresAMissedClose() {
         _ = queue.apply(requested())
         let retired = queue.apply(toolCompleted(callId: Self.toolCallId))
         #expect(retired)
@@ -143,11 +143,11 @@ struct ApprovalQueueTests {
     /// replacing means a resubscribe resurrects a card the user already
     /// answered.
     @Test mutating func subscribeStateReplacesTheQueue() {
-        _ = queue.apply(requested(callId: "stale", toolCallId: "t-stale"))
+        _ = queue.apply(requested(askId: "stale", toolCallId: "t-stale"))
         let replaced = queue.apply(
-            subscribeState(pending: [requested(callId: "live", toolCallId: "t-live")]))
+            subscribeState(pending: [requested(askId: "live", toolCallId: "t-live")]))
         #expect(replaced)
-        #expect(queue.cards.map(\.callId) == ["live"])
+        #expect(queue.cards.map(\.askId) == ["live"])
     }
 
     @Test mutating func emptySubscribeStateClearsAnAnsweredCard() {
@@ -171,8 +171,8 @@ struct ApprovalQueueTests {
     @Test mutating func malformedRequestIsIgnored() {
         let malformed: [[String: Any]] = [
             ["kind": "approval_requested", "tool": "Bash"],
-            ["kind": "approval_requested", "call_id": "", "tool": "Bash"],
-            ["kind": "approval_requested", "call_id": "p-1"],
+            ["kind": "approval_requested", "ask_id": "", "tool": "Bash"],
+            ["kind": "approval_requested", "ask_id": "p-1"],
         ]
         for frame in malformed {
             let changed = queue.apply(frame)
@@ -192,15 +192,15 @@ struct ApprovalQueueTests {
     }
 
     /// The optimistic dismiss when the user taps approve/deny — the server's
-    /// `approval_resolved` fan-out confirms it, and re-adding the card on the
+    /// `ask_resolved` fan-out confirms it, and re-adding the card on the
     /// frame's return would flash a prompt they just answered.
     @Test mutating func resolveByPromptIdIsTheOptimisticDismiss() {
         _ = queue.apply(requested())
-        let dismissed = queue.resolve(callId: Self.promptId)
+        let dismissed = queue.resolve(askId: Self.promptId)
         #expect(dismissed)
         #expect(queue.cards.isEmpty)
 
-        let again = queue.resolve(callId: Self.promptId)
+        let again = queue.resolve(askId: Self.promptId)
         #expect(again == false)
     }
 

@@ -489,9 +489,9 @@ describe('finalizeTrailingAnswer — keep the /stop reply as a bubble', () => {
 });
 
 // Pins the approval labelling of a tool step: the badge tracks the PROMPT
-// (`approval_requested` → `approval_resolved`), the verdict rides the step,
-// and a call that finishes always retires the badge — including the gate
-// timing out, which broadcasts no resolution at all.
+// (`approval_requested` → `ask_resolved`), a decided close labels the step,
+// an undecided one only clears the badge, and a call that finishes always
+// retires the badge.
 
 describe('work-step approval labelling', () => {
   const withCall = (): TranscriptRow[] =>
@@ -510,8 +510,15 @@ describe('work-step approval labelling', () => {
     expect(out[0].steps?.[0].approval).toBe('approve_always');
   });
 
+  it('an undecided close clears the badge and labels nothing', () => {
+    const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    const out = resolveStepApproval(asked, 'prompt-9', undefined);
+    expect(out[0].steps?.[0].awaitingApproval).toBeUndefined();
+    expect(out[0].steps?.[0].approval).toBeUndefined();
+  });
+
   it('leaves a thread untouched when the resolved prompt is another session\'s', () => {
-    // `approval_resolved` is broadcast connection-wide, so every open thread
+    // `ask_resolved` is broadcast connection-wide, so every open thread
     // sees every decision. An unrelated one must not mint a new transcript.
     const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
     expect(resolveStepApproval(asked, 'prompt-other', 'deny')).toBe(asked);

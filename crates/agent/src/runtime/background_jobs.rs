@@ -215,7 +215,10 @@ mod tests {
 
     fn fixture() -> Fixture {
         let (tx, _rx) = mpsc::channel(8);
-        let supervisor = AgentSupervisor::new(tx);
+        let supervisor = AgentSupervisor::new(
+            tx,
+            std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+        );
         let parent = SessionId::from("parent");
         let (sender, mailbox) = mailbox::channel(8);
         supervisor

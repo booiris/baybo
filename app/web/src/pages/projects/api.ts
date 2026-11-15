@@ -410,14 +410,14 @@ export async function resolveApproval(
   client: AdminClient,
   projectId: string,
   number: number,
-  callId: string,
+  askId: string,
   decision: 'approve' | 'approve_always' | 'deny',
 ): Promise<Outcome<null>> {
   try {
     const { error, response } = await client.POST(
-      '/v1/projects/{project_id}/issues/{number}/approvals/{call_id}',
+      '/v1/projects/{project_id}/issues/{number}/approvals/{ask_id}',
       {
-        params: { path: { project_id: projectId, number, call_id: callId } },
+        params: { path: { project_id: projectId, number, ask_id: askId } },
         body: { decision },
       },
     );

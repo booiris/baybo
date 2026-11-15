@@ -144,9 +144,9 @@ export interface WireWorkStep {
  *  `approval_requested` frame minus `session_id` (the bundle carries it
  *  once). */
 export interface WireApprovalCard {
-  call_id: string;
+  ask_id: string;
   /** `call_id` of the TOOL call this prompt blocks (what `tool_started` /
-   *  `tool_completed` carry) — NOT the prompt's own `call_id`, which is minted
+   *  `tool_completed` carry) — NOT the prompt's own `ask_id`, which is minted
    *  per prompt. Lets the work block badge the step that is waiting. */
   tool_call_id?: string;
   user_id?: string;
@@ -254,7 +254,7 @@ export type Frame =
     }
   | {
       kind: 'approval_requested';
-      call_id: string;
+      ask_id: string;
       /** The blocked TOOL call — see `WireApprovalCard.tool_call_id`. */
       tool_call_id?: string;
       session_id: string;
@@ -264,8 +264,14 @@ export type Frame =
       params_preview: string;
       description?: string | null;
     }
-  | { kind: 'approval_resolved'; call_id: string; decision: string }
-  | { kind: 'resolve_approval'; call_id: string; decision: string }
+  | {
+      kind: 'ask_resolved';
+      ask_id: string;
+      outcome: 'answered' | 'declined' | 'abandoned';
+      /** Set when a human decided an approval; absent on every undecided close. */
+      decision?: string;
+    }
+  | { kind: 'resolve_approval'; ask_id: string; decision: string }
   | { kind: 'history_append'; session_id: string; entry: string }
   | { kind: 'history_snapshot'; session_id: string; entries: string[] }
   | { kind: 'start_bot'; bot_id: string; token: string }
@@ -443,8 +449,8 @@ export class ChatWs {
   }
 
   /** Echo a ResolveApproval back. */
-  resolveApproval(callId: string, decision: 'approve' | 'approve_always' | 'deny'): void {
-    this.sendFrame({ kind: 'resolve_approval', call_id: callId, decision });
+  resolveApproval(askId: string, decision: 'approve' | 'approve_always' | 'deny'): void {
+    this.sendFrame({ kind: 'resolve_approval', ask_id: askId, decision });
   }
 
   /** Tear the connection down permanently. No further reconnects. */

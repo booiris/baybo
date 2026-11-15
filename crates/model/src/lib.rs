@@ -7,6 +7,7 @@ mod external_agent;
 mod fingerprint;
 mod folder;
 mod governance;
+pub mod human_ask;
 mod ids;
 mod llm_entry_name;
 mod llm_pin;

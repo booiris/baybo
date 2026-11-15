@@ -12,7 +12,7 @@ struct BoardWaitingStrip: View {
         let title: String
         let prompt: IssueApprovalPrompt
 
-        var id: String { "approval-\(number)-\(prompt.callId)" }
+        var id: String { "approval-\(number)-\(prompt.askId)" }
     }
 
     var body: some View {
@@ -75,12 +75,12 @@ struct BoardWaitingStrip: View {
 
             HStack(spacing: 6) {
                 Button(lang.t("board.deny")) {
-                    onApprove(item.number, item.prompt.callId, .deny)
+                    onApprove(item.number, item.prompt.askId, .deny)
                 }
                 .buttonStyle(CompactPillButtonStyle(fill: nil, color: Theme.err, expands: false))
                 .accessibilityIdentifier("waiting-deny-\(item.number)")
                 Button(lang.t("board.approve")) {
-                    onApprove(item.number, item.prompt.callId, .approve)
+                    onApprove(item.number, item.prompt.askId, .approve)
                 }
                 .buttonStyle(
                     CompactPillButtonStyle(fill: Theme.ink, color: Theme.paper, expands: false))

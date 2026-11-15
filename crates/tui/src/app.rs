@@ -18,9 +18,9 @@ use baybo_model::SessionId;
 use ratatui::text::Line;
 use ratatui::widgets::TableState;
 
-use baybo_human_ask::AskQueue;
 use baybo_tools::{ApprovalDecision, ResourceAccess};
 
+use crate::client::PendingApprovals;
 use crate::markdown::MarkdownStream;
 
 const HISTORY_CAP: usize = 500;
@@ -29,7 +29,8 @@ const HISTORY_CAP: usize = 500;
 /// committed as a one-line summary to scrollback (once resolved).
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovalChatEntry {
-    pub call_id: String,
+    /// The blocked tool call, which keys its in-flight [`RunningTool`].
+    pub tool_call_id: String,
     pub tool: String,
     pub accesses: Vec<ResourceAccess>,
     pub params_preview: String,
@@ -195,7 +196,7 @@ pub(crate) struct AppState {
     /// never doubling up, never missing one.
     pub(crate) last_row_blank: bool,
     /// Active inline approval prompt. At most one is live at a time; further
-    /// queued requests stay on [`AskQueue`] until the head is resolved.
+    /// queued requests stay on [`PendingApprovals`] until the head is resolved.
     pub(crate) pending_approval: Option<ApprovalChatEntry>,
     /// Full list of slash commands for completion; sourced once at startup
     /// from `SlashHandler::commands()`.
@@ -207,10 +208,10 @@ pub(crate) struct AppState {
     /// (see [`CONFIRM_EXIT_WINDOW`]) commits the exit. Cleared by any other
     /// key so the confirmation doesn't linger across unrelated input.
     pub(crate) confirm_exit_at: Option<Instant>,
-    /// Shared pending-approval queue. Cloned into the event loop so key
-    /// handlers can drain entries. `None` means approval gating is disabled
+    /// Shared pending approval cards. Cloned into the event loop so key
+    /// handlers can answer them. `None` means approval gating is disabled
     /// for the test harness — production always wires this up.
-    pub(crate) approval: Option<AskQueue>,
+    pub(crate) approval: Option<PendingApprovals>,
     /// Plain (non-slash) messages submitted while a turn is in flight.
     /// Unlike [`AppState::outgoing_queue`], these are dispatched to the agent
     /// **immediately** (mid-turn steering — the agent folds them in once
@@ -374,15 +375,19 @@ impl AppState {
     }
 
     /// Buffer a resolved-approval summary onto its in-flight tool (matched by
-    /// `call_id`) so it commits between that tool's `●` and `⎿`. Returns the
+    /// the tool's `call_id`, which is the approval's `tool_call_id`) so it commits between that tool's `●` and `⎿`. Returns the
     /// lines back as `Err` when no such tool is tracked, so the caller can
     /// commit them standalone instead.
     pub(crate) fn buffer_approval_line(
         &mut self,
-        call_id: &str,
+        tool_call_id: &str,
         lines: Vec<Line<'static>>,
     ) -> Result<(), Vec<Line<'static>>> {
-        match self.running_tools.iter_mut().find(|t| t.call_id == call_id) {
+        match self
+            .running_tools
+            .iter_mut()
+            .find(|t| t.call_id == tool_call_id)
+        {
             Some(rt) => {
                 rt.approval_lines.extend(lines);
                 Ok(())
@@ -454,7 +459,7 @@ impl AppState {
         self.outgoing_queue.clear();
     }
 
-    pub(crate) fn with_approval(mut self, shared: AskQueue) -> Self {
+    pub(crate) fn with_approval(mut self, shared: PendingApprovals) -> Self {
         self.approval = Some(shared);
         self
     }
@@ -513,11 +518,11 @@ impl AppState {
         let mut entry = self.pending_approval.take()?;
         entry.state = ApprovalChatState::Resolved(decision);
 
-        if let Some(queue) = self.approval.as_ref() {
-            queue.resolve_head(decision);
-            if let Some(req) = queue.peek_head() {
+        if let Some(approvals) = self.approval.as_ref() {
+            approvals.answer_head(decision);
+            if let Some(req) = approvals.head() {
                 self.pending_approval = Some(ApprovalChatEntry {
-                    call_id: req.call_id,
+                    tool_call_id: req.tool_call_id,
                     tool: req.tool,
                     accesses: req.accesses,
                     params_preview: req.params_preview,
@@ -1201,7 +1206,7 @@ mod tests {
         app.note_response_pending();
         assert!(app.show_working());
         app.set_pending_approval(ApprovalChatEntry {
-            call_id: "call-1".into(),
+            tool_call_id: "use-1".into(),
             tool: "Bash".into(),
             accesses: Vec::new(),
             params_preview: String::new(),

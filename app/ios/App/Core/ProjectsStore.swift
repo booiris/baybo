@@ -486,15 +486,15 @@ final class ProjectsStore: ObservableObject {
 
     @discardableResult
     func resolveApproval(
-        board projectId: String, issue number: Int64, callId: String,
+        board projectId: String, issue number: Int64, askId: String,
         decision: IssueApprovalDecision
     ) async -> Bool {
         let snapshot = approvalPrompts[projectId]
-        retirePrompt(board: projectId, issue: number, callId: callId)
+        retirePrompt(board: projectId, issue: number, askId: askId)
 
         let answered = await write(board: projectId) { client in
             try await client.projectIssueApprovalResolve(
-                projectId: projectId, number: number, callId: callId, decision: decision)
+                projectId: projectId, number: number, askId: askId, decision: decision)
         }
         guard !answered else { return true }
         if Self.readsAsGone(writeError) {
@@ -516,11 +516,11 @@ final class ProjectsStore: ObservableObject {
         }
     #endif
 
-    private func retirePrompt(board projectId: String, issue number: Int64, callId: String) {
+    private func retirePrompt(board projectId: String, issue number: Int64, askId: String) {
         guard var forBoard = approvalPrompts[projectId], var forCard = forBoard[number] else {
             return
         }
-        forCard.removeAll { $0.callId == callId }
+        forCard.removeAll { $0.askId == askId }
         // An empty list and an absent key must not both mean "none waiting" —
         // the strip reads absence, so collapse to it.
         forBoard[number] = forCard.isEmpty ? nil : forCard

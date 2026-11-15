@@ -593,7 +593,10 @@ mod tests {
         let (_trigger_tx, cron_trigger_rx) = tokio::sync::mpsc::channel(1);
         let router = Router::from_config(RouterConfig {
             session_manager: Arc::clone(&sessions),
-            supervisor: AgentSupervisor::new(response_tx),
+            supervisor: AgentSupervisor::new(
+                response_tx,
+                std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+            ),
             channels: Arc::new(baybo_channels::ChannelRegistry::new()),
             security_gateway: Arc::new(SecurityGateway::new(
                 Arc::new(baybo_security::LeakDetector::with_default_rules()),

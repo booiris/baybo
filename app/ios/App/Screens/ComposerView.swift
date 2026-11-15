@@ -93,7 +93,7 @@ struct ComposerView: View {
                 }
                 // Re-key on the prompt so answering the head SWAPS in the next
                 // card (fresh one-shot latch) instead of reusing this view.
-                .id(approval.callId)
+                .id(approval.askId)
             }
 
             if !staging.staged.isEmpty {
@@ -147,7 +147,7 @@ struct ComposerView: View {
         .readingColumn()
         .padding(.top, 0)
         .padding(.bottom, dockBottomPadding)
-        .animation(.easeOut(duration: 0.2), value: store.pendingApprovals.first?.callId)
+        .animation(.easeOut(duration: 0.2), value: store.pendingApprovals.first?.askId)
         .background { composerVeil }
         .attachmentPickers(attach: attach, staging: staging, photoPicks: $photoPicks)
         .onAppear {

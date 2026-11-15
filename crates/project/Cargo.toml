@@ -12,6 +12,7 @@ doctest = false
 test-support = []
 
 [dependencies]
+baybo-human-ask = { workspace = true }
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
 baybo-tools = { workspace = true }
@@ -28,6 +29,7 @@ tokio = { workspace = true, features = ["fs", "process"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+baybo-human-ask = { workspace = true, features = ["test-support"] }
 baybo-session = { workspace = true, features = ["test-support"] }
 baybo-store = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }

@@ -24,7 +24,6 @@ baybo-model = { workspace = true }
 baybo-channels = { workspace = true }
 baybo-llm = { workspace = true }
 baybo-tools = { workspace = true }
-baybo-human-ask = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 baybo-context = { workspace = true }
 baybo-turn = { workspace = true }
@@ -39,6 +38,7 @@ baybo-session = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-deck = { workspace = true }
 baybo-project = { workspace = true }
+baybo-human-ask = { workspace = true }
 baybo-janitor = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-store = { workspace = true }

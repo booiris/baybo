@@ -192,10 +192,10 @@ async fn run_pump(
                         let frame = user_frame(&session_id, &text, &msg_id, attachments);
                         (frame, format!("send session={session_id} msg_id={msg_id}"))
                     }
-                    Some(OutboundCmd::ResolveApproval { call_id, decision }) => {
+                    Some(OutboundCmd::ResolveApproval { ask_id, decision }) => {
                         (
-                            resolve_approval_frame(&call_id, decision),
-                            format!("resolve_approval call_id={call_id}"),
+                            resolve_approval_frame(&ask_id, decision),
+                            format!("resolve_approval ask_id={ask_id}"),
                         )
                     }
                     None => {
@@ -370,7 +370,7 @@ pub(super) async fn dispatch_inbound_frame(ctx: &PumpCtx, frame: Frame) {
                     sink.on_title(session_id.as_str().to_owned(), title.clone())
                 });
             }
-            if let Some(pending) = patch.approval_pending {
+            if let Some(pending) = patch.awaiting_human {
                 with_global_sink(list_sink, |sink| {
                     sink.on_approval_pending(session_id.as_str().to_owned(), pending)
                 });

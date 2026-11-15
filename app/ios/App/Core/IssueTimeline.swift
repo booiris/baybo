@@ -20,7 +20,7 @@ struct IssueEvent: Equatable {
     let createdAtMs: Int64
     /// `approval_requested` / `approval_resolved`: the prompt's id, which is
     /// what an answer names. Distinct from the blocked tool call's own id.
-    let callId: String?
+    let askId: String?
     let tool: String?
     let summary: String?
     let decision: String?
@@ -62,7 +62,7 @@ struct IssueEvent: Equatable {
         default:
             self.actor = .user
         }
-        callId = body["call_id"] as? String
+        askId = body["ask_id"] as? String
         tool = body["tool"] as? String
         summary = body["summary"] as? String
         decision = body["decision"] as? String
@@ -79,7 +79,7 @@ struct IssuePerson: Equatable {
 }
 
 struct IssueApprovalPrompt: Equatable {
-    let callId: String
+    let askId: String
     let tool: String
     let summary: String?
     /// Who asked. A coordination run's prompt is the lead's, not the card
@@ -95,12 +95,12 @@ enum IssueTimeline {
         var open: [String: IssueApprovalPrompt] = [:]
         var order: [String] = []
         for event in events {
-            guard let callId = event.callId else { continue }
+            guard let askId = event.askId else { continue }
             switch event.kind {
             case "approval_requested":
-                if open[callId] == nil { order.append(callId) }
-                open[callId] = IssueApprovalPrompt(
-                    callId: callId,
+                if open[askId] == nil { order.append(askId) }
+                open[askId] = IssueApprovalPrompt(
+                    askId: askId,
                     tool: event.tool ?? "a tool",
                     summary: event.summary,
                     askedBy: {
@@ -110,8 +110,8 @@ enum IssueTimeline {
                     askedAtMs: event.createdAtMs
                 )
             case "approval_resolved":
-                open.removeValue(forKey: callId)
-                order.removeAll { $0 == callId }
+                open.removeValue(forKey: askId)
+                order.removeAll { $0 == askId }
             default:
                 continue
             }

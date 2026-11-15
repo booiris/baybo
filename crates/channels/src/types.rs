@@ -1,8 +1,10 @@
+use baybo_model::human_ask::AskId;
 use baybo_model::{ChannelType, ResourceAccess, SessionId, User};
 use baybo_model::{ContentBlock, MessageMetadata};
 use baybo_tools::ApprovalDecision;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use wire::AskOutcomeKind;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -265,13 +267,13 @@ pub enum SessionEvent {
     /// state.
     UserEcho(IncomingMessage),
     /// A tool call is blocked waiting for a human decision. Emitted by
-    /// the channel's [`baybo_tools::ApprovalGate`] waker so every
+    /// the channel's ask-queue watcher when the ask enters the queue, so every
     /// subscriber to the call's `session_id` can show the approval UI
     /// concurrently; the first `ResolveApproval` wins, and the channel
-    /// publishes [`SessionEvent::ApprovalResolved`] to dismiss the
-    /// prompt elsewhere.
+    /// publishes [`SessionEvent::AskResolved`] to dismiss the prompt
+    /// elsewhere.
     ApprovalRequested {
-        call_id: String,
+        ask_id: AskId,
         /// `call_id` of the TOOL call the prompt blocks (the id
         /// `ToolStarted`/`ToolCompleted` carry) — see
         /// [`baybo_model::approval::ApprovalRequest::tool_call_id`].
@@ -283,13 +285,16 @@ pub enum SessionEvent {
         params_preview: String,
         description: Option<String>,
     },
-    /// Some subscriber resolved a pending approval; concurrent UIs
-    /// drop the prompt. `session_id` is carried so the channel can
-    /// fan out to the right subscriber set.
-    ApprovalResolved {
-        call_id: String,
+    /// A pending ask of any kind closed — answered, declined or abandoned.
+    /// Dispatched for every close the channel's ask queue publishes, so an
+    /// approval nobody decided still leaves every open client. `session_id`
+    /// keys delivery; the frame drops it.
+    AskResolved {
         session_id: SessionId,
-        decision: ApprovalDecision,
+        ask_id: AskId,
+        outcome: AskOutcomeKind,
+        /// A human's decision on an approval; `None` otherwise.
+        decision: Option<ApprovalDecision>,
     },
 }
 
@@ -308,7 +313,7 @@ impl SessionEvent {
             SessionEvent::Agent(out) => &out.session_id,
             SessionEvent::UserEcho(m) => &m.message.session_id,
             SessionEvent::ApprovalRequested { session_id, .. } => session_id,
-            SessionEvent::ApprovalResolved { session_id, .. } => session_id,
+            SessionEvent::AskResolved { session_id, .. } => session_id,
         }
     }
 
@@ -320,7 +325,7 @@ impl SessionEvent {
             SessionEvent::Agent(out) => &out.user_id,
             SessionEvent::UserEcho(m) => &m.message.sender.id,
             SessionEvent::ApprovalRequested { user_id, .. } => user_id,
-            SessionEvent::ApprovalResolved { .. } => "",
+            SessionEvent::AskResolved { .. } => "",
         }
     }
 }

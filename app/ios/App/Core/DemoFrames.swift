@@ -705,7 +705,7 @@
         /// observer and the web reducer are the production ones; only the leg is
         /// fake — `resolveDemoApprovalIfRequested` answers the card in-process
         /// (there is no `chatResolveApproval` to call without a binding) by
-        /// pushing exactly the frames the gateway would: `approval_resolved`, then
+        /// pushing exactly the frames the gateway would: `ask_resolved`, then
         /// the tool's completion carrying the decision.
         ///
         /// Two prompts open at once (a parallel tool pair) so the queue counter
@@ -730,7 +730,7 @@
                     ])
                     pushDemo([
                         "kind": "approval_requested",
-                        "call_id": "demo-prompt-\(call)",
+                        "ask_id": "demo-prompt-\(call)",
                         "tool_call_id": call,
                         "session_id": sessionId,
                         "tool": "Bash",
@@ -752,7 +752,7 @@
             _ approval: PendingApproval, decision: ApprovalDecision
         ) -> Bool {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-approval"),
-                approval.callId.hasPrefix("demo-prompt-"),
+                approval.askId.hasPrefix("demo-prompt-"),
                 let toolCallId = approval.toolCallId
             else { return false }
             let decisionText =
@@ -762,8 +762,8 @@
                 }
             Task { @MainActor in
                 pushDemo([
-                    "kind": "approval_resolved", "call_id": approval.callId,
-                    "decision": decisionText,
+                    "kind": "ask_resolved", "ask_id": approval.askId,
+                    "outcome": "answered", "decision": decisionText,
                 ])
                 try? await Task.sleep(for: .milliseconds(decision == .deny ? 300 : 1400))
                 pushDemo([

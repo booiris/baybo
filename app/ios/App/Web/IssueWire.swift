@@ -14,6 +14,8 @@ enum IssueWire {
             "stage": issue.stage,
             "unread": issue.unread,
             "last_run_failed": issue.lastRunFailed,
+            // The gateway's REST twin until PR 3 retires `approval_pending`.
+            "awaiting_human": issue.approvalPending,
             "approval_pending": issue.approvalPending,
             "opened_by_agent": issue.openedByAgent,
             "created_at_ms": issue.createdAtMs,

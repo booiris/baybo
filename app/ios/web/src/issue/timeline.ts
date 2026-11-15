@@ -47,10 +47,10 @@ export function pendingApprovals(events: IssueEvent[]): IssueEvent[] {
   // the live approval_pending bit so cached requests cannot be answered.
   const open = new Map<string, IssueEvent>();
   for (const event of events) {
-    const callId = typeof event.body.call_id === "string" ? event.body.call_id : null;
-    if (callId === null) continue;
-    if (event.body.kind === "approval_requested") open.set(callId, event);
-    else if (event.body.kind === "approval_resolved") open.delete(callId);
+    const askId = typeof event.body.ask_id === "string" ? event.body.ask_id : null;
+    if (askId === null) continue;
+    if (event.body.kind === "approval_requested") open.set(askId, event);
+    else if (event.body.kind === "approval_resolved") open.delete(askId);
   }
   return [...open.values()];
 }

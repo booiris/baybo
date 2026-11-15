@@ -178,7 +178,7 @@ function PendingApproval({
   busy,
 }: {
   approval: PendingApprovalRow;
-  onResolve: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
+  onResolve: (askId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
   busy: boolean;
 }) {
   return (
@@ -195,7 +195,7 @@ function PendingApproval({
             type="button"
             disabled={busy}
             onClick={() => {
-              onResolve(approval.callId, 'approve');
+              onResolve(approval.askId, 'approve');
             }}
             className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold bg-brand text-ink disabled:opacity-50"
           >
@@ -205,7 +205,7 @@ function PendingApproval({
             type="button"
             disabled={busy}
             onClick={() => {
-              onResolve(approval.callId, 'approve_always');
+              onResolve(approval.askId, 'approve_always');
             }}
             className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] bg-surface disabled:opacity-50"
           >
@@ -215,7 +215,7 @@ function PendingApproval({
             type="button"
             disabled={busy}
             onClick={() => {
-              onResolve(approval.callId, 'deny');
+              onResolve(approval.askId, 'deny');
             }}
             className="border-2 border-err rounded-md px-2 py-0.5 font-mono text-[0.66rem] text-err bg-surface disabled:opacity-50"
           >
@@ -243,7 +243,7 @@ export function Timeline({
   events: IssueEvent[];
   issue: Issue;
   onComment: (text: string, attachments: IssueAttachmentRequest[]) => void;
-  onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
+  onResolveApproval: (askId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
   /// Handed to whoever owns the scroller, so it can watch this block for the
   /// height that lands late — a comment's attachment swapping its placeholder
   /// for the real image, and the composer growing under a long draft.
@@ -334,7 +334,7 @@ export function Timeline({
   // Approvals render where they happened rather than hoisted above the
   // history: a decision pulled out of its run loses the run it belonged to.
   const asks = approvalAsks(events);
-  const open = new Set(pendingApprovals(events).map((approval) => approval.callId));
+  const open = new Set(pendingApprovals(events).map((approval) => approval.askId));
   return (
     // A column that takes whatever height is left in the pane, so the entry
     // list can absorb the slack and leave the composer at the foot even on a
@@ -364,7 +364,7 @@ export function Timeline({
                   <ResolvedApproval
                     key={event.id}
                     event={event}
-                    ask={asks.get(event.body.call_id)}
+                    ask={asks.get(event.body.ask_id)}
                     now={now}
                   />
                 );
@@ -372,8 +372,8 @@ export function Timeline({
               if (event.body.kind === 'approval_requested') {
                 // Answered prompts are not narrated twice: the resolved card
                 // below carries the same command with its verdict on it.
-                if (!open.has(event.body.call_id)) return null;
-                const approval = asks.get(event.body.call_id);
+                if (!open.has(event.body.ask_id)) return null;
+                const approval = asks.get(event.body.ask_id);
                 return approval === undefined ? null : (
                   <PendingApproval
                     key={event.id}

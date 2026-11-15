@@ -35,7 +35,6 @@ mod markdown;
 pub mod smoke_contract;
 pub mod transport;
 
-pub use baybo_human_ask::AskQueue;
 pub use event::{LogLevel, LogRecord, TuiLogSink};
 pub use transport::{TransportEvent, TransportEventStream};
 
@@ -81,7 +80,7 @@ use crate::app::{
     AppState, ApprovalChatEntry, ApprovalChatState, BlockKind, CONFIRM_EXIT_WINDOW,
     TranscriptBlock, ViewMode,
 };
-use crate::client::WsTransport;
+use crate::client::{PendingApprovals, WsTransport};
 use crate::event::AppEvent;
 use crate::keymap::{Action, KeyContext, translate};
 
@@ -104,7 +103,7 @@ pub struct TuiAdapter {
     on_exit: Option<OnExit>,
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>,
-    approval_queue: AskQueue,
+    approvals: PendingApprovals,
     transport: Arc<WsTransport>,
 }
 
@@ -114,7 +113,7 @@ impl TuiAdapter {
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "tui-user".to_string());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(256);
-        let approval_queue = transport.approval_queue();
+        let approvals = transport.approvals();
         let initial_session_id = transport.current_session_id();
         Self {
             initial_session_id,
@@ -130,7 +129,7 @@ impl TuiAdapter {
             on_exit: None,
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
-            approval_queue,
+            approvals,
             transport,
         }
     }
@@ -183,7 +182,7 @@ impl TuiAdapter {
             dashboard_provider: self.dashboard_provider.clone(),
             model_label: self.model_label.clone(),
             on_exit: self.on_exit.clone(),
-            approval_queue: self.approval_queue.clone(),
+            approvals: self.approvals.clone(),
         };
 
         tokio::spawn(async move {
@@ -207,7 +206,7 @@ struct LoopCtx {
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     model_label: Option<String>,
     on_exit: Option<OnExit>,
-    approval_queue: AskQueue,
+    approvals: PendingApprovals,
 }
 
 async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sender<AppEvent>) {
@@ -272,7 +271,6 @@ async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sende
                     message: text,
                 })),
                 TransportEvent::ApprovalRequested => Some(AppEvent::ApprovalRequested),
-                TransportEvent::ApprovalResolved { .. } => None,
             };
             if let Some(ev) = forwarded
                 && event_tx.send(ev).await.is_err()
@@ -404,7 +402,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
         in_alt_screen: Arc::clone(&in_alt_screen),
     };
 
-    let mut state = AppState::new().with_approval(ctx.approval_queue.clone());
+    let mut state = AppState::new().with_approval(ctx.approvals.clone());
     state.session_id = ctx.initial_session_id.clone();
     state.set_model_label(ctx.model_label.clone());
     if let Some(handler) = ctx.slash_handler.as_ref() {
@@ -668,11 +666,11 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     }
                     AppEvent::ApprovalRequested => {
                         if !state.approval_pending()
-                            && let Some(queue) = state.approval.as_ref()
-                            && let Some(req) = queue.peek_head()
+                            && let Some(approvals) = state.approval.as_ref()
+                            && let Some(req) = approvals.head()
                         {
                             state.set_pending_approval(ApprovalChatEntry {
-                                call_id: req.call_id,
+                                tool_call_id: req.tool_call_id,
                                 tool: req.tool,
                                 accesses: req.accesses,
                                 params_preview: req.params_preview,
@@ -1607,7 +1605,7 @@ async fn interrupt_turn(
 
 /// Record the resolved approval. The decision sits between its tool's `●` and
 /// `⎿`, but that block is deferred until `ToolCompleted`, so buffer the line
-/// onto the in-flight tool (matched by `call_id`) and let it commit with the
+/// onto the in-flight tool (matched by `tool_call_id`) and let it commit with the
 /// block. If the tool isn't tracked (shouldn't happen), commit it standalone so
 /// the decision isn't lost.
 fn resolve_approval(
@@ -1619,7 +1617,7 @@ fn resolve_approval(
         return Ok(());
     };
     let lines = chat::render_approval_resolved_lines(&outcome.resolved);
-    if let Err(lines) = state.buffer_approval_line(&outcome.resolved.call_id, lines) {
+    if let Err(lines) = state.buffer_approval_line(&outcome.resolved.tool_call_id, lines) {
         flush_answer_boundary(state, terminal)?;
         commit_tool_lines(state, terminal, lines)?;
     }

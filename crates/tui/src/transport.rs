@@ -9,7 +9,6 @@ use std::pin::Pin;
 
 use baybo_channels::{NoticeLevel, Result};
 use baybo_model::ContentBlock;
-use baybo_tools::ApprovalDecision;
 use futures::Stream;
 
 /// Event shape surfaced by [`crate::client::WsTransport::subscribe`].
@@ -40,16 +39,10 @@ pub enum TransportEvent {
     Response(Vec<ContentBlock>),
     /// Out-of-band notice surfaced by the agent.
     Notice { level: NoticeLevel, text: String },
-    /// A new tool-call approval was queued on the shared
-    /// [`baybo_human_ask::AskQueue`]; the loop should refresh the
-    /// approval UI.
+    /// A new approval card is on the shared
+    /// [`PendingApprovals`](crate::client::PendingApprovals); the loop
+    /// should refresh the approval UI.
     ApprovalRequested,
-    /// An approval was resolved remotely (by another client); the loop
-    /// should drop any pending UI entry for `call_id`.
-    ApprovalResolved {
-        call_id: String,
-        decision: ApprovalDecision,
-    },
 }
 
 /// Stream of [`TransportEvent`]s produced by [`crate::client::WsTransport::subscribe`].

@@ -71,7 +71,7 @@ test("onRequested + tryResolveInbound happy path resolves with correct decision"
   // still resolves via tryResolveInbound regardless of prompt send.
   const pending = a.onRequested(
     {
-      callId: "c1",
+      askId: "c1",
       sessionId: "s",
       userId: "u",
       tool: "bash",
@@ -93,7 +93,7 @@ test("tryResolveInbound ignores non-keyword text and leaves pending intact", asy
   const chat = { toUserId: "u@im.wechat" };
   const pending = a.onRequested(
     {
-      callId: "c2",
+      askId: "c2",
       sessionId: "s",
       userId: "u",
       tool: "bash",
@@ -112,7 +112,7 @@ test("onRequested for a route=null auto-denies without touching state", async ()
   const a = new WeixinApprovals(stubLogger());
   const decision = await a.onRequested(
     {
-      callId: "c3",
+      askId: "c3",
       sessionId: "s",
       userId: "u",
       tool: "bash",
@@ -128,7 +128,7 @@ test("onBotStopped resolves all pending for that bot as deny", async () => {
   const h = fakeHandle();
   const chat = { toUserId: "u@im.wechat" };
   const p = a.onRequested(
-    { callId: "c4", sessionId: "s", userId: "u", tool: "bash", paramsPreview: "" },
+    { askId: "c4", sessionId: "s", userId: "u", tool: "bash", paramsPreview: "" },
     { botId: "bot1", handle: h, chat },
   );
   await new Promise((r) => setImmediate(r));
@@ -140,11 +140,11 @@ test("onStop flushes every pending", async () => {
   const a = new WeixinApprovals(stubLogger());
   const h = fakeHandle();
   const p1 = a.onRequested(
-    { callId: "x1", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
+    { askId: "x1", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
     { botId: "bot1", handle: h, chat: { toUserId: "u1@im.wechat" } },
   );
   const p2 = a.onRequested(
-    { callId: "x2", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
+    { askId: "x2", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
     { botId: "bot2", handle: h, chat: { toUserId: "u2@im.wechat" } },
   );
   await new Promise((r) => setImmediate(r));
@@ -158,11 +158,11 @@ test("second onRequested for same (bot, user) supersedes the first (old denies)"
   const h = fakeHandle();
   const chat = { toUserId: "u@im.wechat" };
   const first = a.onRequested(
-    { callId: "a", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
+    { askId: "a", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
     { botId: "bot1", handle: h, chat },
   );
   const second = a.onRequested(
-    { callId: "b", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
+    { askId: "b", sessionId: "s", userId: "u", tool: "t", paramsPreview: "" },
     { botId: "bot1", handle: h, chat },
   );
   await new Promise((r) => setImmediate(r));

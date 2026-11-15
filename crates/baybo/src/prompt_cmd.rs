@@ -33,9 +33,11 @@ use baybo_channels::{
     SessionEvent,
 };
 use baybo_config::BayboConfig;
-use baybo_human_ask::AskQueue;
 use baybo_model::{ChannelType, ContentBlock, MessageMetadata, SessionId, User};
-use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalRequest, AutoDenyGate};
+use baybo_tools::{
+    ApprovalDecision, ApprovalGate, ApprovalRequest, AskCancel, AskSite, AutoDenyGate,
+};
+use baybo_tui::client::PendingApprovals;
 use baybo_tui::{TransportEvent, TransportEventStream};
 use chrono::Utc;
 use futures::StreamExt;
@@ -180,7 +182,7 @@ async fn run_via_gateway(
         .submit(build_incoming(&session_id, &opts.prompt))
         .await?;
 
-    let approvals = transport.approval_queue();
+    let approvals = transport.approvals();
     let answer = await_turn(
         opts.timeout,
         consume_ws_turn(&approvals, &mut events, decision, opts.json),
@@ -194,7 +196,7 @@ async fn run_via_gateway(
 }
 
 async fn consume_ws_turn(
-    approvals: &AskQueue,
+    approvals: &PendingApprovals,
     events: &mut TransportEventStream,
     decision: ApprovalDecision,
     json: bool,
@@ -209,16 +211,15 @@ async fn consume_ws_turn(
             }
             TransportEvent::ApprovalRequested => {
                 // No human to decide; resolve over the wire so the turn
-                // never stalls on the gateway's approval-gate timeout.
-                let tool = approvals.peek_head().map(|r| r.tool).unwrap_or_default();
-                approvals.resolve_head(decision);
-                note_approval(decision, &tool);
+                // never parks on the gateway's approval gate.
+                if let Some(card) = approvals.answer_head(decision) {
+                    note_approval(decision, &card.tool);
+                }
             }
             TransportEvent::Notice { level, text } => eprint_notice(level, &text),
             TransportEvent::ToolStarted { .. }
             | TransportEvent::ToolCompleted { .. }
-            | TransportEvent::Status { .. }
-            | TransportEvent::ApprovalResolved { .. } => {}
+            | TransportEvent::Status { .. } => {}
         }
     }
     writer.finish_incomplete()
@@ -248,6 +249,9 @@ async fn run_in_process(
         Vec::new(),
     )
     .await?;
+    // No push task runs here: drop the ask push stream so the relay sees a
+    // closed channel (a no-op) rather than filling a queue nobody drains.
+    drop(graph.ask_push_stream.take());
 
     // Override the channel's interactive approval gate with a session-
     // scoped auto gate. Session-level wins over the type-level gate
@@ -389,7 +393,12 @@ struct AutoApproveGate;
 
 #[async_trait::async_trait]
 impl ApprovalGate for AutoApproveGate {
-    async fn request(&self, _req: ApprovalRequest) -> baybo_tools::ApprovalOutcome {
+    async fn request(
+        &self,
+        _req: ApprovalRequest,
+        _site: AskSite,
+        _cancel: AskCancel,
+    ) -> baybo_tools::ApprovalOutcome {
         baybo_tools::ApprovalOutcome::policy(ApprovalDecision::Approve)
     }
 }
@@ -573,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_final_message_is_canonical_answer() {
-        let q = AskQueue::new();
+        let (q, _answers) = PendingApprovals::new();
         let mut s = ws_stream(vec![
             TransportEvent::StreamDelta("hel".into()),
             TransportEvent::StreamDelta("lo".into()),
@@ -587,7 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_response_without_deltas_is_returned() {
-        let q = AskQueue::new();
+        let (q, _answers) = PendingApprovals::new();
         let mut s = ws_stream(vec![TransportEvent::Response(text_blocks("only final"))]);
         let out = consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
             .await
@@ -597,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_deltas_without_final_response_fall_back() {
-        let q = AskQueue::new();
+        let (q, _answers) = PendingApprovals::new();
         let mut s = ws_stream(vec![TransportEvent::StreamDelta("partial".into())]);
         let out = consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
             .await
@@ -607,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_empty_turn_errors() {
-        let q = AskQueue::new();
+        let (q, _answers) = PendingApprovals::new();
         let mut s = ws_stream(vec![]);
         assert!(
             consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
@@ -618,10 +627,10 @@ mod tests {
 
     #[tokio::test]
     async fn ws_approval_is_auto_resolved_from_queue() {
-        let q = AskQueue::new();
-        q.enqueue_mirror(ApprovalRequest {
+        let (q, _answers) = PendingApprovals::new();
+        q.show(ApprovalRequest {
             tool_call_id: String::new(),
-            call_id: "c1".into(),
+            ask_id: "c1".parse().unwrap(),
             session_id: SessionId::from("s1"),
             user_id: String::new(),
             tool: "BashTool".into(),
@@ -637,7 +646,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "done");
-        assert!(q.is_empty(), "approval entry should be resolved and popped");
+        assert!(q.is_empty(), "the card should be answered and taken off");
     }
 
     // ---- in-process path --------------------------------------------------

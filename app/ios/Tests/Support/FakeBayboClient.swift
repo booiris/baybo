@@ -24,7 +24,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     }
 
     struct ApprovalCall: Equatable {
-        let callId: String
+        let askId: String
         let decision: ApprovalDecision
     }
 
@@ -380,9 +380,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         return try outcome.get()
     }
 
-    func chatResolveApproval(callId: String, decision: ApprovalDecision) async throws {
+    func chatResolveApproval(askId: String, decision: ApprovalDecision) async throws {
         let error: Error? = lock.withLock {
-            approvals.append(ApprovalCall(callId: callId, decision: decision))
+            approvals.append(ApprovalCall(askId: askId, decision: decision))
             return approvalError
         }
         if let error { throw error }
@@ -815,11 +815,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         return json
     }
     func projectIssueApprovalResolve(
-        projectId: String, number: Int64, callId: String, decision: IssueApprovalDecision
+        projectId: String, number: Int64, askId: String, decision: IssueApprovalDecision
     ) async throws {
         try refuseIfOffline()
         let error = lock.withLock {
-            _approvalsResolved.append((number, callId, decision))
+            _approvalsResolved.append((number, askId, decision))
             return _approvalResolveError
         }
         if let error { throw error }

@@ -2124,14 +2124,14 @@ pub(crate) async fn resolve_issue_approval<C: GatewayJsonClient + Sync>(
     client: &C,
     project: String,
     number: i64,
-    call_id: String,
+    ask_id: String,
     decision: crate::api::IssueApprovalDecision,
 ) -> Result<(), String> {
-    validate_path_segment(&call_id, "call_id")?;
+    validate_path_segment(&ask_id, "ask_id")?;
     let path = format!(
         "{}/approvals/{}",
         issue_path(&project, number)?,
-        percent_encode(&call_id)
+        percent_encode(&ask_id)
     );
     let body = serde_json::to_vec(&ResolveIssueApprovalRequest {
         decision: match decision {
@@ -3975,7 +3975,7 @@ mod tests {
         assert!(!issues[0].approval_pending);
     }
 
-    /// Two answers, and the `call_id` rides the path rather than the body —
+    /// Two answers, and the `ask_id` rides the path rather than the body —
     /// the queue is keyed by it.
     #[tokio::test]
     async fn answering_a_card_prompt_names_the_call_in_the_path() {

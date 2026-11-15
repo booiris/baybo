@@ -163,7 +163,7 @@ Three things the hatch must NOT break, and how:
   hatch would silently do nothing. `TranscriptBridge` drops `persist` writes from
   `rebuildIfShowing()` until the fresh `ready`.
 - **Pending approvals.** Native and frame-derived; a sync page carries rows, not
-  prompts. Dropping one leaves a gate nobody can answer until it self-denies, so
+  prompts. Dropping one leaves a gate nobody can answer (asks never time out), so
   `resync` leaves the queue alone.
 
 ### The crash reload (the hatch's involuntary twin)

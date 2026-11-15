@@ -239,7 +239,7 @@ struct ProjectsStoreTests {
             [
                 12: [
                     IssueApprovalPrompt(
-                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1",
+                        askId: "c1", tool: "exec", summary: nil, askedBy: "dev-1",
                         askedAtMs: 1)
                 ]
             ])
@@ -284,7 +284,7 @@ struct ProjectsStoreTests {
             [
                 12: [
                     IssueApprovalPrompt(
-                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1",
+                        askId: "c1", tool: "exec", summary: nil, askedBy: "dev-1",
                         askedAtMs: 1)
                 ]
             ])
@@ -292,7 +292,7 @@ struct ProjectsStoreTests {
         #expect(!(await store.setCancelled(board: "p1", issue: 12, true)))
         #expect(store.boards["p1"]?.issues.first?.cancelledAtMs == nil)
         #expect(store.boards["p1"]?.runs.map(\.number) == [12])
-        #expect(store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c1"])
+        #expect(store.approvalPrompts["p1"]?[12]?.map(\.askId) == ["c1"])
     }
 
     @Test func offlineRefusesTheWriteInsteadOfQueueingIt() async {
@@ -349,18 +349,18 @@ struct ProjectsStoreTests {
             [
                 12: [
                     IssueApprovalPrompt(
-                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 1),
+                        askId: "c1", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 1),
                     IssueApprovalPrompt(
-                        callId: "c2", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 2),
+                        askId: "c2", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 2),
                 ]
             ])
 
         _ = await store.resolveApproval(
-            board: "p1", issue: 12, callId: "c1", decision: .approve)
-        #expect(store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c2"])
+            board: "p1", issue: 12, askId: "c1", decision: .approve)
+        #expect(store.approvalPrompts["p1"]?[12]?.map(\.askId) == ["c2"])
 
         _ = await store.resolveApproval(
-            board: "p1", issue: 12, callId: "c2", decision: .deny)
+            board: "p1", issue: 12, askId: "c2", decision: .deny)
         #expect(store.approvalPrompts["p1"]?[12] == nil)
         #expect(fake.approvalsResolved.map(\.1) == ["c1", "c2"])
         #expect(fake.approvalsResolved.map(\.2) == [.approve, .deny])
@@ -378,16 +378,16 @@ struct ProjectsStoreTests {
             [
                 12: [
                     IssueApprovalPrompt(
-                        callId: "c1", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 1)
+                        askId: "c1", tool: "exec", summary: nil, askedBy: "dev-1", askedAtMs: 1)
                 ]
             ])
 
         fake.failProjects = true
         let answered = await store.resolveApproval(
-            board: "p1", issue: 12, callId: "c1", decision: .approve)
+            board: "p1", issue: 12, askId: "c1", decision: .approve)
         #expect(!answered)
         #expect(
-            store.approvalPrompts["p1"]?[12]?.map(\.callId) == ["c1"],
+            store.approvalPrompts["p1"]?[12]?.map(\.askId) == ["c1"],
             "a prompt still waiting must come back")
     }
 
