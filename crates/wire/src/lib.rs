@@ -64,13 +64,16 @@ pub enum AskOutcomeKind {
     Abandoned,
 }
 
-impl From<&AskResolution> for AskOutcomeKind {
-    fn from(resolution: &AskResolution) -> Self {
-        match resolution {
-            AskResolution::Approval(_) | AskResolution::Answered(_) => Self::Answered,
-            AskResolution::Declined | AskResolution::PolicyDenied => Self::Declined,
-            AskResolution::Abandoned => Self::Abandoned,
-        }
+/// What clients learn when `resolution` closes an ask: how it closed, and a
+/// human's decision when one decided an approval. The one projection of an
+/// [`AskResolution`] onto [`Frame::AskResolved`] — answer payloads and
+/// server-side distinctions stay behind it.
+pub fn ask_close(resolution: &AskResolution) -> (AskOutcomeKind, Option<ApprovalDecision>) {
+    match resolution {
+        AskResolution::Approval(decision) => (AskOutcomeKind::Answered, Some(*decision)),
+        AskResolution::Answered(_) => (AskOutcomeKind::Answered, None),
+        AskResolution::Declined | AskResolution::PolicyDenied => (AskOutcomeKind::Declined, None),
+        AskResolution::Abandoned => (AskOutcomeKind::Abandoned, None),
     }
 }
 
@@ -1609,22 +1612,26 @@ mod tests {
     }
 
     #[test]
-    fn ask_outcome_kind_from_resolution() {
+    fn ask_close_keeps_only_the_decision() {
         assert_eq!(
-            AskOutcomeKind::from(&AskResolution::Approval(ApprovalDecision::Deny)),
-            AskOutcomeKind::Answered
+            ask_close(&AskResolution::Approval(ApprovalDecision::Deny)),
+            (AskOutcomeKind::Answered, Some(ApprovalDecision::Deny))
         );
         assert_eq!(
-            AskOutcomeKind::from(&AskResolution::Answered(Vec::new())),
-            AskOutcomeKind::Answered
+            ask_close(&AskResolution::Answered(Vec::new())),
+            (AskOutcomeKind::Answered, None)
         );
         assert_eq!(
-            AskOutcomeKind::from(&AskResolution::Declined),
-            AskOutcomeKind::Declined
+            ask_close(&AskResolution::Declined),
+            (AskOutcomeKind::Declined, None)
         );
         assert_eq!(
-            AskOutcomeKind::from(&AskResolution::Abandoned),
-            AskOutcomeKind::Abandoned
+            ask_close(&AskResolution::PolicyDenied),
+            (AskOutcomeKind::Declined, None)
+        );
+        assert_eq!(
+            ask_close(&AskResolution::Abandoned),
+            (AskOutcomeKind::Abandoned, None)
         );
     }
 

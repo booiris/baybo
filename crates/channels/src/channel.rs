@@ -326,14 +326,11 @@ impl Channel {
         ask_id: AskId,
         resolution: &AskResolution,
     ) {
-        let decision = match resolution {
-            AskResolution::Approval(decision) => Some(*decision),
-            _ => None,
-        };
+        let (outcome, decision) = wire::ask_close(resolution);
         self.dispatch_event(SessionEvent::AskResolved {
             session_id,
             ask_id,
-            outcome: wire::AskOutcomeKind::from(resolution),
+            outcome,
             decision,
         });
     }

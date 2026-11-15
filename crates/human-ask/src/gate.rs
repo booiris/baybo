@@ -88,15 +88,13 @@ impl ApprovalGate for ChannelAskGate {
     ) -> ApprovalOutcome {
         let row = approval_row(req, site);
         let ask_id = row.ask_id.clone();
-        match self.park(row, cancel).await {
-            Some(AskResolution::Approval(decision)) => ApprovalOutcome::answered(decision),
-            Some(AskResolution::PolicyDenied) => ApprovalOutcome::policy(ApprovalDecision::Deny),
-            Some(AskResolution::Abandoned) | None => ApprovalOutcome::abandoned(),
-            Some(other @ (AskResolution::Answered(_) | AskResolution::Declined)) => {
-                tracing::warn!(%ask_id, ?other, "approval ask resolved as a question; denying");
-                ApprovalOutcome::abandoned()
-            }
-        }
+        let Some(resolution) = self.park(row, cancel).await else {
+            return ApprovalOutcome::abandoned();
+        };
+        ApprovalOutcome::from_ask(&resolution).unwrap_or_else(|| {
+            tracing::warn!(%ask_id, ?resolution, "approval ask resolved as a question; denying");
+            ApprovalOutcome::abandoned()
+        })
     }
 }
 

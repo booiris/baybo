@@ -10,10 +10,10 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use baybo_human_ask::{AskCore, AskEvent, AskObserver, HumanAskManager};
 use baybo_model::human_ask::{AskRequest, AskResolution};
-use baybo_model::{ApprovalDecision, ApprovalResolution, ProjectId, SessionId};
+use baybo_model::{ApprovalResolution, ProjectId, SessionId};
 use baybo_store::project::{IssueActor, IssueEventBody};
 use baybo_store::{HumanAskRow, SessionStore};
-use baybo_tools::ApprovalRequest;
+use baybo_tools::{ApprovalOutcome, ApprovalRequest};
 
 use crate::ProjectManager;
 
@@ -92,7 +92,10 @@ impl AskObserver for TimelineAskObserver {
         };
         let ask_id = ask.ask_id.clone();
         let body = match body {
-            Some((decision, resolution)) => IssueEventBody::ApprovalResolved {
+            Some(ApprovalOutcome {
+                decision,
+                resolution,
+            }) => IssueEventBody::ApprovalResolved {
                 ask_id,
                 decision,
                 resolution,
@@ -114,14 +117,9 @@ impl AskObserver for TimelineAskObserver {
 /// How a resolution reads on the card. `None` for a policy denial (never
 /// raised on the card, so there is no prompt to close) and for question
 /// payloads.
-fn timeline_resolution(
-    resolution: &AskResolution,
-) -> Option<(ApprovalDecision, ApprovalResolution)> {
-    match resolution {
-        AskResolution::Approval(decision) => Some((*decision, ApprovalResolution::Answered)),
-        AskResolution::Abandoned => Some((ApprovalDecision::Deny, ApprovalResolution::Abandoned)),
-        AskResolution::PolicyDenied | AskResolution::Answered(_) | AskResolution::Declined => None,
-    }
+fn timeline_resolution(resolution: &AskResolution) -> Option<ApprovalOutcome> {
+    ApprovalOutcome::from_ask(resolution)
+        .filter(|outcome| outcome.resolution != ApprovalResolution::Policy)
 }
 
 async fn unsettled_attempt(
@@ -170,6 +168,8 @@ fn summarise(req: &ApprovalRequest) -> String {
 
 #[cfg(test)]
 mod tests {
+    use baybo_model::ApprovalDecision;
+
     use super::*;
 
     #[test]
@@ -208,11 +208,11 @@ mod tests {
         assert_eq!(timeline_resolution(&AskResolution::PolicyDenied), None);
         assert_eq!(
             timeline_resolution(&AskResolution::Abandoned),
-            Some((ApprovalDecision::Deny, ApprovalResolution::Abandoned))
+            Some(ApprovalOutcome::abandoned())
         );
         assert_eq!(
             timeline_resolution(&AskResolution::Approval(ApprovalDecision::Approve)),
-            Some((ApprovalDecision::Approve, ApprovalResolution::Answered))
+            Some(ApprovalOutcome::answered(ApprovalDecision::Approve))
         );
     }
 }

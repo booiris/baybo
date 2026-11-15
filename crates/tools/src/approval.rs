@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use baybo_model::human_ask::AskResolution;
 use baybo_model::{ChannelType, SessionId};
 use dashmap::DashMap;
 
@@ -66,6 +67,18 @@ impl ApprovalOutcome {
         Self {
             decision: ApprovalDecision::Deny,
             resolution: ApprovalResolution::Abandoned,
+        }
+    }
+
+    /// What an approval's ledger close means for the tool call: the one
+    /// reading of an [`AskResolution`] as an approval. `None` for the
+    /// question-only closes, which no approval can end in.
+    pub fn from_ask(resolution: &AskResolution) -> Option<Self> {
+        match resolution {
+            AskResolution::Approval(decision) => Some(Self::answered(*decision)),
+            AskResolution::PolicyDenied => Some(Self::policy(ApprovalDecision::Deny)),
+            AskResolution::Abandoned => Some(Self::abandoned()),
+            AskResolution::Answered(_) | AskResolution::Declined => None,
         }
     }
 }

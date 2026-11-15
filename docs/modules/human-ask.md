@@ -1185,10 +1185,19 @@ Where the code differs from the sketch above, and why:
   `session_id` (skipped for a run that never reached a session).
   `TimelineAskObserver` records nothing for `PolicyDenied` (the card never
   showed the prompt) or for question payloads.
-- **`AskOutcomeKind`.** `From<&AskResolution>`: `Approval(_)` and
-  `Answered(_)` → `answered`, `Declined` and `PolicyDenied` → `declined`
-  (a policy denial never enters a queue, so never actually reaches the
-  wire), `Abandoned` → `abandoned`.
+- **What a close says on the wire.** `wire::ask_close(&AskResolution)`
+  is the one projection onto `AskResolved`: `Approval(d)` → `answered` with
+  `decision: d`, `Answered(_)` → `answered`, `Declined` and `PolicyDenied`
+  → `declined` (a policy denial never enters a queue, so never actually
+  reaches the wire), `Abandoned` → `abandoned`. Only an approval a human
+  decided carries a decision; answer payloads never leave the server.
+- **What a close means for the tool call.** `ApprovalOutcome::from_ask` is
+  the one reading of an `AskResolution` as an approval:
+  `Approval(d)` → `answered(d)`, `PolicyDenied` → `policy(Deny)`,
+  `Abandoned` → `abandoned()`, question closes → `None`. The gate returns
+  it to the executor (a question close on an approval row warns and
+  abandons); `TimelineAskObserver` writes the same value to the card,
+  minus the policy denials.
 - **Push titles.** `AskPush` carries the ask's `kind`; `ask_push_text`
   picks `APPROVAL_TITLE` + the tool-name body or `QUESTION_TITLE` + the fixed
   "Open the conversation to answer". The pre-POST recheck is
