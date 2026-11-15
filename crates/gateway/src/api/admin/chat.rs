@@ -856,8 +856,8 @@ pub struct ChatSessionSummary {
     #[serde(default, skip_serializing_if = "is_false")]
     pub awaiting_human: bool,
     /// Deprecated twin of `awaiting_human`, always the same value. Kept for
-    /// clients that predate the rename; removed in PR 3 of the human-ask
-    /// rollout (`docs/modules/human-ask.md`).
+    /// clients that predate the rename; removed in the iOS stage of the
+    /// human-ask rollout (`docs/modules/human-ask.md`).
     #[serde(default, skip_serializing_if = "is_false")]
     #[schema(deprecated)]
     pub approval_pending: bool,

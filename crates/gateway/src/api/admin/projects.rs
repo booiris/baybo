@@ -414,8 +414,8 @@ pub struct IssueDto {
     /// True only while this card has an answerable ask in the queue.
     pub awaiting_human: bool,
     /// Deprecated twin of `awaiting_human`, always the same value. Kept for
-    /// clients that predate the rename; removed in PR 3 of the human-ask
-    /// rollout (`docs/modules/human-ask.md`).
+    /// clients that predate the rename; removed in the iOS stage of the
+    /// human-ask rollout (`docs/modules/human-ask.md`).
     #[schema(deprecated)]
     pub approval_pending: bool,
     /// An agent filed this card, rather than the operator. The board's own

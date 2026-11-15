@@ -109,11 +109,11 @@ time out, but a prompt can still close without a decision — a `/stop`, a
 settled run, a gateway restart — so an entry can name a prompt nothing is
 waiting for, which is why answering one tolerates a 404 and reads it as
 "already closed". The card's `approval_pending` flag (the gateway's REST twin
-of `awaiting_human`, until PR 3 of the human-ask rollout moves the app onto
+of `awaiting_human`, until the iOS stage of the human-ask rollout moves the app onto
 the new name) comes off the gateway's ask queue rather than the timeline for
 exactly that reason. The chat list's `SessionUpdated` patch key is already
 `awaiting_human`, so the patch-driven list mark on an installed phone is dark
-until PR 3; the REST twin keeps the cold-start mark and the board working.
+until the iOS stage; the REST twin keeps the cold-start mark and the board working.
 
 ## Related
 

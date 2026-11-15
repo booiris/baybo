@@ -1,6 +1,6 @@
 # Approvals — merge the two gates onto one persisted record
 
-> **Status:** done — superseded by [`human-ask`](../modules/human-ask.md) PR 1: one
+> **Status:** done — superseded by [`human-ask`](../modules/human-ask.md)'s foundation stage: one
 > `ChannelAskGate` over the durable `human_asks` ledger, the card recorded by
 > `baybo_project::install_ask_bridge`'s observer. Kept as history; the rest of this note
 > describes the code as it was.

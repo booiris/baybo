@@ -688,8 +688,8 @@ Preview construction:
 
    An approval push differs only in `title` (`"Baybo needs approval"`, the one
    line a locked phone renders under "Show Previews: When Unlocked") and `body`
-   (`"<Tool> is waiting for your approval"`). A question push (PR 2's
-   `AskUser`) uses `"Baybo has a question"` and the fixed body `"Open the
+   (`"<Tool> is waiting for your approval"`). A question push (the
+   `AskUser` stage's tool) uses `"Baybo has a question"` and the fixed body `"Open the
    conversation to answer"` — no model-authored text. **The body never carries the
    call's arguments.** `params_preview` is unredacted JSON that can hold a
    credential from a command line, and a lock screen is a shoulder-surfing

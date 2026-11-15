@@ -182,7 +182,8 @@ fn install_session_mark(queue: &AskQueue, channel: Weak<Channel>) {
 /// Fan one pending ask out to the clients that can show it.
 fn announce(channel: &Channel, ask: PendingAsk) {
     let Some(entry) = ask.approval().cloned() else {
-        // TODO(human-ask): dispatch `QuestionAsked` once questions exist (PR 2).
+        // TODO(human-ask): dispatch `QuestionAsked` in the `AskUser` stage
+        // (docs/modules/human-ask.md, Rollout plan).
         return;
     };
     channel.dispatch_approval_requested(
