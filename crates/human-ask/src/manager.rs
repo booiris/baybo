@@ -285,6 +285,23 @@ impl HumanAskManager {
         self.unapplied(session_id).await
     }
 
+    /// Whether the turn that raised `row` still has a resumable ask nobody
+    /// has answered. Answering one of several asks a turn parked on must not
+    /// carry the turn on: its settlement would abandon the others. The
+    /// Resume door waits for the last answer, as the live batch would.
+    pub async fn awaits_more_answers(&self, row: &HumanAskRow) -> Result<bool> {
+        Ok(self
+            .unapplied(&row.session_id)
+            .await?
+            .iter()
+            .any(|sibling| {
+                sibling.turn_id == row.turn_id
+                    && sibling.ask_id != row.ask_id
+                    && sibling.is_pending()
+                    && resumable(sibling.kind, sibling.phase)
+            }))
+    }
+
     pub fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
         self.parked_on(session_id) != ParkedOn::Nothing
     }

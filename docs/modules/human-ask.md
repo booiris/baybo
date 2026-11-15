@@ -370,6 +370,7 @@ without a back-edge to the manager.
 | `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on **every** unapplied ask of the call — what it abandoned, and an answer that won the claim in the same instant — because its tool future is gone and its caller's append is the only result the call will get; it returns whether the call had any unapplied ask, and the caller appends either way. |
 | `PolicyDenyGate::request` (the gate, not a manager verb) | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
 | `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied`; resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for **resumable** rows it abandoned (the caller appends next; a pending non-resumable row's call was already filled — by the loop's cancel claim or by hydration — so it is reconciled and reported as nothing) and `Settled::Apply { ask_id, tool_call_id, kind, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
+| `awaits_more_answers(row) -> bool` | — (read-only) | whether `row`'s turn still has another pending resumable ask; the Resume door waits while it does |
 | `mark_applied(ask_id)` | `applied_at` (claim) | — |
 | `reload_pending(scope: ReloadScope)` | `Abandoned` for non-resumable pending rows (observers see `Resolved(Abandoned)`); `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; under `ReloadScope::ResumeAnswered` (the gateway) request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. `ReloadScope::LeaveAnswered` (`baybo prompt`) leaves them for the gateway's next boot or the session's next turn. |
 
@@ -644,6 +645,14 @@ its LLM pin. The actor receives `AgentMessage::ResumeAsk { ask_id }` at
 
 `handle_resume_ask`: if `manager.get(ask_id)` is already applied (a door's
 settlement got there first, or a duplicate route) → return, nothing to do.
+If the turn that raised it (the row's `turn_id`) still has another
+resumable ask nobody has answered (`manager.awaits_more_answers(row)`) →
+return too: the settlement applies every unapplied ask of the session and
+abandons the pending ones, so resuming on the first of two answers would
+close the second card under the user. The answer stays `resolved`, and
+the last answer's `ResumeAsk` applies them all in one Resume turn — the
+turn carries on once every call it parked has an answer, as the live batch
+would. A new message still abandons whatever is left unanswered.
 Otherwise `run_agent_loop(TurnInput::Resume { resumed_turn_id, ask_id, tool_use_id }, SettleMode::Continue, …)`
 exactly like `handle_user_input`, including `send_user_reply`. The
 settlement applies the answer; the first LLM iteration then runs on a window

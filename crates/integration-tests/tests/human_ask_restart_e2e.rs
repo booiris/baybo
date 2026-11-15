@@ -24,7 +24,7 @@ use baybo_model::{
     TriggerSource,
 };
 use baybo_storage::Store;
-use baybo_tools::{Tool, ToolContext, ToolManifest, ToolOutput};
+use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
 use baybo_turn::TurnInputKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -52,6 +52,9 @@ impl Tool for GatedWrite {
     }
     fn parameters_schema(&self) -> Value {
         json!({"type": "object", "properties": {}})
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         vec![ResourceAccess::WriteFile {
@@ -621,6 +624,111 @@ async fn a_new_message_after_a_restart_abandons_the_dead_ask_first() {
         )),
         "AskResolved goes out so open tabs drop the card"
     );
+    stop(node).await;
+}
+
+/// A turn parked on two approvals when the process stopped. Answering the
+/// first after the restart must not carry the turn on — its settlement would
+/// abandon the second while its card is still up. The turn resumes once, on
+/// the last answer, with both results in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_parked_on_two_asks_resumes_on_the_last_answer() {
+    const SECOND_CALL: &str = "call-restart-2";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join(DB_FILE);
+    let session = owner_session(TriggerSource::User);
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let (first, second) = {
+        let store = Store::open(&db).await.expect("open the database");
+        store
+            .session
+            .save(&session)
+            .await
+            .expect("save the session");
+        let mut harness = builder(&session, store, &runs).build();
+        harness.stub_llm.push_stream(
+            [CALL_ID, SECOND_CALL]
+                .into_iter()
+                .map(|id| {
+                    StreamEvent::ToolCall(ToolCallInfo {
+                        id: id.to_string(),
+                        name: GATED_TOOL.to_string(),
+                        arguments: json!({}),
+                        signature: None,
+                    })
+                })
+                .collect(),
+        );
+        harness.send_text("write both").await.expect("send");
+        let queue = harness.ask_queues.get_or_create(&session.channel);
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            while queue.len() < 2 {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("both calls park on an approval");
+        harness.actor_parent_token.cancel();
+        harness.drain_outputs(DRAIN_TIMEOUT).await;
+        tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
+            .await
+            .expect("the actor quiesces");
+        let rows = {
+            let store = Store::open(&db).await.expect("reopen the database");
+            store
+                .human_ask
+                .list_unapplied_for_session(&session.id)
+                .await
+                .expect("list asks")
+        };
+        let id_of = |call: &str| {
+            rows.iter()
+                .find(|r| r.tool_call_id == call)
+                .unwrap_or_else(|| panic!("an ask for {call}: {rows:?}"))
+                .ask_id
+                .clone()
+        };
+        (id_of(CALL_ID), id_of(SECOND_CALL))
+    };
+
+    let mut node = boot(&db, &session, &runs, true, |_| {}).await;
+    node.harness
+        .human_asks
+        .resolve(&first, AskResolution::Approval(ApprovalDecision::Approve))
+        .await
+        .expect("answer the first");
+    node.harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(resume_turns(&node.harness).await, 0, "the turn waits");
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert!(row(&node.harness, &second).await.is_pending());
+    assert_eq!(
+        node.owner
+            .pending_approvals(&session.id)
+            .iter()
+            .map(|card| card.ask_id.clone())
+            .collect::<Vec<_>>(),
+        vec![second.clone()],
+        "the second card stays up"
+    );
+
+    reply(&node.harness, "both done");
+    node.harness
+        .human_asks
+        .resolve(&second, AskResolution::Approval(ApprovalDecision::Deny))
+        .await
+        .expect("answer the second");
+    let outputs = node.harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(resume_turns(&node.harness).await, 1, "resumed once");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "only the approved call ran");
+    assert!(adjacent_result(&node.harness).await.contains(WRITTEN));
+    for ask_id in [&first, &second] {
+        assert!(row(&node.harness, ask_id).await.applied_at.is_some());
+    }
+    assert!(replied(&outputs, "both done"), "{outputs:#?}");
+    assert_eq!(node.harness.strict_rejections.load(Ordering::SeqCst), 0);
+    assert_eq!(node.harness.stub_llm.captured_requests().len(), 1);
     stop(node).await;
 }
 

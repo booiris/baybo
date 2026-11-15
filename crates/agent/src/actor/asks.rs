@@ -5,7 +5,7 @@
 use baybo_model::human_ask::AskId;
 use baybo_store::HumanAskRow;
 use baybo_turn::TurnInput;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::AgentActor;
 
@@ -39,13 +39,19 @@ impl AgentActor {
 
     /// A human answered `ask_id` while no tool future waited on it: run the
     /// Resume turn that applies the answer and carries on from it. Nothing
-    /// to do when a door's prelude (or a duplicate route) got there first.
+    /// to do when a door's prelude (or a duplicate route) got there first,
+    /// or while the same turn still waits on another answer — the last one
+    /// resumes it, with every answer applied.
     pub(super) async fn handle_resume_ask(&mut self, ask_id: &AskId) -> anyhow::Result<()> {
         let Some(row) = self.volatile.agent_loop.ask(ask_id).await? else {
             warn!(%ask_id, "resume for an ask the ledger does not have");
             return Ok(());
         };
         if row.applied_at.is_some() || row.resolved_at.is_none() {
+            return Ok(());
+        }
+        if self.volatile.agent_loop.awaits_more_answers(&row).await? {
+            debug!(%ask_id, turn_id = %row.turn_id, "resume waits for the turn's other answers");
             return Ok(());
         }
         let response_tx = self.volatile.response_tx.clone();

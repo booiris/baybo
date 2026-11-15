@@ -916,9 +916,11 @@ fn resume_door(
     baybo_agent::runtime::asks::RouterResumeSink::new(tx, sessions)
 }
 
-/// A provider that rejects a transcript whose `tool_use` is not answered by
-/// the very next message — what Anthropic's API does, and what a misplaced
-/// settlement result would trip in production.
+/// A provider that rejects a transcript whose `tool_use` is not answered
+/// right after it — what Anthropic's API does, and what a misplaced
+/// settlement result would trip in production. "Right after" is the run of
+/// tool rows that follows, which the request builder merges into the one
+/// message the API sees.
 struct StrictToolPairing {
     inner: Arc<dyn LlmCompletion>,
     rejections: Arc<AtomicUsize>,
@@ -932,11 +934,13 @@ impl StrictToolPairing {
                 let ContentBlock::ToolUse { id, .. } = block else {
                     continue;
                 };
-                let answered = messages.get(i + 1).is_some_and(|next| {
-                    next.content.iter().any(|b| {
+                let answered = messages[i + 1..]
+                    .iter()
+                    .take_while(|next| next.role == baybo_model::Role::Tool)
+                    .flat_map(|next| &next.content)
+                    .any(|b| {
                         matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
-                    })
-                });
+                    });
                 if !answered {
                     self.rejections.fetch_add(1, Ordering::SeqCst);
                     return Err(baybo_llm::LlmError::BadRequest(format!(

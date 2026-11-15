@@ -51,6 +51,10 @@ impl AgentLoop {
         Ok(self.asks.get(ask_id).await?)
     }
 
+    pub async fn awaits_more_answers(&self, row: &HumanAskRow) -> anyhow::Result<bool> {
+        Ok(self.asks.awaits_more_answers(row).await?)
+    }
+
     /// Run `turn_input` (a `Resume`) as a turn whose whole body is the
     /// settlement: [`SettleMode::SettleOnly`].
     pub async fn run_settlement_turn(
