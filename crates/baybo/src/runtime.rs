@@ -282,10 +282,6 @@ pub async fn build_managers(
     // empty `Vec` for non-gateway paths) so the manager-graph layer
     // stays free of per-tool-domain wiring (browser blob upload, etc).
     embedded_mcp_servers: Vec<EmbeddedMcpServer>,
-    // Whether the boot reload re-drives answered asks. Only the gateway
-    // does: a one-shot process would run other sessions' Resume turns and
-    // then cut them off at its own teardown.
-    ask_reload: baybo_human_ask::ReloadScope,
 ) -> anyhow::Result<ManagerGraph> {
     // Shared, hot-swappable Bash permission mode. A `permission` config reload
     // swaps it live (see `reload.rs`); the handle is held by both the tool
@@ -713,20 +709,6 @@ pub async fn build_managers(
         Arc::clone(&human_asks),
         stores.session.clone(),
     );
-    // Best-effort, like the skill-job recovery: put the ledger's pending asks
-    // back on their queues (the push relay sees their edges) and, per
-    // `ask_reload`, re-drive the answered ones. Resume requests wait in the
-    // router's intake until the router runs.
-    match human_asks.reload_pending(ask_reload).await {
-        Ok(report) => info!(
-            requeued = report.requeued,
-            resumed = report.resumed,
-            abandoned = report.abandoned,
-            applied = report.applied,
-            "reloaded unapplied human asks"
-        ),
-        Err(e) => tracing::warn!(error = %e, "failed to reload unapplied human asks"),
-    }
 
     // --- security gateway + tool executor
     // Tool-output spill now lives in `baybo-context` (resolved from the

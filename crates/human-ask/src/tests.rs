@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{AskCore, AskEvent};
 use crate::error::HumanAskError;
 use crate::gate::{ChannelAskGate, PolicyDenyGate};
-use crate::manager::{HumanAskManager, HumanAskManagerConfig, ReloadScope, Settled};
+use crate::manager::{HumanAskManager, HumanAskManagerConfig, Settled};
 use crate::ports::{AskObserver, ResumeSink};
 use crate::queue::{AskQueue, AskQueueEvent, AskQueues, PendingEdge};
 use crate::test_support::MemoryHumanAskStore;
@@ -385,10 +385,7 @@ async fn a_question_resolution_does_not_fit_an_approval() {
 async fn resolving_a_dead_ask_removes_it_and_requests_a_resume() {
     let h = harness();
     h.store.insert(row("a", "s1", AskPhase::BeforeExecute));
-    h.manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload");
+    h.manager.reload_pending().await.expect("reload");
     assert_eq!(h.queue.liveness(&id("a")), Some(false));
     h.edges.lock().clear();
 
@@ -421,10 +418,7 @@ async fn resolving_a_dead_ask_in_an_issue_session_requests_nothing() {
     let h = harness();
     h.store
         .insert(row("a", ISSUE_SESSION, AskPhase::BeforeExecute));
-    h.manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload");
+    h.manager.reload_pending().await.expect("reload");
     h.manager.resolve(&id("a"), APPROVE).await.expect("resolve");
     assert!(h.sink.requests.lock().is_empty());
     assert_eq!(
@@ -553,10 +547,7 @@ async fn a_live_waiter_sees_abandon() {
 async fn abandon_for_session_takes_live_and_dead_asks() {
     let h = harness();
     h.store.insert(row("dead", "s1", AskPhase::BeforeExecute));
-    h.manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload");
+    h.manager.reload_pending().await.expect("reload");
     let live = park(&h, "live", "s1", AskPhase::BeforeExecute, tokens()).await;
     assert!(h.manager.has_live_pending_ask(&"s1".into()));
     assert_eq!(
@@ -609,11 +600,7 @@ async fn reload_requeues_pending_resumable_rows_per_channel() {
     sidecar.channel = ChannelType::from("custom");
     h.store.insert(sidecar);
 
-    let report = h
-        .manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload");
+    let report = h.manager.reload_pending().await.expect("reload");
     assert_eq!(report.requeued, 4);
     assert_eq!(h.queue.len(), 3);
     let raised: Vec<SessionId> = h
@@ -635,11 +622,7 @@ async fn reload_requeues_pending_resumable_rows_per_channel() {
     assert!(custom.contains(&id("x")));
     assert!(h.observer.seen.lock().is_empty(), "reload notifies nobody");
 
-    let again = h
-        .manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload twice");
+    let again = h.manager.reload_pending().await.expect("reload twice");
     assert_eq!(again.requeued, 0, "idempotent");
     assert_eq!(h.queue.len(), 3);
 }
@@ -653,11 +636,7 @@ async fn reload_resumes_resolved_rows_without_showing_them() {
         row("b", ISSUE_SESSION, AskPhase::BeforeExecute),
         APPROVE,
     ));
-    let report = h
-        .manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload");
+    let report = h.manager.reload_pending().await.expect("reload");
     assert_eq!(report.resumed, 1);
     assert!(h.queue.is_empty(), "not re-shown");
     assert!(h.edges.lock().is_empty(), "no Raised, so no push");
@@ -671,32 +650,12 @@ async fn reload_resumes_resolved_rows_without_showing_them() {
 }
 
 #[tokio::test]
-async fn a_one_shot_reload_leaves_answered_asks_alone() {
-    let h = harness();
-    h.store
-        .insert(resolved(row("a", "s1", AskPhase::BeforeExecute), APPROVE));
-    h.store.insert(row("p", "s1", AskPhase::BeforeExecute));
-    let report = h
-        .manager
-        .reload_pending(ReloadScope::LeaveAnswered)
-        .await
-        .expect("reload");
-    assert_eq!((report.resumed, report.requeued), (0, 1));
-    assert!(h.sink.requests.lock().is_empty());
-    assert!(h.store.row(&id("a")).expect("row").applied_at.is_none());
-}
-
-#[tokio::test]
 async fn reload_reconciles_non_resumable_rows() {
     let h = harness();
     h.store.insert(row("p", "s1", AskPhase::DuringExecute));
     h.store
         .insert(resolved(row("r", "s1", AskPhase::DuringExecute), APPROVE));
-    let report = h
-        .manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload");
+    let report = h.manager.reload_pending().await.expect("reload");
     assert_eq!((report.abandoned, report.applied), (1, 1));
     let p = h.store.row(&id("p")).expect("row");
     assert_eq!(p.resolution, Some(AskResolution::Abandoned));
@@ -716,11 +675,7 @@ async fn reload_reconciles_non_resumable_rows() {
         "the board hears the abandon; nothing is re-raised"
     );
 
-    let again = h
-        .manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("again");
+    let again = h.manager.reload_pending().await.expect("again");
     assert_eq!(again, Default::default(), "idempotent");
 }
 
@@ -736,10 +691,7 @@ async fn settle_unapplied_handles_every_row_state() {
         row("midrun", "s1", AskPhase::DuringExecute),
         APPROVE,
     ));
-    h.manager
-        .reload_pending(ReloadScope::ResumeAnswered)
-        .await
-        .expect("reload");
+    h.manager.reload_pending().await.expect("reload");
     // `midrun` was stamped applied by the reload; seed a fresh one.
     h.store.insert(resolved(
         row("midrun2", "s1", AskPhase::DuringExecute),

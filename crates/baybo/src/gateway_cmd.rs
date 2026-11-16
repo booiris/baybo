@@ -544,9 +544,24 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         shutdown.clone(),
         Arc::clone(&leak_detector),
         embedded_mcp_servers,
-        baybo_human_ask::ReloadScope::ResumeAnswered,
     )
     .await?;
+    // Best-effort, like the skill-job recovery: put the ledger's pending asks
+    // back on their queues (the push relay, built in `build_managers`, sees
+    // their edges) and re-drive the answered ones. Resume requests wait in
+    // the router's intake until the router runs. Only the gateway reloads:
+    // `baybo prompt` tears down after its own turn, and its own session's
+    // asks are settled by that turn's prelude.
+    match graph.human_asks.reload_pending().await {
+        Ok(report) => tracing::info!(
+            requeued = report.requeued,
+            resumed = report.resumed,
+            abandoned = report.abandoned,
+            applied = report.applied,
+            "reloaded unapplied human asks"
+        ),
+        Err(e) => tracing::warn!(error = %e, "failed to reload unapplied human asks"),
+    }
     let run_handle = runtime::wire_router(&mut graph).await?;
 
     // WS-backed sidecars register themselves from the route task when a

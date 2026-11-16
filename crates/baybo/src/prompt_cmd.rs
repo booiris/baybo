@@ -247,9 +247,6 @@ async fn run_in_process(
         leak_detector,
         // No embedded MCP servers — the browser tool is gateway-only.
         Vec::new(),
-        // Answered asks of other sessions wait for the gateway: this process
-        // tears down after its own turn and would cut their Resume turns off.
-        baybo_human_ask::ReloadScope::LeaveAnswered,
     )
     .await?;
     // No push task runs here: drop the ask push stream so the relay sees a

@@ -43,16 +43,6 @@ pub enum Settled {
     },
 }
 
-/// Whether [`HumanAskManager::reload_pending`] re-drives answered asks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReloadScope {
-    /// The gateway: answered resumable asks go to the resume sink.
-    ResumeAnswered,
-    /// A one-shot process that tears down after its own turn: answered asks
-    /// are left for the gateway's next boot or the session's next turn.
-    LeaveAnswered,
-}
-
 /// Counts from one [`HumanAskManager::reload_pending`] pass, for the boot log.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReloadReport {
@@ -225,11 +215,12 @@ impl HumanAskManager {
     /// Boot: rebuild the queues from the ledger. Pending resumable asks are
     /// re-enqueued as dead entries (publishing `Raised`, but no observer
     /// `Raised` — the ask was already announced); resolved resumable ones are
-    /// handed to the resume sink without being shown again, unless `scope`
-    /// is [`ReloadScope::LeaveAnswered`]; pending non-resumable ones are
-    /// abandoned (observers see that resolution) and resolved ones stamped
-    /// applied. Idempotent.
-    pub async fn reload_pending(&self, scope: ReloadScope) -> Result<ReloadReport> {
+    /// handed to the resume sink without being shown again; pending
+    /// non-resumable ones are abandoned (observers see that resolution) and
+    /// resolved ones stamped applied. Idempotent. The gateway's boot step:
+    /// a one-shot process does not reload, since it would run other sessions'
+    /// Resume turns and cut them off at its own teardown.
+    pub async fn reload_pending(&self) -> Result<ReloadReport> {
         let mut report = ReloadReport::default();
         for row in self.core.list_unapplied().await? {
             let resumable = resumable(row.kind, row.phase);
@@ -249,7 +240,7 @@ impl HumanAskManager {
                     self.core.mark_applied(&row.ask_id).await?;
                 }
                 (false, true) => {
-                    if scope == ReloadScope::ResumeAnswered && self.request_resume(&row).await {
+                    if self.request_resume(&row).await {
                         report.resumed += 1;
                     }
                 }

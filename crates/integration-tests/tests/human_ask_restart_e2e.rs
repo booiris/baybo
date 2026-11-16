@@ -143,7 +143,7 @@ async fn boot(
     before_reload(&harness);
     harness
         .human_asks
-        .reload_pending(baybo_human_ask::ReloadScope::ResumeAnswered)
+        .reload_pending()
         .await
         .expect("reload pending asks");
     Node {

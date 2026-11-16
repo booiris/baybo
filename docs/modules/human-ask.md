@@ -381,7 +381,7 @@ there is no write path in the crate that skips them.
 | `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied`; resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for **resumable** rows it abandoned (the caller appends next; a pending non-resumable row's call was already filled — by the loop's cancel claim or by hydration — so it is reconciled and reported as nothing) and `Settled::Apply { ask_id, tool_call_id, kind, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
 | `awaits_more_answers(row) -> bool` | — (read-only) | whether `row`'s turn still has another pending resumable ask; the Resume door waits while it does |
 | `mark_applied(ask_id)` | `applied_at` (claim) | — |
-| `reload_pending(scope: ReloadScope)` | `Abandoned` for non-resumable pending rows (observers see `Resolved(Abandoned)`); `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; under `ReloadScope::ResumeAnswered` (the gateway) request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. `ReloadScope::LeaveAnswered` (`baybo prompt`) leaves them for the gateway's next boot or the session's next turn. |
+| `reload_pending()` | `Abandoned` for non-resumable pending rows (observers see `Resolved(Abandoned)`); `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. Only the gateway calls it (see below). |
 
 A dropped waiter is **not** a resolution. `QueueCleanup::drop` (today:
 `drop_call` → `Abandoned` edge) becomes `queue.orphan(ask_id)`: a resumable
@@ -527,7 +527,7 @@ order the code can actually have:
    — the same `AskQueues` the channels fetch from; the manager never holds
    the registry or a `Channel`. **`baybo_project::install_ask_bridge`** runs
    right after, once `ProjectManager` (`:640`) exists.
-7. **`manager.reload_pending(scope)`** — best-effort like
+7. **`manager.reload_pending()`**, in `gateway_cmd` after `build_managers` returns (the gateway alone; see the `baybo prompt` paragraph) — best-effort like
    `skill_assessor.recover_pending_jobs` (`:479`): log counts, never block
    boot. After it, the in-memory queue is the read model again and
    `SubscribeState.pending_*`, `ChatSessionSummary.awaiting_human`,
@@ -569,11 +569,13 @@ runs and leaves the dangling `tool_use` row as the tail so the eventual real
 manager type.
 
 `baybo prompt` boots the same graph under the workspace lock (gateway not
-running), passing `ReloadScope::LeaveAnswered` to `build_managers`: it
-requests no Resume turns — it would run other sessions' turns and cut them
-off at its own teardown — so the reload is side-effect-free apart from the
-in-memory push and the non-resumable reconciliation, both of which the
-gateway would do identically at its next boot; it builds no relay, so the
+running) but does **not** reload: the reload is a gateway boot step in
+`gateway_cmd`, right after `build_managers` and before `wire_router`. A
+one-shot reload would run other sessions' Resume turns and cut them off at
+its own teardown, and nothing else it does matters there: no card is shown
+in that process, its own session's unapplied asks are settled by its turn's
+prelude (a dead ask is abandoned whether or not it was re-queued), and the
+gateway's next boot reconciles the rest. It builds no relay consumer, so the
 push stream is dropped unread (`observe` treats a closed stream as a no-op).
 
 #### The turn prelude: one home for unapplied asks
@@ -1145,7 +1147,6 @@ pub struct HumanAskManager;                     // from_config(HumanAskManagerCo
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
                                                 //        unapplied_tool_use_ids, actor_stop_cost (LivePendingAsks impl)
 pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, kind, resolution } }
-pub enum ReloadScope { ResumeAnswered, LeaveAnswered }   // reload_pending: gateway vs one-shot `baybo prompt`
 pub struct ReloadReport { requeued, resumed, abandoned, applied }
 #[async_trait] pub trait ResumeSink {
     async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
