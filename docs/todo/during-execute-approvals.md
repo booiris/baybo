@@ -21,8 +21,9 @@ An approval is raised in one of two phases (`AskPhase`):
 When the tool future of a during-execute approval goes away — a gateway
 restart, an actor panic, `/stop` — the ask is abandoned: the card disappears
 and the call's result is the abandoned refusal. The idle reaper never ends
-such a turn (`ParkedOn::NotResumable`), because ending it would abandon the
-prompt.
+such a turn (`ActorStopCost::AbandonsAsks`), because ending it would abandon
+the prompt. Once this move lands that variant can no longer happen and the
+enum collapses to whether anything is live.
 
 ## Shipped: a deadline on during-execute approvals
 

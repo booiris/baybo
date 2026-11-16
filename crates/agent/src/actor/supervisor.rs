@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use baybo_channels::{AgentEvent, AgentOutput};
+use baybo_human_ask::ActorStopCost;
 use baybo_model::SessionId;
 use chrono::Duration;
 use dashmap::DashMap;
@@ -65,8 +66,8 @@ pub struct AgentSupervisor {
     response_tx: mpsc::Sender<AgentOutput>,
     in_flight_background_jobs:
         Arc<DashMap<SessionId, HashMap<baybo_model::BackgroundHandle, InFlightJob>>>,
-    /// What an idle session's turn is parked on, which decides whether the
-    /// reaper may end that turn (see [`Self::reap_idle`]).
+    /// What stopping an idle session's actor would cost its live asks, which
+    /// decides whether the reaper may end its turn (see [`Self::reap_idle`]).
     live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
     /// The release token of the turn each registered actor is running. The
     /// reaper cancels it to end a turn parked on resumable asks; it is a
@@ -106,8 +107,12 @@ impl AgentSupervisor {
     /// pending, and an answer resumes the session through the Resume door.
     /// `false` (and nothing touched) when the turn is not parked, or is
     /// parked on an ask that ending it would abandon.
+    ///
+    /// The cost is read here, at the moment of the cancel, and not taken from
+    /// an earlier probe: an answer landing in between turns the parked call
+    /// back into running work, which the cancel must not cut.
     pub fn release_parked_turn(&self, session_id: &SessionId) -> bool {
-        if self.live_asks.parked_on(session_id) != baybo_human_ask::ParkedOn::Resumable {
+        if self.live_asks.actor_stop_cost(session_id) != ActorStopCost::ReleasesTurn {
             return false;
         }
         let Some(release) = self.turn_releases.get(session_id) else {
@@ -455,8 +460,8 @@ impl AgentSupervisor {
                 );
                 continue;
             }
-            let parked = self.live_asks.parked_on(&session_id);
-            if parked == baybo_human_ask::ParkedOn::NotResumable {
+            let cost = self.live_asks.actor_stop_cost(&session_id);
+            if cost == ActorStopCost::AbandonsAsks {
                 debug!(
                     %session_id,
                     "idle reaper: skipping a session parked on a during-execute approval"
@@ -470,7 +475,7 @@ impl AgentSupervisor {
                 Ok(()) => {
                     // After the stop is queued, so the actor is certain to exit
                     // once the parked turn ends.
-                    if parked == baybo_human_ask::ParkedOn::Resumable {
+                    if cost == ActorStopCost::ReleasesTurn {
                         self.release_parked_turn(&session_id);
                     }
                     debug!(%session_id, "idle reaper: sent Shutdown");
@@ -897,21 +902,20 @@ mod tests {
         assert!(fresh_rx.try_recv().is_err());
     }
 
-    /// A probe that reports what each listed session is parked on.
-    struct Parked(Vec<(SessionId, baybo_human_ask::ParkedOn)>);
+    /// A probe that reports a fixed stop cost for each listed session.
+    struct StopCosts(Vec<(SessionId, ActorStopCost)>);
 
-    impl baybo_human_ask::LivePendingAsks for Parked {
-        fn parked_on(&self, session_id: &SessionId) -> baybo_human_ask::ParkedOn {
+    impl baybo_human_ask::LivePendingAsks for StopCosts {
+        fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
             self.0
                 .iter()
                 .find(|(id, _)| id == session_id)
-                .map_or(baybo_human_ask::ParkedOn::Nothing, |(_, parked)| *parked)
+                .map_or(ActorStopCost::Free, |(_, cost)| *cost)
         }
     }
 
     #[tokio::test]
     async fn reap_idle_ends_a_resumable_park_and_keeps_a_during_execute_one() {
-        use baybo_human_ask::ParkedOn;
         use chrono::Utc;
 
         let session_store = Arc::new(MemorySessionStore::new());
@@ -942,9 +946,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
         let supervisor = AgentSupervisor::new(
             tx,
-            Arc::new(Parked(vec![
-                (resumable.clone(), ParkedOn::Resumable),
-                (during.clone(), ParkedOn::NotResumable),
+            Arc::new(StopCosts(vec![
+                (resumable.clone(), ActorStopCost::ReleasesTurn),
+                (during.clone(), ActorStopCost::AbandonsAsks),
             ])),
         );
         let (resumable_tx, mut resumable_rx) = mailbox::channel(8);
@@ -975,6 +979,66 @@ mod tests {
             "a during-execute approval keeps its turn"
         );
         assert!(during_rx.try_recv().is_err(), "and its actor stays warm");
+    }
+
+    /// A probe that answers from a script, one cost per call, then `Free`.
+    struct ScriptedCosts(parking_lot::Mutex<std::collections::VecDeque<ActorStopCost>>);
+
+    impl baybo_human_ask::LivePendingAsks for ScriptedCosts {
+        fn actor_stop_cost(&self, _session_id: &SessionId) -> ActorStopCost {
+            self.0.lock().pop_front().unwrap_or(ActorStopCost::Free)
+        }
+    }
+
+    #[tokio::test]
+    async fn reap_idle_leaves_a_turn_whose_ask_was_answered_after_the_probe() {
+        use chrono::Utc;
+
+        let session_store = Arc::new(MemorySessionStore::new());
+        let sessions = SessionManager::new(
+            session_store.clone(),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+        let user = User {
+            id: "u-1".to_string(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        let mut session = sessions
+            .create_session(user, ChannelType::tui())
+            .await
+            .unwrap();
+        session.last_active = Utc::now() - Duration::seconds(120);
+        session_store.save(&session).await.unwrap();
+
+        // The reaper's probe sees a parked turn; by the time it would cancel,
+        // the answer has landed and the call is running again.
+        let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
+        let supervisor = AgentSupervisor::new(
+            tx,
+            Arc::new(ScriptedCosts(parking_lot::Mutex::new(
+                [ActorStopCost::ReleasesTurn, ActorStopCost::Free].into(),
+            ))),
+        );
+        let (mailbox_tx, mut mailbox_rx) = mailbox::channel(8);
+        supervisor
+            .register_if_absent(session.id.clone(), mailbox_tx)
+            .expect("first insert");
+        let release = CancellationToken::new();
+        let _turn = supervisor.track_turn(&session.id, release.clone());
+
+        assert_eq!(
+            supervisor.reap_idle(&sessions, Duration::seconds(60)).await,
+            1
+        );
+        assert!(
+            !release.is_cancelled(),
+            "a turn that went back to work is not cut"
+        );
+        assert!(
+            matches!(mailbox_rx.try_recv(), Ok(AgentMessage::ActorStop)),
+            "the stop still waits for the turn to end"
+        );
     }
 
     #[test]

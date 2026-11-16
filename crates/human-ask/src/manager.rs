@@ -11,7 +11,7 @@ use chrono::Utc;
 
 use crate::core::{AskCore, AskEvent};
 use crate::error::{HumanAskError, Result};
-use crate::ports::{LivePendingAsks, ParkedOn, ResumeSink};
+use crate::ports::{ActorStopCost, LivePendingAsks, ResumeSink};
 use crate::queue::{AskQueues, PendingAsk};
 
 pub struct HumanAskManagerConfig {
@@ -302,22 +302,22 @@ impl HumanAskManager {
             }))
     }
 
+    /// Whether a tool future is parked on an ask of `session_id`: what a
+    /// test waits for before acting on a parked turn.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
-        self.parked_on(session_id) != ParkedOn::Nothing
+        self.actor_stop_cost(session_id) != ActorStopCost::Free
     }
 
-    /// What the session's live asks, across every channel queue, would lose
-    /// if its actor went away.
-    pub fn parked_on(&self, session_id: &SessionId) -> ParkedOn {
+    /// What stopping the session's actor would cost its live asks, across
+    /// every channel queue.
+    pub fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
         self.queues
             .all()
             .iter()
-            .map(|queue| queue.parked_on(session_id))
-            .fold(ParkedOn::Nothing, |acc, next| match (acc, next) {
-                (ParkedOn::NotResumable, _) | (_, ParkedOn::NotResumable) => ParkedOn::NotResumable,
-                (ParkedOn::Resumable, _) | (_, ParkedOn::Resumable) => ParkedOn::Resumable,
-                _ => ParkedOn::Nothing,
-            })
+            .map(|queue| queue.actor_stop_cost(session_id))
+            .max()
+            .unwrap_or(ActorStopCost::Free)
     }
 
     async fn unapplied(&self, session_id: &SessionId) -> Result<Vec<HumanAskRow>> {
@@ -399,8 +399,8 @@ impl HumanAskManager {
 }
 
 impl LivePendingAsks for HumanAskManager {
-    fn parked_on(&self, session_id: &SessionId) -> ParkedOn {
-        HumanAskManager::parked_on(self, session_id)
+    fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
+        HumanAskManager::actor_stop_cost(self, session_id)
     }
 }
 

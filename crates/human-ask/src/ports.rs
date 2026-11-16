@@ -22,24 +22,27 @@ pub trait ResumeSink: Send + Sync {
     fn request_resume(&self, req: ResumeRequest);
 }
 
-/// What a session's live asks — the ones a tool future is parked on right
-/// now — would lose if its actor went away.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParkedOn {
-    /// No tool future is parked on an ask.
-    Nothing,
-    /// Only resumable asks: once the actor is gone each one stays pending,
-    /// and an answer resumes the session through the Resume door.
-    Resumable,
-    /// At least one ask is not resumable (a during-execute approval): the
-    /// actor going away abandons it.
-    NotResumable,
+/// What stopping a session's actor would cost its live asks, the ones a tool
+/// future is parked on right now. Ordered by cost, so the cost of several
+/// asks is the `max` of theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ActorStopCost {
+    /// No tool future is parked on an ask: the actor stops between turns.
+    Free,
+    /// Every live ask is resumable. The running turn has to be released
+    /// first; each ask then stays pending, and an answer resumes the session
+    /// through the Resume door.
+    ReleasesTurn,
+    /// A live ask is not resumable (a during-execute approval): stopping
+    /// would abandon it. Goes away once those approvals move before execute
+    /// (`docs/todo/during-execute-approvals.md`).
+    AbandonsAsks,
 }
 
-/// "What is this session's turn parked on right now?" — the idle reaper's
+/// "What would stopping this session's actor cost?" — the idle reaper's
 /// probe, answered from memory.
 pub trait LivePendingAsks: Send + Sync {
-    fn parked_on(&self, session_id: &SessionId) -> ParkedOn;
+    fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost;
 }
 
 /// Told about asks raised and resolved through a verb. Runs on the verb's

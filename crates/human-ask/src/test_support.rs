@@ -130,8 +130,8 @@ impl HumanAskStore for MemoryHumanAskStore {
 pub struct NoLivePendingAsks;
 
 impl crate::ports::LivePendingAsks for NoLivePendingAsks {
-    fn parked_on(&self, _session_id: &SessionId) -> crate::ports::ParkedOn {
-        crate::ports::ParkedOn::Nothing
+    fn actor_stop_cost(&self, _session_id: &SessionId) -> crate::ports::ActorStopCost {
+        crate::ports::ActorStopCost::Free
     }
 }
 

@@ -23,7 +23,7 @@ use baybo_store::HumanAskRow;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-use crate::ports::ParkedOn;
+use crate::ports::ActorStopCost;
 
 /// One pending ask as the queue (and its watchers) see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,26 +286,21 @@ impl AskQueue {
             .collect()
     }
 
-    /// Whether a tool future in this process is parked on an ask of
-    /// `session_id`.
-    pub fn has_live(&self, session_id: &SessionId) -> bool {
-        self.parked_on(session_id) != ParkedOn::Nothing
-    }
-
-    /// What this queue's live asks for `session_id` would lose if their tool
-    /// futures went away.
-    pub fn parked_on(&self, session_id: &SessionId) -> ParkedOn {
-        let mut parked = ParkedOn::Nothing;
-        for entry in self.inner.lock().iter() {
-            if &entry.ask.session_id != session_id || entry.responder.is_none() {
-                continue;
-            }
-            if !entry.ask.is_resumable() {
-                return ParkedOn::NotResumable;
-            }
-            parked = ParkedOn::Resumable;
-        }
-        parked
+    /// What stopping `session_id`'s actor would cost this queue's live asks.
+    pub fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
+        self.inner
+            .lock()
+            .iter()
+            .filter(|e| &e.ask.session_id == session_id && e.responder.is_some())
+            .map(|e| {
+                if e.ask.is_resumable() {
+                    ActorStopCost::ReleasesTurn
+                } else {
+                    ActorStopCost::AbandonsAsks
+                }
+            })
+            .max()
+            .unwrap_or(ActorStopCost::Free)
     }
 
     /// `Some(true)` for a live entry, `Some(false)` for a dead one, `None`
@@ -620,26 +615,29 @@ mod tests {
     }
 
     #[test]
-    fn parked_on_says_what_losing_the_waiter_would_cost() {
+    fn actor_stop_cost_is_the_costliest_live_ask() {
         let queue = AskQueue::new();
         let s1 = SessionId::from("s1");
-        assert_eq!(queue.parked_on(&s1), ParkedOn::Nothing);
+        assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::Free);
 
         let (tx, _before) = oneshot::channel();
         queue.push_live(ask("b1", "s1", AskPhase::BeforeExecute), tx);
-        assert_eq!(queue.parked_on(&s1), ParkedOn::Resumable);
+        assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::ReleasesTurn);
 
         let (tx, _during) = oneshot::channel();
         queue.push_live(ask("d1", "s1", AskPhase::DuringExecute), tx);
-        assert_eq!(queue.parked_on(&s1), ParkedOn::NotResumable);
+        assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::AbandonsAsks);
 
         queue.orphan(&id("d1"));
         assert_eq!(
-            queue.parked_on(&s1),
-            ParkedOn::Resumable,
-            "a dead entry parks nothing"
+            queue.actor_stop_cost(&s1),
+            ActorStopCost::ReleasesTurn,
+            "a dead entry costs nothing"
         );
-        assert_eq!(queue.parked_on(&SessionId::from("s2")), ParkedOn::Nothing);
+        assert_eq!(
+            queue.actor_stop_cost(&SessionId::from("s2")),
+            ActorStopCost::Free
+        );
     }
 
     #[test]
@@ -648,10 +646,12 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         queue.push_live(ask("c1", "s1", AskPhase::BeforeExecute), tx);
         assert_eq!(queue.liveness(&id("c1")), Some(true));
-        assert!(queue.has_live(&SessionId::from("s1")));
         queue.orphan(&id("c1"));
         assert_eq!(queue.liveness(&id("c1")), Some(false), "dead, still queued");
-        assert!(!queue.has_live(&SessionId::from("s1")));
+        assert_eq!(
+            queue.actor_stop_cost(&SessionId::from("s1")),
+            ActorStopCost::Free
+        );
         assert_eq!(*seen.lock(), vec![("s1".into(), raised("c1"))], "no edge");
     }
 
