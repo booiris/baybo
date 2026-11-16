@@ -11,7 +11,7 @@ name: CI
 #
 # Three things still are, and they are what the comments below now defend:
 #   - WALL-CLOCK. A cold `ios-sim` is ~20 min (warm ~8), then the non-gating
-#     `ios-ui-smokes` ~35 more; a cold `test` is ~15. Nobody waits less
+#     `ios-ui-smokes` ~20-25 more (three shards); a cold `test` is ~15. Nobody waits less
 #     because the minutes are free.
 #   - macOS CONCURRENCY. The free plan allows 20 concurrent jobs but only 5
 #     concurrent macOS ones, shared across the account. That, not minutes, is
@@ -21,7 +21,7 @@ name: CI
 #
 # Also worth knowing now that the repo is public: workflow logs and uploaded
 # artifacts need only READ access, which everyone now has. `ios-ui-smokes`
-# uploads `ios-xcresult` on every run, and an xcresult carries UI-test screenshots — of
+# uploads `ios-xcresult-<shard>` on every run, and an xcresult carries UI-test screenshots — of
 # demo fixtures today, so nothing sensitive, but check that again before
 # pointing a test at real data.
 #
@@ -199,7 +199,7 @@ jobs:
   # Detects which expensive, path-scoped stacks this PR touches, so the jobs
   # below can be skipped entirely. Runner minutes are free on this public repo,
   # so what a skip buys is TIME and a macOS queue slot: `ios-sim` + its chained
-  # `ios-ui-smokes` are the slow pair (~45-55 min end to end, cold) and the
+  # `ios-ui-smokes` are the slow pair (~40 min end to end, cold) and the
   # free plan runs only 5 concurrent macOS jobs account-wide, so a PR that
   # needs no Mac should not hold one.
   changes:
@@ -210,6 +210,7 @@ jobs:
       render: ${{ steps.filter.outputs.render }}
       ios: ${{ steps.filter.outputs.ios }}
       ios_native: ${{ steps.filter.outputs.ios_native }}
+      ios_ui: ${{ steps.filter.outputs.ios_ui }}
       install: ${{ steps.filter.outputs.install }}
       remote_host: ${{ steps.filter.outputs.remote_host }}
       gateway_macos: ${{ steps.filter.outputs.gateway_macos }}
@@ -256,6 +257,20 @@ jobs:
             echo "ios_native=true" >> "$GITHUB_OUTPUT"
           else
             echo "ios_native=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # The UI smokes, narrower again: only what ships inside the app they
+          # drive (Swift, the transcript bundle, the app's own Rust core) or
+          # is the smokes themselves. They run on demo fixtures with no
+          # gateway, so a change confined to crates/ or remote-host/ still
+          # gets the `ios-sim` compile + unit gate but no longer pays for the
+          # three-Mac smoke run — most PRs that reach `ios-sim` are that kind.
+          # The cost: a root-crate change that only misbehaves at RUNTIME in
+          # the app is not smoked on its own PR.
+          if changed '^app/ios/(App/|UITests/|NotificationExtension/|project\.yml|scripts/ci-boot-sim\.sh|web/|ffi/|bindgen/)'; then
+            echo "ios_ui=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ios_ui=false" >> "$GITHUB_OUTPUT"
           fi
 
           # The install/release shell stack. Nothing else in CI ever executes
@@ -524,8 +539,8 @@ jobs:
   # (`ios-web`, ~2 min), the app's own cargo workspace needs Rust but no Mac
   # (`ios-core`, slow), and only the Swift/Xcode half needs a Mac (`ios-sim`,
   # slowest, and the only one that takes one of the 5 macOS slots — its
-  # non-gating `ios-ui-smokes` runs after it on the same build, never beside
-  # it). All three are ON, each behind its matching `changes` filter: `ios` for
+  # non-gating `ios-ui-smokes` shards run after it on the same build, never
+  # beside it, behind their own narrower `ios_ui` filter). All three are ON, each behind its matching `changes` filter: `ios` for
   # the two Linux jobs, `ios_native` for the Mac one, so a docs-only change
   # under app/ios never queues for a Mac.
   # ---------------------------------------------------------------------------
@@ -734,8 +749,10 @@ jobs:
       # lost +x does not launch. The .xctestrun inside addresses everything
       # relative to itself (__TESTROOT__), so it survives the move.
       - name: Pack build products for the UI smokes
+        if: needs.changes.outputs.ios_ui == 'true'
         run: tar -czf "$RUNNER_TEMP/ios-build-products.tgz" -C build/DerivedData/Build Products
       - uses: actions/upload-artifact@v4
+        if: needs.changes.outputs.ios_ui == 'true'
         with:
           name: ios-build-products
           path: ${{ runner.temp }}/ios-build-products.tgz
@@ -753,33 +770,53 @@ jobs:
   # once they have proven stable over a few weeks of real runs.
   #
   # Its own job, chained after `ios-sim`, rather than steps at the end of it.
-  # Inside that job the smokes held the gating check open: unit tests were done
-  # at ~8 min, but the check only reported when the JOB ended, ~35 min of smokes
-  # later. Chained with `needs`, the two never run at the same time, so this
-  # still holds ONE of the 5 macOS slots at a time — the price is a second
-  # runner boot (~1-2 min), not a second slot. It runs the build `ios-sim`
-  # uploaded (no Rust, no web, no xcodebuild build), and only after that build
-  # passed its unit tests, as the steps used to.
+  # Inside that job the smokes held the gating check open until they ended.
+  # Chained with `needs`, it runs the build `ios-sim` uploaded (no Rust, no
+  # web, no xcodebuild build), and only after that build passed its unit tests.
+  #
+  # Gated on `ios_ui`, which is narrower than `ios_native`: see the filter in
+  # `changes` for what that trades away.
+  #
+  # SHARDED three ways. Serial, the suite was a 48-min median (117 tests, ~41
+  # min of test execution) and was being killed by its step cap. The shards run
+  # at the same time, so this now holds up to THREE of the 5 macOS slots for
+  # ~20-25 min instead of one for ~48 — affordable because the `ios_ui` gate
+  # keeps the job off most PRs. Each shard still runs its tests serially on one
+  # simulator; only the class list is split. Each repeats ~5-7 min of fixed
+  # overhead (runner boot, artifact, cold simulator, xcodebuild start-up),
+  # which is why three and not more.
   #
   # `continue-on-error` at the job level, like `render-tests`: a failure shows
   # red on the PR without failing the run. scripts/dev-merge-sync.sh waits on
   # its REQUIRED_CHECKS only, so this never holds a merge.
   ios-ui-smokes:
-    name: iOS UI smokes (non-gating)
-    needs: ios-sim
+    name: iOS UI smokes (non-gating, ${{ matrix.shard }})
+    needs: [changes, ios-sim]
+    if: ${{ needs.changes.outputs.ios_ui == 'true' }}
     runs-on: macos-26
     continue-on-error: true
-    # The smokes alone took 29m22s on the last green master run and have since
-    # hit the old 35-min step cap (no xcresult survives a cap kill). The step cap
-    # sits under the job's so a slow run still reports and uploads.
-    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [projects, media, rest]
+    # A shard is ~20-25 min. The step cap sits under the job's so a slow run
+    # still reports and uploads.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: app/ios
+    env:
+      # Balanced on measured class times (~13 min of tests per shard). `rest` is
+      # everything NOT named here, so a new test class lands in it without
+      # anyone editing this list; move one up only to rebalance.
+      SHARD_PROJECTS: ProjectsUITests ProjectCardUITests
+      SHARD_MEDIA: ArchiveFlowUITests ComposerAttachUITests AttachmentImageUITests AttachmentShareUITests RenameMenuUITests
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: app/ios/scripts
+          sparse-checkout: |
+            app/ios/scripts
+            app/ios/UITests
       - run: scripts/ci-boot-sim.sh
       - uses: actions/download-artifact@v4
         with:
@@ -790,15 +827,36 @@ jobs:
           tar -xzf "$RUNNER_TEMP/ios-build-products.tgz" -C build/DerivedData/Build
 
       - name: UI smokes
-        timeout-minutes: 50
+        timeout-minutes: 35
+        env:
+          # xcodebuild block-buffers stdout into the xcbeautify pipe, so a
+          # cap-killed run used to lose every test line it had produced.
+          NSUnbufferedIO: "YES"
         run: |
           set -o pipefail
+          # A renamed class would make `-only-testing` match nothing and the
+          # shard pass on zero tests, while `rest` quietly adopted the tests.
+          for class in $SHARD_PROJECTS $SHARD_MEDIA; do
+            if [ ! -f "UITests/$class.swift" ]; then
+              echo "::error::shard list names $class, but UITests/$class.swift does not exist"
+              exit 1
+            fi
+          done
+          selection=()
+          case "${{ matrix.shard }}" in
+            projects) for class in $SHARD_PROJECTS; do selection+=("-only-testing:BayboUITests/$class"); done ;;
+            media) for class in $SHARD_MEDIA; do selection+=("-only-testing:BayboUITests/$class"); done ;;
+            rest)
+              selection+=("-only-testing:BayboUITests")
+              for class in $SHARD_PROJECTS $SHARD_MEDIA; do selection+=("-skip-testing:BayboUITests/$class"); done
+              ;;
+          esac
           xcrun simctl bootstatus "$SIM_UDID" -b
           xctestrun="$(ls build/DerivedData/Build/Products/*.xctestrun | head -1)"
           xcodebuild test-without-building \
             -xctestrun "$xctestrun" \
             -destination "id=$SIM_UDID" \
-            -only-testing:BayboUITests \
+            "${selection[@]}" \
             -parallel-testing-enabled NO \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
             -resultBundlePath build/TestResults/ui.xcresult | xcbeautify
@@ -813,12 +871,12 @@ jobs:
             xcrun xcresulttool get test-results summary --path build/TestResults/ui.xcresult \
               | tee -a "$GITHUB_STEP_SUMMARY" || true
           else
-            echo "no xcresult was produced (the 50-minute step cap cut the run short?)" \
+            echo "no xcresult was produced (the 35-minute step cap cut the run short?)" \
               | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios-xcresult
+          name: ios-xcresult-${{ matrix.shard }}
           path: app/ios/build/TestResults/

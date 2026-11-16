@@ -62,8 +62,8 @@ REQUIRED_CHECKS=(
 # The two patterns MUST mirror `IOS_DEPS` and the ios_native filter in
 # .github/workflows/ci.yml. They differ on purpose: a docs-only change under
 # app/ios runs the two Linux jobs but never queues for the Mac one.
-IOS_DEPS_PATTERN='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
-IOS_NATIVE_PATTERN='^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/'
+IOS_DEPS_PATTERN='^(app/ios/|crates/(wire|device-proto|model|carrier)/|remote-host/|docs/openapi\.json)'
+IOS_NATIVE_PATTERN='^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model|carrier)/|^remote-host/'
 
 # Same shape, same reason, for the install/release shell stack — and the sharper
 # edge of the two: `install.sh` is the only user-facing file no other gate can
