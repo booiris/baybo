@@ -364,6 +364,15 @@ first and only then touches memory. The manager and the gates share
 `AskCore { store, observers }`, so the gate can abandon its own ask on cancel
 without a back-edge to the manager.
 
+`AskCore` does not hand out its store. Its writes are verbs that tell the
+observers once the write has landed — `raise` (create, then `Raised`),
+`record_settled` (create a row already resolved and applied, then
+`Resolved`; the policy deny), `claim` (resolve a pending row, then
+`Resolved` on a win only) — plus `mark_applied`, which observers do not
+hear, and the reads `get` / `list_unapplied` / `list_unapplied_for_session`.
+So "observers see every raise and every resolution" holds by construction:
+there is no write path in the crate that skips them.
+
 | Verb | Persists | Then |
 | --- | --- | --- |
 | `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim) | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A row whose `channel` has no queue still gets the claim, with a `warn!`. |
@@ -1314,7 +1323,7 @@ Where the code differs from the sketch above, and why:
 
 1. executor computes uncovered accesses → `gate.request(ApprovalRequest, cancel)`
    (the executor no longer races the token itself)
-2. `ChannelAskGate`: `core.create(row)` → observer `Raised` → `queue.push(entry)`
+2. `ChannelAskGate`: `core.raise(row)` (create → observer `Raised`) → `queue.push(entry)`
    → `Raised` edge + `AskRaised` watcher → gateway dispatches
    `SessionEvent::ApprovalRequested` → wait
 3. user clicks → `Frame::ResolveApproval` → `route.rs` arm →

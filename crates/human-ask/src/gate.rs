@@ -11,7 +11,7 @@ use baybo_tools::{ApprovalGate, ApprovalOutcome, AskCancel, AskSite, CancelOrigi
 use chrono::Utc;
 use tokio::sync::oneshot;
 
-use crate::core::{AskCore, AskEvent};
+use crate::core::AskCore;
 use crate::queue::{AskQueue, PendingAsk};
 
 /// How long a non-resumable ask — a during-execute approval — waits for an
@@ -51,7 +51,7 @@ impl ChannelAskGate {
     /// shutdown) it never returns, leaving the ask pending for the next
     /// process.
     async fn park(&self, row: HumanAskRow, cancel: AskCancel) -> Option<AskResolution> {
-        if let Err(e) = self.core.store().create(&row).await {
+        if let Err(e) = self.core.raise(&row).await {
             tracing::warn!(
                 ask_id = %row.ask_id,
                 kind = row.kind.as_str(),
@@ -60,7 +60,6 @@ impl ChannelAskGate {
             );
             return None;
         }
-        self.core.notify(&row, AskEvent::Raised).await;
 
         let ask = PendingAsk::from_row(&row);
         let (tx, rx) = oneshot::channel();
@@ -106,17 +105,9 @@ impl ChannelAskGate {
         rx: oneshot::Receiver<AskResolution>,
     ) -> AskResolution {
         let timed_out = AskResolution::TimedOut;
-        match self
-            .core
-            .store()
-            .resolve(&row.ask_id, &timed_out, Utc::now())
-            .await
-        {
-            Ok(true) => {
-                self.core
-                    .notify(row, AskEvent::Resolved(timed_out.clone()))
-                    .await;
-            }
+        let mut claimed = row.clone();
+        match self.core.claim(&mut claimed, timed_out.clone()).await {
+            Ok(true) => {}
             Ok(false) => return rx.await.unwrap_or(AskResolution::Abandoned),
             Err(e) => {
                 tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record an ask timing out");
@@ -169,23 +160,16 @@ impl ApprovalGate for PolicyDenyGate {
         site: AskSite,
         _cancel: AskCancel,
     ) -> ApprovalOutcome {
-        let denied = ApprovalOutcome::policy(ApprovalDecision::Deny);
-        let mut row = approval_row(req, site);
-        let now = Utc::now();
-        row.resolved_at = Some(now);
-        row.resolution = Some(AskResolution::PolicyDenied);
-        row.applied_at = Some(now);
-        match self.core.store().create(&row).await {
-            Ok(()) => {
-                self.core
-                    .notify(&row, AskEvent::Resolved(AskResolution::PolicyDenied))
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record policy denial");
-            }
+        let row = approval_row(req, site);
+        let ask_id = row.ask_id.clone();
+        if let Err(e) = self
+            .core
+            .record_settled(row, AskResolution::PolicyDenied)
+            .await
+        {
+            tracing::warn!(%ask_id, error = %e, "could not record policy denial");
         }
-        denied
+        ApprovalOutcome::policy(ApprovalDecision::Deny)
     }
 }
 

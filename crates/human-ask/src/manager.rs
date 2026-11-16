@@ -7,9 +7,8 @@ use std::sync::Arc;
 use baybo_model::SessionId;
 use baybo_model::human_ask::{AskId, AskKind, AskResolution, ResumeRequest, resumable};
 use baybo_store::HumanAskRow;
-use chrono::Utc;
 
-use crate::core::{AskCore, AskEvent};
+use crate::core::AskCore;
 use crate::error::{HumanAskError, Result};
 use crate::ports::{ActorStopCost, LivePendingAsks, ResumeSink};
 use crate::queue::{AskQueues, PendingAsk};
@@ -82,7 +81,7 @@ impl HumanAskManager {
     }
 
     pub async fn get(&self, ask_id: &AskId) -> Result<Option<HumanAskRow>> {
-        Ok(self.core.store().get(ask_id).await?)
+        self.core.get(ask_id).await
     }
 
     /// A human (or policy) decided `ask_id`. Claims the resolution, then
@@ -102,14 +101,11 @@ impl HumanAskManager {
                 kind: row.kind,
             });
         }
-        if !self.claim(&mut row, resolution.clone()).await? {
+        if !self.core.claim(&mut row, resolution.clone()).await? {
             return Err(HumanAskError::AskClosed {
                 ask_id: ask_id.clone(),
             });
         }
-        self.core
-            .notify(&row, AskEvent::Resolved(resolution.clone()))
-            .await;
 
         let delivered = match self.queues.get(&row.channel) {
             Some(queue) => queue
@@ -143,7 +139,7 @@ impl HumanAskManager {
     /// this call claimed.
     pub async fn abandon_for_session(&self, session_id: &SessionId) -> Result<usize> {
         let mut claimed = 0;
-        for mut row in self.unapplied(session_id).await? {
+        for mut row in self.unapplied_for_session(session_id).await? {
             if row.is_pending() && self.abandon_row(&mut row).await? {
                 claimed += 1;
             }
@@ -164,7 +160,7 @@ impl HumanAskManager {
         tool_call_id: &str,
     ) -> Result<bool> {
         let rows: Vec<HumanAskRow> = self
-            .unapplied(session_id)
+            .unapplied_for_session(session_id)
             .await?
             .into_iter()
             .filter(|row| row.tool_call_id == tool_call_id)
@@ -189,7 +185,7 @@ impl HumanAskManager {
     /// live ask cannot exist here — it is logged and left alone.
     pub async fn settle_unapplied(&self, session_id: &SessionId) -> Result<Vec<Settled>> {
         let mut settled = Vec::new();
-        for mut row in self.unapplied(session_id).await? {
+        for mut row in self.unapplied_for_session(session_id).await? {
             if row.is_pending() {
                 if self.is_live(&row) {
                     tracing::warn!(
@@ -235,7 +231,7 @@ impl HumanAskManager {
     /// applied. Idempotent.
     pub async fn reload_pending(&self, scope: ReloadScope) -> Result<ReloadReport> {
         let mut report = ReloadReport::default();
-        for row in self.core.store().list_unapplied().await? {
+        for row in self.core.list_unapplied().await? {
             let resumable = resumable(row.kind, row.phase);
             match (row.is_pending(), resumable) {
                 (true, true) => {
@@ -272,7 +268,7 @@ impl HumanAskManager {
     /// queue: a just-answered dead ask is already off the queue.
     pub async fn unapplied_tool_use_ids(&self, session_id: &SessionId) -> Result<Vec<String>> {
         Ok(self
-            .unapplied(session_id)
+            .unapplied_for_session(session_id)
             .await?
             .into_iter()
             .filter(|row| resumable(row.kind, row.phase))
@@ -282,7 +278,7 @@ impl HumanAskManager {
 
     /// The session's asks not yet applied to its transcript, live or dead.
     pub async fn unapplied_for_session(&self, session_id: &SessionId) -> Result<Vec<HumanAskRow>> {
-        self.unapplied(session_id).await
+        self.core.list_unapplied_for_session(session_id).await
     }
 
     /// Whether the turn that raised `row` still has a resumable ask nobody
@@ -291,7 +287,7 @@ impl HumanAskManager {
     /// Resume door waits for the last answer, as the live batch would.
     pub async fn awaits_more_answers(&self, row: &HumanAskRow) -> Result<bool> {
         Ok(self
-            .unapplied(&row.session_id)
+            .unapplied_for_session(&row.session_id)
             .await?
             .iter()
             .any(|sibling| {
@@ -320,14 +316,6 @@ impl HumanAskManager {
             .unwrap_or(ActorStopCost::Free)
     }
 
-    async fn unapplied(&self, session_id: &SessionId) -> Result<Vec<HumanAskRow>> {
-        Ok(self
-            .core
-            .store()
-            .list_unapplied_for_session(session_id)
-            .await?)
-    }
-
     fn is_live(&self, row: &HumanAskRow) -> bool {
         self.queues
             .get(&row.channel)
@@ -335,28 +323,10 @@ impl HumanAskManager {
             .unwrap_or(false)
     }
 
-    /// Claim `resolution` on a pending row and mirror it onto `row`.
-    async fn claim(&self, row: &mut HumanAskRow, resolution: AskResolution) -> Result<bool> {
-        let now = Utc::now();
-        let won = self
-            .core
-            .store()
-            .resolve(&row.ask_id, &resolution, now)
-            .await?;
-        if won {
-            row.resolved_at = Some(now);
-            row.resolution = Some(resolution);
-        }
-        Ok(won)
-    }
-
     async fn abandon_row(&self, row: &mut HumanAskRow) -> Result<bool> {
-        if !self.claim(row, AskResolution::Abandoned).await? {
+        if !self.core.claim(row, AskResolution::Abandoned).await? {
             return Ok(false);
         }
-        self.core
-            .notify(row, AskEvent::Resolved(AskResolution::Abandoned))
-            .await;
         if let Some(queue) = self.queues.get(&row.channel) {
             let _ = queue.abandon(&row.ask_id);
         }
