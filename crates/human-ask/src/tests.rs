@@ -155,7 +155,7 @@ fn site(phase: AskPhase) -> AskSite {
 fn tokens() -> TurnTokens {
     TurnTokens {
         turn: CancellationToken::new(),
-        actor: CancellationToken::new(),
+        release: CancellationToken::new(),
     }
 }
 
@@ -235,6 +235,49 @@ async fn write_ahead_row_and_observer_precede_the_queue_push() {
     task.abort();
 }
 
+/// Answers every ask the moment it is announced, before the gate has put it
+/// on the queue.
+struct AnswerOnRaise {
+    manager: Arc<HumanAskManager>,
+}
+
+#[async_trait]
+impl AskObserver for AnswerOnRaise {
+    async fn on_event(&self, ask: &HumanAskRow, event: AskEvent) {
+        if event == AskEvent::Raised {
+            let _ = self.manager.resolve(&ask.ask_id, APPROVE).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_answer_that_lands_before_the_queue_push_still_reaches_the_gate() {
+    for (phase, expected) in [
+        (
+            AskPhase::BeforeExecute,
+            ApprovalOutcome::answered(ApprovalDecision::Approve),
+        ),
+        // Not on the queue yet, so it reads as a dead during-execute ask and
+        // is closed; the gate must hear that instead of parking forever.
+        (AskPhase::DuringExecute, ApprovalOutcome::abandoned()),
+    ] {
+        let h = harness();
+        h.core.add_observer(Arc::new(AnswerOnRaise {
+            manager: Arc::clone(&h.manager),
+        }));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.gate
+                .request(req("a", "s1"), site(phase), AskCancel::new(tokens())),
+        )
+        .await
+        .expect("the gate does not park on an ask a verb already closed");
+        assert_eq!(outcome, expected, "{phase:?}");
+        assert!(h.queue.is_empty(), "{phase:?}: no card is left up");
+        assert!(h.store.row(&id("a")).expect("row").applied_at.is_some());
+    }
+}
+
 #[tokio::test]
 async fn a_failing_create_raises_no_entry_and_no_edge() {
     let h = harness();
@@ -312,6 +355,37 @@ async fn an_unanswered_during_execute_approval_times_out() {
         h.manager.resolve(&id("a"), APPROVE).await.is_err(),
         "a late answer is refused"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timeout_the_ledger_could_not_record_stays_listed_for_the_reconcile() {
+    let h = harness();
+    let task = park(&h, "a", "s1", AskPhase::DuringExecute, tokens()).await;
+    h.store.fail_resolves(true);
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert_eq!(
+        task.await.expect("join"),
+        ApprovalOutcome::timed_out(),
+        "the tool still gets its timeout"
+    );
+    assert!(!h.queue.contains(&id("a")), "the card is closed");
+    let stored = h.store.row(&id("a")).expect("row");
+    assert!(stored.is_pending());
+    assert!(
+        stored.applied_at.is_none(),
+        "a pending row stamped applied would never be listed again"
+    );
+
+    h.store.fail_resolves(false);
+    let settled = h
+        .manager
+        .settle_unapplied(&"s1".into())
+        .await
+        .expect("settle");
+    assert!(settled.is_empty(), "its call already has a result");
+    let stored = h.store.row(&id("a")).expect("row");
+    assert_eq!(stored.resolution, Some(AskResolution::Abandoned));
+    assert!(stored.applied_at.is_some());
 }
 
 #[tokio::test(start_paused = true)]
@@ -506,17 +580,25 @@ async fn a_mid_run_answer_racing_stop_still_gets_one_result() {
         h.queue.is_empty(),
         "a non-resumable orphan leaves the queue"
     );
-    // The answer lands between the gate dropping and the loop's claim.
-    h.manager.resolve(&id("a"), APPROVE).await.expect("resolve");
+    // The answer lands between the gate dropping and the loop's claim: its
+    // tool future is gone, so it is refused and the ask closed, not recorded
+    // as an approval nothing carries out.
+    let late = h.manager.resolve(&id("a"), APPROVE).await;
+    assert!(
+        matches!(late, Err(HumanAskError::AskClosed { .. })),
+        "{late:?}"
+    );
     assert!(h.sink.requests.lock().is_empty());
     assert!(
-        h.manager
+        !h.manager
             .abandon_for_tool_call(&"s1".into(), "use-a")
             .await
             .expect("claim"),
-        "the loop appends the cancel fill"
+        "nothing left to claim; the loop appends its cancel fill either way"
     );
-    assert!(h.store.row(&id("a")).expect("row").applied_at.is_some());
+    let stored = h.store.row(&id("a")).expect("row");
+    assert_eq!(stored.resolution, Some(AskResolution::Abandoned));
+    assert!(stored.applied_at.is_some());
 }
 
 #[tokio::test]
@@ -524,7 +606,7 @@ async fn ancestor_cancel_never_returns() {
     let h = harness();
     let t = tokens();
     let task = park(&h, "a", "s1", AskPhase::BeforeExecute, t.clone()).await;
-    t.actor.cancel();
+    t.release.cancel();
     t.turn.cancel();
     let out = tokio::time::timeout(Duration::from_millis(50), task).await;
     assert!(out.is_err(), "stays parked on an ancestor cancel");
@@ -647,6 +729,52 @@ async fn reload_resumes_resolved_rows_without_showing_them() {
             ask_id: id("a"),
         }]
     );
+}
+
+#[tokio::test]
+async fn reload_carries_on_past_a_row_it_cannot_write() {
+    let h = harness();
+    h.store.insert(row("p", "s1", AskPhase::DuringExecute));
+    h.store.insert(row("a", "s2", AskPhase::BeforeExecute));
+    h.store.fail_resolves(true);
+    let report = h.manager.reload_pending().await.expect("reload");
+    assert_eq!((report.failed, report.requeued), (1, 1));
+    assert!(
+        h.queue.contains(&id("a")),
+        "the row after the failure is shown"
+    );
+    let p = h.store.row(&id("p")).expect("row");
+    assert!(
+        p.is_pending() && p.applied_at.is_none(),
+        "left as it was for the next boot"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_to_a_dead_during_execute_ask_is_refused_and_closes_it() {
+    let h = harness();
+    h.store.insert(row("d", "s1", AskPhase::DuringExecute));
+    let refused = h.manager.resolve(&id("d"), APPROVE).await;
+    assert!(
+        matches!(refused, Err(HumanAskError::AskClosed { .. })),
+        "{refused:?}"
+    );
+    let stored = h.store.row(&id("d")).expect("row");
+    assert_eq!(
+        stored.resolution,
+        Some(AskResolution::Abandoned),
+        "no approval is recorded for a call nothing can run"
+    );
+    assert!(stored.applied_at.is_some());
+    let events: Vec<AskEvent> = h
+        .observer
+        .seen
+        .lock()
+        .iter()
+        .map(|(_, e, _, _)| e.clone())
+        .collect();
+    assert_eq!(events, vec![AskEvent::Resolved(AskResolution::Abandoned)]);
+    assert!(h.sink.requests.lock().is_empty(), "nothing to resume");
 }
 
 #[tokio::test]

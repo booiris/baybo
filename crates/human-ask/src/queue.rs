@@ -150,7 +150,7 @@ enum Outgoing {
 
 /// What [`AskQueue::resolve`] found and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Removed {
+pub(crate) struct Removed {
     pub ask: PendingAsk,
     /// A live waiter received the resolution. `false` for a dead entry, or a
     /// live one whose waiter vanished in the same instant.
@@ -369,7 +369,7 @@ impl AskQueue {
 
     /// Remove an ask a human (or policy) decided and hand the decision to
     /// its waiter, if it has one. `None` when the ask is not queued.
-    pub fn resolve(&self, ask_id: &AskId, resolution: AskResolution) -> Option<Removed> {
+    pub(crate) fn resolve(&self, ask_id: &AskId, resolution: AskResolution) -> Option<Removed> {
         let edge = if matches!(
             resolution,
             AskResolution::Abandoned | AskResolution::TimedOut
@@ -392,7 +392,7 @@ impl AskQueue {
 
     /// Remove an ask nobody decided. A live waiter sees
     /// [`AskResolution::Abandoned`].
-    pub fn abandon(&self, ask_id: &AskId) -> Option<Removed> {
+    pub(crate) fn abandon(&self, ask_id: &AskId) -> Option<Removed> {
         self.resolve(ask_id, AskResolution::Abandoned)
     }
 
@@ -401,7 +401,7 @@ impl AskQueue {
     /// still answerable. A non-resumable one is useless without its tool
     /// future, so it is removed with an `Abandoned` edge; its row is
     /// reconciled later by the manager.
-    pub fn orphan(&self, ask_id: &AskId) {
+    pub(crate) fn orphan(&self, ask_id: &AskId) {
         let resumable_found = {
             let mut q = self.inner.lock();
             match q.iter_mut().find(|e| &e.ask.ask_id == ask_id) {

@@ -742,8 +742,8 @@ impl ToolExecutor {
         parallel_group: Option<ParallelGroup>,
         _parent_turn_for_log: Option<TurnId>,
         // This call's cancel token (`turn`, a child of the turn's) and the
-        // actor's (`actor`). A parked ask reads both to tell a turn cancel
-        // from process shutdown.
+        // turn's release token. A parked ask reads both to tell a turn
+        // cancel from a turn ended with its asks left pending.
         tokens: TurnTokens,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.lite_llm` is unset (argv-mode / older tests).
@@ -1544,7 +1544,7 @@ mod tests {
     fn idle_tokens() -> TurnTokens {
         TurnTokens {
             turn: CancellationToken::new(),
-            actor: CancellationToken::new(),
+            release: CancellationToken::new(),
         }
     }
 

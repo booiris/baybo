@@ -46,8 +46,9 @@ pub trait LivePendingAsks: Send + Sync {
 }
 
 /// Told about asks raised and resolved through a verb. Runs on the verb's
-/// task after the store write, never from a queue watcher and never on boot
-/// reload.
+/// task after the store write, never from a queue watcher. Boot reload sends
+/// no `Raised`; a reload that abandons a dead non-resumable ask does send
+/// `Resolved(Abandoned)`.
 #[async_trait]
 pub trait AskObserver: Send + Sync {
     async fn on_event(&self, ask: &HumanAskRow, event: AskEvent);

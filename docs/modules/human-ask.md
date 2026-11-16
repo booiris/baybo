@@ -282,7 +282,9 @@ door. A during-execute approval cannot outlive its tool future, so it
 alone keeps a deadline, `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min): the gate
 claims `AskResolution::TimedOut`, closes the card, and the tool returns a
 `ApprovalResolution::TimedOut` denial (`REFUSAL_TIMED_OUT`) and carries on —
-nothing is replayed. See
+nothing is replayed. If that claim cannot be written the tool still gets its
+timeout, but the row is left pending **and unapplied**, so the session's next
+settlement or the next boot closes it as a dead non-resumable ask. See
 [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 `baybo prompt` (`prompt_cmd.rs:258-264`) keeps working through the session
@@ -375,7 +377,7 @@ there is no write path in the crate that skips them.
 
 | Verb | Persists | Then |
 | --- | --- | --- |
-| `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim) | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A row whose `channel` has no queue still gets the claim, with a `warn!`. |
+| `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim). A pending **dead non-resumable** ask (a during-execute approval whose tool future is gone) is instead closed `Abandoned` + `applied` and the answer refused with `AskClosed`: nothing could carry the decision out, so none is recorded | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A resumable row whose `channel` has no queue still gets the claim, with a `warn!`. |
 | `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on **every** unapplied ask of the call — what it abandoned, and an answer that won the claim in the same instant — because its tool future is gone and its caller's append is the only result the call will get; it returns whether the call had any unapplied ask, and the caller appends either way. |
 | `PolicyDenyGate::request` (the gate, not a manager verb) | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
 | `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied`; resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for **resumable** rows it abandoned (the caller appends next; a pending non-resumable row's call was already filled — by the loop's cancel claim or by hydration — so it is reconciled and reported as nothing) and `Settled::Apply { ask_id, tool_call_id, kind, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
@@ -427,10 +429,12 @@ future with `Denied` before the loop's biased select observes anything.
 
 So the origin decision moves into the gate race, and the plumbing is new:
 
-- `run_agent_loop` passes `TurnTokens { turn, actor: self.volatile.actor_token.clone() }`
+- `AgentActor::turn_tokens` builds `TurnTokens { turn: release.child_token(), release }`,
+  where `release` is a per-turn child of the actor's token (see "Idle
+  reaper"); `run_agent_loop` passes it
   through `AgentLoop::run` / `run_inner` into `ToolExecutor::execute` and
   onto the handles as `AskCancel`. `CancelOrigin::of(&tokens)` is `Ancestor`
-  iff `tokens.actor.is_cancelled()`, else `Turn`. One helper, in
+  iff `tokens.release.is_cancelled()`, else `Turn`. One helper, in
   `baybo-tools::ask`, used by every gate.
 - `ApprovalGate::request(req, cancel: AskCancel)` and
   `QuestionGate::ask(req, cancel)` take the tokens. `ChannelAskGate` selects
@@ -465,12 +469,17 @@ So the origin decision moves into the gate race, and the plumbing is new:
 | | call parked on a resumable ask | parked on a non-resumable ask | other unfinished calls |
 | --- | --- | --- | --- |
 | `Turn` — any `TurnLifecycle::cancel` on the turn id: `/stop` (`UserStopped`), board stop (`OperatorCancel` / `BudgetExhausted`, `stopper.rs:52-65`), admin / CLI `OperatorCancel` | gate returns `Denied`; loop claims `Abandoned`, then appends it | same | cancelled fill, as today |
-| `Ancestor` — `actor_token` tripped: process shutdown (`runtime.rs:846`) | nothing appended, nothing emitted; entry dead, row pending | nothing appended; entry removed; row reconciled by `reload_pending` | nothing appended; hydration fills "interrupted" |
+| `Ancestor` — the turn's release token tripped: process shutdown (through `actor_token`, `runtime.rs:846`), or the idle reaper's `release_parked_turn` | nothing appended, nothing emitted; entry dead, row pending | nothing appended; entry removed; row reconciled by `reload_pending` | nothing appended; hydration fills "interrupted" |
 
-For attended sessions the only ancestor cancel is process shutdown (the idle
-reaper's `ActorStop` is a mailbox message served after the turn, never a
-token; subagent parent-cancels reach only `Spawned` turns, which raise no
-asks). A `/stop` racing shutdown reads `Ancestor` — the conservative outcome.
+For attended sessions there are two ancestor cancels: process shutdown, and
+the idle reaper releasing a parked turn (see "Idle reaper"). The reaper only
+releases a turn whose stop cost is `ReleasesTurn`, so the non-resumable
+column is reached at shutdown alone. (Subagent parent-cancels reach only
+`Spawned` turns, which raise no asks.) A `/stop` racing either reads
+`Ancestor` — the conservative outcome. The actor tells the two origins apart
+the same way: only a `Turn` cancel is a user stop that discards the messages
+queued behind the turn; after a release they run as the next turn, whose
+prelude withdraws the released asks.
 
 The `Ancestor` branch is **best-effort**: shutdown cancels the parent token
 from a detached task and nothing joins actor tasks before the process exits
@@ -603,11 +612,11 @@ under a Resume turn — appends, and for an approved call the re-execution
 under a fresh step (it needs the executor and a turn to open a step under,
 which is why this is a turn and not a bare append; `publish_cron_notification`
 is the precedent for a turn whose body is only an append). The loop's
-settlement body is `AgentLoop::settle_unapplied_asks(session, mode)` with
-`SettleMode::{SettleOnly, Continue}`: every door uses `SettleOnly` (the turn
-ends after the appends; the door's own turn follows and its first LLM call
-sees the settled results), the chat Resume door uses `Continue` (the same
-turn goes on to the LLM iterations). Nothing else is appended between
+settlement body is `AgentLoop::settle_unapplied_asks(session, …)`, entered two
+ways: every door calls `AgentLoop::run_settlement_turn` (the turn ends after
+the appends; the door's own turn follows and its first LLM call sees the
+settled results), and the chat Resume door's `run_inner` calls it and then
+goes on to the LLM iterations in the same turn. Nothing else is appended between
 hydration and the settlement, so adjacency holds.
 
 For each `Settled` the manager returns:
@@ -664,7 +673,7 @@ close the second card under the user. The answer stays `resolved`, and
 the last answer's `ResumeAsk` applies them all in one Resume turn — the
 turn carries on once every call it parked has an answer, as the live batch
 would. A new message still abandons whatever is left unanswered.
-Otherwise `run_agent_loop(TurnInput::Resume { resumed_turn_id, ask_id, tool_use_id }, SettleMode::Continue, …)`
+Otherwise `run_agent_loop(TurnInput::Resume { resumed_turn_id, ask_id, tool_use_id }, …)`
 exactly like `handle_user_input`, including `send_user_reply`. The
 settlement applies the answer; the first LLM iteration then runs on a window
 whose tail is `assistant(tool_use) + tool_result` — a legal starting state,
@@ -1021,7 +1030,7 @@ before execute.
 `ActorStop` is served between turns, so a turn parked on an ask would hold
 its actor — transcript, tool future and all — for as long as nobody answers.
 Each turn therefore runs under a **release token**: a child of the actor's
-token that is the turn's `TurnTokens.actor`, registered with the supervisor
+token that is the turn's `TurnTokens.release`, registered with the supervisor
 while the turn runs (`AgentSupervisor::track_turn`). For an idle session
 whose stop cost is `ReleasesTurn`, `reap_idle` queues `ActorStop` and then
 calls `release_parked_turn`, which reads the cost again and cancels that
@@ -1118,7 +1127,7 @@ pub struct HumanAskRow { ask_id, session_id, channel: ChannelType, tool_call_id:
 }
 
 // baybo_tools::ask  (tool-facing port, sibling of tools::approval)
-pub struct TurnTokens { pub turn: CancellationToken, pub actor: CancellationToken }
+pub struct TurnTokens { pub turn: CancellationToken, pub release: CancellationToken }
 pub enum CancelOrigin { Turn, Ancestor }        // CancelOrigin::of(&TurnTokens)
 pub struct AskCancel { pub tokens: TurnTokens }
 pub struct AskSite { pub channel: ChannelType, pub phase: AskPhase }   // which queue the row reloads into; which phase raised it
@@ -1147,7 +1156,7 @@ pub struct HumanAskManager;                     // from_config(HumanAskManagerCo
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
                                                 //        unapplied_tool_use_ids, actor_stop_cost (LivePendingAsks impl)
 pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, kind, resolution } }
-pub struct ReloadReport { requeued, resumed, abandoned, applied }
+pub struct ReloadReport { requeued, resumed, abandoned, applied, failed }   // a row that fails is logged, counted and left for the next boot; the rows after it still reload
 #[async_trait] pub trait ResumeSink {
     async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
     fn request_resume(&self, req: ResumeRequest);
@@ -1158,7 +1167,7 @@ pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>
 pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<dyn Tool>, ToolManifest)>; }
 
 // baybo_agent
-pub enum SettleMode { SettleOnly, Continue }    // AgentLoop::settle_unapplied_asks(session, mode); AgentActor::settle_unapplied_asks() wraps SettleOnly in a Resume turn
+// AgentLoop::settle_unapplied_asks(session, …) is the settlement body; AgentLoop::run_settlement_turn wraps it in a Resume turn for AgentActor::settle_unapplied_asks() (the doors); run_inner calls it for the chat Resume door
 struct UnappliedAsks(Arc<HumanAskManager>);     // impl baybo_context::PendingToolCalls — keeps human-ask free of a context edge
 ```
 
@@ -1412,8 +1421,8 @@ leaves draft.
   + `TOOL_DEADLINE_GRACE`; `Ancestor` branch appends/emits nothing, `Turn`
   branch claims `abandon_for_tool_call` before each append;
   `AgentActor::settle_unapplied_asks()` called by the five doors before their
-  append and by `/compact`, `AgentLoop::settle_unapplied_asks(session, mode)`
-  with `SettleMode`; `PreDecided` re-execute; `ResumeSink` impl;
+  append and by `/compact`, `AgentLoop::settle_unapplied_asks(session, …)`;
+  `PreDecided` re-execute; `ResumeSink` impl;
   `AgentMessage::ResumeAsk` / `handle_resume_ask`; `PendingToolCalls` port in
   `baybo-context` + the `UnappliedAsks` newtype +
   `repair_tool_pairing(messages, skip)`; reaper probe.
@@ -1503,8 +1512,9 @@ Unit (`baybo-human-ask`, `MemoryHumanAskStore` where a store is needed):
   abandon-clears-the-mark; `a_dropped_request_future_clears_the_session_mark`
   becomes "a turn-cancelled request persists `Abandoned` before the Drop
   guard runs".
-- observers receive `Raised`/`Resolved` from every verb and nothing from
-  reload.
+- observers receive `Raised`/`Resolved` from every verb; reload sends no
+  `Raised`, and `Resolved(Abandoned)` only for a dead non-resumable ask it
+  abandons.
 
 Unit (other crates):
 
@@ -1594,7 +1604,7 @@ implemented as written unless overridden.
    unblock them is gone. The `SessionPatch` wire key is still renamed
    outright. Recommended: twin on REST only.
 3. **Shutdown leaves asks pending; `/stop` abandons them.** This needs the
-   actor token threaded into the executor (`TurnTokens`) and the gate to make
+   turn's release token threaded into the executor (`TurnTokens`) and the gate to make
    the origin decision — a small but new seam, and best-effort on the
    shutdown side. The alternative — treat shutdown like `/stop` — means
    "survives a restart" only covers crashes, not `baybo gateway restart`,

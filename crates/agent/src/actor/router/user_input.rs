@@ -383,6 +383,11 @@ impl Router {
                 return;
             }
         };
+        // An answer is activity like a message is: without the stamp the
+        // resumed session is still idle to the reaper from its first second.
+        if let Err(e) = self.session_manager.touch(&req.session_id).await {
+            warn!(session_id = %req.session_id, error = %e, "could not stamp activity for a resumed ask");
+        }
         let routed = self
             .route_one_to_actor(
                 &req.session_id,
@@ -748,7 +753,9 @@ mod tests {
     struct RouterFixture {
         router: Router,
         dedup: Arc<InboundDedup>,
-        _mailboxes: Arc<Mutex<Vec<MailboxReceiver<AgentMessage>>>>,
+        sessions: Arc<SessionManager>,
+        session_store: Arc<MemorySessionStore>,
+        mailboxes: Arc<Mutex<Vec<MailboxReceiver<AgentMessage>>>>,
         _trigger_tx: mpsc::Sender<baybo_cron::CronTriggerEvent>,
         _response_rx: mpsc::Receiver<AgentOutput>,
     }
@@ -759,8 +766,9 @@ mod tests {
             response_tx,
             std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
         );
+        let session_store = Arc::new(MemorySessionStore::new());
         let sessions = Arc::new(SessionManager::new(
-            Arc::new(MemorySessionStore::new()),
+            session_store.clone(),
             Arc::new(MemorySessionFolderStore::new()),
         ));
         let mailboxes: Arc<Mutex<Vec<MailboxReceiver<AgentMessage>>>> =
@@ -777,7 +785,7 @@ mod tests {
         let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
         let dedup = Arc::new(InboundDedup::new());
         let router = Router::from_config(RouterConfig {
-            session_manager: sessions,
+            session_manager: Arc::clone(&sessions),
             supervisor,
             channels: Arc::new(ChannelRegistry::new()),
             security_gateway: Arc::new(SecurityGateway::new(Arc::new(detector), vault)),
@@ -803,7 +811,9 @@ mod tests {
         RouterFixture {
             router,
             dedup,
-            _mailboxes: mailboxes,
+            sessions,
+            session_store,
+            mailboxes,
             _trigger_tx: trigger_tx,
             _response_rx: response_rx,
         }
@@ -843,6 +853,62 @@ mod tests {
         assert!(
             !fx.dedup.check_and_record(&ct, "", "msg-1"),
             "a routed send's key must stay recorded"
+        );
+    }
+
+    /// A dead ask usually exists because the reaper already found its session
+    /// idle. The answer is activity: without the stamp the resumed session is
+    /// reaped again on the next tick, mid-turn.
+    #[tokio::test]
+    async fn a_resume_stamps_the_session_active() {
+        use baybo_session::SessionStore;
+
+        let fx = fixture(8, LeakDetector::with_default_rules());
+        let user = User {
+            id: "u1".into(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        let mut session = fx
+            .sessions
+            .create_session(user, ChannelType::tui())
+            .await
+            .expect("create");
+        session.last_active = Utc::now() - chrono::Duration::hours(2);
+        fx.session_store.save(&session).await.expect("backdate");
+        let idle = chrono::Duration::minutes(30);
+        assert!(
+            fx.sessions
+                .idle_sessions(idle)
+                .await
+                .expect("idle")
+                .contains(&session.id)
+        );
+
+        let ask_id: baybo_model::human_ask::AskId = "ask-1".parse().expect("ask id");
+        fx.router
+            .handle_resume_ask(baybo_model::human_ask::ResumeRequest {
+                session_id: session.id.clone(),
+                ask_id: ask_id.clone(),
+            })
+            .await;
+
+        assert!(
+            !fx.sessions
+                .idle_sessions(idle)
+                .await
+                .expect("idle")
+                .contains(&session.id),
+            "the resumed session is no longer idle"
+        );
+        let mut mailboxes = fx.mailboxes.lock();
+        let routed = mailboxes
+            .first_mut()
+            .expect("an actor was spawned")
+            .try_recv();
+        assert!(
+            matches!(&routed, Ok(AgentMessage::ResumeAsk { ask_id: got }) if *got == ask_id),
+            "the resume reaches the actor"
         );
     }
 

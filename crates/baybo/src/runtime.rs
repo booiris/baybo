@@ -536,7 +536,8 @@ pub async fn build_managers(
     )?;
 
     // The ask push relay watches the owner queue's edges, so it must exist
-    // before the reload below publishes the dead asks it re-queues: edges go
+    // before the gateway's boot reload (`gateway_cmd`) publishes the dead asks
+    // it re-queues: edges go
     // to whoever is watching at drain time, with no replay. Installed on
     // `owner` alone: the queue is per-channel, and the app holds an `owner`
     // connection, so an ask parked on the TUI's or Telegram's queue is one

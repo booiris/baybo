@@ -1836,8 +1836,9 @@ halves once at boot, after the ask manager and the `ProjectManager` exist:
   issue's unsettled run, read from `list_runs` at that moment) and
   `ApprovalResolved` on `AskEvent::Resolved` — `Answered` with the human's
   decision, or `Abandoned` / `Deny`. A policy denial is never on the card and
-  records nothing. Observers run from the ask verbs only, never on boot
-  reload, so a restart does not write a duplicate `approval_requested` row;
+  records nothing. `Raised` is never sent on boot reload, so a restart does
+  not write a duplicate `approval_requested` row (a reload that abandons a
+  dead during-execute approval does send `Resolved(Abandoned)`);
   a `Resolved` after a restart simply finds no unsettled-run attempt to
   carry, which `attempt: Option<i64>` allows. It holds the board as a
   `Weak<ProjectManager>`: `ProjectManager → closer → HumanAskManager →

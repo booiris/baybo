@@ -558,6 +558,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             resumed = report.resumed,
             abandoned = report.abandoned,
             applied = report.applied,
+            failed = report.failed,
             "reloaded unapplied human asks"
         ),
         Err(e) => tracing::warn!(error = %e, "failed to reload unapplied human asks"),

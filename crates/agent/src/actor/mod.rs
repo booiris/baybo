@@ -330,8 +330,8 @@ pub struct AgentActor {
 }
 
 impl AgentActor {
-    /// The tokens one turn runs under. Its `actor` side is a release token
-    /// below the actor's own: tripping it ends this turn the way a shutdown
+    /// The tokens one turn runs under. Its `release` side is a per-turn child
+    /// of the actor's token: tripping it ends this turn the way a shutdown
     /// would and leaves later turns alone. The supervisor holds it while the
     /// guard lives, so the idle reaper can end a turn parked on resumable
     /// asks.
@@ -349,7 +349,7 @@ impl AgentActor {
             .map(|s| s.track_turn(&self.durable.session.id, release.clone()));
         let tokens = baybo_tools::TurnTokens {
             turn: release.child_token(),
-            actor: release,
+            release,
         };
         (tokens, guard)
     }
@@ -413,6 +413,14 @@ impl AgentActor {
                 break;
             };
             notification_retry.reset();
+            // Shutdown: the token every turn of this actor runs under is
+            // already cancelled. A message served now would run its prelude
+            // under it and abandon the asks shutdown leaves pending, so only
+            // the stop (for its final save) is still taken.
+            if self.volatile.actor_token.is_cancelled() && !matches!(msg, AgentMessage::ActorStop) {
+                debug!(session_id = %session_id, "actor is shutting down; dropping a queued message");
+                continue;
+            }
             match msg {
                 AgentMessage::ActorStop => {
                     debug!(session_id = %session_id, "actor stopping");
@@ -648,10 +656,12 @@ impl AgentActor {
         parent_turn_id: Option<baybo_model::TurnId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
-        // Set to whether this turn ended via cancellation (`/stop` / shutdown),
-        // so the user-turn caller can drop queued interjections a `/stop` would
-        // otherwise leave to run as follow-up turns. Caught after the loop fully
-        // returns, so it covers every cancellation path (incl. mid-LLM-call).
+        // Set to whether the user stopped this turn (`/stop`), so the user-turn
+        // caller can drop queued interjections a `/stop` would otherwise leave
+        // to run as follow-up turns. Not set for a released turn (the idle
+        // reaper, shutdown): what the user queued behind it must still run.
+        // Caught after the loop fully returns, so it covers every cancellation
+        // path (incl. mid-LLM-call).
         stopped_out: Option<&mut bool>,
         // A recurring cron fire's turn (its own, or its report's): the
         // `report_nothing` silence and the record of what it hands to the
@@ -668,7 +678,7 @@ impl AgentActor {
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
         let (tokens, _release) = self.turn_tokens();
-        let turn_token = tokens.turn.clone();
+        let turn_tokens = tokens.clone();
         let result = self
             .volatile
             .agent_loop
@@ -684,9 +694,10 @@ impl AgentActor {
                 cron_report,
             )
             .await;
-        let cancelled = turn_token.is_cancelled();
+        let cancelled = turn_tokens.turn.is_cancelled();
         if let Some(out) = stopped_out {
-            *out = cancelled;
+            *out = cancelled
+                && baybo_tools::CancelOrigin::of(&turn_tokens) == baybo_tools::CancelOrigin::Turn;
         }
         // A user is waiting on this turn — a genuine failure must surface as
         // a terminal notice, not silence (the log line alone leaves the chat

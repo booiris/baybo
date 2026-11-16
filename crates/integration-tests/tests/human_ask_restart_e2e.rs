@@ -444,6 +444,80 @@ async fn a_released_parked_turn_is_resumed_by_its_answer() {
         .expect("the actor quiesces");
 }
 
+/// A message the user sent while the approval was up is still in the mailbox
+/// when the reaper releases the turn. A release is not a `/stop`: the
+/// message must run as the next turn, whose prelude withdraws the ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_queued_behind_a_released_turn_still_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&dir.path().join(DB_FILE))
+        .await
+        .expect("open the database");
+    let session = owner_session(TriggerSource::User);
+    store
+        .session
+        .save(&session)
+        .await
+        .expect("save the session");
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut harness = builder(&session, store, &runs).with_resume_door().build();
+    call_gated_write(&harness);
+    harness.send_text("write it").await.expect("send");
+    let ask_id = parked_ask(&harness).await;
+
+    harness.send_text("never mind").await.expect("send");
+    reply(&harness, "ok");
+    assert!(harness.supervisor.release_parked_turn(&session.id));
+    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        replied(&outputs, "ok"),
+        "the queued message ran: {outputs:#?}"
+    );
+    let after = row(&harness, &ask_id).await;
+    assert_eq!(after.resolution, Some(AskResolution::Abandoned));
+    assert!(after.applied_at.is_some());
+    assert!(adjacent_result(&harness).await.contains("withdrawn"));
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(harness.strict_rejections.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
+        .await
+        .expect("the actor quiesces");
+}
+
+/// Shutdown is not a release the actor carries on from: a message queued
+/// behind the parked turn must not run, because its prelude would withdraw
+/// the ask the next process is meant to re-show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_queued_behind_a_parked_turn_does_not_run_at_shutdown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&dir.path().join(DB_FILE))
+        .await
+        .expect("open the database");
+    let session = owner_session(TriggerSource::User);
+    store
+        .session
+        .save(&session)
+        .await
+        .expect("save the session");
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut harness = builder(&session, store, &runs).build();
+    call_gated_write(&harness);
+    harness.send_text("write it").await.expect("send");
+    let ask_id = parked_ask(&harness).await;
+
+    harness.send_text("never mind").await.expect("send");
+    reply(&harness, "ok");
+    harness.actor_parent_token.cancel();
+    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(!replied(&outputs, "ok"), "{outputs:#?}");
+    let after = row(&harness, &ask_id).await;
+    assert!(after.is_pending(), "left for the next process: {after:?}");
+    assert!(after.applied_at.is_none());
+    assert_eq!(completed_for_call(&outputs), 0, "nothing is appended");
+}
+
 /// Wait until a tool future in `harness`'s session is parked on an ask, and
 /// return that ask's id.
 async fn parked_ask(harness: &AgentTestHarness) -> AskId {

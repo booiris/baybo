@@ -145,10 +145,14 @@ See [trace.md](trace.md#toolcall-output-storage).
    `ApprovalGateMap`'s `AutoDenyGate` fallback for a channel with no
    registered gate.
 
-**Cancelled batches.** `run_agent_loop` passes `TurnTokens { turn, actor }`
+**Cancelled batches.** `run_agent_loop` passes `TurnTokens { turn, release }`
 through `AgentLoop::run` → `run_inner` → `run_iteration`; each call gets a
-child of the turn token plus the actor token. After the batch the loop reads
-`CancelOrigin::of(tokens)` once. On `Ancestor` (process shutdown) it appends
+child of the turn token plus the turn's release token. `run_agent_loop`
+reports a user stop only for a `Turn` cancel, so messages queued behind a
+turn the idle reaper released still run; an actor whose own token is
+cancelled (shutdown) takes no further message but `ActorStop`. After the
+batch the loop reads
+`CancelOrigin::of(tokens)` once. On `Ancestor` (shutdown, or the idle reaper's release) it appends
 and emits nothing for a call that never finished or whose ask came back
 abandoned — the transcript is left as a crash would leave it, the ask row
 stays pending, and hydration repairs the siblings. On `Turn` (`/stop`, board
@@ -288,7 +292,7 @@ fresh and the retry stage), `/compact` (before `compact_now`) and
 wedges the transcript just as a user row does). When the ledger has no
 unapplied ask for the session it returns without opening a turn; otherwise it
 runs a `TurnInput::Resume` turn through `AgentLoop::run_settlement_turn`, whose
-whole body is `AgentLoop::settle_unapplied_asks(…, SettleMode::SettleOnly, …)`
+whole body is `AgentLoop::settle_unapplied_asks`
 (`runtime/agent_loop/settle.rs`). The settlement asks
 `HumanAskManager::settle_unapplied` and appends one result per `Settled`,
 through the same `append_executed_tool` post-processing the batch uses: a
@@ -298,7 +302,7 @@ through the same `append_executed_tool` post-processing the batch uses: a
 `mark_applied` **first**, then a re-execution under a fresh `LlmIteration`
 step with `ToolExecutor::execute(…, PreExecuteGate::PreDecided(decision))`, so
 the gate is not asked again (`ApproveAlways` still seeds the grants). The
-`resumed_turn_id` is the session's newest turn created no later than the ask.
+`resumed_turn_id` is the ask row's own `turn_id`.
 
 `RouterResumeSink` (`runtime::asks`) is the manager's `ResumeSink`: it sends
 `RouterInbound::ResumeAsk` on the router's intake (created in
@@ -307,9 +311,13 @@ answers `resumes_on_answer = false` for issue sessions. The router routes it
 like `route_one_to_actor`, through `resolve_spawn_pins`, as
 `AgentMessage::ResumeAsk { ask_id }` at `Trigger` priority.
 `handle_resume_ask` returns when the row is already applied (a door got there
-first) or not resolved; otherwise it runs `run_agent_loop(TurnInput::Resume)`,
-whose `run_inner` settles with `SettleMode::Continue` before the first LLM
-iteration, and sends the reply with `send_user_reply`.
+first), not resolved, or while the row's turn still has another pending
+resumable ask (`awaits_more_answers`); otherwise it runs
+`run_agent_loop(TurnInput::Resume)`, whose `run_inner` settles before the
+first LLM iteration and carries on, and sends the reply with
+`send_user_reply`. The router's `handle_resume_ask` stamps the session active
+first, as a user message would: the resumed session is otherwise still idle
+to the reaper.
 
 The idle reaper asks `LivePendingAsks::actor_stop_cost` (`AgentSupervisor::new`
 takes the manager as that probe). A turn parked only on resumable asks is

@@ -1,7 +1,8 @@
 //! The durable human-in-the-loop lifecycle: an ask is written to the
 //! `human_asks` ledger before it is shown, parked on its channel's
 //! [`AskQueue`], and resolved by a [`HumanAskManager`] verb that persists
-//! first. Nothing times out; a dropped waiter orphans its ask instead of
+//! first. Nothing times out except a during-execute approval
+//! ([`DURING_EXECUTE_APPROVAL_TIMEOUT`]); a dropped waiter orphans its ask instead of
 //! resolving it, so asks survive a turn cancel by the process and a restart.
 //!
 //! See `docs/modules/human-ask.md`.

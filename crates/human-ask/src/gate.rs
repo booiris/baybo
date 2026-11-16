@@ -47,9 +47,9 @@ impl ChannelAskGate {
     /// the loop drops the tool future the moment this yields `Pending`, so a
     /// write started there would be torn. The write-ahead insert itself can
     /// outlive a dropped future and commit after the loop's cancel fill; the
-    /// settlement skips a call that already has a result. On an ancestor cancel (process
-    /// shutdown) it never returns, leaving the ask pending for the next
-    /// process.
+    /// settlement skips a call that already has a result. On an ancestor cancel
+    /// (shutdown, or the idle reaper's release) it never returns, leaving the
+    /// ask pending for whoever resumes it.
     async fn park(&self, row: HumanAskRow, cancel: AskCancel) -> Option<AskResolution> {
         if let Err(e) = self.core.raise(&row).await {
             tracing::warn!(
@@ -68,6 +68,15 @@ impl ChannelAskGate {
             queue: self.queue.clone(),
             ask_id: row.ask_id.clone(),
         };
+        // The observers heard `Raised` before the entry existed, so a verb
+        // may have claimed the row in between and found nothing to deliver
+        // to. No later verb can reach this entry then: deliver what the row
+        // says.
+        if let Ok(Some(current)) = self.core.get(&row.ask_id).await
+            && let Some(resolution) = current.resolution
+        {
+            let _ = self.queue.resolve(&row.ask_id, resolution);
+        }
 
         let deadline = async {
             if resumable(row.kind, row.phase) {
@@ -86,7 +95,10 @@ impl ChannelAskGate {
                     CancelOrigin::Ancestor => std::future::pending().await,
                 };
             }
-            () = deadline => self.expire(&row, rx).await,
+            () = deadline => match self.expire(&row, rx).await {
+                Some(resolution) => resolution,
+                None => return Some(AskResolution::TimedOut),
+            },
         };
         if let Err(e) = self.core.mark_applied(&row.ask_id).await {
             tracing::warn!(ask_id = %row.ask_id, error = %e, "could not stamp ask applied");
@@ -96,26 +108,37 @@ impl ChannelAskGate {
 
     /// The deadline passed: claim `TimedOut` on the still-pending row and
     /// close the card. A verb that claimed first wins, and its answer is
-    /// already on its way down `rx`. If the claim cannot be written the ask
-    /// still times out here; the row stays pending and is reconciled as a
-    /// dead non-resumable ask.
+    /// already on its way down `rx`. `None` when the claim could not be
+    /// written: the ask still times out for its tool, but the row is left
+    /// pending and unapplied, so the session's next settlement or the next
+    /// boot closes it as a dead non-resumable ask.
     async fn expire(
         &self,
         row: &HumanAskRow,
-        rx: oneshot::Receiver<AskResolution>,
-    ) -> AskResolution {
+        mut rx: oneshot::Receiver<AskResolution>,
+    ) -> Option<AskResolution> {
         let timed_out = AskResolution::TimedOut;
         let mut claimed = row.clone();
-        match self.core.claim(&mut claimed, timed_out.clone()).await {
-            Ok(true) => {}
-            Ok(false) => return rx.await.unwrap_or(AskResolution::Abandoned),
+        let recorded = match self.core.claim(&mut claimed, timed_out.clone()).await {
+            Ok(true) => true,
+            Ok(false) => return Some(rx.await.unwrap_or(AskResolution::Abandoned)),
             Err(e) => {
                 tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record an ask timing out");
+                false
             }
+        };
+        let closed_here = self.queue.resolve(&row.ask_id, timed_out.clone()).is_some();
+        // An answer can win the claim this one failed to write and take the
+        // entry first: what it sent down `rx` stands. (When this call took
+        // the entry, `rx` holds only its own `TimedOut`.)
+        if !recorded
+            && !closed_here
+            && let Ok(answered) = rx.try_recv()
+        {
+            return Some(answered);
         }
         tracing::info!(ask_id = %row.ask_id, "during-execute approval timed out");
-        let _ = self.queue.resolve(&row.ask_id, timed_out.clone());
-        timed_out
+        recorded.then_some(timed_out)
     }
 }
 

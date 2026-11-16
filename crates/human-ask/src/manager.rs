@@ -54,6 +54,8 @@ pub struct ReloadReport {
     pub abandoned: usize,
     /// Resolved non-resumable asks stamped applied.
     pub applied: usize,
+    /// Rows whose reload failed and were left as they were.
+    pub failed: usize,
 }
 
 impl HumanAskManager {
@@ -77,7 +79,9 @@ impl HumanAskManager {
     /// A human (or policy) decided `ask_id`. Claims the resolution, then
     /// removes the queue entry and hands the decision to the live waiter, or
     /// — for a dead resumable ask outside an issue session — requests a
-    /// Resume turn. `Err(AskClosed)` when another verb claimed it first.
+    /// Resume turn. `Err(AskClosed)` when another verb claimed it first, or
+    /// when the ask is a dead non-resumable one, which this call closes as
+    /// `Abandoned`.
     pub async fn resolve(&self, ask_id: &AskId, resolution: AskResolution) -> Result<()> {
         let mut row = self
             .get(ask_id)
@@ -91,7 +95,9 @@ impl HumanAskManager {
                 kind: row.kind,
             });
         }
-        if !self.core.claim(&mut row, resolution.clone()).await? {
+        if self.close_if_unanswerable(&mut row).await?
+            || !self.core.claim(&mut row, resolution.clone()).await?
+        {
             return Err(HumanAskError::AskClosed {
                 ask_id: ask_id.clone(),
             });
@@ -223,35 +229,45 @@ impl HumanAskManager {
     pub async fn reload_pending(&self) -> Result<ReloadReport> {
         let mut report = ReloadReport::default();
         for row in self.core.list_unapplied().await? {
-            let resumable = resumable(row.kind, row.phase);
-            match (row.is_pending(), resumable) {
-                (true, true) => {
-                    let queue = self.queues.get_or_create(&row.channel);
-                    if !queue.contains(&row.ask_id) {
-                        queue.push_dead(PendingAsk::from_row(&row));
-                        report.requeued += 1;
-                    }
-                }
-                (true, false) => {
-                    let mut row = row;
-                    if self.abandon_row(&mut row).await? {
-                        report.abandoned += 1;
-                    }
-                    self.core.mark_applied(&row.ask_id).await?;
-                }
-                (false, true) => {
-                    if self.request_resume(&row).await {
-                        report.resumed += 1;
-                    }
-                }
-                (false, false) => {
-                    if self.core.mark_applied(&row.ask_id).await? {
-                        report.applied += 1;
-                    }
-                }
+            let ask_id = row.ask_id.clone();
+            if let Err(e) = self.reload_row(row, &mut report).await {
+                tracing::warn!(%ask_id, error = %e, "failed to reload a human ask");
+                report.failed += 1;
             }
         }
         Ok(report)
+    }
+
+    /// One row of [`Self::reload_pending`]. A row that fails is left as it
+    /// was for the next boot or its session's next settlement; it must not
+    /// keep the rows after it off their queues.
+    async fn reload_row(&self, mut row: HumanAskRow, report: &mut ReloadReport) -> Result<()> {
+        match (row.is_pending(), resumable(row.kind, row.phase)) {
+            (true, true) => {
+                let queue = self.queues.get_or_create(&row.channel);
+                if !queue.contains(&row.ask_id) {
+                    queue.push_dead(PendingAsk::from_row(&row));
+                    report.requeued += 1;
+                }
+            }
+            (true, false) => {
+                if self.abandon_row(&mut row).await? {
+                    report.abandoned += 1;
+                }
+                self.core.mark_applied(&row.ask_id).await?;
+            }
+            (false, true) => {
+                if self.request_resume(&row).await {
+                    report.resumed += 1;
+                }
+            }
+            (false, false) => {
+                if self.core.mark_applied(&row.ask_id).await? {
+                    report.applied += 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// LLM `tool_use` ids of the session's unapplied resumable asks — the
@@ -312,6 +328,19 @@ impl HumanAskManager {
             .get(&row.channel)
             .and_then(|queue| queue.liveness(&row.ask_id))
             .unwrap_or(false)
+    }
+
+    /// A pending ask nothing can apply an answer to: not resumable, and the
+    /// tool future that raised it is gone. Close it as abandoned so a late
+    /// answer is refused instead of recorded as a decision nothing carries
+    /// out. `Ok(true)` when `row` was such an ask.
+    async fn close_if_unanswerable(&self, row: &mut HumanAskRow) -> Result<bool> {
+        if !row.is_pending() || resumable(row.kind, row.phase) || self.is_live(row) {
+            return Ok(false);
+        }
+        self.abandon_row(row).await?;
+        self.core.mark_applied(&row.ask_id).await?;
+        Ok(true)
     }
 
     async fn abandon_row(&self, row: &mut HumanAskRow) -> Result<bool> {

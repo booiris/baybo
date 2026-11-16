@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 pub struct MemoryHumanAskStore {
     rows: Mutex<Vec<HumanAskRow>>,
     fail_create: AtomicBool,
+    fail_resolve: AtomicBool,
 }
 
 impl MemoryHumanAskStore {
@@ -26,6 +27,11 @@ impl MemoryHumanAskStore {
     /// Make every later `create` fail, as a full disk would.
     pub fn fail_creates(&self) {
         self.fail_create.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every later `resolve` fail (`true`) or work again (`false`).
+    pub fn fail_resolves(&self, fail: bool) {
+        self.fail_resolve.store(fail, Ordering::SeqCst);
     }
 
     /// Every row, in insertion order.
@@ -66,6 +72,9 @@ impl HumanAskStore for MemoryHumanAskStore {
         resolution: &AskResolution,
         now: DateTime<Utc>,
     ) -> baybo_store::human_ask::Result<bool> {
+        if self.fail_resolve.load(Ordering::SeqCst) {
+            return Err(StorageError::Storage("resolve disabled by test".into()));
+        }
         let mut rows = self.rows.lock();
         match rows
             .iter_mut()

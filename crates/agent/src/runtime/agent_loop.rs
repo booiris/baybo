@@ -39,7 +39,6 @@ use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
 
 mod settle;
-pub use settle::SettleMode;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
 /// for a placeholder to complete. If a chunk ends with an open `[{` but no
@@ -863,8 +862,9 @@ impl AgentLoop {
     }
 
     /// Run one turn. `tokens.turn` is this turn's cancel token;
-    /// `tokens.actor` is the actor's, which a parked ask reads to tell a turn
-    /// cancel from process shutdown.
+    /// `tokens.release` is its release token, which a parked ask reads to
+    /// tell a turn cancel from a turn ended with its asks left pending
+    /// (shutdown, or the idle reaper's release).
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,
@@ -1046,7 +1046,6 @@ impl AgentLoop {
                 turn_id,
                 &tokens,
                 delta_tx.as_ref(),
-                SettleMode::Continue,
                 &mut turn_attachments,
             )
             .await?;
@@ -1559,7 +1558,7 @@ impl AgentLoop {
                 let step = step_for_calls.clone();
                 let tokens = TurnTokens {
                     turn: cancel_token.child_token(),
-                    actor: tokens.actor.clone(),
+                    release: tokens.release.clone(),
                 };
                 let notifier = notifier_for_calls.clone();
                 let bind_source = Arc::clone(&llm_for_calls);

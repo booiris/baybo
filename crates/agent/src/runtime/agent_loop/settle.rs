@@ -21,16 +21,6 @@ use super::{AgentLoop, DispatchedToolCall};
 use crate::runtime::tool_executor::{ExecutedTool, PreExecuteGate};
 use baybo_channels::AgentOutput;
 
-/// What follows the settlement inside its Resume turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettleMode {
-    /// A door's prelude: the turn ends after the appends, and the door's own
-    /// turn follows.
-    SettleOnly,
-    /// The chat Resume door: the same turn goes on to the LLM iterations.
-    Continue,
-}
-
 /// The persisted `tool_use` a settlement answers, as the batch would have
 /// dispatched it.
 struct SettledCall {
@@ -56,7 +46,9 @@ impl AgentLoop {
     }
 
     /// Run `turn_input` (a `Resume`) as a turn whose whole body is the
-    /// settlement: [`SettleMode::SettleOnly`].
+    /// settlement: a door's prelude. The turn ends after the appends and the
+    /// door's own turn follows. (The chat Resume door instead settles inside
+    /// `run_inner` and goes on to the LLM iterations.)
     pub async fn run_settlement_turn(
         &mut self,
         session: &mut Session,
@@ -86,7 +78,6 @@ impl AgentLoop {
                         turn_id,
                         &tokens,
                         delta_tx.as_ref(),
-                        SettleMode::SettleOnly,
                         &mut attachments,
                     )
                     .await?;
@@ -107,8 +98,8 @@ impl AgentLoop {
     /// approved call its re-execution under a fresh step (stamped applied
     /// first, so a crash mid-run never runs it twice). Returns how many
     /// results were appended. Media a re-executed tool produced for the user
-    /// lands in `turn_attachments`; under [`SettleMode::SettleOnly`] there is
-    /// no final row to carry it.
+    /// lands in `turn_attachments`; [`Self::run_settlement_turn`] has no final
+    /// row to carry it and drops it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn settle_unapplied_asks(
         &mut self,
@@ -117,7 +108,6 @@ impl AgentLoop {
         turn_id: TurnId,
         tokens: &TurnTokens,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-        mode: SettleMode,
         turn_attachments: &mut Vec<ContentBlock>,
     ) -> anyhow::Result<usize> {
         self.context_manager.ensure_seeded().await?;
@@ -125,7 +115,7 @@ impl AgentLoop {
         if settled.is_empty() {
             return Ok(0);
         }
-        debug!(session_id = %session.id, count = settled.len(), ?mode, "settling unapplied asks");
+        debug!(session_id = %session.id, count = settled.len(), "settling unapplied asks");
         let mut llm_visible_images = Vec::new();
         let mut appended = 0;
         for next in settled {
@@ -352,7 +342,7 @@ impl AgentLoop {
             crate::runtime::tool_executor::TurnBackground::for_turn(session, TurnInputKind::Resume);
         let call_tokens = TurnTokens {
             turn: tokens.turn.child_token(),
-            actor: tokens.actor.clone(),
+            release: tokens.release.clone(),
         };
         let approved_for_call = Arc::clone(&approved);
         let session_ref: &Session = session;
