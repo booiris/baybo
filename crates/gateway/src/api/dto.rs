@@ -610,6 +610,7 @@ pub enum TurnInputKind {
     SubagentNotification,
     IssueRun,
     Resume,
+    AskSettlement,
 }
 
 impl From<baybo_turn::TurnInputKind> for TurnInputKind {
@@ -623,6 +624,7 @@ impl From<baybo_turn::TurnInputKind> for TurnInputKind {
             baybo_turn::TurnInputKind::SubagentNotification => Self::SubagentNotification,
             baybo_turn::TurnInputKind::IssueRun => Self::IssueRun,
             baybo_turn::TurnInputKind::Resume => Self::Resume,
+            baybo_turn::TurnInputKind::AskSettlement => Self::AskSettlement,
         }
     }
 }

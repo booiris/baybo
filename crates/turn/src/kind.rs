@@ -9,7 +9,6 @@
 //!   asserted against the payload: a maintenance turn runs inside a
 //!   `User`-trigger session and records `origin = User` honestly.
 
-use baybo_model::human_ask::AskId;
 use baybo_model::{ContentBlock, TurnId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,8 +28,13 @@ pub enum TurnInputKind {
     /// One execution of a board issue by its assignee.
     IssueRun,
     /// Continuation of a turn whose ask was answered after the asking actor
-    /// was gone.
+    /// was gone: the chat Resume door. Applies the answers, then carries on
+    /// with the conversation and ends in a reply.
     Resume,
+    /// A door's prelude: put a result on the transcript for every ask the
+    /// session left unapplied, before the door's own turn. Calls no LLM and
+    /// produces no reply.
+    AskSettlement,
 }
 
 impl TurnInputKind {
@@ -38,6 +42,10 @@ impl TurnInputKind {
     /// [`crate::Turn::is_chat_turn`], which delegates here so the two can't
     /// drift. Kind-level because display surfaces (the trace viewer) receive
     /// the projected kind, not the `TurnInput` payload.
+    ///
+    /// An ask settlement counts: it can re-execute a call the user approved,
+    /// and `/stop` and the issue-run stopper find the turn to cancel through
+    /// this predicate.
     pub fn is_chat_turn(self) -> bool {
         !matches!(self, Self::Compact | Self::CronNotification)
     }
@@ -49,6 +57,7 @@ impl TurnInputKind {
             | Self::SubagentNotification
             | Self::Compact
             | Self::Resume
+            | Self::AskSettlement
             | Self::IssueRun => true,
             Self::Cron | Self::CronNotification | Self::Spawned => false,
         }
@@ -105,14 +114,16 @@ pub enum TurnInput {
         run_id: baybo_model::IssueRunId,
         brief: Vec<ContentBlock>,
     },
-    /// Continuation of `resumed_turn_id` after its ask `ask_id` (raised by
-    /// tool call `tool_use_id`) was answered with no live actor to receive
-    /// it.
+    /// Continuation of `resumed_turn_id`, the turn that parked on asks,
+    /// after they were answered with no live actor to receive the answers.
+    /// Which asks it applied is the ledger's to say (every unapplied ask of
+    /// the session), not the payload's.
     Resume {
         resumed_turn_id: TurnId,
-        ask_id: AskId,
-        tool_use_id: String,
     },
+    /// A door's prelude settling the session's unapplied asks. No payload:
+    /// what it settles is whatever the ledger holds when it runs.
+    AskSettlement,
 }
 
 impl TurnInput {
@@ -126,6 +137,7 @@ impl TurnInput {
             TurnInput::SubagentNotification { .. } => TurnInputKind::SubagentNotification,
             TurnInput::IssueRun { .. } => TurnInputKind::IssueRun,
             TurnInput::Resume { .. } => TurnInputKind::Resume,
+            TurnInput::AskSettlement => TurnInputKind::AskSettlement,
         }
     }
 }
@@ -180,13 +192,15 @@ mod tests {
         assert_eq!(i.input_kind(), TurnInputKind::SubagentNotification);
 
         assert_eq!(resume_input().input_kind(), TurnInputKind::Resume);
+        assert_eq!(
+            TurnInput::AskSettlement.input_kind(),
+            TurnInputKind::AskSettlement
+        );
     }
 
     fn resume_input() -> TurnInput {
         TurnInput::Resume {
             resumed_turn_id: TurnId::new(),
-            ask_id: AskId::new(),
-            tool_use_id: "toolu_1".into(),
         }
     }
 
@@ -196,6 +210,7 @@ mod tests {
         for (kind, attended, user_facing, chat) in [
             (UserChat, true, true, true),
             (Resume, true, true, true),
+            (AskSettlement, true, false, true),
             (SubagentNotification, true, false, true),
             (Compact, true, false, false),
             (IssueRun, true, false, true),
@@ -222,6 +237,7 @@ mod tests {
             },
             TurnInput::SubagentNotification { content: vec![] },
             resume_input(),
+            TurnInput::AskSettlement,
         ] {
             let s = serde_json::to_string(&input).unwrap();
             let back: TurnInput = serde_json::from_str(&s).unwrap();

@@ -102,10 +102,10 @@ A turn is described along two independent axes, each with one source of truth �
 ```rust
 // input kind — what payload fed the turn; a projection of TurnInput.
 // Display / the denormalised `turns.kind` column only.
-pub enum TurnInputKind { UserChat, Cron, CronNotification, Compact, Spawned, SubagentNotification, IssueRun, Resume }
+pub enum TurnInputKind { UserChat, Cron, CronNotification, Compact, Spawned, SubagentNotification, IssueRun, Resume, AskSettlement }
 ```
 
-- **input kind** (`TurnInputKind`) — `Turn::input_kind()`, projected from `TurnInput`. `TurnInput` is a strongly typed payload enum whose variants line up 1:1 with `TurnInputKind`. `UserChat`, `Cron`, `Spawned`, `SubagentNotification`, `IssueRun`, and `Resume` are chat turns; `Compact` (a foreground maintenance command, no reply) and `CronNotification` (the delivery of a one-shot cron fire's result into the conversation that scheduled it) are not — see the subset table above. `CronNotification` still opens a real turn: its `Completed { reply_ordinal }` edge is what drives the push dispatcher off the row it just appended, exactly as a user turn does. `Resume { resumed_turn_id, ask_id, tool_use_id }` is the continuation of a turn whose ask was answered after its actor was gone (see [`human-ask.md`](human-ask.md#answering-a-dead-ask-the-resume-turn)); the link to the resumed turn rides the payload, not `parent_turn_id`.
+- **input kind** (`TurnInputKind`) — `Turn::input_kind()`, projected from `TurnInput`. `TurnInput` is a strongly typed payload enum whose variants line up 1:1 with `TurnInputKind`. `UserChat`, `Cron`, `Spawned`, `SubagentNotification`, `IssueRun`, `Resume` and `AskSettlement` are chat turns; `Compact` (a foreground maintenance command, no reply) and `CronNotification` (the delivery of a one-shot cron fire's result into the conversation that scheduled it) are not — see the subset table above. `CronNotification` still opens a real turn: its `Completed { reply_ordinal }` edge is what drives the push dispatcher off the row it just appended, exactly as a user turn does. `Resume { resumed_turn_id }` is the continuation of a turn whose asks were answered after its actor was gone, and the payload-free `AskSettlement` is a door's prelude that puts results for a session's unapplied asks on the transcript before the door's own turn (see [`human-ask.md`](human-ask.md#answering-a-dead-ask-the-resume-turn)); the link to the resumed turn rides the payload, not `parent_turn_id`.
 - **origin** (`baybo_model::TriggerKind`, stored on `Turn.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: `/compact` can run inside a `User`-trigger session while carrying a `Compact` input. Subagent turns record their session's inherited root (`TriggerSource` has no spawned variant, so `session.trigger.kind()` never yields `TriggerKind::Spawned`).
 
 ### Kind-level predicates
@@ -116,6 +116,7 @@ Three predicates live on `TurnInputKind`, each the one home for its question:
 | ---------------------- | -------------- | ------------- | ---------------- |
 | `UserChat`             | yes            | yes           | yes              |
 | `Resume`               | yes            | yes           | yes              |
+| `AskSettlement`        | yes            | yes           | no               |
 | `SubagentNotification` | yes            | yes           | no               |
 | `IssueRun`             | yes            | yes           | no               |
 | `Compact`              | no             | yes           | no               |

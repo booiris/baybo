@@ -12019,7 +12019,8 @@
           "spawned",
           "subagent_notification",
           "issue_run",
-          "resume"
+          "resume",
+          "ask_settlement"
         ]
       },
       "TurnOrigin": {

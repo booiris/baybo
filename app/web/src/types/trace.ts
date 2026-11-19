@@ -408,7 +408,8 @@ export type TurnInputKind =
   | 'spawned'
   | 'subagent_notification'
   | 'issue_run'
-  | 'resume';
+  | 'resume'
+  | 'ask_settlement';
 
 /**
  * Whether a turn of this kind is a **chat turn** — one the user saw in the

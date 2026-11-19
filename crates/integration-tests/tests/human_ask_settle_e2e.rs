@@ -243,15 +243,25 @@ fn assert_paired(request: &ChatRequest) {
     }
 }
 
-async fn resume_turns(harness: &AgentTestHarness) -> usize {
+async fn turns_of(harness: &AgentTestHarness, kind: TurnInputKind) -> usize {
     harness
         .turn_lifecycle
         .list_by_session(&harness.session.id, None)
         .await
         .expect("list turns")
         .iter()
-        .filter(|turn| turn.input.input_kind() == TurnInputKind::Resume)
+        .filter(|turn| turn.input.input_kind() == kind)
         .count()
+}
+
+/// Turns of the chat Resume door: an answer carried on into a reply.
+async fn resume_turns(harness: &AgentTestHarness) -> usize {
+    turns_of(harness, TurnInputKind::Resume).await
+}
+
+/// Turns of a door's prelude: asks settled ahead of the door's own turn.
+async fn settlement_turns(harness: &AgentTestHarness) -> usize {
+    turns_of(harness, TurnInputKind::AskSettlement).await
 }
 
 fn reply(harness: &AgentTestHarness, text: &str) {
@@ -288,7 +298,8 @@ async fn a_new_message_abandons_a_dead_pending_ask_before_the_user_row() {
         "hydration must not fill a parked call: {result}"
     );
     assert_eq!(runs.load(Ordering::SeqCst), 0);
-    assert_eq!(resume_turns(&harness).await, 1);
+    assert_eq!(settlement_turns(&harness).await, 1);
+    assert_eq!(resume_turns(&harness).await, 0, "nothing was answered");
     let requests = harness.stub_llm.captured_requests();
     assert_eq!(requests.len(), 1);
     assert_paired(&requests[0]);
@@ -527,7 +538,7 @@ async fn compact_settles_before_the_summariser_reads_the_transcript() {
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     assert!(adjacent_result(&harness).await.contains("withdrawn"));
-    assert_eq!(resume_turns(&harness).await, 1);
+    assert_eq!(settlement_turns(&harness).await, 1);
     stop(harness).await;
 }
 
@@ -605,7 +616,12 @@ async fn the_resume_door_does_nothing_for_an_applied_ask() {
         1,
         "no second LLM call"
     );
-    assert_eq!(resume_turns(&harness).await, 1, "only the prelude's turn");
+    assert_eq!(settlement_turns(&harness).await, 1, "the prelude's turn");
+    assert_eq!(
+        resume_turns(&harness).await,
+        0,
+        "and no Resume turn after it"
+    );
     stop(harness).await;
 }
 
@@ -616,6 +632,7 @@ async fn a_session_with_nothing_unapplied_opens_no_resume_turn() {
     harness.send_text("hello").await.expect("send");
     harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(resume_turns(&harness).await, 0);
+    assert_eq!(settlement_turns(&harness).await, 0);
     stop(harness).await;
 }
 

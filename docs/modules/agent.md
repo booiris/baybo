@@ -293,7 +293,7 @@ fresh and the retry stage), `/compact` (before `compact_now`) and
 `publish_cron_notification` (an assistant row after a dangling `tool_use`
 wedges the transcript just as a user row does). When the ledger has no
 unapplied ask for the session it returns without opening a turn; otherwise it
-runs a `TurnInput::Resume` turn in `AgentLoop::settle_before_append`, whose
+runs a `TurnInput::AskSettlement` turn in `AgentLoop::settle_before_append`, whose
 whole body is `AgentLoop::settle_unapplied_asks`
 (`runtime/agent_loop/settle.rs`). The settlement asks
 `HumanAskManager::settle_unapplied` and appends one result per `SettledAsk`

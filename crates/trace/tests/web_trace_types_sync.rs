@@ -307,6 +307,7 @@ fn web_trace_types_cover_the_turn_input_kinds() {
         TurnInputKind::SubagentNotification,
         TurnInputKind::IssueRun,
         TurnInputKind::Resume,
+        TurnInputKind::AskSettlement,
     ];
     for k in kinds {
         // Exhaustiveness tripwire: a new variant fails to compile here.
@@ -318,7 +319,8 @@ fn web_trace_types_cover_the_turn_input_kinds() {
             | TurnInputKind::Spawned
             | TurnInputKind::SubagentNotification
             | TurnInputKind::IssueRun
-            | TurnInputKind::Resume => {}
+            | TurnInputKind::Resume
+            | TurnInputKind::AskSettlement => {}
         }
     }
 

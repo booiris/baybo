@@ -40,7 +40,6 @@ use tokio_util::sync::CancellationToken;
 
 mod settle;
 pub use settle::AsksSettled;
-pub(crate) use settle::resume_input;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
 /// for a placeholder to complete. If a chunk ends with an open `[{` but no
@@ -490,7 +489,8 @@ fn memory_recall_query(input: &TurnInput) -> Option<Vec<ContentBlock>> {
         | TurnInput::Spawned { .. }
         | TurnInput::SubagentNotification { .. }
         | TurnInput::CronNotification { .. }
-        | TurnInput::Resume { .. } => None,
+        | TurnInput::Resume { .. }
+        | TurnInput::AskSettlement => None,
     }
 }
 
@@ -1074,6 +1074,7 @@ impl AgentLoop {
                 session,
                 span_recorder,
                 turn_id,
+                turn_kind,
                 &tokens,
                 delta_tx.as_ref(),
                 &mut turn_attachments,

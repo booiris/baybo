@@ -617,7 +617,7 @@ session, which has no asks.) `AgentActor::settle_unapplied_asks()` is the
 actor's one-line way to call it with its own turn tokens. The prelude
 does nothing when the manager
 reports no unapplied asks (no turn is opened) and otherwise settles them
-under a `with_turn(TurnInput::Resume { .. })` turn — appends, and for an approved call the re-execution
+under a `with_turn(TurnInput::AskSettlement)` turn — appends, and for an approved call the re-execution
 under a fresh step (it needs the executor and a turn to open a step under,
 which is why this is a turn and not a bare append; `publish_cron_notification`
 is the precedent for a turn whose body is only an append). The loop's
@@ -690,7 +690,7 @@ close the second card under the user. The answer stays `resolved`, and
 the last answer's `ResumeAsk` applies them all in one Resume turn — the
 turn carries on once every call it parked has an answer, as the live batch
 would. A new message still abandons whatever is left unanswered.
-Otherwise `run_agent_loop(TurnInput::Resume { resumed_turn_id, ask_id, tool_use_id }, …)`
+Otherwise `run_agent_loop(TurnInput::Resume { resumed_turn_id }, …)`
 exactly like `handle_user_input`, including `send_user_reply`. The
 settlement applies the answer; the first LLM iteration then runs on a window
 whose tail is `assistant(tool_use) + tool_result` — a legal starting state,
@@ -704,9 +704,27 @@ pass (the session has one), failure notices user-facing (one helper,
 title pass and stays `UserChat`-only), included in the push dispatcher's
 kind filter (`push/mod.rs:516`) — the user answered and may have walked away.
 `parent_turn_id = None`; the link is in the payload. Exhaustive matches to
-extend: `input_kind()`, `turn/src/store.rs` (`turns.kind` = `"resume"`),
+extend: `input_kind()`, `turn/src/store.rs` (`turns.kind` = `"resume"`, and
+`"ask_settlement"` for the prelude's kind, below),
 `query/src/lib.rs` `turn_input_text` (no title text), `dto.rs:615-624`,
 `web_trace_types_sync.rs:312-320` with `app/web/src/types/trace.ts:403-419`.
+
+**Two kinds, not one.** The chat Resume door and a door's prelude are
+different turns and have their own kinds:
+
+| | `Resume { resumed_turn_id }` | `AskSettlement` |
+| --- | --- | --- |
+| opened by | `handle_resume_ask`, on an answer | `settle_before_append`, ahead of any door |
+| body | settlement, then LLM iterations, ends in a reply | settlement only; `Structured { "settled_asks": n }` |
+| `is_user_facing` | yes | no |
+| push | yes | no (not in `should_dispatch`) |
+| `is_chat_turn` / `is_attended` | yes / yes | yes / yes — it can re-execute an approved call, so `/stop` and the issue-run stopper must find it |
+| trace label | "Resumed after answer" | "Settled pending asks" |
+
+`Resume` carries only the turn that parked: which asks a turn applied is
+the ledger's to say (every unapplied ask of the session), so the payload
+names no single ask. A re-executed call runs under the rules of whichever of
+the two kinds is doing the settling (`turn_kind` is passed to `reexecute`).
 
 A `ResumeAsk` can be lost in flight without a crash: the reaper's
 `ActorStop` is served while the registry entry is still occupied
@@ -1163,7 +1181,7 @@ pub struct QuestionHandle { gate: Arc<dyn QuestionGate>, tool_call_id: String, p
 // Tool gains `fn sole_call(&self) -> bool { false }`.
 
 // baybo_turn::kind
-TurnInputKind::Resume; TurnInput::Resume { resumed_turn_id: TurnId, ask_id: AskId, tool_use_id: String }
+TurnInputKind::{Resume, AskSettlement}; TurnInput::Resume { resumed_turn_id: TurnId }; TurnInput::AskSettlement
 TurnInputKind::is_attended(self) -> bool; TurnInputKind::is_user_facing(self) -> bool
 
 // baybo_human_ask
@@ -1281,8 +1299,8 @@ Where the code differs from the sketch above, and why:
   passes `PreExecuteGate::PreDecided(decision)` to `ToolExecutor::execute`
   (`PreExecuteGate::Ask` everywhere else) and runs under a fresh
   `StepKind::LlmIteration` step that carries the tool span but no `LlmCall`
-  span — no new step kind, so no trace-viewer mirror changes. A settle-only
-  Resume turn completes with `TurnOutput::Structured { "settled_asks": n }`
+  span — no new step kind, so no trace-viewer mirror changes. An
+  `AskSettlement` turn completes with `TurnOutput::Structured { "settled_asks": n }`
   (no reply ordinal, so no push). `resumed_turn_id` is the row's own
   `turn_id`, recorded when the ask was raised (`AskSite.turn_id`). A
   settlement error fails the door (the door's own append does not happen);
@@ -1405,7 +1423,7 @@ Where the code differs from the sketch above, and why:
    cancelled fill for a call that never finished) is appended
 
 **New message, dead ask pending** — door: `settle_unapplied_asks()`
-(settlement-only Resume turn: synthetic or real result appended) → user row →
+(`AskSettlement` turn: synthetic or real result appended) → user row →
 user turn. See [above](#a-new-message-while-a-dead-ask-is-pending).
 
 **Unattended turn hits a gate** — `PolicyDenyGate` writes an already-applied
@@ -1435,8 +1453,8 @@ leaves draft.
 - `baybo-tools::ask`: `TurnTokens`, `CancelOrigin`, `AskCancel`, `ParkGauge`;
   `ApprovalGate::request` takes `AskCancel`; `ApprovalHandle` takes a
   `String` id + gauge + cancel.
-- `baybo-turn`: `is_attended`, `is_user_facing`, `TurnInputKind::Resume` +
-  `TurnInput::Resume` + the four exhaustive mirrors.
+- `baybo-turn`: `is_attended`, `is_user_facing`, `TurnInputKind::{Resume, AskSettlement}` +
+  their `TurnInput` variants + the four exhaustive mirrors.
 - `baybo-agent`: `attended` replaces `InheritedToolContext` (deleted, all
   sites listed under Attendedness); `TurnTokens` threaded from
   `run_agent_loop`; `ToolExecutor::new(…, policy_deny)`; `PausableDeadline`

@@ -1301,6 +1301,7 @@ mod tests {
             TurnInputKind::Compact,
             TurnInputKind::Spawned,
             TurnInputKind::SubagentNotification,
+            TurnInputKind::AskSettlement,
         ] {
             assert!(!PushDispatcher::should_dispatch(&event(
                 TurnPhase::Completed {

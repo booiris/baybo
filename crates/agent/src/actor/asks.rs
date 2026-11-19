@@ -3,7 +3,7 @@
 //! arrives through.
 
 use super::AgentActor;
-use crate::runtime::agent_loop::{AsksSettled, resume_input};
+use crate::runtime::agent_loop::AsksSettled;
 use baybo_model::human_ask::AskId;
 
 impl AgentActor {
@@ -37,7 +37,9 @@ impl AgentActor {
         let response_tx = self.volatile.response_tx.clone();
         let response = self
             .run_agent_loop(
-                resume_input(&row),
+                baybo_turn::TurnInput::Resume {
+                    resumed_turn_id: row.turn_id,
+                },
                 None,
                 Some(response_tx),
                 None,

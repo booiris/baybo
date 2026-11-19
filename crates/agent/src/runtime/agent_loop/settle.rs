@@ -57,16 +57,19 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         tokens: TurnTokens,
     ) -> anyhow::Result<AsksSettled> {
-        let unapplied = self.asks.unapplied_for_session(&session.id).await?;
-        let Some(head) = unapplied.first() else {
+        if self
+            .asks
+            .unapplied_for_session(&session.id)
+            .await?
+            .is_empty()
+        {
             return Ok(AsksSettled(()));
-        };
-        let turn_input = resume_input(head);
+        }
         self.refresh_active_llm();
         let spec = crate::runtime::scope::TurnSpec {
             session_id: session.id.clone(),
             origin: session.trigger.kind(),
-            input: turn_input,
+            input: TurnInput::AskSettlement,
             parent_turn_id: None,
         };
         crate::runtime::scope::with_turn(
@@ -80,6 +83,7 @@ impl AgentLoop {
                         session,
                         span_recorder,
                         turn_id,
+                        TurnInputKind::AskSettlement,
                         &tokens,
                         delta_tx.as_ref(),
                         &mut attachments,
@@ -110,6 +114,9 @@ impl AgentLoop {
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
         turn_id: TurnId,
+        // The kind of the turn doing the settling (`Resume` or
+        // `AskSettlement`): a re-executed call runs under its rules.
+        turn_kind: TurnInputKind,
         tokens: &TurnTokens,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         turn_attachments: &mut Vec<ContentBlock>,
@@ -158,6 +165,7 @@ impl AgentLoop {
                         session,
                         span_recorder,
                         turn_id,
+                        turn_kind,
                         tokens,
                         delta_tx,
                         &call,
@@ -257,6 +265,7 @@ impl AgentLoop {
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
         turn_id: TurnId,
+        turn_kind: TurnInputKind,
         tokens: &TurnTokens,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         call: &SettledCall,
@@ -290,7 +299,7 @@ impl AgentLoop {
         let read_tracker = self.read_tracker.clone();
         let agent_id = session.state.agent_id_or_builtin();
         let background =
-            crate::runtime::tool_executor::TurnBackground::for_turn(session, TurnInputKind::Resume);
+            crate::runtime::tool_executor::TurnBackground::for_turn(session, turn_kind);
         let call_tokens = TurnTokens {
             turn: tokens.turn.child_token(),
             release: tokens.release.clone(),
@@ -323,7 +332,7 @@ impl AgentLoop {
                         notifier,
                         Some(&bind_source),
                         background,
-                        TurnInputKind::Resume.is_attended(),
+                        turn_kind.is_attended(),
                         read_tracker,
                         None,
                         call.dispatch.via_invoke,
@@ -341,15 +350,6 @@ impl AgentLoop {
 
 /// The denial an approval refused by `resolution` reads as, in the same shape
 /// the executor's gate produces live.
-/// The Resume turn payload for `row`, naming the turn that raised it.
-pub(crate) fn resume_input(row: &HumanAskRow) -> TurnInput {
-    TurnInput::Resume {
-        resumed_turn_id: row.turn_id,
-        ask_id: row.ask_id.clone(),
-        tool_use_id: row.tool_call_id.clone(),
-    }
-}
-
 /// What a settled ask puts on the transcript for its call.
 enum SettledResult {
     /// The result is known without running anything.

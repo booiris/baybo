@@ -3800,7 +3800,7 @@ export interface components {
          * @description Wire mirror of [`baybo_turn::TurnInputKind`] — what payload fed the turn.
          * @enum {string}
          */
-        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification" | "issue_run" | "resume";
+        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification" | "issue_run" | "resume" | "ask_settlement";
         /**
          * @description Wire mirror of a turn's origin (the owning session's root trigger,
          *     [`baybo_model::TriggerKind`]).
