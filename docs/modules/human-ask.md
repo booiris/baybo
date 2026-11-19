@@ -571,7 +571,7 @@ logs and passes an empty set — today's synthetic fill.) The manager answers
 over the queue, because by the time a cold-spawned actor hydrates, `resolve`
 has already removed the entry and a queue-keyed probe would miss exactly the
 ask being resumed. Hydration's
-`repair_tool_pairing(messages, skip)` **skips the synthetic fill** for those
+`repair_tool_pairing(messages, awaiting_ask)` **skips the synthetic fill** for those
 ids and excludes them from the `needs_repair` dangling-tail trigger, so a
 healthy-but-parked transcript takes the fast path; the reposition pass still
 runs and leaves the dangling `tool_use` row as the tail so the eventual real
@@ -1468,7 +1468,7 @@ leaves draft.
   `PreDecided` re-execute; `ResumeSink` impl;
   `AgentMessage::ResumeAsk` / `handle_resume_ask`;
   `restore_from_store(&awaiting_ask)` →
-  `repair_tool_pairing(messages, skip)`; reaper probe.
+  `repair_tool_pairing(messages, awaiting_ask)`; reaper probe.
 - `baybo-channels`: `AskSurface`;
   `SessionEvent::AskResolved { session_id, .. }`.
 - `baybo-project`: `TimelineAskObserver` (async, `Weak<ProjectManager>`) +

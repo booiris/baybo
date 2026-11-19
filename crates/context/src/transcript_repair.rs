@@ -229,7 +229,6 @@ fn synthetic_fill(id: &str, tool_name: &str) -> ChatMessage {
 
 fn quarantine_invalid_results(
     mut messages: Vec<ChatMessage>,
-    skip: &HashSet<String>,
 ) -> (Vec<ChatMessage>, Vec<String>, Vec<String>) {
     let tool_use_ids: HashSet<String> = messages
         .iter()
@@ -248,9 +247,6 @@ fn quarantine_invalid_results(
             let ContentBlock::ToolResult { tool_use_id, .. } = block else {
                 return true;
             };
-            if skip.contains(tool_use_id) {
-                return true;
-            }
             if !tool_use_ids.contains(tool_use_id) {
                 orphan_result_ids.push(tool_use_id.clone());
                 return false;
@@ -272,17 +268,18 @@ fn quarantine_invalid_results(
 /// are diagnostic only: their original durable rows must not be rewritten or
 /// deleted.
 ///
-/// `skip` holds the ids of calls parked on a human ask: they are never filled
-/// or quarantined, and a dangling one does not by itself force the repair
+/// `awaiting_ask` holds the ids of calls parked on a human ask. Such a call
+/// is never filled, and a dangling one does not by itself force the repair
 /// pass, so a healthy-but-parked transcript keeps the fast path and its
 /// dangling `tool_use` row stays the tail for the real result to follow.
+/// Nothing else about it is special: an orphan or duplicate result carrying
+/// its id is quarantined and reported like any other.
 pub(crate) fn repair_tool_pairing(
     messages: Vec<ChatMessage>,
-    skip: &HashSet<String>,
+    awaiting_ask: &HashSet<String>,
 ) -> ToolPairingRepair {
     let (messages, renamed_call_ids) = disambiguate_repeated_call_ids(messages);
-    let (messages, orphan_result_ids, duplicate_result_ids) =
-        quarantine_invalid_results(messages, skip);
+    let (messages, orphan_result_ids, duplicate_result_ids) = quarantine_invalid_results(messages);
 
     // Index every tool-result row by the ids it carries. Persisted rows
     // hold one ToolResult each, so a plain id → position map suffices;
@@ -304,6 +301,9 @@ pub(crate) fn repair_tool_pairing(
     // row displaced behind a non-result row.
     let mut needs_repair = false;
     let mut expected_after: HashSet<&str> = HashSet::new();
+    // A call still waiting on its ask may stay unanswered.
+    let unanswered =
+        |expected: &HashSet<&str>| expected.iter().any(|id| !awaiting_ask.contains(*id));
     for msg in &messages {
         if is_tool_result_row(msg) {
             for id in result_ids(msg) {
@@ -313,19 +313,17 @@ pub(crate) fn repair_tool_pairing(
             }
             continue;
         }
-        if !expected_after.is_empty() {
+        if unanswered(&expected_after) {
             needs_repair = true; // unanswered ToolUse followed by a non-result row
         }
         expected_after.clear();
         for block in &msg.content {
-            if let ContentBlock::ToolUse { id, .. } = block
-                && !skip.contains(id)
-            {
+            if let ContentBlock::ToolUse { id, .. } = block {
                 expected_after.insert(id.as_str());
             }
         }
     }
-    if !expected_after.is_empty() {
+    if unanswered(&expected_after) {
         needs_repair = true; // dangling ToolUse at the tail
     }
     if !needs_repair {
@@ -365,7 +363,7 @@ pub(crate) fn repair_tool_pairing(
                     repaired.push(messages[ri].clone());
                 }
                 Some(_) => {} // shares a row with an id already emitted
-                None if skip.contains(&id) => {}
+                None if awaiting_ask.contains(&id) => {}
                 None => {
                     let fill = synthetic_fill(&id, &name);
                     fills.push(fill.clone());
@@ -800,14 +798,14 @@ mod tests {
         );
     }
 
-    fn skip(ids: &[&str]) -> HashSet<String> {
+    fn awaiting(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
     }
 
     #[test]
     fn a_parked_call_is_not_filled_and_stays_the_tail() {
         let msgs = vec![user_text("q"), assistant_with_uses(&["a"])];
-        let repair = repair_tool_pairing(msgs.clone(), &skip(&["a"]));
+        let repair = repair_tool_pairing(msgs.clone(), &awaiting(&["a"]));
         assert!(repair.fills.is_empty());
         assert_eq!(repair.messages, msgs, "fast path keeps the window as is");
     }
@@ -819,7 +817,7 @@ mod tests {
             assistant_with_uses(&["a", "b"]),
             result("b"),
         ];
-        let repair = repair_tool_pairing(msgs, &skip(&["a"]));
+        let repair = repair_tool_pairing(msgs, &awaiting(&["a"]));
         assert!(repair.fills.is_empty(), "b answered, a parked");
         assert_eq!(
             ids_in_order(&repair.messages),
@@ -827,7 +825,7 @@ mod tests {
         );
 
         let msgs = vec![user_text("q"), assistant_with_uses(&["a", "b"])];
-        let repair = repair_tool_pairing(msgs, &skip(&["a"]));
+        let repair = repair_tool_pairing(msgs, &awaiting(&["a"]));
         assert_eq!(repair.fills.len(), 1);
         assert_eq!(
             ids_in_order(&repair.messages),
@@ -836,17 +834,43 @@ mod tests {
     }
 
     #[test]
-    fn a_result_for_a_parked_id_is_never_quarantined_and_is_repositioned() {
+    fn a_duplicate_result_for_a_parked_id_is_quarantined_and_the_first_repositioned() {
         let msgs = vec![
             assistant_with_uses(&["a"]),
             user_text("displaced"),
             result("a"),
             result("a"),
         ];
-        let repair = repair_tool_pairing(msgs, &skip(&["a"]));
+        let repair = repair_tool_pairing(msgs, &awaiting(&["a"]));
+        assert!(repair.fills.is_empty());
+        assert_eq!(
+            repair.duplicate_result_ids,
+            vec!["a".to_string()],
+            "reported like any other duplicate"
+        );
+        assert!(repair.orphan_result_ids.is_empty());
+        let ids = ids_in_order(&repair.messages);
+        assert_eq!(ids[..2], ["use:a", "res:a"]);
+        assert_eq!(ids.iter().filter(|id| *id == "res:a").count(), 1);
+    }
+
+    #[test]
+    fn an_orphan_result_is_reported_even_when_its_id_awaits_an_ask() {
+        let msgs = vec![user_text("q"), result("a")];
+        let repair = repair_tool_pairing(msgs, &awaiting(&["a"]));
+        assert_eq!(repair.orphan_result_ids, vec!["a".to_string()]);
+        assert!(ids_in_order(&repair.messages).is_empty());
+    }
+
+    /// The answer was appended but the process died before the ask was
+    /// stamped applied: the call has its result and the ledger still lists
+    /// it. A healthy pair, so the window is left exactly as it is.
+    #[test]
+    fn an_answered_call_still_listed_as_awaiting_keeps_the_fast_path() {
+        let msgs = vec![user_text("q"), assistant_with_uses(&["a"]), result("a")];
+        let repair = repair_tool_pairing(msgs.clone(), &awaiting(&["a"]));
         assert!(repair.fills.is_empty());
         assert!(repair.duplicate_result_ids.is_empty());
-        assert!(repair.orphan_result_ids.is_empty());
-        assert_eq!(ids_in_order(&repair.messages)[..2], ["use:a", "res:a"]);
+        assert_eq!(repair.messages, msgs);
     }
 }
