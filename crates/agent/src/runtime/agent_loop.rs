@@ -751,12 +751,13 @@ impl AgentLoop {
     /// load path. Kept on `AgentLoop` so `AgentActor::run` doesn't
     /// have to reach inside the loop's private state.
     ///
-    /// The loop tells hydration which dangling calls an ask of
-    /// `session_id` will still settle, so the repair leaves them unfilled.
-    pub async fn restore_transcript_from_store(&mut self, session_id: &baybo_model::SessionId) {
+    /// The loop tells hydration which dangling calls an ask of the session
+    /// will still settle, so the repair leaves them unfilled.
+    pub async fn restore_transcript_from_store(&mut self) {
+        let session_id = self.context_manager.session_id().clone();
         let awaiting_ask: std::collections::HashSet<String> = match self
             .asks
-            .unapplied_tool_use_ids(session_id)
+            .unapplied_tool_use_ids(&session_id)
             .await
         {
             Ok(ids) => ids.into_iter().collect(),

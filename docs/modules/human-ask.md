@@ -562,7 +562,7 @@ repair uses), and every row it writes stays a fixpoint of that repair. Each
 ask row also records the raising `turn_id`.
 
 Hydration is told which calls are parked as a plain value:
-`AgentLoop::restore_transcript_from_store(session_id)` reads
+`AgentLoop::restore_transcript_from_store()` reads
 `manager.unapplied_tool_use_ids(session)` and passes the set to
 `ContextManager::restore_from_store(&awaiting_ask)`. (No port: the loop is
 the only caller of hydration and already holds the manager. A read error

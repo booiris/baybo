@@ -556,6 +556,11 @@ impl ContextManager {
     }
 
     /// Read-only access to the owned transcript.
+    /// The session this manager's transcript belongs to.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
     }
