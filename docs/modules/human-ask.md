@@ -614,7 +614,10 @@ construct, and every append a door makes ahead of its turn
 `&AsksSettled`. A new door, or a new append, that skips the prelude does not
 compile. (`append_spawned_prompt` takes none: it opens a subagent's fresh
 session, which has no asks.) `AgentActor::settle_unapplied_asks()` is the
-actor's one-line way to call it with its own turn tokens. The prelude
+actor's one-line way to call it with its own turn tokens. (A cleaner shape
+for the same guarantee — the appends as methods on a handle the prelude
+returns, with no token parameter — is deferred:
+[`../todo/ask-prelude-handle.md`](../todo/ask-prelude-handle.md).) The prelude
 does nothing when the manager
 reports no unapplied asks (no turn is opened) and otherwise settles them
 under a `with_turn(TurnInput::AskSettlement)` turn — appends, and for an approved call the re-execution
