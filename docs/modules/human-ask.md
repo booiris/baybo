@@ -1199,7 +1199,7 @@ pub struct ChannelAskGate { queue: AskQueue, core: Arc<AskCore> }   // impl Appr
 pub struct PolicyDenyGate { core: Arc<AskCore> }                    // impl ApprovalGate
 pub struct HumanAskManager;                     // from_config(HumanAskManagerConfig { core, queues: AskQueues, resume_sink: Arc<dyn ResumeSink> })
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
-                                                //        unapplied_tool_use_ids, actor_stop_cost (LivePendingAsks impl)
+                                                //        unapplied_tool_use_ids, actor_stop_cost (the LivePendingAsks impl; no inherent twin)
 pub struct SettledAsk { ask_id, tool_call_id, kind, resolution }   // settle_unapplied: one per resumable unapplied row; the caller appends, then mark_applied
 pub struct ReloadReport { requeued, resumed, abandoned, applied, failed }   // a row that fails is logged, counted and left for the next boot; the rows after it still reload
 pub trait ResumeSink { fn request_resume(&self, req: ResumeRequest); }   // fire and forget; the router decides whether it opens a Resume turn

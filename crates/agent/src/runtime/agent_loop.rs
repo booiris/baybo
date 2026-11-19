@@ -178,6 +178,22 @@ struct DispatchedToolCall {
     via_invoke: bool,
 }
 
+/// A tool call that has its outcome, ready to be put on the transcript.
+struct FinishedCall<'a> {
+    tool_use_id: &'a str,
+    dispatch: &'a DispatchedToolCall,
+    executed: ExecutedTool,
+}
+
+/// Where a turn collects the media its tool results carry beside their
+/// text: `turn_attachments` for the user (folded into the final assistant
+/// row), `llm_visible_images` for the model (one follow-up row after every
+/// result of the batch).
+struct ToolMedia<'a> {
+    turn_attachments: &'a mut Vec<ContentBlock>,
+    llm_visible_images: &'a mut Vec<ContentBlock>,
+}
+
 impl DispatchedToolCall {
     fn resolve(tc: &baybo_llm::ToolCallInfo, registry: &baybo_tools::ToolRegistry) -> Self {
         if tc.name == baybo_tools::builtin::tool_search::TOOL_INVOKE_NAME
@@ -1073,11 +1089,13 @@ impl AgentLoop {
         if turn_kind == TurnInputKind::Resume {
             self.settle_unapplied_asks(
                 session,
-                span_recorder,
-                turn_id,
-                turn_kind,
-                &tokens,
-                delta_tx.as_ref(),
+                settle::SettlingTurn {
+                    span_recorder,
+                    turn_id,
+                    kind: turn_kind,
+                    tokens: &tokens,
+                    delta_tx: delta_tx.as_ref(),
+                },
                 &mut turn_attachments,
             )
             .await?;
@@ -1721,11 +1739,15 @@ impl AgentLoop {
                 session,
                 delta_tx,
                 turn_id,
-                &tool_call.id,
-                dispatch,
-                executed,
-                turn_attachments,
-                &mut llm_visible_images,
+                FinishedCall {
+                    tool_use_id: &tool_call.id,
+                    dispatch,
+                    executed,
+                },
+                ToolMedia {
+                    turn_attachments,
+                    llm_visible_images: &mut llm_visible_images,
+                },
                 cron_report.as_ref(),
             )
             .await?;
@@ -1752,19 +1774,24 @@ impl AgentLoop {
     /// batch ran it or a settlement re-executed it. Media for the user lands
     /// in `turn_attachments`; images for the model collect in
     /// `llm_visible_images` for one follow-up row after every result.
-    #[allow(clippy::too_many_arguments)]
     async fn append_executed_tool(
         &mut self,
         session: &mut Session,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         turn_id: TurnId,
-        tool_use_id: &str,
-        dispatch: &DispatchedToolCall,
-        executed: ExecutedTool,
-        turn_attachments: &mut Vec<ContentBlock>,
-        llm_visible_images: &mut Vec<ContentBlock>,
+        finished: FinishedCall<'_>,
+        media: ToolMedia<'_>,
         cron_report: Option<&crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<()> {
+        let FinishedCall {
+            tool_use_id,
+            dispatch,
+            executed,
+        } = finished;
+        let ToolMedia {
+            turn_attachments,
+            llm_visible_images,
+        } = media;
         let (status, raw_summary) = tool_completion_summary(&executed);
         let call_approval = executed.approval;
         self.emit_tool_completed(

@@ -18,7 +18,7 @@ use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::{AgentLoop, DispatchedToolCall};
+use super::{AgentLoop, DispatchedToolCall, FinishedCall, ToolMedia};
 use crate::runtime::tool_executor::{ExecutedTool, PreExecuteGate};
 use baybo_channels::AgentOutput;
 
@@ -27,6 +27,18 @@ use baybo_channels::AgentOutput;
 struct SettledCall {
     id: String,
     dispatch: DispatchedToolCall,
+}
+
+/// The turn a settlement runs in: a `Resume` turn (the chat Resume door) or
+/// an `AskSettlement` one (a door's prelude). A re-executed call runs under
+/// its kind's rules.
+#[derive(Clone, Copy)]
+pub(super) struct SettlingTurn<'a> {
+    pub(super) span_recorder: &'a Arc<SpanRecorder>,
+    pub(super) turn_id: TurnId,
+    pub(super) kind: TurnInputKind,
+    pub(super) tokens: &'a TurnTokens,
+    pub(super) delta_tx: Option<&'a mpsc::Sender<AgentOutput>>,
 }
 
 /// Proof that the session's unapplied asks were settled: the only way to
@@ -81,11 +93,13 @@ impl AgentLoop {
                 let settled = self
                     .settle_unapplied_asks(
                         session,
-                        span_recorder,
-                        turn_id,
-                        TurnInputKind::AskSettlement,
-                        &tokens,
-                        delta_tx.as_ref(),
+                        SettlingTurn {
+                            span_recorder,
+                            turn_id,
+                            kind: TurnInputKind::AskSettlement,
+                            tokens: &tokens,
+                            delta_tx: delta_tx.as_ref(),
+                        },
                         &mut attachments,
                     )
                     .await?;
@@ -108,17 +122,10 @@ impl AgentLoop {
     /// results were appended. Media a re-executed tool produced for the user
     /// lands in `turn_attachments`; [`Self::settle_before_append`] has no final
     /// row to carry it and drops it.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn settle_unapplied_asks(
+    pub(super) async fn settle_unapplied_asks(
         &mut self,
         session: &mut Session,
-        span_recorder: &Arc<SpanRecorder>,
-        turn_id: TurnId,
-        // The kind of the turn doing the settling (`Resume` or
-        // `AskSettlement`): a re-executed call runs under its rules.
-        turn_kind: TurnInputKind,
-        tokens: &TurnTokens,
-        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        turn: SettlingTurn<'_>,
         turn_attachments: &mut Vec<ContentBlock>,
     ) -> anyhow::Result<usize> {
         self.context_manager.ensure_seeded().await?;
@@ -161,27 +168,23 @@ impl AgentLoop {
                     if !self.asks.mark_applied(&ask_id).await? {
                         continue;
                     }
-                    self.reexecute(
-                        session,
-                        span_recorder,
-                        turn_id,
-                        turn_kind,
-                        tokens,
-                        delta_tx,
-                        &call,
-                        decision,
-                    )
-                    .await?
+                    self.reexecute(session, turn, &call, decision).await?
                 }
             };
-            self.append_settled(
+            self.append_executed_tool(
                 session,
-                delta_tx,
-                turn_id,
-                &call,
-                executed,
-                turn_attachments,
-                &mut llm_visible_images,
+                turn.delta_tx,
+                turn.turn_id,
+                FinishedCall {
+                    tool_use_id: &call.id,
+                    dispatch: &call.dispatch,
+                    executed,
+                },
+                ToolMedia {
+                    turn_attachments,
+                    llm_visible_images: &mut llm_visible_images,
+                },
+                None,
             )
             .await?;
             appended += 1;
@@ -190,31 +193,6 @@ impl AgentLoop {
         }
         self.append_llm_visible_images(llm_visible_images).await?;
         Ok(appended)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn append_settled(
-        &mut self,
-        session: &mut Session,
-        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-        turn_id: TurnId,
-        call: &SettledCall,
-        executed: ExecutedTool,
-        turn_attachments: &mut Vec<ContentBlock>,
-        llm_visible_images: &mut Vec<ContentBlock>,
-    ) -> anyhow::Result<()> {
-        self.append_executed_tool(
-            session,
-            delta_tx,
-            turn_id,
-            &call.id,
-            &call.dispatch,
-            executed,
-            turn_attachments,
-            llm_visible_images,
-            None,
-        )
-        .await
     }
 
     /// Whether the live window already answers `tool_use` `id` — a cancel
@@ -259,18 +237,20 @@ impl AgentLoop {
 
     /// Run an approved call again with the human's decision standing in for
     /// the gate, under a fresh step of the current turn.
-    #[allow(clippy::too_many_arguments)]
     async fn reexecute(
         &mut self,
         session: &mut Session,
-        span_recorder: &Arc<SpanRecorder>,
-        turn_id: TurnId,
-        turn_kind: TurnInputKind,
-        tokens: &TurnTokens,
-        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        turn: SettlingTurn<'_>,
         call: &SettledCall,
         decision: ApprovalDecision,
     ) -> anyhow::Result<ExecutedTool> {
+        let SettlingTurn {
+            span_recorder,
+            turn_id,
+            kind: turn_kind,
+            tokens,
+            delta_tx,
+        } = turn;
         let label = self
             .tool_registry
             .progress_label(&call.dispatch.name, &call.dispatch.arguments);

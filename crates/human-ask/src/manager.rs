@@ -321,17 +321,7 @@ impl HumanAskManager {
     /// test waits for before acting on a parked turn.
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_live_pending_ask(&self, session_id: &SessionId) -> bool {
-        self.actor_stop_cost(session_id) != ActorStopCost::Free
-    }
-
-    /// What stopping the session's actor would cost its live asks, across
-    /// every channel queue.
-    pub fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
-        self.queues
-            .all()
-            .iter()
-            .map(|queue| queue.actor_stop_cost(session_id))
-            .fold(ActorStopCost::Free, ActorStopCost::plus)
+        LivePendingAsks::actor_stop_cost(self, session_id) != ActorStopCost::Free
     }
 
     fn is_live(&self, row: &HumanAskRow) -> bool {
@@ -390,8 +380,13 @@ impl HumanAskManager {
 }
 
 impl LivePendingAsks for HumanAskManager {
+    /// The session's live asks across every channel queue.
     fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
-        HumanAskManager::actor_stop_cost(self, session_id)
+        self.queues
+            .all()
+            .iter()
+            .map(|queue| queue.actor_stop_cost(session_id))
+            .fold(ActorStopCost::Free, ActorStopCost::plus)
     }
 }
 

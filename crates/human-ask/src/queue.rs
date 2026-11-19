@@ -286,8 +286,9 @@ impl AskQueue {
             .collect()
     }
 
-    /// What stopping `session_id`'s actor would cost this queue's live asks.
-    pub fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
+    /// What stopping `session_id`'s actor would cost this queue's live asks:
+    /// one queue's share of [`LivePendingAsks::actor_stop_cost`](crate::LivePendingAsks::actor_stop_cost).
+    pub(crate) fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
         self.inner
             .lock()
             .iter()
