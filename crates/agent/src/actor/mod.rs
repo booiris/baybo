@@ -646,7 +646,7 @@ impl AgentActor {
     /// it to the response channel.
     /// Run the loop on the session's *current* context. The triggering
     /// message must already be appended (the callers do this via
-    /// `AgentLoop::append_user_message` / `append_cron_fire` /
+    /// `AgentLoop::append_user_message_with_platform_msg_id` / `append_cron_fire` /
     /// `append_background_notification_prompt_once`) so framing lives in
     /// `baybo-context` and the loop just iterates.
     #[allow(clippy::too_many_arguments)]
@@ -746,10 +746,10 @@ impl AgentActor {
             // framed spelling of the same thing. Same ordering either way.
             brief: baybo_model::prose_with_media(brief.to_string(), &files),
         };
-        self.settle_unapplied_asks().await?;
+        let settled = self.settle_unapplied_asks().await?;
         self.volatile
             .agent_loop
-            .append_issue_brief(number, checkout, brief, &files)
+            .append_issue_brief(&settled, number, checkout, brief, &files)
             .await?;
         self.run_agent_loop(turn_input, None, None, None, None, None)
             .await?;
@@ -785,10 +785,10 @@ impl AgentActor {
             }),
         };
         let prompt_context = builtin.map(|ctx| ctx.prompt_context);
-        self.settle_unapplied_asks().await?;
+        let settled = self.settle_unapplied_asks().await?;
         self.volatile
             .agent_loop
-            .append_cron_fire(job_id, prompt, prompt_context.as_deref())
+            .append_cron_fire(&settled, job_id, prompt, prompt_context.as_deref())
             .await?;
         // Only a recurring fire (which owns a listed conversation) can be
         // silenced by `report_nothing` or leave work in the background; a
@@ -994,7 +994,7 @@ impl AgentActor {
 
         // An assistant row after a dangling `tool_use` wedges the transcript
         // just as a user row does.
-        self.settle_unapplied_asks().await?;
+        let settled = self.settle_unapplied_asks().await?;
         let turn_lifecycle = Arc::clone(&self.volatile.turn_lifecycle);
         let origin = self.durable.session.trigger.kind();
         let append_outcome = crate::runtime::scope::with_turn(
@@ -1014,7 +1014,7 @@ impl AgentActor {
                 let append_outcome = self
                     .volatile
                     .agent_loop
-                    .append_cron_notification(content.clone(), source_event_id.as_deref())
+                    .append_cron_notification(&settled, content.clone(), source_event_id.as_deref())
                     .await?;
                 let SessionMessageAppendOutcome::Inserted { ordinal } = append_outcome else {
                     return Err(anyhow::anyhow!(
@@ -1283,10 +1283,10 @@ impl AgentActor {
         // text deltas as `AgentEvent::AnswerDelta` while the final assembled
         // message still flows through the normal path.
         let response_tx = self.volatile.response_tx.clone();
-        self.settle_unapplied_asks().await?;
+        let settled = self.settle_unapplied_asks().await?;
         self.volatile
             .agent_loop
-            .append_user_message_with_platform_msg_id(content.clone(), platform_msg_id)
+            .append_user_message_with_platform_msg_id(&settled, content.clone(), platform_msg_id)
             .await?;
         // Single slash-command turn (the non-slash common path is handled by
         // `handle_merged_user_turn`). Slash turns do not drain mid-turn
@@ -1330,7 +1330,7 @@ impl AgentActor {
             combined.extend(incoming.message.content.iter().cloned());
         }
         combined.extend(last.message.content.iter().cloned());
-        self.settle_unapplied_asks().await?;
+        let settled = self.settle_unapplied_asks().await?;
         // Append every message as its own row ahead of the turn (the last
         // included) so the loop iterates the current context; the combined
         // content rides in `TurnInput` for the turn record only.
@@ -1338,6 +1338,7 @@ impl AgentActor {
             self.volatile
                 .agent_loop
                 .append_user_message_with_platform_msg_id(
+                    &settled,
                     incoming.message.content,
                     incoming.platform_msg_id,
                 )
@@ -1345,7 +1346,11 @@ impl AgentActor {
         }
         self.volatile
             .agent_loop
-            .append_user_message_with_platform_msg_id(last.message.content, last.platform_msg_id)
+            .append_user_message_with_platform_msg_id(
+                &settled,
+                last.message.content,
+                last.platform_msg_id,
+            )
             .await?;
         let response_tx = self.volatile.response_tx.clone();
         // Let the loop drain user messages that arrive *during* this turn and
@@ -1535,13 +1540,14 @@ impl AgentActor {
     ) -> anyhow::Result<()> {
         // The summariser reads the transcript, so a dangling `tool_use` has
         // to be answered first.
-        self.settle_unapplied_asks().await?;
+        let settled = self.settle_unapplied_asks().await?;
         // `compact_now` mints its own maintenance turn and returns a control
         // notice; it does not emit a chat reply from the actor itself.
         let notice = self
             .volatile
             .agent_loop
             .compact_now(
+                &settled,
                 &mut self.durable.session,
                 &self.volatile.turn_lifecycle,
                 &self.volatile.span_recorder,

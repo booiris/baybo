@@ -39,6 +39,8 @@ use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
 
 mod settle;
+pub use settle::AsksSettled;
+pub(crate) use settle::resume_input;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
 /// for a placeholder to complete. If a chunk ends with an open `[{` but no
@@ -2466,13 +2468,9 @@ impl AgentLoop {
     /// messages into one turn while keeping each as its own transcript row;
     /// context's `messages_for_llm` collapses the consecutive rows for the
     /// provider call.
-    pub async fn append_user_message(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
-        self.append_user_message_with_platform_msg_id(content, String::new())
-            .await
-    }
-
     pub async fn append_user_message_with_platform_msg_id(
         &mut self,
+        _settled: &AsksSettled,
         content: Vec<ContentBlock>,
         platform_msg_id: impl Into<String>,
     ) -> anyhow::Result<()> {
@@ -2500,6 +2498,7 @@ impl AgentLoop {
     /// picture in the message.
     pub async fn append_issue_brief(
         &mut self,
+        _settled: &AsksSettled,
         number: i64,
         checkout: &str,
         brief: &str,
@@ -2514,6 +2513,7 @@ impl AgentLoop {
 
     pub async fn append_cron_fire(
         &mut self,
+        _settled: &AsksSettled,
         turn_id: &str,
         prompt: &str,
         context: Option<&str>,
@@ -2541,6 +2541,7 @@ impl AgentLoop {
     ///
     pub async fn append_cron_notification(
         &mut self,
+        _settled: &AsksSettled,
         content: Vec<ContentBlock>,
         source_event_id: Option<&str>,
     ) -> anyhow::Result<baybo_session::SessionMessageAppendOutcome> {
@@ -2576,6 +2577,7 @@ impl AgentLoop {
     /// duplicating the live context window.
     pub async fn append_background_notification_prompt_once(
         &mut self,
+        _settled: &AsksSettled,
         content: Vec<ContentBlock>,
         source_event_id: &str,
     ) -> anyhow::Result<baybo_session::SessionMessageAppendOutcome> {
@@ -3304,6 +3306,7 @@ impl AgentLoop {
     /// on a real lifecycle.
     pub async fn compact_now(
         &mut self,
+        _settled: &AsksSettled,
         session: &mut Session,
         turn_lifecycle: &Arc<TurnLifecycle>,
         span_recorder: &Arc<SpanRecorder>,

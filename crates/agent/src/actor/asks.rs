@@ -2,38 +2,27 @@
 //! runs before its own append, and the Resume door an answered dead ask
 //! arrives through.
 
-use baybo_model::human_ask::AskId;
-use baybo_store::HumanAskRow;
-use baybo_turn::TurnInput;
-
 use super::AgentActor;
+use crate::runtime::agent_loop::{AsksSettled, resume_input};
+use baybo_model::human_ask::AskId;
 
 impl AgentActor {
-    /// Settle this session's unapplied asks in a Resume turn of their own,
-    /// so the result of each lands adjacent to the row that raised it. A
-    /// no-op that opens no turn when there is nothing to settle. Every door
-    /// calls this before its own append.
-    pub(super) async fn settle_unapplied_asks(&mut self) -> anyhow::Result<()> {
-        let session_id = self.durable.session.id.clone();
-        let rows = self.volatile.agent_loop.unapplied_asks(&session_id).await?;
-        let Some(head) = rows.into_iter().next() else {
-            return Ok(());
-        };
-        let turn_input = resume_input(&head);
+    /// The prelude every door runs before its own append: settle this
+    /// session's unapplied asks. The appends take the [`AsksSettled`] it
+    /// returns, so a door cannot skip it.
+    pub(super) async fn settle_unapplied_asks(&mut self) -> anyhow::Result<AsksSettled> {
         let (tokens, _release) = self.turn_tokens();
         let response_tx = self.volatile.response_tx.clone();
         self.volatile
             .agent_loop
-            .run_settlement_turn(
+            .settle_before_append(
                 &mut self.durable.session,
-                turn_input,
                 &self.volatile.turn_lifecycle,
                 &self.volatile.span_recorder,
                 Some(response_tx),
                 tokens,
             )
-            .await?;
-        Ok(())
+            .await
     }
 
     /// A human answered `ask_id` while no tool future waited on it: run the
@@ -58,14 +47,5 @@ impl AgentActor {
             .await?;
         self.send_user_reply(response).await;
         Ok(())
-    }
-}
-
-/// The Resume turn payload for `row`, naming the turn that raised it.
-fn resume_input(row: &HumanAskRow) -> TurnInput {
-    TurnInput::Resume {
-        resumed_turn_id: row.turn_id,
-        ask_id: row.ask_id.clone(),
-        tool_use_id: row.tool_call_id.clone(),
     }
 }

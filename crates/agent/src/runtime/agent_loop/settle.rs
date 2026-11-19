@@ -29,34 +29,39 @@ struct SettledCall {
     dispatch: DispatchedToolCall,
 }
 
-impl AgentLoop {
-    /// The session's asks not yet applied to its transcript.
-    pub async fn unapplied_asks(
-        &self,
-        session: &baybo_model::SessionId,
-    ) -> anyhow::Result<Vec<HumanAskRow>> {
-        Ok(self.asks.unapplied_for_session(session).await?)
-    }
+/// Proof that the session's unapplied asks were settled: the only way to
+/// get one is [`AgentLoop::settle_before_append`]. Every append a door makes
+/// ahead of its turn takes it, so a door cannot put a row after a
+/// `tool_use` an ask still has to answer — that order is one no provider
+/// accepts, and nothing repairs it before the next LLM call.
+pub struct AsksSettled(());
 
+impl AgentLoop {
     /// The row a Resume turn for the answered `ask_id` starts from, if it
     /// should run now.
     pub async fn resume_ready(&self, ask_id: &AskId) -> anyhow::Result<Option<HumanAskRow>> {
         Ok(self.asks.resume_ready(ask_id).await?)
     }
 
-    /// Run `turn_input` (a `Resume`) as a turn whose whole body is the
-    /// settlement: a door's prelude. The turn ends after the appends and the
-    /// door's own turn follows. (The chat Resume door instead settles inside
-    /// `run_inner` and goes on to the LLM iterations.)
-    pub async fn run_settlement_turn(
+    /// A door's prelude: settle the session's unapplied asks before the door
+    /// appends anything, so each result lands adjacent to the row that
+    /// raised it. Opens no turn when there is nothing to settle; otherwise
+    /// the settlement is a `Resume` turn of its own, which ends after the
+    /// appends, and the door's turn follows. (The chat Resume door instead
+    /// settles inside `run_inner` and goes on to the LLM iterations.)
+    pub async fn settle_before_append(
         &mut self,
         session: &mut Session,
-        turn_input: TurnInput,
         turn_lifecycle: &Arc<TurnLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         tokens: TurnTokens,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<AsksSettled> {
+        let unapplied = self.asks.unapplied_for_session(&session.id).await?;
+        let Some(head) = unapplied.first() else {
+            return Ok(AsksSettled(()));
+        };
+        let turn_input = resume_input(head);
         self.refresh_active_llm();
         let spec = crate::runtime::scope::TurnSpec {
             session_id: session.id.clone(),
@@ -84,7 +89,7 @@ impl AgentLoop {
                     TurnOutput::Structured {
                         value: serde_json::json!({ "settled_asks": settled }),
                     },
-                    settled,
+                    AsksSettled(()),
                 ))
             },
         )
@@ -97,7 +102,7 @@ impl AgentLoop {
     /// approved call its re-execution under a fresh step (stamped applied
     /// first, so a crash mid-run never runs it twice). Returns how many
     /// results were appended. Media a re-executed tool produced for the user
-    /// lands in `turn_attachments`; [`Self::run_settlement_turn`] has no final
+    /// lands in `turn_attachments`; [`Self::settle_before_append`] has no final
     /// row to carry it and drops it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn settle_unapplied_asks(
@@ -335,6 +340,15 @@ impl AgentLoop {
 
 /// The denial an approval refused by `resolution` reads as, in the same shape
 /// the executor's gate produces live.
+/// The Resume turn payload for `row`, naming the turn that raised it.
+pub(crate) fn resume_input(row: &HumanAskRow) -> TurnInput {
+    TurnInput::Resume {
+        resumed_turn_id: row.turn_id,
+        ask_id: row.ask_id.clone(),
+        tool_use_id: row.tool_call_id.clone(),
+    }
+}
+
 /// What a settled ask puts on the transcript for its call.
 enum SettledResult {
     /// The result is known without running anything.

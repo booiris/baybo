@@ -283,7 +283,9 @@ those ids, so the real result can land adjacent later.
 ### Unapplied asks: the turn prelude and the Resume door
 
 Every door that appends to a transcript first calls
-`AgentActor::settle_unapplied_asks()` (`actor/asks.rs`): `handle_user_input`,
+`AgentActor::settle_unapplied_asks()` (`actor/asks.rs`) — and has to: the
+loop's door appends and `compact_now` take the `AsksSettled` value only that
+prelude (`AgentLoop::settle_before_append`) returns. The doors: `handle_user_input`,
 `handle_merged_user_turn`, `dispatch_issue_run` (before `append_issue_brief`),
 `dispatch_cron_prompt` (before `append_cron_fire`), the background-notification
 delivery (before `append_background_notification_prompt_once`, on both the
@@ -291,7 +293,7 @@ fresh and the retry stage), `/compact` (before `compact_now`) and
 `publish_cron_notification` (an assistant row after a dangling `tool_use`
 wedges the transcript just as a user row does). When the ledger has no
 unapplied ask for the session it returns without opening a turn; otherwise it
-runs a `TurnInput::Resume` turn through `AgentLoop::run_settlement_turn`, whose
+runs a `TurnInput::Resume` turn in `AgentLoop::settle_before_append`, whose
 whole body is `AgentLoop::settle_unapplied_asks`
 (`runtime/agent_loop/settle.rs`). The settlement asks
 `HumanAskManager::settle_unapplied` and appends one result per `SettledAsk`
