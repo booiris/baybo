@@ -148,11 +148,6 @@ impl crate::ports::LivePendingAsks for NoLivePendingAsks {
 /// resumes nothing.
 pub struct NoResume;
 
-#[async_trait]
 impl crate::ports::ResumeSink for NoResume {
-    async fn resumes_on_answer(&self, _session_id: &SessionId) -> bool {
-        false
-    }
-
     fn request_resume(&self, _req: baybo_model::human_ask::ResumeRequest) {}
 }

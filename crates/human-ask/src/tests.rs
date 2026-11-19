@@ -24,19 +24,12 @@ use crate::ports::{AskObserver, ResumeSink};
 use crate::queue::{AskQueue, AskQueueEvent, AskQueues, PendingEdge};
 use crate::test_support::MemoryHumanAskStore;
 
-const ISSUE_SESSION: &str = "issue-session";
-
 #[derive(Default)]
 struct RecordingSink {
     requests: Mutex<Vec<ResumeRequest>>,
 }
 
-#[async_trait]
 impl ResumeSink for RecordingSink {
-    async fn resumes_on_answer(&self, session_id: &SessionId) -> bool {
-        session_id.as_str() != ISSUE_SESSION
-    }
-
     fn request_resume(&self, req: ResumeRequest) {
         self.requests.lock().push(req);
     }
@@ -488,20 +481,6 @@ async fn resolving_a_dead_ask_removes_it_and_requests_a_resume() {
 }
 
 #[tokio::test]
-async fn resolving_a_dead_ask_in_an_issue_session_requests_nothing() {
-    let h = harness();
-    h.store
-        .insert(row("a", ISSUE_SESSION, AskPhase::BeforeExecute));
-    h.manager.reload_pending().await.expect("reload");
-    h.manager.resolve(&id("a"), APPROVE).await.expect("resolve");
-    assert!(h.sink.requests.lock().is_empty());
-    assert_eq!(
-        h.store.row(&id("a")).expect("row").resolution,
-        Some(APPROVE)
-    );
-}
-
-#[tokio::test]
 async fn turn_cancel_returns_abandoned_and_leaves_the_row_pending() {
     let h = harness();
     let t = tokens();
@@ -714,10 +693,6 @@ async fn reload_resumes_resolved_rows_without_showing_them() {
     let h = harness();
     h.store
         .insert(resolved(row("a", "s1", AskPhase::BeforeExecute), APPROVE));
-    h.store.insert(resolved(
-        row("b", ISSUE_SESSION, AskPhase::BeforeExecute),
-        APPROVE,
-    ));
     let report = h.manager.reload_pending().await.expect("reload");
     assert_eq!(report.resumed, 1);
     assert!(h.queue.is_empty(), "not re-shown");

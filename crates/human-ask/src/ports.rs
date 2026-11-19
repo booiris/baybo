@@ -9,16 +9,11 @@ use baybo_store::HumanAskRow;
 use crate::core::AskEvent;
 
 /// Reaches the router when a human answers an ask whose tool future is gone.
-#[async_trait]
 pub trait ResumeSink: Send + Sync {
-    /// Whether an answer to a dead ask in this session should open a chat
-    /// Resume turn. Issue sessions answer `false`: the run's own re-drive
-    /// applies the answer under the real run.
-    async fn resumes_on_answer(&self, session_id: &SessionId) -> bool;
-
-    /// Ask the router to open a Resume turn for a resolved ask. Fire and
-    /// forget: a lost request leaves the row resolved, and the next turn or
-    /// boot applies it.
+    /// Tell the router a dead ask was answered. Fire and forget: whether
+    /// that opens a Resume turn is the router's call (an issue session's own
+    /// run applies the answer instead), and a lost request leaves the row
+    /// resolved for the session's next turn or the next boot to apply.
     fn request_resume(&self, req: ResumeRequest);
 }
 

@@ -368,9 +368,11 @@ impl Router {
     }
 
     /// A human answered a dead ask: route a `ResumeAsk` to the session's
-    /// actor, hydrating one if none is live. A failure here loses nothing —
-    /// the row stays resolved, and the session's next turn or the next boot
-    /// applies it.
+    /// actor, hydrating one if none is live. Nothing is routed for a session
+    /// that applies the answer some other way (see
+    /// [`crate::runtime::asks::resume_message`]). A failure here loses
+    /// nothing — the row stays resolved, and the session's next turn or the
+    /// next boot applies it.
     pub(super) async fn handle_resume_ask(&self, req: baybo_model::human_ask::ResumeRequest) {
         let session = match self.session_manager.get(&req.session_id).await {
             Ok(Some(session)) => session,
@@ -383,19 +385,16 @@ impl Router {
                 return;
             }
         };
+        let Some(message) = crate::runtime::asks::resume_message(&session, &req) else {
+            return;
+        };
         // An answer is activity like a message is: without the stamp the
         // resumed session is still idle to the reaper from its first second.
         if let Err(e) = self.session_manager.touch(&req.session_id).await {
             warn!(session_id = %req.session_id, error = %e, "could not stamp activity for a resumed ask");
         }
         let routed = self
-            .route_one_to_actor(
-                &req.session_id,
-                &session,
-                AgentMessage::ResumeAsk {
-                    ask_id: req.ask_id.clone(),
-                },
-            )
+            .route_one_to_actor(&req.session_id, &session, message)
             .await;
         if !routed {
             warn!(session_id = %req.session_id, ask_id = %req.ask_id, "could not route a resume to the session's actor");
@@ -800,6 +799,7 @@ mod tests {
             agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
             cron_trigger_rx,
             issue_run_rx: None,
+            ask_resume_rx: None,
             board: None,
             actor_parent_token: CancellationToken::new(),
             rate_limit: LiveRateLimit::new(rate_limit_max, Duration::from_secs(60)),
@@ -910,6 +910,38 @@ mod tests {
             matches!(&routed, Ok(AgentMessage::ResumeAsk { ask_id: got }) if *got == ask_id),
             "the resume reaches the actor"
         );
+    }
+
+    /// An issue session's own run applies the answer, so the chat Resume
+    /// door routes nothing for it and spawns no actor.
+    #[tokio::test]
+    async fn a_resume_for_an_issue_session_routes_nothing() {
+        let fx = fixture(8, LeakDetector::with_default_rules());
+        let user = User {
+            id: "u1".into(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        let session = fx
+            .sessions
+            .create_session_with_trigger(
+                user,
+                ChannelType::tui(),
+                baybo_model::TriggerSource::Issue {
+                    project_id: baybo_model::ProjectId::generate(),
+                    issue_id: baybo_model::IssueId::generate(),
+                    number: 1,
+                },
+            )
+            .await
+            .expect("create");
+        fx.router
+            .handle_resume_ask(baybo_model::human_ask::ResumeRequest {
+                session_id: session.id.clone(),
+                ask_id: "ask-1".parse().expect("ask id"),
+            })
+            .await;
+        assert!(fx.mailboxes.lock().is_empty(), "no actor was spawned");
     }
 
     /// The batch choke point's un-record: a whole-group bail (here the rate

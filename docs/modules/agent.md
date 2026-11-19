@@ -305,10 +305,12 @@ step with `ToolExecutor::execute(…, PreExecuteGate::PreDecided(decision))`, so
 the gate is not asked again (`ApproveAlways` still seeds the grants). The
 `resumed_turn_id` is the ask row's own `turn_id`.
 
-`RouterResumeSink` (`runtime::asks`) is the manager's `ResumeSink`: it sends
-`RouterInbound::ResumeAsk` on the router's intake (created in
-`build_managers` and carried on `ManagerGraph` for `wire_router` to take), and
-answers `resumes_on_answer = false` for issue sessions. The router routes it
+`RouterResumeSink` (`runtime::asks`) is the manager's `ResumeSink`: a sender
+on a dedicated `ResumeRequest` channel (`RouterResumeSink::channel()`, built in
+`build_managers`; the receiver rides `ManagerGraph` to `wire_router` and into
+`RouterConfig::ask_resume_rx`, like `issue_run_rx`). The router's
+`handle_resume_ask` asks `resume_message(session, req)` — `None` for an issue
+session, whose run applies the answer — and routes the result
 like `route_one_to_actor`, through `resolve_spawn_pins`, as
 `AgentMessage::ResumeAsk { ask_id }` at `Trigger` priority.
 `handle_resume_ask` returns when the row is already applied (a door got there

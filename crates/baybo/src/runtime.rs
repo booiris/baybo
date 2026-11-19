@@ -231,12 +231,10 @@ pub struct ManagerGraph {
     /// `None` when there is no owner channel, and left unread by `baybo
     /// prompt` (a closed stream is a no-op for the relay).
     pub ask_push_stream: Option<baybo_gateway::push::ask::AskPushStream>,
-    /// The router's intake. Created in [`build_managers`] because the ask
-    /// manager's Resume door sends on it; channel transports get clones.
-    pub router_incoming_tx: mpsc::Sender<RouterInbound>,
-    /// The intake's receiver, a one-shot like `cron_trigger_rx` —
-    /// [`wire_router`] consumes it.
-    pub router_incoming_rx: Option<mpsc::Receiver<RouterInbound>>,
+    /// Answers to asks no tool future waits on, sent by the ask manager's
+    /// resume sink. A one-shot like `cron_trigger_rx`: [`wire_router`] hands
+    /// it to the router.
+    pub ask_resume_rx: Option<mpsc::Receiver<baybo_model::human_ask::ResumeRequest>>,
 
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
@@ -521,11 +519,7 @@ pub async fn build_managers(
     // `ask_queues` so the boot reload and the install meet on one queue.
     let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
     let ask_queues = baybo_human_ask::AskQueues::new();
-    // The router's intake is created here rather than in `wire_router`, so
-    // the ask manager can hold the Resume door (a sender on it) as a
-    // required field; `wire_router` takes the receiver off the graph.
-    let (router_incoming_tx, router_incoming_rx) =
-        mpsc::channel::<RouterInbound>(config.channels.message_buffer_size);
+    let (resume_sink, ask_resume_rx) = baybo_agent::runtime::asks::RouterResumeSink::channel();
     // Eagerly install every enabled channel from config so connections
     // can attach to a pre-existing slot rather than racing on lazy
     // first-connect creation. See docs/modules/channels-protocol-refactor.md.
@@ -555,10 +549,7 @@ pub async fn build_managers(
         baybo_human_ask::HumanAskManagerConfig {
             core: Arc::clone(&ask_core),
             queues: ask_queues.clone(),
-            resume_sink: Arc::new(baybo_agent::runtime::asks::RouterResumeSink::new(
-                router_incoming_tx.clone(),
-                Arc::clone(&session_manager),
-            )),
+            resume_sink: Arc::new(resume_sink),
         },
     ));
 
@@ -966,8 +957,7 @@ pub async fn build_managers(
         ask_queues,
         human_asks,
         ask_push_stream,
-        router_incoming_tx,
-        router_incoming_rx: Some(router_incoming_rx),
+        ask_resume_rx: Some(ask_resume_rx),
         subagent_dispatch_limiter,
     })
 }
@@ -1010,11 +1000,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     let keep_recent = graph.config.agent.context.keep_recent;
     let builtin_memory = graph.config.memory.builtin.enabled;
 
-    let incoming_tx = graph.router_incoming_tx.clone();
-    let incoming_rx = graph
-        .router_incoming_rx
-        .take()
-        .ok_or_else(|| anyhow::anyhow!(WIRE_ROUTER_TWICE))?;
+    let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
     let supervisor = AgentSupervisor::new(response_tx, graph.human_asks.clone());
@@ -1273,6 +1259,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
         issue_run_rx: graph.issue_run_rx.take(),
+        ask_resume_rx: graph.ask_resume_rx.take(),
         board: Some(Arc::clone(&graph.project_manager)),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),

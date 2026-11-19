@@ -52,7 +52,7 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-storage` (`sqlite/human_ask.rs`) | `SqliteHumanAskStore` over the `human_asks` table. DDL in `sqlite/mod.rs` like every other table. |
 | `baybo-tools` (`tools::approval`, new `tools::ask`) | The **tool-facing ports** only: `ApprovalGate`, `ApprovalGateMap`, `AutoDenyGate`, `ApprovalHandle`, `ApprovalOutcome`, `refusal_reason`; new `QuestionGate`, `QuestionHandle`, `AskCancel`, `ParkGauge`, `ToolContext.question`, `Tool::sole_call()`. Never depends on `baybo-human-ask`. |
 | `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
-| `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`, `RouterInbound::ResumeAsk`. |
+| `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`. (The Resume door is not a channel message: it has its own receiver on the router.) |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
 | `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingApprovals` and does not depend on this crate.) |
 
@@ -377,7 +377,7 @@ there is no write path in the crate that skips them.
 
 | Verb | Persists | Then |
 | --- | --- | --- |
-| `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim). A pending **dead non-resumable** ask (a during-execute approval whose tool future is gone) is instead closed `Abandoned` + `applied` and the answer refused with `AskClosed`: nothing could carry the decision out, so none is recorded | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A resumable row whose `channel` has no queue still gets the claim, with a `warn!`. |
+| `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim). A pending **dead non-resumable** ask (a during-execute approval whose tool future is gone) is instead closed `Abandoned` + `applied` and the answer refused with `AskClosed`: nothing could carry the decision out, so none is recorded | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), and resumable: hand `ResumeRequest { session_id, ask_id }` to the resume sink (the router decides whether that opens a Resume turn). `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A resumable row whose `channel` has no queue still gets the claim, with a `warn!`. |
 | `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on **every** unapplied ask of the call — what it abandoned, and an answer that won the claim in the same instant — because its tool future is gone and its caller's append is the only result the call will get; it returns whether the call had any unapplied ask, and the caller appends either way. |
 | `PolicyDenyGate::request` (the gate, not a manager verb) | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
 | `settle_unapplied(session) -> Vec<SettledAsk>` | per unapplied row: pending → `Abandoned` (claim); a **non-resumable** row, pending or resolved → `applied` | returns one `SettledAsk { ask_id, tool_call_id, kind, resolution }` per **resumable** row, pending-and-just-abandoned or resolved alike, **not stamped applied**: the caller appends the result `resolution` means (or re-executes an approved call) and then calls `mark_applied`. A settlement that fails part-way therefore leaves the rest unapplied, and the next one hands them out again. A non-resumable row's call already has a result — the tool's own, the loop's cancel claim, or hydration's crash fill — so it is closed, stamped and reported as nothing. Removes the queue entries it abandoned. |
@@ -657,12 +657,18 @@ once, for the run.
 
 Only the `Router` can spawn an actor (`router/mod.rs:254`), so the dead path
 must reach it. The manager holds `Arc<dyn ResumeSink>`
-(`fn request_resume(&self, ResumeRequest)`), implemented in `baybo-agent`
-over `mpsc::Sender<RouterInbound>` with a new
-`RouterInbound::ResumeAsk(ResumeRequest)` variant (the enum lives in
-`baybo-channels`, `types.rs:47`). The router routes it like
-`route_one_to_actor`, through `resolve_spawn_pins`, so a hydrated actor keeps
-its LLM pin. The actor receives `AgentMessage::ResumeAsk { ask_id }` at
+(`fn request_resume(&self, ResumeRequest)`, its only method), implemented in
+`baybo-agent` as `RouterResumeSink`: a sender on a dedicated
+`mpsc::channel::<ResumeRequest>` whose receiver the router drains as
+`RouterConfig::ask_resume_rx`, the same seam as `cron_trigger_rx` and
+`issue_run_rx`. It is not a `RouterInbound` variant: that enum is what
+channel transports send, and a transport must not be able to mint a Resume
+turn. The router's `handle_resume_ask` loads the session and asks
+`runtime::asks::resume_message(session, req)`, the one home of "does this
+session resume through the chat door" (an issue session does not: its run's
+own re-drive applies the answer). It then stamps the session active and
+routes like `route_one_to_actor`, through `resolve_spawn_pins`, so a hydrated
+actor keeps its LLM pin. The actor receives `AgentMessage::ResumeAsk { ask_id }` at
 `Trigger` priority.
 
 `handle_resume_ask` asks `manager.resume_ready(ask_id)` and returns when it
@@ -1159,10 +1165,7 @@ pub struct HumanAskManager;                     // from_config(HumanAskManagerCo
                                                 //        unapplied_tool_use_ids, actor_stop_cost (LivePendingAsks impl)
 pub struct SettledAsk { ask_id, tool_call_id, kind, resolution }   // settle_unapplied: one per resumable unapplied row; the caller appends, then mark_applied
 pub struct ReloadReport { requeued, resumed, abandoned, applied, failed }   // a row that fails is logged, counted and left for the next boot; the rows after it still reload
-#[async_trait] pub trait ResumeSink {
-    async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
-    fn request_resume(&self, req: ResumeRequest);
-}
+pub trait ResumeSink { fn request_resume(&self, req: ResumeRequest); }   // fire and forget; the router decides whether it opens a Resume turn
 pub trait LivePendingAsks { fn actor_stop_cost(&self, session: &SessionId) -> ActorStopCost; }  // Free < ReleasesTurn < AbandonsAsks
 #[async_trait] pub trait AskObserver { async fn on_event(&self, ask: &HumanAskRow, event: AskEvent); }
 pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>;
@@ -1199,14 +1202,15 @@ Where the code differs from the sketch above, and why:
   session user's channel; `ApprovalHandle` passes `DuringExecute` and the
   requesting user's channel. `PolicyDenyGate` needs the channel too, since it
   is built once and serves every channel.
-- **Issue sessions and the resume sink.** The manager learns whether a session
-  resumes through the chat Resume door from the `ResumeSink` port itself
-  (`resumes_on_answer`), implemented in `baybo-agent` over the session's
-  `TriggerSource`. One port, no extra config field, no schema change.
+- **Issue sessions and the resume sink.** The manager hands every answered
+  dead resumable ask to the sink; whether that opens a chat Resume turn is
+  the router's rule (`runtime::asks::resume_message`, over the session's
+  `TriggerSource`), applied to the session the router loads anyway. The ask
+  crate sequences no routing policy and the sink holds no session store.
 - **Boot wiring.** `build_managers` follows the [Restart survival](#restart-survival)
   order: store → `recover_orphaned_traces_and_turns` (which needs the
   `SessionManager` and `TurnLifecycle`, built just before it) → `AskCore`,
-  `AskQueues` and the router intake → `install_channels` → `AskPushRelay`
+  `AskQueues` and the resume channel (`RouterResumeSink::channel()`) → `install_channels` → `AskPushRelay`
   installed on `owner` → `HumanAskManager` (with
   `baybo_agent::runtime::asks::RouterResumeSink`) → … → `ProjectManager` →
   `baybo_project::install_ask_bridge` → `reload_pending` (best-effort,
@@ -1316,7 +1320,8 @@ Where the code differs from the sketch above, and why:
   `AskPushStream`, and the queue's `AskClosed` event (what the gateway
   watcher turns into `AskResolved`; the frame mapping is covered by
   `crates/gateway/tests/channel_ws.rs`). The router is replaced by a
-  forwarder from `RouterResumeSink`'s `ResumeAsk` into the actor mailbox.
+  forwarder from `RouterResumeSink`'s receiver into the actor mailbox, through
+  the same `resume_message` rule.
   The question half of the restart case waits for the `AskUser` stage. The issue-run case
   asserts the approved call runs once and the run's own LLM call sees the
   settled result; `finish_run` is the router's `IssueRunWaiter`, which the
@@ -1368,9 +1373,9 @@ Where the code differs from the sketch above, and why:
    `awaiting_human: true`
 4. user answers → `manager.resolve` → claim → entry removed (the row is now
    `resolved`, store-only) → `AskResolved` → `ResumeSink` →
-   `RouterInbound::ResumeAsk` → spawn/hydrate actor — hydration asks the
+   the router's `ask_resume_rx` → spawn/hydrate actor — hydration asks the
    **store** for unapplied ids and skips the fill for this `tool_use`
-5. actor: `handle_resume_ask` → Resume turn (`Continue`) → settlement
+5. actor: `handle_resume_ask` → Resume turn → settlement, then the LLM iterations
    applies the answer (append, or `mark_applied` + re-execute) → first LLM
    iteration → reply streams as usual
 
@@ -1428,7 +1433,7 @@ leaves draft.
   `AgentMessage::ResumeAsk` / `handle_resume_ask`; `PendingToolCalls` port in
   `baybo-context` + the `UnappliedAsks` newtype +
   `repair_tool_pairing(messages, skip)`; reaper probe.
-- `baybo-channels`: `AskSurface`; `RouterInbound::ResumeAsk`;
+- `baybo-channels`: `AskSurface`;
   `SessionEvent::AskResolved { session_id, .. }`.
 - `baybo-project`: `TimelineAskObserver` (async, `Weak<ProjectManager>`) +
   `AskCloser` behind the existing `CardPromptCloser` seam, wired by

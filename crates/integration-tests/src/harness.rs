@@ -18,7 +18,7 @@ use baybo_agent::{
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
     tool_executor::ToolExecutor,
 };
-use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, RouterInbound};
+use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
 use baybo_context::{ContextManager, ContextManagerConfig, HeuristicTokenizer};
 use baybo_cost::test_support::MemoryCostStore;
 use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
@@ -894,26 +894,27 @@ impl LlmCompletion for GatedChat {
 }
 
 /// The chat Resume door with the router cut out: the production sink queues
-/// `RouterInbound::ResumeAsk`, and this forwards it to the one actor the
-/// harness hosts, as `Router::handle_resume_ask` would.
+/// the request, and this forwards what the router's own rule
+/// (`resume_message`) makes of it to the one actor the harness hosts.
 fn resume_door(
     sessions: Arc<baybo_agent::SessionManager>,
     mailbox: MailboxSender<AgentMessage>,
 ) -> baybo_agent::runtime::asks::RouterResumeSink {
-    let (tx, mut rx) = mpsc::channel::<RouterInbound>(16);
+    let (sink, mut rx) = baybo_agent::runtime::asks::RouterResumeSink::channel();
     tokio::spawn(async move {
-        while let Some(inbound) = rx.recv().await {
-            if let RouterInbound::ResumeAsk(req) = inbound
-                && mailbox
-                    .send(AgentMessage::ResumeAsk { ask_id: req.ask_id })
-                    .await
-                    .is_err()
-            {
+        while let Some(req) = rx.recv().await {
+            let Ok(Some(session)) = sessions.get(&req.session_id).await else {
+                continue;
+            };
+            let Some(message) = baybo_agent::runtime::asks::resume_message(&session, &req) else {
+                continue;
+            };
+            if mailbox.send(message).await.is_err() {
                 return;
             }
         }
     });
-    baybo_agent::runtime::asks::RouterResumeSink::new(tx, sessions)
+    sink
 }
 
 /// A provider that rejects a transcript whose `tool_use` is not answered

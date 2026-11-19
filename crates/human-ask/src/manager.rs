@@ -115,7 +115,7 @@ impl HumanAskManager {
             }
         };
         if !delivered && resumable(row.kind, row.phase) {
-            self.request_resume(&row).await;
+            self.request_resume(&row);
         }
         Ok(())
     }
@@ -246,9 +246,8 @@ impl HumanAskManager {
                 self.core.mark_applied(&row.ask_id).await?;
             }
             (false, true) => {
-                if self.request_resume(&row).await {
-                    report.resumed += 1;
-                }
+                self.request_resume(&row);
+                report.resumed += 1;
             }
             (false, false) => {
                 if self.core.mark_applied(&row.ask_id).await? {
@@ -383,17 +382,11 @@ impl HumanAskManager {
         }))
     }
 
-    /// Hand a resolved dead ask to the resume sink unless its session
-    /// resumes some other way. Returns whether a request was sent.
-    async fn request_resume(&self, row: &HumanAskRow) -> bool {
-        if !self.resume_sink.resumes_on_answer(&row.session_id).await {
-            return false;
-        }
+    fn request_resume(&self, row: &HumanAskRow) {
         self.resume_sink.request_resume(ResumeRequest {
             session_id: row.session_id.clone(),
             ask_id: row.ask_id.clone(),
         });
-        true
     }
 }
 
