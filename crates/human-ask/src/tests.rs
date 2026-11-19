@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{AskCore, AskEvent};
 use crate::error::HumanAskError;
 use crate::gate::{ChannelAskGate, PolicyDenyGate};
-use crate::manager::{HumanAskManager, HumanAskManagerConfig, Settled};
+use crate::manager::{HumanAskManager, HumanAskManagerConfig, SettledAsk};
 use crate::ports::{AskObserver, ResumeSink};
 use crate::queue::{AskQueue, AskQueueEvent, AskQueues, PendingEdge};
 use crate::test_support::MemoryHumanAskStore;
@@ -838,11 +838,13 @@ async fn settle_unapplied_handles_every_row_state() {
     assert_eq!(
         settled,
         vec![
-            Settled::Abandoned {
+            SettledAsk {
+                ask_id: id("dead"),
                 tool_call_id: "use-dead".into(),
                 kind: AskKind::Approval,
+                resolution: AskResolution::Abandoned,
             },
-            Settled::Apply {
+            SettledAsk {
                 ask_id: id("answered"),
                 tool_call_id: "use-answered".into(),
                 kind: AskKind::Approval,
@@ -850,7 +852,12 @@ async fn settle_unapplied_handles_every_row_state() {
             },
         ]
     );
-    assert!(h.store.row(&id("dead")).expect("row").applied_at.is_some());
+    let dead = h.store.row(&id("dead")).expect("row");
+    assert_eq!(dead.resolution, Some(AskResolution::Abandoned));
+    assert!(
+        dead.applied_at.is_none(),
+        "abandoned, but applied only once the caller has appended its result"
+    );
     let orphan = h.store.row(&id("orphan")).expect("row");
     assert_eq!(orphan.resolution, Some(AskResolution::Abandoned));
     assert!(orphan.applied_at.is_some(), "reconciled, nothing appended");
@@ -867,9 +874,58 @@ async fn settle_unapplied_handles_every_row_state() {
             .expect("row")
             .applied_at
             .is_none(),
-        "the caller stamps Apply rows"
+        "the caller stamps what it appends"
     );
     assert!(h.queue.is_empty());
+
+    let again = h
+        .manager
+        .settle_unapplied(&"s1".into())
+        .await
+        .expect("settle again");
+    assert_eq!(
+        again, settled,
+        "a settlement whose append never happened is handed out again"
+    );
+}
+
+#[tokio::test]
+async fn resume_ready_waits_for_an_answer_to_every_ask_of_the_turn() {
+    let h = harness();
+    assert_eq!(
+        h.manager.resume_ready(&id("gone")).await.expect("ready"),
+        None
+    );
+
+    h.store
+        .insert(resolved(row("a", "s1", AskPhase::BeforeExecute), APPROVE));
+    h.store.insert(row("b", "s1", AskPhase::BeforeExecute));
+    assert_eq!(
+        h.manager.resume_ready(&id("b")).await.expect("ready"),
+        None,
+        "not answered"
+    );
+    assert_eq!(
+        h.manager.resume_ready(&id("a")).await.expect("ready"),
+        None,
+        "its turn still waits on b"
+    );
+
+    h.manager.resolve(&id("b"), APPROVE).await.expect("resolve");
+    let ready = h
+        .manager
+        .resume_ready(&id("a"))
+        .await
+        .expect("ready")
+        .expect("every ask of the turn is answered");
+    assert_eq!(ready.ask_id, id("a"));
+
+    h.manager.mark_applied(&id("a")).await.expect("apply");
+    assert_eq!(
+        h.manager.resume_ready(&id("a")).await.expect("ready"),
+        None,
+        "a prelude got there first"
+    );
 }
 
 #[tokio::test]
@@ -952,7 +1008,7 @@ async fn settle_unapplied_returns_apply_when_a_resolve_wins_the_claim() {
         .expect("settle");
     assert_eq!(
         settled,
-        vec![Settled::Apply {
+        vec![SettledAsk {
             ask_id: id("a"),
             tool_call_id: "use-a".into(),
             kind: AskKind::Approval,

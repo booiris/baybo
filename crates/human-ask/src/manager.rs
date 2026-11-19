@@ -26,21 +26,19 @@ pub struct HumanAskManager {
     resume_sink: Arc<dyn ResumeSink>,
 }
 
-/// What [`HumanAskManager::settle_unapplied`] needs its caller to put on the
-/// transcript.
+/// One ask [`HumanAskManager::settle_unapplied`] needs its caller to put on
+/// the transcript: append the result `resolution` means for `tool_call_id`
+/// (or re-execute an approved call), then
+/// [`HumanAskManager::mark_applied`]. The row stays unapplied until then,
+/// so a settlement that fails part-way is retried whole by the next one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Settled {
-    /// A pending ask the settlement abandoned (already stamped applied):
-    /// append the synthetic "nobody answered" result.
-    Abandoned { tool_call_id: String, kind: AskKind },
-    /// A resolved resumable ask: append (or re-execute for) `resolution`,
-    /// then [`HumanAskManager::mark_applied`].
-    Apply {
-        ask_id: AskId,
-        tool_call_id: String,
-        kind: AskKind,
-        resolution: AskResolution,
-    },
+pub struct SettledAsk {
+    pub ask_id: AskId,
+    pub tool_call_id: String,
+    pub kind: AskKind,
+    /// `Abandoned` for an ask nobody answered, the settlement's own claim
+    /// included.
+    pub resolution: AskResolution,
 }
 
 /// Counts from one [`HumanAskManager::reload_pending`] pass, for the boot log.
@@ -172,14 +170,14 @@ impl HumanAskManager {
     }
 
     /// Settle a session's unapplied asks before a turn builds on its
-    /// transcript. Pending dead asks are abandoned (and stamped applied) and
-    /// come back as [`Settled::Abandoned`] when resumable; a non-resumable
-    /// one's call already has a result (the loop's cancel fill, or
-    /// hydration's crash fill), so it is reported as nothing. Resolved
-    /// resumable ones come back as [`Settled::Apply`]; resolved
-    /// non-resumable ones are stamped applied and reported as nothing. A
-    /// live ask cannot exist here — it is logged and left alone.
-    pub async fn settle_unapplied(&self, session_id: &SessionId) -> Result<Vec<Settled>> {
+    /// transcript. Every resumable one comes back as a [`SettledAsk`] for
+    /// the caller to append and stamp: a pending dead ask is claimed
+    /// `Abandoned` first, a resolved one carries its resolution. A
+    /// non-resumable one's call already has a result (the tool's own, the
+    /// loop's cancel fill, or hydration's crash fill), so it is closed and
+    /// stamped applied here and reported as nothing. A live ask cannot exist
+    /// here — it is logged and left alone.
+    pub async fn settle_unapplied(&self, session_id: &SessionId) -> Result<Vec<SettledAsk>> {
         let mut settled = Vec::new();
         for mut row in self.unapplied_for_session(session_id).await? {
             if row.is_pending() {
@@ -190,21 +188,12 @@ impl HumanAskManager {
                     );
                     continue;
                 }
-                if self.abandon_row(&mut row).await? {
-                    self.core.mark_applied(&row.ask_id).await?;
-                    if !resumable(row.kind, row.phase) {
-                        continue;
+                if !self.abandon_row(&mut row).await? {
+                    // Lost the claim to a concurrent verb: read what it wrote.
+                    match self.get(&row.ask_id).await? {
+                        Some(current) if current.applied_at.is_none() => row = current,
+                        _ => continue,
                     }
-                    settled.push(Settled::Abandoned {
-                        tool_call_id: row.tool_call_id,
-                        kind: row.kind,
-                    });
-                    continue;
-                }
-                // Lost the claim to a concurrent verb: read what it wrote.
-                match self.get(&row.ask_id).await? {
-                    Some(current) if current.applied_at.is_none() => row = current,
-                    _ => continue,
                 }
             }
             if let Some(next) = self.settle_resolved(row).await? {
@@ -288,11 +277,35 @@ impl HumanAskManager {
         self.core.list_unapplied_for_session(session_id).await
     }
 
+    /// The row a Resume turn should start from for the answered `ask_id`, or
+    /// `None` when there is nothing to do yet: the ledger does not have it,
+    /// it is not resolved, a door's prelude already applied it, or its turn
+    /// still waits on another answer (see [`Self::awaits_more_answers`]).
+    pub async fn resume_ready(&self, ask_id: &AskId) -> Result<Option<HumanAskRow>> {
+        let Some(row) = self.get(ask_id).await? else {
+            tracing::warn!(%ask_id, "resume for an ask the ledger does not have");
+            return Ok(None);
+        };
+        if row.applied_at.is_some() || row.is_pending() {
+            return Ok(None);
+        }
+        if self.awaits_more_answers(&row).await? {
+            tracing::debug!(%ask_id, turn_id = %row.turn_id, "resume waits for the turn's other answers");
+            return Ok(None);
+        }
+        Ok(Some(row))
+    }
+
     /// Whether the turn that raised `row` still has a resumable ask nobody
     /// has answered. Answering one of several asks a turn parked on must not
     /// carry the turn on: its settlement would abandon the others. The
     /// Resume door waits for the last answer, as the live batch would.
-    pub async fn awaits_more_answers(&self, row: &HumanAskRow) -> Result<bool> {
+    ///
+    /// Scoped to the raising turn while the settlement it guards applies the
+    /// whole session's asks. The two agree: a session runs one turn at a
+    /// time and each turn's prelude settles what the previous one left, so
+    /// only the newest turn can still have a pending ask.
+    async fn awaits_more_answers(&self, row: &HumanAskRow) -> Result<bool> {
         Ok(self
             .unapplied_for_session(&row.session_id)
             .await?
@@ -353,20 +366,16 @@ impl HumanAskManager {
         Ok(true)
     }
 
-    async fn settle_resolved(&self, row: HumanAskRow) -> Result<Option<Settled>> {
+    async fn settle_resolved(&self, row: HumanAskRow) -> Result<Option<SettledAsk>> {
         if !resumable(row.kind, row.phase) {
             self.core.mark_applied(&row.ask_id).await?;
             return Ok(None);
         }
-        let Some(resolution) = row.resolution else {
+        let resolution = row.resolution.unwrap_or_else(|| {
             tracing::warn!(ask_id = %row.ask_id, "resolved ask without a resolution; abandoning");
-            self.core.mark_applied(&row.ask_id).await?;
-            return Ok(Some(Settled::Abandoned {
-                tool_call_id: row.tool_call_id,
-                kind: row.kind,
-            }));
-        };
-        Ok(Some(Settled::Apply {
+            AskResolution::Abandoned
+        });
+        Ok(Some(SettledAsk {
             ask_id: row.ask_id,
             tool_call_id: row.tool_call_id,
             kind: row.kind,

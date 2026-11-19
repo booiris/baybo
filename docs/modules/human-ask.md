@@ -380,8 +380,8 @@ there is no write path in the crate that skips them.
 | `resolve(ask_id, resolution)` | `resolution`, `resolved_at` (claim). A pending **dead non-resumable** ask (a during-execute approval whose tool future is gone) is instead closed `Abandoned` + `applied` and the answer refused with `AskClosed`: nothing could carry the decision out, so none is recorded | remove the entry (live or dead), `Answered` edge, `AskClosed` event; live: fire the oneshot; dead (or a waiter that vanished in the same instant), resumable, and `resume_sink.resumes_on_answer(session)`: hand `ResumeRequest { session_id, ask_id }` to the resume sink. `Err(AskClosed)` if the claim affected 0 rows, `Err(NotFound)` for an unknown id, `Err(KindMismatch)` for an approval decision on a question or answers on an approval. A resumable row whose `channel` has no queue still gets the claim, with a `warn!`. |
 | `abandon(ask_id)` / `abandon_for_session(session_id)` / `abandon_for_tool_call(session_id, tool_call_id)` | `Abandoned` (claim, pending rows only) | remove entry, `Abandoned` edge, `AskClosed(abandoned)` event, fire the oneshot with `Abandoned` (a live waiter sees `abandoned()`, and the gate's stamp point marks the row applied). `abandon_for_tool_call` also stamps `applied` on **every** unapplied ask of the call — what it abandoned, and an answer that won the claim in the same instant — because its tool future is gone and its caller's append is the only result the call will get; it returns whether the call had any unapplied ask, and the caller appends either way. |
 | `PolicyDenyGate::request` (the gate, not a manager verb) | row created already `resolved = PolicyDenied`, `applied` | no queue entry, no edge; observer event only. |
-| `settle_unapplied(session) -> Vec<Settled>` | per unapplied row: pending → `Abandoned` (claim) + `applied`; resolved non-resumable → `applied` | returns `Settled::Abandoned { tool_call_id, kind }` for **resumable** rows it abandoned (the caller appends next; a pending non-resumable row's call was already filled — by the loop's cancel claim or by hydration — so it is reconciled and reported as nothing) and `Settled::Apply { ask_id, tool_call_id, kind, resolution }` for `resolved` **resumable** rows, so the caller can put the right `tool_result` on the transcript. A resolved non-resumable row is stamped applied and reported as nothing — its result is either already on the transcript or was crash-filled by hydration. Removes the queue entries it abandoned. |
-| `awaits_more_answers(row) -> bool` | — (read-only) | whether `row`'s turn still has another pending resumable ask; the Resume door waits while it does |
+| `settle_unapplied(session) -> Vec<SettledAsk>` | per unapplied row: pending → `Abandoned` (claim); a **non-resumable** row, pending or resolved → `applied` | returns one `SettledAsk { ask_id, tool_call_id, kind, resolution }` per **resumable** row, pending-and-just-abandoned or resolved alike, **not stamped applied**: the caller appends the result `resolution` means (or re-executes an approved call) and then calls `mark_applied`. A settlement that fails part-way therefore leaves the rest unapplied, and the next one hands them out again. A non-resumable row's call already has a result — the tool's own, the loop's cancel claim, or hydration's crash fill — so it is closed, stamped and reported as nothing. Removes the queue entries it abandoned. |
+| `resume_ready(ask_id) -> Option<HumanAskRow>` | — (read-only) | the row a Resume turn starts from for an answered ask, or `None` when there is nothing to do yet: unknown, not resolved, already applied, or its turn still has another pending resumable ask (the private `awaits_more_answers`). The Resume door's one question |
 | `mark_applied(ask_id)` | `applied_at` (claim) | — |
 | `reload_pending()` | `Abandoned` for non-resumable pending rows (observers see `Resolved(Abandoned)`); `applied` for resolved non-resumable rows | re-enqueue every **pending** resumable row on `queues.get_or_create(row.channel)` as a dead entry, `Raised` edge; request a resume for `resolved` resumable non-Issue rows **without** enqueueing or publishing anything — the user already answered, and re-showing the card, re-marking the session and re-pushing for it would be wrong. Only the gateway calls it (see below). |
 
@@ -619,34 +619,36 @@ settled results), and the chat Resume door's `run_inner` calls it and then
 goes on to the LLM iterations in the same turn. Nothing else is appended between
 hydration and the settlement, so adjacency holds.
 
-For each `Settled` the manager returns:
+For each `SettledAsk` the manager returns, the settlement appends what its
+`resolution` means for a call of its `kind` (`settled_result` in
+`runtime/agent_loop/settle.rs`) and then stamps it applied:
 
-- `Abandoned { tool_call_id, kind: Approval }` → append the
-  `TOOL_DENIED_PREFIX` body with `refusal_reason(Abandoned)` and
-  `ToolResultMeta { approval: Some(Deny) }`.
-- `Abandoned { kind: Question }` → append
-  `{"declined": true, "reason": "user moved on without answering"}`.
-- `Apply { resolution: Answered(..) | Declined }` → append the real
-  `AskUser` result (identical envelope to the live path), `mark_applied`.
-- `Apply { resolution: Approval(Deny) }` → append the denied result as
-  `agent_loop.rs:1706-1716` does live, `mark_applied`.
-- `Apply { resolution: Approval(Approve | ApproveAlways) }` → `mark_applied`
-  **first**, then re-execute: open a step under the Resume turn and call
-  `ToolExecutor::execute` with the persisted `tool_use` block's name and
-  params and `PreDecided(decision)` so the gate short-circuits without
-  raising (`ApproveAlways` also seeds `approved_resources`, as live); append
-  the result through the same post-processing helper the batch loop uses
-  (`agent_loop.rs:1687-1794`, factored out). The original turn's step/span
-  rows were closed by recovery; the re-execution gets fresh ones. Only
-  resumable rows ever reach `Apply`; a resolved non-resumable row is stamped
-  applied by `settle_unapplied` with nothing appended, which is what keeps a
-  Bash command the user approved mid-run from running a second time on the
-  user's next message.
+- a question → the `AskUser` envelope from `baybo_human_ask::result`
+  (identical to the live path): `answered`, `declined`, or for an
+  `Abandoned` one `{"declined": true, "reason": "user moved on without answering"}`.
+- an approval → read through `ApprovalOutcome::from_ask`, the same reading
+  the live gate returns, so nothing about a ledger close is decided twice:
+  - `Deny` (answered, abandoned, policy, timed out) → the denied result
+    with `refusal_reason(outcome.resolution)` and
+    `ToolResultMeta { approval: Some(Deny) }`.
+  - `Approve | ApproveAlways` → `mark_applied` **first**, then re-execute:
+    open a step under the Resume turn and call `ToolExecutor::execute` with
+    the persisted `tool_use` block's name and params and
+    `PreDecided(decision)` so the gate short-circuits without raising
+    (`ApproveAlways` also seeds `approved_resources`, as live); append the
+    result through the same post-processing helper the batch loop uses. The
+    original turn's step/span rows were closed by recovery; the re-execution
+    gets fresh ones.
+
+Only resumable rows are ever handed out; a resolved non-resumable row is
+stamped applied by `settle_unapplied` with nothing appended, which is what
+keeps a Bash command the user approved mid-run from running a second time on
+the user's next message.
 
 When a door calls the settlement no *live* ask can exist for the session —
 an actor runs one turn at a time — so `settle_unapplied` only ever meets
 dead entries; a live one is a bug and is logged, not touched. For the
-issue-run requeue the settlement runs under a `SettleOnly` Resume turn and
+issue-run requeue the settlement runs as its own Resume turn (`run_settlement_turn`) and
 the real `IssueRun` turn with its `IssueRunWaiter` follows; the approved
 call executes exactly once, under the Resume turn, and `finish_run` fires
 once, for the run.
@@ -663,11 +665,11 @@ over `mpsc::Sender<RouterInbound>` with a new
 its LLM pin. The actor receives `AgentMessage::ResumeAsk { ask_id }` at
 `Trigger` priority.
 
-`handle_resume_ask`: if `manager.get(ask_id)` is already applied (a door's
-settlement got there first, or a duplicate route) → return, nothing to do.
-If the turn that raised it (the row's `turn_id`) still has another
-resumable ask nobody has answered (`manager.awaits_more_answers(row)`) →
-return too: the settlement applies every unapplied ask of the session and
+`handle_resume_ask` asks `manager.resume_ready(ask_id)` and returns when it
+says there is nothing to do yet. That is so when the row is already applied
+(a door's settlement got there first, or a duplicate route), and when the
+turn that raised it (the row's `turn_id`) still has another resumable ask
+nobody has answered: the settlement applies every unapplied ask of the session and
 abandons the pending ones, so resuming on the first of two answers would
 close the second card under the user. The answer stays `resolved`, and
 the last answer's `ResumeAsk` applies them all in one Resume turn — the
@@ -1155,7 +1157,7 @@ pub struct PolicyDenyGate { core: Arc<AskCore> }                    // impl Appr
 pub struct HumanAskManager;                     // from_config(HumanAskManagerConfig { core, queues: AskQueues, resume_sink: Arc<dyn ResumeSink> })
                                                 // verbs: resolve, abandon, abandon_for_session, abandon_for_tool_call, settle_unapplied, mark_applied, reload_pending, get,
                                                 //        unapplied_tool_use_ids, actor_stop_cost (LivePendingAsks impl)
-pub enum Settled { Abandoned { tool_call_id, kind }, Apply { ask_id, tool_call_id, kind, resolution } }
+pub struct SettledAsk { ask_id, tool_call_id, kind, resolution }   // settle_unapplied: one per resumable unapplied row; the caller appends, then mark_applied
 pub struct ReloadReport { requeued, resumed, abandoned, applied, failed }   // a row that fails is logged, counted and left for the next boot; the rows after it still reload
 #[async_trait] pub trait ResumeSink {
     async fn resumes_on_answer(&self, session: &SessionId) -> bool;   // false for TriggerSource::Issue sessions
@@ -1268,7 +1270,7 @@ Where the code differs from the sketch above, and why:
   the background-notification door logs and retries on its timer. The
   `AskUser` result envelope for `Answered` / `Declined` / an abandoned
   question lives in `baybo_human_ask::result`, so the `AskUser` stage's tool reuses it.
-  `Settled::Apply` carries the row's `kind` as well: a dead ask abandoned by
+  `SettledAsk` carries the row's `kind` as well: a dead ask abandoned by
   a verb (card close, `abandon`) is resolved-not-applied, and its
   `Abandoned` resolution alone cannot say whether the refusal is an approval
   denial or a declined question.
@@ -1383,7 +1385,7 @@ Where the code differs from the sketch above, and why:
    cancelled fill for a call that never finished) is appended
 
 **New message, dead ask pending** — door: `settle_unapplied_asks()`
-(`SettleOnly` Resume turn: synthetic or real result appended) → user row →
+(settlement-only Resume turn: synthetic or real result appended) → user row →
 user turn. See [above](#a-new-message-while-a-dead-ask-is-pending).
 
 **Unattended turn hits a gate** — `PolicyDenyGate` writes an already-applied
@@ -1534,9 +1536,9 @@ Unit (other crates):
   dead, row pending; `Turn` cancel → the loop's claim lands before the
   result append, and an answer racing it is consumed by the one fill; a call
   that already has a result gets nothing more; the settlement applies
-  each `Settled` variant with one adjacent result, under a `SettleOnly` turn
+  each `SettledAsk` with one adjacent result, through `run_settlement_turn`
   from every door (user, merged, issue brief, cron fire, notification,
-  `/compact`) and under `Continue` from the Resume door; `mark_applied`
+  `/compact`) and inside `run_inner` from the Resume door; `mark_applied`
   precedes re-execution on `Approve`.
 - `baybo-tools`: `AskUser` validation table; `question: None` → declined.
 - `baybo-wire`: round-trips for the new frames, `pending_questions` in the

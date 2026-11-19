@@ -5,12 +5,13 @@
 
 use std::sync::Arc;
 
-use baybo_human_ask::Settled;
+use baybo_human_ask::SettledAsk;
 use baybo_model::human_ask::{AskId, AskKind, AskResolution};
 use baybo_model::{ContentBlock, Session, TurnId};
 use baybo_store::HumanAskRow;
 use baybo_tools::{
-    ApprovalDecision, ApprovalResolution, ToolError, ToolOutput, TurnTokens, refusal_reason,
+    ApprovalDecision, ApprovalOutcome, ApprovalResolution, ToolError, ToolOutput, TurnTokens,
+    refusal_reason,
 };
 use baybo_trace::{LifecycleOutcome, SpanRecorder, StepKind};
 use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
@@ -37,12 +38,10 @@ impl AgentLoop {
         Ok(self.asks.unapplied_for_session(session).await?)
     }
 
-    pub async fn ask(&self, ask_id: &AskId) -> anyhow::Result<Option<HumanAskRow>> {
-        Ok(self.asks.get(ask_id).await?)
-    }
-
-    pub async fn awaits_more_answers(&self, row: &HumanAskRow) -> anyhow::Result<bool> {
-        Ok(self.asks.awaits_more_answers(row).await?)
+    /// The row a Resume turn for the answered `ask_id` starts from, if it
+    /// should run now.
+    pub async fn resume_ready(&self, ask_id: &AskId) -> anyhow::Result<Option<HumanAskRow>> {
+        Ok(self.asks.resume_ready(ask_id).await?)
     }
 
     /// Run `turn_input` (a `Resume`) as a turn whose whole body is the
@@ -119,26 +118,19 @@ impl AgentLoop {
         let mut llm_visible_images = Vec::new();
         let mut appended = 0;
         for next in settled {
-            let (ask_id, tool_call_id, resolution, kind) = match next {
-                Settled::Abandoned { tool_call_id, kind } => {
-                    (None, tool_call_id, AskResolution::Abandoned, kind)
-                }
-                Settled::Apply {
-                    ask_id,
-                    tool_call_id,
-                    kind,
-                    resolution,
-                } => (Some(ask_id), tool_call_id, resolution, kind),
-            };
+            let SettledAsk {
+                ask_id,
+                tool_call_id,
+                kind,
+                resolution,
+            } = next;
             let Some(call) = self.persisted_tool_use(&tool_call_id) else {
                 warn!(
                     session_id = %session.id,
                     tool_use_id = %tool_call_id,
                     "settling an ask whose tool_use is not in the window; nothing to answer"
                 );
-                if let Some(ask_id) = &ask_id {
-                    self.asks.mark_applied(ask_id).await?;
-                }
+                self.asks.mark_applied(&ask_id).await?;
                 continue;
             };
             if self.has_tool_result(&tool_call_id) {
@@ -147,72 +139,27 @@ impl AgentLoop {
                     tool_use_id = %tool_call_id,
                     "settling an ask whose call already has a result; appending nothing"
                 );
-                if let Some(ask_id) = &ask_id {
-                    self.asks.mark_applied(ask_id).await?;
-                }
+                self.asks.mark_applied(&ask_id).await?;
                 continue;
             }
-            let executed = match (&resolution, kind) {
-                (
-                    AskResolution::Approval(
-                        decision @ (ApprovalDecision::Approve | ApprovalDecision::ApproveAlways),
-                    ),
-                    _,
-                ) => {
-                    let Some(ask_id) = &ask_id else { continue };
-                    if !self.asks.mark_applied(ask_id).await? {
+            let executed = match settled_result(kind, &resolution, &call) {
+                SettledResult::Ready(executed) => executed,
+                SettledResult::Reexecute(decision) => {
+                    // Stamped first, so a crash mid-run never runs it twice.
+                    if !self.asks.mark_applied(&ask_id).await? {
                         continue;
                     }
-                    let executed = self
-                        .reexecute(
-                            session,
-                            span_recorder,
-                            turn_id,
-                            tokens,
-                            delta_tx,
-                            &call,
-                            *decision,
-                        )
-                        .await?;
-                    self.append_settled(
+                    self.reexecute(
                         session,
-                        delta_tx,
+                        span_recorder,
                         turn_id,
+                        tokens,
+                        delta_tx,
                         &call,
-                        executed,
-                        turn_attachments,
-                        &mut llm_visible_images,
+                        decision,
                     )
-                    .await?;
-                    appended += 1;
-                    continue;
+                    .await?
                 }
-                (AskResolution::Answered(answers), _) => ExecutedTool {
-                    output: Ok(ToolOutput::Json(baybo_human_ask::result::answered(answers))),
-                    approval: None,
-                    abandoned: false,
-                    handed_over: None,
-                },
-                (AskResolution::Declined, _) => ExecutedTool {
-                    output: Ok(ToolOutput::Json(baybo_human_ask::result::declined())),
-                    approval: None,
-                    abandoned: false,
-                    handed_over: None,
-                },
-                (AskResolution::Abandoned, AskKind::Question) => ExecutedTool {
-                    output: Ok(ToolOutput::Json(baybo_human_ask::result::abandoned())),
-                    approval: None,
-                    abandoned: false,
-                    handed_over: None,
-                },
-                (AskResolution::Approval(ApprovalDecision::Deny), _) => {
-                    denied(&call, ApprovalResolution::Answered)
-                }
-                (AskResolution::Abandoned, AskKind::Approval) => {
-                    denied(&call, ApprovalResolution::Abandoned)
-                }
-                (AskResolution::PolicyDenied, _) => denied(&call, ApprovalResolution::Policy),
-                (AskResolution::TimedOut, _) => denied(&call, ApprovalResolution::TimedOut),
             };
             self.append_settled(
                 session,
@@ -225,9 +172,8 @@ impl AgentLoop {
             )
             .await?;
             appended += 1;
-            if let Some(ask_id) = &ask_id {
-                self.asks.mark_applied(ask_id).await?;
-            }
+            // A no-op for a re-executed call, which was stamped before it ran.
+            self.asks.mark_applied(&ask_id).await?;
         }
         self.append_llm_visible_images(llm_visible_images).await?;
         Ok(appended)
@@ -389,6 +335,48 @@ impl AgentLoop {
 
 /// The denial an approval refused by `resolution` reads as, in the same shape
 /// the executor's gate produces live.
+/// What a settled ask puts on the transcript for its call.
+enum SettledResult {
+    /// The result is known without running anything.
+    Ready(ExecutedTool),
+    /// A human approved the call: run it with that decision already made.
+    Reexecute(ApprovalDecision),
+}
+
+/// What `resolution` means for the call an ask of `kind` blocked. An
+/// approval is read through [`ApprovalOutcome::from_ask`], the one reading
+/// of a ledger close for a tool call, so a settled denial is worded exactly
+/// as the live gate's.
+fn settled_result(kind: AskKind, resolution: &AskResolution, call: &SettledCall) -> SettledResult {
+    let question = |value| {
+        SettledResult::Ready(ExecutedTool {
+            output: Ok(ToolOutput::Json(value)),
+            approval: None,
+            abandoned: false,
+            handed_over: None,
+        })
+    };
+    match (kind, resolution) {
+        (AskKind::Question, AskResolution::Answered(answers)) => {
+            question(baybo_human_ask::result::answered(answers))
+        }
+        (AskKind::Question, AskResolution::Declined) => {
+            question(baybo_human_ask::result::declined())
+        }
+        (AskKind::Question, _) => question(baybo_human_ask::result::abandoned()),
+        (AskKind::Approval, _) => {
+            let outcome =
+                ApprovalOutcome::from_ask(resolution).unwrap_or_else(ApprovalOutcome::abandoned);
+            match outcome.decision {
+                decision @ (ApprovalDecision::Approve | ApprovalDecision::ApproveAlways) => {
+                    SettledResult::Reexecute(decision)
+                }
+                ApprovalDecision::Deny => SettledResult::Ready(denied(call, outcome.resolution)),
+            }
+        }
+    }
+}
+
 fn denied(call: &SettledCall, resolution: ApprovalResolution) -> ExecutedTool {
     ExecutedTool {
         output: Err(anyhow::Error::new(ToolError::Denied {

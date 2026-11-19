@@ -23,7 +23,7 @@ pub use error::{HumanAskError, Result};
 pub use gate::{
     AskChannels, ChannelAskGate, ChannelAsks, DURING_EXECUTE_APPROVAL_TIMEOUT, PolicyDenyGate,
 };
-pub use manager::{HumanAskManager, HumanAskManagerConfig, ReloadReport, Settled};
+pub use manager::{HumanAskManager, HumanAskManagerConfig, ReloadReport, SettledAsk};
 pub use ports::{ActorStopCost, AskObserver, LivePendingAsks, ResumeSink};
 pub use queue::{
     AskQueue, AskQueueEvent, AskQueues, AskWatcher, PendingAsk, PendingEdge, PendingWatcher,

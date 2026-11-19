@@ -5,12 +5,11 @@
 use baybo_model::human_ask::AskId;
 use baybo_store::HumanAskRow;
 use baybo_turn::TurnInput;
-use tracing::{debug, warn};
 
 use super::AgentActor;
 
 impl AgentActor {
-    /// Settle this session's unapplied asks under a `SettleOnly` Resume turn,
+    /// Settle this session's unapplied asks in a Resume turn of their own,
     /// so the result of each lands adjacent to the row that raised it. A
     /// no-op that opens no turn when there is nothing to settle. Every door
     /// calls this before its own append.
@@ -43,17 +42,9 @@ impl AgentActor {
     /// or while the same turn still waits on another answer — the last one
     /// resumes it, with every answer applied.
     pub(super) async fn handle_resume_ask(&mut self, ask_id: &AskId) -> anyhow::Result<()> {
-        let Some(row) = self.volatile.agent_loop.ask(ask_id).await? else {
-            warn!(%ask_id, "resume for an ask the ledger does not have");
+        let Some(row) = self.volatile.agent_loop.resume_ready(ask_id).await? else {
             return Ok(());
         };
-        if row.applied_at.is_some() || row.resolved_at.is_none() {
-            return Ok(());
-        }
-        if self.volatile.agent_loop.awaits_more_answers(&row).await? {
-            debug!(%ask_id, turn_id = %row.turn_id, "resume waits for the turn's other answers");
-            return Ok(());
-        }
         let response_tx = self.volatile.response_tx.clone();
         let response = self
             .run_agent_loop(

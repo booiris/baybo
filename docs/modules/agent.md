@@ -294,7 +294,8 @@ unapplied ask for the session it returns without opening a turn; otherwise it
 runs a `TurnInput::Resume` turn through `AgentLoop::run_settlement_turn`, whose
 whole body is `AgentLoop::settle_unapplied_asks`
 (`runtime/agent_loop/settle.rs`). The settlement asks
-`HumanAskManager::settle_unapplied` and appends one result per `Settled`,
+`HumanAskManager::settle_unapplied` and appends one result per `SettledAsk`
+(stamping it applied only after the append),
 through the same `append_executed_tool` post-processing the batch uses: a
 `ToolError::Denied` with `refusal_reason(Abandoned | Answered | Policy)` and
 `ToolResultMeta { approval: Some(Deny) }` for a refused approval, the
@@ -312,7 +313,7 @@ like `route_one_to_actor`, through `resolve_spawn_pins`, as
 `AgentMessage::ResumeAsk { ask_id }` at `Trigger` priority.
 `handle_resume_ask` returns when the row is already applied (a door got there
 first), not resolved, or while the row's turn still has another pending
-resumable ask (`awaits_more_answers`); otherwise it runs
+resumable ask — one question, `HumanAskManager::resume_ready`; otherwise it runs
 `run_agent_loop(TurnInput::Resume)`, whose `run_inner` settles before the
 first LLM iteration and carries on, and sends the reply with
 `send_user_reply`. The router's `handle_resume_ask` stamps the session active
