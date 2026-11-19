@@ -385,7 +385,7 @@ impl AgentActor {
         // store; failures log and fall through to an empty transcript.
         self.volatile
             .agent_loop
-            .restore_transcript_from_store()
+            .restore_transcript_from_store(&session_id)
             .await;
 
         // Notification work uses a timer so a fire-and-forget result can be

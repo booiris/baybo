@@ -716,9 +716,6 @@ impl AgentTestHarnessBuilder {
             subagent_profile: Some((subagent_registry, "harness".to_string())),
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(baybo_agent::runtime::asks::UnappliedAsks(Arc::clone(
-                &human_asks,
-            ))),
         });
 
         let guarded_llm =

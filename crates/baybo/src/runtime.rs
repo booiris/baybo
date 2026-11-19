@@ -1054,9 +1054,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         // nothing billed).
         let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
         let human_asks = Arc::clone(&graph.human_asks);
-        let pending_tool_calls: Arc<dyn baybo_context::PendingToolCalls> = Arc::new(
-            baybo_agent::runtime::asks::UnappliedAsks(Arc::clone(&graph.human_asks)),
-        );
         // Shared across every actor: the title pass notifies this sink once it
         // has persisted a generated title, and it fans a `SessionUpdated` patch
         // out to every Subscribed channel so the owning surface updates live.
@@ -1123,7 +1120,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                             workspace_paths_arc.root(),
                             &session.trigger,
                         ),
-                        pending_tool_calls: Arc::clone(&pending_tool_calls),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),

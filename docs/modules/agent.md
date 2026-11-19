@@ -275,9 +275,9 @@ The streaming twin of the dangling-use guard is
 mid-stream cancel so the dangling row is never persisted in the first place.
 
 A `ToolUse` parked on a human ask is the one dangling id hydration leaves
-alone: the spawner hands every `ContextManager` a `PendingToolCalls` port
-(`runtime::asks::UnappliedAsks`, over `HumanAskManager::unapplied_tool_use_ids`,
-read from the ledger), and `repair_tool_pairing` neither fills nor quarantines
+alone: `AgentLoop::restore_transcript_from_store` reads
+`HumanAskManager::unapplied_tool_use_ids` from the ledger and passes the set
+to `ContextManager::restore_from_store`, and `repair_tool_pairing` neither fills nor quarantines
 those ids, so the real result can land adjacent later.
 
 ### Unapplied asks: the turn prelude and the Resume door

@@ -54,7 +54,7 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`. (The Resume door is not a channel message: it has its own receiver on the router.) |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
-| `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` and `PendingToolCalls` impls. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingApprovals` and does not depend on this crate.) |
+| `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` impl. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingApprovals` and does not depend on this crate.) |
 
 Dependency edges, all acyclic: `human-ask → model, store, tools`;
 `channels → tools, human-ask`; `project → human-ask`;
@@ -544,9 +544,8 @@ order the code can actually have:
    dead-ask session with no subscriber pushes once per boot (the relay's nag
    map starts empty; `APPROVAL_PUSH_QUEUE` bounds the burst).
 8. `ToolExecutor::new(…, policy_deny)` (`:825`), tool registration,
-   `wire_router` (`:935`): the actor spawner passes a `baybo-agent` newtype
-   over `manager.unapplied_tool_use_ids` as the `PendingToolCalls` port on
-   `ContextManagerConfig` (`:1037`) and `AgentSupervisor::new` takes the
+   `wire_router` (`:935`): each `AgentLoop` holds the manager and reads
+   `manager.unapplied_tool_use_ids` when it hydrates, and `AgentSupervisor::new` takes the
    manager as the `LivePendingAsks` probe. `Arc<HumanAskManager>` rides
    `ManagerGraph` → `GatewayDeps` → `AdminState` / `WsChannelState` like
    `project_manager`, for the resolve doors.
@@ -562,14 +561,16 @@ or dispatched (`ContextManager::unique_call_ids`, the same suffix rule the
 repair uses), and every row it writes stays a fixpoint of that repair. Each
 ask row also records the raising `turn_id`.
 
-`PendingToolCalls` is a narrow port defined in `baybo-context`:
-`#[async_trait] trait PendingToolCalls { async fn unapplied_tool_use_ids(&self, session: &SessionId) -> Vec<String>; }`,
-answered by the manager **over the store** (`list_unapplied_for_session`,
-resumable rows only) — not over the queue, because by the time a cold-spawned
-actor hydrates, `resolve` has already removed the entry and a queue-keyed
-probe would miss exactly the ask being resumed. The impl lives in
-`baybo-agent` (which depends on both crates) so `baybo-human-ask` gains no
-edge to `baybo-context`. Hydration's
+Hydration is told which calls are parked as a plain value:
+`AgentLoop::restore_transcript_from_store(session_id)` reads
+`manager.unapplied_tool_use_ids(session)` and passes the set to
+`ContextManager::restore_from_store(&awaiting_ask)`. (No port: the loop is
+the only caller of hydration and already holds the manager. A read error
+logs and passes an empty set — today's synthetic fill.) The manager answers
+**over the store** (`list_unapplied_for_session`, resumable rows only) — not
+over the queue, because by the time a cold-spawned actor hydrates, `resolve`
+has already removed the entry and a queue-keyed probe would miss exactly the
+ask being resumed. Hydration's
 `repair_tool_pairing(messages, skip)` **skips the synthetic fill** for those
 ids and excludes them from the `needs_repair` dangling-tail trigger, so a
 healthy-but-parked transcript takes the fast path; the reposition pass still
@@ -1173,7 +1174,6 @@ pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<
 
 // baybo_agent
 // AgentLoop::settle_unapplied_asks(session, …) is the settlement body; AgentLoop::run_settlement_turn wraps it in a Resume turn for AgentActor::settle_unapplied_asks() (the doors); run_inner calls it for the chat Resume door
-struct UnappliedAsks(Arc<HumanAskManager>);     // impl baybo_context::PendingToolCalls — keeps human-ask free of a context edge
 ```
 
 `ApprovalSurface` on `Channel` becomes
@@ -1430,8 +1430,8 @@ leaves draft.
   `AgentActor::settle_unapplied_asks()` called by the five doors before their
   append and by `/compact`, `AgentLoop::settle_unapplied_asks(session, …)`;
   `PreDecided` re-execute; `ResumeSink` impl;
-  `AgentMessage::ResumeAsk` / `handle_resume_ask`; `PendingToolCalls` port in
-  `baybo-context` + the `UnappliedAsks` newtype +
+  `AgentMessage::ResumeAsk` / `handle_resume_ask`;
+  `restore_from_store(&awaiting_ask)` →
   `repair_tool_pairing(messages, skip)`; reaper probe.
 - `baybo-channels`: `AskSurface`;
   `SessionEvent::AskResolved { session_id, .. }`.
@@ -1630,8 +1630,8 @@ withdrawn: they are already auto-denied by the gate map's fallback for the
 ## Constraints
 
 - Rows in `human_asks` are never deleted by the runtime. No `cleanup_*` API.
-- `baybo-context` receives `PendingToolCalls` (a verb), never the store or
-  the manager. `baybo-tools` never depends on `baybo-human-ask`;
+- `baybo-context` receives the set of parked `tool_use` ids (a value), never
+  the store or the manager. `baybo-tools` never depends on `baybo-human-ask`;
   `baybo-human-ask` never depends on `baybo-channels` or `baybo-context`. No
   `Arc<dyn HumanAskStore>` outside `baybo-human-ask`, except the
   `baybo-storage` `Store` bundle field and the single `stores.human_ask.clone()`

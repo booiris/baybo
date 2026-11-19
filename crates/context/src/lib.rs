@@ -2,7 +2,6 @@ pub mod breakdown;
 pub mod budget;
 pub mod compressor;
 pub mod error;
-pub mod pending_tool_calls;
 pub mod prompts;
 pub mod tokenizer;
 mod transcript_repair;
@@ -11,9 +10,6 @@ pub use breakdown::{ContextBreakdown, ContextPart, ContextSegment, context_break
 pub use budget::TokenBudget;
 pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
-#[cfg(any(test, feature = "test-support"))]
-pub use pending_tool_calls::NoPendingToolCalls;
-pub use pending_tool_calls::PendingToolCalls;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
 pub use prompts::deferred_tools::DeferredServerNotice;
 pub use tokenizer::{HeuristicTokenizer, Tokenizer};
@@ -405,8 +401,6 @@ pub struct ContextManager {
     /// pre-filtered rows and reused verbatim by [`Self::ensure_seeded`] and
     /// the post-compaction trailer — byte-stable for the session's life.
     deferred_tool_notice: Option<String>,
-    /// See [`ContextManagerConfig::pending_tool_calls`].
-    pending_tool_calls: Arc<dyn PendingToolCalls>,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -462,9 +456,6 @@ pub struct ContextManagerConfig {
     /// reused verbatim by the seed and the post-compaction trailer —
     /// byte-stable for the session's whole life.
     pub deferred_tool_servers: Vec<crate::prompts::deferred_tools::DeferredServerNotice>,
-    /// Which dangling `tool_use` ids hydration must leave unfilled because a
-    /// human ask will settle them.
-    pub pending_tool_calls: Arc<dyn PendingToolCalls>,
 }
 
 fn explicit_message_ordinals(
@@ -523,7 +514,6 @@ impl ContextManager {
             notification_cue: None,
             system_prompt_version: None,
             skills_version: None,
-            pending_tool_calls: config.pending_tool_calls,
             deferred_tool_notice: (!config.deferred_tool_servers.is_empty()).then(|| {
                 crate::prompts::deferred_tools::render_deferred_tool_reminder(
                     &config.deferred_tool_servers,
@@ -1969,7 +1959,12 @@ impl ContextManager {
     ///
     /// Failures log at warn and fall through to a fresh transcript;
     /// startup must not block on a transient store error.
-    pub async fn restore_from_store(&mut self) {
+    ///
+    /// `awaiting_ask` names the dangling `tool_use` ids a human ask will
+    /// still settle. The repair leaves those unfilled: their real result
+    /// arrives when the answer is applied, and has to land adjacent to the
+    /// assistant row that issued the call.
+    pub async fn restore_from_store(&mut self, awaiting_ask: &HashSet<String>) {
         // Clone the bound handles up-front so we can call
         // `&mut self` methods inside the function without holding a
         // borrow of `self.session_id` / `self.sessions`.
@@ -1987,19 +1982,13 @@ impl ContextManager {
                 let messages: Vec<ChatMessage> = rows.into_iter().map(|row| row.message).collect();
                 let original = messages.clone();
                 let mut durable = original.clone();
-                let parked: HashSet<String> = self
-                    .pending_tool_calls
-                    .unapplied_tool_use_ids(&session_id)
-                    .await
-                    .into_iter()
-                    .collect();
                 let transcript_repair::ToolPairingRepair {
                     messages: repaired,
                     fills,
                     orphan_result_ids,
                     duplicate_result_ids,
                     renamed_call_ids,
-                } = transcript_repair::repair_tool_pairing(messages, &parked);
+                } = transcript_repair::repair_tool_pairing(messages, awaiting_ask);
                 if !renamed_call_ids.is_empty() {
                     let renamed_call_id_sample: Vec<&str> = renamed_call_ids
                         .iter()
@@ -3132,7 +3121,6 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -3211,7 +3199,7 @@ mod tests {
             .expect("persist orphan row");
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         assert_eq!(restored.messages(), std::slice::from_ref(&user));
         assert_eq!(
@@ -3254,7 +3242,7 @@ mod tests {
             .unwrap();
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         // In-memory: fill sits directly after the assistant row, nudge after.
         assert_eq!(restored.messages().len(), 3);
@@ -3267,7 +3255,7 @@ mod tests {
         // The fill was persisted (append-only), so a SECOND hydration
         // finds pairing complete and synthesizes nothing new.
         let mut again = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        again.restore_from_store().await;
+        again.restore_from_store(&HashSet::new()).await;
         assert_eq!(
             again.messages().len(),
             3,
@@ -3322,7 +3310,7 @@ mod tests {
         }
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         let window = restored.messages().to_vec();
         assert_eq!(
             tool_ids(&window),
@@ -3358,7 +3346,7 @@ mod tests {
             ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "web_search_4"));
 
         let mut again = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        again.restore_from_store().await;
+        again.restore_from_store(&HashSet::new()).await;
         assert_eq!(again.messages(), &window[..], "identical on every load");
         assert_eq!(
             sessions
@@ -3393,7 +3381,7 @@ mod tests {
         assert_eq!(ctx.messages(), std::slice::from_ref(&original));
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         assert_eq!(
             restored
                 .append_idempotent(source_event_id, &replay)
@@ -3579,7 +3567,7 @@ mod tests {
             .expect("persist orphan row");
 
         let mut restored = make_ctx_with_sessions(sessions, 0, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         let outcome = restored
             .force_compress("test-model", Vec::new(), |_request, marker| async move {
@@ -3907,7 +3895,6 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -3984,7 +3971,6 @@ mod tests {
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -4040,7 +4026,6 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         })
     }
 
@@ -4213,7 +4198,6 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         })
         .resolve_system_prompt()
         .await;
@@ -4305,7 +4289,6 @@ mod tests {
                 name: "tencent-lighthouse".into(),
                 description: Some("Lighthouse VM management".into()),
             }],
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.ensure_seeded().await.unwrap();
 
@@ -4875,7 +4858,6 @@ mod tests {
             sessions: test_sessions(),
             subagent_profile: None,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -4958,7 +4940,6 @@ mod tests {
             sessions: Arc::clone(&sessions),
             subagent_profile: None,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed"))
@@ -5204,7 +5185,7 @@ mod tests {
         let reply = anchored_session(&sessions, 5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         let expected = 5_000 + restored.tokenizer.count_message(&reply);
         assert_eq!(restored.count_tokens(), expected);
@@ -5225,7 +5206,7 @@ mod tests {
         let reply = anchored_session(&sessions, 5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         let tools = schema_tools(4_000);
         let grown = crate::tokenizer::tool_definition_tokens(
             restored.tokenizer.as_ref(),
@@ -5264,7 +5245,7 @@ mod tests {
         }
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         assert_eq!(restored.messages().len(), 3, "the fill is in the window");
         restored.set_current_model(MODEL_ID);
         restored.record_call_actual(5_000).await;
@@ -5283,7 +5264,7 @@ mod tests {
         anchored_session(&sessions, 5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         restored.needs_compression("another-model", &[]);
 
         let swept: usize = restored
@@ -5305,7 +5286,7 @@ mod tests {
             .unwrap();
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         assert_eq!(restored.messages(), std::slice::from_ref(&summary));
         assert_eq!(
@@ -5347,7 +5328,7 @@ mod tests {
         live.record_call_actual(5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         let swept: usize = restored
             .messages()
             .iter()
@@ -5393,7 +5374,7 @@ mod tests {
             .unwrap();
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         assert_ne!(restored.messages(), &displaced[..], "repair must reorder");
         let swept: usize = restored
             .messages()
@@ -5469,7 +5450,7 @@ mod tests {
 
             let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
             restored.set_active_model_audio_delivery(audio);
-            restored.restore_from_store().await;
+            restored.restore_from_store(&HashSet::new()).await;
             assert_eq!(restored.count_tokens() == 10, restored_anchor, "{audio:?}");
         }
     }
@@ -5963,7 +5944,6 @@ mod tests {
             subagent_profile: None,
             builtin_memory: false,
             deferred_tool_servers: Vec::new(),
-            pending_tool_calls: Arc::new(crate::NoPendingToolCalls),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx

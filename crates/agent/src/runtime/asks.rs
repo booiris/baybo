@@ -1,38 +1,13 @@
-//! The agent's adapters onto the human-ask ledger: the hydration probe and
-//! the router door a dead ask's answer comes back through. Both are
-//! implemented over [`HumanAskManager`].
+//! The agent's side of the chat Resume door: the sink the ask manager sends
+//! an answered dead ask through, and the router's rule for what it opens.
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use baybo_human_ask::{HumanAskManager, ResumeSink};
+use baybo_human_ask::ResumeSink;
+use baybo_model::Session;
 use baybo_model::human_ask::ResumeRequest;
-use baybo_model::{Session, SessionId};
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::actor::AgentMessage;
-
-/// Hydration's [`baybo_context::PendingToolCalls`] probe, answered from the
-/// ledger. Lives here so `baybo-human-ask` needs no edge to `baybo-context`.
-pub struct UnappliedAsks(pub Arc<HumanAskManager>);
-
-#[async_trait]
-impl baybo_context::PendingToolCalls for UnappliedAsks {
-    async fn unapplied_tool_use_ids(&self, session: &SessionId) -> Vec<String> {
-        match self.0.unapplied_tool_use_ids(session).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                warn!(
-                    session_id = %session,
-                    error = %e,
-                    "could not read the session's unapplied asks; hydration fills every dangling call"
-                );
-                Vec::new()
-            }
-        }
-    }
-}
 
 /// How many answered dead asks may wait for the router at once. A request
 /// past it is dropped, which loses nothing: the row stays resolved, and the
@@ -78,7 +53,7 @@ pub fn resume_message(session: &Session, req: &ResumeRequest) -> Option<AgentMes
 mod tests {
     use super::*;
     use baybo_model::human_ask::AskId;
-    use baybo_model::{ChannelType, TriggerSource, User};
+    use baybo_model::{ChannelType, SessionId, TriggerSource, User};
     use baybo_session::SessionManager;
     use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
     use std::sync::Arc;

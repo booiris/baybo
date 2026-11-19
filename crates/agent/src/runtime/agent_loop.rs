@@ -738,8 +738,26 @@ impl AgentLoop {
     /// is bound to its session at construction time and owns the
     /// load path. Kept on `AgentLoop` so `AgentActor::run` doesn't
     /// have to reach inside the loop's private state.
-    pub async fn restore_transcript_from_store(&mut self) {
-        self.context_manager.restore_from_store().await;
+    ///
+    /// The loop tells hydration which dangling calls an ask of
+    /// `session_id` will still settle, so the repair leaves them unfilled.
+    pub async fn restore_transcript_from_store(&mut self, session_id: &baybo_model::SessionId) {
+        let awaiting_ask: std::collections::HashSet<String> = match self
+            .asks
+            .unapplied_tool_use_ids(session_id)
+            .await
+        {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                warn!(
+                    %session_id,
+                    error = %e,
+                    "could not read the session's unapplied asks; hydration fills every dangling call"
+                );
+                std::collections::HashSet::new()
+            }
+        };
+        self.context_manager.restore_from_store(&awaiting_ask).await;
         // Recover the read-before-write tracker from the restored transcript:
         // each `Read` result row carries the fingerprint it observed, so a read
         // that happened before this actor was evicted/restarted still satisfies
