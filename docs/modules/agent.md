@@ -325,7 +325,9 @@ first, as a user message would: the resumed session is otherwise still idle
 to the reaper.
 
 The idle reaper asks `LivePendingAsks::actor_stop_cost` (`AgentSupervisor::new`
-takes the manager as that probe). A turn parked only on resumable asks is
+takes the manager as that probe). A turn parked only on resumable asks, with
+no other call of its batch still executing (`RunningCalls`, counted by the
+loop), is
 ended through its release token (`AgentSupervisor::release_parked_turn`) and
 the actor stopped; its answer later resumes the session through the Resume
 door. A turn parked on a during-execute approval keeps its actor warm. See

@@ -518,6 +518,120 @@ async fn a_message_queued_behind_a_parked_turn_does_not_run_at_shutdown() {
     assert_eq!(completed_for_call(&outputs), 0, "nothing is appended");
 }
 
+const SLOW_TOOL: &str = "slow_sibling";
+
+/// Runs until it is told to finish, so a test can hold it mid-execution.
+struct SlowSibling {
+    started: Arc<tokio::sync::Notify>,
+    finish: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SlowSibling {
+    fn name(&self) -> &str {
+        SLOW_TOOL
+    }
+    fn description(&self) -> String {
+        "takes a while".to_string()
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
+    }
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        self.started.notify_one();
+        self.finish.notified().await;
+        Ok(ToolOutput::Text("done".to_string()))
+    }
+}
+
+/// One call of the batch waits on an approval while its sibling is still
+/// executing. The reaper's release would cut the sibling mid-run, so it
+/// waits until the parked call is all that is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_turn_is_not_released_while_a_sibling_call_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&dir.path().join(DB_FILE))
+        .await
+        .expect("open the database");
+    let session = owner_session(TriggerSource::User);
+    store
+        .session
+        .save(&session)
+        .await
+        .expect("save the session");
+    let runs = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let mut harness = builder(&session, store, &runs)
+        .with_tool(
+            Arc::new(SlowSibling {
+                started: Arc::clone(&started),
+                finish: Arc::clone(&finish),
+            }),
+            ToolManifest {
+                name: SLOW_TOOL.to_string(),
+                description: "takes a while".to_string(),
+                trust_level: baybo_model::TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: Vec::new(),
+                channels: Vec::new(),
+            },
+        )
+        .build();
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: CALL_ID.to_string(),
+            name: GATED_TOOL.to_string(),
+            arguments: json!({}),
+            signature: None,
+        }),
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-slow".to_string(),
+            name: SLOW_TOOL.to_string(),
+            arguments: json!({}),
+            signature: None,
+        }),
+    ]);
+    harness.send_text("write it").await.expect("send");
+    let ask_id = parked_ask(&harness).await;
+    tokio::time::timeout(WAIT_TIMEOUT, started.notified())
+        .await
+        .expect("the sibling starts");
+
+    assert!(
+        !harness.supervisor.release_parked_turn(&session.id),
+        "the sibling is still running"
+    );
+    assert_eq!(queue_liveness(&harness, &session, &ask_id), Some(true));
+
+    finish.notify_one();
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        while !harness.supervisor.release_parked_turn(&session.id) {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("released once only the parked call is left");
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        while queue_liveness(&harness, &session, &ask_id) != Some(false) {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the card stays, with no waiter behind it");
+    assert!(row(&harness, &ask_id).await.is_pending());
+}
+
+fn queue_liveness(harness: &AgentTestHarness, session: &Session, ask_id: &AskId) -> Option<bool> {
+    harness
+        .ask_queues
+        .get_or_create(&session.channel)
+        .liveness(ask_id)
+}
+
 /// Wait until a tool future in `harness`'s session is parked on an ask, and
 /// return that ask's id.
 async fn parked_ask(harness: &AgentTestHarness) -> AskId {

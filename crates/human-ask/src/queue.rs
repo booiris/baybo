@@ -294,13 +294,12 @@ impl AskQueue {
             .filter(|e| &e.ask.session_id == session_id && e.responder.is_some())
             .map(|e| {
                 if e.ask.is_resumable() {
-                    ActorStopCost::ReleasesTurn
+                    ActorStopCost::ReleasesTurn { waiting_calls: 1 }
                 } else {
                     ActorStopCost::AbandonsAsks
                 }
             })
-            .max()
-            .unwrap_or(ActorStopCost::Free)
+            .fold(ActorStopCost::Free, ActorStopCost::plus)
     }
 
     /// `Some(true)` for a live entry, `Some(false)` for a dead one, `None`
@@ -615,14 +614,24 @@ mod tests {
     }
 
     #[test]
-    fn actor_stop_cost_is_the_costliest_live_ask() {
+    fn actor_stop_cost_adds_up_the_live_asks() {
         let queue = AskQueue::new();
         let s1 = SessionId::from("s1");
         assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::Free);
 
         let (tx, _before) = oneshot::channel();
         queue.push_live(ask("b1", "s1", AskPhase::BeforeExecute), tx);
-        assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::ReleasesTurn);
+        assert_eq!(
+            queue.actor_stop_cost(&s1),
+            ActorStopCost::ReleasesTurn { waiting_calls: 1 }
+        );
+        let (tx, _second) = oneshot::channel();
+        queue.push_live(ask("b2", "s1", AskPhase::BeforeExecute), tx);
+        assert_eq!(
+            queue.actor_stop_cost(&s1),
+            ActorStopCost::ReleasesTurn { waiting_calls: 2 },
+            "one waiting call per live ask"
+        );
 
         let (tx, _during) = oneshot::channel();
         queue.push_live(ask("d1", "s1", AskPhase::DuringExecute), tx);
@@ -631,7 +640,7 @@ mod tests {
         queue.orphan(&id("d1"));
         assert_eq!(
             queue.actor_stop_cost(&s1),
-            ActorStopCost::ReleasesTurn,
+            ActorStopCost::ReleasesTurn { waiting_calls: 2 },
             "a dead entry costs nothing"
         );
         assert_eq!(

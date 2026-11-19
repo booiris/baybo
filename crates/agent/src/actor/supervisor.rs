@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::mailbox::{MailboxSender, TrySendError};
+use crate::runtime::running_calls::RunningCalls;
 use baybo_session::SessionManager;
 
 /// Handle to communicate with a running AgentActor.
@@ -69,16 +70,24 @@ pub struct AgentSupervisor {
     /// What stopping an idle session's actor would cost its live asks, which
     /// decides whether the reaper may end its turn (see [`Self::reap_idle`]).
     live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
-    /// The release token of the turn each registered actor is running. The
-    /// reaper cancels it to end a turn parked on resumable asks; it is a
-    /// child of the actor's own token, so later turns are untouched.
-    turn_releases: Arc<DashMap<SessionId, CancellationToken>>,
+    /// The turn each registered actor is running, for the reaper to end one
+    /// parked on resumable asks.
+    turn_releases: Arc<DashMap<SessionId, TurnRelease>>,
 }
 
-/// Keeps a running turn's release token registered with the supervisor; the
-/// registration ends when the turn does.
+/// What the supervisor holds of a running turn.
+struct TurnRelease {
+    /// Cancelling it ends the turn the way a shutdown would. A child of the
+    /// actor's own token, so later turns are untouched.
+    token: CancellationToken,
+    /// How many of the turn's tool calls are executing.
+    running: RunningCalls,
+}
+
+/// Keeps a running turn registered with the supervisor; the registration
+/// ends when the turn does.
 pub struct TurnReleaseGuard {
-    releases: Arc<DashMap<SessionId, CancellationToken>>,
+    releases: Arc<DashMap<SessionId, TurnRelease>>,
     session_id: SessionId,
 }
 
@@ -102,35 +111,57 @@ impl AgentSupervisor {
         }
     }
 
-    /// End `session_id`'s running turn the way a shutdown would, if every ask
-    /// it is parked on is resumable: nothing is appended, each ask stays
-    /// pending, and an answer resumes the session through the Resume door.
-    /// `false` (and nothing touched) when the turn is not parked, or is
-    /// parked on an ask that ending it would abandon.
+    /// End `session_id`'s running turn the way a shutdown would, if all it
+    /// is doing is waiting on resumable asks: nothing is appended, each ask
+    /// stays pending, and an answer resumes the session through the Resume
+    /// door. `false` (and nothing touched) when the turn is not parked, is
+    /// parked on an ask that ending it would abandon, or has a call running
+    /// that is not one of the waiters — a foreground subagent or a slow tool
+    /// beside the parked call, whose work the release would cut.
     ///
     /// The cost is read here, at the moment of the cancel, and not taken from
     /// an earlier probe: an answer landing in between turns the parked call
     /// back into running work, which the cancel must not cut.
     pub fn release_parked_turn(&self, session_id: &SessionId) -> bool {
-        if self.live_asks.actor_stop_cost(session_id) != ActorStopCost::ReleasesTurn {
+        let ActorStopCost::ReleasesTurn { waiting_calls } =
+            self.live_asks.actor_stop_cost(session_id)
+        else {
             return false;
-        }
+        };
         let Some(release) = self.turn_releases.get(session_id) else {
             return false;
         };
+        let running = release.running.count();
+        if running > waiting_calls {
+            debug!(
+                %session_id,
+                running,
+                waiting_calls,
+                "not ending a parked turn: a sibling call is still running"
+            );
+            return false;
+        }
         info!(%session_id, "ending a turn parked on resumable asks");
-        release.cancel();
+        release.token.cancel();
         true
     }
 
-    /// Register the release token of the turn `session_id`'s actor is about
-    /// to run. Drop the guard when the turn ends.
-    pub fn track_turn(
+    /// Register the turn `session_id`'s actor is about to run: its release
+    /// token and its loop's running-call count. Drop the guard when the turn
+    /// ends.
+    pub(super) fn track_turn(
         &self,
         session_id: &SessionId,
         release: CancellationToken,
+        running: RunningCalls,
     ) -> TurnReleaseGuard {
-        self.turn_releases.insert(session_id.clone(), release);
+        self.turn_releases.insert(
+            session_id.clone(),
+            TurnRelease {
+                token: release,
+                running,
+            },
+        );
         TurnReleaseGuard {
             releases: Arc::clone(&self.turn_releases),
             session_id: session_id.clone(),
@@ -475,7 +506,7 @@ impl AgentSupervisor {
                 Ok(()) => {
                     // After the stop is queued, so the actor is certain to exit
                     // once the parked turn ends.
-                    if cost == ActorStopCost::ReleasesTurn {
+                    if matches!(cost, ActorStopCost::ReleasesTurn { .. }) {
                         self.release_parked_turn(&session_id);
                     }
                     debug!(%session_id, "idle reaper: sent Shutdown");
@@ -947,7 +978,10 @@ mod tests {
         let supervisor = AgentSupervisor::new(
             tx,
             Arc::new(StopCosts(vec![
-                (resumable.clone(), ActorStopCost::ReleasesTurn),
+                (
+                    resumable.clone(),
+                    ActorStopCost::ReleasesTurn { waiting_calls: 1 },
+                ),
                 (during.clone(), ActorStopCost::AbandonsAsks),
             ])),
         );
@@ -961,8 +995,13 @@ mod tests {
             .expect("first insert");
         let resumable_release = CancellationToken::new();
         let during_release = CancellationToken::new();
-        let _resumable_turn = supervisor.track_turn(&resumable, resumable_release.clone());
-        let _during_turn = supervisor.track_turn(&during, during_release.clone());
+        let _resumable_turn = supervisor.track_turn(
+            &resumable,
+            resumable_release.clone(),
+            RunningCalls::default(),
+        );
+        let _during_turn =
+            supervisor.track_turn(&during, during_release.clone(), RunningCalls::default());
 
         let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
         assert_eq!(reaped, 1);
@@ -1017,7 +1056,11 @@ mod tests {
         let supervisor = AgentSupervisor::new(
             tx,
             Arc::new(ScriptedCosts(parking_lot::Mutex::new(
-                [ActorStopCost::ReleasesTurn, ActorStopCost::Free].into(),
+                [
+                    ActorStopCost::ReleasesTurn { waiting_calls: 1 },
+                    ActorStopCost::Free,
+                ]
+                .into(),
             ))),
         );
         let (mailbox_tx, mut mailbox_rx) = mailbox::channel(8);
@@ -1025,7 +1068,7 @@ mod tests {
             .register_if_absent(session.id.clone(), mailbox_tx)
             .expect("first insert");
         let release = CancellationToken::new();
-        let _turn = supervisor.track_turn(&session.id, release.clone());
+        let _turn = supervisor.track_turn(&session.id, release.clone(), RunningCalls::default());
 
         assert_eq!(
             supervisor.reap_idle(&sessions, Duration::seconds(60)).await,
@@ -1041,11 +1084,42 @@ mod tests {
         );
     }
 
+    /// One call waits on an approval while a sibling (a foreground subagent,
+    /// a slow tool) still runs: releasing the turn would cut that work.
+    #[test]
+    fn a_parked_turn_with_a_sibling_call_still_running_is_not_released() {
+        let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
+        let id = SessionId::from("s");
+        let supervisor = AgentSupervisor::new(
+            tx,
+            Arc::new(StopCosts(vec![(
+                id.clone(),
+                ActorStopCost::ReleasesTurn { waiting_calls: 1 },
+            )])),
+        );
+        let running = RunningCalls::default();
+        let release = CancellationToken::new();
+        let _turn = supervisor.track_turn(&id, release.clone(), running.clone());
+
+        let waiter = running.start();
+        let sibling = running.start();
+        assert!(!supervisor.release_parked_turn(&id));
+        assert!(!release.is_cancelled());
+
+        drop(sibling);
+        assert!(
+            supervisor.release_parked_turn(&id),
+            "only the waiter is left"
+        );
+        assert!(release.is_cancelled());
+        drop(waiter);
+    }
+
     #[test]
     fn a_turn_release_is_tracked_only_while_its_guard_lives() {
         let sup = make_supervisor();
         let id = SessionId::from("s");
-        let guard = sup.track_turn(&id, CancellationToken::new());
+        let guard = sup.track_turn(&id, CancellationToken::new(), RunningCalls::default());
         assert!(sup.turn_releases.contains_key(&id));
         drop(guard);
         assert!(!sup.turn_releases.contains_key(&id));

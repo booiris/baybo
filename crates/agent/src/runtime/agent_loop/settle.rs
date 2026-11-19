@@ -296,6 +296,7 @@ impl AgentLoop {
             release: tokens.release.clone(),
         };
         let approved_for_call = Arc::clone(&approved);
+        let _running = self.running_calls.start();
         let session_ref: &Session = session;
         let executed = crate::runtime::scope::with_step(
             span_recorder.as_ref(),

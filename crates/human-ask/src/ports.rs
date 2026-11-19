@@ -18,20 +18,38 @@ pub trait ResumeSink: Send + Sync {
 }
 
 /// What stopping a session's actor would cost its live asks, the ones a tool
-/// future is parked on right now. Ordered by cost, so the cost of several
-/// asks is the `max` of theirs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// future is parked on right now. The cost of several asks is their
+/// [`Self::plus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorStopCost {
     /// No tool future is parked on an ask: the actor stops between turns.
     Free,
     /// Every live ask is resumable. The running turn has to be released
     /// first; each ask then stays pending, and an answer resumes the session
-    /// through the Resume door.
-    ReleasesTurn,
+    /// through the Resume door. `waiting_calls` is how many tool calls wait
+    /// on those asks (one live ask per call), so the caller can tell a turn
+    /// that is only waiting from one with a sibling call still running.
+    ReleasesTurn { waiting_calls: usize },
     /// A live ask is not resumable (a during-execute approval): stopping
     /// would abandon it. Goes away once those approvals move before execute
     /// (`docs/todo/during-execute-approvals.md`).
     AbandonsAsks,
+}
+
+impl ActorStopCost {
+    /// The cost of both: abandoning anything outweighs the rest, and
+    /// waiting calls add up.
+    pub fn plus(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::AbandonsAsks, _) | (_, Self::AbandonsAsks) => Self::AbandonsAsks,
+            (Self::ReleasesTurn { waiting_calls: a }, Self::ReleasesTurn { waiting_calls: b }) => {
+                Self::ReleasesTurn {
+                    waiting_calls: a + b,
+                }
+            }
+            (Self::Free, cost) | (cost, Self::Free) => cost,
+        }
+    }
 }
 
 /// "What would stopping this session's actor cost?" — the idle reaper's

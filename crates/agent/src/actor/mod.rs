@@ -342,11 +342,13 @@ impl AgentActor {
         Option<supervisor::TurnReleaseGuard>,
     ) {
         let release = self.volatile.actor_token.child_token();
-        let guard = self
-            .volatile
-            .supervisor
-            .as_ref()
-            .map(|s| s.track_turn(&self.durable.session.id, release.clone()));
+        let guard = self.volatile.supervisor.as_ref().map(|s| {
+            s.track_turn(
+                &self.durable.session.id,
+                release.clone(),
+                self.volatile.agent_loop.running_calls(),
+            )
+        });
         let tokens = baybo_tools::TurnTokens {
             turn: release.child_token(),
             release,

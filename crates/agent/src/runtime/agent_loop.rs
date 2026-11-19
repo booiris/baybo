@@ -590,6 +590,10 @@ pub struct AgentLoop {
     /// The session's asks, for the cancelled-batch path: a turn cancel claims
     /// `Abandoned` on a call's asks before appending its result.
     asks: Arc<baybo_human_ask::HumanAskManager>,
+    /// How many tool calls are executing right now. The supervisor reads it
+    /// before releasing a turn parked on asks: see
+    /// [`crate::runtime::running_calls`].
+    running_calls: crate::runtime::running_calls::RunningCalls,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -733,7 +737,13 @@ impl AgentLoop {
             read_tracker: ReadTracker::default(),
             progress_monitor: TurnProgressMonitor::default(),
             asks,
+            running_calls: crate::runtime::running_calls::RunningCalls::default(),
         }
+    }
+
+    /// A handle on this loop's running-call count, for the supervisor.
+    pub fn running_calls(&self) -> crate::runtime::running_calls::RunningCalls {
+        self.running_calls.clone()
     }
 
     /// Delegate to `ContextManager::restore_from_store` — the manager
@@ -1560,6 +1570,7 @@ impl AgentLoop {
                 .record_prompt_delivered(&path, fingerprint);
         }
         let read_tracker_for_calls = self.read_tracker.clone();
+        let running_for_calls = self.running_calls.clone();
         let notify_silence_for_calls = cron_report.as_ref().map(|turn| turn.silence.clone());
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response
@@ -1589,6 +1600,7 @@ impl AgentLoop {
                 let triggering_llm_span = Some(llm_span_id);
                 let limiter = Arc::clone(&concurrency_limiter);
                 let read_tracker = read_tracker_for_calls.clone();
+                let running = running_for_calls.clone();
                 // `Concurrent` → one permit (up to the cap run together);
                 // `Exclusive` → every permit, so the call runs alone among
                 // pool calls; `Independent` → no permit (self-bounded, e.g.
@@ -1608,6 +1620,7 @@ impl AgentLoop {
                         Some(n) => limiter.acquire_many_owned(n).await.ok(),
                         None => None,
                     };
+                    let _running = running.start();
                     debug!(tool = %tool_name, "executing tool call");
                     executor
                         .execute(

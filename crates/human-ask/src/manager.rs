@@ -331,8 +331,7 @@ impl HumanAskManager {
             .all()
             .iter()
             .map(|queue| queue.actor_stop_cost(session_id))
-            .max()
-            .unwrap_or(ActorStopCost::Free)
+            .fold(ActorStopCost::Free, ActorStopCost::plus)
     }
 
     fn is_live(&self, row: &HumanAskRow) -> bool {

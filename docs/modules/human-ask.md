@@ -1038,11 +1038,12 @@ fires for either kind.
 `AgentSupervisor::new` takes `Arc<dyn LivePendingAsks>`
 (`fn actor_stop_cost(&self, &SessionId) -> ActorStopCost`, over the in-memory
 queues): what stopping the actor would cost the asks a tool future is parked
-on. `Free` (none), `ReleasesTurn` (every live ask is a question or a
-before-execute approval) or `AbandonsAsks` (at least one during-execute
-approval). The variants are ordered by cost, so several asks cost the `max`
-of theirs; `AbandonsAsks` goes away once the during-execute approvals move
-before execute.
+on. `Free` (none), `ReleasesTurn { waiting_calls }` (every live ask is a
+question or a before-execute approval; `waiting_calls` counts them, one per
+tool call) or `AbandonsAsks` (at least one during-execute approval). Several
+asks cost their `ActorStopCost::plus`: abandoning outweighs the rest and
+waiting calls add up. `AbandonsAsks` goes away once the during-execute
+approvals move before execute.
 
 `ActorStop` is served between turns, so a turn parked on an ask would hold
 its actor — transcript, tool future and all — for as long as nobody answers.
@@ -1052,7 +1053,13 @@ while the turn runs (`AgentSupervisor::track_turn`). For an idle session
 whose stop cost is `ReleasesTurn`, `reap_idle` queues `ActorStop` and then
 calls `release_parked_turn`, which reads the cost again and cancels that
 token only if it is still `ReleasesTurn`: an answer that landed in between
-has turned the parked call back into running work. The turn reads the cancel
+has turned the parked call back into running work. It also needs the turn to
+be doing nothing else. The ask queue cannot see a sibling call of the same
+batch (a foreground subagent, a slow tool) that is still executing, so the
+loop counts its executing calls (`runtime::running_calls::RunningCalls`,
+registered beside the release token) and the release happens only when that
+count does not exceed `waiting_calls` — every running call is one of the
+waiters. Otherwise the reaper leaves the turn for a later tick. The turn reads the cancel
 as `Ancestor`, exactly as at shutdown: nothing is appended, each ask's entry
 stays in the queue with no waiter, its row stays pending. The actor exits
 after the turn; an answer later goes through the Resume door, which spawns a
@@ -1175,7 +1182,7 @@ pub struct HumanAskManager;                     // from_config(HumanAskManagerCo
 pub struct SettledAsk { ask_id, tool_call_id, kind, resolution }   // settle_unapplied: one per resumable unapplied row; the caller appends, then mark_applied
 pub struct ReloadReport { requeued, resumed, abandoned, applied, failed }   // a row that fails is logged, counted and left for the next boot; the rows after it still reload
 pub trait ResumeSink { fn request_resume(&self, req: ResumeRequest); }   // fire and forget; the router decides whether it opens a Resume turn
-pub trait LivePendingAsks { fn actor_stop_cost(&self, session: &SessionId) -> ActorStopCost; }  // Free < ReleasesTurn < AbandonsAsks
+pub trait LivePendingAsks { fn actor_stop_cost(&self, session: &SessionId) -> ActorStopCost; }  // Free | ReleasesTurn { waiting_calls } | AbandonsAsks; combined with ActorStopCost::plus
 #[async_trait] pub trait AskObserver { async fn on_event(&self, ask: &HumanAskRow, event: AskEvent); }
 pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>;
 pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<dyn Tool>, ToolManifest)>; }

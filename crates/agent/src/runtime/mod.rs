@@ -16,6 +16,7 @@ pub mod error_recovery;
 pub mod llm_pool;
 pub(crate) mod progress_ledger;
 pub mod progress_observer;
+pub mod running_calls;
 pub mod sandbox;
 pub mod scope;
 pub mod subagent_spawner;
