@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 pub struct MemoryHumanAskStore {
     rows: Mutex<Vec<HumanAskRow>>,
     fail_create: AtomicBool,
+    fail_resolve: AtomicBool,
 }
 
 impl MemoryHumanAskStore {
@@ -26,6 +27,11 @@ impl MemoryHumanAskStore {
     /// Make every later `create` fail, as a full disk would.
     pub fn fail_creates(&self) {
         self.fail_create.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every later `resolve` fail (`true`) or work again (`false`).
+    pub fn fail_resolves(&self, fail: bool) {
+        self.fail_resolve.store(fail, Ordering::SeqCst);
     }
 
     /// Every row, in insertion order.
@@ -66,6 +72,9 @@ impl HumanAskStore for MemoryHumanAskStore {
         resolution: &AskResolution,
         now: DateTime<Utc>,
     ) -> baybo_store::human_ask::Result<bool> {
+        if self.fail_resolve.load(Ordering::SeqCst) {
+            return Err(StorageError::Storage("resolve disabled by test".into()));
+        }
         let mut rows = self.rows.lock();
         match rows
             .iter_mut()
@@ -130,7 +139,15 @@ impl HumanAskStore for MemoryHumanAskStore {
 pub struct NoLivePendingAsks;
 
 impl crate::ports::LivePendingAsks for NoLivePendingAsks {
-    fn has_live_pending_ask(&self, _session_id: &SessionId) -> bool {
-        false
+    fn actor_stop_cost(&self, _session_id: &SessionId) -> crate::ports::ActorStopCost {
+        crate::ports::ActorStopCost::Free
     }
+}
+
+/// A resume sink for fixtures with no router: an answer to a dead ask
+/// resumes nothing.
+pub struct NoResume;
+
+impl crate::ports::ResumeSink for NoResume {
+    fn request_resume(&self, _req: baybo_model::human_ask::ResumeRequest) {}
 }

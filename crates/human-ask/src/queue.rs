@@ -1,9 +1,11 @@
 //! [`AskQueue`]: the in-memory read model of a channel's pending asks.
 //!
-//! One queue per channel, not per session. Holds an entry for every ask a
-//! tool future in this process is parked on: each **live** entry carries the
-//! oneshot its waiter waits on. The queue is the gateway's alone: a client
-//! that only shows cards (the TUI, `baybo prompt`) keeps its own list.
+//! One queue per channel, not per session. Holds an entry for every
+//! `pending` ledger row the process knows about: **live** entries carry the
+//! oneshot a parked tool future waits on, **dead** entries (after a restart,
+//! or once the waiter is gone) carry none and are still shown and
+//! answerable. The queue is the gateway's alone: a client that only shows
+//! cards (the TUI, `baybo prompt`) keeps its own list.
 //!
 //! The queue never touches the ledger. Watchers are sync, run outside the
 //! queue lock in mutation order, and must not block.
@@ -14,12 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use baybo_model::approval::ApprovalRequest;
 use baybo_model::human_ask::{
-    ASK_USER_TOOL_NAME, AskId, AskKind, AskPhase, AskRequest, AskResolution,
+    ASK_USER_TOOL_NAME, AskId, AskKind, AskPhase, AskRequest, AskResolution, resumable,
 };
 use baybo_model::{ChannelType, SessionId};
 use baybo_store::HumanAskRow;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
+
+use crate::ports::ActorStopCost;
 
 /// One pending ask as the queue (and its watchers) see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +61,10 @@ impl PendingAsk {
             AskRequest::Approval(req) => Some(req),
             AskRequest::Question(_) => None,
         }
+    }
+
+    pub fn is_resumable(&self) -> bool {
+        resumable(self.kind, self.phase)
     }
 }
 
@@ -142,7 +150,7 @@ enum Outgoing {
 
 /// What [`AskQueue::resolve`] found and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Removed {
+pub(crate) struct Removed {
     pub ask: PendingAsk,
     /// A live waiter received the resolution. `false` for a dead entry, or a
     /// live one whose waiter vanished in the same instant.
@@ -278,13 +286,21 @@ impl AskQueue {
             .collect()
     }
 
-    /// Whether a tool future in this process is parked on an ask of
-    /// `session_id`.
-    pub fn has_live(&self, session_id: &SessionId) -> bool {
+    /// What stopping `session_id`'s actor would cost this queue's live asks:
+    /// one queue's share of [`LivePendingAsks::actor_stop_cost`](crate::LivePendingAsks::actor_stop_cost).
+    pub(crate) fn actor_stop_cost(&self, session_id: &SessionId) -> ActorStopCost {
         self.inner
             .lock()
             .iter()
-            .any(|e| &e.ask.session_id == session_id && e.responder.is_some())
+            .filter(|e| &e.ask.session_id == session_id && e.responder.is_some())
+            .map(|e| {
+                if e.ask.is_resumable() {
+                    ActorStopCost::ReleasesTurn { waiting_calls: 1 }
+                } else {
+                    ActorStopCost::AbandonsAsks
+                }
+            })
+            .fold(ActorStopCost::Free, ActorStopCost::plus)
     }
 
     /// `Some(true)` for a live entry, `Some(false)` for a dead one, `None`
@@ -326,9 +342,8 @@ impl AskQueue {
         self.push(ask, Some(responder));
     }
 
-    /// Enqueue an ask no tool future waits on.
-    #[cfg(test)]
-    fn push_dead(&self, ask: PendingAsk) {
+    /// Enqueue an ask no tool future waits on (boot reload).
+    pub(crate) fn push_dead(&self, ask: PendingAsk) {
         self.push(ask, None);
     }
 
@@ -354,8 +369,11 @@ impl AskQueue {
 
     /// Remove an ask a human (or policy) decided and hand the decision to
     /// its waiter, if it has one. `None` when the ask is not queued.
-    pub fn resolve(&self, ask_id: &AskId, resolution: AskResolution) -> Option<Removed> {
-        let edge = if resolution == AskResolution::Abandoned {
+    pub(crate) fn resolve(&self, ask_id: &AskId, resolution: AskResolution) -> Option<Removed> {
+        let edge = if matches!(
+            resolution,
+            AskResolution::Abandoned | AskResolution::TimedOut
+        ) {
             PendingEdge::Abandoned
         } else {
             PendingEdge::Answered
@@ -374,15 +392,30 @@ impl AskQueue {
 
     /// Remove an ask nobody decided. A live waiter sees
     /// [`AskResolution::Abandoned`].
-    pub fn abandon(&self, ask_id: &AskId) -> Option<Removed> {
+    pub(crate) fn abandon(&self, ask_id: &AskId) -> Option<Removed> {
         self.resolve(ask_id, AskResolution::Abandoned)
     }
 
-    /// A waiter went away without a resolution. Nothing could apply an
-    /// answer any more, so the ask leaves the queue with an `Abandoned`
-    /// edge; its row is closed by the turn's cancel claim or the next boot.
-    pub fn orphan(&self, ask_id: &AskId) {
-        let _ = self.remove(ask_id, PendingEdge::Abandoned, AskResolution::Abandoned);
+    /// A waiter went away without a resolution. A resumable ask stays queued
+    /// as a dead entry with no edge — the row is still pending and the ask
+    /// still answerable. A non-resumable one is useless without its tool
+    /// future, so it is removed with an `Abandoned` edge; its row is
+    /// reconciled later by the manager.
+    pub(crate) fn orphan(&self, ask_id: &AskId) {
+        let resumable_found = {
+            let mut q = self.inner.lock();
+            match q.iter_mut().find(|e| &e.ask.ask_id == ask_id) {
+                Some(entry) if entry.ask.is_resumable() => {
+                    entry.responder = None;
+                    true
+                }
+                Some(_) => false,
+                None => return,
+            }
+        };
+        if !resumable_found {
+            let _ = self.remove(ask_id, PendingEdge::Abandoned, AskResolution::Abandoned);
+        }
     }
 
     /// Snapshot of every queued ask, in insertion order.
@@ -414,10 +447,10 @@ impl Default for AskQueue {
     }
 }
 
-/// One [`AskQueue`] per channel. The eager boot install and the lazy install
-/// of a sidecar's channel both go through [`Self::get_or_create`], and the
-/// manager finds a channel's queue here. A few operations per boot or
-/// connect — a plain mutex.
+/// One [`AskQueue`] per channel. The channel install and the boot reload both
+/// go through [`Self::get_or_create`], so a reload for a channel whose
+/// sidecar has not connected yet creates the queue the later install
+/// attaches to. A few operations per boot or connect — a plain mutex.
 #[derive(Clone, Default)]
 pub struct AskQueues {
     inner: Arc<Mutex<HashMap<ChannelType, AskQueue>>>,
@@ -582,15 +615,63 @@ mod tests {
     }
 
     #[test]
-    fn orphan_drops_the_entry_with_an_abandoned_edge() {
+    fn actor_stop_cost_adds_up_the_live_asks() {
+        let queue = AskQueue::new();
+        let s1 = SessionId::from("s1");
+        assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::Free);
+
+        let (tx, _before) = oneshot::channel();
+        queue.push_live(ask("b1", "s1", AskPhase::BeforeExecute), tx);
+        assert_eq!(
+            queue.actor_stop_cost(&s1),
+            ActorStopCost::ReleasesTurn { waiting_calls: 1 }
+        );
+        let (tx, _second) = oneshot::channel();
+        queue.push_live(ask("b2", "s1", AskPhase::BeforeExecute), tx);
+        assert_eq!(
+            queue.actor_stop_cost(&s1),
+            ActorStopCost::ReleasesTurn { waiting_calls: 2 },
+            "one waiting call per live ask"
+        );
+
+        let (tx, _during) = oneshot::channel();
+        queue.push_live(ask("d1", "s1", AskPhase::DuringExecute), tx);
+        assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::AbandonsAsks);
+
+        queue.orphan(&id("d1"));
+        assert_eq!(
+            queue.actor_stop_cost(&s1),
+            ActorStopCost::ReleasesTurn { waiting_calls: 2 },
+            "a dead entry costs nothing"
+        );
+        assert_eq!(
+            queue.actor_stop_cost(&SessionId::from("s2")),
+            ActorStopCost::Free
+        );
+    }
+
+    #[test]
+    fn orphan_keeps_a_resumable_entry_dead_and_silent() {
         let (queue, seen) = watched_queue();
         let (tx, _rx) = oneshot::channel();
         queue.push_live(ask("c1", "s1", AskPhase::BeforeExecute), tx);
         assert_eq!(queue.liveness(&id("c1")), Some(true));
-        assert!(queue.has_live(&SessionId::from("s1")));
+        queue.orphan(&id("c1"));
+        assert_eq!(queue.liveness(&id("c1")), Some(false), "dead, still queued");
+        assert_eq!(
+            queue.actor_stop_cost(&SessionId::from("s1")),
+            ActorStopCost::Free
+        );
+        assert_eq!(*seen.lock(), vec![("s1".into(), raised("c1"))], "no edge");
+    }
+
+    #[test]
+    fn orphan_drops_a_non_resumable_entry_with_an_abandoned_edge() {
+        let (queue, seen) = watched_queue();
+        let (tx, _rx) = oneshot::channel();
+        queue.push_live(ask("c1", "s1", AskPhase::DuringExecute), tx);
         queue.orphan(&id("c1"));
         assert!(queue.is_empty());
-        assert!(!queue.has_live(&SessionId::from("s1")));
         assert_eq!(
             *seen.lock(),
             vec![

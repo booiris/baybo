@@ -272,7 +272,7 @@ async fn run_in_process(
     // fan-out delivers this turn's output to our mpsc.
     let mut events = attach_inprocess_sink(&graph.channels_registry, &session_id)?;
 
-    let handle = wire_router(&mut graph).await;
+    let handle = wire_router(&mut graph).await?;
     let incoming_tx = handle.incoming_tx;
     tokio::spawn(handle.router.run(handle.incoming_rx, handle.response_rx));
 

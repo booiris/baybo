@@ -211,6 +211,10 @@ mod tests {
             Some(ApprovalOutcome::abandoned())
         );
         assert_eq!(
+            timeline_resolution(&AskResolution::TimedOut),
+            Some(ApprovalOutcome::timed_out())
+        );
+        assert_eq!(
             timeline_resolution(&AskResolution::Approval(ApprovalDecision::Approve)),
             Some(ApprovalOutcome::answered(ApprovalDecision::Approve))
         );

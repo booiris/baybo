@@ -618,6 +618,7 @@ mod tests {
             agent_profiles: Arc::clone(&board.db.agent_profile),
             cron_trigger_rx,
             issue_run_rx: None,
+            ask_resume_rx: None,
             board: Some(Arc::clone(&board.projects)),
             actor_parent_token: CancellationToken::new(),
             rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),

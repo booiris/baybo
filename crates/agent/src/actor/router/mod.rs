@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_cron::CronTriggerEvent;
+use baybo_model::human_ask::ResumeRequest;
 use baybo_model::{LlmEntryName, LlmPin, Session};
 use baybo_project::IssueRunEvent;
 use baybo_store::agent_profile::AgentProfileStore;
@@ -267,6 +268,10 @@ pub struct Router {
     /// Recorded issue runs waiting to execute. Same `Option<Receiver>`
     /// shape and reason as `cron_trigger_rx`.
     issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
+    /// Answers to asks no tool future waits on, from the ask manager's
+    /// resume sink. Same `Option<Receiver>` shape and reason as
+    /// `cron_trigger_rx`.
+    ask_resume_rx: Option<mpsc::Receiver<ResumeRequest>>,
     /// The board a run belongs to. The manager and nothing under it: this
     /// crate reports how a run went and the board decides what that costs
     /// the card. `None` in assemblies with no board (the TUI's embedded
@@ -310,6 +315,9 @@ pub struct RouterConfig {
     /// Recorded issue runs waiting to execute. `None` in an assembly with
     /// no board.
     pub issue_run_rx: Option<mpsc::Receiver<IssueRunEvent>>,
+    /// The chat Resume door — see [`Router::ask_resume_rx`]. `None` in an
+    /// assembly whose asks never outlive their turn.
+    pub ask_resume_rx: Option<mpsc::Receiver<ResumeRequest>>,
     /// See [`Router::board`]. `None` in an assembly with no board.
     pub board: Option<Arc<baybo_project::ProjectManager>>,
     /// Cancellation parent passed to every top-level actor the router
@@ -340,6 +348,7 @@ impl Router {
             agent_profiles,
             cron_trigger_rx,
             issue_run_rx,
+            ask_resume_rx,
             board,
             actor_parent_token,
             rate_limit,
@@ -359,6 +368,7 @@ impl Router {
             agent_profiles,
             cron_trigger_rx: Some(cron_trigger_rx),
             issue_run_rx,
+            ask_resume_rx,
             board,
             actor_parent_token,
             workspace,
@@ -382,6 +392,7 @@ impl Router {
 
         let mut cron_rx = self.cron_trigger_rx.take();
         let mut issue_rx = self.issue_run_rx.take();
+        let mut resume_rx = self.ask_resume_rx.take();
 
         loop {
             tokio::select! {
@@ -401,6 +412,14 @@ impl Router {
                 }
                 Some(output) = response_rx.recv() => {
                     self.handle_agent_output(output).await;
+                }
+                Some(req) = async {
+                    match resume_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_resume_ask(req).await;
                 }
                 Some(event) = async {
                     match cron_rx.as_mut() {

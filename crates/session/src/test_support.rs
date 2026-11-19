@@ -85,6 +85,24 @@ impl MemorySessionStore {
     pub fn seed_session(&self, session: &Session) {
         self.data.lock().insert(session.id.clone(), session.clone());
     }
+
+    /// Synchronously append `messages` to a session's transcript, for sync
+    /// setup that must land before an actor hydrates.
+    pub fn seed_messages(&self, session_id: &SessionId, messages: &[ChatMessage]) {
+        let mut guard = self.transcripts.lock();
+        let log = guard.entry(session_id.clone()).or_default();
+        for message in messages {
+            let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+            log.push(StoredMessageRow {
+                ordinal,
+                message: message.clone(),
+                superseded_by: None,
+                created_at: Utc::now(),
+                source_event_id: None,
+                compaction_inserted: false,
+            });
+        }
+    }
 }
 
 #[async_trait]

@@ -67,7 +67,7 @@ pub(crate) fn recent_slice_bounds(max_tokens: usize) -> (usize, usize, usize) {
 
 pub type Result<T> = std::result::Result<T, ContextError>;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -556,8 +556,22 @@ impl ContextManager {
     }
 
     /// Read-only access to the owned transcript.
+    /// The session this manager's transcript belongs to.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    /// The ids a new assistant row's tool calls should carry: `ids` made
+    /// unique against every `ToolUse` already in the window and each other,
+    /// by the rule load-time repair applies to repeats. Call before the row
+    /// is appended and dispatched, so the transcript, the executor and the
+    /// ask ledger all see the same id.
+    pub fn unique_call_ids<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        transcript_repair::unique_call_ids(self.messages(), ids)
     }
 
     fn needs_framing(&self) -> bool {
@@ -1950,7 +1964,12 @@ impl ContextManager {
     ///
     /// Failures log at warn and fall through to a fresh transcript;
     /// startup must not block on a transient store error.
-    pub async fn restore_from_store(&mut self) {
+    ///
+    /// `awaiting_ask` names the dangling `tool_use` ids a human ask will
+    /// still settle. The repair leaves those unfilled: their real result
+    /// arrives when the answer is applied, and has to land adjacent to the
+    /// assistant row that issued the call.
+    pub async fn restore_from_store(&mut self, awaiting_ask: &HashSet<String>) {
         // Clone the bound handles up-front so we can call
         // `&mut self` methods inside the function without holding a
         // borrow of `self.session_id` / `self.sessions`.
@@ -1974,7 +1993,7 @@ impl ContextManager {
                     orphan_result_ids,
                     duplicate_result_ids,
                     renamed_call_ids,
-                } = transcript_repair::repair_tool_pairing(messages);
+                } = transcript_repair::repair_tool_pairing(messages, awaiting_ask);
                 if !renamed_call_ids.is_empty() {
                     let renamed_call_id_sample: Vec<&str> = renamed_call_ids
                         .iter()
@@ -3185,7 +3204,7 @@ mod tests {
             .expect("persist orphan row");
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         assert_eq!(restored.messages(), std::slice::from_ref(&user));
         assert_eq!(
@@ -3228,7 +3247,7 @@ mod tests {
             .unwrap();
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         // In-memory: fill sits directly after the assistant row, nudge after.
         assert_eq!(restored.messages().len(), 3);
@@ -3241,7 +3260,7 @@ mod tests {
         // The fill was persisted (append-only), so a SECOND hydration
         // finds pairing complete and synthesizes nothing new.
         let mut again = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        again.restore_from_store().await;
+        again.restore_from_store(&HashSet::new()).await;
         assert_eq!(
             again.messages().len(),
             3,
@@ -3296,7 +3315,7 @@ mod tests {
         }
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         let window = restored.messages().to_vec();
         assert_eq!(
             tool_ids(&window),
@@ -3332,7 +3351,7 @@ mod tests {
             ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "web_search_4"));
 
         let mut again = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        again.restore_from_store().await;
+        again.restore_from_store(&HashSet::new()).await;
         assert_eq!(again.messages(), &window[..], "identical on every load");
         assert_eq!(
             sessions
@@ -3367,7 +3386,7 @@ mod tests {
         assert_eq!(ctx.messages(), std::slice::from_ref(&original));
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         assert_eq!(
             restored
                 .append_idempotent(source_event_id, &replay)
@@ -3553,7 +3572,7 @@ mod tests {
             .expect("persist orphan row");
 
         let mut restored = make_ctx_with_sessions(sessions, 0, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         let outcome = restored
             .force_compress("test-model", Vec::new(), |_request, marker| async move {
@@ -5171,7 +5190,7 @@ mod tests {
         let reply = anchored_session(&sessions, 5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         let expected = 5_000 + restored.tokenizer.count_message(&reply);
         assert_eq!(restored.count_tokens(), expected);
@@ -5192,7 +5211,7 @@ mod tests {
         let reply = anchored_session(&sessions, 5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         let tools = schema_tools(4_000);
         let grown = crate::tokenizer::tool_definition_tokens(
             restored.tokenizer.as_ref(),
@@ -5231,7 +5250,7 @@ mod tests {
         }
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         assert_eq!(restored.messages().len(), 3, "the fill is in the window");
         restored.set_current_model(MODEL_ID);
         restored.record_call_actual(5_000).await;
@@ -5250,7 +5269,7 @@ mod tests {
         anchored_session(&sessions, 5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         restored.needs_compression("another-model", &[]);
 
         let swept: usize = restored
@@ -5272,7 +5291,7 @@ mod tests {
             .unwrap();
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
 
         assert_eq!(restored.messages(), std::slice::from_ref(&summary));
         assert_eq!(
@@ -5314,7 +5333,7 @@ mod tests {
         live.record_call_actual(5_000).await;
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         let swept: usize = restored
             .messages()
             .iter()
@@ -5360,7 +5379,7 @@ mod tests {
             .unwrap();
 
         let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
-        restored.restore_from_store().await;
+        restored.restore_from_store(&HashSet::new()).await;
         assert_ne!(restored.messages(), &displaced[..], "repair must reorder");
         let swept: usize = restored
             .messages()
@@ -5436,7 +5455,7 @@ mod tests {
 
             let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
             restored.set_active_model_audio_delivery(audio);
-            restored.restore_from_store().await;
+            restored.restore_from_store(&HashSet::new()).await;
             assert_eq!(restored.count_tokens() == 10, restored_anchor, "{audio:?}");
         }
     }

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use super::{AgentActor, AgentMessage, is_blank_reply, is_turn_cancelled, mailbox};
+use crate::runtime::agent_loop::AsksSettled;
 
 /// Maximum terminal results waiting to be committed to a notification prompt.
 /// Dropped results remain recoverable from their child transcript or command
@@ -404,6 +405,23 @@ impl AgentActor {
     /// Advance the delivery stage. An active ledger always completes first;
     /// any fresh results remain buffered as the following batch.
     async fn run_background_notification_delivery(&mut self) {
+        let notifications = &self.durable.session.state.background_notifications;
+        if notifications.active_delivery.is_none() && notifications.buffered_results.is_empty() {
+            return;
+        }
+        // Both stages below append the notification prompt; an unapplied
+        // ask's result has to land before it.
+        let settled = match self.settle_unapplied_asks().await {
+            Ok(settled) => settled,
+            Err(error) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    error = %error,
+                    "could not settle unapplied asks before a background notification; retrying later"
+                );
+                return;
+            }
+        };
         if self
             .durable
             .session
@@ -412,7 +430,7 @@ impl AgentActor {
             .active_delivery
             .is_some()
         {
-            self.retry_background_notification_delivery().await;
+            self.retry_background_notification_delivery(&settled).await;
             return;
         }
 
@@ -444,7 +462,7 @@ impl AgentActor {
         let append_outcome = match self
             .volatile
             .agent_loop
-            .append_background_notification_prompt_once(content.clone(), &source_event_id)
+            .append_background_notification_prompt_once(&settled, content.clone(), &source_event_id)
             .await
         {
             Ok(outcome) => outcome,
@@ -492,6 +510,7 @@ impl AgentActor {
                     .volatile
                     .agent_loop
                     .append_background_notification_prompt_once(
+                        &settled,
                         content.clone(),
                         &reanchor_source_event_id,
                     )
@@ -602,7 +621,7 @@ impl AgentActor {
     /// restores a user-role request tail after partial failed attempts. If
     /// compaction superseded the original prompt, the frozen ledger content is
     /// re-appended and the ordinal is updated first.
-    async fn retry_background_notification_delivery(&mut self) {
+    async fn retry_background_notification_delivery(&mut self, settled: &AsksSettled) {
         if !self
             .persist_session_state_with_activity("background_notification_retrying")
             .await
@@ -650,7 +669,11 @@ impl AgentActor {
             let new_ordinal = self
                 .volatile
                 .agent_loop
-                .append_background_notification_prompt_once(reanchor_content, &source_event_id)
+                .append_background_notification_prompt_once(
+                    settled,
+                    reanchor_content,
+                    &source_event_id,
+                )
                 .await
                 .map(|outcome| outcome.ordinal());
             let new_ordinal = match new_ordinal {

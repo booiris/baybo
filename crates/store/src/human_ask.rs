@@ -21,7 +21,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub struct HumanAskRow {
     pub ask_id: AskId,
     pub session_id: SessionId,
-    /// The channel whose queue shows the ask.
+    /// Which channel's queue a pending row is reloaded into after a restart.
     pub channel: ChannelType,
     /// LLM `tool_use_id` of the call the ask blocks. Not unique per row.
     pub tool_call_id: String,

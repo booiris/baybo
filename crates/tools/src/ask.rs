@@ -14,30 +14,33 @@ use baybo_model::{ChannelType, TurnId};
 use tokio_util::sync::CancellationToken;
 
 /// The two cancel tokens a turn runs under. `turn` trips on any cancel of the
-/// turn (`/stop`, board stop, operator cancel) and on every ancestor cancel;
-/// `actor` trips only when the actor itself is being torn down (process
-/// shutdown).
+/// turn (`/stop`, board stop, operator cancel) and whenever `release` does;
+/// `release` trips when the turn is ended with its asks left pending: the
+/// actor or the process shutting down, or the idle reaper releasing a turn
+/// parked on resumable asks.
 #[derive(Debug, Clone)]
 pub struct TurnTokens {
     pub turn: CancellationToken,
-    pub actor: CancellationToken,
+    pub release: CancellationToken,
 }
 
 /// Why a parked ask's turn token tripped. Decides whether the ask is
-/// abandoned (`Turn`) or left pending for the next process (`Ancestor`).
+/// abandoned (`Turn`) or left pending for whoever resumes it — the next
+/// process, or a fresh actor through the Resume door (`Ancestor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOrigin {
     /// The turn itself was cancelled; the actor lives on.
     Turn,
-    /// The actor's token tripped — the process is going away.
+    /// The turn's release token tripped: the turn ends, nothing is appended,
+    /// and its asks stay pending.
     Ancestor,
 }
 
 impl CancelOrigin {
-    /// The one place the origin is decided: `Ancestor` iff the actor token is
-    /// cancelled.
+    /// The one place the origin is decided: `Ancestor` iff the release token
+    /// is cancelled.
     pub fn of(tokens: &TurnTokens) -> Self {
-        if tokens.actor.is_cancelled() {
+        if tokens.release.is_cancelled() {
             Self::Ancestor
         } else {
             Self::Turn
@@ -66,7 +69,7 @@ impl AskCancel {
     pub fn never() -> Self {
         Self::new(TurnTokens {
             turn: CancellationToken::new(),
-            actor: CancellationToken::new(),
+            release: CancellationToken::new(),
         })
     }
 }
@@ -131,14 +134,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn origin_is_ancestor_only_when_the_actor_token_tripped() {
+    fn origin_is_ancestor_only_when_the_release_token_tripped() {
         let tokens = TurnTokens {
             turn: CancellationToken::new(),
-            actor: CancellationToken::new(),
+            release: CancellationToken::new(),
         };
         tokens.turn.cancel();
         assert_eq!(CancelOrigin::of(&tokens), CancelOrigin::Turn);
-        tokens.actor.cancel();
+        tokens.release.cancel();
         assert_eq!(CancelOrigin::of(&tokens), CancelOrigin::Ancestor);
     }
 

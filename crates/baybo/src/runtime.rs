@@ -224,14 +224,17 @@ pub struct ManagerGraph {
     /// One ask queue per channel; the lazy install fetches from it too.
     pub ask_queues: baybo_human_ask::AskQueues,
     /// The verbs over the ask ledger. Every actor's loop holds it; the
-    /// gateway's resolve doors call it, and
-    /// `gateway_cmd` closes the stale asks with it at boot.
+    /// gateway's resolve doors call it.
     pub human_asks: Arc<baybo_human_ask::HumanAskManager>,
     /// Pushes for asks parked on the owner queue, drained by the gateway's
     /// push task. A one-shot like `cron_trigger_rx`: `gateway_cmd` takes it.
     /// `None` when there is no owner channel, and left unread by `baybo
     /// prompt` (a closed stream is a no-op for the relay).
     pub ask_push_stream: Option<baybo_gateway::push::ask::AskPushStream>,
+    /// Answers to asks no tool future waits on, sent by the ask manager's
+    /// resume sink. A one-shot like `cron_trigger_rx`: [`wire_router`] hands
+    /// it to the router.
+    pub ask_resume_rx: Option<mpsc::Receiver<baybo_model::human_ask::ResumeRequest>>,
 
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
     /// dispatch) and the router (releases on terminal). The CLI /
@@ -513,9 +516,10 @@ pub async fn build_managers(
 
     // The one read of the ask ledger: every channel's gate and the ask
     // manager share this core, and every channel fetches its queue from
-    // `ask_queues` so the manager and the install meet on one queue.
+    // `ask_queues` so the boot reload and the install meet on one queue.
     let ask_core = Arc::new(baybo_human_ask::AskCore::new(stores.human_ask.clone()));
     let ask_queues = baybo_human_ask::AskQueues::new();
+    let (resume_sink, ask_resume_rx) = baybo_agent::runtime::asks::RouterResumeSink::channel();
     // Eagerly install every enabled channel from config so connections
     // can attach to a pre-existing slot rather than racing on lazy
     // first-connect creation. See docs/modules/channels-protocol-refactor.md.
@@ -526,9 +530,11 @@ pub async fn build_managers(
     )?;
 
     // The ask push relay watches the owner queue's edges, so it must exist
-    // before any ask parks: edges go to whoever is watching at drain time,
-    // with no replay. Installed on `owner` alone: the queue is per-channel,
-    // and the app holds an `owner` connection, so an ask parked on the TUI's or Telegram's queue is one
+    // before the gateway's boot reload (`gateway_cmd`) publishes the dead asks
+    // it re-queues: edges go
+    // to whoever is watching at drain time, with no replay. Installed on
+    // `owner` alone: the queue is per-channel, and the app holds an `owner`
+    // connection, so an ask parked on the TUI's or Telegram's queue is one
     // the phone could not answer even after opening the conversation.
     let ask_push_stream = match channels_registry.get(&baybo_model::ChannelType::owner()) {
         Some(owner) => {
@@ -543,6 +549,7 @@ pub async fn build_managers(
         baybo_human_ask::HumanAskManagerConfig {
             core: Arc::clone(&ask_core),
             queues: ask_queues.clone(),
+            resume_sink: Arc::new(resume_sink),
         },
     ));
 
@@ -950,6 +957,7 @@ pub async fn build_managers(
         ask_queues,
         human_asks,
         ask_push_stream,
+        ask_resume_rx: Some(ask_resume_rx),
         subagent_dispatch_limiter,
     })
 }
@@ -975,11 +983,13 @@ pub struct RouterRunHandle {
     pub supervisor: AgentSupervisor,
 }
 
+const WIRE_ROUTER_TWICE: &str = "wire_router called twice; its one-shot receivers are consumed";
+
 /// Build the [`Router`] and wire a per-session actor spawner against
 /// the graph. The returned handle already has cron triggers attached —
 /// every cron-enqueued session reaches the router regardless of entry
 /// point.
-pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
+pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHandle> {
     let buffer = graph.config.channels.message_buffer_size;
 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(HeuristicTokenizer);
@@ -1159,11 +1169,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     // `take` the cron rx eagerly — a caller who forgot to plumb it would
     // silently drop every cron-fired turn. Calling `wire_router` twice
-    // panics here loudly rather than silently handing out a dummy receiver.
+    // fails here loudly rather than silently handing out a dummy receiver.
     let cron_trigger_rx = graph
         .cron_trigger_rx
         .take()
-        .expect("wire_router called twice; cron_trigger_rx already consumed");
+        .ok_or_else(|| anyhow::anyhow!(WIRE_ROUTER_TWICE))?;
 
     // Idle actor reaper: shuts down registered actors whose sessions
     // have been idle. Hydration on the next user message rebuilds the
@@ -1245,19 +1255,20 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
         issue_run_rx: graph.issue_run_rx.take(),
+        ask_resume_rx: graph.ask_resume_rx.take(),
         board: Some(Arc::clone(&graph.project_manager)),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
         inbound_dedup: Arc::clone(&graph.inbound_dedup),
     });
 
-    RouterRunHandle {
+    Ok(RouterRunHandle {
         router,
         incoming_tx,
         incoming_rx,
         response_rx,
         supervisor: supervisor_for_gateway,
-    }
+    })
 }
 
 /// Wire SIGINT / SIGTERM (Unix) or Ctrl-C (non-Unix) into the provided

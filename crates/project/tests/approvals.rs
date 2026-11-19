@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use baybo_human_ask::test_support::MemoryHumanAskStore;
+use baybo_human_ask::test_support::{MemoryHumanAskStore, NoResume};
 use baybo_human_ask::{AskCore, AskQueues, ChannelAskGate, HumanAskManager, HumanAskManagerConfig};
 use baybo_model::human_ask::{AskId, AskResolution};
 use baybo_model::{
@@ -65,6 +65,7 @@ async fn fixture() -> Fixture {
     let asks = Arc::new(HumanAskManager::from_config(HumanAskManagerConfig {
         core: Arc::clone(&core),
         queues: queues.clone(),
+        resume_sink: Arc::new(NoResume),
     }));
     baybo_project::install_ask_bridge(&core, &manager, Arc::clone(&asks), Arc::clone(&sessions));
     let gate: Arc<dyn ApprovalGate> = Arc::new(ChannelAskGate::new(

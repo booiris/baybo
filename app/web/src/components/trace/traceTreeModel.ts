@@ -53,6 +53,8 @@ const TURN_KIND_LABEL: Partial<Record<TurnInputKind, string>> = {
   compact: 'Compaction',
   cron_notification: 'Cron delivery',
   subagent_notification: 'Background results',
+  resume: 'Resumed after answer',
+  ask_settlement: 'Settled pending asks',
 };
 
 /**

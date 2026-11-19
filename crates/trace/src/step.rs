@@ -63,7 +63,10 @@ pub enum StepKind {
     ///
     /// Invariant: a successful step has ≥ 1 `LlmCall` span. A failed
     /// step *may* have zero only when the trace-store write of the
-    /// first `begin_span` itself errored.
+    /// first `begin_span` itself errored. The one exception is a Resume
+    /// turn's re-execution of an approved call, whose step carries the
+    /// tool span alone: the LLM call that dispatched it belongs to the
+    /// turn that raised the ask.
     LlmIteration,
     /// A context compaction: an LLM call that replaces the transcript so
     /// far with a summary. `trigger` says which path ran it — they are

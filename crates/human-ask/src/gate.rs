@@ -1,20 +1,29 @@
 //! The two [`ApprovalGate`] implementations backed by the ledger.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_model::approval::{ApprovalDecision, ApprovalRequest};
-use baybo_model::human_ask::{AskId, AskKind, AskRequest, AskResolution};
+use baybo_model::human_ask::{AskId, AskKind, AskRequest, AskResolution, resumable};
 use baybo_store::HumanAskRow;
 use baybo_tools::{ApprovalGate, ApprovalOutcome, AskCancel, AskSite, CancelOrigin};
 use chrono::Utc;
 use tokio::sync::oneshot;
 
-use crate::core::{AskCore, AskEvent};
+use crate::core::AskCore;
 use crate::queue::{AskQueue, PendingAsk};
 
+/// How long a non-resumable ask — a during-execute approval — waits for an
+/// answer. It cannot outlive its tool future, so without a deadline it would
+/// hold its turn in memory for as long as nobody answers; when the deadline
+/// passes the tool gets a timed-out denial and carries on. Resumable asks
+/// have no deadline. See `docs/todo/during-execute-approvals.md`.
+pub const DURING_EXECUTE_APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// A channel's gate: persist the ask, enqueue it, wait for a verb to resolve
-/// it. No timeout. Clients learn of the ask from the queue's
+/// it — with no timeout, except a non-resumable ask's
+/// [`DURING_EXECUTE_APPROVAL_TIMEOUT`]. Clients learn of the ask from the queue's
 /// [`AskQueueEvent::AskRaised`](crate::AskQueueEvent::AskRaised), which the
 /// channel's ask watcher turns into a frame.
 pub struct ChannelAskGate {
@@ -37,12 +46,12 @@ impl ChannelAskGate {
     /// On a turn cancel the arm returns at once without awaiting anything:
     /// the loop drops the tool future the moment this yields `Pending`, so a
     /// write started there would be torn. The write-ahead insert itself can
-    /// outlive a dropped future and commit after the loop's cancel fill,
-    /// leaving a pending row no queue shows; the next boot closes it. On an
-    /// ancestor cancel (process shutdown) it never returns: the row stays
-    /// pending, and the next boot closes it.
+    /// outlive a dropped future and commit after the loop's cancel fill; the
+    /// settlement skips a call that already has a result. On an ancestor cancel
+    /// (shutdown, or the idle reaper's release) it never returns, leaving the
+    /// ask pending for whoever resumes it.
     async fn park(&self, row: HumanAskRow, cancel: AskCancel) -> Option<AskResolution> {
-        if let Err(e) = self.core.store().create(&row).await {
+        if let Err(e) = self.core.raise(&row).await {
             tracing::warn!(
                 ask_id = %row.ask_id,
                 kind = row.kind.as_str(),
@@ -51,7 +60,6 @@ impl ChannelAskGate {
             );
             return None;
         }
-        self.core.notify(&row, AskEvent::Raised).await;
 
         let ask = PendingAsk::from_row(&row);
         let (tx, rx) = oneshot::channel();
@@ -60,21 +68,77 @@ impl ChannelAskGate {
             queue: self.queue.clone(),
             ask_id: row.ask_id.clone(),
         };
-
-        tokio::select! {
-            biased;
-            answered = rx => {
-                let resolution = answered.unwrap_or(AskResolution::Abandoned);
-                if let Err(e) = self.core.mark_applied(&row.ask_id).await {
-                    tracing::warn!(ask_id = %row.ask_id, error = %e, "could not stamp ask applied");
-                }
-                Some(resolution)
-            }
-            _ = cancel.tokens.turn.cancelled() => match cancel.origin() {
-                CancelOrigin::Turn => Some(AskResolution::Abandoned),
-                CancelOrigin::Ancestor => std::future::pending().await,
-            },
+        // The observers heard `Raised` before the entry existed, so a verb
+        // may have claimed the row in between and found nothing to deliver
+        // to. No later verb can reach this entry then: deliver what the row
+        // says.
+        if let Ok(Some(current)) = self.core.get(&row.ask_id).await
+            && let Some(resolution) = current.resolution
+        {
+            let _ = self.queue.resolve(&row.ask_id, resolution);
         }
+
+        let deadline = async {
+            if resumable(row.kind, row.phase) {
+                std::future::pending::<()>().await;
+            } else {
+                tokio::time::sleep(DURING_EXECUTE_APPROVAL_TIMEOUT).await;
+            }
+        };
+        let mut rx = rx;
+        let resolution = tokio::select! {
+            biased;
+            answered = &mut rx => answered.unwrap_or(AskResolution::Abandoned),
+            _ = cancel.tokens.turn.cancelled() => {
+                return match cancel.origin() {
+                    CancelOrigin::Turn => Some(AskResolution::Abandoned),
+                    CancelOrigin::Ancestor => std::future::pending().await,
+                };
+            }
+            () = deadline => match self.expire(&row, rx).await {
+                Some(resolution) => resolution,
+                None => return Some(AskResolution::TimedOut),
+            },
+        };
+        if let Err(e) = self.core.mark_applied(&row.ask_id).await {
+            tracing::warn!(ask_id = %row.ask_id, error = %e, "could not stamp ask applied");
+        }
+        Some(resolution)
+    }
+
+    /// The deadline passed: claim `TimedOut` on the still-pending row and
+    /// close the card. A verb that claimed first wins, and its answer is
+    /// already on its way down `rx`. `None` when the claim could not be
+    /// written: the ask still times out for its tool, but the row is left
+    /// pending and unapplied, so the session's next settlement or the next
+    /// boot closes it as a dead non-resumable ask.
+    async fn expire(
+        &self,
+        row: &HumanAskRow,
+        mut rx: oneshot::Receiver<AskResolution>,
+    ) -> Option<AskResolution> {
+        let timed_out = AskResolution::TimedOut;
+        let mut claimed = row.clone();
+        let recorded = match self.core.claim(&mut claimed, timed_out.clone()).await {
+            Ok(true) => true,
+            Ok(false) => return Some(rx.await.unwrap_or(AskResolution::Abandoned)),
+            Err(e) => {
+                tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record an ask timing out");
+                false
+            }
+        };
+        let closed_here = self.queue.resolve(&row.ask_id, timed_out.clone()).is_some();
+        // An answer can win the claim this one failed to write and take the
+        // entry first: what it sent down `rx` stands. (When this call took
+        // the entry, `rx` holds only its own `TimedOut`.)
+        if !recorded
+            && !closed_here
+            && let Ok(answered) = rx.try_recv()
+        {
+            return Some(answered);
+        }
+        tracing::info!(ask_id = %row.ask_id, "during-execute approval timed out");
+        recorded.then_some(timed_out)
     }
 }
 
@@ -119,23 +183,16 @@ impl ApprovalGate for PolicyDenyGate {
         site: AskSite,
         _cancel: AskCancel,
     ) -> ApprovalOutcome {
-        let denied = ApprovalOutcome::policy(ApprovalDecision::Deny);
-        let mut row = approval_row(req, site);
-        let now = Utc::now();
-        row.resolved_at = Some(now);
-        row.resolution = Some(AskResolution::PolicyDenied);
-        row.applied_at = Some(now);
-        match self.core.store().create(&row).await {
-            Ok(()) => {
-                self.core
-                    .notify(&row, AskEvent::Resolved(AskResolution::PolicyDenied))
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record policy denial");
-            }
+        let row = approval_row(req, site);
+        let ask_id = row.ask_id.clone();
+        if let Err(e) = self
+            .core
+            .record_settled(row, AskResolution::PolicyDenied)
+            .await
+        {
+            tracing::warn!(%ask_id, error = %e, "could not record policy denial");
         }
-        denied
+        ApprovalOutcome::policy(ApprovalDecision::Deny)
     }
 }
 
@@ -157,7 +214,7 @@ fn approval_row(req: ApprovalRequest, site: AskSite) -> HumanAskRow {
     }
 }
 
-/// A dropped waiter takes its ask off the queue; it never resolves it.
+/// A dropped waiter orphans its ask; it never resolves it.
 struct OrphanOnDrop {
     queue: AskQueue,
     ask_id: AskId,

@@ -546,14 +546,24 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         embedded_mcp_servers,
     )
     .await?;
-    // No ask survives a restart yet: close what the previous process left
-    // pending before any channel can show or answer it. Hydration then
-    // fills each dangling call as interrupted, as for any crash.
-    match graph.human_asks.close_stale_asks().await {
-        Ok(abandoned) => tracing::info!(abandoned, "closed stale human asks"),
-        Err(e) => tracing::warn!(error = %e, "failed to close stale human asks"),
+    // Best-effort, like the skill-job recovery: put the ledger's pending asks
+    // back on their queues (the push relay, built in `build_managers`, sees
+    // their edges) and re-drive the answered ones. Resume requests wait in
+    // the router's intake until the router runs. Only the gateway reloads:
+    // `baybo prompt` tears down after its own turn, and its own session's
+    // asks are settled by that turn's prelude.
+    match graph.human_asks.reload_pending().await {
+        Ok(report) => tracing::info!(
+            requeued = report.requeued,
+            resumed = report.resumed,
+            abandoned = report.abandoned,
+            applied = report.applied,
+            failed = report.failed,
+            "reloaded unapplied human asks"
+        ),
+        Err(e) => tracing::warn!(error = %e, "failed to reload unapplied human asks"),
     }
-    let run_handle = runtime::wire_router(&mut graph).await;
+    let run_handle = runtime::wire_router(&mut graph).await?;
 
     // WS-backed sidecars register themselves from the route task when a
     // client connects; nothing to pre-register here.
@@ -658,7 +668,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         // the lifecycle bus while it waits — the turn has not completed, and
         // never will unless the user answers — so the ask queue needs its own
         // path to the dispatcher. The relay itself is built in
-        // `build_managers`, before any ask can park.
+        // `build_managers`, ahead of the boot reload whose edges it must see.
         let ask_stream = graph.ask_push_stream.take();
         let ask_pushes = ask_stream.is_some();
         let push_shutdown = shutdown.clone();
