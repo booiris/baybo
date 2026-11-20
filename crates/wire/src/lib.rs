@@ -62,6 +62,7 @@ pub enum MessageRole {
 pub enum AskOutcomeKind {
     Answered,
     Declined,
+    Cancelled,
     /// Nobody decided: `/stop`, a card close, the user moved on, or a
     /// during-execute approval's deadline passed.
     Abandoned,
@@ -76,6 +77,7 @@ pub fn ask_close(resolution: &AskResolution) -> (AskOutcomeKind, Option<Approval
         AskResolution::Approval(decision) => (AskOutcomeKind::Answered, Some(*decision)),
         AskResolution::Answered(_) => (AskOutcomeKind::Answered, None),
         AskResolution::Declined | AskResolution::PolicyDenied => (AskOutcomeKind::Declined, None),
+        AskResolution::Cancelled => (AskOutcomeKind::Cancelled, None),
         AskResolution::Abandoned | AskResolution::TimedOut => (AskOutcomeKind::Abandoned, None),
     }
 }
@@ -593,6 +595,7 @@ pub struct QuestionCard {
 pub enum QuestionReply {
     Answered { answers: Vec<QuestionAnswer> },
     Declined,
+    Cancelled,
 }
 
 /// Frame envelope. Tagged on the `kind` field so the receive side
@@ -1677,6 +1680,7 @@ mod tests {
         for outcome in [
             AskOutcomeKind::Answered,
             AskOutcomeKind::Declined,
+            AskOutcomeKind::Cancelled,
             AskOutcomeKind::Abandoned,
         ] {
             let frame = Frame::AskResolved {
@@ -1784,16 +1788,19 @@ mod tests {
         assert_eq!(answered, decode(&encode(&answered).unwrap()).unwrap());
         assert!(answered.routing_session_id().is_none());
 
-        let declined = Frame::AnswerQuestion {
-            ask_id: "q1".parse().unwrap(),
-            reply: QuestionReply::Declined,
-        };
-        assert_eq!(declined, decode(&encode(&declined).unwrap()).unwrap());
+        for reply in [QuestionReply::Declined, QuestionReply::Cancelled] {
+            let frame = Frame::AnswerQuestion {
+                ask_id: "q1".parse().unwrap(),
+                reply,
+            };
+            assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+        }
     }
 
     #[test]
     fn round_trip_tool_completed_and_work_step_with_ask_summary() {
         let summary = AskStepSummary {
+            cancelled: false,
             declined: false,
             questions: vec![AskStepQuestion {
                 header: "Auth".into(),

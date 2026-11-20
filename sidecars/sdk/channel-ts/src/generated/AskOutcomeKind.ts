@@ -6,4 +6,4 @@
  * `Answered`; an approval's decision rides beside it in
  * [`Frame::AskResolved::decision`].
  */
-export type AskOutcomeKind = "answered" | "declined" | "abandoned";
+export type AskOutcomeKind = "answered" | "declined" | "cancelled" | "abandoned";

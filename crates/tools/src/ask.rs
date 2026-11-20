@@ -151,6 +151,7 @@ pub enum QuestionOutcome {
     Answered(Vec<QuestionAnswer>),
     /// The human declined the questions as a whole.
     Declined,
+    Cancelled,
     /// Nobody answered: `/stop`, the card was closed, or the ask could not
     /// be shown.
     Abandoned,
@@ -162,6 +163,7 @@ impl QuestionOutcome {
         match self {
             Self::Answered(_) => QuestionOutcomeKind::Answered,
             Self::Declined => QuestionOutcomeKind::Declined,
+            Self::Cancelled => QuestionOutcomeKind::Cancelled,
             Self::Abandoned => QuestionOutcomeKind::Abandoned,
         }
     }

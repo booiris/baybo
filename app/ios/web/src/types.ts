@@ -178,7 +178,7 @@ export type WireFrame =
   | {
       kind: "ask_resolved";
       ask_id: string;
-      outcome: "answered" | "declined" | "abandoned";
+      outcome: "answered" | "declined" | "cancelled" | "abandoned";
       decision?: string;
     }
   // `started_at` is present iff `active` — it is the turn's identity for the

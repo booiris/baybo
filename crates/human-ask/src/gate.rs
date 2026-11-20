@@ -173,6 +173,7 @@ impl QuestionGate for ChannelAskGate {
         match resolution {
             AskResolution::Answered(answers) => QuestionOutcome::Answered(answers),
             AskResolution::Declined => QuestionOutcome::Declined,
+            AskResolution::Cancelled => QuestionOutcome::Cancelled,
             AskResolution::Abandoned | AskResolution::PolicyDenied | AskResolution::TimedOut => {
                 QuestionOutcome::Abandoned
             }

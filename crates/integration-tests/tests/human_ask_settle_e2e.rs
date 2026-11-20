@@ -412,6 +412,22 @@ async fn an_answered_question_lands_as_the_ask_user_result() {
 }
 
 #[tokio::test]
+async fn a_cancelled_question_keeps_its_result_after_restart() {
+    let Fixture { mut harness, .. } = restarted(
+        baybo_model::human_ask::ASK_USER_TOOL_NAME,
+        AskKind::Question,
+        Some(AskResolution::Cancelled),
+    )
+    .await;
+    reply(&harness, "ok");
+    harness.send_text("next").await.expect("send");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let result = adjacent_result(&harness).await;
+    assert!(result.contains(r#"{"cancelled":true}"#), "{result}");
+    stop(harness).await;
+}
+
+#[tokio::test]
 async fn an_abandoned_question_reads_declined() {
     let Fixture { mut harness, .. } = restarted(
         baybo_model::human_ask::ASK_USER_TOOL_NAME,

@@ -6,4 +6,4 @@ import type { AskStepQuestion } from "./AskStepQuestion";
  * input and result (`baybo_human_ask::ask_step_summary`) so the live wire and
  * REST reconstruction agree identically.
  */
-export type AskStepSummary = { declined: boolean, questions?: Array<AskStepQuestion>, };
+export type AskStepSummary = { declined: boolean, cancelled: boolean, questions?: Array<AskStepQuestion>, };

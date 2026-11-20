@@ -537,6 +537,7 @@ describe('work-step approval labelling & ask summary', () => {
   it('completion attaches the typed AskStepSummary onto the tool step', () => {
     const ask = {
       declined: false,
+      cancelled: false,
       questions: [
         {
           header: 'Auth',

@@ -260,6 +260,7 @@ pub struct QuestionAnswer {
 pub enum QuestionOutcomeKind {
     Answered,
     Declined,
+    Cancelled,
     Abandoned,
 }
 
@@ -268,6 +269,7 @@ impl QuestionOutcomeKind {
         match self {
             Self::Answered => "answered",
             Self::Declined => "declined",
+            Self::Cancelled => "cancelled",
             Self::Abandoned => "abandoned",
         }
     }
@@ -308,6 +310,8 @@ pub struct AskStepQuestion {
 )]
 pub struct AskStepSummary {
     pub declined: bool,
+    #[serde(default)]
+    pub cancelled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<AskStepQuestion>,
 }
@@ -322,6 +326,8 @@ pub enum AskResolution {
     Answered(Vec<QuestionAnswer>),
     /// A human declined to answer the questions.
     Declined,
+    /// The human explicitly cancelled the question.
+    Cancelled,
     /// Nobody answered: `/stop`, the card was closed, the user moved on, or
     /// the ask could not survive a restart.
     Abandoned,

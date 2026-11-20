@@ -21,7 +21,8 @@ Each question renders as a tab in the UI with 2 to 4 predefined options plus a f
 
 Rules:
 - Use this only when a genuine ambiguity or user preference must be settled before acting; do not ask trivial yes/no questions or anything you can determine by reading files.
-- `AskUser` MUST be the only tool call in your response. Put all questions into one call's `questions` array and wait for the user's answer before calling any other tool."#;
+- `AskUser` MUST be the only tool call in your response. Put all questions into one call's `questions` array and wait for the user's answer before calling any other tool.
+- A {"cancelled": true} result means the user cancelled this request. Leave its questions unanswered and do not repeat the request."#;
 
 /// Tool that raises a durable question ask through [`ToolContext::question`].
 pub struct AskUserTool;
@@ -216,6 +217,7 @@ impl Tool for AskUserTool {
         let payload = match outcome {
             QuestionOutcome::Answered(answers) => crate::result::answered(&answers),
             QuestionOutcome::Declined => crate::result::declined(),
+            QuestionOutcome::Cancelled => crate::result::cancelled(),
             QuestionOutcome::Abandoned => crate::result::abandoned(),
         };
         Ok(ToolOutput::Json(payload))

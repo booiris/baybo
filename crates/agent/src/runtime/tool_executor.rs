@@ -4471,6 +4471,9 @@ mod tests {
                     Ok(ToolOutput::Json(json!({ "answers": answers })))
                 }
                 QuestionOutcome::Declined => Ok(ToolOutput::Json(json!({ "declined": true }))),
+                QuestionOutcome::Cancelled => {
+                    Ok(ToolOutput::Json(baybo_human_ask::result::cancelled()))
+                }
                 QuestionOutcome::Abandoned => Err(ToolError::Execution("abandoned".into())),
             }
         }

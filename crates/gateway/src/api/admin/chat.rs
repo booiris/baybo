@@ -600,6 +600,8 @@ impl From<baybo_model::human_ask::AskStepQuestion> for ChatAskQuestion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ChatAskStepSummary {
     pub declined: bool,
+    #[serde(default)]
+    pub cancelled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<ChatAskQuestion>,
 }
@@ -608,6 +610,7 @@ impl From<baybo_model::human_ask::AskStepSummary> for ChatAskStepSummary {
     fn from(summary: baybo_model::human_ask::AskStepSummary) -> Self {
         Self {
             declined: summary.declined,
+            cancelled: summary.cancelled,
             questions: summary
                 .questions
                 .into_iter()

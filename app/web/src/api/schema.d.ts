@@ -1787,6 +1787,7 @@ export interface components {
          *     [`baybo_model::human_ask::AskStepSummary`] on the REST transcript surface.
          */
         ChatAskStepSummary: {
+            cancelled?: boolean;
             declined: boolean;
             questions?: components["schemas"]["ChatAskQuestion"][];
         };

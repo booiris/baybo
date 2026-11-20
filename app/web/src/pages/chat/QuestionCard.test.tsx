@@ -105,13 +105,16 @@ describe('QuestionCard', () => {
     expect((screen.getByLabelText(/Session/) as HTMLInputElement).checked).toBe(true);
   });
 
-  it('Skip sends declined immediately even when nothing is answered', () => {
+  it.each([['Skip', 'declined'], ['Cancel ask', 'cancelled']])('%s sends only its outcome once', (label, kind) => {
     const onSubmit = vi.fn(() => true);
     render(<StatefulCard onSubmit={onSubmit} />);
 
-    fireEvent.click(screen.getByRole('button', { name: /skip/i }));
+    fireEvent.click(screen.getByLabelText(/JWT/));
+    const button = screen.getByRole('button', { name: label });
+    fireEvent.click(button);
+    fireEvent.click(button);
     expect(onSubmit).toHaveBeenCalledTimes(1);
-    expect(onSubmit).toHaveBeenCalledWith({ kind: 'declined' });
+    expect(onSubmit).toHaveBeenCalledWith({ kind });
   });
 
   it('uses arrows and numbers outside text fields and submits only on explicit activation', () => {

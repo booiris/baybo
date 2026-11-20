@@ -364,6 +364,9 @@ fn settled_result(
         (AskKind::Question, AskResolution::Declined) => {
             question(baybo_human_ask::result::declined())
         }
+        (AskKind::Question, AskResolution::Cancelled) => {
+            question(baybo_human_ask::result::cancelled())
+        }
         (AskKind::Question, _) => question(baybo_human_ask::result::abandoned()),
         (AskKind::Approval, _) => {
             let outcome =

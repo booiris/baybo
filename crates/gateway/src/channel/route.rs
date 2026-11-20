@@ -283,6 +283,7 @@ async fn answer_question(
             AskResolution::Answered(answers)
         }
         QuestionReply::Declined => AskResolution::Declined,
+        QuestionReply::Cancelled => AskResolution::Cancelled,
     };
     if let Err(e) = state.human_asks.resolve(ask_id, resolution).await {
         tracing::debug!(%ask_id, error = %e, "AnswerQuestion not applied");

@@ -4,4 +4,4 @@ import type { QuestionAnswer } from "./QuestionAnswer";
 /**
  * Client answer payload on [`Frame::AnswerQuestion`].
  */
-export type QuestionReply = { "kind": "answered", answers: Array<QuestionAnswer>, } | { "kind": "declined" };
+export type QuestionReply = { "kind": "answered", answers: Array<QuestionAnswer>, } | { "kind": "declined" } | { "kind": "cancelled" };

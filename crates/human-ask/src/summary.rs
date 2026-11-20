@@ -23,12 +23,14 @@ pub fn first_question_header(input: &Value) -> Option<String> {
 
 /// Derive a typed [`AskStepSummary`] from an `AskUser` call's `input` and
 /// parsed JSON `result`. Returns `None` when the input does not parse as a
-/// non-empty [`QuestionRequest`](baybo_model::human_ask::QuestionRequest) or the result is neither an `answers` nor a
-/// `declined` envelope (e.g. a validation error or cancelled fill).
+/// non-empty [`QuestionRequest`](baybo_model::human_ask::QuestionRequest) or
+/// the result is not an `answers`, `declined` or `cancelled` envelope.
 pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary> {
     let req = crate::tools::validate_question_request(input.clone()).ok()?;
 
-    if result.get("declined").and_then(Value::as_bool) == Some(true) {
+    let declined = result.get("declined").and_then(Value::as_bool) == Some(true);
+    let cancelled = result.get("cancelled").and_then(Value::as_bool) == Some(true);
+    if declined || cancelled {
         let questions = req
             .questions
             .into_iter()
@@ -43,7 +45,8 @@ pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>
             })
             .collect();
         return Some(AskStepSummary {
-            declined: true,
+            declined,
+            cancelled,
             questions,
         });
     }
@@ -96,6 +99,7 @@ pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>
 
     Some(AskStepSummary {
         declined: false,
+        cancelled: false,
         questions,
     })
 }
@@ -109,6 +113,9 @@ pub fn format_ask_summary(summary: &AskStepSummary) -> String {
     } else {
         format!("Asked {n} questions")
     };
+    if summary.cancelled {
+        return format!("{lead} · cancelled");
+    }
     if summary.declined {
         return format!("{lead} · declined");
     }
@@ -232,6 +239,23 @@ mod tests {
             assert_eq!(summary.questions.len(), 2);
             assert_eq!(format_ask_summary(&summary), "Asked 2 questions · declined");
         }
+    }
+
+    #[test]
+    fn cancellation_preserves_the_questions_without_claiming_an_answer() {
+        let summary = ask_step_summary(&sample_input(), &result::cancelled()).expect("summary");
+        assert!(summary.cancelled);
+        assert!(!summary.declined);
+        assert_eq!(
+            format_ask_summary(&summary),
+            "Asked 2 questions · cancelled"
+        );
+        assert!(
+            summary
+                .questions
+                .iter()
+                .all(|q| q.selected.is_empty() && q.other.is_none() && !q.skipped)
+        );
     }
 
     #[test]

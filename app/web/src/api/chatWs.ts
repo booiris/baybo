@@ -137,7 +137,8 @@ export interface WireQuestionAnswer {
 
 export type WireQuestionReply =
   | { kind: 'answered'; answers: WireQuestionAnswer[] }
-  | { kind: 'declined' };
+  | { kind: 'declined' }
+  | { kind: 'cancelled' };
 
 export interface WireQuestionCard {
   queue_index: number;
@@ -159,6 +160,7 @@ export interface WireAskStepQuestion {
 
 export interface WireAskStepSummary {
   declined: boolean;
+  cancelled: boolean;
   questions?: WireAskStepQuestion[];
 }
 
@@ -319,7 +321,7 @@ export type Frame =
   | {
       kind: 'ask_resolved';
       ask_id: string;
-      outcome: 'answered' | 'declined' | 'abandoned';
+      outcome: 'answered' | 'declined' | 'cancelled' | 'abandoned';
       /** Set when a human decided an approval; absent on every undecided close. */
       decision?: string;
     }

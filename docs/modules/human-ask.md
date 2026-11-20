@@ -816,6 +816,8 @@ Result, `ToolOutput::Json`, serialized verbatim into the `tool_result`:
 ```jsonc
 { "answers": [ { "header": "Auth", "selected": ["JWT"], "other": null } ] }
 // a tab the user did not answer: { "header": "DB", "selected": [], "other": null, "skipped": true }
+// cancelled by the user, with no draft answers submitted:
+{ "cancelled": true }
 // declined as a whole:
 { "declined": true, "note": "the user declined to answer; proceed on your best judgment or ask in plain text" }
 ```
@@ -859,7 +861,7 @@ the channel, bumps the park gauge, awaits the oneshot; no timeout) → map
 
 **Step summary** — `ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>`
 (in `baybo-human-ask`, typed: question count + per-tab `header` with selected
-labels / other / skipped, or declined) is the one derivation used by both the
+labels / other / skipped, declined or cancelled) is the one derivation used by both the
 live plane and REST: the loop computes it at `emit_tool_completed`
 (`agent_loop.rs:~1643`, where `dispatch.arguments` and `executed.output` are
 in hand) and it rides `AgentEvent::ToolCompleted.ask` → `Frame::ToolCompleted.ask`
@@ -873,8 +875,9 @@ carries only `ToolStarted`/`ToolCompleted`, `work_steps.rs:36-83`).
 
 The web composer parks text and ready attachments in the session's ordinary
 message queue while a live or restored question is pending. The question
-card keeps its draft selections and Other fields until the user submits or
-skips it. Both actions send `Frame::AnswerQuestion`. The continued turn's
+card keeps its draft selections and Other fields until the user chooses Submit,
+Skip or Cancel ask. Cancelling closes the question and returns `{"cancelled": true}`
+to the model. All three actions send `Frame::AnswerQuestion`. The continued turn's
 normal completion drains the queue. A typed `/stop` still cancels a live turn.
 
 ### Wire surface
@@ -886,7 +889,7 @@ named `ask_id`. `ApprovalResolved` is gone: its decision rides
 
 ```rust
 Frame::QuestionAsked   { ask_id, tool_call_id: String, session_id, user_id, questions: Vec<WireQuestion> }  // session-scoped
-Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | abandoned */,
+Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | cancelled | abandoned */,
                          decision: Option<ApprovalDecision> /* a human's, on an approval */ }              // session-less, any kind
 Frame::AnswerQuestion  { ask_id, reply: QuestionReply /* Answered { answers: Vec<WireAnswer> } | Declined */ } // client → server
 Frame::ToolCompleted   { …, ask: Option<AskStepSummary> }                                                   // additive optional field
@@ -986,7 +989,7 @@ pattern:
 - tab strip of `header`s, answered tabs ticked; radio for single, checkbox
   for `multi_select`; a multiline "Other…" text area per tab;
 - **Submit** enabled once every tab has a selection or other-text; **Skip**
-  sends `Declined`;
+  sends `Declined`. **Cancel ask** sends `Cancelled`, even with incomplete answers;
 - keys: `←/→`/`Tab` switch tabs, `1–4` pick — inactive
   while the other-input has focus; the active tab index lives per `askId` in
   `SessionView`;
@@ -996,7 +999,7 @@ Work step: "waiting for your answer" while parked, spinner suppressed, and
 `awaitingReply` cleared on `question_asked` so no "Working…" stacks above the
 form. After the answer the step collapses to a summary
 (`Asked 2 questions · Auth: JWT · DB: Postgres, Redis`; skipped tabs read
-*skipped*; declined reads *declined*), expandable to the full questions with
+*skipped*; a closed card shows *declined* or *cancelled*), expandable to the full questions with
 the chosen options highlighted, rendered from `ChatWorkStep.ask` /
 `WireWorkStep.ask` / `tool_completed.ask` — the one server-side derivation;
 no new `ToolResultMeta` field, as decided, and the DTO never exposes raw tool
@@ -1625,7 +1628,7 @@ implemented as written unless overridden.
    shutdown side. The alternative — treat shutdown like `/stop` — means
    "survives a restart" only covers crashes, not `baybo gateway restart`,
    which is the common restart.
-4. **Messages queue behind restored questions too.** The card owns its answers and only Submit or Skip sends a question reply.
+4. **Messages queue behind restored questions too.** The card owns its answers and only Submit, Skip or Cancel ask sends a question reply.
 
 (Earlier draft decision "user-rooted subagents become unattended" is
 withdrawn: they are already auto-denied by the gate map's fallback for the

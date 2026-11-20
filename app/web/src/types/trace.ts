@@ -361,7 +361,7 @@ export type ToolEventPayload =
       command: string;
     };
 
-export type QuestionOutcomeKind = 'answered' | 'declined' | 'abandoned';
+export type QuestionOutcomeKind = 'answered' | 'declined' | 'cancelled' | 'abandoned';
 
 export type SpanEventKind =
   | {

@@ -5140,6 +5140,7 @@ function askSummaryFromApi(
   if (!api) return undefined;
   return {
     declined: api.declined,
+    cancelled: api.cancelled ?? false,
     questions: api.questions?.map((q) => ({
       header: q.header,
       question: q.question,
@@ -6887,6 +6888,7 @@ function ReasoningStepView({ text }: { text: string }) {
 }
 
 function AskStepSummaryView({ summary }: { summary: AskStepSummary }) {
+  const outcome = summary.cancelled ? 'cancelled' : summary.declined ? 'declined' : null;
   const qs = summary.questions ?? [];
   const lead = qs.length === 1 ? 'Asked 1 question' : `Asked ${qs.length} questions`;
   return (
@@ -6894,10 +6896,10 @@ function AskStepSummaryView({ summary }: { summary: AskStepSummary }) {
       <summary className="cursor-pointer select-none hover:text-ink break-words [overflow-wrap:anywhere]">
         <span className="select-none mr-1.5">⎿</span>
         <span>{lead}</span>
-        {summary.declined ? (
+        {outcome !== null ? (
           <>
             <span> · </span>
-            <em className="italic">declined</em>
+            <em className="italic">{outcome}</em>
           </>
         ) : (
           qs.map((q, idx) => {
@@ -6958,8 +6960,8 @@ function AskStepSummaryView({ summary }: { summary: AskStepSummary }) {
                     <span className="font-bold">Other:</span> {q.other}
                   </div>
                 ) : null}
-                {summary.declined ? (
-                  <div className="pl-1 italic text-ink-soft">declined</div>
+                {outcome !== null ? (
+                  <div className="pl-1 italic text-ink-soft">{outcome}</div>
                 ) : q.skipped ? (
                   <div className="pl-1 italic text-ink-soft">skipped</div>
                 ) : null}

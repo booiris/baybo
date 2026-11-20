@@ -40,6 +40,11 @@ pub fn declined() -> Value {
     json!({ "declined": true, "note": DECLINED_NOTE })
 }
 
+/// The human cancelled this question without submitting any draft answers.
+pub fn cancelled() -> Value {
+    json!({ "cancelled": true })
+}
+
 /// Nobody could be asked because this turn has no question gate (unattended
 /// turn or a channel without a question UI).
 pub fn unattended() -> Value {

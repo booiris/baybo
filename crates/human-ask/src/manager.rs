@@ -448,7 +448,9 @@ fn normalize_answers(request: &QuestionRequest, answers: &mut [QuestionAnswer]) 
 fn fits(kind: AskKind, resolution: &AskResolution) -> bool {
     match resolution {
         AskResolution::Approval(_) => kind == AskKind::Approval,
-        AskResolution::Answered(_) | AskResolution::Declined => kind == AskKind::Question,
+        AskResolution::Answered(_) | AskResolution::Declined | AskResolution::Cancelled => {
+            kind == AskKind::Question
+        }
         AskResolution::Abandoned | AskResolution::PolicyDenied => true,
         // Only the gate's own deadline produces it, never a verb.
         AskResolution::TimedOut => false,

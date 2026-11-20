@@ -234,6 +234,7 @@ describe('WorkStepView render-time ask badge & AskStepSummary', () => {
           toolStatus: 'ok',
           ask: {
             declined: false,
+            cancelled: false,
             questions: [
               {
                 header: 'Auth',
@@ -271,7 +272,7 @@ describe('WorkStepView render-time ask badge & AskStepSummary', () => {
     expect(container.textContent).toContain('Which auth strategy?');
     expect(container.textContent).toContain('Stateless');
 
-    const declined = render(
+    const closedCard = (outcome: 'declined' | 'cancelled') => render(
       <WorkStepView
         step={step({
           kind: 'tool',
@@ -279,7 +280,8 @@ describe('WorkStepView render-time ask badge & AskStepSummary', () => {
           tool: 'AskUser',
           toolStatus: 'ok',
           ask: {
-            declined: true,
+            declined: outcome === 'declined',
+            cancelled: outcome === 'cancelled',
             questions: [
               {
                 header: 'Auth',
@@ -294,8 +296,12 @@ describe('WorkStepView render-time ask badge & AskStepSummary', () => {
         })}
       />,
     );
-    expect(declined.container.querySelector('summary')?.textContent).toContain('Asked 1 question');
-    expect(declined.container.querySelector('summary em')?.textContent).toBe('declined');
+    for (const outcome of ['declined', 'cancelled'] as const) {
+      const { container } = closedCard(outcome);
+      expect(container.querySelector('summary')?.textContent).toContain('Asked 1 question');
+      expect(container.querySelector('summary em')?.textContent).toBe(outcome);
+      expect(container.querySelector('details > div')?.textContent).toContain(outcome);
+    }
   });
 
   it('suppresses CancelledTurnIndicator when the trailing closed block owns a pending ask (post-restart)', () => {
