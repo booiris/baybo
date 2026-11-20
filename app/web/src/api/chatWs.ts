@@ -137,7 +137,6 @@ export interface WireQuestionAnswer {
 
 export type WireQuestionReply =
   | { kind: 'answered'; answers: WireQuestionAnswer[] }
-  | { kind: 'declined' }
   | { kind: 'cancelled' };
 
 export interface WireQuestionCard {

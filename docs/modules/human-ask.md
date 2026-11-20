@@ -875,9 +875,9 @@ carries only `ToolStarted`/`ToolCompleted`, `work_steps.rs:36-83`).
 
 The web composer parks text and ready attachments in the session's ordinary
 message queue while a live or restored question is pending. The question
-card keeps its draft selections and Other fields until the user chooses Submit,
-Skip or Cancel ask. Cancelling closes the question and returns `{"cancelled": true}`
-to the model. All three actions send `Frame::AnswerQuestion`. The continued turn's
+card keeps its draft selections and Other fields until the user chooses Submit
+or Cancel ask. Cancelling closes the question and returns `{"cancelled": true}`
+to the model. Both actions send `Frame::AnswerQuestion`. The continued turn's
 normal completion drains the queue. A typed `/stop` still cancels a live turn.
 
 ### Wire surface
@@ -891,7 +891,7 @@ named `ask_id`. `ApprovalResolved` is gone: its decision rides
 Frame::QuestionAsked   { ask_id, tool_call_id: String, session_id, user_id, questions: Vec<WireQuestion> }  // session-scoped
 Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | cancelled | abandoned */,
                          decision: Option<ApprovalDecision> /* a human's, on an approval */ }              // session-less, any kind
-Frame::AnswerQuestion  { ask_id, reply: QuestionReply /* Answered { answers: Vec<WireAnswer> } | Declined */ } // client → server
+Frame::AnswerQuestion  { ask_id, reply: QuestionReply /* Answered { answers: Vec<WireAnswer> } | Cancelled */ } // client → server
 Frame::ToolCompleted   { …, ask: Option<AskStepSummary> }                                                   // additive optional field
 SubscribeState { …, pending_questions: Vec<QuestionCard> }   // #[serde(default, skip_serializing_if = "Vec::is_empty")]
 WireWorkStep   { …, ask: Option<AskStepSummary> }
@@ -988,8 +988,7 @@ pattern:
 
 - tab strip of `header`s, answered tabs ticked; radio for single, checkbox
   for `multi_select`; a multiline "Other…" text area per tab;
-- **Submit** enabled once every tab has a selection or other-text; **Skip**
-  sends `Declined`. **Cancel ask** sends `Cancelled`, even with incomplete answers;
+- **Submit** enabled once every tab has a selection or other-text; **Cancel ask** sends `Cancelled`, even with incomplete answers;
 - keys: `←/→`/`Tab` switch tabs, `1–4` pick — inactive
   while the other-input has focus; the active tab index lives per `askId` in
   `SessionView`;
@@ -1597,7 +1596,7 @@ Integration (`crates/integration-tests`, sqlite-backed harness):
   attempt executes the approved call and `finish_run` is called once.
 
 Web (vitest): `QuestionCard` (tabs, single/multi, other, submit enablement,
-skip, keys), `decideComposerAction` precedence incl. `/stop`, a slash
+cancel, keys), `decideComposerAction` precedence incl. `/stop`, a slash
 command under a live or restored question → `park`,
 `transcriptTailSignature` with two asks, render-time badge with
 `turn.active = false` and the bundle arriving before the REST page,
@@ -1628,7 +1627,7 @@ implemented as written unless overridden.
    shutdown side. The alternative — treat shutdown like `/stop` — means
    "survives a restart" only covers crashes, not `baybo gateway restart`,
    which is the common restart.
-4. **Messages queue behind restored questions too.** The card owns its answers and only Submit, Skip or Cancel ask sends a question reply.
+4. **Messages queue behind restored questions too.** The card owns its answers and only Submit or Cancel ask sends a question reply.
 
 (Earlier draft decision "user-rooted subagents become unattended" is
 withdrawn: they are already auto-denied by the gate map's fallback for the

@@ -594,7 +594,6 @@ pub struct QuestionCard {
 )]
 pub enum QuestionReply {
     Answered { answers: Vec<QuestionAnswer> },
-    Declined,
     Cancelled,
 }
 
@@ -1788,13 +1787,11 @@ mod tests {
         assert_eq!(answered, decode(&encode(&answered).unwrap()).unwrap());
         assert!(answered.routing_session_id().is_none());
 
-        for reply in [QuestionReply::Declined, QuestionReply::Cancelled] {
-            let frame = Frame::AnswerQuestion {
-                ask_id: "q1".parse().unwrap(),
-                reply,
-            };
-            assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-        }
+        let cancelled = Frame::AnswerQuestion {
+            ask_id: "q1".parse().unwrap(),
+            reply: QuestionReply::Cancelled,
+        };
+        assert_eq!(cancelled, decode(&encode(&cancelled).unwrap()).unwrap());
     }
 
     #[test]

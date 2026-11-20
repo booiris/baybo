@@ -1979,7 +1979,7 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
         }
     }
 
-    // 2. Declined flow.
+    // 2. Cancel the entire question card.
     let q2 = baybo_tools::QuestionAsk {
         ask_id: "q-ws-2".parse().unwrap(),
         tool_call_id: "use-q-ws-2".into(),
@@ -2010,14 +2010,14 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
         &mut tab_a,
         Frame::AnswerQuestion {
             ask_id: "q-ws-2".parse().unwrap(),
-            reply: wire::QuestionReply::Declined,
+            reply: wire::QuestionReply::Cancelled,
         },
     )
     .await
-    .expect("send Declined");
+    .expect("send Cancelled");
     assert_eq!(
         parked2.await.expect("gate task 2"),
-        baybo_tools::QuestionOutcome::Declined
+        baybo_tools::QuestionOutcome::Cancelled
     );
     loop {
         match recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
@@ -2031,7 +2031,7 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
                 decision,
             } => {
                 assert_eq!(ask_id, "q-ws-2");
-                assert_eq!(outcome, wire::AskOutcomeKind::Declined);
+                assert_eq!(outcome, wire::AskOutcomeKind::Cancelled);
                 assert_eq!(decision, None);
                 break;
             }

@@ -105,16 +105,16 @@ describe('QuestionCard', () => {
     expect((screen.getByLabelText(/Session/) as HTMLInputElement).checked).toBe(true);
   });
 
-  it.each([['Skip', 'declined'], ['Cancel ask', 'cancelled']])('%s sends only its outcome once', (label, kind) => {
+  it('cancels the ask once without submitting draft answers', () => {
     const onSubmit = vi.fn(() => true);
     render(<StatefulCard onSubmit={onSubmit} />);
 
     fireEvent.click(screen.getByLabelText(/JWT/));
-    const button = screen.getByRole('button', { name: label });
+    const button = screen.getByRole('button', { name: /cancel ask/i });
     fireEvent.click(button);
     fireEvent.click(button);
     expect(onSubmit).toHaveBeenCalledTimes(1);
-    expect(onSubmit).toHaveBeenCalledWith({ kind });
+    expect(onSubmit).toHaveBeenCalledWith({ kind: 'cancelled' });
   });
 
   it('uses arrows and numbers outside text fields and submits only on explicit activation', () => {
@@ -198,7 +198,7 @@ describe('QuestionCard', () => {
 
     expect(screen.getByText('+2 waiting')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /submit/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /skip/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /cancel ask/i })).toBeDisabled();
     expect(screen.getByText(/waiting for connection/i)).toBeInTheDocument();
   });
 });

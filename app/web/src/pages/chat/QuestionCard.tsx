@@ -271,17 +271,14 @@ export function QuestionCard({
           >
             <RiCheckLine /> Submit
           </button>
-          {(['declined', 'cancelled'] as const).map((kind) => (
-            <button
-              key={kind}
-              type="button"
-              onClick={() => sendReply({ kind })}
-              disabled={submitting || !connected}
-              className="px-3 py-1.5 bg-white text-ink border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal-sm"
-            >
-              {kind === 'declined' ? 'Skip' : 'Cancel ask'}
-            </button>
-          ))}
+          <button
+            type="button"
+            onClick={() => sendReply({ kind: 'cancelled' })}
+            disabled={submitting || !connected}
+            className="px-3 py-1.5 bg-white text-ink border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal-sm"
+          >
+            Cancel ask
+          </button>
         </div>
         {questions.length > 1 ? <span className="text-[11px] font-mono text-ink-soft">←/→ tabs</span> : null}
       </div>

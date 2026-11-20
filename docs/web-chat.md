@@ -204,7 +204,7 @@ Key invariant: because the stop button only appears when `!hasContent`, typing a
 
 - `!hasContent` → `noop`.
 - `/stop` typed → `stop` (bypasses busy/paused and pending questions — this is what abandons a live ask), routed to `sendText('/stop')`.
-- A pending question, a busy turn or a paused queue → `park`. Text, commands and ready attachments enter the same session queue. Submit, Skip and Cancel ask on the card resolve the question.
+- A pending question, a busy turn or a paused queue → `park`. Text, commands and ready attachments enter the same session queue. Submit and Cancel ask on the card resolve the question.
 - Otherwise → `direct` via `sendText(composer, wire)`.
 
 `/stop` detection is `isStopCommand`: trimmed text starting with `/` whose first token (split on whitespace or `@`) lowercases to `stop`.
@@ -636,7 +636,7 @@ Between `handleSend` and the agent's first output frame, `SessionView.awaitingRe
 One view model drives both kinds: `SessionView.pendingAsks: PendingAsk[]` (discriminated on `kind: 'approval' | 'question'`), with removal always keyed by `askId`. The foot of the transcript renders the **oldest** pending ask and badges `+{N} waiting` when more are queued:
 
 - **`ApprovalCard`** (in `ChatPage.tsx`) — shows `Approval needed: <tool>`, an optional description, a bulleted list of `ResourceAccess` entries rendered by `formatAccess` (e.g. `read <path>`, `run: <command>`, `reach <host>` / `network access`, `read env: …`), and a collapsible `<details>` with the raw `paramsPreview`. Three buttons emit an `ApprovalDecision`: **Approve** (`bg-ok`), **Approve always** (`approve_always`), **Deny** (`bg-err`).
-- **`QuestionCard`** (`app/web/src/pages/chat/QuestionCard.tsx`) — shows a tab strip of `header`s (answered tabs ticked), radio buttons for single-select or checkboxes for `multi_select`, a multiline `"Other…"` text area per tab, **Submit** (enabled once every tab has a selection or other-text), **Skip** (`declined`) and **Cancel ask** (`cancelled`). Choosing a radio option advances to the next tab when one is available. Checkboxes and the multiline field keep the current tab open. Window keyboard shortcuts (`←/→`/`Tab` switch tabs, `1–4` pick) are active whenever focus is not in a text input; the active tab index lives per `askId` in `SessionView.questionTabByAskId`.
+- **`QuestionCard`** (`app/web/src/pages/chat/QuestionCard.tsx`) — shows a tab strip of `header`s (answered tabs ticked), radio buttons for single-select or checkboxes for `multi_select`, a multiline `"Other…"` text area per tab, **Submit** (enabled once every tab has a selection or other-text) and **Cancel ask** (`cancelled`). Choosing a radio option advances to the next tab when one is available. Checkboxes and the multiline field keep the current tab open. Window keyboard shortcuts (`←/→`/`Tab` switch tabs, `1–4` pick) are active whenever focus is not in a text input; the active tab index lives per `askId` in `SessionView.questionTabByAskId`.
 
 Both cards disable their buttons while `!connected` (with a warn banner) and guard against synchronous double-clicks with a `submittingRef`. On (re)subscribe, `pendingAsks` is REPLACEd wholesale from `subscribe_state.pending_approvals ∪ subscribe_state.pending_questions` — full cards from one atomic server-side queue read, with each question’s `queue_index` restoring its position among approvals — and `awaitingReply` is cleared whenever a pending ask arrives so no "Working…" stacks above the card.
 
