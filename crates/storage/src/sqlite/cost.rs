@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
 use super::time;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_model::{CallReason, CostRecord, CostSummary, TimeRange};
 use baybo_model::{MicroUsd, SessionId, SpanId, TurnId};
 use baybo_store::StorageError;
@@ -67,23 +67,19 @@ impl CostStore for SqliteCostStore {
         let user_id = user_id.to_string();
         let from = time::to_us(range.from);
         let to = time::to_us(range.to);
-        let raws = self
+        self
             .pool
             .interact("cost.query_user", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \
+                    "SELECT id, user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \
                             input_tokens, output_tokens, cached_input_tokens, \
                             cache_creation_input_tokens, cost_usd, timestamp \
                      FROM cost_records \
                      WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
                 )?;
-                let raws = stmt
-                    .query_map(rusqlite::params![user_id, from, to], raw_cost_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(raws)
+                COST.list(stmt.query(rusqlite::params![user_id, from, to])?)
             })
-            .await?;
-        raws.into_iter().map(raw_to_cost_record).collect()
+            .await
     }
 
     async fn query_user_summary(&self, user_id: &str, range: TimeRange) -> CostResult<CostSummary> {
@@ -95,13 +91,11 @@ impl CostStore for SqliteCostStore {
             .interact("cost.query_user_summary", move |conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                                COALESCE(SUM(output_tokens), 0), \
-                                COALESCE(SUM(cached_input_tokens), 0), \
-                                COALESCE(SUM(cache_creation_input_tokens), 0), \
-                                COUNT(*) \
+                        &format!(
+                            "SELECT {SUMMARY_COLUMNS} \
                          FROM cost_records \
-                         WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
+                         WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3"
+                        ),
                         rusqlite::params![user_id, from, to],
                         summary_from_aggregate_row,
                     )
@@ -127,16 +121,10 @@ impl CostStore for SqliteCostStore {
         };
         self.pool
             .interact("cost.query_range_grouped", move |conn| {
-                // Aggregates first, key last, so the shared
-                // `summary_from_aggregate_row` decode (columns 0-5) is reused
-                // instead of a third hand-indexed copy.
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT COALESCE(SUM(cost_usd), 0), \
-                            COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
-                            COALESCE(SUM(cached_input_tokens), 0), \
-                            COALESCE(SUM(cache_creation_input_tokens), 0), COUNT(*), {key_expr} \
+                    "SELECT {SUMMARY_COLUMNS}, {key_expr} AS bucket \
                      FROM cost_records WHERE timestamp >= ?1 AND timestamp < ?2 \
-                     GROUP BY 7"
+                     GROUP BY bucket"
                 ))?;
                 let rows = stmt
                     .query_map(rusqlite::params![from, to], bucket_from_aggregate_row)?
@@ -153,13 +141,10 @@ impl CostStore for SqliteCostStore {
         let session_id = session_id.as_str().to_string();
         self.pool
             .interact("cost.query_session_by_turn", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT COALESCE(SUM(cost_usd), 0), \
-                            COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
-                            COALESCE(SUM(cached_input_tokens), 0), \
-                            COALESCE(SUM(cache_creation_input_tokens), 0), COUNT(*), turn_id \
-                     FROM cost_records WHERE session_id = ?1 GROUP BY turn_id",
-                )?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SUMMARY_COLUMNS}, turn_id AS bucket \
+                     FROM cost_records WHERE session_id = ?1 GROUP BY turn_id"
+                ))?;
                 let rows = stmt
                     .query_map(rusqlite::params![session_id], bucket_from_aggregate_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -176,12 +161,10 @@ impl CostStore for SqliteCostStore {
             .interact("cost.query_global", move |conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                                COALESCE(SUM(output_tokens), 0), \
-                                COALESCE(SUM(cached_input_tokens), 0), \
-                                COALESCE(SUM(cache_creation_input_tokens), 0), \
-                                COUNT(*) \
-                         FROM cost_records WHERE timestamp >= ?1 AND timestamp < ?2",
+                        &format!(
+                            "SELECT {SUMMARY_COLUMNS} \
+                         FROM cost_records WHERE timestamp >= ?1 AND timestamp < ?2"
+                        ),
                         rusqlite::params![from, to],
                         summary_from_aggregate_row,
                     )
@@ -198,12 +181,10 @@ impl CostStore for SqliteCostStore {
             .interact("cost.query_session", move |conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                                COALESCE(SUM(output_tokens), 0), \
-                                COALESCE(SUM(cached_input_tokens), 0), \
-                                COALESCE(SUM(cache_creation_input_tokens), 0), \
-                                COUNT(*) \
-                         FROM cost_records WHERE session_id = ?1",
+                        &format!(
+                            "SELECT {SUMMARY_COLUMNS} \
+                         FROM cost_records WHERE session_id = ?1"
+                        ),
                         rusqlite::params![session_id],
                         summary_from_aggregate_row,
                     )
@@ -216,24 +197,20 @@ impl CostStore for SqliteCostStore {
     async fn query_records_in_range(&self, range: TimeRange) -> CostResult<Vec<CostRecord>> {
         let from = time::to_us(range.from);
         let to = time::to_us(range.to);
-        let raws = self
+        self
             .pool
             .interact("cost.query_records_in_range", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \
+                    "SELECT id, user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \
                             input_tokens, output_tokens, cached_input_tokens, \
                             cache_creation_input_tokens, cost_usd, timestamp \
                      FROM cost_records \
                      WHERE timestamp >= ?1 AND timestamp < ?2 \
                      ORDER BY timestamp",
                 )?;
-                let raws = stmt
-                    .query_map(rusqlite::params![from, to], raw_cost_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(raws)
+                COST.list(stmt.query(rusqlite::params![from, to])?)
             })
-            .await?;
-        raws.into_iter().map(raw_to_cost_record).collect()
+            .await
     }
 
     async fn query_turn(&self, turn_id: &TurnId) -> CostResult<CostSummary> {
@@ -243,12 +220,10 @@ impl CostStore for SqliteCostStore {
             .interact("cost.query_turn", move |conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                                COALESCE(SUM(output_tokens), 0), \
-                                COALESCE(SUM(cached_input_tokens), 0), \
-                                COALESCE(SUM(cache_creation_input_tokens), 0), \
-                                COUNT(*) \
-                         FROM cost_records WHERE turn_id = ?1",
+                        &format!(
+                            "SELECT {SUMMARY_COLUMNS} \
+                         FROM cost_records WHERE turn_id = ?1"
+                        ),
                         rusqlite::params![turn_id],
                         summary_from_aggregate_row,
                     )
@@ -259,105 +234,61 @@ impl CostStore for SqliteCostStore {
     }
 }
 
-/// Decode `<summary aggregates>, key` — the shared 6-column aggregate
-/// SELECT list with the group key appended as column 6.
+const SUMMARY_COLUMNS: &str = "COALESCE(SUM(cost_usd), 0) AS cost_usd, \
+    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+    COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens, \
+    COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens, \
+    COUNT(*) AS record_count";
+
 fn bucket_from_aggregate_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostGroupBucket> {
     Ok(CostGroupBucket {
         summary: summary_from_aggregate_row(row)?,
-        key: row.get::<_, String>(6)?,
+        key: row.get::<_, String>("bucket")?,
     })
 }
 
 fn summary_from_aggregate_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostSummary> {
     Ok(CostSummary {
-        total_cost_usd: MicroUsd::from_micros(row.get::<_, i64>(0)?),
-        total_input_tokens: row.get::<_, i64>(1)? as usize,
-        total_output_tokens: row.get::<_, i64>(2)? as usize,
-        total_cached_input_tokens: row.get::<_, i64>(3)? as usize,
-        total_cache_creation_input_tokens: row.get::<_, i64>(4)? as usize,
-        record_count: row.get::<_, i64>(5)? as usize,
+        total_cost_usd: MicroUsd::from_micros(row.get::<_, i64>("cost_usd")?),
+        total_input_tokens: row.get::<_, i64>("input_tokens")? as usize,
+        total_output_tokens: row.get::<_, i64>("output_tokens")? as usize,
+        total_cached_input_tokens: row.get::<_, i64>("cached_input_tokens")? as usize,
+        total_cache_creation_input_tokens: row.get::<_, i64>("cache_creation_input_tokens")?
+            as usize,
+        record_count: row.get::<_, i64>("record_count")? as usize,
     })
 }
 
-/// Raw column values of one `cost_records` row.
-///
-/// The `query_map` row closure can only fail with a `rusqlite::Error`, so the
-/// columns that still need fallible decoding (ids, timestamp) are carried out
-/// verbatim and turned into a [`CostRecord`] by [`raw_to_cost_record`].
-struct RawCostRow {
-    user_id: String,
-    session_id: String,
-    turn_id: String,
-    span_id: String,
-    reason: Option<String>,
-    model: String,
-    reasoning_effort: Option<String>,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_input_tokens: i64,
-    cache_creation_input_tokens: i64,
-    cost_usd: i64,
-    timestamp_us: i64,
-}
-
-fn raw_cost_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawCostRow> {
-    Ok(RawCostRow {
-        user_id: row.get(0)?,
-        session_id: row.get(1)?,
-        turn_id: row.get(2)?,
-        span_id: row.get(3)?,
-        reason: row.get(4)?,
-        model: row.get(5)?,
-        reasoning_effort: row.get(6)?,
-        input_tokens: row.get(7)?,
-        output_tokens: row.get(8)?,
-        cached_input_tokens: row.get(9)?,
-        cache_creation_input_tokens: row.get(10)?,
-        cost_usd: row.get(11)?,
-        timestamp_us: row.get(12)?,
-    })
-}
-
-fn raw_to_cost_record(raw: RawCostRow) -> CostResult<CostRecord> {
-    let timestamp_us = raw.timestamp_us;
-    let timestamp = time::from_us(timestamp_us).ok_or_else(|| {
-        StorageError::Storage(format!(
-            "cost_records.timestamp out of range: {timestamp_us}"
-        ))
-    })?;
-
-    // Rows written before the `reason` column exists read NULL; unknown
-    // tokens (a future variant rolled back) likewise fall back to the
-    // default reason rather than failing the whole query.
-    let reason = raw
-        .reason
-        .as_deref()
-        .and_then(CallReason::parse)
-        .unwrap_or_default();
-
-    Ok(CostRecord {
-        user_id: raw.user_id,
-        session_id: SessionId::from(raw.session_id),
-        turn_id: raw
-            .turn_id
-            .parse::<TurnId>()
-            .map_err(|e| StorageError::Storage(format!("decode turn_id: {e}")))?,
-        span_id: raw
-            .span_id
-            .parse::<SpanId>()
-            .map_err(|e| StorageError::Storage(format!("decode span_id: {e}")))?,
-        reason,
-        model: raw.model,
-        reasoning_effort: raw.reasoning_effort,
-        input_tokens: raw.input_tokens as usize,
-        output_tokens: raw.output_tokens as usize,
-        cached_input_tokens: raw.cached_input_tokens as usize,
-        cache_creation_input_tokens: raw.cache_creation_input_tokens as usize,
-        cost_usd: MicroUsd::from_micros(raw.cost_usd),
-        timestamp,
-    })
-}
-
+const COST: RowDecoder<CostRecord> = RowDecoder {
+    table: "cost_records",
+    key: "id",
+    decode: |row| {
+        let reason: Option<String> = row.get("reason")?;
+        Ok(CostRecord {
+            user_id: row.get("user_id")?,
+            session_id: SessionId::from(row.get::<_, String>("session_id")?),
+            turn_id: row.get::<_, String>("turn_id")?.parse::<TurnId>()?,
+            span_id: row.get::<_, String>("span_id")?.parse::<SpanId>()?,
+            // Legacy NULLs and unknown reason tags both use the default category.
+            reason: reason
+                .as_deref()
+                .and_then(CallReason::parse)
+                .unwrap_or_default(),
+            model: row.get("model")?,
+            reasoning_effort: row.get("reasoning_effort")?,
+            input_tokens: row.get::<_, i64>("input_tokens")?.try_into()?,
+            output_tokens: row.get::<_, i64>("output_tokens")?.try_into()?,
+            cached_input_tokens: row.get::<_, i64>("cached_input_tokens")?.try_into()?,
+            cache_creation_input_tokens: row
+                .get::<_, i64>("cache_creation_input_tokens")?
+                .try_into()?,
+            cost_usd: MicroUsd::from_micros(row.get("cost_usd")?),
+            timestamp: time::from_us(row.get("timestamp")?)
+                .ok_or_else(|| anyhow::anyhow!("invalid timestamp"))?,
+        })
+    },
+};
 #[cfg(test)]
 mod tests {
     use super::*;

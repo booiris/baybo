@@ -2,10 +2,8 @@
 
 use async_trait::async_trait;
 use baybo_model::{FolderId, SessionId};
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
-use baybo_store::StorageError;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::session_folder::{Result, SessionFolderRow, SessionFolderStore};
 
 pub struct SqliteSessionFolderStore {
@@ -18,79 +16,53 @@ impl SqliteSessionFolderStore {
     }
 }
 
-/// Raw column tuple: (id, parent_id, name, position, created_at µs).
-type RawFolder = (String, Option<String>, String, i64, i64);
-
-fn row_from_raw(raw: RawFolder) -> Result<SessionFolderRow> {
-    let (id, parent_id, name, position, created_at_us) = raw;
-    let created_at = super::time::from_us(created_at_us).ok_or_else(|| {
-        StorageError::Storage(format!(
-            "session_folders.created_at out of range: {created_at_us}"
-        ))
-    })?;
-    Ok(SessionFolderRow {
-        id: FolderId::from(id),
-        parent_id: parent_id.map(FolderId::from),
-        name,
-        position,
-        created_at,
-    })
-}
+const FOLDER: RowDecoder<SessionFolderRow> = RowDecoder {
+    table: "session_folders",
+    key: "id",
+    decode: |row| {
+        let id: String = row.get("id")?;
+        let parent_id: Option<String> = row.get("parent_id")?;
+        let created_at_us: i64 = row.get("created_at")?;
+        let created_at = super::time::from_us(created_at_us).ok_or_else(|| {
+            anyhow::anyhow!("session_folders.created_at out of range: {created_at_us}")
+        })?;
+        Ok(SessionFolderRow {
+            id: FolderId::from(id),
+            parent_id: parent_id.map(FolderId::from),
+            name: row.get("name")?,
+            position: row.get("position")?,
+            created_at,
+        })
+    },
+};
 
 #[async_trait]
 impl SessionFolderStore for SqliteSessionFolderStore {
     async fn list(&self) -> Result<Vec<SessionFolderRow>> {
-        let raws = self
-            .pool
+        self.pool
             .interact("session_folders.list", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT id, parent_id, name, position, created_at \
                      FROM session_folders ORDER BY parent_id, position, id",
                 )?;
-                let raws = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<RawFolder>>>()?;
-                Ok(raws)
+                FOLDER.list(stmt.query([])?)
             })
-            .await?;
-        raws.into_iter().map(row_from_raw).collect()
+            .await
     }
 
     async fn get(&self, id: &FolderId) -> Result<Option<SessionFolderRow>> {
         let id = id.as_str().to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact("session_folders.get", move |conn| {
-                Ok(conn
-                    .query_row(
+                FOLDER.optional(
+                    conn.prepare(
                         "SELECT id, parent_id, name, position, created_at \
                          FROM session_folders WHERE id = ?1",
-                        rusqlite::params![id],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?)
+                    )?
+                    .query(rusqlite::params![id])?,
+                )
             })
-            .await?;
-        match raw {
-            Some(raw) => Ok(Some(row_from_raw(raw)?)),
-            None => Ok(None),
-        }
+            .await
     }
 
     async fn create(&self, row: &SessionFolderRow) -> Result<()> {
