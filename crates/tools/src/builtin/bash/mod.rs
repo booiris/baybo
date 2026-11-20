@@ -92,7 +92,7 @@ const DESTRUCTIVE_COMMAND_WARNING: &str = "Destructive command: contains a file-
      action is irreversible — review the command and the \
      target paths carefully before approving.";
 
-/// Escalation note attached when a resumed `DuringExecute` retry approval
+/// Escalation note attached when a resumed `DuringExecuteResumable` retry approval
 /// skips the failed sandboxed attempt and runs unsandboxed directly.
 const RESUMED_ESCALATION_NOTE: &str = "ran outside the OS sandbox after user-approved retry";
 

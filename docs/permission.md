@@ -252,7 +252,7 @@ a sandboxed grant to the host route. Under `free`, it returns `None` because
 the command already runs outside the OS sandbox.
 
 Only the post-failure unsandboxed retry (`request_unsandboxed_retry_approval`)
-remains a mid-execution (`DuringExecute`) prompt through `ApprovalHandle`.
+remains a mid-execution (`DuringExecuteResumable`) prompt through `ApprovalHandle`.
 
 ## Background Runs
 

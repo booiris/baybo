@@ -208,6 +208,17 @@ impl Tool for SkillTool {
                     missing.join(", ")
                 )));
             }
+            let approval = ctx.approval.as_ref().ok_or_else(|| ToolError::Denied {
+                tool: self.name().to_owned(),
+                reason: "env-var approval is required but no approval handle is configured"
+                    .to_owned(),
+            })?;
+            approval.require_pre_execute_approval(
+                self.name(),
+                &[ToolResourceAccess::Env {
+                    vars: skill.requirements.required_env.clone(),
+                }],
+            )?;
         }
 
         let mut out = match p.file_path.as_deref() {
@@ -1250,7 +1261,7 @@ mod tests {
             registry,
             risk_check: Arc::new(AlwaysPass),
         };
-        let ctx = mk_ctx(); // wired with AutoDenyGate on `ctx.approval`
+        let mut ctx = mk_ctx(); // wired with AutoDenyGate on `ctx.approval`
 
         let ask = tool
             .pre_execute_ask(&json!({"skill": "demo"}), &ctx, PreExecuteCheck::Evaluate)
@@ -1268,13 +1279,43 @@ mod tests {
             Some("Skill 'demo' env vars: PATH")
         );
 
-        // Once the executor's pre-execute gate approves (or resumes under
-        // PreDecided), `execute` runs without consulting `ctx.approval`.
+        ctx.approval
+            .as_mut()
+            .unwrap()
+            .record_pre_execute_approval(ask.accesses);
         let out = tool
             .execute(json!({"skill": "demo"}), &ctx)
             .await
             .expect("execute must not re-prompt through ctx.approval");
         assert!(matches!(out, ToolOutput::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn skill_reload_cannot_expand_the_approved_env() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
+        let mut skill = mk_skill(dir.path(), "demo");
+        skill.requirements.required_env = vec!["PATH".into()];
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(skill.clone());
+        let tool = SkillTool {
+            registry: registry.clone(),
+            risk_check: Arc::new(AlwaysPass),
+        };
+        let mut ctx = mk_ctx();
+        let params = json!({"skill": "demo"});
+        let ask = tool
+            .pre_execute_ask(&params, &ctx, PreExecuteCheck::Evaluate)
+            .await
+            .unwrap();
+        ctx.approval
+            .as_mut()
+            .unwrap()
+            .record_pre_execute_approval(ask.accesses);
+        skill.requirements.required_env.push("HOME".into());
+        registry.register(skill);
+        let error = tool.execute(params, &ctx).await.unwrap_err();
+        assert!(matches!(error, ToolError::Denied { .. }));
     }
 
     #[tokio::test]

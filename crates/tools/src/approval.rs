@@ -44,7 +44,8 @@ pub enum PreExecuteCheck {
     Evaluate,
     /// Resumed call: a human already answered this call's pre-execute ask.
     /// Skip non-deterministic or costly checks (such as an LLM risk judge) and
-    /// return the accesses and `cacheable` flag the prior ask covered.
+    /// return the current accesses and `cacheable` flag. The executor checks
+    /// these against the resources persisted with the original approval.
     PreDecided,
 }
 
@@ -54,7 +55,7 @@ pub enum PreExecuteCheck {
 /// approval cache only when `cacheable` is `true`, and raises an
 /// [`baybo_model::human_ask::AskPhase::BeforeExecute`] prompt if any access
 /// remains uncovered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreExecuteAsk {
     /// Concrete resources this call asks to access.
     pub accesses: Vec<ResourceAccess>,

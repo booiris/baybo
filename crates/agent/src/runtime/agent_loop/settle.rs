@@ -142,6 +142,7 @@ impl AgentLoop {
                 tool_call_id,
                 kind,
                 phase,
+                accesses,
                 resolution,
             } = next;
             let Some(call) = self.persisted_tool_use(&tool_call_id) else {
@@ -162,7 +163,7 @@ impl AgentLoop {
                 self.asks.mark_applied(&ask_id).await?;
                 continue;
             }
-            let executed = match settled_result(kind, phase, &resolution, &call) {
+            let executed = match settled_result(kind, phase, accesses, &resolution, &call) {
                 SettledResult::Ready(executed) => executed,
                 SettledResult::Reexecute(gate) => {
                     // Stamped first, so a crash mid-run never runs it twice.
@@ -344,6 +345,7 @@ enum SettledResult {
 fn settled_result(
     kind: AskKind,
     phase: AskPhase,
+    accesses: Vec<baybo_tools::ResourceAccess>,
     resolution: &AskResolution,
     call: &SettledCall,
 ) -> SettledResult {
@@ -368,7 +370,11 @@ fn settled_result(
                 ApprovalOutcome::from_ask(resolution).unwrap_or_else(ApprovalOutcome::abandoned);
             match outcome.decision {
                 decision @ (ApprovalDecision::Approve | ApprovalDecision::ApproveAlways) => {
-                    SettledResult::Reexecute(PreExecuteGate::PreDecided { decision, phase })
+                    SettledResult::Reexecute(PreExecuteGate::PreDecided {
+                        decision,
+                        phase,
+                        accesses,
+                    })
                 }
                 ApprovalDecision::Deny => SettledResult::Ready(denied(call, outcome.resolution)),
             }

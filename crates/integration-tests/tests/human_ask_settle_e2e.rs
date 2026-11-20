@@ -94,6 +94,11 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
     let runs = Arc::new(AtomicUsize::new(0));
     let store_slot = Arc::new(Mutex::new(None));
     let applied_when_ran = Arc::new(Mutex::new(None));
+    let probe = Arc::new(ProbeWrite {
+        runs: Arc::clone(&runs),
+        store: Arc::clone(&store_slot),
+        applied_when_ran: Arc::clone(&applied_when_ran),
+    });
     let session = baybo_integration_tests::SessionBuilder::new().build();
     let ask_id = AskId::new();
     let request = match kind {
@@ -103,7 +108,7 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
             session_id: session.id.clone(),
             user_id: session.user.id.clone(),
             tool: tool.to_string(),
-            accesses: Vec::new(),
+            accesses: probe.accessed_resources(&json!({})),
             params_preview: "{}".to_string(),
             description: None,
         }),
@@ -145,14 +150,7 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
     ];
     let harness = AgentTestHarness::builder()
         .session(session)
-        .with_tool(
-            Arc::new(ProbeWrite {
-                runs: Arc::clone(&runs),
-                store: Arc::clone(&store_slot),
-                applied_when_ran: Arc::clone(&applied_when_ran),
-            }),
-            manifest(),
-        )
+        .with_tool(probe, manifest())
         .with_channel_ask_gate()
         .with_seed_transcript(transcript)
         .with_seed_ask(row)
@@ -665,8 +663,16 @@ async fn a_background_notification_settles_before_its_prompt() {
 
 #[tokio::test]
 async fn skill_env_approval_resumes_without_reprompting_and_does_not_cache() {
-    use baybo_skills::{AlwaysPass, SkillDefinition, SkillRegistry, SkillRequirements};
+    assert_skill_env_resume(false).await;
+}
 
+#[tokio::test]
+async fn skill_env_resume_refuses_expanded_requirements() {
+    assert_skill_env_resume(true).await;
+}
+
+async fn assert_skill_env_resume(expanded: bool) {
+    use baybo_skills::{AlwaysPass, SkillDefinition, SkillRegistry, SkillRequirements};
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("SKILL.md"), "# Secret Skill Body\n").expect("write skill");
     let skill_registry = Arc::new(SkillRegistry::new());
@@ -684,7 +690,11 @@ async fn skill_env_approval_resumes_without_reprompting_and_does_not_cache() {
         trust_level: baybo_model::TrustLevel::Trusted,
         requirements: SkillRequirements {
             required_bins: vec![],
-            required_env: vec!["PATH".to_string()],
+            required_env: if expanded {
+                vec!["PATH".into(), "HOME".into()]
+            } else {
+                vec!["PATH".into()]
+            },
             required_models: vec![],
         },
         token_budget_hint: 0,
@@ -766,10 +776,12 @@ async fn skill_env_approval_resumes_without_reprompting_and_does_not_cache() {
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     let result = adjacent_result(&harness).await;
-    assert!(
-        result.contains("Secret Skill Body"),
-        "resumed Skill call must return skill body without re-prompting: {result}"
-    );
+    if expanded {
+        assert!(!result.contains("Secret Skill Body"));
+        assert!(result.contains("approval requirements changed"), "{result}");
+    } else {
+        assert!(result.contains("Secret Skill Body"), "{result}");
+    }
     assert_eq!(
         harness.ask_store.rows().len(),
         1,
@@ -887,7 +899,7 @@ async fn during_execute_unsandboxed_retry_resumes_straight_to_unsandboxed_and_do
     let result = adjacent_result(&harness).await;
     assert!(
         result.contains("unsandboxed-resume-ok") && result.contains("sandbox_escalation"),
-        "resumed DuringExecute approval must execute unsandboxed with escalation note: {result}"
+        "resumed DuringExecuteResumable approval must execute unsandboxed with escalation note: {result}"
     );
     assert_eq!(
         harness.ask_store.rows().len(),

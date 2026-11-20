@@ -899,7 +899,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     turn_id       TEXT NOT NULL,
                     -- AskKind::as_str(): 'approval' | 'question'.
                     kind          TEXT NOT NULL,
-                    -- AskPhase::as_str(): 'before_execute' | 'during_execute_resumable' | 'during_execute'.
+                    -- AskPhase::as_str(): 'before_execute' | 'during_execute_resumable' | 'during_execute_non_resumable'.
                     phase         TEXT NOT NULL,
                     -- AskRequest JSON.
                     request       TEXT NOT NULL,

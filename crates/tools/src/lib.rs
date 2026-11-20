@@ -202,8 +202,9 @@ pub trait Tool: Send + Sync {
 
     /// Async pre-execution approval hook with access to [`ToolContext`].
     ///
-    /// Runs before `Tool::execute` on the pre-reveal parameters. Returns
-    /// `Some` when the call should pass through the executor's pre-execute
+    /// Runs before `Tool::execute` on the same revealed parameters. The
+    /// executor re-masks returned approval data before persisting or displaying
+    /// it. Returns `Some` when the call should pass through the executor's pre-execute
     /// approval gate (resumable [`AskPhase::BeforeExecute`] ask), or `None`
     /// when no pre-execution prompt is needed.
     ///
@@ -287,7 +288,7 @@ pub trait Tool: Send + Sync {
     /// release.
     ///
     /// Defaults to `None`: mid-call prompts from this tool are non-resumable
-    /// ([`AskPhase::DuringExecute`], with a deadline and abandonment on
+    /// ([`AskPhase::DuringExecuteNonResumable`], with a deadline and abandonment on
     /// restart). Tools that can resume a mid-call approval implement
     /// [`DuringExecuteResumer`] and return `Some(self)` here so declaration and
     /// implementation stay bound together at compile time.
@@ -746,7 +747,7 @@ pub fn noop_event_sink() -> Arc<dyn ToolEventSink> {
 ///   the cache so a follow-up call inside the same session does not
 ///   re-prompt.
 ///
-/// Every prompt it raises is a during-execute ask ([`AskPhase::DuringExecute`]
+/// Every prompt it raises is a during-execute ask ([`AskPhase::DuringExecuteNonResumable`]
 /// for [`Self::request`] / [`Self::request_uncached`], or
 /// [`AskPhase::DuringExecuteResumable`] for
 /// [`Self::request_resumable_uncached`] when the owning tool wires
@@ -771,6 +772,7 @@ pub struct ApprovalHandle {
     /// [`Tool::during_execute_resumer`] never records an unresumable ask as
     /// resumable.
     can_resume_during_execute: bool,
+    pre_execute_accesses: Vec<ResourceAccess>,
     /// Last outcome an ACTUAL prompt returned (cache short-circuits never
     /// record). Shared across clones so the executor reads back what
     /// mid-execution prompts decided after the tool returns.
@@ -794,6 +796,7 @@ impl ApprovalHandle {
             tool_call_id,
             turn_id,
             can_resume_during_execute: false,
+            pre_execute_accesses: Vec::new(),
             last_outcome: Arc::new(parking_lot::Mutex::new(None)),
             park,
             cancel,
@@ -806,6 +809,32 @@ impl ApprovalHandle {
     pub fn with_resumable_during_execute(mut self, resumable: bool) -> Self {
         self.can_resume_during_execute = resumable;
         self
+    }
+
+    /// Record the resources authorized for this invocation, independently of
+    /// the session cache. Called by the executor after its gate succeeds.
+    pub fn record_pre_execute_approval(&mut self, accesses: Vec<ResourceAccess>) {
+        self.pre_execute_accesses = accesses;
+    }
+
+    /// Refuse current requirements not covered by this invocation's
+    /// authorization. The caller must retry for a new ask.
+    pub fn require_pre_execute_approval(
+        &self,
+        tool: &str,
+        accesses: &[ResourceAccess],
+    ) -> crate::Result<()> {
+        if accesses.iter().all(|access| {
+            self.pre_execute_accesses
+                .iter()
+                .any(|approved| approved.to_approved().covers(access))
+        }) {
+            return Ok(());
+        }
+        Err(ToolError::Denied {
+            tool: tool.to_owned(),
+            reason: "approval requirements changed or were not approved; retry the tool call for a new approval".to_owned(),
+        })
     }
 
     /// Raise one prompt through the gate, holding the park gauge while it
@@ -869,8 +898,12 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        self.raise(req, user.channel.clone(), AskPhase::DuringExecute)
-            .await
+        self.raise(
+            req,
+            user.channel.clone(),
+            AskPhase::DuringExecuteNonResumable,
+        )
+        .await
     }
 
     /// Forward an uncached mid-call approval that can resume after restart or
@@ -881,7 +914,7 @@ impl ApprovalHandle {
     /// verifies that the executor saw `Some` from
     /// [`Tool::during_execute_resumer`]: if a tool forgot to wire that method,
     /// dev/test builds trip a `debug_assert!` and release builds fall back to
-    /// non-resumable [`AskPhase::DuringExecute`] so no unresumable ask is ever
+    /// non-resumable [`AskPhase::DuringExecuteNonResumable`] so no unresumable ask is ever
     /// recorded as resumable.
     pub async fn request_resumable_uncached(
         &self,
@@ -899,7 +932,7 @@ impl ApprovalHandle {
         let phase = if self.can_resume_during_execute {
             AskPhase::DuringExecuteResumable
         } else {
-            AskPhase::DuringExecute
+            AskPhase::DuringExecuteNonResumable
         };
         let req = ApprovalRequest {
             ask_id: baybo_model::human_ask::AskId::new(),
@@ -959,7 +992,11 @@ impl ApprovalHandle {
             description: None,
         };
         let outcome = self
-            .raise(req, user.channel.clone(), AskPhase::DuringExecute)
+            .raise(
+                req,
+                user.channel.clone(),
+                AskPhase::DuringExecuteNonResumable,
+            )
             .await;
         if outcome.decision == ApprovalDecision::ApproveAlways {
             let mut cache = self.approved_cache.lock();
@@ -1369,7 +1406,7 @@ mod approval_handle_tests {
             _cancel: AskCancel,
         ) -> ApprovalOutcome {
             assert_eq!(req.tool_call_id, "use-1", "prompt carries the tool call id");
-            assert_eq!(site.phase, AskPhase::DuringExecute);
+            assert_eq!(site.phase, AskPhase::DuringExecuteNonResumable);
             ApprovalOutcome::answered(self.0)
         }
     }

@@ -14,8 +14,8 @@ use tokio::sync::oneshot;
 use crate::core::AskCore;
 use crate::queue::{AskQueue, PendingAsk};
 
-/// How long a non-resumable ask — a during-execute approval on a tool that
-/// does not implement `resume_during_execute` — waits for an answer. It cannot
+/// How long a during-execute approval that did not opt into resumable
+/// continuation waits for an answer. It cannot
 /// outlive its tool future, so without a deadline it would hold its turn in
 /// memory for as long as nobody answers; when the deadline passes the tool
 /// gets a timed-out denial and carries on. Resumable asks have no deadline.

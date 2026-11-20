@@ -643,7 +643,7 @@ mod tests {
         );
 
         let (tx, _during) = oneshot::channel();
-        queue.push_live(ask("d1", "s1", AskPhase::DuringExecute), tx);
+        queue.push_live(ask("d1", "s1", AskPhase::DuringExecuteNonResumable), tx);
         assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::AbandonsAsks);
 
         queue.orphan(&id("d1"));
@@ -687,7 +687,7 @@ mod tests {
     fn orphan_drops_a_non_resumable_entry_with_an_abandoned_edge() {
         let (queue, seen) = watched_queue();
         let (tx, _rx) = oneshot::channel();
-        queue.push_live(ask("c1", "s1", AskPhase::DuringExecute), tx);
+        queue.push_live(ask("c1", "s1", AskPhase::DuringExecuteNonResumable), tx);
         queue.orphan(&id("c1"));
         assert!(queue.is_empty());
         assert_eq!(

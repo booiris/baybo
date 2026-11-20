@@ -314,7 +314,7 @@ is on this connection's channel queue and calls `HumanAskManager::resolve`,
 which claims the decision in the ledger first and then removes the entry
 (the watchers do the broadcast). A resumable ask waits until a
 human answers it or a verb abandons it (`/stop`, a card close, a new message
-past a dead ask); a non-resumable `DuringExecute` approval expires after
+past a dead ask); a non-resumable `DuringExecuteNonResumable` approval expires after
 `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min). A process exit or idle release
 leaves resumable asks pending for the next boot or Resume turn (see
 [`human-ask.md`](human-ask.md)). The board's

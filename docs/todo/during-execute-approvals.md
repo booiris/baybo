@@ -5,7 +5,7 @@
 > before-execute (`Tool::pre_execute_ask`), and Bash's post-failure unsandboxed
 > retry opts in to resumable during-execute continuation via
 > `Tool::during_execute_resumer` + `DuringExecuteResumer`
-> (`AskPhase::DuringExecuteResumable`). Plain `AskPhase::DuringExecute`
+> (`AskPhase::DuringExecuteResumable`). Plain `AskPhase::DuringExecuteNonResumable`
 > (default for any tool that does not implement `DuringExecuteResumer`, or any
 > prompt raised via `ApprovalHandle::request` / `request_uncached`) stays
 > non-resumable and keeps `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min) and
@@ -18,7 +18,7 @@ An approval is raised in one of three phases (`AskPhase`):
 - **Before execute (`AskPhase::BeforeExecute`)** — the executor's pre-execute
   gate (`Tool::pre_execute_ask`), before the tool runs. Resumable: re-dispatches
   the persisted `tool_use` through `Tool::execute` with
-  `PreExecuteGate::PreDecided { decision, phase: BeforeExecute }`.
+  `PreExecuteGate::PreDecided { decision, phase: BeforeExecute, accesses }`.
 - **During execute, resumable (`AskPhase::DuringExecuteResumable`)** — raised
   through `ApprovalHandle::request_resumable_uncached(self, ...)` by a tool
   that implements `DuringExecuteResumer` and returns `Some(self)` from
@@ -27,7 +27,7 @@ An approval is raised in one of three phases (`AskPhase`):
   or idle release skips `pre_execute_ask` (uncached) and invokes
   `DuringExecuteResumer::resume_during_execute`. A dead denial/abandon resolves
   to the standard `ToolError::Denied`.
-- **During execute, non-resumable (`AskPhase::DuringExecute`)** — the fail-safe
+- **During execute, non-resumable (`AskPhase::DuringExecuteNonResumable`)** — the fail-safe
   default for any tool that raises a mid-execution prompt via
   `ApprovalHandle::request` / `request_uncached`. Governed by
   `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min), guarded from idle-reaper
@@ -53,7 +53,10 @@ An approval is raised in one of three phases (`AskPhase`):
    carries `accesses`, `cacheable`, `description`, and `params_preview`. Its
    default delegates to `accessed_resources` + `progress_label` (`cacheable: true`).
    `ToolExecutor` constructs `ToolContext` ahead of the gate and runs
-   `pre_execute_ask` on pre-reveal params, flushing any `ctx.events` (such as
+   `pre_execute_ask` on the same revealed params as execution. Returned approval
+   data is re-masked before use; the original ledger resources bound resumed
+   approvals, and Skill checks its current env requirements against the per-call
+   grant. The executor flushes any `ctx.events` (such as
    risk-judge `LlmCall`/`Phase` events) before the gate returns.
 2. **Uncached asks in the executor's gate**: when `PreExecuteAsk::cacheable` is
    `false`, the executor neither consults `approved_resources` before prompting
@@ -74,8 +77,8 @@ An approval is raised in one of three phases (`AskPhase`):
    single source of truth at compile time. Tools that can resume a mid-call
    prompt call `ApprovalHandle::request_resumable_uncached(self, ...)` (which
    requires `&dyn DuringExecuteResumer` at compile time and verifies
-   `Tool::during_execute_resumer().is_some()` at runtime). `PreExecuteGate::PreDecided { decision, phase }`
+   `Tool::during_execute_resumer().is_some()` at runtime). `PreExecuteGate::PreDecided { decision, phase, accesses }`
    dispatches `DuringExecuteResumer::resume_during_execute` without leaking any
    Bash/sandbox concept into the generic gate or `ToolContext`. Ordinary
-   `request` / `request_uncached` prompts keep `AskPhase::DuringExecute` with
+   `request` / `request_uncached` prompts keep `AskPhase::DuringExecuteNonResumable` with
    `DURING_EXECUTE_APPROVAL_TIMEOUT` and `ActorStopCost::AbandonsAsks`.

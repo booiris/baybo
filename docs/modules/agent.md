@@ -85,9 +85,9 @@ begin-time `tool_use_id`, or a smaller inline copy. Errors close immediately wit
 
 ### ToolExecutor responsibility
 
-ToolExecutor: lookup tool → validate trust/capability → consult approval gate → construct `ToolContext` → create child Turn/Trace nodes → reveal placeholders in args → execute → sanitize output → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
+ToolExecutor: lookup tool → validate trust/capability → create trace nodes and `ToolContext` → reveal arguments → compute and re-mask the pre-execute ask → consult approval gate → execute with the same revealed arguments → sanitize output → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
 
-`ToolExecutor` holds an `Arc<SecurityGateway>`. Tool invocation is the one legitimate plaintext boundary for arguments: the pre-reveal `params` is what flows into `SpanKind::ToolCall`'s `ToolCallBegin.params` and the approval preview (placeholder form), while a cloned `params_revealed` — with `reveal_in_value` applied — is what's passed to `tool_registry.execute`. After execution the returned `ToolOutput` is run through `sanitize_tool_output` so any tool-echoed secret is re-minted and vaulted before it enters the trace, the next LLM call, or memory. Errors are passed through `sanitize_error` before the error bubbles into `with_span`, which closes the span as `Failed { reason }`.
+`ToolExecutor` holds an `Arc<SecurityGateway>`. Tool invocation is the one legitimate plaintext boundary for arguments: the pre-reveal `params` is what flows into `SpanKind::ToolCall`'s `ToolCallBegin.params` and the approval preview (placeholder form), while a cloned `params_revealed` — with `reveal_in_value` applied — is shared by `Tool::pre_execute_ask` and `Tool::execute`. Returned approval data is re-masked using the original input placeholders and scanned before reaching the UI, ledger or session cache. After execution the returned `ToolOutput` is run through `sanitize_tool_output` so any tool-echoed secret is re-minted and vaulted before it enters the trace, the next LLM call, or memory. Errors are passed through `sanitize_error` before the error bubbles into `with_span`, which closes the span as `Failed { reason }`.
 
 ### Sandbox scope per call
 
@@ -303,8 +303,8 @@ through the same `append_executed_tool` post-processing the batch uses: a
 `ToolResultMeta { approval: Some(Deny) }` for a refused approval, the
 `baybo_human_ask::result` envelope for a question, and for an approved call
 `mark_applied` **first**, then a re-execution under a fresh `LlmIteration`
-step with `ToolExecutor::execute(…, PreExecuteGate::PreDecided(decision))`, so
-the gate is not asked again (`ApproveAlways` still seeds the grants). The
+step with `ToolExecutor::execute(…, PreExecuteGate::PreDecided { decision, phase, accesses })`, so
+the original resources must still cover the current request before execution (`ApproveAlways` still seeds cacheable grants). A changed request fails closed and tells the model to retry for a new approval. The
 `resumed_turn_id` is the ask row's own `turn_id`.
 
 `RouterResumeSink` (`runtime::asks`) is the manager's `ResumeSink`: a sender
@@ -384,7 +384,7 @@ Per-tool `max_timeout()`:
 | OpenViking memory store | 120s | `OpenVikingTimeouts::store_max` (default) in `memory/src/backends/openviking.rs` |
 | Subagent (in-process) | `TOOL_WAIT_BACKSTOP` = 30 days | `subagent/src/tool.rs` — effectively unbounded; the real bound is the caller's cancel / turn lineage |
 
-**Approval gate** — a resumable tool-approval prompt waits with no timeout until a human answers it or the turn is cancelled (`docs/modules/human-ask.md`); the outer tool deadline pauses while it waits. A non-resumable `DuringExecute` approval alone expires, after `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min).
+**Approval gate** — a resumable tool-approval prompt waits with no timeout until a human answers it or the turn is cancelled (`docs/modules/human-ask.md`); the outer tool deadline pauses while it waits. A non-resumable `DuringExecuteNonResumable` approval alone expires, after `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min).
 
 **Progress observer** (`runtime/progress_observer.rs`) — out-of-band status emitter for long UserChat turns:
 

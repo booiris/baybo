@@ -410,7 +410,7 @@ pub(crate) fn cap_trace_output_with_len(value: Value, full_len: usize) -> (Value
 /// exactly the case that loses its verdict otherwise: it reaches the loop as an
 /// untyped error, indistinguishable from a crash.
 /// How the pre-execute approval gate treats a call's uncovered accesses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreExecuteGate {
     /// Raise an ask on the turn's gate, as every live call does.
     Ask,
@@ -419,14 +419,15 @@ pub enum PreExecuteGate {
     /// anything.
     ///
     /// - [`AskPhase::BeforeExecute`]: evaluates `pre_execute_ask` in
-    ///   `PreDecided` mode (seeding `ApproveAlways` grants when cacheable) and
-    ///   runs `Tool::execute`.
+    ///   `PreDecided` mode, verifies the original resources still cover the
+    ///   request, seeds cacheable `ApproveAlways` grants and runs `Tool::execute`.
     /// - [`AskPhase::DuringExecuteResumable`]: skips `pre_execute_ask` (never
     ///   caches) and runs `DuringExecuteResumer::resume_during_execute` via
     ///   `Tool::during_execute_resumer`.
     PreDecided {
         decision: ApprovalDecision,
         phase: AskPhase,
+        accesses: Vec<ResourceAccess>,
     },
 }
 
@@ -1071,15 +1072,21 @@ impl ToolExecutor {
                     checkout_git_config: None,
                 };
 
-                // Pre-execute approval gate: ask the tool (on pre-reveal
-                // params) what, if anything, needs human approval, check the
+                let mut params_revealed = params.clone();
+                self.security_gateway
+                    .reveal_in_value(&mut params_revealed)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
+
+                // Pre-execute approval gate: ask the tool what needs human
+                // approval using the same arguments execution will receive. Check the
                 // session cache only when the ask is cacheable, and raise a
                 // resumable `BeforeExecute` prompt if anything remains. When
-                // resuming an answered `DuringExecute` approval, skip the
+                // resuming an answered `DuringExecuteResumable` approval, skip the
                 // pre-execute gate (never caching) and dispatch the tool's
                 // `resume_during_execute` hook below.
                 let resume_during_execute = matches!(
-                    pre_execute,
+                    &pre_execute,
                     PreExecuteGate::PreDecided {
                         phase: AskPhase::DuringExecuteResumable,
                         ..
@@ -1088,11 +1095,12 @@ impl ToolExecutor {
                 if let PreExecuteGate::PreDecided {
                     decision,
                     phase: AskPhase::DuringExecuteResumable,
-                } = pre_execute
+                    ..
+                } = &pre_execute
                 {
-                    let outcome = ApprovalOutcome::answered(decision);
+                    let outcome = ApprovalOutcome::answered(*decision);
                     *approval_sink.lock() = Some(outcome);
-                    if decision == ApprovalDecision::Deny {
+                    if *decision == ApprovalDecision::Deny {
                         return Err(anyhow::Error::new(ToolError::Denied {
                             tool: tool_name_owned.clone(),
                             reason: refusal_reason(outcome.resolution).to_string(),
@@ -1104,13 +1112,26 @@ impl ToolExecutor {
                         ));
                     }
                 } else {
-                    let pre_check = match pre_execute {
+                    let pre_check = match &pre_execute {
                         PreExecuteGate::Ask => PreExecuteCheck::Evaluate,
                         PreExecuteGate::PreDecided { .. } => PreExecuteCheck::PreDecided,
                     };
                     let pre_ask = match pinned_tool.as_ref() {
-                        Some(tool) => tool.pre_execute_ask(&params, &ctx, pre_check).await,
+                        Some(tool) => tool.pre_execute_ask(&params_revealed, &ctx, pre_check).await,
                         None => None,
+                    };
+                    let authorized_accesses = pre_ask
+                        .as_ref()
+                        .map(|ask| ask.accesses.clone())
+                        .unwrap_or_default();
+                    let pre_ask = if let Some(ask) = pre_ask {
+                        let mut value = serde_json::to_value(ask)?;
+                        self.security_gateway
+                            .sanitize_approval_value(&mut value, &params)
+                            .await?;
+                        Some(serde_json::from_value::<baybo_tools::PreExecuteAsk>(value)?)
+                    } else {
+                        None
                     };
                     self.flush_tool_events(
                         &event_sink,
@@ -1143,15 +1164,35 @@ impl ToolExecutor {
                         }
                         None => (Vec::new(), true, None, None),
                     };
+                    if let PreExecuteGate::PreDecided { decision, accesses, .. } = &pre_execute {
+                        if *decision == ApprovalDecision::Deny {
+                            let outcome = ApprovalOutcome::answered(*decision);
+                            *approval_sink.lock() = Some(outcome);
+                            return Err(ToolError::Denied {
+                                tool: tool_name_owned.clone(),
+                                reason: refusal_reason(outcome.resolution).to_owned(),
+                            }.into());
+                        }
+                        let changed = uncovered.iter().any(|access| {
+                            !accesses.iter().any(|original| original.to_approved().covers(access))
+                        });
+                        if changed {
+                            return Err(ToolError::Denied {
+                                tool: tool_name_owned.clone(),
+                                reason: "approval requirements changed; retry the tool call for a new approval".to_owned(),
+                            }.into());
+                        }
+                    }
+
                     #[cfg(test)]
                     if let Some(hook) = &self.after_authorization_hook {
                         hook();
                     }
 
                     if !uncovered.is_empty() {
-                        let outcome = match pre_execute {
+                        let outcome = match &pre_execute {
                             PreExecuteGate::PreDecided { decision, .. } => {
-                                ApprovalOutcome::answered(decision)
+                                ApprovalOutcome::answered(*decision)
                             }
                             PreExecuteGate::Ask => {
                                 gate.request(
@@ -1229,6 +1270,9 @@ impl ToolExecutor {
                             ));
                         }
                     }
+                    if let Some(approval) = ctx.approval.as_mut() {
+                        approval.record_pre_execute_approval(authorized_accesses);
+                    }
                 }
 
                 // Re-resolved per call rather than cached, so an operator who
@@ -1238,16 +1282,6 @@ impl ToolExecutor {
                     (true, Some(checkout)) => worktree::ensure_identity_config(checkout).await,
                     _ => None,
                 };
-
-                // Reveal placeholders in the tool's arguments just
-                // before execution. The pre-reveal `params` is what the
-                // trace + approval surfaces saw; the tool itself
-                // receives plaintext for its API call.
-                let mut params_revealed = params.clone();
-                self.security_gateway
-                    .reveal_in_value(&mut params_revealed)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
 
                 // Execute with timeout enforcement. A `Read` of a virtual path
                 // (e.g. the session transcript) is served inside `ReadTool` from
@@ -2872,7 +2906,7 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst));
         assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
         assert!(approved.lock().is_empty());
-        assert_one_policy_denial(&ledger, AskPhase::DuringExecute);
+        assert_one_policy_denial(&ledger, AskPhase::DuringExecuteNonResumable);
     }
 
     #[tokio::test]
@@ -2923,6 +2957,7 @@ mod tests {
             PreExecuteGate::PreDecided {
                 decision,
                 phase: AskPhase::BeforeExecute,
+                accesses: vec![McpShapedTool::declared_access()],
             },
         )
         .await;
@@ -3366,6 +3401,9 @@ mod tests {
             PreExecuteGate::PreDecided {
                 decision: ApprovalDecision::ApproveAlways,
                 phase: AskPhase::BeforeExecute,
+                accesses: vec![ResourceAccess::ExecCommand {
+                    command: "echo elevated".to_owned(),
+                }],
             },
         )
         .await;
@@ -3540,6 +3578,7 @@ mod tests {
 
         // 2. Resumed PreDecided(ApproveAlways): runs without calling the judge LLM
         //    again, without re-prompting, and seeds the session cache.
+        let original_accesses = recorded.lock()[0].0.accesses.clone();
         let executed_resumed = executor
             .execute(
                 "Bash",
@@ -3566,6 +3605,7 @@ mod tests {
                 PreExecuteGate::PreDecided {
                     decision: ApprovalDecision::ApproveAlways,
                     phase: AskPhase::BeforeExecute,
+                    accesses: original_accesses,
                 },
             )
             .await;
@@ -3766,8 +3806,13 @@ mod tests {
 
     #[tokio::test]
     async fn bash_require_escalated_runs_before_execute_uncached_and_merges_destructive_warning() {
-        use baybo_tools::builtin::bash::BashTool;
+        for decision in [ApprovalDecision::Deny, ApprovalDecision::ApproveAlways] {
+            assert_masked_bash_escalation(decision).await;
+        }
+    }
 
+    async fn assert_masked_bash_escalation(decision: ApprovalDecision) {
+        use baybo_tools::builtin::bash::BashTool;
         let home = tempfile::tempdir().expect("tempdir");
         let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
         std::fs::create_dir_all(paths.work_dir()).expect("work dir");
@@ -3790,18 +3835,23 @@ mod tests {
             },
         );
 
-        let (gate, recorded) =
-            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::ApproveAlways));
+        let (gate, recorded) = RecordingGate::new(ApprovalOutcome::answered(decision));
         let gates = ApprovalGateMap::new();
         gates.insert(baybo_model::ChannelType::tui(), gate);
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
+        let vault = Arc::new(baybo_security::SecretVault::new(
+            key,
+            Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+        ));
+        let placeholder = "[{REDACTED_SECRET_0123456789abcdef01234567}]";
+        vault
+            .store_secret(placeholder, sandbox_root.to_str().unwrap().as_bytes())
+            .await
+            .unwrap();
         let security_gateway = Arc::new(SecurityGateway::new(
             Arc::new(baybo_security::LeakDetector::with_default_rules()),
-            Arc::new(baybo_security::SecretVault::new(
-                key,
-                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
-            )),
+            vault,
         ));
         let executor = ToolExecutor::new(
             Arc::new(registry),
@@ -3837,9 +3887,10 @@ mod tests {
 
         let target = sandbox_root.join("esc-delete.txt");
         std::fs::write(&target, "x").expect("write");
-        let cmd = format!("rm {}", target.display());
+        let cmd = format!("rm {placeholder}/esc-delete.txt");
         let params = json!({
             "command": cmd,
+            "cwd": placeholder,
             "sandbox_permissions": "require_escalated",
             "justification": "Need host rm",
         });
@@ -3878,6 +3929,19 @@ mod tests {
             )
             .await;
 
+        assert_eq!(
+            recorded.lock().len(),
+            1,
+            "masked cwd must not bypass approval"
+        );
+        let request_json = serde_json::to_string(&recorded.lock()[0].0).unwrap();
+        assert!(request_json.contains(placeholder));
+        assert!(!request_json.contains(sandbox_root.to_str().unwrap()));
+        if decision == ApprovalDecision::Deny {
+            assert!(executed.output.is_err());
+            assert!(target.exists(), "denied masked command must not run");
+            return;
+        }
         assert!(executed.output.is_ok(), "{:?}", executed.output.err());
         assert!(!target.exists(), "approved escalated command ran");
         {
@@ -3897,6 +3961,7 @@ mod tests {
         // never inserts into an empty session cache.
         std::fs::write(&target, "y").expect("write again");
         let empty_cache = Arc::new(Mutex::new(Vec::new()));
+        let original_accesses = recorded.lock()[0].0.accesses.clone();
         let executed_resumed = executor
             .execute(
                 "Bash",
@@ -3923,6 +3988,7 @@ mod tests {
                 PreExecuteGate::PreDecided {
                     decision: ApprovalDecision::ApproveAlways,
                     phase: AskPhase::BeforeExecute,
+                    accesses: original_accesses,
                 },
             )
             .await;
@@ -4040,6 +4106,7 @@ mod tests {
                 PreExecuteGate::PreDecided {
                     decision: ApprovalDecision::ApproveAlways,
                     phase: AskPhase::DuringExecuteResumable,
+                    accesses: Vec::new(),
                 },
             )
             .await;
@@ -4272,10 +4339,10 @@ mod tests {
         let asks = recorded.lock();
         assert_eq!(asks.len(), 3);
         assert_eq!(asks[0].0.tool, "plain_tool");
-        assert_eq!(asks[0].1.phase, AskPhase::DuringExecute);
+        assert_eq!(asks[0].1.phase, AskPhase::DuringExecuteNonResumable);
         assert_eq!(asks[1].0.tool, "resumable_tool");
         assert_eq!(asks[1].0.params_preview, "plain");
-        assert_eq!(asks[1].1.phase, AskPhase::DuringExecute);
+        assert_eq!(asks[1].1.phase, AskPhase::DuringExecuteNonResumable);
         assert_eq!(asks[2].0.tool, "resumable_tool");
         assert_eq!(asks[2].0.params_preview, "resumable");
         assert_eq!(asks[2].1.phase, AskPhase::DuringExecuteResumable);
