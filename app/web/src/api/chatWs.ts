@@ -8,7 +8,16 @@
 // caller is interested in.
 
 import { decode, encode } from '@msgpack/msgpack';
+import type { AskStepSummary as WireAskStepSummary } from '../../../../sidecars/sdk/channel-ts/src/generated/AskStepSummary';
+import type { Question as WireQuestion } from '../../../../sidecars/sdk/channel-ts/src/generated/Question';
+import type { QuestionCard as WireQuestionCard } from '../../../../sidecars/sdk/channel-ts/src/generated/QuestionCard';
+import type { QuestionReply as WireQuestionReply } from '../../../../sidecars/sdk/channel-ts/src/generated/QuestionReply';
 import { uuid } from '../uuid';
+
+export type { WireAskStepSummary, WireQuestion, WireQuestionCard, WireQuestionReply };
+export type { AskStepQuestion as WireAskStepQuestion } from '../../../../sidecars/sdk/channel-ts/src/generated/AskStepQuestion';
+export type { QuestionAnswer as WireQuestionAnswer } from '../../../../sidecars/sdk/channel-ts/src/generated/QuestionAnswer';
+export type { QuestionOption as WireQuestionOption } from '../../../../sidecars/sdk/channel-ts/src/generated/QuestionOption';
 
 // Wire frame shape pulled straight from the Rust ts-rs generation.
 // We re-declare a lightweight version here because the shipped
@@ -115,52 +124,6 @@ export interface TaskView {
   subject: string;
   status: string;
   depends_on?: string[];
-}
-
-export interface WireQuestionOption {
-  label: string;
-  description: string;
-}
-
-export interface WireQuestion {
-  header: string;
-  question: string;
-  options: WireQuestionOption[];
-  multi_select: boolean;
-}
-
-export interface WireQuestionAnswer {
-  header: string;
-  selected: string[];
-  other?: string;
-}
-
-export type WireQuestionReply =
-  | { kind: 'answered'; answers: WireQuestionAnswer[] }
-  | { kind: 'cancelled' };
-
-export interface WireQuestionCard {
-  queue_index: number;
-  ask_id: string;
-  tool_call_id: string;
-  user_id?: string;
-  questions: WireQuestion[];
-}
-
-export interface WireAskStepQuestion {
-  header: string;
-  question: string;
-  options?: WireQuestionOption[];
-  multi_select: boolean;
-  selected?: string[];
-  other?: string;
-  skipped: boolean;
-}
-
-export interface WireAskStepSummary {
-  declined: boolean;
-  cancelled: boolean;
-  questions?: WireAskStepQuestion[];
 }
 
 /** One step inside a turn's in-flight work block, carried in the

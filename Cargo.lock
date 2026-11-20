@@ -901,6 +901,7 @@ dependencies = [
  "tracing",
  "ts-rs",
  "ulid",
+ "utoipa",
  "uuid",
 ]
 

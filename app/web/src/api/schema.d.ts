@@ -1767,12 +1767,15 @@ export interface components {
          *     sidecars like `"slack"` pass through unchanged).
          */
         ChannelType: string;
-        /** @description One option presented inside a reconstructed `AskUser` step. */
+        /** @description One selectable option in an `AskUser` question. */
         ChatAskOption: {
             description: string;
             label: string;
         };
-        /** @description One question and its recorded answer inside [`ChatAskStepSummary`]. */
+        /**
+         * @description One question and its recorded answer inside [`AskStepSummary`], for both the
+         *     collapsed step line and the expanded question/choice view.
+         */
         ChatAskQuestion: {
             header: string;
             multi_select?: boolean;
@@ -1782,10 +1785,7 @@ export interface components {
             selected?: string[];
             skipped?: boolean;
         };
-        /**
-         * @description Typed summary of a finished `AskUser` call, mirroring
-         *     [`baybo_model::human_ask::AskStepSummary`] on the REST transcript surface.
-         */
+        /** @description Answered questions and the cancellation or decline status of a finished `AskUser` call. */
         ChatAskStepSummary: {
             cancelled?: boolean;
             declined: boolean;

@@ -342,7 +342,7 @@ lose pending asks — a resubscribe re-delivers the full card sets in the
 `SubscribeState`, is re-sent every pending approval on its queue right after
 it registers.
 
-### Gateway owns its own DTOs — utoipa stays in the gateway
+### Gateway DTOs and shared model types
 
 Route handlers call the manager `pub async fn` methods directly
 (`SessionManager`, `TurnLifecycle`, `CronScheduler`,
@@ -353,13 +353,11 @@ would force a cross-crate refactor of every `crates/cli/src/commands/`
 module. The duplicated surface is small and the independence is worth
 more than the line count saved.
 
-`baybo-gateway` is the only **crate** in the workspace that depends
-on `utoipa`. Domain crates (`baybo-model`, `baybo-turn`, `baybo-cron`,
-`baybo-tools`) stay HTTP-framework-agnostic — no `#[derive(ToSchema)]`,
-no `#[schema(...)]` attributes leaking into them. The gateway defines
-a mirror type for every domain type that appears on the wire and
-provides `From<Domain>` conversions; handlers build DTOs at the seam
-via `.map(DomainDto::from)`. `api/dto.rs` holds the shared envelopes
+The gateway uses the shared `baybo-model` types directly for the `AskUser`
+step summary, its questions, and their options. These types derive
+`utoipa::ToSchema` in `baybo-model` and keep their published `ChatAsk*`
+schema names. Gateway-specific representations use DTOs with
+`From<Domain>` conversions. `api/dto.rs` holds the shared envelopes
 (`ListResponse`, `ErrorBody`) and the mirrors for the CLI-parity
 families (status, config, llm, cron, channels, turns, traces, logs,
 analytics, tools); the handler modules define their own endpoint DTOs the same

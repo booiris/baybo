@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::SessionId;
 use crate::approval::{ApprovalDecision, ApprovalRequest};
@@ -214,7 +215,9 @@ pub struct Question {
     pub multi_select: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One selectable option in an `AskUser` question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = ChatAskOption)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
@@ -265,7 +268,8 @@ impl QuestionOutcomeKind {
 
 /// One question and its recorded answer inside [`AskStepSummary`], for both the
 /// collapsed step line and the expanded question/choice view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = ChatAskQuestion)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
@@ -287,10 +291,9 @@ pub struct AskStepQuestion {
     pub skipped: bool,
 }
 
-/// Typed summary of a finished `AskUser` call, derived server-side from its
-/// input and result (`baybo_human_ask::AskStepInput::summarize`) so the live wire and
-/// REST reconstruction agree identically.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Answered questions and the cancellation or decline status of a finished `AskUser` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = ChatAskStepSummary)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",

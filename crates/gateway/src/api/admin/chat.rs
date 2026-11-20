@@ -47,6 +47,7 @@ use baybo_channels::wire::{
     WireWorkStep, WireWorkStepKind,
 };
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent};
+use baybo_model::human_ask::AskStepSummary;
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
     ControlEvent, ControlEventKind, FolderId, FolderSummary, LineageKind, Role, Session, SessionId,
@@ -548,78 +549,6 @@ pub struct ChatMessageLookup {
     pub ordinal: Option<i64>,
 }
 
-/// One option presented inside a reconstructed `AskUser` step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
-pub struct ChatAskOption {
-    pub label: String,
-    pub description: String,
-}
-
-impl From<baybo_model::human_ask::QuestionOption> for ChatAskOption {
-    fn from(option: baybo_model::human_ask::QuestionOption) -> Self {
-        Self {
-            label: option.label,
-            description: option.description,
-        }
-    }
-}
-
-/// One question and its recorded answer inside [`ChatAskStepSummary`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
-pub struct ChatAskQuestion {
-    pub header: String,
-    pub question: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<ChatAskOption>,
-    #[serde(default)]
-    pub multi_select: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub selected: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub other: Option<String>,
-    #[serde(default)]
-    pub skipped: bool,
-}
-
-impl From<baybo_model::human_ask::AskStepQuestion> for ChatAskQuestion {
-    fn from(q: baybo_model::human_ask::AskStepQuestion) -> Self {
-        Self {
-            header: q.header,
-            question: q.question,
-            options: q.options.into_iter().map(ChatAskOption::from).collect(),
-            multi_select: q.multi_select,
-            selected: q.selected,
-            other: q.other,
-            skipped: q.skipped,
-        }
-    }
-}
-
-/// Typed summary of a finished `AskUser` call, mirroring
-/// [`baybo_model::human_ask::AskStepSummary`] on the REST transcript surface.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
-pub struct ChatAskStepSummary {
-    pub declined: bool,
-    #[serde(default)]
-    pub cancelled: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub questions: Vec<ChatAskQuestion>,
-}
-
-impl From<baybo_model::human_ask::AskStepSummary> for ChatAskStepSummary {
-    fn from(summary: baybo_model::human_ask::AskStepSummary) -> Self {
-        Self {
-            declined: summary.declined,
-            cancelled: summary.cancelled,
-            questions: summary
-                .questions
-                .into_iter()
-                .map(ChatAskQuestion::from)
-                .collect(),
-        }
-    }
-}
-
 /// One reconstructed step inside a `work` transcript item — the durable
 /// shadow of a live turn-progress event, rebuilt from persisted content
 /// blocks so a reloaded transcript shows the same collapsed work summary
@@ -675,7 +604,7 @@ pub struct ChatWorkStep {
     /// Structured summary for a finished `AskUser` call, matching the live
     /// `Frame::ToolCompleted.ask` payload so reloads render the same step view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ask: Option<ChatAskStepSummary>,
+    pub ask: Option<AskStepSummary>,
     /// When this step happened — the `created_at` of the row it came from, or
     /// the instant the live buffer recorded it. Lets a client time the
     /// stretches BETWEEN the model's mid-turn remarks rather than only the
@@ -775,7 +704,7 @@ impl From<WireWorkStep> for ChatWorkStep {
                 tool_status: step.status,
                 tool_summary: step.summary,
                 approval: step.approval.map(|d| d.as_str().to_owned()),
-                ask: step.ask.map(ChatAskStepSummary::from),
+                ask: step.ask,
                 at: None,
             },
         };
@@ -3362,7 +3291,7 @@ struct WorkAccumulator {
     /// fills in the matching call's summary.
     pending_tools: HashMap<String, usize>,
     /// `tool_use_id` → `AskUser` call arguments, paired with its `ToolResult`
-    /// to derive [`ChatAskStepSummary`] through the same helper the live plane uses.
+    /// to derive [`AskStepSummary`] through the same helper the live plane uses.
     pending_ask_inputs: HashMap<String, baybo_human_ask::AskStepInput>,
 }
 
@@ -3777,7 +3706,7 @@ fn reconstruct_transcript_with_attachments(
                             && let Some((summary, text)) = ask_input.summarize(&parsed)
                         {
                             step.tool_summary = Some(text);
-                            step.ask = Some(ChatAskStepSummary::from(summary));
+                            step.ask = Some(summary);
                         } else {
                             step.tool_summary = Some(summarize_tool_result(content));
                         }
@@ -5425,10 +5354,7 @@ mod tests {
             work.steps[0].tool_summary.as_deref(),
             Some("Asked 2 questions · Auth: JWT · Cache: skipped")
         );
-        assert_eq!(
-            work.steps[0].ask,
-            Some(ChatAskStepSummary::from(expected_answered))
-        );
+        assert_eq!(work.steps[0].ask, Some(expected_answered));
 
         let (expected_declined, _) = baybo_human_ask::AskStepInput::from_tool(
             baybo_model::human_ask::ASK_USER_TOOL_NAME,
@@ -5441,9 +5367,6 @@ mod tests {
             work.steps[1].tool_summary.as_deref(),
             Some("Asked 1 question · declined")
         );
-        assert_eq!(
-            work.steps[1].ask,
-            Some(ChatAskStepSummary::from(expected_declined))
-        );
+        assert_eq!(work.steps[1].ask, Some(expected_declined));
     }
 }

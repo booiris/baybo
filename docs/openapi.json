@@ -8104,7 +8104,7 @@
       },
       "ChatAskOption": {
         "type": "object",
-        "description": "One option presented inside a reconstructed `AskUser` step.",
+        "description": "One selectable option in an `AskUser` question.",
         "required": [
           "label",
           "description"
@@ -8120,7 +8120,7 @@
       },
       "ChatAskQuestion": {
         "type": "object",
-        "description": "One question and its recorded answer inside [`ChatAskStepSummary`].",
+        "description": "One question and its recorded answer inside [`AskStepSummary`], for both the\ncollapsed step line and the expanded question/choice view.",
         "required": [
           "header",
           "question"
@@ -8160,7 +8160,7 @@
       },
       "ChatAskStepSummary": {
         "type": "object",
-        "description": "Typed summary of a finished `AskUser` call, mirroring\n[`baybo_model::human_ask::AskStepSummary`] on the REST transcript surface.",
+        "description": "Answered questions and the cancellation or decline status of a finished `AskUser` call.",
         "required": [
           "declined"
         ],

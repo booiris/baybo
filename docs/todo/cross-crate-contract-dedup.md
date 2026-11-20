@@ -48,10 +48,10 @@ exist independently on the iOS, gateway, and remote-host paths.
 
 ## Boundaries that must remain explicit
 
-- `crates/gateway/src/api/dto.rs` deliberately mirrors domain types so `utoipa`
-  does not leak into domain crates and HTTP v1 changes stay explicit. It contains
-  53 public DTO types. Keep the DTOs and their `From` conversions; use schema and
-  conversion tests to detect drift.
+- Gateway DTOs own HTTP-specific representations. For example, `LogEntry`
+  turns log-field tuples into named objects. Shared model types can derive
+  `utoipa::ToSchema` directly when HTTP uses their existing serialization,
+  as it does for `AskStepSummary`.
 - `app/ios/ffi/src/api.rs` contains 50 public UniFFI records/enums, and
   `app/ios/ffi/src/gateway_api.rs` contains 31 private `Wire*` types. These bridge
   JSON and Swift ABI constraints. Do not replace them with external Rust types
@@ -63,6 +63,32 @@ exist independently on the iOS, gateway, and remote-host paths.
   owner or an existing protocol boundary.
 
 ## High-value candidates
+
+### Gateway REST types
+
+Follow-up from the 2026-11-20 review. Use the existing `baybo-model` types
+for the ten REST mirrors below and remove their field-by-field conversions.
+
+- [ ] Use `ApprovalDecision` and `ApprovalResolution` in the projects API,
+  and `AgentFramework` in the agents API.
+- [ ] Replace `LlmPricingOverrideDto`, the gateway's `ChannelType`, and
+  `TurnOrigin` with `LlmPricingOverride`, `ChannelType`, and `TriggerKind`.
+  Preserve integer micro-USD prices and the open-ended channel string.
+- [ ] Use `CronStatus` and `CronSchedule` directly. Accept `CronJobPatch` in
+  the update handler in place of `UpdateCronRequest`. An omitted field in a
+  PATCH must leave that job setting untouched.
+- [ ] Use `FolderSummary` in place of `FolderDto`. Keep folder IDs as strings
+  on the wire and omit an absent parent ID.
+- [ ] Within the gateway, use `log_buffer::LogLevel` for the REST enum too.
+  Preserve its lowercase wire values.
+
+Verify each batch against the pre-change OpenAPI document, including component
+names, references, enum tags, required fields and nullability. Regenerate the
+TypeScript bindings and run the affected request and response tests.
+
+Separate follow-up: review the mirrors of `wire::SlashCommandSpec`,
+`baybo_tools::ToolDefinition`, and `baybo_turn::TurnInputKind` with their
+owning crates. Reusing those types would require schema support there.
 
 ### Protocol and security rules
 

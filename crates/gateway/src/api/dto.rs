@@ -1,12 +1,8 @@
 //! Shared request / response DTOs for the v1 API.
 //!
-//! Every type that appears in an admin-API response lives here and
-//! derives [`utoipa::ToSchema`] so `crate::openapi` can emit a spec
-//! matching the wire format. Domain types in `baybo-model`, `baybo-turn`,
-//! `baybo-cron`, `baybo-tools` deliberately stay free of utoipa so
-//! changes over there don't silently reshape the HTTP surface — every
-//! field crossing the API boundary has an explicit DTO mirror plus a
-//! `From` conversion, and the drift test picks up any schema change.
+//! Gateway-specific representations derive [`utoipa::ToSchema`] here or
+//! beside their routes. The chat API uses the shared `baybo-model` types
+//! for its `AskUser` step summaries. The OpenAPI drift test covers both.
 //!
 //! When a domain type changes:
 //!

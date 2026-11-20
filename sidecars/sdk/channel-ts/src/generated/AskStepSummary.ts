@@ -2,8 +2,6 @@
 import type { AskStepQuestion } from "./AskStepQuestion";
 
 /**
- * Typed summary of a finished `AskUser` call, derived server-side from its
- * input and result (`baybo_human_ask::ask_step_summary`) so the live wire and
- * REST reconstruction agree identically.
+ * Answered questions and the cancellation or decline status of a finished `AskUser` call.
  */
 export type AskStepSummary = { declined: boolean, cancelled: boolean, questions?: Array<AskStepQuestion>, };
