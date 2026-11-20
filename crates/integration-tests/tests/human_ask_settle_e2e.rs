@@ -37,6 +37,52 @@ struct Fixture {
     ask_id: AskId,
 }
 
+fn seed_ask(
+    session: &baybo_model::Session,
+    ask_id: &AskId,
+    call_id: &str,
+    tool: &str,
+    kind: AskKind,
+    resolution: Option<AskResolution>,
+    accesses: Vec<ResourceAccess>,
+) -> HumanAskRow {
+    let request = match kind {
+        AskKind::Approval => AskRequest::Approval(ApprovalRequest {
+            ask_id: ask_id.clone(),
+            tool_call_id: call_id.to_string(),
+            session_id: session.id.clone(),
+            user_id: session.user.id.clone(),
+            tool: tool.to_string(),
+            accesses,
+            params_preview: "{}".to_string(),
+            description: None,
+        }),
+        AskKind::Question => AskRequest::Question(QuestionRequest {
+            questions: vec![Question {
+                header: "Auth".to_string(),
+                question: "Which auth?".to_string(),
+                options: Vec::new(),
+                multi_select: false,
+            }],
+        }),
+    };
+    let now = Utc::now();
+    HumanAskRow {
+        ask_id: ask_id.clone(),
+        session_id: session.id.clone(),
+        channel: session.channel.clone(),
+        tool_call_id: call_id.to_string(),
+        turn_id: baybo_model::TurnId::new(),
+        kind,
+        phase: AskPhase::BeforeExecute,
+        request,
+        created_at: now,
+        resolved_at: resolution.as_ref().map(|_| now),
+        resolution,
+        applied_at: None,
+    }
+}
+
 /// What a restart leaves behind: `[user, assistant(tool_use)]` on the
 /// transcript, an ask row for the call, and the turn that raised it.
 async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>) -> Fixture {
@@ -59,41 +105,15 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
         }
     });
     let session = baybo_integration_tests::SessionBuilder::new().build();
-    let request = match kind {
-        AskKind::Approval => AskRequest::Approval(ApprovalRequest {
-            ask_id: ask_id.clone(),
-            tool_call_id: CALL_ID.to_string(),
-            session_id: session.id.clone(),
-            user_id: session.user.id.clone(),
-            tool: tool.to_string(),
-            accesses: probe.accessed_resources(&json!({})),
-            params_preview: "{}".to_string(),
-            description: None,
-        }),
-        AskKind::Question => AskRequest::Question(QuestionRequest {
-            questions: vec![Question {
-                header: "Auth".to_string(),
-                question: "Which auth?".to_string(),
-                options: Vec::new(),
-                multi_select: false,
-            }],
-        }),
-    };
-    let now = Utc::now();
-    let row = HumanAskRow {
-        ask_id: ask_id.clone(),
-        session_id: session.id.clone(),
-        channel: session.channel.clone(),
-        tool_call_id: CALL_ID.to_string(),
-        turn_id: baybo_model::TurnId::new(),
+    let row = seed_ask(
+        &session,
+        &ask_id,
+        CALL_ID,
+        tool,
         kind,
-        phase: AskPhase::BeforeExecute,
-        request,
-        created_at: now,
-        resolved_at: resolution.as_ref().map(|_| now),
         resolution,
-        applied_at: None,
-    };
+        probe.accessed_resources(&json!({})),
+    );
     let transcript = vec![
         ChatMessage::system(vec![ContentBlock::Text(
             "You are Baybo, a test assistant.".to_string(),
@@ -820,4 +840,315 @@ async fn during_execute_unsandboxed_retry_resumes_straight_to_unsandboxed_and_do
         "ApproveAlways on resumed unsandboxed retry must not persist to session cache"
     );
     stop(harness).await;
+}
+
+mod dispatch {
+    use super::*;
+    use baybo_integration_tests::human_ask::transcript;
+    use baybo_tools::{ToolConcurrency, ToolContext, ToolOutput};
+    use tokio::sync::{mpsc, oneshot};
+
+    const PROBE: &str = "settlement_probe";
+    #[derive(Debug)]
+    struct StartedCall {
+        id: String,
+        release: oneshot::Sender<()>,
+        finished: oneshot::Receiver<()>,
+    }
+    struct Probe {
+        started: mpsc::UnboundedSender<StartedCall>,
+        concurrency: ToolConcurrency,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            PROBE
+        }
+        fn description(&self) -> String {
+            "wait for the test to release this call".into()
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object","properties":{"id":{"type":"string"}, "ask":{"type":"boolean"}}})
+        }
+        fn concurrency(&self) -> ToolConcurrency {
+            self.concurrency
+        }
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            let id = params["id"].as_str().expect("call id").to_owned();
+            let (release, wait) = oneshot::channel();
+            let (done, finished) = oneshot::channel();
+            self.started
+                .send(StartedCall {
+                    id: id.clone(),
+                    release,
+                    finished,
+                })
+                .expect("report start");
+            wait.await.expect("test releases the call");
+            if params["ask"] == true {
+                ctx.approval
+                    .as_ref()
+                    .expect("attended turn")
+                    .request_uncached(
+                        PROBE,
+                        &ctx.session_id,
+                        &ctx.user,
+                        vec![ResourceAccess::WriteFile {
+                            path: "/tmp/nested".into(),
+                        }],
+                        id.clone(),
+                    )
+                    .await;
+            }
+            let _ = done.send(());
+            Ok(ToolOutput::Text(id))
+        }
+    }
+
+    fn batch(
+        decisions: &[(&str, ApprovalDecision)],
+        nested: bool,
+        concurrency: ToolConcurrency,
+    ) -> (AgentTestHarness, mpsc::UnboundedReceiver<StartedCall>) {
+        let session = baybo_integration_tests::SessionBuilder::new().build();
+        let (tx, started) = mpsc::unbounded_channel();
+        let probe = Probe {
+            started: tx,
+            concurrency,
+        };
+        let manifest = ToolManifest {
+            name: PROBE.into(),
+            description: probe.description(),
+            parameters_schema: probe.parameters_schema(),
+            trust_level: baybo_model::TrustLevel::Trusted,
+            capabilities: vec![],
+            channels: vec![],
+        };
+        let mut builder = AgentTestHarness::builder()
+            .with_tool(Arc::new(probe), manifest)
+            .with_channel_ask_gate();
+        let mut uses = Vec::new();
+        let turn_id = baybo_model::TurnId::new();
+        for &(id, decision) in decisions {
+            let mut row = seed_ask(
+                &session,
+                &AskId::new(),
+                id,
+                PROBE,
+                AskKind::Approval,
+                Some(AskResolution::Approval(decision)),
+                vec![],
+            );
+            row.turn_id = turn_id;
+            builder = builder.with_seed_ask(row);
+            uses.push(ContentBlock::ToolUse {
+                id: id.into(),
+                name: PROBE.into(),
+                input: json!({"id":id,"ask":nested}),
+                signature: None,
+            });
+        }
+        let transcript = vec![
+            ChatMessage::user(vec![ContentBlock::Text("run the batch".into())]),
+            ChatMessage::assistant(uses),
+        ];
+        (
+            builder
+                .session(session)
+                .with_seed_transcript(transcript)
+                .build(),
+            started,
+        )
+    }
+
+    async fn next_call(started: &mut mpsc::UnboundedReceiver<StartedCall>) -> StartedCall {
+        tokio::time::timeout(STOP_TIMEOUT, started.recv())
+            .await
+            .expect("call starts before its siblings finish")
+            .expect("start event")
+    }
+
+    async fn stop_current(harness: &AgentTestHarness) {
+        let turns = harness
+            .turn_lifecycle
+            .list_active_chat_turns_by_session(&harness.session.id)
+            .await
+            .unwrap();
+        let [turn] = turns.as_slice() else {
+            panic!("expected one active turn")
+        };
+        harness
+            .turn_lifecycle
+            .cancel(&turn.id, baybo_turn::CancelReason::UserStopped, vec![])
+            .await
+            .unwrap();
+    }
+
+    async fn results(harness: &AgentTestHarness) -> Vec<(String, String)> {
+        transcript(harness)
+            .await
+            .into_iter()
+            .flat_map(|row| row.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some((tool_use_id, content.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn approved_siblings_overlap_and_results_keep_ledger_order() {
+        use ApprovalDecision::{Approve, Deny};
+        let (mut harness, mut started) = batch(
+            &[("first", Approve), ("denied", Deny), ("last", Approve)],
+            false,
+            ToolConcurrency::Concurrent,
+        );
+        reply(&harness, "done");
+        harness.send_text("continue").await.unwrap();
+        let a = next_call(&mut started).await;
+        let b = next_call(&mut started).await;
+        let (first, last) = if a.id == "first" { (a, b) } else { (b, a) };
+        assert_eq!((first.id.as_str(), last.id.as_str()), ("first", "last"));
+        last.release.send(()).unwrap();
+        tokio::time::timeout(STOP_TIMEOUT, last.finished)
+            .await
+            .expect("last completes before first")
+            .unwrap();
+        first.release.send(()).unwrap();
+        harness.drain_outputs(DRAIN_TIMEOUT).await;
+        let rows = results(&harness).await;
+        assert_eq!(
+            rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["first", "denied", "last"]
+        );
+        assert!(rows[1].1.contains(baybo_model::TOOL_DENIED_PREFIX));
+        assert!(
+            harness
+                .ask_store
+                .rows()
+                .iter()
+                .all(|row| row.applied_at.is_some())
+        );
+        stop(harness).await;
+    }
+
+    #[tokio::test]
+    async fn stop_drops_a_reexecuted_tool_that_ignores_its_token() {
+        let (mut harness, mut started) = batch(
+            &[(CALL_ID, ApprovalDecision::Approve)],
+            false,
+            ToolConcurrency::Concurrent,
+        );
+        let id = harness.ask_store.rows()[0].ask_id.clone();
+        harness
+            .mailbox
+            .send(AgentMessage::ResumeAsk { ask_id: id })
+            .await
+            .unwrap();
+        let mut call = next_call(&mut started).await;
+        stop_current(&harness).await;
+        tokio::time::timeout(STOP_TIMEOUT, call.release.closed())
+            .await
+            .expect("stop drops the tool");
+        harness.drain_outputs(DRAIN_TIMEOUT).await;
+        let rows = results(&harness).await;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]
+                .1
+                .contains(baybo_context::prompts::cancelled_turn::TOOL_RESULT_BODY)
+        );
+        stop(harness).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_an_approval_waiting_for_exclusive_permits_unapplied() {
+        use ApprovalDecision::Approve;
+        let (mut harness, mut started) = batch(
+            &[("first", Approve), ("second", Approve)],
+            false,
+            ToolConcurrency::Exclusive,
+        );
+        harness.send_text("continue").await.unwrap();
+        let running = next_call(&mut started).await;
+        let asks = harness.ask_store.clone();
+        stop(harness).await;
+        assert!(started.try_recv().is_err());
+        let rows = asks.rows();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.applied_at.is_some(), row.tool_call_id == running.id);
+        }
+    }
+
+    async fn nested_ask() -> (AgentTestHarness, AskId) {
+        let (mut harness, mut started) = batch(
+            &[(CALL_ID, ApprovalDecision::Approve)],
+            true,
+            ToolConcurrency::Concurrent,
+        );
+        harness.send_text("continue").await.unwrap();
+        next_call(&mut started).await.release.send(()).unwrap();
+        let queue = harness.ask_queues.get_or_create(&harness.session.channel);
+        let id = tokio::time::timeout(STOP_TIMEOUT, async {
+            loop {
+                if let Some(row) = harness
+                    .ask_store
+                    .rows()
+                    .into_iter()
+                    .find(|row| row.is_pending())
+                    && queue.contains(&row.ask_id)
+                {
+                    break row.ask_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("during-execute ask is live");
+        (harness, id)
+    }
+
+    #[tokio::test]
+    async fn stop_claims_the_during_execute_ask_of_a_reexecuted_call() {
+        let (mut harness, id) = nested_ask().await;
+        stop_current(&harness).await;
+        harness.drain_outputs(DRAIN_TIMEOUT).await;
+        let row = harness.ask_store.row(&id).unwrap();
+        assert_eq!(row.resolution, Some(AskResolution::Abandoned));
+        assert!(row.applied_at.is_some());
+        assert_eq!(results(&harness).await.len(), 1);
+        stop(harness).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_the_reexecution_and_leaves_its_live_ask_pending() {
+        let (harness, id) = nested_ask().await;
+        let asks = harness.ask_store.clone();
+        let store = harness.session_store.clone();
+        let session_id = harness.session.id.clone();
+        stop(harness).await;
+        let row = asks.row(&id).unwrap();
+        assert!(row.is_pending() && row.applied_at.is_none());
+        let rows = store
+            .load_session_messages_with_supersede(&session_id)
+            .await
+            .unwrap();
+        assert!(
+            !rows
+                .iter()
+                .flat_map(|r| &r.message.content)
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        );
+    }
 }

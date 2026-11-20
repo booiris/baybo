@@ -647,14 +647,14 @@ For each `SettledAsk` the manager returns, the settlement appends what its
   - `Deny` (answered, abandoned, policy, timed out) → the denied result
     with `refusal_reason(outcome.resolution)` and
     `ToolResultMeta { approval: Some(Deny) }`.
-  - `Approve | ApproveAlways` → `mark_applied` **first**, then re-execute:
-    open a step under the Resume turn and call `ToolExecutor::execute` with
-    the persisted `tool_use` block's name and params and
-    `PreDecided { decision, phase, accesses }` so the gate short-circuits without raising
-    (`ApproveAlways` also seeds `approved_resources`, as live); append the
-    result through the same post-processing helper the batch loop uses. The
-    original turn's step/span rows were closed by recovery; the re-execution
-    gets fresh ones.
+  - `Approve | ApproveAlways` → dispatch the persisted call with
+    `PreDecided { decision, phase, accesses }` under a fresh step of the
+    current turn. Approved siblings share the live dispatcher's permit pool
+    and cancellation handling. Each claims its ask with `mark_applied` after
+    acquiring its permits and before executing. The dispatcher writes back
+    grants and appends results in ledger order, including synthetic denials
+    between approved calls. Settlement does not advance the read tracker's
+    model-response boundary.
 
 Only resumable rows are ever handed out; a resolved non-resumable row is
 stamped applied by `settle_unapplied` with nothing appended, which is what

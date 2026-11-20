@@ -17,8 +17,7 @@ use tokio::sync::mpsc;
 
 use baybo_model::{ControlEventKind, Session};
 use baybo_tools::{
-    ApprovalDecision, CancelOrigin, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry,
-    TurnTokens,
+    ApprovalDecision, CancelOrigin, ReadTracker, ToolOutput, ToolRegistry, TurnTokens,
 };
 use baybo_trace::{
     CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle,
@@ -38,7 +37,9 @@ use crate::runtime::tool_executor::{ExecutedTool, PreExecuteGate, ToolExecutor};
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
 
+mod dispatch;
 mod settle;
+use dispatch::{BatchCall, BatchTurn, CallWork};
 pub use settle::AsksSettled;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
@@ -58,17 +59,6 @@ const TOOL_SUMMARY_MAX: usize = 80;
 /// win (FIFO eviction) because earlier screenshots are typically stale —
 /// the page state has moved on.
 const MAX_LLM_IMAGES_PER_ITERATION: usize = 8;
-
-/// Upper bound on how many [`ToolConcurrency::Concurrent`] tool calls
-/// run at once within a single LLM response. A
-/// [`ToolConcurrency::Exclusive`] call (any tool that mutates state)
-/// acquires *all* of these permits, so it runs alone — it waits for
-/// in-flight pool calls to drain and blocks any other pool call until it
-/// returns. A [`ToolConcurrency::Independent`] call (`spawn_subagent`)
-/// acquires no permit and self-bounds out-of-band, so the pool never
-/// throttles subagent fan-out. Like the per-tool timeout ceiling, the
-/// cap lives in code rather than `baybo.json`.
-const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
 
 /// Trim and length-cap a single-line summary string. Char-based so a
 /// multibyte boundary is never split.
@@ -1074,9 +1064,6 @@ impl AgentLoop {
         // Title generation stays `UserChat`-only: a `Resume` turn's session
         // already has its opening message titled.
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
-        let background =
-            crate::runtime::tool_executor::TurnBackground::for_turn(session, turn_kind);
-        let attended = turn_kind.is_attended();
         self.context_manager.ensure_seeded().await?;
         // Churn and repeated failure are within-turn properties. Editing a
         // file back to how it was is exactly what "undo that" means when the
@@ -1088,20 +1075,6 @@ impl AgentLoop {
         // the answer (it needs only the opening message, already in context).
         self.maybe_generate_title(session, span_recorder, turn_id, is_user_turn, &cancel_token)
             .await;
-
-        // Tool-authored notices (`AgentEvent::Notice`) ride the turn-wide
-        // delta_tx directly, not the per-iteration `iter_delta_tx`: they
-        // are a distinct output variant from the LLM's streamed `AnswerDelta`
-        // and must reach the channel on every iteration, independent of
-        // any per-iteration streaming decision.
-        let notifier: Option<Arc<dyn baybo_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
-            Arc::new(DeltaTxNotifier {
-                tx: tx.clone(),
-                session_id: session.id.clone(),
-                user_id: session.user.id.clone(),
-                channel: session.channel.clone(),
-            }) as Arc<dyn baybo_tools::SessionNotifier>
-        });
 
         // Expand an explicit `/command` skill invocation before the loop:
         // context reads the matching skill's body and appends it (persisted +
@@ -1124,19 +1097,17 @@ impl AgentLoop {
         let mut turn_attachments: Vec<ContentBlock> = Vec::new();
         // A Resume turn applies the answered ask first, so the first LLM
         // call starts from `assistant(tool_use) + tool_result`.
+        let turn = BatchTurn {
+            span_recorder,
+            turn_id,
+            kind: turn_kind,
+            cancellation,
+            delta_tx: delta_tx.as_ref(),
+            cron_report: cron_report.as_ref(),
+        };
         if turn_kind == TurnInputKind::Resume {
-            self.settle_unapplied_asks(
-                session,
-                settle::SettlingTurn {
-                    span_recorder,
-                    turn_id,
-                    kind: turn_kind,
-                    tokens: &cancellation.tokens,
-                    delta_tx: delta_tx.as_ref(),
-                },
-                &mut turn_attachments,
-            )
-            .await?;
+            self.settle_unapplied_asks(session, turn, &mut turn_attachments)
+                .await?;
         }
 
         // Iterative LLM loop
@@ -1247,36 +1218,14 @@ impl AgentLoop {
             )
             .await?;
 
-            // Stream deltas on every iteration, not just the first. The
-            // final answer can land on any iteration (it follows however
-            // many tool-call rounds the model needs), and the TUI renders
-            // the final message body *only* from streamed deltas — its
-            // `finalize_stream` skips `Text` blocks via
-            // `render_non_text_blocks`. An unstreamed post-tool answer
-            // would persist and reach the client over the wire yet never
-            // render. Streaming each iteration keeps that answer visible.
-            let iter_delta_tx = delta_tx.as_ref();
-
             let outcome = crate::runtime::scope::with_step(
                 span_recorder.as_ref(),
                 turn_id,
                 StepKind::LlmIteration,
                 Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled)),
                 |step| {
-                    let fut = self.run_iteration(
-                        session,
-                        span_recorder,
-                        step,
-                        turn_id,
-                        iterations,
-                        iter_delta_tx,
-                        notifier.clone(),
-                        cancellation,
-                        &mut turn_attachments,
-                        background,
-                        attended,
-                        cron_report.clone(),
-                    );
+                    let fut =
+                        self.run_iteration(session, step, iterations, turn, &mut turn_attachments);
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
             )
@@ -1408,7 +1357,7 @@ impl AgentLoop {
     /// `LlmIteration` step (opened by [`crate::runtime::scope::with_step`] in
     /// the caller). Calls the LLM, then executes the response's tool
     /// calls concurrently under the per-response permit pool — each call
-    /// holds permits per its [`ToolConcurrency`] (`spawn_subagent` is
+    /// holds permits per its [`baybo_tools::ToolConcurrency`] (`spawn_subagent` is
     /// `Independent`, so it neither waits for nor holds a permit and its
     /// fan-out runs in parallel) — and appends their results to context
     /// in declaration order.
@@ -1416,28 +1365,20 @@ impl AgentLoop {
     /// Returns [`IterationOutcome::Final`] when the LLM produced no
     /// tool calls — that's the final assistant response and the loop
     /// terminates.
-    #[allow(clippy::too_many_arguments)]
     async fn run_iteration(
         &mut self,
         session: &mut Session,
-        span_recorder: &Arc<SpanRecorder>,
         step: StepHandle,
-        turn_id: TurnId,
         iterations: usize,
-        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-        notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
-        cancellation: &TurnCancellation,
+        turn: BatchTurn<'_>,
         turn_attachments: &mut Vec<ContentBlock>,
-        // What this turn lets its calls leave running past it — computed once
-        // per turn in `run_inner`.
-        background: crate::runtime::tool_executor::TurnBackground,
-        // Whether a human can answer this turn's asks — computed once per
-        // turn in `run_inner`.
-        attended: bool,
-        cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<IterationOutcome> {
-        let tokens = &cancellation.tokens;
-        let cancel_token = &tokens.turn;
+        let BatchTurn {
+            span_recorder,
+            delta_tx,
+            cancellation,
+            ..
+        } = turn;
         let (response, llm_span_id) = match self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancellation)
             .await
@@ -1540,79 +1481,6 @@ impl AgentLoop {
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
         self.context_manager.append(&assistant_msg).await?;
 
-        // Resolve `ToolInvoke` envelopes to their targets before anything
-        // keys off the call's name: progress captions, permit sizing, the
-        // executor's security doors, trace spans, and result post-processing
-        // must all see the real tool. The assistant message above keeps the
-        // model's original `ToolInvoke` block — the provider echo must match
-        // what the model emitted — and results still pair by `tool_use_id`.
-        let dispatch_calls: Vec<DispatchedToolCall> = response
-            .tool_calls
-            .iter()
-            .map(|tc| DispatchedToolCall::resolve(tc, &self.tool_registry))
-            .collect();
-
-        // Surface each tool call as a live progress line before dispatch
-        // (streaming turns only; cron passes `delta_tx = None`).
-        // Emitted ahead of `join_all` so the user sees "starting" before
-        // any approval prompt the executor raises mid-call.
-        for (tc, dispatch) in response.tool_calls.iter().zip(&dispatch_calls) {
-            let label = self
-                .tool_registry
-                .progress_label(&dispatch.name, &dispatch.arguments);
-            self.emit_tool_started(
-                delta_tx,
-                session,
-                tc.id.clone(),
-                dispatch.name.clone(),
-                label,
-            )
-            .await;
-        }
-
-        // Execute tool calls under a bounded-concurrency limiter.
-        // Approved resources are shared via a Mutex so concurrent calls
-        // see each other's grants immediately. Wrapped in an `Arc` so
-        // that any persist-always closure injected into `ToolContext`
-        // mid-execution can clone its handle into the executor boundary
-        // without a borrow escape.
-        //
-        // Concurrency model: a per-response `Semaphore` (sized to
-        // `MAX_CONCURRENT_TOOL_CALLS`) gates the futures join_all'd
-        // below. A `ToolConcurrency::Concurrent` call (a read-only tool)
-        // holds one permit, so up to the cap run at once; a
-        // `ToolConcurrency::Exclusive` call (any tool with side effects)
-        // holds *all* the permits, so it runs alone among pool calls; a
-        // `ToolConcurrency::Independent` call (`spawn_subagent`) holds
-        // none, so it neither waits nor blocks and self-bounds its own
-        // fan-out. The post-execution pass that mutates `session.messages`
-        // is kept SEQUENTIAL — appending tool results in original
-        // `tool_calls` order keeps the next turn's context byte-stable
-        // (prompt cache hits) and matches provider expectations that
-        // tool_use ↔ tool_result pairs land in declaration order. The
-        // executor + approval gate are already designed for
-        // concurrency (TUI gate serialises its prompts internally).
-        let approved = std::sync::Arc::new(parking_lot::Mutex::new(
-            session.state.approved_resources.clone(),
-        ));
-
-        let executor = Arc::clone(&self.tool_executor);
-        let session_id_for_calls = session.id.clone();
-        let session_trigger_for_calls = session.trigger.clone();
-        // The agent this session runs as, so a tool's memory writes and its
-        // `Skill` lookups land in the right partition and scope. Unbound
-        // sessions resolve to the built-in.
-        let agent_for_calls = session.state.agent_id_or_builtin();
-        let user_for_calls = session.user.clone();
-        let recorder_for_calls = Arc::clone(span_recorder);
-        let step_for_calls = step.clone();
-        let notifier_for_calls = notifier.clone();
-        // Tools get the LITE client: every consumer of the tool-layer
-        // side-LLM slot is an auxiliary call (the Bash risk judges,
-        // WebFetch's page summary), and none of them sends the session
-        // transcript, so there is no prompt cache to lose.
-        let llm_for_calls = Arc::clone(&self.lite_client);
-        let registry_for_calls = Arc::clone(&self.tool_registry);
         // Promote the previous response's staged reads before this batch runs,
         // so a `Read` and an `Edit`/`Write` of the same file in THIS response
         // can't authorize each other: the read stays staged until the next
@@ -1628,188 +1496,51 @@ impl AgentLoop {
             self.read_tracker
                 .record_prompt_delivered(&path, fingerprint);
         }
-        let read_tracker_for_calls = self.read_tracker.clone();
-        let running_for_calls = self.running_calls.clone();
-        let notify_silence_for_calls = cron_report.as_ref().map(|turn| turn.silence.clone());
-        let shared_response = dispatch_calls.len() > 1;
-        let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
-        // Race cancellation so tools that ignore the token cannot delay `/stop`.
-        // Drain ready results first; dropping the remaining futures cancels them.
-        // A sole-call tool (e.g. `AskUser`) sharing a response with any sibling
-        // is rejected without executing, while its siblings still run normally.
-        let mut tool_results: Vec<Option<ExecutedTool>> = std::iter::repeat_with(|| None)
-            .take(response.tool_calls.len())
-            .collect();
-        let mut pending = futures::stream::FuturesUnordered::new();
-        for (idx, (tc, dispatch)) in response.tool_calls.iter().zip(&dispatch_calls).enumerate() {
-            if shared_response && self.tool_registry.sole_call(&dispatch.name) {
-                tool_results[idx] = Some(ExecutedTool {
-                    output: Ok(ToolOutput::Error(format!(
-                        "{} must be the only tool call in its response",
-                        dispatch.name
-                    ))),
-                    approval: None,
-                    abandoned: false,
-                    handed_over: None,
-                });
-                continue;
-            }
-            let executor = Arc::clone(&executor);
-            let notify_silence = notify_silence_for_calls.clone();
-            let session_id = session_id_for_calls.clone();
-            let session_trigger = session_trigger_for_calls.clone();
-            let agent_id = agent_for_calls.clone();
-            let user = user_for_calls.clone();
-            let approved = Arc::clone(&approved);
-            let recorder = Arc::clone(&recorder_for_calls);
-            let step = step_for_calls.clone();
-            let tokens = TurnTokens {
-                turn: cancel_token.child_token(),
-                release: tokens.release.clone(),
-            };
-            let notifier = notifier_for_calls.clone();
-            let bind_source = Arc::clone(&llm_for_calls);
-            let tool_name = dispatch.name.clone();
-            let arguments = dispatch.arguments.clone();
-            let via_invoke = dispatch.via_invoke;
-            let tool_use_id = tc.id.clone();
-            let triggering_llm_span = Some(llm_span_id);
-            let limiter = Arc::clone(&concurrency_limiter);
-            let read_tracker = read_tracker_for_calls.clone();
-            let running = running_for_calls.clone();
-            // `Concurrent` → one permit (up to the cap run together);
-            // `Exclusive` → every permit, so the call runs alone among
-            // pool calls; `Independent` → no permit (self-bounded, e.g.
-            // `spawn_subagent`). Unknown tools fail safe to `Exclusive`
-            // inside `ToolRegistry::concurrency`.
-            let permits = match registry_for_calls.concurrency(&tool_name) {
-                ToolConcurrency::Concurrent => Some(1),
-                ToolConcurrency::Exclusive => Some(MAX_CONCURRENT_TOOL_CALLS as u32),
-                ToolConcurrency::Independent => None,
-            };
-            pending.push(async move {
-                // Hold a pool permit for the whole call (none for an
-                // `Independent` call). `acquire` errors only if the
-                // semaphore is closed, which never happens for this
-                // per-response limiter.
-                let _permit = match permits {
-                    Some(n) => limiter.acquire_many_owned(n).await.ok(),
-                    None => None,
-                };
-                let _running = running.start();
-                debug!(tool = %tool_name, "executing tool call");
-                let executed = executor
-                    .execute(
-                        &tool_name,
-                        arguments,
-                        &session_id,
-                        &session_trigger,
-                        &agent_id,
-                        &user,
-                        &approved,
-                        &recorder,
-                        &step,
-                        triggering_llm_span,
-                        tool_use_id,
-                        None,
-                        Some(turn_id),
-                        tokens,
-                        notifier,
-                        Some(&bind_source),
-                        background,
-                        attended,
-                        read_tracker,
-                        notify_silence,
-                        via_invoke,
-                        PreExecuteGate::Ask,
-                    )
-                    .await;
-                (idx, executed)
-            });
-        }
-        let cancelled_mid_batch = loop {
-            tokio::select! {
-                biased;
-                next = futures::StreamExt::next(&mut pending) => match next {
-                    Some((idx, executed)) => tool_results[idx] = Some(executed),
-                    None => break false,
-                },
-                _ = cancellation.cancelled() => break true,
-            }
-        };
-        drop(pending);
-        // One origin governs both unfinished calls and the actor's mailbox cleanup.
-        let cancel_origin = cancellation.origin();
-
-        // Sequential post-processing: append results in `tool_calls`
-        // order so context state stays byte-stable across calls.
-        let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
-        for ((tool_call, dispatch), executed) in response
+        // Resolve `ToolInvoke` envelopes to their targets before anything
+        // keys off the call's name: progress captions, permit sizing, the
+        // executor's security doors, trace spans, and result post-processing
+        // must all see the real tool. The assistant message above keeps the
+        // model's original `ToolInvoke` block — the provider echo must match
+        // what the model emitted — and results still pair by `tool_use_id`.
+        let shared_response = response.tool_calls.len() > 1;
+        let calls: Vec<_> = response
             .tool_calls
             .iter()
-            .zip(&dispatch_calls)
-            .zip(tool_results)
-        {
-            let interrupted = executed.as_ref().is_none_or(|e| e.abandoned);
-            if interrupted
-                && !self
-                    .claim_interrupted_call(session, &tool_call.id, cancel_origin)
-                    .await
-            {
-                continue;
-            }
-            // Every persisted tool use needs a result in the live context window.
-            let Some(executed) = executed else {
-                self.emit_tool_completed(
-                    delta_tx,
-                    session,
-                    tool_call.id.clone(),
-                    (ToolStatus::Error, "cancelled".to_string()),
-                    None,
-                    None,
-                )
-                .await;
-                let wrapped = baybo_model::wrap_tool_output(
-                    &dispatch.name,
-                    baybo_context::prompts::cancelled_turn::TOOL_RESULT_BODY,
-                    &[],
-                );
-                let tool_msg =
-                    ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, None);
-                self.context_manager.append(&tool_msg).await?;
-                continue;
-            };
-            self.append_executed_tool(
-                session,
-                delta_tx,
-                turn_id,
-                FinishedCall {
-                    tool_use_id: &tool_call.id,
+            .map(|info| {
+                let dispatch = DispatchedToolCall::resolve(info, &self.tool_registry);
+                let work = if shared_response && self.tool_registry.sole_call(&dispatch.name) {
+                    CallWork::Ready(ExecutedTool {
+                        output: Ok(ToolOutput::Error(format!(
+                            "{} must be the only tool call in its response",
+                            dispatch.name
+                        ))),
+                        approval: None,
+                        abandoned: false,
+                        handed_over: None,
+                    })
+                } else {
+                    CallWork::Run(PreExecuteGate::Ask)
+                };
+                BatchCall {
+                    id: info.id.clone(),
                     dispatch,
-                    executed,
-                },
-                ToolMedia {
-                    turn_attachments,
-                    llm_visible_images: &mut llm_visible_images,
-                },
-                cron_report.as_ref(),
-            )
-            .await?;
-        }
-
-        self.append_llm_visible_images(llm_visible_images).await?;
-
-        // Completed calls keep their approval grants even when the batch is cancelled.
-        session.state.approved_resources = approved.lock().clone();
-
-        // `with_step` maps this unwind to the turn's cancellation outcome.
-        if cancelled_mid_batch {
-            return Err(anyhow::anyhow!("turn cancelled during tool execution"));
-        }
-
-        let task_mutated = dispatch_calls
-            .iter()
-            .any(|dc| baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&dc.name.as_str()));
+                    work,
+                    asks: Vec::new(),
+                }
+            })
+            .collect();
+        let task_mutated = calls.iter().any(|call| {
+            baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&call.dispatch.name.as_str())
+        });
+        self.dispatch_calls(
+            session,
+            turn,
+            &step,
+            Some(llm_span_id),
+            calls,
+            turn_attachments,
+        )
+        .await?;
         Ok(IterationOutcome::Continue { task_mutated })
     }
 
