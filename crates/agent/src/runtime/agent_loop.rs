@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 mod dispatch;
 mod settle;
 use dispatch::{BatchCall, BatchTurn, CallWork};
-pub use settle::AsksSettled;
+pub(crate) mod settled_transcript;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
 /// for a placeholder to complete. If a chunk ends with an open `[{` but no
@@ -686,7 +686,7 @@ fn compaction_failed_text(reason: &str) -> String {
     format!("Context compaction failed; the conversation is unchanged. Reason: {reason}")
 }
 
-/// What [`AgentLoop::compact_now`] hands back for the caller to ship as a
+/// What [`SettledTranscript::compact_now`](settled_transcript::SettledTranscript::compact_now) hands back for the caller to ship as a
 /// notice. The severity travels with the text so a failed compaction cannot
 /// reach the user as an `Info` line that reads like a confirmation.
 pub struct CompactionNotice {
@@ -2287,103 +2287,6 @@ impl AgentLoop {
         });
     }
 
-    /// Append a user-authored message to this session's transcript — both the
-    /// in-memory context and the persisted `session_messages` log — ahead
-    /// of the turn that runs next. Lets the actor coalesce a burst of user
-    /// messages into one turn while keeping each as its own transcript row;
-    /// context's `messages_for_llm` collapses the consecutive rows for the
-    /// provider call.
-    pub async fn append_user_message_with_platform_msg_id(
-        &mut self,
-        _settled: &AsksSettled,
-        content: Vec<ContentBlock>,
-        platform_msg_id: impl Into<String>,
-    ) -> anyhow::Result<()> {
-        // A coalesced burst can be the first thing a fresh session ever
-        // appends; seed the system prompt first so it never lands *after*
-        // user content. `ensure_seeded` keys off `messages[0]`, so a leading
-        // user row would otherwise make every later turn re-seed.
-        self.context_manager.ensure_seeded().await?;
-        let msg = ChatMessage::user(content).with_platform_msg_id(platform_msg_id);
-        self.context_manager.append(&msg).await?;
-        Ok(())
-    }
-
-    /// Append a cron fire's framed prompt as a persisted `Cron`-source row
-    /// ahead of the turn. The framing ([`baybo_context::prompts::cron`]) makes
-    /// the model treat the fire as a task to perform now rather than a live
-    /// user message; `MessageSource::Cron` lets the operator inbox find the
-    /// row. Seeds the system prompt first so a fresh cron session never lands
-    /// the fire ahead of `messages[0]`.
-    /// Append a board issue's brief as the run's input row.
-    /// Append the card a run was handed. `files` are the card's own
-    /// attachments, already resolved into blocks: they follow the framed
-    /// prose rather than being wrapped by it, so the framing's contract —
-    /// that the instruction is the tail of the *text* — still holds with a
-    /// picture in the message.
-    pub async fn append_issue_brief(
-        &mut self,
-        _settled: &AsksSettled,
-        number: i64,
-        checkout: &str,
-        brief: &str,
-        files: &[baybo_model::MediaBlock],
-    ) -> anyhow::Result<()> {
-        self.context_manager.ensure_seeded().await?;
-        let framed = baybo_context::prompts::issue::frame_issue_brief(number, checkout, brief);
-        let msg = ChatMessage::issue_brief(baybo_model::prose_with_media(framed, files));
-        self.context_manager.append(&msg).await?;
-        Ok(())
-    }
-
-    pub async fn append_cron_fire(
-        &mut self,
-        _settled: &AsksSettled,
-        turn_id: &str,
-        prompt: &str,
-        context: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.context_manager.ensure_seeded().await?;
-        let framed =
-            baybo_context::prompts::cron::frame_cron_prompt_with_context(turn_id, prompt, context);
-        let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
-        self.context_manager.append(&msg).await?;
-        Ok(())
-    }
-
-    /// Append a one-shot cron fire's result to **this** (the scheduling)
-    /// conversation as a persisted `Role::Assistant` row. A one-shot origin
-    /// delivery supplies `source_event_id` so a crash replay returns the
-    /// existing row instead of appending another copy; recurring fires pass
-    /// `None` because each fire owns a fresh conversation.
-    ///
-    /// No inference runs: `content` is the fire's own reply, already framed
-    /// with a scheduled-task header ([`baybo_context::prompts::cron`]). The
-    /// row is stamped `MessageSource::CronNotification`, so chat surfaces can
-    /// badge it and the next real turn reads it back as something the
-    /// assistant already reported. Seeds the system prompt first — the
-    /// notification can be the first thing an otherwise-cold session appends.
-    ///
-    pub async fn append_cron_notification(
-        &mut self,
-        _settled: &AsksSettled,
-        content: Vec<ContentBlock>,
-        source_event_id: Option<&str>,
-    ) -> anyhow::Result<baybo_session::SessionMessageAppendOutcome> {
-        self.context_manager.ensure_seeded().await?;
-        let message = ChatMessage::cron_notification(content);
-        match source_event_id {
-            Some(source_event_id) => Ok(self
-                .context_manager
-                .append_idempotent(source_event_id, &message)
-                .await?),
-            None => {
-                let ordinal = self.context_manager.append(&message).await?;
-                Ok(baybo_session::SessionMessageAppendOutcome::Inserted { ordinal })
-            }
-        }
-    }
-
     /// Append a subagent-spawned session's initial prompt as a persisted
     /// `SubagentSeed` row ahead of the turn — the one agent-injected row chat
     /// surfaces render (the child's transcript opens with its errand).
@@ -2395,22 +2298,6 @@ impl AgentLoop {
         let msg = ChatMessage::subagent_seed(content);
         self.context_manager.append(&msg).await?;
         Ok(())
-    }
-
-    /// Append the crash-replayable hidden prompt that carries a background
-    /// batch into its analysis turn. Existing rows are returned without
-    /// duplicating the live context window.
-    pub async fn append_background_notification_prompt_once(
-        &mut self,
-        _settled: &AsksSettled,
-        content: Vec<ContentBlock>,
-        source_event_id: &str,
-    ) -> anyhow::Result<baybo_session::SessionMessageAppendOutcome> {
-        self.context_manager.ensure_seeded().await?;
-        Ok(self
-            .context_manager
-            .append_idempotent(source_event_id, &ChatMessage::agent_context(content))
-            .await?)
     }
 
     /// Arm or clear the request-time background-notification retry cue. Applied
@@ -3120,94 +3007,6 @@ impl AgentLoop {
         {
             debug!(session_id = %session.id, error = %e, "failed to persist progress narration");
         }
-    }
-
-    /// Run an on-demand compression pass and return the notice for the caller
-    /// to ship as an `AgentEvent::Notice`.
-    /// The variants of `CompressionOutcome` map to specific user-facing
-    /// messages so the caller (typically a `/compact` notice) can
-    /// distinguish "strategy declined", "no savings", a failed summarizer
-    /// call, and a real compress — instead of one generic "nothing to
-    /// compress" line.
-    /// A fresh turn is minted so the compression step + LLM span land
-    /// on a real lifecycle.
-    pub async fn compact_now(
-        &mut self,
-        _settled: &AsksSettled,
-        session: &mut Session,
-        turn_lifecycle: &Arc<TurnLifecycle>,
-        span_recorder: &Arc<SpanRecorder>,
-        parent_turn_id: Option<TurnId>,
-        cancel_token: CancellationToken,
-    ) -> anyhow::Result<CompactionNotice> {
-        // `/compact` is a user-typed command, but it is not a chat turn: it
-        // runs `force_compress` directly and emits a notice, not an assistant
-        // reply.
-        let turn_input = TurnInput::Compact;
-        let spec = TurnSpec {
-            session_id: session.id.clone(),
-            origin: session.trigger.kind(),
-            input: turn_input,
-            parent_turn_id,
-        };
-
-        crate::runtime::scope::with_turn(
-            turn_lifecycle,
-            cancel_token.clone(),
-            spec,
-            |turn_id| async move {
-                let runner = self.build_compression_runner(
-                    session,
-                    span_recorder,
-                    turn_id,
-                    &cancel_token,
-                    CompressionTrigger::Forced,
-                );
-                let model_id = runner.model_info.id.clone();
-                let tool_defs = self.session_tool_defs(session);
-                let outcome = self
-                    .context_manager
-                    .force_compress(&model_id, tool_defs, |req, marker| async move {
-                        runner.run(req, marker).await
-                    })
-                    .await?;
-                let notice = match outcome {
-                    baybo_context::CompressionOutcome::Compressed => CompactionNotice::info(
-                        "Context compressed.",
-                    ),
-                    baybo_context::CompressionOutcome::BelowThreshold => CompactionNotice::info(
-                        "Context already under the compression threshold; skipped.",
-                    ),
-                    baybo_context::CompressionOutcome::StrategyDeclined => CompactionNotice::info(
-                        "Compression strategy declined: nothing to summarize (conversation too short).",
-                    ),
-                    baybo_context::CompressionOutcome::NoSavings => CompactionNotice::info(
-                        "Compression ran but produced no savings; kept the original.",
-                    ),
-                    baybo_context::CompressionOutcome::Cancelled => CompactionNotice::info(
-                        "Compaction cancelled; the conversation is unchanged.",
-                    ),
-                    // The one arm the user has to act on — retype `/compact`,
-                    // or let the threshold path retry — so it is the one arm
-                    // that does not come back as `Info`.
-                    baybo_context::CompressionOutcome::Failed { reason } => {
-                        warn!(
-                            session_id = %session.id,
-                            reason = %reason,
-                            "/compact failed; transcript left unchanged"
-                        );
-                        CompactionNotice::warn(&compaction_failed_text(&reason))
-                    }
-                };
-                let output = TurnOutput::Message {
-                    content: vec![ContentBlock::Text(notice.text.clone())],
-                    // `/compact` is not a user-chat turn — never pushed.
-                    ordinal: None,
-                };
-                Ok((output, notice))
-            },
-        )
-        .await
     }
 
     /// One-shot conversation-title seed. Called at the **start** of

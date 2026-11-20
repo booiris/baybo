@@ -3,102 +3,24 @@
 //! that raised it, before anything else is appended. See "The turn prelude"
 //! in `docs/modules/human-ask.md`.
 
-use std::sync::Arc;
-
 use baybo_human_ask::SettledAsk;
 use baybo_model::human_ask::{AskId, AskKind, AskPhase, AskResolution};
 use baybo_model::{ContentBlock, Session};
 use baybo_store::HumanAskRow;
 use baybo_tools::{
-    ApprovalDecision, ApprovalOutcome, ApprovalResolution, ToolError, ToolOutput, TurnTokens,
-    refusal_reason,
+    ApprovalDecision, ApprovalOutcome, ApprovalResolution, ToolError, ToolOutput, refusal_reason,
 };
-use baybo_trace::{LifecycleOutcome, SpanRecorder, StepKind};
-use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
-use tokio::sync::mpsc;
+use baybo_trace::{LifecycleOutcome, StepKind};
 use tracing::{debug, warn};
 
-use super::{AgentLoop, BatchCall, BatchTurn, CallWork, DispatchedToolCall, TurnCancellation};
+use super::{AgentLoop, BatchCall, BatchTurn, CallWork, DispatchedToolCall};
 use crate::runtime::tool_executor::{ExecutedTool, PreExecuteGate};
-use baybo_channels::AgentOutput;
-
-/// Proof that the session's unapplied asks were settled: the only way to
-/// get one is [`AgentLoop::settle_before_append`]. Every append a door makes
-/// ahead of its turn takes it, so a door cannot put a row after a
-/// `tool_use` an ask still has to answer — that order is one no provider
-/// accepts, and nothing repairs it before the next LLM call.
-pub struct AsksSettled(());
 
 impl AgentLoop {
     /// The row a Resume turn for the answered `ask_id` starts from, if it
     /// should run now.
     pub async fn resume_ready(&self, ask_id: &AskId) -> anyhow::Result<Option<HumanAskRow>> {
         Ok(self.asks.resume_ready(ask_id).await?)
-    }
-
-    /// A door's prelude: settle the session's unapplied asks before the door
-    /// appends anything, so each result lands adjacent to the row that
-    /// raised it. Opens no turn when there is nothing to settle; otherwise
-    /// the settlement is a `Resume` turn of its own, which ends after the
-    /// appends, and the door's turn follows. (The chat Resume door instead
-    /// settles inside `run_inner` and goes on to the LLM iterations.)
-    pub async fn settle_before_append(
-        &mut self,
-        session: &mut Session,
-        turn_lifecycle: &Arc<TurnLifecycle>,
-        span_recorder: &Arc<SpanRecorder>,
-        delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        tokens: TurnTokens,
-    ) -> anyhow::Result<AsksSettled> {
-        if self
-            .asks
-            .unapplied_for_session(&session.id)
-            .await?
-            .is_empty()
-        {
-            return Ok(AsksSettled(()));
-        }
-        self.refresh_active_llm();
-        let spec = crate::runtime::scope::TurnSpec {
-            session_id: session.id.clone(),
-            origin: session.trigger.kind(),
-            input: TurnInput::AskSettlement,
-            parent_turn_id: None,
-        };
-        let cancellation = &TurnCancellation {
-            tokens,
-            observed: Default::default(),
-        };
-        crate::runtime::scope::with_turn_reporting_cancel(
-            turn_lifecycle,
-            cancellation.tokens.turn.clone(),
-            spec,
-            |turn_id| async move {
-                let mut attachments = Vec::new();
-                let settled = self
-                    .settle_unapplied_asks(
-                        session,
-                        BatchTurn {
-                            span_recorder,
-                            turn_id,
-                            kind: TurnInputKind::AskSettlement,
-                            cancellation,
-                            cron_report: None,
-                            delta_tx: delta_tx.as_ref(),
-                        },
-                        &mut attachments,
-                    )
-                    .await?;
-                Ok((
-                    TurnOutput::Structured {
-                        value: serde_json::json!({ "settled_asks": settled }),
-                    },
-                    AsksSettled(()),
-                ))
-            },
-            |error| cancellation.classify(error),
-        )
-        .await
     }
 
     /// Append a result for every unapplied ask of the session, in ledger
