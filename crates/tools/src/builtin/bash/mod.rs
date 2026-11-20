@@ -65,8 +65,8 @@ use baybo_model::BackgroundHandle;
 use futures::FutureExt;
 
 use crate::{
-    ApprovalDecision, ExecSandbox, NoticeLevel, ResourceAccess, RunningChild, SpawnOpts, Tool,
-    ToolContext, ToolError, ToolOutput, refusal_reason,
+    ApprovalDecision, ExecSandbox, NoticeLevel, PreExecuteAsk, PreExecuteCheck, ResourceAccess,
+    RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
 };
 
 mod judge;
@@ -84,6 +84,18 @@ use parse::{
 /// names — rather than being silently cut here first. Not quoted to the
 /// model: what it receives is the capped result, not one stream.
 const MAX_OUTPUT_BYTES: usize = 2 * baybo_model::MAX_TOOL_OUTPUT_BYTES;
+/// Warning shown in `pre_execute_ask` when a Bash command contains a
+/// destructive delete / history operation (manual mode, pre-decided auto mode,
+/// and merged into `require_escalated` prompts).
+const DESTRUCTIVE_COMMAND_WARNING: &str = "Destructive command: contains a file-delete operation \
+     (rm / rmdir / git clean / git reset --hard / …). The \
+     action is irreversible — review the command and the \
+     target paths carefully before approving.";
+
+/// Escalation note attached when a resumed `DuringExecute` retry approval
+/// skips the failed sandboxed attempt and runs unsandboxed directly.
+const RESUMED_ESCALATION_NOTE: &str = "ran outside the OS sandbox after user-approved retry";
+
 /// Cap for the one-line command digest logged on sandbox-bypass events.
 const COMMAND_HEAD_MAX_CHARS: usize = 160;
 /// Bash backgrounds a command only once it overruns its own deadline; a
@@ -712,25 +724,9 @@ impl Tool for BashTool {
         Some(BASH_BACKGROUND)
     }
 
-    fn call_label(&self, params: &Value) -> Option<String> {
-        let cmd = params.get("command").and_then(|v| v.as_str())?;
-        if contains_delete_command(cmd) {
-            Some(
-                "Destructive command: contains a file-delete operation \
-                 (rm / rmdir / git clean / git reset --hard / …). The \
-                 action is irreversible — review the command and the \
-                 target paths carefully before approving."
-                    .to_string(),
-            )
-        } else {
-            None
-        }
-    }
-
     /// Progress preview = the command itself (whitespace-collapsed, length-
     /// capped via the shared helper), so the live `● Bash(<cmd>)` line is
-    /// useful for *every* call — `call_label` above is a destructive-command
-    /// warning, not a preview, so we don't inherit it here.
+    /// useful for *every* call.
     fn progress_label(&self, params: &Value) -> Option<String> {
         params
             .get("command")
@@ -746,12 +742,10 @@ impl Tool for BashTool {
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
-        // Manual permission declares every executable Bash command to the
-        // executor's human approval gate. Auto owns the destructive-command
-        // gate inside `execute` via the LLM judge, and free disables Baybo's
-        // default pre-execution approval entirely. `require_escalated` owns an
-        // uncached prompt inside `execute`: a cached approval for the same
-        // sandboxed command must never authorize its unsandboxed form.
+        // Sync baseline: manual permission with `use_default` declares the
+        // command as a cacheable `ExecCommand`. All dynamic / uncached Bash
+        // pre-execute prompts (`require_escalated`, `auto` risk judge) live in
+        // `pre_execute_ask` below so they run in `AskPhase::BeforeExecute`.
         if BENCH
             || sandbox_permissions_from_params(params) == SandboxPermissions::RequireEscalated
             || self.permission() != PermissionMode::Manual
@@ -769,63 +763,138 @@ impl Tool for BashTool {
             .unwrap_or_default()
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        let background = crate::background::BackgroundRequest::parse(&params, &BASH_BACKGROUND)
-            .map_err(ToolError::InvalidParams)?;
-        let run_time = crate::background::requested_run_time(&params, &background, ctx)
-            .map_err(ToolError::InvalidParams)?;
-        let mut p: Params =
-            serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        p.cwd = p.cwd.filter(|cwd| !cwd.as_os_str().is_empty());
-        p.justification = p
-            .justification
-            .map(|justification| justification.trim().to_string())
-            .filter(|justification| !justification.is_empty());
+    async fn pre_execute_ask(
+        &self,
+        params: &Value,
+        ctx: &ToolContext,
+        check: PreExecuteCheck,
+    ) -> Option<PreExecuteAsk> {
+        if BENCH {
+            return None;
+        }
+        let Ok(call) = self.prepare_call(params, ctx, false) else {
+            return None;
+        };
+        let is_destructive = contains_delete_command(&call.command);
 
-        if let Some(dir) = &p.cwd {
-            require_absolute(dir, "Bash", "cwd")?;
-            // `free` keeps the work-dir jail (only the OS sandbox is dropped);
-            // only the bench profile lifts it.
-            if !BENCH {
-                require_within_work_dir(dir, &self.workspace_root, &self.work_dir, "cwd")?;
+        if call.sandbox_permissions.requires_approval(call.permission) {
+            return Some(build_escalated_ask(
+                &call.command,
+                call.justification.as_deref(),
+                is_destructive,
+            ));
+        }
+
+        match call.permission {
+            PermissionMode::Free => None,
+            PermissionMode::Manual => Some(PreExecuteAsk {
+                accesses: vec![ResourceAccess::ExecCommand {
+                    command: call.command,
+                }],
+                cacheable: true,
+                description: is_destructive.then(|| DESTRUCTIVE_COMMAND_WARNING.to_string()),
+                params_preview: None,
+            }),
+            PermissionMode::Auto => {
+                if !call.execution_route.pre_exec_judge() || !is_destructive {
+                    return None;
+                }
+                if check == PreExecuteCheck::PreDecided {
+                    return Some(PreExecuteAsk {
+                        accesses: vec![ResourceAccess::ExecCommand {
+                            command: call.command,
+                        }],
+                        cacheable: true,
+                        description: Some(DESTRUCTIVE_COMMAND_WARNING.to_string()),
+                        params_preview: None,
+                    });
+                }
+                let decision = match ctx.lite_llm.as_deref() {
+                    Some(llm) => {
+                        judge_pre_exec(
+                            llm,
+                            &ctx.events,
+                            &call.command,
+                            call.cwd.as_deref(),
+                            call.effective_sandboxed,
+                        )
+                        .await
+                    }
+                    // No judge wired (argv mode / tests): fall back to
+                    // requiring approval, matching the non-auto destructive
+                    // gate.
+                    None => {
+                        PreExec::Prompt("risk judge unavailable — approval required".to_string())
+                    }
+                };
+                let PreExec::Prompt(rationale) = decision else {
+                    return None;
+                };
+                let run_location = if call.effective_sandboxed {
+                    "inside the OS sandbox"
+                } else {
+                    "without the OS sandbox"
+                };
+                let preview = format!(
+                    "Destructive `Bash` command flagged by the risk judge.\n\
+                     Command : {}\n\
+                     Reason  : {rationale}\n\
+                     Approve to run it ({run_location}).",
+                    call.command
+                );
+                Some(PreExecuteAsk {
+                    accesses: vec![ResourceAccess::ExecCommand {
+                        command: call.command,
+                    }],
+                    cacheable: true,
+                    description: Some(format!("Destructive command: {rationale}")),
+                    params_preview: Some(preview),
+                })
             }
         }
+    }
 
-        let timeout = run_time;
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+        self.execute_inner(params, ctx, false).await
+    }
 
-        let command = p.command;
-        let baybo_cli_kind = classify_baybo_cli_command(&command);
-        if !BENCH {
-            let leading_baybo_bin =
-                matches!(baybo_cli_kind, BayboCliCommandKind::CanonicalSelfInvocation)
-                    .then(|| BAYBO_BIN.as_deref())
-                    .flatten();
-            require_command_paths_within_work_dir(
-                &command,
-                &self.workspace_root,
-                &self.work_dir,
-                &crate::shell_reachable_workspace_roots(&ctx.workspace_paths, &ctx.agent_id),
-                leading_baybo_bin,
-            )?;
-        }
-        // The bench profile has no work-dir jail, so a command with no explicit
-        // `cwd` runs from the process's inherited working directory — the
-        // benchmark container's WORKDIR, where the task files live — rather than
-        // the workspace work dir.
-        let inherited_cwd = if BENCH && p.cwd.is_none() {
-            Some(
-                std::env::current_dir()
-                    .map_err(|e| ToolError::Execution(format!("resolve current dir: {e}")))?,
-            )
+    fn during_execute_resumer(&self) -> Option<&dyn crate::DuringExecuteResumer> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl crate::DuringExecuteResumer for BashTool {
+    async fn resume_during_execute(
+        &self,
+        params: Value,
+        ctx: &ToolContext,
+    ) -> crate::Result<ToolOutput> {
+        self.execute_inner(params, ctx, true).await
+    }
+}
+
+impl BashTool {
+    async fn execute_inner(
+        &self,
+        params: Value,
+        ctx: &ToolContext,
+        escalate_unsandboxed: bool,
+    ) -> crate::Result<ToolOutput> {
+        let call = self.prepare_call(&params, ctx, escalate_unsandboxed)?;
+        let background = call.background;
+        let timeout = call.timeout;
+        let command = call.command;
+        let cwd_ref = call.cwd.as_deref();
+        let execution_route = call.execution_route;
+        let sandbox_bypassed = call.sandbox_bypassed;
+        let effective_sandboxed = call.effective_sandboxed;
+        let effective_escape_policy = if sandbox_bypassed {
+            SandboxEscapePolicy::None
         } else {
-            None
+            execution_route.escape_policy()
         };
-        let cwd_ref: Option<&Path> = p
-            .cwd
-            .as_deref()
-            .or(inherited_cwd.as_deref())
-            .or(ctx.checkout_root.as_deref())
-            .or(Some(ctx.workspace_root.as_path()));
+        let resumed_escalation = escalate_unsandboxed.then_some(RESUMED_ESCALATION_NOTE);
 
         // Record when the destructive-command detector's shell parser can't
         // parse this command — it then falls back to the fail-closed keyword
@@ -840,39 +909,12 @@ impl Tool for BashTool {
             );
         }
 
-        let permission = self.permission();
-        let execution_route = bash_execution_route_for_kind_and_permissions(
-            baybo_cli_kind,
-            permission,
-            p.sandbox_permissions,
-        );
-        // Both rejections surface a precise instruction naming the correct
-        // absolute path: sandboxing either shape would fail opaquely on the
-        // masked state dir / unmounted binary, and the agent has no way to
-        // learn the rule from the failure itself.
-        if let Some(template) = baybo_cli_rejection_template(execution_route) {
-            return Err(ToolError::InvalidParams(
-                template.replace(BAYBO_BIN_PLACEHOLDER, &baybo_bin_display()),
-            ));
-        }
-        if p.sandbox_permissions.requires_approval(permission) {
-            self.request_explicit_unsandboxed_approval(&command, p.justification.as_deref(), ctx)
-                .await?;
-        }
-        let sandbox_bypassed = execution_route.is_sandboxed() && ctx.sandbox.is_none();
-        let effective_sandboxed = execution_route.is_sandboxed() && !sandbox_bypassed;
-        let effective_escape_policy = if sandbox_bypassed {
-            SandboxEscapePolicy::None
-        } else {
-            execution_route.escape_policy()
-        };
-
         // Resolve any requested user secrets to plaintext for env injection.
         // Fail closed if requested but the secret store isn't wired. The names
         // (never the values) are recorded for audit; the values are scrubbed
         // back out of the output below. See docs/secret-management.md.
         let mut extra_env = ChildEnv::default();
-        if !p.secret_env.is_empty() {
+        if !call.secret_env.is_empty() {
             let handle = ctx.secrets.as_deref().ok_or_else(|| {
                 ToolError::Execution(
                     "secret_env was requested but no secret store is available in this context"
@@ -881,10 +923,10 @@ impl Tool for BashTool {
             })?;
             tracing::info!(
                 target: "baybo::tools::bash",
-                secrets = ?p.secret_env,
+                secrets = ?call.secret_env,
                 "bash: injecting user secrets as environment variables"
             );
-            extra_env.vars = handle.resolve_env(&p.secret_env).await?;
+            extra_env.vars = handle.resolve_env(&call.secret_env).await?;
             extra_env.secret_values = extra_env.vars.iter().map(|(_, v)| v.clone()).collect();
         }
         if let Some(trailer) = commit_trailer(ctx) {
@@ -898,16 +940,11 @@ impl Tool for BashTool {
                 .push(("GIT_CONFIG_GLOBAL".to_owned(), config.display().to_string()));
         }
 
-        // Auto permission, destructive-token command: the LLM judge decides before
-        // running whether this needs human approval (replacing the blunt
-        // token→always-prompt gate that `accessed_resources` defers in auto).
-        let pre_exec_judge = execution_route.pre_exec_judge();
-        if pre_exec_judge && contains_delete_command(&command) {
-            self.pre_exec_gate(&command, cwd_ref, ctx, effective_sandboxed)
-                .await?;
-        }
         if sandbox_bypassed {
             self.notify_sandbox_bypass(ctx, &command);
+        }
+        if let Some(note) = resumed_escalation {
+            self.notify_escape(ctx, &command, note);
         }
 
         let args = vec!["-c".into(), self.wrap_command(&command, ctx)];
@@ -939,6 +976,7 @@ impl Tool for BashTool {
                 ctx,
                 &background,
                 effective_escape_policy,
+                resumed_escalation,
             )
             .await?
         {
@@ -1017,7 +1055,8 @@ impl Tool for BashTool {
             )
             .await?;
 
-        let sandbox_for_note = (effective_sandboxed && escalation.is_none())
+        let escalation_note = escalation.as_deref().or(resumed_escalation);
+        let sandbox_for_note = (effective_sandboxed && escalation_note.is_none())
             .then_some(ctx.sandbox.as_deref())
             .flatten();
         format_command_result(
@@ -1025,7 +1064,7 @@ impl Tool for BashTool {
             &out,
             &extra_env,
             ctx,
-            escalation.as_deref(),
+            escalation_note,
             sandbox_for_note,
         )
         .await
@@ -1156,6 +1195,7 @@ async fn run_detached(
     ctx: &ToolContext,
     request: &crate::background::BackgroundRequest,
     escape_policy: SandboxEscapePolicy,
+    resumed_escalation: Option<&str>,
 ) -> crate::Result<Option<ToolOutput>> {
     let Some(mut child) = spawn_detached_child(
         &tool.process_manager,
@@ -1280,8 +1320,9 @@ async fn run_detached(
             let (out, escalation) = tool
                 .escalate_if_failed(command, cwd, out, extra_env, timeout, ctx, escape_policy)
                 .await?;
+            let escalation_note = escalation.as_deref().or(resumed_escalation);
             let sandbox_for_note = (route == DetachedExecutionRoute::Sandboxed
-                && escalation.is_none())
+                && escalation_note.is_none())
             .then_some(ctx.sandbox.as_deref())
             .flatten();
             Ok(Some(
@@ -1290,7 +1331,7 @@ async fn run_detached(
                     &out,
                     extra_env,
                     ctx,
-                    escalation.as_deref(),
+                    escalation_note,
                     sandbox_for_note,
                 )
                 .await?,
@@ -1990,51 +2031,150 @@ fn argv0_matches_gateway_binary(argv0: &str, bin: &Path) -> bool {
     canon(argv0_path) == canon(bin)
 }
 
+struct PreparedBashCall {
+    background: crate::background::BackgroundRequest,
+    timeout: Duration,
+    command: String,
+    cwd: Option<PathBuf>,
+    justification: Option<String>,
+    sandbox_permissions: SandboxPermissions,
+    secret_env: Vec<String>,
+    permission: PermissionMode,
+    execution_route: BashExecutionRoute,
+    sandbox_bypassed: bool,
+    effective_sandboxed: bool,
+}
+
+fn build_escalated_ask(
+    command: &str,
+    justification: Option<&str>,
+    is_destructive: bool,
+) -> PreExecuteAsk {
+    let hint = justification.unwrap_or("Run this Bash command without the OS sandbox?");
+    let warning = "This command will run without the OS sandbox and may access host files and credentials normally hidden by it.";
+    let description = if is_destructive {
+        format!("{hint}\n\n{warning}\n\n{DESTRUCTIVE_COMMAND_WARNING}")
+    } else {
+        format!("{hint}\n\n{warning}")
+    };
+    // Some clients foreground `description`, while the TUI currently
+    // renders only `params_preview`, so both need the safety context.
+    let preview = format!(
+        "{description}\n\n\
+         Command:\n{command}\n\n\
+         Baybo's workspace path rules still apply."
+    );
+    PreExecuteAsk {
+        accesses: vec![ResourceAccess::ExecCommand {
+            command: command.to_string(),
+        }],
+        cacheable: false,
+        description: Some(description),
+        params_preview: Some(preview),
+    }
+}
+
 impl BashTool {
-    async fn request_explicit_unsandboxed_approval(
+    fn prepare_call(
         &self,
-        command: &str,
-        justification: Option<&str>,
+        params: &Value,
         ctx: &ToolContext,
-    ) -> crate::Result<()> {
-        let Some(approval) = ctx.approval.as_ref() else {
-            return Err(ToolError::Execution(
-                "sandbox_permissions=require_escalated needs user approval, but no approval channel is available"
-                    .to_string(),
-            ));
-        };
-        let hint = justification.unwrap_or("Run this Bash command without the OS sandbox?");
-        let warning = "This command will run without the OS sandbox and may access host files and credentials normally hidden by it.";
-        let description = format!("{hint}\n\n{warning}");
-        // Some clients foreground `description`, while the TUI currently
-        // renders only `params_preview`, so both need the safety context.
-        let preview = format!(
-            "{description}\n\n\
-             Command:\n{command}\n\n\
-             Baybo's workspace path rules still apply."
-        );
-        let outcome = approval
-            .request_uncached_with_description(
-                "Bash",
-                &ctx.session_id,
-                &ctx.user,
-                vec![ResourceAccess::ExecCommand {
-                    command: command.to_string(),
-                }],
-                preview,
-                Some(description),
-            )
-            .await;
-        match outcome.decision {
-            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
-            ApprovalDecision::Deny => Err(ToolError::Denied {
-                tool: "Bash".to_string(),
-                reason: format!(
-                    "unsandboxed execution was not approved: {}",
-                    refusal_reason(outcome.resolution)
-                ),
-            }),
+        escalate_unsandboxed: bool,
+    ) -> crate::Result<PreparedBashCall> {
+        let background = crate::background::BackgroundRequest::parse(params, &BASH_BACKGROUND)
+            .map_err(ToolError::InvalidParams)?;
+        let timeout = crate::background::requested_run_time(params, &background, ctx)
+            .map_err(ToolError::InvalidParams)?;
+        let mut p: Params = serde_json::from_value(params.clone())
+            .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        p.cwd = p.cwd.filter(|cwd| !cwd.as_os_str().is_empty());
+        p.justification = p
+            .justification
+            .map(|justification| justification.trim().to_string())
+            .filter(|justification| !justification.is_empty());
+
+        if let Some(dir) = &p.cwd {
+            require_absolute(dir, "Bash", "cwd")?;
+            // `free` keeps the work-dir jail (only the OS sandbox is dropped);
+            // only the bench profile lifts it.
+            if !BENCH {
+                require_within_work_dir(dir, &self.workspace_root, &self.work_dir, "cwd")?;
+            }
         }
+
+        let command = p.command;
+        let baybo_cli_kind = classify_baybo_cli_command(&command);
+        if !BENCH {
+            let leading_baybo_bin =
+                matches!(baybo_cli_kind, BayboCliCommandKind::CanonicalSelfInvocation)
+                    .then(|| BAYBO_BIN.as_deref())
+                    .flatten();
+            require_command_paths_within_work_dir(
+                &command,
+                &self.workspace_root,
+                &self.work_dir,
+                &crate::shell_reachable_workspace_roots(&ctx.workspace_paths, &ctx.agent_id),
+                leading_baybo_bin,
+            )?;
+        }
+        // The bench profile has no work-dir jail, so a command with no explicit
+        // `cwd` runs from the process's inherited working directory — the
+        // benchmark container's WORKDIR, where the task files live — rather than
+        // the workspace work dir.
+        let inherited_cwd = if BENCH && p.cwd.is_none() {
+            Some(
+                std::env::current_dir()
+                    .map_err(|e| ToolError::Execution(format!("resolve current dir: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let cwd = p
+            .cwd
+            .or(inherited_cwd)
+            .or_else(|| ctx.checkout_root.clone())
+            .or_else(|| Some(ctx.workspace_root.clone()));
+
+        let permission = self.permission();
+        let execution_route = bash_execution_route_for_kind_and_permissions(
+            baybo_cli_kind,
+            permission,
+            p.sandbox_permissions,
+        );
+        let execution_route = if escalate_unsandboxed {
+            match execution_route {
+                BashExecutionRoute::RunSandboxed { .. } => BashExecutionRoute::RunUnsandboxed,
+                other => other,
+            }
+        } else {
+            execution_route
+        };
+        // Both rejections surface a precise instruction naming the correct
+        // absolute path: sandboxing either shape would fail opaquely on the
+        // masked state dir / unmounted binary, and the agent has no way to
+        // learn the rule from the failure itself.
+        if let Some(template) = baybo_cli_rejection_template(execution_route) {
+            return Err(ToolError::InvalidParams(
+                template.replace(BAYBO_BIN_PLACEHOLDER, &baybo_bin_display()),
+            ));
+        }
+
+        let sandbox_bypassed = execution_route.is_sandboxed() && ctx.sandbox.is_none();
+        let effective_sandboxed = execution_route.is_sandboxed() && !sandbox_bypassed;
+
+        Ok(PreparedBashCall {
+            background,
+            timeout,
+            command,
+            cwd,
+            justification: p.justification,
+            sandbox_permissions: p.sandbox_permissions,
+            secret_env: p.secret_env,
+            permission,
+            execution_route,
+            sandbox_bypassed,
+            effective_sandboxed,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2108,63 +2248,6 @@ impl BashTool {
                 Err(ToolError::Execution("cancelled".into()))
             }
             res = run_unsandboxed(&self.process_manager, "sh", &args, cwd, extra_env, timeout) => res,
-        }
-    }
-
-    /// Auto-permission pre-execution gate for a destructive-token command: the LLM
-    /// judge decides whether it needs human approval before running (sandboxed).
-    /// `Ok(())` proceeds; `Err` aborts (denied / no approval channel). Uses the
-    /// cached approval path so an "approve always" sticks like the legacy gate.
-    async fn pre_exec_gate(
-        &self,
-        command: &str,
-        cwd: Option<&Path>,
-        ctx: &ToolContext,
-        sandboxed: bool,
-    ) -> crate::Result<()> {
-        let decision = match ctx.lite_llm.as_deref() {
-            Some(llm) => judge_pre_exec(llm, &ctx.events, command, cwd, sandboxed).await,
-            // No judge wired (argv mode / tests): fall back to requiring
-            // approval, matching the non-auto destructive gate.
-            None => PreExec::Prompt("risk judge unavailable — approval required".to_string()),
-        };
-        let rationale = match decision {
-            PreExec::Proceed => return Ok(()),
-            PreExec::Prompt(rationale) => rationale,
-        };
-        let Some(approval) = ctx.approval.as_ref() else {
-            return Err(ToolError::Execution(format!(
-                "destructive command requires approval but no approval channel is available \
-                 ({rationale})"
-            )));
-        };
-        let run_location = if sandboxed {
-            "inside the OS sandbox"
-        } else {
-            "without the OS sandbox"
-        };
-        let preview = format!(
-            "Destructive `Bash` command flagged by the risk judge.\n\
-             Command : {command}\n\
-             Reason  : {rationale}\n\
-             Approve to run it ({run_location})."
-        );
-        let outcome = approval
-            .request(
-                "Bash",
-                &ctx.session_id,
-                &ctx.user,
-                vec![ResourceAccess::ExecCommand {
-                    command: command.to_string(),
-                }],
-                preview,
-            )
-            .await;
-        match outcome.decision {
-            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
-            ApprovalDecision::Deny => Err(ToolError::Execution(format!(
-                "destructive command denied ({rationale})"
-            ))),
         }
     }
 
@@ -2254,7 +2337,8 @@ impl BashTool {
              Approve to retry WITHOUT the OS sandbox (full shell, no workspace guard)."
         );
         let outcome = approval
-            .request_uncached(
+            .request_resumable_uncached(
+                self,
                 "Bash",
                 &ctx.session_id,
                 &ctx.user,
@@ -2670,21 +2754,15 @@ mod tests {
     }
 
     #[test]
-    fn progress_label_previews_every_command_while_call_label_only_warns() {
+    fn progress_label_previews_every_command() {
         let tool = BashTool::for_test();
-        // The ⏺ Bash(...) progress preview is the command for any call…
         assert_eq!(
             tool.progress_label(&serde_json::json!({ "command": "ls -la" })),
             Some("ls -la".to_string()),
         );
-        // …while call_label (the approval warning) stays None unless destructive.
         assert_eq!(
-            tool.call_label(&serde_json::json!({ "command": "ls -la" })),
-            None,
-        );
-        assert!(
-            tool.call_label(&serde_json::json!({ "command": "rm -rf build" }))
-                .is_some(),
+            tool.progress_label(&serde_json::json!({ "command": "rm -rf build" })),
+            Some("rm -rf build".to_string()),
         );
     }
 
@@ -3592,14 +3670,17 @@ mod tests {
     ) -> ToolContext {
         let mut ctx = ctx_with(sandbox);
         let cache: Arc<Mutex<Vec<ApprovedResource>>> = Arc::new(Mutex::new(Vec::new()));
-        ctx.approval = Some(ApprovalHandle::new(
-            gate,
-            cache,
-            String::new(),
-            baybo_model::TurnId::default(),
-            crate::ParkGauge::new(),
-            crate::AskCancel::never(),
-        ));
+        ctx.approval = Some(
+            ApprovalHandle::new(
+                gate,
+                cache,
+                String::new(),
+                baybo_model::TurnId::default(),
+                crate::ParkGauge::new(),
+                crate::AskCancel::never(),
+            )
+            .with_resumable_during_execute(true),
+        );
         ctx
     }
 
@@ -3869,14 +3950,23 @@ mod tests {
         assert!(note.is_some());
     }
 
+    #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
-    async fn pre_exec_gate_proceeds_when_safe() {
+    async fn pre_execute_ask_proceeds_when_judge_says_safe() {
         let tool = BashTool::for_test().with_permission(auto_permission());
-        let mut ctx = ctx_with(None);
+        let mut ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
         ctx.lite_llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
-        tool.pre_exec_gate("rm -rf /tmp/scratch", None, &ctx, true)
-            .await
-            .expect("safe destructive command proceeds without approval");
+        let ask = tool
+            .pre_execute_ask(
+                &json!({ "command": "rm -rf /tmp/work/scratch" }),
+                &ctx,
+                PreExecuteCheck::Evaluate,
+            )
+            .await;
+        assert!(
+            ask.is_none(),
+            "safe destructive command needs no approval: {ask:?}"
+        );
     }
 
     /// A `ToolEventSink` that records every emitted `(action, payload)`.
@@ -3891,17 +3981,23 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
     async fn risk_judge_records_llm_call_input_output_and_duration() {
         let tool = BashTool::for_test().with_permission(auto_permission());
-        let mut ctx = ctx_with(None);
+        let mut ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
         ctx.lite_llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
         let events = Arc::new(RecordingEventSink::default());
         ctx.events = Arc::clone(&events) as Arc<dyn crate::ToolEventSink>;
 
-        tool.pre_exec_gate("rm -rf /tmp/scratch", None, &ctx, true)
-            .await
-            .expect("safe verdict proceeds");
+        let ask = tool
+            .pre_execute_ask(
+                &json!({ "command": "rm -rf /tmp/work/scratch" }),
+                &ctx,
+                PreExecuteCheck::Evaluate,
+            )
+            .await;
+        assert!(ask.is_none(), "safe verdict proceeds");
 
         let recorded = events.entries.lock();
         assert!(
@@ -3909,7 +4005,7 @@ mod tests {
                 && matches!(
                     p,
                     ToolEventPayload::LlmCall { input, output, .. }
-                        if input.contains("rm -rf /tmp/scratch") && output.contains("safe")
+                        if input.contains("rm -rf /tmp/work/scratch") && output.contains("safe")
                 )),
             "expected an llm_call event carrying judge input+output, got {recorded:?}"
         );
@@ -3998,41 +4094,87 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
-    async fn pre_exec_gate_denied_errors() {
+    async fn pre_execute_ask_prompts_when_judge_says_risky() {
         let tool = BashTool::for_test().with_permission(auto_permission());
-        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
-        let mut ctx = ctx_with_approval(None, gate);
+        let mut ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
         ctx.lite_llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
-        let err = tool
-            .pre_exec_gate("rm -rf src", None, &ctx, true)
+        let ask = tool
+            .pre_execute_ask(
+                &json!({ "command": "rm -rf src" }),
+                &ctx,
+                PreExecuteCheck::Evaluate,
+            )
             .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
+            .expect("risky destructive command must request approval");
+        assert!(ask.cacheable, "auto destructive ask stays cacheable");
+        assert_eq!(
+            ask.accesses,
+            vec![ResourceAccess::ExecCommand {
+                command: "rm -rf src".to_string(),
+            }]
+        );
+        let preview = ask.params_preview.as_deref().expect("custom preview");
+        assert!(preview.contains("rm of source"), "preview: {preview}");
+        assert!(
+            preview.contains("inside the OS sandbox"),
+            "preview: {preview}"
+        );
     }
 
+    #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
-    async fn pre_exec_gate_errors_when_unattended_and_risky() {
+    async fn pre_execute_ask_without_llm_requires_approval() {
         let tool = BashTool::for_test().with_permission(auto_permission());
-        let mut ctx = ctx_with(None); // no approval handle
-        ctx.lite_llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
-        let err = tool
-            .pre_exec_gate("rm -rf src", None, &ctx, true)
+        let ctx = ctx_with(None); // ctx.lite_llm = None → fail-closed prompt
+        let ask = tool
+            .pre_execute_ask(
+                &json!({ "command": "rm -rf x" }),
+                &ctx,
+                PreExecuteCheck::Evaluate,
+            )
             .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
+            .expect("no judge → fail-closed prompt");
+        assert!(ask.cacheable);
+        let preview = ask.params_preview.as_deref().expect("custom preview");
+        assert!(
+            preview.contains("without the OS sandbox"),
+            "missing sandbox describes host route: {preview}"
+        );
     }
 
+    #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
-    async fn pre_exec_gate_without_llm_requires_approval() {
+    async fn pre_execute_ask_pre_decided_skips_risk_judge() {
         let tool = BashTool::for_test().with_permission(auto_permission());
-        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
-        let ctx = ctx_with_approval(None, gate); // ctx.lite_llm = None → fail-closed prompt
-        tool.pre_exec_gate("rm -rf x", None, &ctx, true)
+        let events = Arc::new(RecordingEventSink::default());
+        let mut ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
+        ctx.lite_llm = Some(judge_llm(r#"{"risk":"safe","rationale":"should not run"}"#));
+        ctx.events = Arc::clone(&events) as Arc<dyn crate::ToolEventSink>;
+
+        let ask = tool
+            .pre_execute_ask(
+                &json!({ "command": "rm -rf src" }),
+                &ctx,
+                PreExecuteCheck::PreDecided,
+            )
             .await
-            .expect("no judge → prompt, approval granted → proceed");
+            .expect("PreDecided still returns the cacheable access");
+        assert!(ask.cacheable);
+        assert_eq!(
+            ask.accesses,
+            vec![ResourceAccess::ExecCommand {
+                command: "rm -rf src".to_string(),
+            }]
+        );
+        assert!(
+            events.entries.lock().is_empty(),
+            "PreDecided must not call the risk judge again"
+        );
     }
 
+    #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
     async fn default_auto_judges_destructive_commands_inside_sandbox() {
         let _ = std::fs::create_dir_all("/tmp/work");
@@ -4040,31 +4182,29 @@ mod tests {
             baybo_workspace::WorkspacePaths::new("/tmp"),
             baybo_process::ProcessManager::transient(),
         );
-        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FakeExecSandbox::new());
-        let mut ctx = ctx_with_approval(Some(sandbox), Arc::clone(&gate));
+        let mut ctx = ctx_with(Some(sandbox));
         ctx.lite_llm = Some(judge_llm(
             r#"{"risk":"risky","rationale":"would delete source"}"#,
         ));
 
-        let err = tool
-            .execute(
-                json!({
+        let ask = tool
+            .pre_execute_ask(
+                &json!({
                     "command": "rm -rf /tmp/work/default-auto-risky",
                     "cwd": "/tmp/work",
                 }),
                 &ctx,
+                PreExecuteCheck::Evaluate,
             )
             .await
-            .unwrap_err();
+            .expect("expected the auto permission prompt");
 
-        assert!(matches!(err, ToolError::Execution(_)));
-        let requests = gate.requests();
-        assert_eq!(requests.len(), 1, "expected the auto permission prompt");
+        assert!(ask.cacheable);
+        let preview = ask.params_preview.as_deref().expect("custom preview");
         assert!(
-            requests[0].params_preview.contains("inside the OS sandbox"),
-            "default auto prompt must describe the sandboxed route: {}",
-            requests[0].params_preview,
+            preview.contains("inside the OS sandbox"),
+            "default auto prompt must describe the sandboxed route: {preview}",
         );
     }
 
@@ -4100,6 +4240,7 @@ mod tests {
             &ctx,
             &crate::background::BackgroundRequest::default(),
             SandboxEscapePolicy::None,
+            None,
         )
         .await
         .expect("run_detached ok");
@@ -4130,6 +4271,7 @@ mod tests {
             &ctx,
             &crate::background::BackgroundRequest::default(),
             SandboxEscapePolicy::None,
+            None,
         )
         .await
         .expect("run_detached ok");
@@ -4271,6 +4413,7 @@ mod tests {
             &ctx,
             &crate::background::BackgroundRequest::default(),
             SandboxEscapePolicy::None,
+            None,
         )
         .await
         .expect("run_detached ok");
@@ -4851,41 +4994,61 @@ mod tests {
 
     #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
-    async fn require_escalated_approves_exact_command_and_skips_sandbox() {
+    async fn require_escalated_declares_uncached_pre_execute_ask_and_execute_skips_sandbox() {
         let (fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
             stdout: b"sandboxed\n".to_vec(),
             stderr: Vec::new(),
             timed_out: false,
         });
-        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let command = "printf 'unsandboxed-route\\n'";
         let justification = "Allow this command to use the host toolchain?";
-        let mut ctx = ctx_with(Some(sandbox));
-        let cache = Arc::new(Mutex::new(vec![ApprovedResource::ExecCommand {
-            command: command.to_string(),
-        }]));
-        ctx.approval = Some(ApprovalHandle::new(
-            gate.clone(),
-            cache,
-            String::new(),
-            baybo_model::TurnId::default(),
-            crate::ParkGauge::new(),
-            crate::AskCancel::never(),
-        ));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+        let params = json!({
+            "command": command,
+            "sandbox_permissions": "require_escalated",
+            "justification": justification,
+        });
 
-        let out = BashTool::for_test()
-            .execute(
-                json!({
-                    "command": command,
-                    "sandbox_permissions": "require_escalated",
-                    "justification": justification,
-                }),
-                &ctx,
-            )
+        let tool = BashTool::for_test();
+        let ask = tool
+            .pre_execute_ask(&params, &ctx, PreExecuteCheck::Evaluate)
+            .await
+            .expect("require_escalated must produce a pre-execute ask");
+        assert!(
+            !ask.cacheable,
+            "escalation ask must be uncached so a sandboxed grant never covers it"
+        );
+        assert_eq!(
+            ask.accesses,
+            vec![ResourceAccess::ExecCommand {
+                command: command.to_string(),
+            }]
+        );
+        let description = ask
+            .description
+            .as_deref()
+            .expect("escalation approval must have a prominent hint");
+        assert!(
+            description.contains(justification) && description.contains("without the OS sandbox"),
+            "approval description must explain the privilege boundary: {description}"
+        );
+        let preview = ask.params_preview.as_deref().expect("escalation preview");
+        assert!(
+            preview.contains(justification)
+                && preview.contains(command)
+                && preview.contains("without the OS sandbox"),
+            "approval must name the command and privilege boundary: {preview}"
+        );
+
+        // Once approved by the executor's pre-execute gate, `execute` runs
+        // unsandboxed directly without prompting again (so resumed `PreDecided`
+        // execution never re-prompts).
+        let out = tool
+            .execute(params, &ctx)
             .await
             .expect("approved escalation runs");
-
         let ToolOutput::Json(result) = out else {
             panic!("expected JSON result")
         };
@@ -4894,34 +5057,9 @@ mod tests {
             fake.calls().is_empty(),
             "explicit escalation must not invoke the sandbox backend"
         );
-        let requests = gate.requests();
-        assert_eq!(
-            requests.len(),
-            1,
-            "a cached sandboxed approval must not suppress the escalation prompt"
-        );
-        assert_eq!(
-            requests[0].accesses,
-            vec![ResourceAccess::ExecCommand {
-                command: command.to_string(),
-            }]
-        );
-        let description = requests[0]
-            .description
-            .as_deref()
-            .expect("escalation approval must have a prominent hint");
         assert!(
-            description.contains(justification) && description.contains("without the OS sandbox"),
-            "approval description must explain the privilege boundary: {description}"
-        );
-        assert!(
-            requests[0].params_preview.contains(justification)
-                && requests[0].params_preview.contains(command)
-                && requests[0]
-                    .params_preview
-                    .contains("without the OS sandbox"),
-            "approval must name the command and privilege boundary: {}",
-            requests[0].params_preview
+            gate.requests().is_empty(),
+            "execute must not raise a second prompt after pre_execute_ask"
         );
     }
 
@@ -4934,17 +5072,22 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
+        let params = json!({
+            "command": "printf 'already-unsandboxed\\n'",
+            "sandbox_permissions": "require_escalated",
+            "justification": "This must not trigger a redundant prompt.",
+        });
+        let ctx = ctx_with(Some(sandbox));
+        let tool = BashTool::for_test().with_permission(PermissionMode::Free);
+        assert!(
+            tool.pre_execute_ask(&params, &ctx, PreExecuteCheck::Evaluate)
+                .await
+                .is_none(),
+            "free permission already runs unsandboxed and needs no prompt"
+        );
 
-        let out = BashTool::for_test()
-            .with_permission(PermissionMode::Free)
-            .execute(
-                json!({
-                    "command": "printf 'already-unsandboxed\\n'",
-                    "sandbox_permissions": "require_escalated",
-                    "justification": "This must not trigger a redundant prompt.",
-                }),
-                &ctx_with(Some(sandbox)),
-            )
+        let out = tool
+            .execute(params, &ctx)
             .await
             .expect("free permission already grants the unsandboxed route");
 
@@ -4960,70 +5103,79 @@ mod tests {
 
     #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
-    async fn require_escalated_denial_runs_nothing() {
-        let (fake, sandbox) = fake_with_response(SandboxedOutput {
-            exit_code: 0,
-            stdout: b"sandboxed\n".to_vec(),
-            stderr: Vec::new(),
-            timed_out: false,
-        });
-        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
-        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+    async fn require_escalated_without_justification_uses_generic_prompt_and_merges_destructive_warning()
+     {
+        let tool = BashTool::for_test().with_permission(auto_permission());
+        let ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
 
-        let err = BashTool::for_test()
-            .execute(
-                json!({
+        let benign = tool
+            .pre_execute_ask(
+                &json!({
                     "command": "printf should-not-run",
                     "sandbox_permissions": "require_escalated",
                 }),
                 &ctx,
+                PreExecuteCheck::Evaluate,
             )
             .await
-            .expect_err("denied escalation must fail closed");
-
-        assert!(matches!(err, ToolError::Denied { .. }));
+            .expect("escalation produces an ask");
+        assert!(!benign.cacheable);
         assert!(
-            fake.calls().is_empty(),
-            "denial must not run in the sandbox"
-        );
-        let requests = gate.requests();
-        assert_eq!(requests.len(), 1, "denial still records one prompt");
-        assert!(
-            requests[0]
+            benign
                 .params_preview
+                .as_deref()
+                .expect("preview")
                 .starts_with("Run this Bash command without the OS sandbox?"),
             "missing justification must use the generic prompt"
+        );
+
+        // Destructive + require_escalated merges both warnings into one uncached ask.
+        let destructive = tool
+            .pre_execute_ask(
+                &json!({
+                    "command": "rm -rf /tmp/work/build",
+                    "sandbox_permissions": "require_escalated",
+                }),
+                &ctx,
+                PreExecuteCheck::Evaluate,
+            )
+            .await
+            .expect("destructive escalation produces one merged ask");
+        assert!(!destructive.cacheable);
+        let desc = destructive.description.as_deref().expect("description");
+        assert!(
+            desc.contains("without the OS sandbox") && desc.contains("Destructive command"),
+            "merged ask must surface both warnings: {desc}"
         );
     }
 
     #[cfg(not(feature = "bench-bash"))]
     #[tokio::test]
-    async fn require_escalated_without_approval_channel_fails_closed() {
+    async fn resume_during_execute_skips_sandbox_and_records_escalation_note() {
+        use crate::DuringExecuteResumer;
+
         let (fake, sandbox) = fake_with_response(SandboxedOutput {
-            exit_code: 0,
-            stdout: b"sandboxed\n".to_vec(),
-            stderr: Vec::new(),
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: b"sandbox failure\n".to_vec(),
             timed_out: false,
         });
+        let ctx = ctx_with(Some(sandbox));
 
-        let err = BashTool::for_test()
-            .execute(
-                json!({
-                    "command": "printf should-not-run",
-                    "sandbox_permissions": "require_escalated",
-                }),
-                &ctx_with(Some(sandbox)),
-            )
+        let out = BashTool::for_test()
+            .resume_during_execute(json!({ "command": "printf 'resumed-host-run\\n'" }), &ctx)
             .await
-            .expect_err("unattended escalation must fail closed");
+            .expect("resumed unsandboxed retry succeeds");
 
-        let ToolError::Execution(message) = err else {
-            panic!("expected execution error, got {err:?}")
+        let ToolOutput::Json(result) = out else {
+            panic!("expected JSON result")
         };
-        assert!(message.contains("no approval channel is available"));
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["stdout"], "resumed-host-run\n");
+        assert_eq!(result["sandbox_escalation"], RESUMED_ESCALATION_NOTE);
         assert!(
             fake.calls().is_empty(),
-            "missing approval must not fall back to the sandbox"
+            "resumed unsandboxed retry must skip the sandbox backend"
         );
     }
 
@@ -5922,35 +6074,44 @@ mod tests {
         assert!(free.accessed_resources(&benign).is_empty());
     }
 
-    #[test]
-    fn destructive_command_call_label_warns_user() {
-        // Delete-bearing commands surface a warning label that the
+    #[cfg(not(feature = "bench-bash"))]
+    #[tokio::test]
+    async fn destructive_command_pre_execute_ask_warns_user() {
+        let tool = BashTool::for_test().with_permission(PermissionMode::Manual);
+        let ctx = ctx_with(None);
+        // Delete-bearing commands surface a warning description that the
         // approval UI renders alongside the JSON preview, so the user
         // notices the irreversible action before clicking through.
         for cmd in [
-            "rm /tmp/foo",
-            "rm -rf /workspace/scratch",
+            "rm foo",
+            "rm -rf scratch",
             "find . -delete",
             "git clean -fd",
             "git reset --hard origin/main",
             "xargs rm",
         ] {
-            let label = BashTool::for_test().call_label(&json!({ "command": cmd }));
-            let label = label.unwrap_or_else(|| panic!("expected warning label for {cmd:?}"));
+            let ask = tool
+                .pre_execute_ask(&json!({ "command": cmd }), &ctx, PreExecuteCheck::Evaluate)
+                .await
+                .unwrap_or_else(|| panic!("expected manual pre_execute_ask for {cmd:?}"));
+            let label = ask
+                .description
+                .unwrap_or_else(|| panic!("expected warning description for {cmd:?}"));
             assert!(
                 label.contains("Destructive") && label.contains("irreversible"),
                 "warning must mention destructive + irreversible for {cmd:?}, got {label:?}"
             );
         }
 
-        // Benign commands surface no label so the prompt stays clean
-        // (and the approval gate doesn't fire at all for these — the
-        // label only appears as part of the overall warning UX).
-        for cmd in ["echo hi", "git status", "cargo build", "ls /tmp"] {
+        // Benign commands surface no warning description so the prompt stays clean.
+        for cmd in ["echo hi", "git status", "cargo build", "ls ."] {
+            let ask = tool
+                .pre_execute_ask(&json!({ "command": cmd }), &ctx, PreExecuteCheck::Evaluate)
+                .await
+                .unwrap_or_else(|| panic!("expected manual pre_execute_ask for {cmd:?}"));
             assert_eq!(
-                BashTool::for_test().call_label(&json!({ "command": cmd })),
-                None,
-                "benign command {cmd:?} must not surface a warning label"
+                ask.description, None,
+                "benign command {cmd:?} must not surface a warning description"
             );
         }
     }

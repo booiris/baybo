@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use baybo_model::SessionId;
-use baybo_model::human_ask::{AskId, AskKind, AskResolution, ResumeRequest, resumable};
+use baybo_model::human_ask::{AskId, AskKind, AskPhase, AskResolution, ResumeRequest, resumable};
 use baybo_store::HumanAskRow;
 
 use crate::core::AskCore;
@@ -36,6 +36,10 @@ pub struct SettledAsk {
     pub ask_id: AskId,
     pub tool_call_id: String,
     pub kind: AskKind,
+    /// Where the ask was raised: [`AskPhase::BeforeExecute`] re-dispatches
+    /// `Tool::execute`, while [`AskPhase::DuringExecuteResumable`] invokes
+    /// `DuringExecuteResumer::resume_during_execute`.
+    pub phase: AskPhase,
     /// `Abandoned` for an ask nobody answered, the settlement's own claim
     /// included.
     pub resolution: AskResolution,
@@ -367,6 +371,7 @@ impl HumanAskManager {
             ask_id: row.ask_id,
             tool_call_id: row.tool_call_id,
             kind: row.kind,
+            phase: row.phase,
             resolution,
         }))
     }

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use baybo_human_ask::SettledAsk;
-use baybo_model::human_ask::{AskId, AskKind, AskResolution};
+use baybo_model::human_ask::{AskId, AskKind, AskPhase, AskResolution};
 use baybo_model::{ContentBlock, Session, TurnId};
 use baybo_store::HumanAskRow;
 use baybo_tools::{
@@ -141,6 +141,7 @@ impl AgentLoop {
                 ask_id,
                 tool_call_id,
                 kind,
+                phase,
                 resolution,
             } = next;
             let Some(call) = self.persisted_tool_use(&tool_call_id) else {
@@ -161,14 +162,14 @@ impl AgentLoop {
                 self.asks.mark_applied(&ask_id).await?;
                 continue;
             }
-            let executed = match settled_result(kind, &resolution, &call) {
+            let executed = match settled_result(kind, phase, &resolution, &call) {
                 SettledResult::Ready(executed) => executed,
-                SettledResult::Reexecute(decision) => {
+                SettledResult::Reexecute(gate) => {
                     // Stamped first, so a crash mid-run never runs it twice.
                     if !self.asks.mark_applied(&ask_id).await? {
                         continue;
                     }
-                    self.reexecute(session, turn, &call, decision).await?
+                    self.reexecute(session, turn, &call, gate).await?
                 }
             };
             self.append_executed_tool(
@@ -242,7 +243,7 @@ impl AgentLoop {
         session: &mut Session,
         turn: SettlingTurn<'_>,
         call: &SettledCall,
-        decision: ApprovalDecision,
+        gate: PreExecuteGate,
     ) -> anyhow::Result<ExecutedTool> {
         let SettlingTurn {
             span_recorder,
@@ -316,7 +317,7 @@ impl AgentLoop {
                         read_tracker,
                         None,
                         call.dispatch.via_invoke,
-                        PreExecuteGate::PreDecided(decision),
+                        gate,
                     )
                     .await;
                 Ok((LifecycleOutcome::Ok, executed))
@@ -328,21 +329,24 @@ impl AgentLoop {
     }
 }
 
-/// The denial an approval refused by `resolution` reads as, in the same shape
-/// the executor's gate produces live.
 /// What a settled ask puts on the transcript for its call.
 enum SettledResult {
     /// The result is known without running anything.
     Ready(ExecutedTool),
     /// A human approved the call: run it with that decision already made.
-    Reexecute(ApprovalDecision),
+    Reexecute(PreExecuteGate),
 }
 
 /// What `resolution` means for the call an ask of `kind` blocked. An
 /// approval is read through [`ApprovalOutcome::from_ask`], the one reading
 /// of a ledger close for a tool call, so a settled denial is worded exactly
 /// as the live gate's.
-fn settled_result(kind: AskKind, resolution: &AskResolution, call: &SettledCall) -> SettledResult {
+fn settled_result(
+    kind: AskKind,
+    phase: AskPhase,
+    resolution: &AskResolution,
+    call: &SettledCall,
+) -> SettledResult {
     let question = |value| {
         SettledResult::Ready(ExecutedTool {
             output: Ok(ToolOutput::Json(value)),
@@ -364,7 +368,7 @@ fn settled_result(kind: AskKind, resolution: &AskResolution, call: &SettledCall)
                 ApprovalOutcome::from_ask(resolution).unwrap_or_else(ApprovalOutcome::abandoned);
             match outcome.decision {
                 decision @ (ApprovalDecision::Approve | ApprovalDecision::ApproveAlways) => {
-                    SettledResult::Reexecute(decision)
+                    SettledResult::Reexecute(PreExecuteGate::PreDecided { decision, phase })
                 }
                 ApprovalDecision::Deny => SettledResult::Ready(denied(call, outcome.resolution)),
             }

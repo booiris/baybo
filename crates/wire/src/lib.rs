@@ -840,8 +840,8 @@ pub enum Frame {
         tool: String,
         accesses: Vec<ResourceAccess>,
         params_preview: String,
-        /// Optional human-readable label the tool produced via
-        /// `Tool::call_label` (e.g. Bash's `description` parameter).
+        /// Optional human-readable label or warning the tool attached via
+        /// `Tool::pre_execute_ask` (defaulting to `Tool::progress_label`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },

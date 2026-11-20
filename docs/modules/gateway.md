@@ -312,10 +312,12 @@ broadcasts the `SessionPatch.awaiting_human` list mark. The client echoes a
 `ResolveApproval { ask_id, decision }` frame; the inbound loop checks the ask
 is on this connection's channel queue and calls `HumanAskManager::resolve`,
 which claims the decision in the ledger first and then removes the entry
-(the watchers do the broadcast). An ask waits until a
-human answers it or a verb abandons it — except that a during-execute approval expires after `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min) — see [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md) — (`/stop`, a card close, a new message
-past a dead ask); a process exit leaves it pending for the next boot, whose
-reload re-queues it (see [`human-ask.md`](human-ask.md)). The board's
+(the watchers do the broadcast). A resumable ask waits until a
+human answers it or a verb abandons it (`/stop`, a card close, a new message
+past a dead ask); a non-resumable `DuringExecute` approval expires after
+`DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min). A process exit or idle release
+leaves resumable asks pending for the next boot or Resume turn (see
+[`human-ask.md`](human-ask.md)). The board's
 `POST /projects/{id}/issues/{n}/approvals/{ask_id}` resolves through the
 same verb, for a pending `Approval` row raised by that issue's session.
 

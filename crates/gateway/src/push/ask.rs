@@ -73,9 +73,9 @@ pub struct AskPush {
 /// The body of an approval push.
 ///
 /// **The tool's arguments are deliberately absent.** The obvious richer
-/// sources are both unusable here: `Tool::call_label` is implemented by two
-/// tools in the workspace (and Bash's is a fixed warning paragraph that never
-/// names the command), while `params_preview` is unredacted JSON — a
+/// sources are both unusable here: `ApprovalRequest::description` is optional
+/// (and on Bash may be a fixed warning paragraph or user-supplied rationale
+/// rather than the command), while `params_preview` is unredacted JSON — a
 /// `Bash {"command":"curl -H 'Authorization: Bearer …'}` would render that
 /// credential on a lock screen and leave it sitting in Notification Center.
 /// A notification only has to be actionable; the card inside the conversation

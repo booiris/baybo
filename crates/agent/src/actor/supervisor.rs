@@ -455,8 +455,8 @@ impl AgentSupervisor {
     /// resumable, the reaper also cancels that turn's release token: the turn
     /// ends as it would at shutdown (nothing appended, each ask left pending),
     /// and an answer later resumes the session through the Resume door. A
-    /// turn parked on a during-execute approval is left alone — ending it
-    /// would abandon the prompt — until the approval's own deadline
+    /// turn parked on a non-resumable during-execute approval is left alone —
+    /// ending it would abandon the prompt — until the approval's own deadline
     /// (`DURING_EXECUTE_APPROVAL_TIMEOUT`) lets the turn finish.
     ///
     /// Returns the number of `ActorStop` sends attempted. Idle sessions
@@ -495,7 +495,7 @@ impl AgentSupervisor {
             if cost == ActorStopCost::AbandonsAsks {
                 debug!(
                     %session_id,
-                    "idle reaper: skipping a session parked on a during-execute approval"
+                    "idle reaper: skipping a session parked on a non-resumable during-execute approval"
                 );
                 continue;
             }
@@ -1015,7 +1015,7 @@ mod tests {
         ));
         assert!(
             !during_release.is_cancelled(),
-            "a during-execute approval keeps its turn"
+            "a non-resumable during-execute approval keeps its turn"
         );
         assert!(during_rx.try_recv().is_err(), "and its actor stays warm");
     }

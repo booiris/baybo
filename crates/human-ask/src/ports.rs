@@ -30,9 +30,8 @@ pub enum ActorStopCost {
     /// on those asks (one live ask per call), so the caller can tell a turn
     /// that is only waiting from one with a sibling call still running.
     ReleasesTurn { waiting_calls: usize },
-    /// A live ask is not resumable (a during-execute approval): stopping
-    /// would abandon it. Goes away once those approvals move before execute
-    /// (`docs/todo/during-execute-approvals.md`).
+    /// A live ask is not resumable (a during-execute approval on a tool
+    /// without `resume_during_execute`): stopping would abandon it.
     AbandonsAsks,
 }
 

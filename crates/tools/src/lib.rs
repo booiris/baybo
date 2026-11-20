@@ -28,8 +28,8 @@ use serde_json::Value;
 
 pub use approval::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalOutcome, ApprovalRequest,
-    ApprovalResolution, ApprovedResource, AutoDenyGate, HostPattern, ResourceAccess,
-    refusal_reason,
+    ApprovalResolution, ApprovedResource, AutoDenyGate, HostPattern, PreExecuteAsk,
+    PreExecuteCheck, ResourceAccess, refusal_reason,
 };
 pub use ask::{AskCancel, AskSite, CancelOrigin, ParkGauge, ParkGuard, TurnTokens};
 pub(crate) use baybo_model::FileFingerprint;
@@ -191,10 +191,43 @@ pub trait Tool: Send + Sync {
 
     /// Resources this call will touch, derived from the parameters.
     ///
-    /// The approval gate consults these at runtime before execution.
-    /// Tools with no side effects return an empty vec (the default).
+    /// The approval gate consults these at runtime before execution (through
+    /// [`Self::pre_execute_ask`]'s default implementation), and
+    /// `OutputProvenance` reads them when [`Self::output_source`] is
+    /// [`OutputSource::DeclaredFiles`]. Tools with no side effects return an
+    /// empty vec (the default).
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         Vec::new()
+    }
+
+    /// Async pre-execution approval hook with access to [`ToolContext`].
+    ///
+    /// Runs before `Tool::execute` on the pre-reveal parameters. Returns
+    /// `Some` when the call should pass through the executor's pre-execute
+    /// approval gate (resumable [`AskPhase::BeforeExecute`] ask), or `None`
+    /// when no pre-execution prompt is needed.
+    ///
+    /// The default delegates to [`Self::accessed_resources`] and
+    /// [`Self::progress_label`] as a cacheable ask. Tools whose approval
+    /// decision needs runtime context, async checks, custom warnings/previews,
+    /// or uncached semantics (e.g. Bash escalation / risk judge, Skill env
+    /// vars) override this instead of prompting from inside `execute`.
+    async fn pre_execute_ask(
+        &self,
+        params: &Value,
+        _ctx: &ToolContext,
+        _check: PreExecuteCheck,
+    ) -> Option<PreExecuteAsk> {
+        let accesses = self.accessed_resources(params);
+        if accesses.is_empty() {
+            return None;
+        }
+        Some(PreExecuteAsk {
+            accesses,
+            cacheable: true,
+            description: self.progress_label(params),
+            params_preview: None,
+        })
     }
 
     /// Output provenance for prompt-injection severity; defaults to opaque.
@@ -202,23 +235,13 @@ pub trait Tool: Send + Sync {
         OutputSource::default()
     }
 
-    /// Caller-supplied human-readable label for this call (typically a
-    /// short summary the model writes alongside its arguments). The
-    /// executor surfaces it in approval prompts and traces. Default
-    /// returns `None`; tools that accept such a parameter override.
-    fn call_label(&self, _params: &Value) -> Option<String> {
-        None
-    }
-
     /// Short preview of this call for the live progress line
-    /// (`⏺ tool(label)` — see `docs/turn-progress-events.md`). Defaults to
-    /// [`Self::call_label`] so a tool whose approval label is already a
-    /// good preview reuses it (e.g. WebFetch's URL). A tool whose
-    /// `call_label` is a *warning* rather than a preview — e.g. Bash,
-    /// which only labels destructive commands — overrides this to return a
-    /// plain preview of the action (the command) for every call.
-    fn progress_label(&self, params: &Value) -> Option<String> {
-        self.call_label(params)
+    /// (`⏺ tool(label)` — see `docs/turn-progress-events.md`) and for the
+    /// default [`Self::pre_execute_ask`] description. Default returns `None`;
+    /// tools with an identifying argument (path, command, URL, query, …)
+    /// override.
+    fn progress_label(&self, _params: &Value) -> Option<String> {
+        None
     }
 
     /// Maximum wall-clock time this tool is allowed to run, declared
@@ -259,6 +282,39 @@ pub trait Tool: Send + Sync {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput>;
+
+    /// Capability handle for resuming a mid-call approval after restart or idle
+    /// release.
+    ///
+    /// Defaults to `None`: mid-call prompts from this tool are non-resumable
+    /// ([`AskPhase::DuringExecute`], with a deadline and abandonment on
+    /// restart). Tools that can resume a mid-call approval implement
+    /// [`DuringExecuteResumer`] and return `Some(self)` here so declaration and
+    /// implementation stay bound together at compile time.
+    fn during_execute_resumer(&self) -> Option<&dyn DuringExecuteResumer> {
+        None
+    }
+}
+
+/// Continuation hook for tools that can resume a mid-call approval after the
+/// original `execute` future went away (restart or idle actor release).
+///
+/// Implemented alongside [`Tool::during_execute_resumer`] — returning
+/// `Some(self)` from that method is the single source of truth that binds a
+/// tool's resumable capability to its continuation implementation at compile
+/// time.
+#[async_trait]
+pub trait DuringExecuteResumer: Send + Sync {
+    /// Resume a call whose [`AskPhase::DuringExecuteResumable`] approval was
+    /// answered after its original tool future went away.
+    ///
+    /// Runs the approved continuation directly without re-running the
+    /// pre-execute gate or the work that already happened.
+    async fn resume_during_execute(
+        &self,
+        params: Value,
+        ctx: &ToolContext,
+    ) -> crate::Result<ToolOutput>;
 }
 
 /// Which session-trigger contexts a tool is visible in (see
@@ -690,9 +746,13 @@ pub fn noop_event_sink() -> Arc<dyn ToolEventSink> {
 ///   the cache so a follow-up call inside the same session does not
 ///   re-prompt.
 ///
-/// Every prompt it raises is a [`AskPhase::DuringExecute`] ask on the
-/// requesting user's channel, raced against the call's [`AskCancel`], and
-/// holds the call's [`ParkGauge`] for as long as it waits.
+/// Every prompt it raises is a during-execute ask ([`AskPhase::DuringExecute`]
+/// for [`Self::request`] / [`Self::request_uncached`], or
+/// [`AskPhase::DuringExecuteResumable`] for
+/// [`Self::request_resumable_uncached`] when the owning tool wires
+/// [`Tool::during_execute_resumer`]) on the requesting user's channel, raced
+/// against the call's [`AskCancel`], and holds the call's [`ParkGauge`] for as
+/// long as it waits.
 #[derive(Clone)]
 pub struct ApprovalHandle {
     gate: Arc<dyn ApprovalGate>,
@@ -705,6 +765,12 @@ pub struct ApprovalHandle {
     tool_call_id: String,
     /// The turn the call runs in, recorded on every ask the handle raises.
     turn_id: TurnId,
+    /// Whether the executor saw `Some` from [`Tool::during_execute_resumer`]
+    /// for the running tool. Guards [`Self::request_resumable_uncached`] so a
+    /// tool that implements [`DuringExecuteResumer`] but forgot to wire
+    /// [`Tool::during_execute_resumer`] never records an unresumable ask as
+    /// resumable.
+    can_resume_during_execute: bool,
     /// Last outcome an ACTUAL prompt returned (cache short-circuits never
     /// record). Shared across clones so the executor reads back what
     /// mid-execution prompts decided after the tool returns.
@@ -727,19 +793,33 @@ impl ApprovalHandle {
             approved_cache,
             tool_call_id,
             turn_id,
+            can_resume_during_execute: false,
             last_outcome: Arc::new(parking_lot::Mutex::new(None)),
             park,
             cancel,
         }
     }
 
+    /// Record whether the owning tool exposes [`Tool::during_execute_resumer`],
+    /// authorizing [`Self::request_resumable_uncached`] to stamp
+    /// [`AskPhase::DuringExecuteResumable`].
+    pub fn with_resumable_during_execute(mut self, resumable: bool) -> Self {
+        self.can_resume_during_execute = resumable;
+        self
+    }
+
     /// Raise one prompt through the gate, holding the park gauge while it
     /// waits, and record what it decided.
-    async fn raise(&self, req: ApprovalRequest, channel: ChannelType) -> ApprovalOutcome {
+    async fn raise(
+        &self,
+        req: ApprovalRequest,
+        channel: ChannelType,
+        phase: AskPhase,
+    ) -> ApprovalOutcome {
         let site = AskSite {
             channel,
             turn_id: self.turn_id,
-            phase: AskPhase::DuringExecute,
+            phase,
         };
         let outcome = {
             let _parked = self.park.park();
@@ -779,28 +859,6 @@ impl ApprovalHandle {
         accesses: Vec<ResourceAccess>,
         params_preview: String,
     ) -> ApprovalOutcome {
-        self.request_uncached_with_description(
-            tool,
-            session_id,
-            user,
-            accesses,
-            params_preview,
-            None,
-        )
-        .await
-    }
-
-    /// Same as [`Self::request_uncached`], with user-facing context displayed
-    /// prominently by approval clients that support descriptions.
-    pub(crate) async fn request_uncached_with_description(
-        &self,
-        tool: &str,
-        session_id: &SessionId,
-        user: &User,
-        accesses: Vec<ResourceAccess>,
-        params_preview: String,
-        description: Option<String>,
-    ) -> ApprovalOutcome {
         let req = ApprovalRequest {
             ask_id: baybo_model::human_ask::AskId::new(),
             tool_call_id: self.tool_call_id.clone(),
@@ -809,9 +867,51 @@ impl ApprovalHandle {
             tool: tool.to_string(),
             accesses,
             params_preview,
-            description,
+            description: None,
         };
-        self.raise(req, user.channel.clone()).await
+        self.raise(req, user.channel.clone(), AskPhase::DuringExecute)
+            .await
+    }
+
+    /// Forward an uncached mid-call approval that can resume after restart or
+    /// idle release via [`DuringExecuteResumer::resume_during_execute`].
+    ///
+    /// Requiring a `&dyn DuringExecuteResumer` witness proves at compile time
+    /// that the caller implements the continuation hook. The handle also
+    /// verifies that the executor saw `Some` from
+    /// [`Tool::during_execute_resumer`]: if a tool forgot to wire that method,
+    /// dev/test builds trip a `debug_assert!` and release builds fall back to
+    /// non-resumable [`AskPhase::DuringExecute`] so no unresumable ask is ever
+    /// recorded as resumable.
+    pub async fn request_resumable_uncached(
+        &self,
+        _resumer: &dyn DuringExecuteResumer,
+        tool: &str,
+        session_id: &SessionId,
+        user: &User,
+        accesses: Vec<ResourceAccess>,
+        params_preview: String,
+    ) -> ApprovalOutcome {
+        debug_assert!(
+            self.can_resume_during_execute,
+            "tool '{tool}' called request_resumable_uncached without returning Some from Tool::during_execute_resumer"
+        );
+        let phase = if self.can_resume_during_execute {
+            AskPhase::DuringExecuteResumable
+        } else {
+            AskPhase::DuringExecute
+        };
+        let req = ApprovalRequest {
+            ask_id: baybo_model::human_ask::AskId::new(),
+            tool_call_id: self.tool_call_id.clone(),
+            session_id: session_id.clone(),
+            user_id: user.id.clone(),
+            tool: tool.to_string(),
+            accesses,
+            params_preview,
+            description: None,
+        };
+        self.raise(req, user.channel.clone(), phase).await
     }
 
     /// Forward a request to the gate, filtered by the session approval
@@ -858,7 +958,9 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        let outcome = self.raise(req, user.channel.clone()).await;
+        let outcome = self
+            .raise(req, user.channel.clone(), AskPhase::DuringExecute)
+            .await;
         if outcome.decision == ApprovalDecision::ApproveAlways {
             let mut cache = self.approved_cache.lock();
             for access in &uncovered {

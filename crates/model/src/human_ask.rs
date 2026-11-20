@@ -127,9 +127,16 @@ impl AskKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AskPhase {
-    /// The executor's pre-execute gate — the tool has not started.
+    /// The executor's pre-execute gate — the tool has not started. Resumable
+    /// by re-dispatching the persisted `tool_use` with the decision applied.
     BeforeExecute,
-    /// From inside `Tool::execute`, through a handle on the tool context.
+    /// From inside `Tool::execute` on a tool that implements
+    /// `DuringExecuteResumer`: resumable after its original future goes
+    /// away by invoking that hook with the approved call.
+    DuringExecuteResumable,
+    /// From inside `Tool::execute` on a tool without a resume continuation:
+    /// not resumable (governed by `DURING_EXECUTE_APPROVAL_TIMEOUT` and
+    /// abandoned if its future dies).
     DuringExecute,
 }
 
@@ -138,6 +145,7 @@ impl AskPhase {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::BeforeExecute => "before_execute",
+            Self::DuringExecuteResumable => "during_execute_resumable",
             Self::DuringExecute => "during_execute",
         }
     }
@@ -146,6 +154,7 @@ impl AskPhase {
     pub fn from_storage_str(s: &str) -> Option<Self> {
         match s {
             "before_execute" => Some(Self::BeforeExecute),
+            "during_execute_resumable" => Some(Self::DuringExecuteResumable),
             "during_execute" => Some(Self::DuringExecute),
             _ => None,
         }
@@ -154,10 +163,16 @@ impl AskPhase {
 
 /// Whether an ask's answer can still be applied after the tool future that
 /// raised it is gone. A question has no state besides the wait; a
-/// before-execute approval can re-dispatch the persisted `tool_use`. A
-/// during-execute approval cannot: the command's partial state died with it.
+/// [`AskPhase::BeforeExecute`] approval re-dispatches the persisted `tool_use`;
+/// a [`AskPhase::DuringExecuteResumable`] approval invokes the tool's
+/// `resume_during_execute` continuation. A plain [`AskPhase::DuringExecute`]
+/// approval cannot be resumed once its future dies.
 pub fn resumable(kind: AskKind, phase: AskPhase) -> bool {
-    kind == AskKind::Question || phase == AskPhase::BeforeExecute
+    kind == AskKind::Question
+        || matches!(
+            phase,
+            AskPhase::BeforeExecute | AskPhase::DuringExecuteResumable
+        )
 }
 
 /// The payload of one ask.
@@ -243,10 +258,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resumable_is_question_or_before_execute() {
+    fn resumable_matches_kind_and_phase() {
         assert!(resumable(AskKind::Question, AskPhase::DuringExecute));
+        assert!(resumable(
+            AskKind::Question,
+            AskPhase::DuringExecuteResumable
+        ));
         assert!(resumable(AskKind::Question, AskPhase::BeforeExecute));
         assert!(resumable(AskKind::Approval, AskPhase::BeforeExecute));
+        assert!(resumable(
+            AskKind::Approval,
+            AskPhase::DuringExecuteResumable
+        ));
         assert!(!resumable(AskKind::Approval, AskPhase::DuringExecute));
     }
 
@@ -259,7 +282,11 @@ mod tests {
                 format!("\"{}\"", kind.as_str())
             );
         }
-        for phase in [AskPhase::BeforeExecute, AskPhase::DuringExecute] {
+        for phase in [
+            AskPhase::BeforeExecute,
+            AskPhase::DuringExecuteResumable,
+            AskPhase::DuringExecute,
+        ] {
             assert_eq!(AskPhase::from_storage_str(phase.as_str()), Some(phase));
             assert_eq!(
                 serde_json::to_string(&phase).unwrap(),

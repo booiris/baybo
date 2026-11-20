@@ -634,6 +634,14 @@ mod tests {
             "one waiting call per live ask"
         );
 
+        let (tx, _during_resumable) = oneshot::channel();
+        queue.push_live(ask("dr1", "s1", AskPhase::DuringExecuteResumable), tx);
+        assert_eq!(
+            queue.actor_stop_cost(&s1),
+            ActorStopCost::ReleasesTurn { waiting_calls: 3 },
+            "resumable during-execute approvals count as releasable"
+        );
+
         let (tx, _during) = oneshot::channel();
         queue.push_live(ask("d1", "s1", AskPhase::DuringExecute), tx);
         assert_eq!(queue.actor_stop_cost(&s1), ActorStopCost::AbandonsAsks);
@@ -641,7 +649,7 @@ mod tests {
         queue.orphan(&id("d1"));
         assert_eq!(
             queue.actor_stop_cost(&s1),
-            ActorStopCost::ReleasesTurn { waiting_calls: 2 },
+            ActorStopCost::ReleasesTurn { waiting_calls: 3 },
             "a dead entry costs nothing"
         );
         assert_eq!(
@@ -652,17 +660,27 @@ mod tests {
 
     #[test]
     fn orphan_keeps_a_resumable_entry_dead_and_silent() {
-        let (queue, seen) = watched_queue();
-        let (tx, _rx) = oneshot::channel();
-        queue.push_live(ask("c1", "s1", AskPhase::BeforeExecute), tx);
-        assert_eq!(queue.liveness(&id("c1")), Some(true));
-        queue.orphan(&id("c1"));
-        assert_eq!(queue.liveness(&id("c1")), Some(false), "dead, still queued");
-        assert_eq!(
-            queue.actor_stop_cost(&SessionId::from("s1")),
-            ActorStopCost::Free
-        );
-        assert_eq!(*seen.lock(), vec![("s1".into(), raised("c1"))], "no edge");
+        for phase in [AskPhase::BeforeExecute, AskPhase::DuringExecuteResumable] {
+            let (queue, seen) = watched_queue();
+            let (tx, _rx) = oneshot::channel();
+            queue.push_live(ask("c1", "s1", phase), tx);
+            assert_eq!(queue.liveness(&id("c1")), Some(true));
+            queue.orphan(&id("c1"));
+            assert_eq!(
+                queue.liveness(&id("c1")),
+                Some(false),
+                "{phase:?}: dead, still queued"
+            );
+            assert_eq!(
+                queue.actor_stop_cost(&SessionId::from("s1")),
+                ActorStopCost::Free
+            );
+            assert_eq!(
+                *seen.lock(),
+                vec![("s1".into(), raised("c1"))],
+                "{phase:?}: no edge"
+            );
+        }
     }
 
     #[test]

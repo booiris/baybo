@@ -106,7 +106,7 @@ const SUMMARY_MIN_CHARS: usize = 2048;
 const ERROR_BODY_PREVIEW_BYTES: usize = 8 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIRECT_LIMIT: usize = 5;
-const CALL_LABEL_MAX: usize = 120;
+const PROGRESS_LABEL_MAX: usize = 120;
 
 const SUMMARY_SYSTEM_PROMPT: &str = "You are extracting information from a fetched web page. \
 The user supplies a prompt describing what they want to know, followed by the article text \
@@ -372,12 +372,12 @@ REFUSED, so do not retry the same way: a URL resolving to loopback, a private or
             .unwrap_or_default()
     }
 
-    fn call_label(&self, params: &Value) -> Option<String> {
+    fn progress_label(&self, params: &Value) -> Option<String> {
         params.get("url").and_then(|v| v.as_str()).map(|s| {
-            if s.len() <= CALL_LABEL_MAX {
+            if s.len() <= PROGRESS_LABEL_MAX {
                 s.to_string()
             } else {
-                let mut cut = CALL_LABEL_MAX;
+                let mut cut = PROGRESS_LABEL_MAX;
                 while !s.is_char_boundary(cut) {
                     cut -= 1;
                 }
@@ -1085,16 +1085,16 @@ mod tests {
     }
 
     #[test]
-    fn call_label_returns_url_truncated() {
+    fn progress_label_returns_url_truncated() {
         let tool = WebFetchTool::for_testing_default();
         assert_eq!(
-            tool.call_label(&json!({ "url": "https://example.com/" })),
+            tool.progress_label(&json!({ "url": "https://example.com/" })),
             Some("https://example.com/".into())
         );
         let long = "https://example.com/".to_string() + &"a".repeat(200);
-        let label = tool.call_label(&json!({ "url": long })).unwrap();
+        let label = tool.progress_label(&json!({ "url": long })).unwrap();
         assert!(label.ends_with('…'));
-        assert!(label.chars().count() <= CALL_LABEL_MAX + 1);
+        assert!(label.chars().count() <= PROGRESS_LABEL_MAX + 1);
     }
 
     #[tokio::test]

@@ -12,8 +12,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use baybo_model::TrustLevel;
 use baybo_tools::{
-    ApprovalDecision, NoticeLevel, ResourceAccess as ToolResourceAccess, Tool, ToolCapability,
-    ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput, ToolTriggerScope,
+    NoticeLevel, PreExecuteAsk, PreExecuteCheck, ResourceAccess as ToolResourceAccess, Tool,
+    ToolCapability, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolTriggerScope,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -129,9 +130,118 @@ impl Tool for SkillTool {
         Duration::from_secs(60)
     }
 
+    async fn pre_execute_ask(
+        &self,
+        params: &Value,
+        ctx: &ToolContext,
+        check: PreExecuteCheck,
+    ) -> Option<PreExecuteAsk> {
+        let Ok(call) = self.prepare_call(params, ctx) else {
+            return None;
+        };
+        let required = &call.skill.requirements.required_env;
+        if required.is_empty() {
+            return None;
+        }
+        // Order kept: a skill with missing host env vars must fail in
+        // `execute()` without ever prompting the user.
+        if !missing_required_env(&call.skill).is_empty() {
+            return None;
+        }
+        // Do not ask for env-var approval on a skill the risk assessor blocks.
+        if check == PreExecuteCheck::Evaluate
+            && matches!(
+                self.risk_check.assess(&call.skill).await,
+                SkillGate::Block { .. }
+            )
+        {
+            return None;
+        }
+        let preview = format!(
+            "Skill '{}' env vars: {}",
+            call.skill.name,
+            required.join(", ")
+        );
+        Some(PreExecuteAsk {
+            accesses: vec![ToolResourceAccess::Env {
+                vars: required.clone(),
+            }],
+            cacheable: false,
+            description: None,
+            params_preview: Some(preview),
+        })
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
-        let mut p: SkillParams =
-            serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        let PreparedSkillCall { params: p, skill } = self.prepare_call(&params, ctx)?;
+
+        let warning = match self.risk_check.assess(&skill).await {
+            SkillGate::Pass => None,
+            SkillGate::PassWithWarning { rationale } => {
+                emit_skill_notice(
+                    ctx,
+                    NoticeLevel::Warn,
+                    &skill.name,
+                    "rated suspicious",
+                    &rationale,
+                );
+                Some(rationale)
+            }
+            SkillGate::Block { rationale } => {
+                emit_skill_notice(ctx, NoticeLevel::Error, &skill.name, "blocked", &rationale);
+                return Err(ToolError::Denied {
+                    tool: self.name().to_string(),
+                    reason: format!(
+                        "skill '{}' blocked by risk assessor: {rationale}",
+                        skill.name
+                    ),
+                });
+            }
+        };
+
+        if !skill.requirements.required_env.is_empty() {
+            let missing = missing_required_env(&skill);
+            if !missing.is_empty() {
+                return Err(ToolError::Execution(format!(
+                    "skill '{}' requires env vars not set on host: {}",
+                    skill.name,
+                    missing.join(", ")
+                )));
+            }
+        }
+
+        let mut out = match p.file_path.as_deref() {
+            None => render_main(&skill, p.args.as_deref(), ctx.session_id.as_ref())?,
+            Some(rel) => render_subfile(&skill, rel).await?,
+        };
+        if let Some(warn) = warning.as_deref() {
+            match &mut out {
+                ToolOutput::Json(v) => {
+                    v["risk_warning"] = serde_json::Value::String(warn.to_string());
+                }
+                _ => debug_assert!(
+                    false,
+                    "Skill tool must return Json so risk_warning can attach"
+                ),
+            }
+        }
+        Ok(out)
+    }
+}
+
+struct PreparedSkillCall {
+    params: SkillParams,
+    skill: SkillDefinition,
+}
+
+impl SkillTool {
+    fn prepare_call(
+        &self,
+        params: &Value,
+        ctx: &ToolContext,
+    ) -> baybo_tools::Result<PreparedSkillCall> {
+        let mut p: SkillParams = serde_json::from_value(params.clone())
+            .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
         // Strict-JSON-schema LLMs sometimes emit `""` instead of omitting
         // the key. Without this filter, `file_path: ""` would reach
@@ -177,51 +287,18 @@ impl Tool for SkillTool {
             )));
         }
 
-        let warning = match self.risk_check.assess(&skill).await {
-            SkillGate::Pass => None,
-            SkillGate::PassWithWarning { rationale } => {
-                emit_skill_notice(
-                    ctx,
-                    NoticeLevel::Warn,
-                    &skill.name,
-                    "rated suspicious",
-                    &rationale,
-                );
-                Some(rationale)
-            }
-            SkillGate::Block { rationale } => {
-                emit_skill_notice(ctx, NoticeLevel::Error, &skill.name, "blocked", &rationale);
-                return Err(ToolError::Denied {
-                    tool: self.name().to_string(),
-                    reason: format!(
-                        "skill '{}' blocked by risk assessor: {rationale}",
-                        skill.name
-                    ),
-                });
-            }
-        };
-
-        if !skill.requirements.required_env.is_empty() {
-            check_env_or_prompt(self.name(), &skill, ctx).await?;
-        }
-
-        let mut out = match p.file_path.as_deref() {
-            None => render_main(&skill, p.args.as_deref(), ctx.session_id.as_ref())?,
-            Some(rel) => render_subfile(&skill, rel).await?,
-        };
-        if let Some(warn) = warning.as_deref() {
-            match &mut out {
-                ToolOutput::Json(v) => {
-                    v["risk_warning"] = serde_json::Value::String(warn.to_string());
-                }
-                _ => debug_assert!(
-                    false,
-                    "Skill tool must return Json so risk_warning can attach"
-                ),
-            }
-        }
-        Ok(out)
+        Ok(PreparedSkillCall { params: p, skill })
     }
+}
+
+fn missing_required_env(skill: &SkillDefinition) -> Vec<String> {
+    skill
+        .requirements
+        .required_env
+        .iter()
+        .filter(|name| std::env::var(name).is_err())
+        .cloned()
+        .collect()
 }
 
 fn emit_skill_notice(
@@ -239,58 +316,6 @@ fn emit_skill_notice(
         &format!("Skill '{skill_name}' {headline}"),
         rationale,
     );
-}
-
-async fn check_env_or_prompt(
-    tool_name: &str,
-    skill: &SkillDefinition,
-    ctx: &ToolContext,
-) -> baybo_tools::Result<()> {
-    let required = &skill.requirements.required_env;
-
-    let missing: Vec<String> = required
-        .iter()
-        .filter(|name| std::env::var(name).is_err())
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        return Err(ToolError::Execution(format!(
-            "skill '{}' requires env vars not set on host: {}",
-            skill.name,
-            missing.join(", ")
-        )));
-    }
-
-    let approval = ctx.approval.as_ref().ok_or_else(|| {
-        ToolError::Execution(format!(
-            "skill '{}' requires env-var approval but no approval handle is configured",
-            skill.name
-        ))
-    })?;
-
-    let preview = format!("Skill '{}' env vars: {}", skill.name, required.join(", "));
-    let outcome = approval
-        .request_uncached(
-            tool_name,
-            &ctx.session_id,
-            &ctx.user,
-            vec![ToolResourceAccess::Env {
-                vars: required.clone(),
-            }],
-            preview,
-        )
-        .await;
-    match outcome.decision {
-        ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
-        ApprovalDecision::Deny => Err(ToolError::Denied {
-            tool: tool_name.to_string(),
-            reason: format!(
-                "env-var access required by skill '{}' was not approved — {}",
-                skill.name,
-                baybo_tools::refusal_reason(outcome.resolution)
-            ),
-        }),
-    }
 }
 
 /// Token in a built-in SKILL.md body that gets substituted with the
@@ -1190,9 +1215,17 @@ mod tests {
             registry,
             risk_check: Arc::new(AlwaysPass),
         };
+        let ctx = mk_ctx();
+
+        assert!(
+            tool.pre_execute_ask(&json!({"skill": "demo"}), &ctx, PreExecuteCheck::Evaluate)
+                .await
+                .is_none(),
+            "missing host env var must not raise a pre-execute prompt"
+        );
 
         let err = tool
-            .execute(json!({"skill": "demo"}), &mk_ctx())
+            .execute(json!({"skill": "demo"}), &ctx)
             .await
             .unwrap_err();
         match err {
@@ -1201,6 +1234,91 @@ mod tests {
             }
             other => panic!("expected Execution, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn present_env_declares_uncached_pre_execute_ask_and_execute_does_not_reprompt() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
+        let mut s = mk_skill(dir.path(), "demo");
+        // `PATH` is always set on Unix hosts; avoids mutating process env.
+        s.requirements.required_env = vec!["PATH".into()];
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(s);
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
+        let ctx = mk_ctx(); // wired with AutoDenyGate on `ctx.approval`
+
+        let ask = tool
+            .pre_execute_ask(&json!({"skill": "demo"}), &ctx, PreExecuteCheck::Evaluate)
+            .await
+            .expect("present required_env must produce a pre-execute ask");
+        assert!(!ask.cacheable, "skill env approval is per-invocation");
+        assert_eq!(
+            ask.accesses,
+            vec![ToolResourceAccess::Env {
+                vars: vec!["PATH".into()],
+            }]
+        );
+        assert_eq!(
+            ask.params_preview.as_deref(),
+            Some("Skill 'demo' env vars: PATH")
+        );
+
+        // Once the executor's pre-execute gate approves (or resumes under
+        // PreDecided), `execute` runs without consulting `ctx.approval`.
+        let out = tool
+            .execute(json!({"skill": "demo"}), &ctx)
+            .await
+            .expect("execute must not re-prompt through ctx.approval");
+        assert!(matches!(out, ToolOutput::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn blocked_skill_with_present_env_skips_pre_execute_ask() {
+        struct CountingBlock(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl SkillRiskCheck for CountingBlock {
+            async fn assess(&self, _: &SkillDefinition) -> SkillGate {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                SkillGate::Block {
+                    rationale: "dangerous".into(),
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
+        let mut s = mk_skill(dir.path(), "demo");
+        s.requirements.required_env = vec!["PATH".into()];
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(s);
+        let risk = Arc::new(CountingBlock(std::sync::atomic::AtomicUsize::new(0)));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::clone(&risk) as Arc<dyn SkillRiskCheck>,
+        };
+        let ctx = mk_ctx();
+
+        assert!(
+            tool.pre_execute_ask(&json!({"skill": "demo"}), &ctx, PreExecuteCheck::Evaluate)
+                .await
+                .is_none(),
+            "a blocked skill must not ask the user to approve env vars"
+        );
+        assert_eq!(risk.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // PreDecided skips the risk_check inside pre_execute_ask and stays uncached.
+        let ask = tool
+            .pre_execute_ask(&json!({"skill": "demo"}), &ctx, PreExecuteCheck::PreDecided)
+            .await
+            .expect("PreDecided still returns the uncached env ask");
+        assert!(!ask.cacheable);
+        assert_eq!(risk.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

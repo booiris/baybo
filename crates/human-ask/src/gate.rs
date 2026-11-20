@@ -14,11 +14,11 @@ use tokio::sync::oneshot;
 use crate::core::AskCore;
 use crate::queue::{AskQueue, PendingAsk};
 
-/// How long a non-resumable ask — a during-execute approval — waits for an
-/// answer. It cannot outlive its tool future, so without a deadline it would
-/// hold its turn in memory for as long as nobody answers; when the deadline
-/// passes the tool gets a timed-out denial and carries on. Resumable asks
-/// have no deadline. See `docs/todo/during-execute-approvals.md`.
+/// How long a non-resumable ask — a during-execute approval on a tool that
+/// does not implement `resume_during_execute` — waits for an answer. It cannot
+/// outlive its tool future, so without a deadline it would hold its turn in
+/// memory for as long as nobody answers; when the deadline passes the tool
+/// gets a timed-out denial and carries on. Resumable asks have no deadline.
 pub const DURING_EXECUTE_APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// A channel's gate: persist the ask, enqueue it, wait for a verb to resolve
@@ -128,9 +128,6 @@ impl ChannelAskGate {
             }
         };
         let closed_here = self.queue.resolve(&row.ask_id, timed_out.clone()).is_some();
-        // An answer can win the claim this one failed to write and take the
-        // entry first: what it sent down `rx` stands. (When this call took
-        // the entry, `rx` holds only its own `TimedOut`.)
         if !recorded
             && !closed_here
             && let Ok(answered) = rx.try_recv()
