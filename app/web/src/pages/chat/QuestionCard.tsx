@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { RiCheckLine, RiQuestionLine } from 'react-icons/ri';
+import { RiCheckLine, RiCloseLine, RiQuestionLine } from 'react-icons/ri';
 
 import type { WireQuestion, WireQuestionAnswer, WireQuestionReply } from '../../api/chatWs';
 
@@ -53,6 +53,7 @@ export function QuestionCard({
   const [submitting, setSubmitting] = useState(false);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
   const submittingRef = useRef(false);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
 
   const safeTab =
@@ -272,26 +273,51 @@ export function QuestionCard({
           >
             <RiCheckLine /> Submit
           </button>
-          <button
-            type="button"
-            onClick={(event) => {
-              if (confirmingCancel) {
+          <div
+            role="group"
+            aria-label="Cancel ask"
+            className="flex w-24 rounded-md border-2 border-black bg-white text-ink shadow-brutal-sm"
+            onBlur={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget)) setConfirmingCancel(false);
+            }}
+            onKeyDown={(event) => {
+              if (confirmingCancel && event.key === 'Escape') {
+                cancelButtonRef.current?.focus();
                 setConfirmingCancel(false);
-                sendReply({ kind: 'cancelled' });
-              } else {
-                event.currentTarget.focus();
-                setConfirmingCancel(true);
               }
             }}
-            onBlur={() => setConfirmingCancel(false)}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') setConfirmingCancel(false);
-            }}
-            disabled={submitting || !connected}
-            className="px-3 py-1.5 bg-white text-ink border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal-sm"
           >
-            {confirmingCancel ? 'Confirm cancel?' : 'Cancel ask'}
-          </button>
+            <button
+              ref={cancelButtonRef}
+              type="button"
+              aria-label={confirmingCancel ? 'Confirm cancellation' : undefined}
+              title={confirmingCancel ? 'Confirm cancellation' : undefined}
+              onClick={(event) => {
+                event.currentTarget.focus();
+                if (confirmingCancel) sendReply({ kind: 'cancelled' });
+                setConfirmingCancel(!confirmingCancel);
+              }}
+              disabled={submitting || !connected}
+              className="flex flex-1 items-center justify-center rounded-sm py-1.5 text-xs font-bold uppercase tracking-wider hover:bg-gray-100 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {confirmingCancel ? <RiCheckLine aria-hidden="true" size={16} /> : 'Cancel ask'}
+            </button>
+            {confirmingCancel && (
+              <button
+                type="button"
+                aria-label="Keep answering"
+                title="Keep answering"
+                onClick={() => {
+                  cancelButtonRef.current?.focus();
+                  setConfirmingCancel(false);
+                }}
+                disabled={submitting || !connected}
+                className="flex flex-1 items-center justify-center rounded-sm border-l border-black hover:bg-gray-100 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RiCloseLine aria-hidden="true" size={16} />
+              </button>
+            )}
+          </div>
         </div>
         {questions.length > 1 ? <span className="text-[11px] font-mono text-ink-soft">←/→ tabs</span> : null}
       </div>

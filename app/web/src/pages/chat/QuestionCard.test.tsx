@@ -105,7 +105,7 @@ describe('QuestionCard', () => {
     expect((screen.getByLabelText(/Session/) as HTMLInputElement).checked).toBe(true);
   });
 
-  it('requires a second click on the same button to cancel the ask', async () => {
+  it('requires the confirmation checkmark to cancel the ask', async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn(() => true);
     render(<StatefulCard onSubmit={onSubmit} />);
@@ -113,12 +113,29 @@ describe('QuestionCard', () => {
     await user.click(screen.getByLabelText(/JWT/));
     const button = screen.getByRole('button', { name: /cancel ask/i });
     await user.click(button);
-    expect(button).toHaveAccessibleName('Confirm cancel?');
+    expect(button).toHaveAccessibleName('Confirm cancellation');
     expect(onSubmit).not.toHaveBeenCalled();
-    await user.click(button);
+    await user.click(screen.getByRole('button', { name: 'Confirm cancellation' }));
     expect(button).toBeDisabled();
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith({ kind: 'cancelled' });
+  });
+
+  it('keeps draft answers when the cross dismisses confirmation', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn(() => true);
+    render(<StatefulCard onSubmit={onSubmit} />);
+    const other = screen.getByRole('textbox');
+    await user.type(other, 'draft answer');
+    const cancel = screen.getByRole('button', { name: 'Cancel ask' });
+    await user.click(cancel);
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Keep answering' })).toHaveFocus();
+    await user.keyboard('{Enter}');
+    expect(cancel).toHaveAccessibleName('Cancel ask');
+    expect(cancel).toHaveFocus();
+    expect(other).toHaveValue('draft answer');
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 
   it('dismisses cancel confirmation on Escape or when returning to the answer', async () => {
@@ -130,11 +147,11 @@ describe('QuestionCard', () => {
     await user.keyboard('{Escape}');
     expect(button).toHaveAccessibleName('Cancel ask');
     await user.keyboard('{Enter}');
-    expect(button).toHaveAccessibleName('Confirm cancel?');
+    expect(button).toHaveAccessibleName('Confirm cancellation');
     await user.click(screen.getByRole('textbox'));
     expect(button).toHaveAccessibleName('Cancel ask');
     await user.click(button);
-    expect(button).toHaveAccessibleName('Confirm cancel?');
+    expect(button).toHaveAccessibleName('Confirm cancellation');
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
