@@ -271,12 +271,12 @@ export function QuestionCard({
             disabled={submitDisabled}
             className="px-3 py-1.5 bg-brand text-ink border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal-sm"
           >
-            <RiCheckLine /> Submit
+            Submit
           </button>
           <div
             role="group"
             aria-label="Cancel ask"
-            className="flex w-24 rounded-md border-2 border-black bg-white text-ink shadow-brutal-sm"
+            className="flex w-22 items-center justify-center gap-1"
             onBlur={(event) => {
               if (!event.currentTarget.contains(event.relatedTarget)) setConfirmingCancel(false);
             }}
@@ -298,7 +298,11 @@ export function QuestionCard({
                 setConfirmingCancel(!confirmingCancel);
               }}
               disabled={submitting || !connected}
-              className="flex flex-1 items-center justify-center rounded-sm py-1.5 text-xs font-bold uppercase tracking-wider hover:bg-gray-100 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              className={`flex h-8 items-center justify-center rounded-full transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink disabled:opacity-50 disabled:cursor-not-allowed ${
+                confirmingCancel
+                  ? 'w-9 bg-err/10 text-red-800 hover:bg-err/20'
+                  : 'w-full text-xs font-medium text-ink-soft hover:bg-canvas hover:text-ink'
+              }`}
             >
               {confirmingCancel ? <RiCheckLine aria-hidden="true" size={16} /> : 'Cancel ask'}
             </button>
@@ -312,7 +316,7 @@ export function QuestionCard({
                   setConfirmingCancel(false);
                 }}
                 disabled={submitting || !connected}
-                className="flex flex-1 items-center justify-center rounded-sm border-l border-black hover:bg-gray-100 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex h-8 w-9 items-center justify-center rounded-full bg-ink/5 text-ink-soft transition-colors hover:bg-ink/10 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <RiCloseLine aria-hidden="true" size={16} />
               </button>
