@@ -117,6 +117,7 @@ pub struct GatewayDeps {
     /// sqlite. The gateway is the only process that writes the TUI
     /// input-history key; the TUI itself never touches the vault.
     pub secret_vault: Arc<SecretVault>,
+    pub security_gateway: Arc<baybo_agent::SecurityGateway>,
     /// Cloneable bundle of every sqlite-backed store (trace, channel
     /// session/bot/pairing, …). Exposing the whole [`Store`] here means
     /// adding a new store to the gateway only touches [`Store`] itself,

@@ -28,7 +28,8 @@ use baybo_channels::{AskSurface, Channel, ChannelKind, ChannelRegistry, Result a
 use baybo_config::ChannelsConfig;
 use baybo_human_ask::{AskQueue, AskQueueEvent, ChannelAsks, PendingAsk};
 use baybo_model::ChannelType;
-use baybo_tools::ApprovalGate;
+use baybo_model::human_ask::AskRequest;
+use baybo_tools::{ApprovalGate, QuestionGate};
 
 use super::session_pulse::SessionPulse;
 
@@ -116,9 +117,12 @@ pub(crate) fn build_channel(
     asks: ChannelAsks,
 ) -> Arc<Channel> {
     let ChannelAsks { queue, gate } = asks;
-    let approval_gate: Arc<dyn ApprovalGate> = gate;
+    let approval_gate: Arc<dyn ApprovalGate> = Arc::clone(&gate) as Arc<dyn ApprovalGate>;
+    let question_gate: Option<Arc<dyn QuestionGate>> =
+        (channel_type == ChannelType::owner()).then_some(gate as Arc<dyn QuestionGate>);
     let approvals = AskSurface {
         approval_gate,
+        question_gate,
         queue: queue.clone(),
     };
     let channel = Arc::new(Channel::new(channel_type, kind, Some(approvals)));
@@ -182,21 +186,29 @@ fn install_session_mark(queue: &AskQueue, channel: Weak<Channel>) {
 
 /// Fan one pending ask out to the clients that can show it.
 fn announce(channel: &Channel, ask: PendingAsk) {
-    let Some(entry) = ask.approval().cloned() else {
-        // TODO(human-ask): dispatch `QuestionAsked` in the `AskUser` stage
-        // (docs/modules/human-ask.md, Rollout plan).
-        return;
-    };
-    channel.dispatch_approval_requested(
-        entry.ask_id,
-        entry.tool_call_id,
-        entry.session_id,
-        entry.user_id,
-        entry.tool,
-        entry.accesses,
-        entry.params_preview,
-        entry.description,
-    );
+    match ask.request {
+        AskRequest::Approval(entry) => {
+            channel.dispatch_approval_requested(
+                entry.ask_id,
+                entry.tool_call_id,
+                entry.session_id,
+                entry.user_id,
+                entry.tool,
+                entry.accesses,
+                entry.params_preview,
+                entry.description,
+            );
+        }
+        AskRequest::Question(req) => {
+            channel.dispatch_question_asked(
+                ask.ask_id,
+                ask.tool_call_id,
+                ask.session_id,
+                String::new(),
+                req.questions,
+            );
+        }
+    }
 }
 
 /// An ask core over an in-memory ledger, for unit tests that install
@@ -454,5 +466,108 @@ mod tests {
             test_ask_channels().for_channel(&ChannelType::owner()),
         );
         assert!(ch.approval_gate().is_some());
+    }
+
+    #[test]
+    fn build_channel_attaches_question_gate_only_on_owner_channel() {
+        let channels = test_ask_channels();
+        let owner = build_channel(
+            ChannelType::owner(),
+            ChannelKind::Subscribed,
+            channels.for_channel(&ChannelType::owner()),
+        );
+        let tui = build_channel(
+            ChannelType::tui(),
+            ChannelKind::Subscribed,
+            channels.for_channel(&ChannelType::tui()),
+        );
+        let telegram = build_channel(
+            ChannelType::telegram(),
+            ChannelKind::Multiplexed,
+            channels.for_channel(&ChannelType::telegram()),
+        );
+        assert!(owner.question_gate().is_some());
+        assert!(tui.question_gate().is_none());
+        assert!(telegram.question_gate().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_question_raise_is_announced_and_an_answer_closes_it_with_no_decision() {
+        use baybo_model::human_ask::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
+        use baybo_tools::{QuestionAsk, QuestionOutcome};
+
+        let w = wired("s1");
+        let gate = w.channel.question_gate().expect("owner question gate");
+        let ask_id: AskId = "q1".parse().expect("ask id");
+        let questions = vec![Question {
+            header: "Auth".into(),
+            question: "Which auth?".into(),
+            options: vec![
+                QuestionOption {
+                    label: "JWT".into(),
+                    description: "Token".into(),
+                },
+                QuestionOption {
+                    label: "Cookie".into(),
+                    description: "Session".into(),
+                },
+            ],
+            multi_select: false,
+        }];
+        let req = QuestionAsk {
+            ask_id: ask_id.clone(),
+            tool_call_id: "use-q1".into(),
+            session_id: "s1".into(),
+            request: QuestionRequest {
+                questions: questions.clone(),
+            },
+        };
+        let parked =
+            tokio::spawn(
+                async move { gate.ask(req, AskSite::for_test(), AskCancel::never()).await },
+            );
+        while !w
+            .channel
+            .ask_queue()
+            .is_some_and(|queue| queue.contains(&ask_id))
+        {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(matches!(
+            w.seen.events.lock().as_slice(),
+            [SessionEvent::QuestionAsked { ask_id: id, tool_call_id, questions: qs, .. }]
+                if id == "q1" && tool_call_id == "use-q1" && qs == &questions
+        ));
+        assert_eq!(w.channel.pending_asks(&"s1".into()).len(), 1);
+        assert_eq!(marks(&w.seen), vec![Some(true)]);
+
+        let answers = vec![QuestionAnswer {
+            header: "Auth".into(),
+            selected: vec!["JWT".into()],
+            other: None,
+        }];
+        w.asks
+            .resolve(&ask_id, AskResolution::Answered(answers.clone()))
+            .await
+            .expect("resolve");
+        assert_eq!(
+            parked.await.expect("gate task"),
+            QuestionOutcome::Answered(answers)
+        );
+        let events = w.seen.events.lock();
+        assert!(
+            matches!(
+                &events[1..],
+                [SessionEvent::AskResolved {
+                    ask_id: id,
+                    outcome: AskOutcomeKind::Answered,
+                    decision: None,
+                    ..
+                }] if id == "q1"
+            ),
+            "question close carries no approval decision: {events:?}"
+        );
+        assert_eq!(marks(&w.seen), vec![Some(true), Some(false)]);
     }
 }

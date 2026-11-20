@@ -77,6 +77,7 @@ pub struct WsChannelState {
     /// Shared vault for decrypting bot tokens before shipping them
     /// to a sidecar over the (already-authenticated) WS.
     pub secret_vault: Arc<SecretVault>,
+    pub security_gateway: Arc<baybo_agent::SecurityGateway>,
     /// Reconciler handle. The WS route uses its `seed` / `forget`
     /// methods to keep the reconciler's per-sidecar tracked sets in
     /// sync with the initial-register push and disconnect cleanup.
@@ -158,6 +159,7 @@ impl WsChannelState {
             control: Arc::clone(&deps.channel_control),
             channel_bot_store: deps.stores.channel_bot.clone(),
             secret_vault: Arc::clone(&deps.secret_vault),
+            security_gateway: Arc::clone(&deps.security_gateway),
             bot_reconciler: Arc::clone(&deps.bot_reconciler),
             pairing,
             device_store: deps.stores.device.clone(),

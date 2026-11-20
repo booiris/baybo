@@ -843,6 +843,7 @@ fn subscribe_state(session_id: &str) -> Frame {
         },
         work_steps: Vec::new(),
         pending_approvals: Vec::new(),
+        pending_questions: Vec::new(),
         tasks: Vec::new(),
     }
 }

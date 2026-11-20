@@ -60,6 +60,25 @@ describe('applySessionPatch — archive', () => {
       last_active: '2026-07-20T01:00:00Z',
     });
     expect(next[0].archived).toBe(false);
+    expect(next[0].awaiting_human).toBe(false);
+  });
+
+  it('mirrors awaiting_human and preserves it across unrelated patches', () => {
+    const initial = [row('a', { awaiting_human: false })];
+    const raised = applySessionPatch(initial, 'a', { awaiting_human: true });
+    expect(raised[0].awaiting_human).toBe(true);
+
+    // Referential identity when patch is a no-op on awaiting_human
+    expect(applySessionPatch(raised, 'a', { awaiting_human: true })).toBe(raised);
+
+    // Unrelated title/pin patches must not clobber awaiting_human
+    const titled = applySessionPatch(raised, 'a', { title: 'Waiting chat', pinned: true });
+    expect(titled[0].title).toBe('Waiting chat');
+    expect(titled[0].pinned).toBe(true);
+    expect(titled[0].awaiting_human).toBe(true);
+
+    const cleared = applySessionPatch(titled, 'a', { awaiting_human: false });
+    expect(cleared[0].awaiting_human).toBe(false);
   });
 });
 

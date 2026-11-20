@@ -1,12 +1,14 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **foundation stage implemented; the `AskUser` and iOS stages
+> Status: **foundation and `AskUser` + web stages implemented; the iOS stage is
 > pending** — `baybo-human-ask` (queue,
-> core, gates, manager), the ledger, the `tools::ask` ports, the agent
-> live/restart paths, the gateway doors, frames and boot order, the project
-> bridge and the integration suites exist; see
-> [Implementation notes](#implementation-notes-foundation-stage). The
-> `AskUser` + web stage and the iOS stage are not started. This document is
+> core, gates, manager, `AskUserTool`, `ask_step_summary`), the ledger, the
+> `tools::ask` ports (`QuestionGate`, `QuestionHandle`, `Tool::sole_call`), the
+> agent live/restart/sole-call paths, the gateway doors, question/approval
+> frames, REST reconstruction and boot order, the web `QuestionCard` / composer
+> answer / render-time badge UI, the project bridge and the integration suites
+> exist; see [Implementation notes](#implementation-notes-foundation-stage). The
+> iOS stage is not started. This document is
 > the spec the three stages described in [Rollout plan](#rollout-plan) are
 > built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
@@ -749,9 +751,7 @@ settlement's claim loses, `settle_unapplied` returns `Apply` instead, and
 the answer lands before the user row — adjacent either way. Live asks are never touched here:
 a message that reaches the actor while a *live* ask is parked is a mailbox
 interjection, drained at the next iteration boundary as today
-(`agent_loop.rs:1128-1151`). The composer rule in
-[Composer text answers the question](#composer-text-answers-the-question) is
-what keeps a typed answer from becoming such an interjection.
+(`agent_loop.rs:1128-1151`). The web client queues composer messages locally while a question is pending.
 
 ### The outer tool deadline pauses while parked
 
@@ -807,6 +807,10 @@ offered by the UI and not controllable by the model; a model-chosen option
 set that does not fit is the exact case it exists for. No `preview` field in
 v1 (reserved as an optional addition).
 
+Each answer names a distinct requested header. The manager checks option labels
+and single-selection limits before claiming the row. The gateway applies inbound
+secret rules to free-text answers before persistence.
+
 Result, `ToolOutput::Json`, serialized verbatim into the `tool_result`:
 
 ```jsonc
@@ -839,7 +843,7 @@ The agent loop checks the **resolved** dispatch names (`DispatchedToolCall`,
 so a `ToolInvoke { name: "AskUser" }` envelope is caught) after the assistant
 row is persisted: if a sole-call tool shares the response with any sibling,
 that call is not executed and gets
-`ToolOutput::Error("AskUser must be the only tool call in its response; put all questions in one call's `questions` array and wait for the answer before acting")`;
+`ToolOutput::Error("AskUser must be the only tool call in its response")`;
 the siblings run normally. The permit pool cannot express this (an
 `Exclusive` call queues behind siblings rather than rejecting them), so it is
 a pre-dispatch batch check. `AskUser` is also `Exclusive`, which costs
@@ -865,35 +869,13 @@ into `ChatWorkStep.ask`. Without the live field every tab but the one that
 answered would show `summary: "ok"` until a reload (the in-flight buffer
 carries only `ToolStarted`/`ToolCompleted`, `work_steps.rs:36-83`).
 
-### Composer text answers the question
+### Composer messages queue while a question is pending
 
-Decided in the interview: while a question card is showing, a message typed
-in the composer is the "other" answer of the tab the user is looking at; any
-other unanswered tab is submitted as skipped.
-
-This has to be a **client-side** rule. Interjections are drained only between
-iterations (`agent_loop.rs:1128-1151`); while `AskUser` is parked the loop is
-inside the tool batch, so a `Message` frame would sit in the mailbox until
-the question resolved some other way. The web composer therefore sends
-`Frame::AnswerQuestion` instead of a `Message` whenever its view has a
-pending question (live or dead — a dead one resumes the turn), bypassing
-`sendToSession` (no optimistic row, no outbox enrolment) but still committing
-input history and clearing the draft. **Skip** is the only way to send a
-plain message while a card is up. A `Message` that does reach the server
-during a live question (another client, a sidecar) stays an interjection, as
-documented in `docs/web-chat.md`.
-
-`decideComposerAction` gains two inputs, `isCommand` and `hasPendingQuestion`;
-its outputs stay `noop | stop | answer | direct | park` (no `command`
-action exists or is added). Order: `noop → stop → answer → direct | park`,
-with `isCommand` only vetoing `answer`. `/stop` must outrank `answer` (it is
-what abandons a live ask). Any other leading-`/` input falls through to the
-existing branch: **parked** while the question is live (the turn is active,
-so `busy` is true — and the actor would hold a slash at the mailbox head
-anyway, `actor/mod.rs:397-410`), **direct** for a dead question. The hint
-says a command will run once the question is resolved. Staged attachments
-cannot ride an answer; the send button is disabled with a hint while
-attachments are staged and a question is pending.
+The web composer parks text and ready attachments in the session's ordinary
+message queue while a live or restored question is pending. The question
+card keeps its draft selections and Other fields until the user submits or
+skips it. Both actions send `Frame::AnswerQuestion`. The continued turn's
+normal completion drains the queue. A typed `/stop` still cancels a live turn.
 
 ### Wire surface
 
@@ -978,7 +960,8 @@ the **oldest** pending ask; the card shows "+N waiting" when more are queued.
 or one being answered re-pins the scroll.
 
 `applySubscribeState` builds `pendingAsks` from
-`pending_approvals ∪ pending_questions`. The work-step **badge is derived at
+`pending_approvals ∪ pending_questions`, inserting each question at its
+`queue_index` from the session queue snapshot. The work-step **badge is derived at
 render time** from `pendingAsks × step.toolCallId`, and that is its only
 home: `WorkStep.awaitingApproval`, `markStepAwaitingApproval`
 (`ChatPage.tsx:116, :4567-4573`) and the `awaitingByCall` re-derivation in
@@ -1001,14 +984,13 @@ directly above a card that says the turn is waiting on the user.
 pattern:
 
 - tab strip of `header`s, answered tabs ticked; radio for single, checkbox
-  for `multi_select`; a fixed "Other…" input per tab;
+  for `multi_select`; a multiline "Other…" text area per tab;
 - **Submit** enabled once every tab has a selection or other-text; **Skip**
   sends `Declined`;
-- keys: `←/→`/`Tab` switch tabs, `1–4` pick, `Enter` submits — inactive
+- keys: `←/→`/`Tab` switch tabs, `1–4` pick — inactive
   while the other-input has focus; the active tab index lives per `askId` in
-  `SessionView` so `handleSend` can read it;
-- composer placeholder "Typed text answers "<header>" as Other" and the send
-  button title "Answer (Enter)" while a question is pending.
+  `SessionView`;
+- the composer indicates that messages will queue until the question is resolved.
 
 Work step: "waiting for your answer" while parked, spinner suppressed, and
 `awaitingReply` cleared on `question_asked` so no "Working…" stacks above the
@@ -1384,7 +1366,7 @@ Where the code differs from the sketch above, and why:
 3. `ChannelAskGate`: row → push → `Raised { kind: Question }` →
    `SessionEvent::QuestionAsked` → `Frame::QuestionAsked`; web shows the card,
    badges the step, clears `awaitingReply`
-4. user answers (card or composer) → `Frame::AnswerQuestion` →
+4. user submits the question card → `Frame::AnswerQuestion` →
    `manager.resolve(ask_id, Answered(..) | Declined)` → `AskResolved` broadcast
 5. the gate stamps `mark_applied`; tool returns `ToolOutput::Json`; loop
    appends it, `tool_completed { ask: summary }` labels the step everywhere
@@ -1501,7 +1483,7 @@ leaves draft.
 - REST reconstruction: `ChatWorkStep.ask`, `tool_label` branch; OpenAPI +
   `schema.d.ts` regen.
 - Web: `pendingAsks[]`, `QuestionCard`, render-time badge, cancelled-pill
-  suppression, composer `'answer'` action with the stated precedence +
+  suppression, composer queue routing +
   per-ask tab state, step summary from `.ask`, sidebar `awaiting_human`
   through `applySessionPatch`'s explicit copy list, `chatWs.ts` +
   `wireSentinel.ts` mirrors.
@@ -1613,7 +1595,7 @@ Integration (`crates/integration-tests`, sqlite-backed harness):
 
 Web (vitest): `QuestionCard` (tabs, single/multi, other, submit enablement,
 skip, keys), `decideComposerAction` precedence incl. `/stop`, a slash
-command under a live question → `park` and under a dead one → `direct`,
+command under a live or restored question → `park`,
 `transcriptTailSignature` with two asks, render-time badge with
 `turn.active = false` and the bundle arriving before the REST page,
 cancelled-pill suppression, step summary rendering from `.ask`,
@@ -1643,12 +1625,7 @@ implemented as written unless overridden.
    shutdown side. The alternative — treat shutdown like `/stop` — means
    "survives a restart" only covers crashes, not `baybo gateway restart`,
    which is the common restart.
-4. **Composer text answers a dead question too**, and *Skip* is the only way
-   to send a plain message while a card is showing; a leading `/` is never
-   an answer (it parks behind a live question, sends directly past a dead
-   one). The alternative (dead question ⇒ composer sends a message, which
-   abandons the question) is simpler but makes "I came back and typed my
-   answer" silently discard the question.
+4. **Messages queue behind restored questions too.** The card owns its answers and only Submit or Skip sends a question reply.
 
 (Earlier draft decision "user-rooted subagents become unattended" is
 withdrawn: they are already auto-denied by the gate map's fallback for the

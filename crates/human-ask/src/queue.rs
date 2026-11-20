@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use baybo_model::approval::ApprovalRequest;
 use baybo_model::human_ask::{
-    ASK_USER_TOOL_NAME, AskId, AskKind, AskPhase, AskRequest, AskResolution, resumable,
+    ASK_USER_TOOL_NAME, AskId, AskKind, AskPhase, AskRequest, AskResolution, QuestionRequest,
+    resumable,
 };
 use baybo_model::{ChannelType, SessionId};
 use baybo_store::HumanAskRow;
@@ -60,6 +61,13 @@ impl PendingAsk {
         match &self.request {
             AskRequest::Approval(req) => Some(req),
             AskRequest::Question(_) => None,
+        }
+    }
+
+    pub fn question(&self) -> Option<&QuestionRequest> {
+        match &self.request {
+            AskRequest::Question(req) => Some(req),
+            AskRequest::Approval(_) => None,
         }
     }
 
@@ -313,6 +321,14 @@ impl AskQueue {
             .map(|e| e.responder.is_some())
     }
 
+    pub fn session_for(&self, ask_id: &AskId) -> Option<SessionId> {
+        self.inner
+            .lock()
+            .iter()
+            .find(|entry| &entry.ask.ask_id == ask_id)
+            .map(|entry| entry.ask.session_id.clone())
+    }
+
     pub fn contains(&self, ask_id: &AskId) -> bool {
         self.liveness(ask_id).is_some()
     }
@@ -429,6 +445,16 @@ impl AskQueue {
             .lock()
             .iter()
             .filter_map(|e| e.ask.approval().cloned())
+            .collect()
+    }
+
+    /// Snapshot of the session’s pending asks, in insertion order.
+    pub fn list_for_session(&self, session_id: &SessionId) -> Vec<PendingAsk> {
+        self.inner
+            .lock()
+            .iter()
+            .filter(|e| &e.ask.session_id == session_id)
+            .map(|e| e.ask.clone())
             .collect()
     }
 

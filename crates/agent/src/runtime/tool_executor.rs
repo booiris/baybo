@@ -7,16 +7,16 @@ use parking_lot::Mutex;
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
 #[cfg(test)]
 use baybo_model::TrustLevel;
-use baybo_model::human_ask::AskPhase;
+use baybo_model::human_ask::{AskPhase, QuestionOutcomeKind};
 use baybo_model::{ContentBlock, ParallelGroup, SessionId, SpanId, TurnId, User};
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
-    ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalHandle, ApprovalOutcome,
-    ApprovalRequest, ApprovalResolution, ApprovedResource, AskCancel, AskSite, ExecSandbox,
-    ParkGauge, PreExecuteAsk, PreExecuteCheck, ReadTracker, ResourceAccess, ToolCapability,
-    ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry, TurnTokens,
-    VirtualReadResolver, approval::preview_params, refusal_reason,
+    ApprovalDecision, ApprovalGate, ApprovalHandle, ApprovalOutcome, ApprovalRequest,
+    ApprovalResolution, ApprovedResource, AskCancel, AskSite, ChannelGates, ExecSandbox, ParkGauge,
+    PreExecuteAsk, PreExecuteCheck, QuestionHandle, QuestionHandleConfig, ReadTracker,
+    ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry,
+    TurnTokens, VirtualReadResolver, approval::preview_params, refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
@@ -559,7 +559,7 @@ pub struct BoardStores {
 /// observability recording.
 pub struct ToolExecutor {
     tool_registry: Arc<ToolRegistry>,
-    gate_map: Arc<ApprovalGateMap>,
+    gates: ChannelGates,
     /// The gate every ask of an unattended turn goes to, in both phases:
     /// denies by policy and records the denial on the ledger.
     policy_deny: Arc<dyn ApprovalGate>,
@@ -604,7 +604,7 @@ impl ToolExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tool_registry: Arc<ToolRegistry>,
-        gate_map: Arc<ApprovalGateMap>,
+        gates: ChannelGates,
         security_gateway: Arc<SecurityGateway>,
         workspace_root: PathBuf,
         workspace_paths: baybo_workspace::WorkspacePaths,
@@ -618,7 +618,7 @@ impl ToolExecutor {
     ) -> Self {
         Self {
             tool_registry,
-            gate_map,
+            gates,
             policy_deny,
             security_gateway,
             workspace_root,
@@ -941,7 +941,7 @@ impl ToolExecutor {
         let ask_cancel = AskCancel::new(tokens);
         let park_gauge = ParkGauge::new();
         let gate: Arc<dyn ApprovalGate> = if attended {
-            self.gate_map.get(&user.channel, session_id)
+            self.gates.approvals.get(&user.channel, session_id)
         } else {
             Arc::clone(&self.policy_deny)
         };
@@ -952,6 +952,8 @@ impl ToolExecutor {
         // die with the closure.
         let mut approval_outcome = None;
         let approval_result = &mut approval_outcome;
+        let mut question_outcome: Option<QuestionOutcomeKind> = None;
+        let question_result = &mut question_outcome;
         let mut handed_over = None;
         let background_result = &mut handed_over;
 
@@ -1083,6 +1085,26 @@ impl ToolExecutor {
                 );
                 let approval_probe = approval.clone();
 
+                // Question handle: wired only in attended turns on a channel
+                // that exposes a `QuestionGate`. The probe lets us record the
+                // `SpanEventKind::Question` event and propagate `Abandoned`
+                // back to the agent loop on `/stop`.
+                let question = attended
+                    .then(|| self.gates.questions.get(&user.channel))
+                    .flatten()
+                    .map(|question_gate| {
+                        QuestionHandle::from_config(QuestionHandleConfig {
+                            gate: question_gate,
+                            tool_call_id: tool_use_id.clone(),
+                            session_id: session_id.clone(),
+                            channel: user.channel.clone(),
+                            turn_id,
+                            park: park_gauge.clone(),
+                            cancel: ask_cancel.clone(),
+                        })
+                    });
+                let question_probe = question.clone();
+
                 // Per-call event sink. Drained into span events after
                 // `pre_execute_ask` and after tool execution so phase timers
                 // and richer artifacts (risk judge calls, WebFetch HTTP
@@ -1127,6 +1149,7 @@ impl ToolExecutor {
                     sandbox,
                     sandbox_bypass_reason,
                     approval: Some(approval),
+                    question,
                     notifier: notifier.clone(),
                     events: Arc::clone(&event_sink) as Arc<dyn baybo_tools::ToolEventSink>,
                     lite_llm,
@@ -1152,10 +1175,13 @@ impl ToolExecutor {
                 };
 
                 let mut params_revealed = params.clone();
-                self.security_gateway
-                    .reveal_in_value(&mut params_revealed)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
+                // The question payload goes straight to the client and the durable ask ledger.
+                if tool_name_owned != baybo_model::human_ask::ASK_USER_TOOL_NAME {
+                    self.security_gateway
+                        .reveal_in_value(&mut params_revealed)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
+                }
 
                 let resume_during_execute = matches!(
                     &pre_execute,
@@ -1301,6 +1327,20 @@ impl ToolExecutor {
                 if let Some(outcome) = approval_probe.last_outcome() {
                     *approval_result = Some(outcome);
                 }
+                if let Some(outcome) = question_probe
+                    .as_ref()
+                    .and_then(QuestionHandle::last_outcome)
+                {
+                    *question_result = Some(outcome);
+                    let _ = recorder
+                        .emit_event(
+                            span_handle.span_id,
+                            event_seq,
+                            SpanEventKind::Question { outcome },
+                        )
+                        .await;
+                    event_seq += 1;
+                }
                 *background_result = ctx.background_dispatch.take();
 
                 // Flush tool-reported events as span events, regardless
@@ -1427,7 +1467,8 @@ impl ToolExecutor {
         ExecutedTool {
             output,
             approval: outcome.map(|o| o.decision),
-            abandoned: outcome.is_some_and(|o| o.resolution == ApprovalResolution::Abandoned),
+            abandoned: outcome.is_some_and(|o| o.resolution == ApprovalResolution::Abandoned)
+                || question_outcome == Some(QuestionOutcomeKind::Abandoned),
             handed_over,
         }
     }
@@ -2170,7 +2211,7 @@ mod tests {
 
         let executor = ToolExecutor::new(
             Arc::new(registry),
-            Arc::new(ApprovalGateMap::new()),
+            ChannelGates::new(),
             security_gateway,
             sandbox_root,
             paths,
@@ -2651,8 +2692,10 @@ mod tests {
         std::fs::create_dir_all(paths.work_dir()).expect("work dir");
         let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
 
-        let gates = ApprovalGateMap::new();
-        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let gates = ChannelGates::new();
+        gates
+            .approvals
+            .insert(baybo_model::ChannelType::tui(), gate);
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
         let security_gateway = Arc::new(SecurityGateway::new(
@@ -2665,7 +2708,7 @@ mod tests {
         let (ledger, policy_deny) = policy_deny_gate();
         let mut executor = ToolExecutor::new(
             registry,
-            Arc::new(gates),
+            gates,
             security_gateway,
             sandbox_root,
             paths,
@@ -3028,8 +3071,8 @@ mod tests {
             },
         );
 
-        let gates = ApprovalGateMap::new();
-        gates.insert(
+        let gates = ChannelGates::new();
+        gates.approvals.insert(
             baybo_model::ChannelType::tui(),
             Arc::new(FixedOutcomeGate(outcome)),
         );
@@ -3046,7 +3089,7 @@ mod tests {
 
         let executor = ToolExecutor::new(
             Arc::new(registry),
-            Arc::new(gates),
+            gates,
             security_gateway,
             sandbox_root,
             paths,
@@ -3434,8 +3477,10 @@ mod tests {
 
         let (gate, recorded) =
             RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::Deny));
-        let gates = ApprovalGateMap::new();
-        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let gates = ChannelGates::new();
+        gates
+            .approvals
+            .insert(baybo_model::ChannelType::tui(), gate);
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
         let security_gateway = Arc::new(SecurityGateway::new(
@@ -3447,7 +3492,7 @@ mod tests {
         ));
         let executor = ToolExecutor::new(
             Arc::new(registry),
-            Arc::new(gates),
+            gates,
             security_gateway,
             sandbox_root.clone(),
             paths,
@@ -3664,8 +3709,10 @@ mod tests {
 
         let (gate, recorded) =
             RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::ApproveAlways));
-        let gates = ApprovalGateMap::new();
-        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let gates = ChannelGates::new();
+        gates
+            .approvals
+            .insert(baybo_model::ChannelType::tui(), gate);
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
         let security_gateway = Arc::new(SecurityGateway::new(
@@ -3678,7 +3725,7 @@ mod tests {
         let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
         let executor = ToolExecutor::new(
             Arc::new(registry),
-            Arc::new(gates),
+            gates,
             security_gateway,
             sandbox_root,
             paths,
@@ -3822,8 +3869,10 @@ mod tests {
         );
 
         let (gate, recorded) = RecordingGate::new(ApprovalOutcome::answered(decision));
-        let gates = ApprovalGateMap::new();
-        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let gates = ChannelGates::new();
+        gates
+            .approvals
+            .insert(baybo_model::ChannelType::tui(), gate);
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
         let vault = Arc::new(baybo_security::SecretVault::new(
@@ -3841,7 +3890,7 @@ mod tests {
         ));
         let executor = ToolExecutor::new(
             Arc::new(registry),
-            Arc::new(gates),
+            gates,
             security_gateway,
             sandbox_root.clone(),
             paths,
@@ -4022,8 +4071,10 @@ mod tests {
 
         let (gate, recorded) =
             RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::Deny));
-        let gates = ApprovalGateMap::new();
-        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let gates = ChannelGates::new();
+        gates
+            .approvals
+            .insert(baybo_model::ChannelType::tui(), gate);
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
         let security_gateway = Arc::new(SecurityGateway::new(
@@ -4035,7 +4086,7 @@ mod tests {
         ));
         let executor = ToolExecutor::new(
             Arc::new(registry),
-            Arc::new(gates),
+            gates,
             security_gateway,
             sandbox_root,
             paths,
@@ -4248,8 +4299,10 @@ mod tests {
 
         let (gate, recorded) =
             RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::Approve));
-        let gates = ApprovalGateMap::new();
-        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let gates = ChannelGates::new();
+        gates
+            .approvals
+            .insert(baybo_model::ChannelType::tui(), gate);
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
         let security_gateway = Arc::new(SecurityGateway::new(
@@ -4261,7 +4314,7 @@ mod tests {
         ));
         let executor = ToolExecutor::new(
             Arc::new(registry),
-            Arc::new(gates),
+            gates,
             security_gateway,
             sandbox_root,
             paths,
@@ -4332,5 +4385,421 @@ mod tests {
         assert_eq!(asks[2].0.tool, "resumable_tool");
         assert_eq!(asks[2].0.params_preview, "resumable");
         assert_eq!(asks[2].1.phase, AskPhase::DuringExecuteResumable);
+    }
+
+    struct RecordingQuestionGate {
+        outcome: baybo_tools::QuestionOutcome,
+        delay: Duration,
+        recorded: Mutex<Vec<AskPhase>>,
+    }
+
+    impl RecordingQuestionGate {
+        fn new(outcome: baybo_tools::QuestionOutcome, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                delay,
+                recorded: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl baybo_tools::QuestionGate for RecordingQuestionGate {
+        async fn ask(
+            &self,
+            _request: baybo_tools::QuestionAsk,
+            site: baybo_tools::AskSite,
+            _cancel: baybo_tools::AskCancel,
+        ) -> baybo_tools::QuestionOutcome {
+            self.recorded.lock().push(site.phase);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.outcome.clone()
+        }
+    }
+
+    struct StubAskTool {
+        timeout: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl baybo_tools::Tool for StubAskTool {
+        fn name(&self) -> &str {
+            "stub_ask"
+        }
+        fn description(&self) -> String {
+            "asks a test question".into()
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn max_timeout(&self) -> Duration {
+            self.timeout
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            use baybo_tools::QuestionOutcome;
+
+            let Some(handle) = ctx.question.as_ref() else {
+                return Err(ToolError::Execution("no question handle".into()));
+            };
+            let outcome = handle
+                .ask(baybo_model::human_ask::QuestionRequest {
+                    questions: vec![baybo_model::human_ask::Question {
+                        header: "Auth".into(),
+                        question: "Which auth?".into(),
+                        options: vec![
+                            baybo_model::human_ask::QuestionOption {
+                                label: "JWT".into(),
+                                description: "Token".into(),
+                            },
+                            baybo_model::human_ask::QuestionOption {
+                                label: "Cookie".into(),
+                                description: "Session".into(),
+                            },
+                        ],
+                        multi_select: false,
+                    }],
+                })
+                .await;
+            match outcome {
+                QuestionOutcome::Answered(answers) => {
+                    Ok(ToolOutput::Json(json!({ "answers": answers })))
+                }
+                QuestionOutcome::Declined => Ok(ToolOutput::Json(json!({ "declined": true }))),
+                QuestionOutcome::Abandoned => Err(ToolError::Execution("abandoned".into())),
+            }
+        }
+    }
+
+    fn build_question_executor(
+        timeout: Duration,
+        question_gate: Arc<dyn baybo_tools::QuestionGate>,
+    ) -> (
+        ToolExecutor,
+        Arc<baybo_trace::test_support::MemoryTraceStore>,
+        tempfile::TempDir,
+    ) {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            Arc::new(StubAskTool { timeout }),
+            ToolManifest {
+                name: "stub_ask".to_owned(),
+                description: "test".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object"}),
+                capabilities: Vec::new(),
+                channels: Vec::new(),
+            },
+        );
+
+        let gates = ChannelGates::new();
+        gates
+            .questions
+            .insert(baybo_model::ChannelType::owner(), question_gate);
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+        let trace_store = Arc::new(baybo_trace::test_support::MemoryTraceStore::new());
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            gates,
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            policy_deny_gate().1,
+        );
+        (executor, trace_store, home)
+    }
+
+    #[tokio::test]
+    async fn question_handle_wired_only_when_attended_and_emits_question_span_event() {
+        use baybo_store::TraceStore;
+        use baybo_tools::QuestionOutcome;
+        use baybo_trace::{Span, SpanEvent};
+
+        let gate = RecordingQuestionGate::new(
+            QuestionOutcome::Answered(vec![baybo_model::human_ask::QuestionAnswer {
+                header: "Auth".into(),
+                selected: vec!["JWT".into()],
+                other: None,
+            }]),
+            Duration::ZERO,
+        );
+        let (executor, trace_store, _home) =
+            build_question_executor(Duration::from_secs(30), gate.clone());
+        let session_id = SessionId::from("sess-question-attended");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::clone(&trace_store) as Arc<dyn baybo_trace::TraceStore>,
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::owner(),
+        };
+        let approved = Arc::new(Mutex::new(Vec::new()));
+
+        let attended_exec = executor
+            .execute(
+                "stub_ask",
+                json!({}),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-q-1".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+        assert!(
+            attended_exec.output.is_ok(),
+            "{:?}",
+            attended_exec.output.err()
+        );
+        assert!(!attended_exec.abandoned);
+        assert_eq!(gate.recorded.lock().len(), 1);
+        assert_eq!(gate.recorded.lock()[0], AskPhase::DuringExecuteResumable);
+
+        let spans = trace_store
+            .list_spans_by_step(&step.step_id)
+            .await
+            .expect("spans");
+        let span = Span::from_row(spans[0].clone()).expect("decode span");
+        let events: Vec<SpanEvent> = trace_store
+            .list_span_events(&span.id)
+            .await
+            .expect("events")
+            .into_iter()
+            .map(|r| SpanEvent::from_row(r).expect("decode event"))
+            .collect();
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev.kind,
+                SpanEventKind::Question {
+                    outcome: QuestionOutcomeKind::Answered
+                }
+            )),
+            "expected Question(Answered) span event, got {events:?}"
+        );
+
+        // Unattended turn: `ctx.question` is None, gate is never called.
+        let unattended_exec = executor
+            .execute(
+                "stub_ask",
+                json!({}),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-q-2".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                false,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+        assert!(unattended_exec.output.is_err());
+        assert!(!unattended_exec.abandoned);
+        assert_eq!(
+            gate.recorded.lock().len(),
+            1,
+            "unattended turn must not call gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_question_sets_executed_abandoned_and_emits_span_event() {
+        use baybo_store::TraceStore;
+        use baybo_tools::QuestionOutcome;
+        use baybo_trace::{Span, SpanEvent};
+
+        let gate = RecordingQuestionGate::new(QuestionOutcome::Abandoned, Duration::ZERO);
+        let (executor, trace_store, _home) = build_question_executor(Duration::from_secs(30), gate);
+        let session_id = SessionId::from("sess-question-abandoned");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::clone(&trace_store) as Arc<dyn baybo_trace::TraceStore>,
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::owner(),
+        };
+        let approved = Arc::new(Mutex::new(Vec::new()));
+
+        let executed = executor
+            .execute(
+                "stub_ask",
+                json!({}),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-q-abandon".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+        assert!(executed.output.is_err());
+        assert!(executed.abandoned);
+
+        let spans = trace_store
+            .list_spans_by_step(&step.step_id)
+            .await
+            .expect("spans");
+        let span = Span::from_row(spans[0].clone()).expect("decode span");
+        let events: Vec<SpanEvent> = trace_store
+            .list_span_events(&span.id)
+            .await
+            .expect("events")
+            .into_iter()
+            .map(|r| SpanEvent::from_row(r).expect("decode event"))
+            .collect();
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev.kind,
+                SpanEventKind::Question {
+                    outcome: QuestionOutcomeKind::Abandoned
+                }
+            )),
+            "expected Question(Abandoned) span event, got {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pausable_deadline_does_not_expire_while_parked_on_a_question() {
+        use baybo_tools::QuestionOutcome;
+
+        let gate = RecordingQuestionGate::new(
+            QuestionOutcome::Answered(vec![baybo_model::human_ask::QuestionAnswer {
+                header: "Auth".into(),
+                selected: vec!["JWT".into()],
+                other: None,
+            }]),
+            Duration::from_secs(60),
+        );
+        // Tool timeout is 5s, far shorter than the 60s wait on the human.
+        let (executor, trace_store, _home) = build_question_executor(Duration::from_secs(5), gate);
+        let session_id = SessionId::from("sess-question-pause");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::clone(&trace_store) as Arc<dyn baybo_trace::TraceStore>,
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::owner(),
+        };
+        let approved = Arc::new(Mutex::new(Vec::new()));
+
+        let executed = executor
+            .execute(
+                "stub_ask",
+                json!({}),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-q-pause".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+        assert!(
+            executed.output.is_ok(),
+            "deadline must stay paused while parked on a question: {:?}",
+            executed.output.err()
+        );
     }
 }

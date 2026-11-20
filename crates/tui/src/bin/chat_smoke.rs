@@ -212,6 +212,7 @@ async fn tool_call(
             status: "ok".to_string(),
             summary: summary.to_string(),
             approval: None,
+            ask: None,
         },
     )
     .await;

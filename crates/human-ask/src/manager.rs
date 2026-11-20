@@ -5,7 +5,10 @@
 use std::sync::Arc;
 
 use baybo_model::SessionId;
-use baybo_model::human_ask::{AskId, AskKind, AskPhase, AskResolution, ResumeRequest, resumable};
+use baybo_model::human_ask::{
+    AskId, AskKind, AskPhase, AskRequest, AskResolution, QuestionAnswer, QuestionRequest,
+    ResumeRequest, resumable,
+};
 use baybo_store::HumanAskRow;
 
 use crate::core::AskCore;
@@ -87,7 +90,7 @@ impl HumanAskManager {
     /// Resume turn. `Err(AskClosed)` when another verb claimed it first, or
     /// when the ask is a dead non-resumable one, which this call closes as
     /// `Abandoned`.
-    pub async fn resolve(&self, ask_id: &AskId, resolution: AskResolution) -> Result<()> {
+    pub async fn resolve(&self, ask_id: &AskId, mut resolution: AskResolution) -> Result<()> {
         let mut row = self
             .get(ask_id)
             .await?
@@ -98,6 +101,14 @@ impl HumanAskManager {
             return Err(HumanAskError::KindMismatch {
                 ask_id: ask_id.clone(),
                 kind: row.kind,
+            });
+        }
+        if let (AskRequest::Question(request), AskResolution::Answered(answers)) =
+            (&row.request, &mut resolution)
+            && !normalize_answers(request, answers)
+        {
+            return Err(HumanAskError::InvalidAnswers {
+                ask_id: ask_id.clone(),
             });
         }
         if self.close_if_unanswerable(&mut row).await?
@@ -403,6 +414,37 @@ impl LivePendingAsks for HumanAskManager {
 }
 
 /// Whether `resolution` is something an ask of `kind` can resolve to.
+fn normalize_answers(request: &QuestionRequest, answers: &mut [QuestionAnswer]) -> bool {
+    if answers.len() != request.questions.len() {
+        return false;
+    }
+    for question in &request.questions {
+        let Some(answer) = answers
+            .iter_mut()
+            .find(|answer| answer.header == question.header)
+        else {
+            return false;
+        };
+        answer.other = answer
+            .other
+            .take()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        if !question.multi_select && answer.selected.len() + usize::from(answer.other.is_some()) > 1
+        {
+            return false;
+        }
+        for (i, label) in answer.selected.iter().enumerate() {
+            if !question.options.iter().any(|option| &option.label == label)
+                || answer.selected[..i].contains(label)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn fits(kind: AskKind, resolution: &AskResolution) -> bool {
     match resolution {
         AskResolution::Approval(_) => kind == AskKind::Approval,

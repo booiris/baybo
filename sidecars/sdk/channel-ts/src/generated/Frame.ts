@@ -2,9 +2,13 @@
 import type { ActivityKind } from "./ActivityKind";
 import type { ApprovalCard } from "./ApprovalCard";
 import type { AskOutcomeKind } from "./AskOutcomeKind";
+import type { AskStepSummary } from "./AskStepSummary";
 import type { FolderView } from "./FolderView";
 import type { Message } from "./Message";
 import type { ProjectChangeScope } from "./ProjectChangeScope";
+import type { Question } from "./Question";
+import type { QuestionCard } from "./QuestionCard";
+import type { QuestionReply } from "./QuestionReply";
 import type { ResourceAccess } from "./ResourceAccess";
 import type { SessionPatch } from "./SessionPatch";
 import type { SlashCommandSpec } from "./SlashCommandSpec";
@@ -23,7 +27,7 @@ export type Frame = { "kind": "register", token: string, channel_type: string, }
  * Newest persisted `session_messages.ordinal` at snapshot
  * time; `None` for a session with no rows yet.
  */
-as_of_ordinal?: bigint, turn: TurnSnapshot, work_steps?: Array<WireWorkStep>, pending_approvals?: Array<ApprovalCard>, tasks?: Array<TaskView>, } | { "kind": "gap", session_id?: string, } | { "kind": "message" } & Message | { "kind": "messages", messages: Array<Message>, } | { "kind": "answer_delta", session_id: string, user_id?: string, text: string, } | { "kind": "reasoning", session_id: string, user_id?: string, text: string, } | { "kind": "tool_started", session_id: string, user_id?: string, call_id: string, tool: string, label?: string, } | { "kind": "tool_completed", session_id: string, user_id?: string, call_id: string, status: string, summary: string, approval?: string, } | { "kind": "status", session_id: string, user_id?: string, phase: string, } | { "kind": "notice", session_id: string, user_id?: string, level: string, text: string, 
+as_of_ordinal?: bigint, turn: TurnSnapshot, work_steps?: Array<WireWorkStep>, pending_approvals?: Array<ApprovalCard>, pending_questions?: Array<QuestionCard>, tasks?: Array<TaskView>, } | { "kind": "gap", session_id?: string, } | { "kind": "message" } & Message | { "kind": "messages", messages: Array<Message>, } | { "kind": "answer_delta", session_id: string, user_id?: string, text: string, } | { "kind": "reasoning", session_id: string, user_id?: string, text: string, } | { "kind": "tool_started", session_id: string, user_id?: string, call_id: string, tool: string, label?: string, } | { "kind": "tool_completed", session_id: string, user_id?: string, call_id: string, status: string, summary: string, approval?: string, ask?: AskStepSummary, } | { "kind": "status", session_id: string, user_id?: string, phase: string, } | { "kind": "notice", session_id: string, user_id?: string, level: string, text: string, 
 /**
  * `true` for a *transient* mid-turn progress update (the progress
  * observer) rather than a terminal notice. Clients that render a
@@ -86,7 +90,7 @@ description?: string | null, } | { "kind": "ask_resolved", ask_id: string, outco
  * answered — what a client labels the blocked work step with.
  * Absent for questions and for every undecided close.
  */
-decision?: string, } | { "kind": "resolve_approval", ask_id: string, decision: string, } | { "kind": "history_append", session_id: string, entry: string, } | { "kind": "history_snapshot", session_id: string, entries: Array<string>, } | { "kind": "start_bot", bot_id: string, token: string, } | { "kind": "stop_bot", bot_id: string, } | { "kind": "bot_status", bot_id: string, ok: boolean, message?: string, } | { "kind": "slash_manifest", commands: Array<SlashCommandSpec>, } | { "kind": "folders_changed", folders: Array<FolderView>, } | { "kind": "session_updated", session_id: string, patch: SessionPatch, } | { "kind": "session_activity", session_id: string, 
+decision?: string, } | { "kind": "resolve_approval", ask_id: string, decision: string, } | { "kind": "question_asked", ask_id: string, tool_call_id: string, session_id: string, user_id?: string, questions: Array<Question>, } | { "kind": "answer_question", ask_id: string, reply: QuestionReply, } | { "kind": "history_append", session_id: string, entry: string, } | { "kind": "history_snapshot", session_id: string, entries: Array<string>, } | { "kind": "start_bot", bot_id: string, token: string, } | { "kind": "stop_bot", bot_id: string, } | { "kind": "bot_status", bot_id: string, ok: boolean, message?: string, } | { "kind": "slash_manifest", commands: Array<SlashCommandSpec>, } | { "kind": "folders_changed", folders: Array<FolderView>, } | { "kind": "session_updated", session_id: string, patch: SessionPatch, } | { "kind": "session_activity", session_id: string, 
 /**
  * Renamed from the natural `kind` because `kind` is the
  * Frame-level serde discriminator — a same-named variant

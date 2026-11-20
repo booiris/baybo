@@ -226,13 +226,32 @@ impl SecurityGateway {
     /// secrets tokenized into placeholders. Mints + vaults new secrets.
     pub async fn sanitize_stream_fragment(&self, fragment: &str) -> Result<String> {
         let scan = self.leak_detector.scan_text(fragment);
-        if scan.matches.is_empty() {
+        self.mask_scanned_text(fragment, scan.matches).await
+    }
+
+    /// Apply inbound block and replacement rules before a free-text answer is persisted.
+    pub async fn sanitize_answer_text(&self, text: &str) -> Result<String> {
+        let scan = self.leak_detector.scan_text(text);
+        if scan.blocked {
+            return Err(SecurityError::Violation(
+                "answer blocked by leak detection rule".into(),
+            ));
+        }
+        self.mask_scanned_text(text, scan.matches).await
+    }
+
+    async fn mask_scanned_text(
+        &self,
+        fragment: &str,
+        matches: Vec<baybo_security::LeakMatch>,
+    ) -> Result<String> {
+        if matches.is_empty() {
             return Ok(fragment.to_owned());
         }
         let mut out = fragment.to_owned();
         let mut seen: HashSet<String> = HashSet::new();
         let mut mints: Vec<Mint> = Vec::new();
-        for m in scan.matches {
+        for m in matches {
             if !seen.insert(m.original.clone()) {
                 continue;
             }
@@ -327,30 +346,7 @@ impl SecurityGateway {
     /// copy; mints any new secrets encountered.
     pub async fn sanitize_error(&self, msg: &str) -> Result<String> {
         let scan = self.leak_detector.scan_text(msg);
-        if scan.matches.is_empty() {
-            return Ok(msg.to_owned());
-        }
-        let mut out = msg.to_owned();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut mints: Vec<Mint> = Vec::new();
-        for m in scan.matches {
-            if !seen.insert(m.original.clone()) {
-                continue;
-            }
-            let ph = self.minter.mint(m.original.as_bytes());
-            out = out.replace(&m.original, &ph);
-            mints.push(Mint {
-                placeholder: ph,
-                original: m.original,
-                rule_name: m.rule_name,
-            });
-        }
-        for mint in &mints {
-            self.secret_vault
-                .store_secret(&mint.placeholder, mint.original.as_bytes())
-                .await?;
-        }
-        Ok(out)
+        self.mask_scanned_text(msg, scan.matches).await
     }
 
     /// Replace every placeholder in `text` with the real secret looked up
@@ -1091,6 +1087,11 @@ mod tests {
         let vault = Arc::new(make_vault_with_store(store));
         let gw = SecurityGateway::new(Arc::new(detector), vault);
 
+        assert!(
+            gw.sanitize_answer_text("Here is TOP_SECRET_DATA for you")
+                .await
+                .is_err()
+        );
         let mut msg = make_message("Here is TOP_SECRET_DATA for you");
         let mut session = make_session();
         assert!(gw.sanitize_input(&mut msg, &mut session).await.is_err());

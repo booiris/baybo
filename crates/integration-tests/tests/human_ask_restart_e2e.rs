@@ -785,6 +785,152 @@ async fn an_answer_claimed_before_a_crash_is_redriven_by_the_next_boot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_question_survives_a_restart_and_its_answer_resumes_the_turn() {
+    use baybo_model::human_ask::{AskKind, QuestionAnswer};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join(DB_FILE);
+    let session = owner_session(TriggerSource::User);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let question_args = json!({
+        "questions": [{
+            "header": "Auth",
+            "question": "Which auth strategy should we use?",
+            "options": [
+                { "label": "JWT", "description": "Stateless bearer tokens" },
+                { "label": "Cookie", "description": "Server-side sessions" }
+            ],
+            "multi_select": false
+        }]
+    });
+
+    // First boot: model invokes AskUser, parks on the question, then process shuts down.
+    let ask_id = {
+        let store = Store::open(&db).await.expect("open the database");
+        store
+            .session
+            .save(&session)
+            .await
+            .expect("save the session");
+        let mut harness = builder(&session, store, &runs).build();
+        harness
+            .stub_llm
+            .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+                id: CALL_ID.to_string(),
+                name: baybo_model::human_ask::ASK_USER_TOOL_NAME.to_string(),
+                arguments: question_args.clone(),
+                signature: None,
+            })]);
+        harness.send_text("set up auth").await.expect("send");
+        let queue = harness.ask_queues.get_or_create(&session.channel);
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            while queue.is_empty() {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("AskUser parks on a question");
+        let rows = harness
+            .ask_ledger
+            .list_unapplied_for_session(&session.id)
+            .await
+            .expect("list asks");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].kind, AskKind::Question);
+        let ask_id = rows[0].ask_id.clone();
+
+        harness.actor_parent_token.cancel();
+        let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+        assert_eq!(
+            completed_for_call(&outputs),
+            0,
+            "shutdown emits nothing for the parked question"
+        );
+        assert_eq!(harness.strict_rejections.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
+            .await
+            .expect("the actor quiesces");
+        ask_id
+    };
+
+    // Second boot over the same sqlite db.
+    let mut node = boot(&db, &session, &runs, true, |_| {}).await;
+
+    let cards = node.owner.pending_asks(&session.id);
+    assert_eq!(
+        cards.len(),
+        1,
+        "SubscribeState carries the pending question"
+    );
+    assert_eq!(cards[0].ask_id, ask_id);
+    assert_eq!(cards[0].tool_call_id, CALL_ID);
+    let questions = &cards[0].question().unwrap().questions;
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].header, "Auth");
+    assert!(
+        node.owner.pending_approval_sessions().contains(&session.id),
+        "the chat list reads awaiting_human for pending questions too"
+    );
+    tokio::time::timeout(WAIT_TIMEOUT, node.pushes.recv())
+        .await
+        .expect("the unsubscribed session receives one push")
+        .expect("push stream open");
+    no_more_pushes(&mut node.pushes).await;
+
+    let rows = transcript(&node.harness).await;
+    assert!(tool_use_at(&rows).is_some(), "{rows:#?}");
+    assert!(
+        rows.iter().all(|m| result_text(m).is_none()),
+        "the AskUser tool_use stays dangling: {rows:#?}"
+    );
+    assert!(row(&node.harness, &ask_id).await.is_pending());
+
+    reply(&node.harness, "configured JWT auth");
+    let answers = vec![QuestionAnswer {
+        header: "Auth".into(),
+        selected: vec!["JWT".into()],
+        other: None,
+    }];
+    node.harness
+        .human_asks
+        .resolve(&ask_id, AskResolution::Answered(answers.clone()))
+        .await
+        .expect("answer the dead question");
+    let outputs = node.harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let result = adjacent_result(&node.harness).await;
+    assert!(
+        result.contains("JWT"),
+        "real tool_result persisted: {result}"
+    );
+    assert_eq!(resume_turns(&node.harness).await, 1);
+    assert!(replied(&outputs, "configured JWT auth"), "{outputs:#?}");
+    assert!(
+        outputs.iter().any(|o| matches!(
+            &o.event,
+            AgentEvent::ToolCompleted { call_id, ask: Some(summary), .. }
+                if call_id == CALL_ID
+                    && !summary.declined
+                    && summary.questions.len() == 1
+                    && summary.questions[0].selected == vec!["JWT".to_string()]
+        )),
+        "Resume turn must emit ToolCompleted with typed AskStepSummary: {outputs:#?}"
+    );
+    assert_eq!(node.harness.strict_rejections.load(Ordering::SeqCst), 0);
+    assert_eq!(node.harness.stub_llm.captured_requests().len(), 1);
+    assert!(row(&node.harness, &ask_id).await.applied_at.is_some());
+    assert!(node.owner.pending_asks(&session.id).is_empty());
+    assert!(
+        node.closed.lock().iter().any(|e| matches!(
+            e,
+            AskQueueEvent::AskClosed { ask_id: closed, outcome: AskResolution::Answered(_), .. } if *closed == ask_id
+        )),
+        "AskResolved goes out for the answered question"
+    );
+    stop(node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_message_after_a_restart_abandons_the_dead_ask_first() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join(DB_FILE);

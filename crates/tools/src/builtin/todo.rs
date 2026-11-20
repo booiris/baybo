@@ -61,13 +61,6 @@ todo_tool!(
 );
 
 todo_tool!(
-    AskUserQuestionTool,
-    name = "AskUserQuestion",
-    desc = "Ask the user a multiple-choice clarifying question.",
-    reason = "requires a channel-level interactive question bridge"
-);
-
-todo_tool!(
     SendMessageTool,
     name = "SendMessage",
     desc = "Send a message to an agent-team teammate or resume a subagent.",

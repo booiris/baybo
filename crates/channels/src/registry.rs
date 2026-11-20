@@ -12,31 +12,36 @@
 use std::sync::Arc;
 
 use baybo_model::ChannelType;
-use baybo_tools::ApprovalGateMap;
+use baybo_tools::{ApprovalGateMap, ChannelGates};
 use dashmap::DashMap;
 
 use crate::{Channel, ChannelError, Result};
 
 pub struct ChannelRegistry {
     channels: DashMap<ChannelType, Arc<Channel>>,
-    /// Per-channel approval gates collected at install time. Shared
-    /// with `ToolExecutor` so the tool path can look up the right gate
-    /// per call without re-traversing the registry.
-    gate_map: Arc<ApprovalGateMap>,
+    /// Per-channel ask gates collected at install time. Shared with
+    /// `ToolExecutor` so the tool path can look up the right gate per call
+    /// without re-traversing the registry.
+    gates: ChannelGates,
 }
 
 impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
             channels: DashMap::new(),
-            gate_map: Arc::new(ApprovalGateMap::new()),
+            gates: ChannelGates::new(),
         }
     }
 
-    /// Shared handle to the per-channel gate map. Hand this to
-    /// `ToolExecutor` at bootstrap.
+    /// Shared handle to the per-channel approval gate map.
     pub fn approval_gates(&self) -> Arc<ApprovalGateMap> {
-        Arc::clone(&self.gate_map)
+        Arc::clone(&self.gates.approvals)
+    }
+
+    /// Shared handles to the per-channel approval and question gate maps. Hand
+    /// this to `ToolExecutor` at bootstrap.
+    pub fn gates(&self) -> ChannelGates {
+        self.gates.clone()
     }
 
     /// Install a channel at boot. Errors if the channel type is
@@ -48,7 +53,10 @@ impl ChannelRegistry {
             return Err(ChannelError::DuplicateChannel(channel_type.to_string()));
         }
         if let Some(gate) = channel.approval_gate() {
-            self.gate_map.insert(channel_type.clone(), gate);
+            self.gates.approvals.insert(channel_type.clone(), gate);
+        }
+        if let Some(gate) = channel.question_gate() {
+            self.gates.questions.insert(channel_type.clone(), gate);
         }
         let key = channel_type.clone();
         self.channels.insert(channel_type, channel);

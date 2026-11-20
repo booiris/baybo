@@ -31,7 +31,11 @@ pub use approval::{
     ApprovalResolution, ApprovedResource, AutoDenyGate, HostPattern, PreExecuteAsk,
     PreExecuteCheck, ResourceAccess, refusal_reason,
 };
-pub use ask::{AskCancel, AskSite, CancelOrigin, ParkGauge, ParkGuard, TurnTokens};
+pub use ask::{
+    AskCancel, AskSite, CancelOrigin, ChannelGates, ParkGauge, ParkGuard, QuestionAsk,
+    QuestionGate, QuestionGateMap, QuestionHandle, QuestionHandleConfig, QuestionOutcome,
+    TurnTokens,
+};
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::paths::shell_reachable_workspace_roots;
 pub use builtin::read::READ_TOOL_NAME;
@@ -282,6 +286,15 @@ pub trait Tool: Send + Sync {
         ToolTriggerScope::Any
     }
 
+    /// Whether this tool must be the only call in its model response. The
+    /// agent loop refuses such a call when it shares the response with any
+    /// sibling (the siblings still run): `AskUser` waits on a human, and the
+    /// model must read the answer before acting on anything. Defaults to
+    /// `false`.
+    fn sole_call(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput>;
 
     /// Capability handle for resuming a mid-call approval after restart or idle
@@ -351,6 +364,10 @@ pub enum ToolTriggerScope {
     /// weaker half of that gate — a subagent session passes here and is
     /// refused by the executor's own check, which is the safe direction.
     BackgroundHost,
+    /// Only a conversation a user started (`TriggerSource::User`): someone
+    /// is there to answer. `AskUser` has nobody to ask in a cron fire or a
+    /// board run.
+    UserConversation,
 }
 
 impl ToolTriggerScope {
@@ -362,6 +379,7 @@ impl ToolTriggerScope {
             ToolTriggerScope::ProjectBoard => trigger.project().is_some(),
             ToolTriggerScope::SharedWorkspace => trigger.issue().is_none(),
             ToolTriggerScope::BackgroundHost => trigger.can_host_background_jobs(),
+            ToolTriggerScope::UserConversation => matches!(trigger, TriggerSource::User),
         }
     }
 }
@@ -447,6 +465,10 @@ pub struct ToolContext {
     /// handle. `None` means the executor did not wire one in; callers
     /// must fail-closed.
     pub approval: Option<ApprovalHandle>,
+    /// Where a tool asks the user questions (`AskUser`). `Some` only in an
+    /// attended turn on a channel that can show them; `None` means nobody
+    /// can be asked, and the tool must say so rather than wait.
+    pub question: Option<QuestionHandle>,
     /// Side-channel to surface non-fatal verdicts (warnings, blocks)
     /// to the user channel without going through the LLM-visible tool
     /// result. Today only the `Skill` tool emits notices (when the
@@ -610,6 +632,7 @@ impl ToolContext {
             sandbox: None,
             sandbox_bypass_reason: None,
             approval: None,
+            question: None,
             notifier: None,
             events: noop_event_sink(),
             lite_llm: None,

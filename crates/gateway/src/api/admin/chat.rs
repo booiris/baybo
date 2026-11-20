@@ -548,6 +548,75 @@ pub struct ChatMessageLookup {
     pub ordinal: Option<i64>,
 }
 
+/// One option presented inside a reconstructed `AskUser` step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ChatAskOption {
+    pub label: String,
+    pub description: String,
+}
+
+impl From<baybo_model::human_ask::QuestionOption> for ChatAskOption {
+    fn from(option: baybo_model::human_ask::QuestionOption) -> Self {
+        Self {
+            label: option.label,
+            description: option.description,
+        }
+    }
+}
+
+/// One question and its recorded answer inside [`ChatAskStepSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ChatAskQuestion {
+    pub header: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ChatAskOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<String>,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+impl From<baybo_model::human_ask::AskStepQuestion> for ChatAskQuestion {
+    fn from(q: baybo_model::human_ask::AskStepQuestion) -> Self {
+        Self {
+            header: q.header,
+            question: q.question,
+            options: q.options.into_iter().map(ChatAskOption::from).collect(),
+            multi_select: q.multi_select,
+            selected: q.selected,
+            other: q.other,
+            skipped: q.skipped,
+        }
+    }
+}
+
+/// Typed summary of a finished `AskUser` call, mirroring
+/// [`baybo_model::human_ask::AskStepSummary`] on the REST transcript surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ChatAskStepSummary {
+    pub declined: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<ChatAskQuestion>,
+}
+
+impl From<baybo_model::human_ask::AskStepSummary> for ChatAskStepSummary {
+    fn from(summary: baybo_model::human_ask::AskStepSummary) -> Self {
+        Self {
+            declined: summary.declined,
+            questions: summary
+                .questions
+                .into_iter()
+                .map(ChatAskQuestion::from)
+                .collect(),
+        }
+    }
+}
+
 /// One reconstructed step inside a `work` transcript item — the durable
 /// shadow of a live turn-progress event, rebuilt from persisted content
 /// blocks so a reloaded transcript shows the same collapsed work summary
@@ -600,6 +669,10 @@ pub struct ChatWorkStep {
     /// predates the field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    /// Structured summary for a finished `AskUser` call, matching the live
+    /// `Frame::ToolCompleted.ask` payload so reloads render the same step view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<ChatAskStepSummary>,
     /// When this step happened — the `created_at` of the row it came from, or
     /// the instant the live buffer recorded it. Lets a client time the
     /// stretches BETWEEN the model's mid-turn remarks rather than only the
@@ -628,6 +701,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -642,6 +716,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -656,6 +731,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -670,6 +746,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -695,6 +772,7 @@ impl From<WireWorkStep> for ChatWorkStep {
                 tool_status: step.status,
                 tool_summary: step.summary,
                 approval: step.approval.map(|d| d.as_str().to_owned()),
+                ask: step.ask.map(ChatAskStepSummary::from),
                 at: None,
             },
         };
@@ -3280,6 +3358,9 @@ struct WorkAccumulator {
     /// `tool_use_id` → index into `steps`, so a later tool-result message
     /// fills in the matching call's summary.
     pending_tools: HashMap<String, usize>,
+    /// `tool_use_id` → `AskUser` call arguments, paired with its `ToolResult`
+    /// to derive [`ChatAskStepSummary`] through the same helper the live plane uses.
+    pending_ask_inputs: HashMap<String, serde_json::Value>,
 }
 
 impl WorkAccumulator {
@@ -3319,6 +3400,7 @@ impl WorkAccumulator {
         self.last = None;
         self.cancelled = false;
         self.pending_tools.clear();
+        self.pending_ask_inputs.clear();
     }
 }
 
@@ -3574,6 +3656,9 @@ fn reconstruct_transcript_with_attachments(
                             id, name, input, ..
                         } => {
                             work.pending_tools.insert(id.clone(), work.steps.len());
+                            if name == baybo_model::human_ask::ASK_USER_TOOL_NAME {
+                                work.pending_ask_inputs.insert(id.clone(), input.clone());
+                            }
                             work.steps.push(
                                 ChatWorkStep::tool(
                                     id.clone(),
@@ -3680,7 +3765,18 @@ fn reconstruct_transcript_with_attachments(
                             Some(ApprovalDecision::Deny) => "denied".to_owned(),
                             _ => tool_result_status(content),
                         });
-                        step.tool_summary = Some(summarize_tool_result(content));
+                        if let Some(ask_input) = work.pending_ask_inputs.remove(tool_use_id)
+                            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(
+                                strip_tool_output_envelope(content),
+                            )
+                            && let Some(summary) =
+                                baybo_human_ask::ask_step_summary(&ask_input, &parsed)
+                        {
+                            step.tool_summary = Some(baybo_human_ask::format_ask_summary(&summary));
+                            step.ask = Some(ChatAskStepSummary::from(summary));
+                        } else {
+                            step.tool_summary = Some(summarize_tool_result(content));
+                        }
                         step.approval = approval.map(|d| d.as_str().to_owned());
                     }
                 }
@@ -3892,6 +3988,9 @@ fn thinking_text(content: &[ThinkingContent]) -> String {
 /// which needs the tool registry that isn't on the read path. `None` when
 /// nothing recognizable is present.
 fn tool_label(tool: &str, input: &serde_json::Value) -> Option<String> {
+    if tool == baybo_model::human_ask::ASK_USER_TOOL_NAME {
+        return baybo_human_ask::first_question_header(input);
+    }
     const KEYS: [&str; 6] = ["command", "url", "path", "file_path", "query", "pattern"];
     /// `spawn_subagent` carries none of the generic keys, so a delegation
     /// rendered as a bare tool name with no hint of who was sent to do what.
@@ -5229,5 +5328,112 @@ mod tests {
             "only the full denied frame may read as a denial"
         );
         assert_eq!(tool_result_status("all good"), "ok");
+    }
+
+    #[test]
+    fn reconstruct_derives_typed_ask_summary_and_label_for_ask_user() {
+        let answered_input = serde_json::json!({
+            "questions": [
+                {
+                    "header": "Auth",
+                    "question": "Which auth?",
+                    "options": [
+                        { "label": "JWT", "description": "Stateless" },
+                        { "label": "Cookie", "description": "Stateful" }
+                    ],
+                    "multi_select": false
+                },
+                {
+                    "header": "Cache",
+                    "question": "Need cache?",
+                    "options": [
+                        { "label": "Redis", "description": "In-memory" },
+                        { "label": "None", "description": "No cache" }
+                    ],
+                    "multi_select": false
+                }
+            ]
+        });
+        let answered_output = serde_json::json!({
+            "answers": [
+                { "header": "Auth", "selected": ["JWT"] },
+                { "header": "Cache", "selected": [] }
+            ]
+        });
+
+        let declined_input = serde_json::json!({
+            "questions": [
+                {
+                    "header": "Confirm",
+                    "question": "Proceed?",
+                    "options": [
+                        { "label": "Yes", "description": "Go ahead" },
+                        { "label": "No", "description": "Stop" }
+                    ],
+                    "multi_select": false
+                }
+            ]
+        });
+        let declined_output = serde_json::json!({ "declined": true });
+
+        let tail = vec![
+            (1, ts(1), ChatMessage::user(vec![text("help")])),
+            (
+                2,
+                ts(2),
+                ChatMessage::assistant(vec![
+                    tool_use(
+                        "c1",
+                        baybo_model::human_ask::ASK_USER_TOOL_NAME,
+                        answered_input.clone(),
+                    ),
+                    tool_use(
+                        "c2",
+                        baybo_model::human_ask::ASK_USER_TOOL_NAME,
+                        declined_input.clone(),
+                    ),
+                ]),
+            ),
+            (
+                3,
+                ts(3),
+                ChatMessage::tool_result("c1".to_owned(), answered_output.to_string()),
+            ),
+            (
+                4,
+                ts(4),
+                ChatMessage::tool_result("c2".to_owned(), declined_output.to_string()),
+            ),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        let work = &items[1];
+        assert_eq!(work.steps.len(), 2);
+
+        let expected_answered =
+            baybo_human_ask::ask_step_summary(&answered_input, &answered_output)
+                .expect("answered summary");
+        assert_eq!(work.steps[0].tool_label.as_deref(), Some("Auth"));
+        assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
+        assert_eq!(
+            work.steps[0].tool_summary.as_deref(),
+            Some("Asked 2 questions · Auth: JWT · Cache: skipped")
+        );
+        assert_eq!(
+            work.steps[0].ask,
+            Some(ChatAskStepSummary::from(expected_answered))
+        );
+
+        let expected_declined =
+            baybo_human_ask::ask_step_summary(&declined_input, &declined_output)
+                .expect("declined summary");
+        assert_eq!(work.steps[1].tool_label.as_deref(), Some("Confirm"));
+        assert_eq!(
+            work.steps[1].tool_summary.as_deref(),
+            Some("Asked 1 question · declined")
+        );
+        assert_eq!(
+            work.steps[1].ask,
+            Some(ChatAskStepSummary::from(expected_declined))
+        );
     }
 }

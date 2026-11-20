@@ -1767,6 +1767,29 @@ export interface components {
          *     sidecars like `"slack"` pass through unchanged).
          */
         ChannelType: string;
+        /** @description One option presented inside a reconstructed `AskUser` step. */
+        ChatAskOption: {
+            description: string;
+            label: string;
+        };
+        /** @description One question and its recorded answer inside [`ChatAskStepSummary`]. */
+        ChatAskQuestion: {
+            header: string;
+            multi_select?: boolean;
+            options?: components["schemas"]["ChatAskOption"][];
+            other?: string | null;
+            question: string;
+            selected?: string[];
+            skipped?: boolean;
+        };
+        /**
+         * @description Typed summary of a finished `AskUser` call, mirroring
+         *     [`baybo_model::human_ask::AskStepSummary`] on the REST transcript surface.
+         */
+        ChatAskStepSummary: {
+            declined: boolean;
+            questions?: components["schemas"]["ChatAskQuestion"][];
+        };
         /** @description A blob attachment embedded in a historical chat transcript item. */
         ChatAttachment: {
             blob_id: string;
@@ -2279,6 +2302,7 @@ export interface components {
              *     predates the field).
              */
             approval?: string | null;
+            ask?: null | components["schemas"]["ChatAskStepSummary"];
             /**
              * Format: date-time
              * @description When this step happened — the `created_at` of the row it came from, or

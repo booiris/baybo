@@ -1592,92 +1592,101 @@ impl AgentLoop {
         let read_tracker_for_calls = self.read_tracker.clone();
         let running_for_calls = self.running_calls.clone();
         let notify_silence_for_calls = cron_report.as_ref().map(|turn| turn.silence.clone());
+        let shared_response = dispatch_calls.len() > 1;
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
-        let exec_futures = response
-            .tool_calls
-            .iter()
-            .zip(&dispatch_calls)
-            .map(|(tc, dispatch)| {
-                let executor = Arc::clone(&executor);
-                let notify_silence = notify_silence_for_calls.clone();
-                let session_id = session_id_for_calls.clone();
-                let session_trigger = session_trigger_for_calls.clone();
-                let agent_id = agent_for_calls.clone();
-                let user = user_for_calls.clone();
-                let approved = Arc::clone(&approved);
-                let recorder = Arc::clone(&recorder_for_calls);
-                let step = step_for_calls.clone();
-                let tokens = TurnTokens {
-                    turn: cancel_token.child_token(),
-                    release: tokens.release.clone(),
-                };
-                let notifier = notifier_for_calls.clone();
-                let bind_source = Arc::clone(&llm_for_calls);
-                let tool_name = dispatch.name.clone();
-                let arguments = dispatch.arguments.clone();
-                let via_invoke = dispatch.via_invoke;
-                let tool_use_id = tc.id.clone();
-                let triggering_llm_span = Some(llm_span_id);
-                let limiter = Arc::clone(&concurrency_limiter);
-                let read_tracker = read_tracker_for_calls.clone();
-                let running = running_for_calls.clone();
-                // `Concurrent` → one permit (up to the cap run together);
-                // `Exclusive` → every permit, so the call runs alone among
-                // pool calls; `Independent` → no permit (self-bounded, e.g.
-                // `spawn_subagent`). Unknown tools fail safe to `Exclusive`
-                // inside `ToolRegistry::concurrency`.
-                let permits = match registry_for_calls.concurrency(&tool_name) {
-                    ToolConcurrency::Concurrent => Some(1),
-                    ToolConcurrency::Exclusive => Some(MAX_CONCURRENT_TOOL_CALLS as u32),
-                    ToolConcurrency::Independent => None,
-                };
-                async move {
-                    // Hold a pool permit for the whole call (none for an
-                    // `Independent` call). `acquire` errors only if the
-                    // semaphore is closed, which never happens for this
-                    // per-response limiter.
-                    let _permit = match permits {
-                        Some(n) => limiter.acquire_many_owned(n).await.ok(),
-                        None => None,
-                    };
-                    let _running = running.start();
-                    debug!(tool = %tool_name, "executing tool call");
-                    executor
-                        .execute(
-                            &tool_name,
-                            arguments,
-                            &session_id,
-                            &session_trigger,
-                            &agent_id,
-                            &user,
-                            &approved,
-                            &recorder,
-                            &step,
-                            triggering_llm_span,
-                            tool_use_id,
-                            None,
-                            Some(turn_id),
-                            tokens,
-                            notifier,
-                            Some(&bind_source),
-                            background,
-                            attended,
-                            read_tracker,
-                            notify_silence,
-                            via_invoke,
-                            PreExecuteGate::Ask,
-                        )
-                        .await
-                }
-            });
         // Race cancellation so tools that ignore the token cannot delay `/stop`.
         // Drain ready results first; dropping the remaining futures cancels them.
+        // A sole-call tool (e.g. `AskUser`) sharing a response with any sibling
+        // is rejected without executing, while its siblings still run normally.
         let mut tool_results: Vec<Option<ExecutedTool>> = std::iter::repeat_with(|| None)
             .take(response.tool_calls.len())
             .collect();
         let mut pending = futures::stream::FuturesUnordered::new();
-        for (idx, fut) in exec_futures.enumerate() {
-            pending.push(async move { (idx, fut.await) });
+        for (idx, (tc, dispatch)) in response.tool_calls.iter().zip(&dispatch_calls).enumerate() {
+            if shared_response && self.tool_registry.sole_call(&dispatch.name) {
+                tool_results[idx] = Some(ExecutedTool {
+                    output: Ok(ToolOutput::Error(format!(
+                        "{} must be the only tool call in its response",
+                        dispatch.name
+                    ))),
+                    approval: None,
+                    abandoned: false,
+                    handed_over: None,
+                });
+                continue;
+            }
+            let executor = Arc::clone(&executor);
+            let notify_silence = notify_silence_for_calls.clone();
+            let session_id = session_id_for_calls.clone();
+            let session_trigger = session_trigger_for_calls.clone();
+            let agent_id = agent_for_calls.clone();
+            let user = user_for_calls.clone();
+            let approved = Arc::clone(&approved);
+            let recorder = Arc::clone(&recorder_for_calls);
+            let step = step_for_calls.clone();
+            let tokens = TurnTokens {
+                turn: cancel_token.child_token(),
+                release: tokens.release.clone(),
+            };
+            let notifier = notifier_for_calls.clone();
+            let bind_source = Arc::clone(&llm_for_calls);
+            let tool_name = dispatch.name.clone();
+            let arguments = dispatch.arguments.clone();
+            let via_invoke = dispatch.via_invoke;
+            let tool_use_id = tc.id.clone();
+            let triggering_llm_span = Some(llm_span_id);
+            let limiter = Arc::clone(&concurrency_limiter);
+            let read_tracker = read_tracker_for_calls.clone();
+            let running = running_for_calls.clone();
+            // `Concurrent` → one permit (up to the cap run together);
+            // `Exclusive` → every permit, so the call runs alone among
+            // pool calls; `Independent` → no permit (self-bounded, e.g.
+            // `spawn_subagent`). Unknown tools fail safe to `Exclusive`
+            // inside `ToolRegistry::concurrency`.
+            let permits = match registry_for_calls.concurrency(&tool_name) {
+                ToolConcurrency::Concurrent => Some(1),
+                ToolConcurrency::Exclusive => Some(MAX_CONCURRENT_TOOL_CALLS as u32),
+                ToolConcurrency::Independent => None,
+            };
+            pending.push(async move {
+                // Hold a pool permit for the whole call (none for an
+                // `Independent` call). `acquire` errors only if the
+                // semaphore is closed, which never happens for this
+                // per-response limiter.
+                let _permit = match permits {
+                    Some(n) => limiter.acquire_many_owned(n).await.ok(),
+                    None => None,
+                };
+                let _running = running.start();
+                debug!(tool = %tool_name, "executing tool call");
+                let executed = executor
+                    .execute(
+                        &tool_name,
+                        arguments,
+                        &session_id,
+                        &session_trigger,
+                        &agent_id,
+                        &user,
+                        &approved,
+                        &recorder,
+                        &step,
+                        triggering_llm_span,
+                        tool_use_id,
+                        None,
+                        Some(turn_id),
+                        tokens,
+                        notifier,
+                        Some(&bind_source),
+                        background,
+                        attended,
+                        read_tracker,
+                        notify_silence,
+                        via_invoke,
+                        PreExecuteGate::Ask,
+                    )
+                    .await;
+                (idx, executed)
+            });
         }
         let cancelled_mid_batch = loop {
             tokio::select! {
@@ -1720,8 +1729,8 @@ impl AgentLoop {
                     delta_tx,
                     session,
                     tool_call.id.clone(),
-                    ToolStatus::Error,
-                    "cancelled".to_string(),
+                    (ToolStatus::Error, "cancelled".to_string()),
+                    None,
                     None,
                 )
                 .await;
@@ -1792,15 +1801,25 @@ impl AgentLoop {
             turn_attachments,
             llm_visible_images,
         } = media;
-        let (status, raw_summary) = tool_completion_summary(&executed);
+        let ask = if dispatch.name == baybo_model::human_ask::ASK_USER_TOOL_NAME
+            && let Ok(ToolOutput::Json(value)) = &executed.output
+        {
+            baybo_human_ask::ask_step_summary(&dispatch.arguments, value)
+        } else {
+            None
+        };
+        let (status, mut raw_summary) = tool_completion_summary(&executed);
+        if let Some(summary) = &ask {
+            raw_summary = baybo_human_ask::format_ask_summary(summary);
+        }
         let call_approval = executed.approval;
         self.emit_tool_completed(
             delta_tx,
             session,
             tool_use_id.to_string(),
-            status,
-            raw_summary,
+            (status, raw_summary),
             call_approval,
+            ask,
         )
         .await;
 
@@ -2952,11 +2971,12 @@ impl AgentLoop {
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         session: &Session,
         call_id: String,
-        status: ToolStatus,
-        raw_summary: String,
+        completion: (ToolStatus, String),
         approval: Option<ApprovalDecision>,
+        ask: Option<baybo_model::human_ask::AskStepSummary>,
     ) {
         let Some(tx) = delta_tx else { return };
+        let (status, raw_summary) = completion;
         let summary = self
             .security_gateway
             .sanitize_stream_fragment(&raw_summary)
@@ -2972,6 +2992,7 @@ impl AgentLoop {
                     status,
                     summary,
                     approval,
+                    ask,
                 },
             })
             .await;

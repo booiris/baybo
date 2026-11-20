@@ -93,6 +93,8 @@ export interface SessionPatch {
   folder_id?: FolderChange;
   /** Generated conversation title; absent means no change. */
   title?: string;
+  /** True while any ask (approval or question) is pending in this session. */
+  awaiting_human?: boolean;
 }
 
 /** Source of a `Frame::SessionActivity` event — mirror of Rust
@@ -115,6 +117,51 @@ export interface TaskView {
   depends_on?: string[];
 }
 
+export interface WireQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface WireQuestion {
+  header: string;
+  question: string;
+  options: WireQuestionOption[];
+  multi_select: boolean;
+}
+
+export interface WireQuestionAnswer {
+  header: string;
+  selected: string[];
+  other?: string;
+}
+
+export type WireQuestionReply =
+  | { kind: 'answered'; answers: WireQuestionAnswer[] }
+  | { kind: 'declined' };
+
+export interface WireQuestionCard {
+  queue_index: number;
+  ask_id: string;
+  tool_call_id: string;
+  user_id?: string;
+  questions: WireQuestion[];
+}
+
+export interface WireAskStepQuestion {
+  header: string;
+  question: string;
+  options?: WireQuestionOption[];
+  multi_select: boolean;
+  selected?: string[];
+  other?: string;
+  skipped: boolean;
+}
+
+export interface WireAskStepSummary {
+  declined: boolean;
+  questions?: WireAskStepQuestion[];
+}
+
 /** One step inside a turn's in-flight work block, carried in the
  *  `subscribe_state` bundle — mirror of Rust `WireWorkStep`. A `tool`
  *  step carries the call's `call_id` (so a later live `tool_completed`
@@ -133,6 +180,8 @@ export interface WireWorkStep {
    *  approval prompt returned, once it completed within the buffered turn.
    *  Absent when the call never prompted. */
   approval?: string;
+  /** Typed summary of a finished `AskUser` call. */
+  ask?: WireAskStepSummary;
   /** RFC3339 instant the channel's in-flight buffer recorded this step. Lets a
    *  client that joins mid-turn time the stretches between the model's remarks
    *  and not just the turn as a whole. Absent from a gateway predating it. */
@@ -166,9 +215,9 @@ export type Frame =
   | { kind: 'unsubscribe'; session_id: string }
   /** Server → client, once, immediately after every Subscribe: the
    *  atomic state-plane REPLACE bundle (turn activity + in-flight work
-   *  steps + pending approvals + task list). Empty arrays are OMITTED
-   *  on the wire (msgpack skip) — default them to `[]`. The turn/work
-   *  halves go stale by turn identity (`started_at`), never by
+   *  steps + pending approvals + pending questions + task list). Empty arrays
+   *  are OMITTED on the wire (msgpack skip) — default them to `[]`. The
+   *  turn/work halves go stale by turn identity (`started_at`), never by
    *  comparing a sync cursor against `as_of_ordinal`. */
   | {
       kind: 'subscribe_state';
@@ -178,6 +227,7 @@ export type Frame =
       turn: { active: boolean; started_at?: string | null };
       work_steps?: WireWorkStep[];
       pending_approvals?: WireApprovalCard[];
+      pending_questions?: WireQuestionCard[];
       tasks?: TaskView[];
     }
   /** Server → client gap nudge: the server dropped frames for this
@@ -211,6 +261,8 @@ export type Frame =
       /** The decision this call's approval prompt returned; absent when it
        *  never prompted. Persisted server-side, so a reload re-labels it. */
       approval?: string;
+      /** Typed summary of a finished `AskUser` call. */
+      ask?: WireAskStepSummary;
     }
   | { kind: 'status'; session_id: string; user_id?: string; phase: string }
   | { kind: 'task_list'; session_id: string; user_id?: string; tasks: TaskView[] }
@@ -272,6 +324,15 @@ export type Frame =
       decision?: string;
     }
   | { kind: 'resolve_approval'; ask_id: string; decision: string }
+  | {
+      kind: 'question_asked';
+      ask_id: string;
+      tool_call_id: string;
+      session_id: string;
+      user_id?: string;
+      questions: WireQuestion[];
+    }
+  | { kind: 'answer_question'; ask_id: string; reply: WireQuestionReply }
   | { kind: 'history_append'; session_id: string; entry: string }
   | { kind: 'history_snapshot'; session_id: string; entries: string[] }
   | { kind: 'start_bot'; bot_id: string; token: string }
@@ -451,6 +512,11 @@ export class ChatWs {
   /** Echo a ResolveApproval back. */
   resolveApproval(askId: string, decision: 'approve' | 'approve_always' | 'deny'): void {
     this.sendFrame({ kind: 'resolve_approval', ask_id: askId, decision });
+  }
+
+  /** Send a user's answer (or skip/decline) for a pending AskUser prompt. */
+  answerQuestion(askId: string, reply: WireQuestionReply): boolean {
+    return this.sendFrame({ kind: 'answer_question', ask_id: askId, reply });
   }
 
   /** Tear the connection down permanently. No further reconnects. */

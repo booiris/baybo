@@ -1,4 +1,4 @@
-use baybo_model::human_ask::AskId;
+use baybo_model::human_ask::{AskId, AskStepSummary, Question};
 use baybo_model::{ChannelType, ResourceAccess, SessionId, User};
 use baybo_model::{ContentBlock, MessageMetadata};
 use baybo_tools::ApprovalDecision;
@@ -131,6 +131,7 @@ pub enum AgentEvent {
         status: ToolStatus,
         summary: String,
         approval: Option<ApprovalDecision>,
+        ask: Option<AskStepSummary>,
     },
     /// Coarse turn-phase transition for a transient status line (today:
     /// context compaction start/end). Channels show a spinner/banner and
@@ -285,6 +286,16 @@ pub enum SessionEvent {
         params_preview: String,
         description: Option<String>,
     },
+    /// An `AskUser` call is parked waiting for the user's answers. Emitted by
+    /// the channel's ask-queue watcher when the question enters the queue; the
+    /// first `AnswerQuestion` wins and publishes [`SessionEvent::AskResolved`].
+    QuestionAsked {
+        ask_id: AskId,
+        tool_call_id: String,
+        session_id: SessionId,
+        user_id: String,
+        questions: Vec<Question>,
+    },
     /// A pending ask of any kind closed — answered, declined or abandoned.
     /// Dispatched for every close the channel's ask queue publishes, so an
     /// approval nobody decided still leaves every open client. `session_id`
@@ -312,8 +323,9 @@ impl SessionEvent {
         match self {
             SessionEvent::Agent(out) => &out.session_id,
             SessionEvent::UserEcho(m) => &m.message.session_id,
-            SessionEvent::ApprovalRequested { session_id, .. } => session_id,
-            SessionEvent::AskResolved { session_id, .. } => session_id,
+            SessionEvent::ApprovalRequested { session_id, .. }
+            | SessionEvent::QuestionAsked { session_id, .. }
+            | SessionEvent::AskResolved { session_id, .. } => session_id,
         }
     }
 
@@ -324,7 +336,8 @@ impl SessionEvent {
         match self {
             SessionEvent::Agent(out) => &out.user_id,
             SessionEvent::UserEcho(m) => &m.message.sender.id,
-            SessionEvent::ApprovalRequested { user_id, .. } => user_id,
+            SessionEvent::ApprovalRequested { user_id, .. }
+            | SessionEvent::QuestionAsked { user_id, .. } => user_id,
             SessionEvent::AskResolved { .. } => "",
         }
     }

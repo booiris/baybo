@@ -16,6 +16,18 @@ use crate::approval::{ApprovalDecision, ApprovalRequest};
 /// Name of the tool that raises question asks.
 pub const ASK_USER_TOOL_NAME: &str = "AskUser";
 
+/// Maximum questions in a single `AskUser` call (one tab per question).
+pub const MAX_QUESTIONS: usize = 4;
+
+/// Minimum options per `AskUser` question.
+pub const MIN_OPTIONS: usize = 2;
+
+/// Maximum options per `AskUser` question.
+pub const MAX_OPTIONS: usize = 4;
+
+/// Maximum characters in an `AskUser` question's tab `header`.
+pub const MAX_HEADER_CHARS: usize = 12;
+
 /// Identity of one ask. A UUID v4 when minted here; an ask raised through the
 /// approval path reuses the [`ApprovalRequest::ask_id`] it was raised with.
 /// One tool call can raise several asks, so this — not the `tool_call_id` —
@@ -200,6 +212,11 @@ pub struct QuestionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
 pub struct Question {
     /// Short tab label; also the key its [`QuestionAnswer`] is matched by.
     pub header: String,
@@ -210,6 +227,11 @@ pub struct Question {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
@@ -218,12 +240,76 @@ pub struct QuestionOption {
 /// The human's answer to one [`Question`]. `selected` and `other` both empty
 /// means the question was skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
 pub struct QuestionAnswer {
     pub header: String,
     #[serde(default)]
     pub selected: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub other: Option<String>,
+}
+
+/// How an `AskUser` prompt ended on a tool span (`SpanEventKind::Question`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionOutcomeKind {
+    Answered,
+    Declined,
+    Abandoned,
+}
+
+impl QuestionOutcomeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Declined => "declined",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// One question and its recorded answer inside [`AskStepSummary`], for both the
+/// collapsed step line and the expanded question/choice view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct AskStepQuestion {
+    pub header: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub other: Option<String>,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+/// Typed summary of a finished `AskUser` call, derived server-side from its
+/// input and result (`baybo_human_ask::ask_step_summary`) so the live wire and
+/// REST reconstruction agree identically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct AskStepSummary {
+    pub declined: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<AskStepQuestion>,
 }
 
 /// How an ask resolved.

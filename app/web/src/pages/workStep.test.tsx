@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, render } from '@testing-library/react';
 
-import { WorkSpeechRun, WorkStepView, type WorkStep } from './ChatPage';
+import {
+  WorkSpeechRun,
+  WorkStepView,
+  isCancelledWorkAt,
+  type PendingAsk,
+  type TranscriptRow,
+  type WorkStep,
+} from './ChatPage';
 
 // Which steps inside a work block are MARKDOWN and which are verbatim is a
 // contract, not a styling detail: the model writes its reasoning in the same
@@ -150,5 +157,166 @@ describe('WorkStepView reasoning sampling', () => {
     });
     expect(container.querySelector('strong')?.textContent).toBe('要点：');
     expect(container.textContent).toContain('tail');
+  });
+});
+
+describe('WorkStepView render-time ask badge & AskStepSummary', () => {
+  const approvalAsk: PendingAsk = {
+    kind: 'approval',
+    askId: 'ask-a1',
+    toolCallId: 'call-1',
+    sessionId: 's1',
+    tool: 'Bash',
+    description: null,
+    paramsPreview: '{}',
+    accesses: [],
+  };
+
+  const questionAsk: PendingAsk = {
+    kind: 'question',
+    askId: 'ask-q1',
+    toolCallId: 'call-q1',
+    sessionId: 's1',
+    questions: [
+      {
+        header: 'Auth',
+        question: 'Which auth?',
+        options: [
+          { label: 'JWT', description: 'Token' },
+          { label: 'Cookie', description: 'Session' },
+        ],
+        multi_select: false,
+      },
+    ],
+  };
+
+  it('derives waiting-for-approval badge at render time and suppresses spinner', () => {
+    const { container } = render(
+      <WorkStepView
+        step={step({
+          kind: 'tool',
+          toolCallId: 'call-1',
+          tool: 'Bash',
+          toolStatus: 'running',
+        })}
+        pendingAsks={[approvalAsk]}
+      />,
+    );
+    expect(container.textContent).toContain('waiting for approval');
+    expect(container.querySelector('.animate-spin')).toBeNull();
+  });
+
+  it('derives waiting-for-your-answer badge for pending question and suppresses spinner', () => {
+    const { container } = render(
+      <WorkStepView
+        step={step({
+          kind: 'tool',
+          toolCallId: 'call-q1',
+          tool: 'AskUser',
+          toolLabel: 'Auth',
+          toolStatus: 'running',
+        })}
+        pendingAsks={[questionAsk]}
+      />,
+    );
+    expect(container.textContent).toContain('waiting for your answer');
+    expect(container.querySelector('.animate-spin')).toBeNull();
+  });
+
+  it('renders answered, skipped, and declined AskStepSummary with expandable full options', () => {
+    const { container } = render(
+      <WorkStepView
+        step={step({
+          kind: 'tool',
+          toolCallId: 'call-q1',
+          tool: 'AskUser',
+          toolLabel: 'Auth',
+          toolStatus: 'ok',
+          ask: {
+            declined: false,
+            questions: [
+              {
+                header: 'Auth',
+                question: 'Which auth strategy?',
+                options: [
+                  { label: 'JWT', description: 'Stateless' },
+                  { label: 'Cookie', description: 'Stateful' },
+                ],
+                multi_select: false,
+                selected: ['JWT'],
+                skipped: false,
+              },
+              {
+                header: 'Cache',
+                question: 'Need a cache?',
+                options: [
+                  { label: 'Redis', description: 'In-memory' },
+                  { label: 'None', description: 'Skip' },
+                ],
+                multi_select: false,
+                selected: [],
+                skipped: true,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+    const summary = container.querySelector('summary');
+    expect(summary?.textContent).toContain('Asked 2 questions');
+    expect(summary?.textContent).toContain('Auth: JWT');
+    expect(summary?.textContent).toContain('Cache: skipped');
+    expect(summary?.querySelector('em')?.textContent).toBe('skipped');
+    // Expanded content includes the full question text and options
+    expect(container.textContent).toContain('Which auth strategy?');
+    expect(container.textContent).toContain('Stateless');
+
+    const declined = render(
+      <WorkStepView
+        step={step({
+          kind: 'tool',
+          toolCallId: 'call-q2',
+          tool: 'AskUser',
+          toolStatus: 'ok',
+          ask: {
+            declined: true,
+            questions: [
+              {
+                header: 'Auth',
+                question: 'Which auth strategy?',
+                options: [{ label: 'JWT', description: 'Stateless' }],
+                multi_select: false,
+                selected: [],
+                skipped: true,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+    expect(declined.container.querySelector('summary')?.textContent).toContain('Asked 1 question');
+    expect(declined.container.querySelector('summary em')?.textContent).toBe('declined');
+  });
+
+  it('suppresses CancelledTurnIndicator when the trailing closed block owns a pending ask (post-restart)', () => {
+    const trailingWork: TranscriptRow = {
+      key: 'row-s1-w4',
+      role: 'system',
+      text: '',
+      kind: 'work',
+      workActive: false,
+      steps: [
+        {
+          key: 's0',
+          kind: 'tool',
+          toolCallId: 'call-q1',
+          tool: 'AskUser',
+          toolLabel: 'Auth',
+        },
+      ],
+    };
+    const deadTurn = { active: false, startedAt: null };
+    expect(isCancelledWorkAt([trailingWork], 0, deadTurn, [])).toBe(true);
+    expect(isCancelledWorkAt([trailingWork], 0, deadTurn, [questionAsk])).toBe(false);
   });
 });

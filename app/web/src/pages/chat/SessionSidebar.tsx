@@ -278,7 +278,7 @@ function SessionRow({
       {hasPending ? (
         <span
           className={`w-2 h-2 rounded-full shrink-0 ${active ? 'bg-white' : 'bg-warn'}`}
-          title="Approval pending"
+          title="Waiting for you"
         />
       ) : null}
       <span

@@ -10,7 +10,7 @@ function row(key: string, text = ''): TranscriptRow {
   return { key, role: 'assistant', text };
 }
 
-const QUIET = { awaitingReply: false, pendingApproval: false, deferred: 0 };
+const QUIET = { awaitingReply: false, pendingAskIds: [] as string[], deferred: 0 };
 
 describe('transcriptTailSignature', () => {
   it('is unchanged by a scroll-up prepend of older pages', () => {
@@ -48,10 +48,15 @@ describe('transcriptTailSignature', () => {
     ).not.toBe(transcriptTailSignature([row('a')], QUIET));
   });
 
-  it('moves when an approval card appears', () => {
-    expect(
-      transcriptTailSignature([row('a')], { ...QUIET, pendingApproval: true }),
-    ).not.toBe(transcriptTailSignature([row('a')], QUIET));
+  it('moves when an ask card appears, queues a second ask, or retires one', () => {
+    const none = transcriptTailSignature([row('a')], QUIET);
+    const one = transcriptTailSignature([row('a')], { ...QUIET, pendingAskIds: ['ask-1'] });
+    const two = transcriptTailSignature([row('a')], { ...QUIET, pendingAskIds: ['ask-1', 'ask-2'] });
+    const secondOnly = transcriptTailSignature([row('a')], { ...QUIET, pendingAskIds: ['ask-2'] });
+    expect(one).not.toBe(none);
+    expect(two).not.toBe(one);
+    expect(secondOnly).not.toBe(one);
+    expect(secondOnly).not.toBe(two);
   });
 
   it('moves when a deferred bubble is parked below the thread', () => {

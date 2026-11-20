@@ -15,11 +15,11 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use baybo_channels::wire::{
     self, ApprovalCard, AttachmentKind, Frame, MAX_MESSAGE_BATCH_ATTACHMENTS,
-    MAX_MESSAGE_BATCH_MESSAGES, MAX_MESSAGE_BATCH_TEXT_BYTES, Message as WireMessage, TaskView,
-    TurnSnapshot, WireAttachment,
+    MAX_MESSAGE_BATCH_MESSAGES, MAX_MESSAGE_BATCH_TEXT_BYTES, Message as WireMessage, QuestionCard,
+    QuestionReply, TaskView, TurnSnapshot, WireAttachment,
 };
 use baybo_channels::{ChannelKind, IncomingMessage, Message as AgentMessage, RouterInbound};
-use baybo_model::human_ask::{AskId, AskResolution};
+use baybo_model::human_ask::{AskId, AskRequest, AskResolution};
 use baybo_model::{BlobRef, ChannelType, ContentBlock, MessageMetadata, SessionId, User};
 use baybo_store::BlobStore;
 use chrono::Utc;
@@ -238,6 +238,55 @@ async fn resolve_approval(
         .await
     {
         tracing::debug!(%ask_id, error = %e, "ResolveApproval not applied");
+    }
+}
+
+/// A client answered or declined a pending `AskUser` card. Scoped to this
+/// connection's channel like [`resolve_approval`]: only an ask on its own
+/// queue is answerable from here.
+async fn answer_question(
+    state: &WsChannelState,
+    sidecar: &Sidecar,
+    ask_id: &AskId,
+    reply: QuestionReply,
+) {
+    let Some(session_id) = sidecar
+        .channel
+        .ask_queue()
+        .and_then(|queue| queue.session_for(ask_id))
+    else {
+        tracing::debug!(%ask_id, "AnswerQuestion for an ask not pending here; ignored");
+        return;
+    };
+    let resolution = match reply {
+        QuestionReply::Answered { mut answers } => {
+            for answer in &mut answers {
+                if let Some(text) = &mut answer.other {
+                    match state.security_gateway.sanitize_answer_text(text).await {
+                        Ok(masked) => *text = masked,
+                        Err(_) => {
+                            let _ = sidecar.send_frame(Frame::Notice {
+                                session_id: session_id.clone(),
+                                user_id: String::new(),
+                                level: "error".into(),
+                                text: "The answer could not be accepted. Review the free-text response and try again.".into(),
+                                transient: false,
+                                mid_turn: Some(false),
+                                durable_id: None,
+                            }).await;
+                            send_subscribe_state(state, sidecar, &session_id).await;
+                            return;
+                        }
+                    }
+                }
+            }
+            AskResolution::Answered(answers)
+        }
+        QuestionReply::Declined => AskResolution::Declined,
+    };
+    if let Err(e) = state.human_asks.resolve(ask_id, resolution).await {
+        tracing::debug!(%ask_id, error = %e, "AnswerQuestion not applied");
+        send_subscribe_state(state, sidecar, &session_id).await;
     }
 }
 
@@ -579,6 +628,9 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
             Frame::ResolveApproval { ask_id, decision } => {
                 resolve_approval(state, sidecar, &ask_id, decision).await;
             }
+            Frame::AnswerQuestion { ask_id, reply } => {
+                answer_question(state, sidecar, &ask_id, reply).await;
+            }
             Frame::HistoryAppend { session_id, entry } => {
                 if channel_type.as_str() != ChannelType::TUI {
                     tracing::warn!(
@@ -743,20 +795,33 @@ async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session
     } else {
         Vec::new()
     };
-    let pending_approvals: Vec<ApprovalCard> = sidecar
+    let mut pending_approvals = Vec::new();
+    let mut pending_questions = Vec::new();
+    for (queue_index, ask) in sidecar
         .channel
-        .pending_approvals(session_id)
+        .pending_asks(session_id)
         .into_iter()
-        .map(|req| ApprovalCard {
-            ask_id: req.ask_id,
-            tool_call_id: Some(req.tool_call_id),
-            user_id: req.user_id,
-            tool: req.tool,
-            accesses: req.accesses,
-            params_preview: req.params_preview,
-            description: req.description,
-        })
-        .collect();
+        .enumerate()
+    {
+        match ask.request {
+            AskRequest::Approval(req) => pending_approvals.push(ApprovalCard {
+                ask_id: req.ask_id,
+                tool_call_id: Some(req.tool_call_id),
+                user_id: req.user_id,
+                tool: req.tool,
+                accesses: req.accesses,
+                params_preview: req.params_preview,
+                description: req.description,
+            }),
+            AskRequest::Question(req) => pending_questions.push(QuestionCard {
+                ask_id: ask.ask_id,
+                tool_call_id: ask.tool_call_id,
+                user_id: String::new(),
+                questions: req.questions,
+                queue_index,
+            }),
+        }
+    }
     if let Err(e) = sidecar
         .send_frame(Frame::SubscribeState {
             session_id: session_id.clone(),
@@ -764,6 +829,7 @@ async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session
             turn,
             work_steps,
             pending_approvals,
+            pending_questions,
             tasks,
         })
         .await

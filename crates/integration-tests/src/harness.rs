@@ -36,7 +36,7 @@ use baybo_security::test_support::MemorySecretStore;
 use baybo_security::{LeakDetector, SecretVault};
 use baybo_skills::SkillRegistry;
 use baybo_store::{HumanAskRow, HumanAskStore};
-use baybo_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
+use baybo_tools::{ApprovalGate, ChannelGates, QuestionGate, Tool, ToolManifest, ToolRegistry};
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, TraceEventStream, TraceStore};
 use baybo_turn::TurnLifecycle;
@@ -583,9 +583,12 @@ impl AgentTestHarnessBuilder {
         for (tool, manifest) in baybo_task::tools::agent_tools(task_store.clone()) {
             tool_registry.register(tool, manifest);
         }
+        for (tool, manifest) in baybo_human_ask::tools::agent_tools() {
+            tool_registry.register(tool, manifest);
+        }
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
-        let approval_gates = Arc::new(ApprovalGateMap::new());
+        let gates = ChannelGates::new();
         let ask_store = MemoryHumanAskStore::new();
         let memory_session_store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
         let (session_store, folder_store, turn_store_dyn, ask_ledger) = match &self.store {
@@ -641,13 +644,19 @@ impl AgentTestHarnessBuilder {
             resume_sink,
         }));
         if self.channel_ask_gate {
-            approval_gates.insert(
+            let gate = Arc::new(ChannelAskGate::new(
+                ask_queues.get_or_create(&session.channel),
+                Arc::clone(&ask_core),
+            ));
+            gates.approvals.insert(
                 session.channel.clone(),
-                Arc::new(ChannelAskGate::new(
-                    ask_queues.get_or_create(&session.channel),
-                    Arc::clone(&ask_core),
-                )),
+                Arc::clone(&gate) as Arc<dyn ApprovalGate>,
             );
+            if session.channel == ChannelType::owner() {
+                gates
+                    .questions
+                    .insert(session.channel.clone(), gate as Arc<dyn QuestionGate>);
+            }
         }
         let virtual_reads: Option<Arc<dyn baybo_tools::VirtualReadResolver>> =
             Some(Arc::new(baybo_agent::SessionTranscriptReader::new(
@@ -656,7 +665,7 @@ impl AgentTestHarnessBuilder {
             )));
         let tool_executor = Arc::new(ToolExecutor::new(
             tool_registry.clone(),
-            approval_gates,
+            gates,
             gateway.clone(),
             std::path::PathBuf::from("/tmp"),
             baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),

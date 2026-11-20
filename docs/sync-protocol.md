@@ -283,17 +283,19 @@ Frame::SubscribeState {
   turn: { active: bool, started_at: Option<DateTime> },
   work_steps: Vec<WireWorkStep>,      // empty unless mid-turn
   pending_approvals: Vec<ApprovalCard>,
+  pending_questions: Vec<QuestionCard>,
   tasks: Vec<TaskView>,
 }
 ```
 
 This replaces the current four-frame drizzle (`TurnState`, `WorkSnapshot`,
 `PendingApprovalsSnapshot`, `TaskList` — `route.rs:294-481`) with a single
-atomic REPLACE. `pending_approvals` is the **authoritative replacement set**
-— full cards, built from one atomic queue read — which closes the documented
-approval-snapshot race window (`wire/src/lib.rs:666-671`); a live
-`ApprovalRequested`/`AskResolved` arriving after the snapshot wins over
-it (normal frame order on one connection). `as_of_ordinal` stamps the
+atomic REPLACE. `pending_approvals` and `pending_questions` are the
+**authoritative replacement sets** — full cards, built from one atomic queue
+read — which closes the documented approval-snapshot race window
+(`wire/src/lib.rs:666-671`); a live `ApprovalRequested`/`QuestionAsked`/
+`AskResolved` arriving after the snapshot wins over it (normal frame order on
+one connection). `as_of_ordinal` stamps the
 snapshot's transcript position, but the normative staleness test for the
 `turn`/`work_steps` halves is **turn identity, not ordinal arithmetic** —
 the coverage watermark advances continuously during an active turn (tool

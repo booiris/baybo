@@ -21,7 +21,9 @@
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
-use baybo_model::human_ask::{AskId, AskResolution};
+use baybo_model::human_ask::{AskId, AskResolution, AskStepSummary, Question, QuestionAnswer};
+#[cfg(test)]
+use baybo_model::human_ask::{AskStepQuestion, QuestionOption};
 use baybo_model::{ApprovalDecision, ChannelType, ResourceAccess, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -417,6 +419,11 @@ pub struct WireWorkStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub approval: Option<ApprovalDecision>,
+    /// Typed summary of a finished `AskUser` call, derived server-side from
+    /// its input and result so live tabs and REST reloads render the same card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub ask: Option<AskStepSummary>,
     /// When this step happened, so a client can time the stretches BETWEEN the
     /// model's mid-turn remarks rather than only the turn as a whole. Stamped
     /// as the buffer records the event; the REST reconstruction stamps its own
@@ -439,6 +446,7 @@ impl WireWorkStep {
             status: None,
             summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -454,6 +462,7 @@ impl WireWorkStep {
             status: None,
             summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -469,6 +478,7 @@ impl WireWorkStep {
             status: None,
             summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -496,6 +506,7 @@ impl WireWorkStep {
             status: None,
             summary: None,
             approval: None,
+            ask: None,
             at: None,
         }
     }
@@ -550,6 +561,38 @@ pub struct ApprovalCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub description: Option<String>,
+}
+
+/// One pending `AskUser` prompt carried in [`Frame::SubscribeState`].
+/// Field-compatible with [`Frame::QuestionAsked`] minus `session_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct QuestionCard {
+    /// Position among all pending asks in this session snapshot.
+    pub queue_index: usize,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+    pub ask_id: AskId,
+    pub tool_call_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user_id: String,
+    pub questions: Vec<Question>,
+}
+
+/// Client answer payload on [`Frame::AnswerQuestion`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub enum QuestionReply {
+    Answered { answers: Vec<QuestionAnswer> },
+    Declined,
 }
 
 /// Frame envelope. Tagged on the `kind` field so the receive side
@@ -629,6 +672,8 @@ pub enum Frame {
         work_steps: Vec<WireWorkStep>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pending_approvals: Vec<ApprovalCard>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_questions: Vec<QuestionCard>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tasks: Vec<TaskView>,
     },
@@ -720,6 +765,9 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
         approval: Option<ApprovalDecision>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        ask: Option<AskStepSummary>,
     },
     /// Server → client: a coarse turn-phase transition for a transient
     /// status line. `phase` is a lower-case string (today `"compacting"` /
@@ -866,6 +914,27 @@ pub enum Frame {
         ask_id: AskId,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
+    },
+    /// Server → client: the model called `AskUser` and is waiting for the
+    /// user's structured answers. Stays pending (across restarts too) until a
+    /// client sends [`Frame::AnswerQuestion`] or the turn moves on;
+    /// [`Frame::AskResolved`] retires it either way.
+    QuestionAsked {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
+        tool_call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        questions: Vec<Question>,
+    },
+    /// Client → server: answer or decline a pending question the client saw in
+    /// [`Frame::QuestionAsked`] or [`Frame::SubscribeState`].
+    AnswerQuestion {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        ask_id: AskId,
+        reply: QuestionReply,
     },
     /// Client → server: persist one submitted input line to the
     /// server-side history store. Used by the built-in TUI to get
@@ -1063,6 +1132,7 @@ impl Frame {
             | Frame::TaskList { session_id, .. }
             | Frame::TurnState { session_id, .. }
             | Frame::ApprovalRequested { session_id, .. }
+            | Frame::QuestionAsked { session_id, .. }
             | Frame::HistoryAppend { session_id, .. }
             | Frame::HistorySnapshot { session_id, .. }
             | Frame::SessionUpdated { session_id, .. }
@@ -1074,6 +1144,7 @@ impl Frame {
             | Frame::RegisterAck { .. }
             | Frame::AskResolved { .. }
             | Frame::ResolveApproval { .. }
+            | Frame::AnswerQuestion { .. }
             | Frame::StartBot { .. }
             | Frame::StopBot { .. }
             | Frame::BotStatus { .. }
@@ -1368,6 +1439,27 @@ mod tests {
                 params_preview: "{}".into(),
                 description: None,
             }],
+            pending_questions: vec![QuestionCard {
+                queue_index: 1,
+                ask_id: "q1".parse().unwrap(),
+                tool_call_id: "t-use-2".into(),
+                user_id: String::new(),
+                questions: vec![Question {
+                    header: "Auth".into(),
+                    question: "Which auth?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "JWT".into(),
+                            description: "stateless".into(),
+                        },
+                        QuestionOption {
+                            label: "Session".into(),
+                            description: "server".into(),
+                        },
+                    ],
+                    multi_select: false,
+                }],
+            }],
             tasks: vec![TaskView {
                 id: "t1".into(),
                 subject: "do it".into(),
@@ -1391,6 +1483,7 @@ mod tests {
             },
             work_steps: Vec::new(),
             pending_approvals: Vec::new(),
+            pending_questions: Vec::new(),
             tasks: Vec::new(),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1647,6 +1740,112 @@ mod tests {
             decision: ApprovalDecision::Deny,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_question_asked_and_answer_question() {
+        let asked = Frame::QuestionAsked {
+            ask_id: "q1".parse().unwrap(),
+            tool_call_id: "t-use-q1".into(),
+            session_id: "s1".into(),
+            user_id: String::new(),
+            questions: vec![Question {
+                header: "DB".into(),
+                question: "Which database?".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "Postgres".into(),
+                        description: "relational".into(),
+                    },
+                    QuestionOption {
+                        label: "SQLite".into(),
+                        description: "embedded".into(),
+                    },
+                ],
+                multi_select: true,
+            }],
+        };
+        assert_eq!(asked, decode(&encode(&asked).unwrap()).unwrap());
+        assert_eq!(
+            asked.routing_session_id().map(SessionId::as_str),
+            Some("s1")
+        );
+
+        let answered = Frame::AnswerQuestion {
+            ask_id: "q1".parse().unwrap(),
+            reply: QuestionReply::Answered {
+                answers: vec![QuestionAnswer {
+                    header: "DB".into(),
+                    selected: vec!["Postgres".into()],
+                    other: Some("plus cache".into()),
+                }],
+            },
+        };
+        assert_eq!(answered, decode(&encode(&answered).unwrap()).unwrap());
+        assert!(answered.routing_session_id().is_none());
+
+        let declined = Frame::AnswerQuestion {
+            ask_id: "q1".parse().unwrap(),
+            reply: QuestionReply::Declined,
+        };
+        assert_eq!(declined, decode(&encode(&declined).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_tool_completed_and_work_step_with_ask_summary() {
+        let summary = AskStepSummary {
+            declined: false,
+            questions: vec![AskStepQuestion {
+                header: "Auth".into(),
+                question: "Which auth?".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "JWT".into(),
+                        description: "stateless".into(),
+                    },
+                    QuestionOption {
+                        label: "Session".into(),
+                        description: "cookie".into(),
+                    },
+                ],
+                multi_select: false,
+                selected: vec!["JWT".into()],
+                other: None,
+                skipped: false,
+            }],
+        };
+        let completed = Frame::ToolCompleted {
+            session_id: "s1".into(),
+            user_id: String::new(),
+            call_id: "tc1".into(),
+            status: "ok".into(),
+            summary: "Asked 1 question · Auth: JWT".into(),
+            approval: None,
+            ask: Some(summary.clone()),
+        };
+        assert_eq!(completed, decode(&encode(&completed).unwrap()).unwrap());
+
+        let mut step = WireWorkStep::tool(
+            Some("tc1".into()),
+            Some("AskUser".into()),
+            Some("Auth".into()),
+        );
+        step.status = Some("ok".into());
+        step.summary = Some("Asked 1 question · Auth: JWT".into());
+        step.ask = Some(summary);
+        let bundle = Frame::SubscribeState {
+            session_id: "s1".into(),
+            as_of_ordinal: Some(1),
+            turn: TurnSnapshot {
+                active: true,
+                started_at: None,
+            },
+            work_steps: vec![step],
+            pending_approvals: Vec::new(),
+            pending_questions: Vec::new(),
+            tasks: Vec::new(),
+        };
+        assert_eq!(bundle, decode(&encode(&bundle).unwrap()).unwrap());
     }
 
     #[test]

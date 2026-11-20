@@ -51,11 +51,16 @@ import {
   type ResourceAccess,
   type SessionPatch,
   type WireApprovalCard,
+  type WireAskStepSummary,
   type WireAttachment,
+  type WireQuestion,
+  type WireQuestionCard,
+  type WireQuestionReply,
   type WireWorkStep,
 } from '../api/chatWs';
 import type { components } from '../api/schema';
 import { AttachmentList } from './chat/AttachmentList';
+import { QuestionCard } from './chat/QuestionCard';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
 import {
@@ -89,6 +94,9 @@ import { ISSUE_REF_COMPONENTS, remarkIssueRefs } from './projects/issueRefs';
 
 type ApiTranscriptItem = components['schemas']['ChatTranscriptItem'];
 type ApiAttachment = components['schemas']['ChatAttachment'];
+type ApiChatAskStepSummary = components['schemas']['ChatAskStepSummary'];
+
+export type AskStepSummary = WireAskStepSummary;
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
  *  and `prose` carry `text`; `tool` carries the tool-call fields and is
@@ -110,13 +118,12 @@ export interface WorkStep {
   toolLabel?: string | null;
   toolStatus?: 'running' | 'ok' | 'error' | 'denied';
   toolSummary?: string;
-  /** Prompt id, set while this call is blocked on the user's approval — the
-   *  step reads "waiting for approval" until the matching `ask_resolved`
-   *  (or the call's own completion) lands. */
-  awaitingApproval?: string;
   /** The decision the user gave. Persisted with the tool result, so a reload
    *  still shows what was judged. */
   approval?: 'approve' | 'approve_always' | 'deny';
+  /** Typed summary of a finished `AskUser` call, derived server-side so live
+   *  wire frames and REST reconstruction render identically. */
+  ask?: AskStepSummary;
   /** Epoch ms for when this step happened. Server-supplied where the step has
    *  a source row or a buffered event; stamped locally when a live frame mints
    *  the step, since the frames themselves carry no time. Drives the per-run
@@ -198,14 +205,26 @@ export interface TranscriptRow {
   workSettling?: boolean;
 }
 
-interface PendingApproval {
+export interface PendingApproval {
+  kind: 'approval';
   askId: string;
+  toolCallId?: string;
   sessionId: string;
   tool: string;
   description: string | null;
   paramsPreview: string;
   accesses: ResourceAccess[];
 }
+
+export interface PendingQuestion {
+  kind: 'question';
+  askId: string;
+  toolCallId: string;
+  sessionId: string;
+  questions: WireQuestion[];
+}
+
+export type PendingAsk = PendingApproval | PendingQuestion;
 
 type ApprovalDecision = 'approve' | 'approve_always' | 'deny';
 
@@ -230,7 +249,9 @@ interface ModelOption {
  */
 export interface SessionView {
   transcript: TranscriptRow[];
-  pendingApproval: PendingApproval | null;
+  pendingAsks: PendingAsk[];
+  /** Active tab per pending question. */
+  questionTabByAskId: Record<string, number>;
   historyLoaded: boolean;
   historyLoading: boolean;
   /** True while a scroll-up "load older" request is in flight; used
@@ -281,7 +302,8 @@ export interface SessionView {
 
 export const EMPTY_VIEW: SessionView = {
   transcript: [],
-  pendingApproval: null,
+  pendingAsks: [],
+  questionTabByAskId: {},
   historyLoaded: false,
   historyLoading: false,
   olderLoading: false,
@@ -301,7 +323,7 @@ export const EMPTY_VIEW: SessionView = {
  *  text grows), as does a new step landing in a live work block. */
 export function transcriptTailSignature(
   transcript: TranscriptRow[],
-  below: { awaitingReply: boolean; pendingApproval: boolean; deferred: number },
+  below: { awaitingReply: boolean; pendingAskIds: readonly string[]; deferred: number },
 ): string {
   const last = transcript.length > 0 ? transcript[transcript.length - 1] : null;
   return [
@@ -309,7 +331,7 @@ export function transcriptTailSignature(
     last ? last.text.length : 0,
     last?.steps?.length ?? 0,
     below.awaitingReply ? '1' : '0',
-    below.pendingApproval ? '1' : '0',
+    below.pendingAskIds.join(','),
     below.deferred,
   ].join('|');
 }
@@ -439,21 +461,17 @@ export type ComposerAction = 'noop' | 'stop' | 'direct' | 'park';
 
 /** Pure decision for what a composer submit should do, extracted from
  *  `handleSend` so the send-vs-park rule is unit-testable independent of the
- *  component. The rule is intentionally INDEPENDENT of how many items are
- *  already queued: an idle, unpaused send always goes direct (it starts a turn
- *  whose completion auto-drains the queue), so a non-empty queue can never
- *  stall the composer. Parking happens only while a turn is in flight (preserve
- *  order) or the pipeline is paused after a /stop or error. `/stop` always
- *  bypasses, even busy/paused. */
+ *  component. A pending question also holds the queue after reconnect. */
 export function decideComposerAction(opts: {
   hasContent: boolean;
   isStop: boolean;
+  hasPendingQuestion: boolean;
   busy: boolean;
   paused: boolean;
 }): ComposerAction {
   if (!opts.hasContent) return 'noop';
   if (opts.isStop) return 'stop';
-  return !opts.busy && !opts.paused ? 'direct' : 'park';
+  return opts.busy || opts.paused || opts.hasPendingQuestion ? 'park' : 'direct';
 }
 
 /** Accept slash-command completion: replace the leading `/command` token of
@@ -1189,6 +1207,7 @@ export function ChatPage() {
           cron_job_id: s.cron_job_id ?? undefined,
           cron_job_title: s.cron_job_title ?? undefined,
           cron_group_pinned: s.cron_group_pinned ?? false,
+          awaiting_human: s.awaiting_human ?? false,
         }));
       });
     }
@@ -1297,6 +1316,7 @@ export function ChatPage() {
         cron_job_id: s.cron_job_id ?? undefined,
         cron_job_title: s.cron_job_title ?? undefined,
         cron_group_pinned: s.cron_group_pinned ?? false,
+        awaiting_human: s.awaiting_human ?? false,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -1551,6 +1571,7 @@ export function ChatPage() {
           case 'message':
           case 'notice':
           case 'approval_requested':
+          case 'question_asked':
           case 'turn_state':
             recencyRef.current.set(frame.session_id, Date.now());
             break;
@@ -1576,6 +1597,11 @@ export function ChatPage() {
             (turnTokenRef.current.get(frame.session_id) ?? 0) + 1,
           );
           firedForTurnRef.current.delete(frame.session_id);
+        }
+        // A tab opened mid-question can see its live completion without having
+        // observed the turn start. Arm the normal queue drain for that reply.
+        if (frame.kind === 'tool_completed' && frame.ask && !turnTokenRef.current.has(frame.session_id)) {
+          turnTokenRef.current.set(frame.session_id, 1);
         }
         if (frame.kind === 'turn_state' && !frame.active) {
           streamingAnswerRef.current.delete(frame.session_id);
@@ -1778,7 +1804,7 @@ export function ChatPage() {
   useLayoutEffect(() => {
     const signature = transcriptTailSignature(currentView.transcript, {
       awaitingReply: currentView.awaitingReply,
-      pendingApproval: currentView.pendingApproval !== null,
+      pendingAskIds: currentView.pendingAsks.map((a) => a.askId),
       deferred: queue.deferred.length,
     });
     const tailMoved = signature !== tailSignatureRef.current;
@@ -1793,7 +1819,7 @@ export function ChatPage() {
     }
   }, [
     currentView.transcript,
-    currentView.pendingApproval,
+    currentView.pendingAsks,
     currentView.awaitingReply,
     // A newly deferred bubble grows the scroller without touching the
     // transcript — re-pin to the bottom when the user is already there.
@@ -2473,10 +2499,21 @@ export function ChatPage() {
     [sessionId, status.state, sendToSession, flushPacerKeepStreaming],
   );
 
+  const oldestAsk = currentView.pendingAsks.at(0);
+  const pendingQuestion = oldestAsk?.kind === 'question' ? oldestAsk : null;
+  const activeQuestionTab = pendingQuestion
+    ? Math.min(
+        Math.max(0, currentView.questionTabByAskId[pendingQuestion.askId] ?? 0),
+        Math.max(0, pendingQuestion.questions.length - 1),
+      )
+    : 0;
+  const hasPendingQuestion = currentView.pendingAsks.some((ask) => ask.kind === 'question');
+  const composerTrimmed = composer.trim();
+
   // Non-empty draft OR at least one ready attachment — drives the Send/Stop
   // matrix and whether a submit does anything.
   const hasContent =
-    composer.trim().length > 0 || attachments.some((a) => a.status === 'ready');
+    composerTrimmed.length > 0 || attachments.some((a) => a.status === 'ready');
 
   const handleSend = useCallback(
     (e: FormEvent) => {
@@ -2499,22 +2536,18 @@ export function ChatPage() {
       const action = decideComposerAction({
         hasContent: trimmed.length > 0 || wire.length > 0,
         isStop: isStopCommand(trimmed),
+        hasPendingQuestion,
         busy,
         paused: queue.pauseReason !== null,
       });
       if (action === 'noop') return;
-      // A refused send must not cost the user their draft. `sendText` bails on
-      // no session, no socket, or a connection that isn't up yet, and Enter
-      // reaches here through `form.requestSubmit()` — which ignores the send
-      // button's `disabled`, so this is the only gate on that path. Parking is
-      // local and always succeeds.
       if (action === 'park') {
         queue.enqueue({ id: uuid(), text: trimmed, attachments: wire });
       } else if (!(action === 'stop' ? sendText('/stop') : sendText(composer, wire))) {
         return;
       }
-      // Record the submitted line in the input ring (send, park, or a typed
-      // `/stop` all count; `commit` trims, dedupes, and ignores empties).
+      // Record the submitted line in the input ring (send, park, or a
+      // typed `/stop` all count; `commit` trims, dedupes, and ignores empties).
       inputHistory.commit(composer);
       // Sending is one of exactly two things that end a draft. `draftKey` is
       // this render's — the same conversation `sendText` posted to — never a
@@ -2523,7 +2556,17 @@ export function ChatPage() {
       draftApi.discard(draftKey);
       setSlashHintsFor(null);
     },
-    [composer, busy, attachments, sendText, queue, inputHistory, draftApi, draftKey],
+    [
+      composer,
+      busy,
+      attachments,
+      sendText,
+      queue,
+      inputHistory,
+      draftApi,
+      draftKey,
+      hasPendingQuestion,
+    ],
   );
 
   const handleStop = useCallback(
@@ -2961,17 +3004,41 @@ export function ChatPage() {
   }, [sessionId, queue, sendToSession]);
 
   const handleApprovalDecision = useCallback(
-    (decision: ApprovalDecision) => {
+    (askId: string, decision: ApprovalDecision) => {
       if (!sessionId || !wsRef.current) return;
-      const current = views[sessionId]?.pendingApproval;
-      if (!current) return;
-      wsRef.current.resolveApproval(current.askId, decision);
-      // Optimistic dismissal — the server's `ask_resolved` fan-out
-      // will also clear it via routeInboundFrame, harmless if it
-      // arrives second.
-      setViews((prev) => mergeView(prev, sessionId, { pendingApproval: null }));
+      wsRef.current.resolveApproval(askId, decision);
+      // Optimistic dismissal + provisional step label — the server's
+      // `ask_resolved` fan-out is a harmless no-op when it lands second.
+      setViews((prev) => removePendingAsk(prev, sessionId, askId, decision));
     },
-    [sessionId, views],
+    [sessionId],
+  );
+
+  const handleAnswerQuestion = useCallback(
+    (askId: string, reply: WireQuestionReply) => {
+      if (!sessionId || !wsRef.current?.answerQuestion(askId, reply)) return false;
+      setViews((prev) => removePendingAsk(prev, sessionId, askId));
+      return true;
+    },
+    [sessionId],
+  );
+
+  const handleQuestionTabChange = useCallback(
+    (askId: string, tab: number) => {
+      if (sessionId === undefined) return;
+      setViews((prev) => {
+        const view = prev[sessionId] ?? EMPTY_VIEW;
+        if (view.questionTabByAskId[askId] === tab) return prev;
+        return {
+          ...prev,
+          [sessionId]: {
+            ...view,
+            questionTabByAskId: { ...view.questionTabByAskId, [askId]: tab },
+          },
+        };
+      });
+    },
+    [sessionId],
   );
 
   // Hiding a conversation is confirmed through an in-app dialog (not the
@@ -3326,15 +3393,16 @@ export function ChatPage() {
     }
   }, [client]);
 
-  const pendingApprovalIds = useMemo(
-    () =>
-      new Set(
-        Object.entries(views)
-          .filter(([, v]) => v.pendingApproval)
-          .map(([id]) => id),
-      ),
-    [views],
-  );
+  const pendingAskIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [id, v] of Object.entries(views)) {
+      if (v.pendingAsks.length > 0) ids.add(id);
+    }
+    for (const s of sessions) {
+      if (s.awaiting_human === true) ids.add(s.session_id);
+    }
+    return ids;
+  }, [views, sessions]);
 
   return (
     <div className="flex flex-1 overflow-hidden bg-surface min-h-0">
@@ -3342,7 +3410,7 @@ export function ChatPage() {
       <SessionSidebar
         sessions={visibleSessions}
         activeSessionId={sessionId}
-        pendingIds={pendingApprovalIds}
+        pendingIds={pendingAskIds}
         creating={creating}
         loading={sessionsLoading}
         onNewChat={handleNewChat}
@@ -3404,12 +3472,13 @@ export function ChatPage() {
             <div className="flex justify-center py-12 text-ink-soft">
               <RiLoader4Line className="text-3xl animate-spin" />
             </div>
-          ) : currentView.transcript.length === 0 && !currentView.pendingApproval ? (
+          ) : currentView.transcript.length === 0 && currentView.pendingAsks.length === 0 ? (
             <WelcomeEmpty slashCommands={slashCommands} onPick={handleComposerChange} />
           ) : (
             <ThreadView
               rows={currentView.transcript}
               turn={currentView.turn}
+              pendingAsks={currentView.pendingAsks}
               baseUrl={baseUrl}
               adminToken={adminToken}
               compactionDividerBeforeKey={compactionDividerBeforeKey}
@@ -3455,11 +3524,24 @@ export function ChatPage() {
               />
             ))}
             {currentView.awaitingReply ? <WorkingIndicator /> : null}
-            {currentView.pendingApproval ? (
+            {oldestAsk?.kind === 'approval' ? (
               <ApprovalCard
-                approval={currentView.pendingApproval}
-                onDecide={handleApprovalDecision}
+                key={oldestAsk.askId}
+                approval={oldestAsk}
+                onDecide={(decision) => handleApprovalDecision(oldestAsk.askId, decision)}
                 connected={status.state === 'connected'}
+                queuedCount={currentView.pendingAsks.length - 1}
+              />
+            ) : oldestAsk?.kind === 'question' ? (
+              <QuestionCard
+                key={oldestAsk.askId}
+                askId={oldestAsk.askId}
+                questions={oldestAsk.questions}
+                activeTab={activeQuestionTab}
+                onTabChange={(tab) => handleQuestionTabChange(oldestAsk.askId, tab)}
+                onSubmit={(reply) => handleAnswerQuestion(oldestAsk.askId, reply)}
+                connected={status.state === 'connected'}
+                queuedCount={currentView.pendingAsks.length - 1}
               />
             ) : null}
             <div ref={transcriptEndRef} />
@@ -3508,8 +3590,8 @@ export function ChatPage() {
                 sessionId={sessionId}
                 baseUrl={baseUrl}
                 adminToken={adminToken}
-                onFire={fireQueuedItem}
-                onResume={resumeQueue}
+                onFire={hasPendingQuestion ? undefined : fireQueuedItem}
+                onResume={hasPendingQuestion ? undefined : resumeQueue}
               />
             ) : null}
 
@@ -3620,14 +3702,15 @@ export function ChatPage() {
                   )
                 }
                 placeholder={
-                  status.state === 'connected'
-                    ? 'Message Baybo…  (Shift+Enter for newline)'
-                    : 'Waiting for connection…'
+                  status.state !== 'connected'
+                    ? 'Waiting for connection…'
+                    : hasPendingQuestion
+                      ? 'Queue a message until the question is resolved…'
+                      : 'Message Baybo…  (Shift+Enter for newline)'
                 }
                 rows={1}
                 className="w-full px-4 pt-3 pb-1.5 font-sans text-sm bg-transparent resize-none focus:outline-none leading-relaxed placeholder:text-ink-soft/70"
               />
-
               <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-0.5">
                 <div className="flex items-center gap-2 min-w-0 flex-1">
                   <input
@@ -3680,7 +3763,7 @@ export function ChatPage() {
                     }
                     className="shrink-0 h-8 w-8 flex items-center justify-center bg-brand text-ink border-2 border-black rounded-full shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                     title={
-                      busy || queue.pauseReason !== null
+                      (hasPendingQuestion || busy || queue.pauseReason !== null) && !isStopCommand(composerTrimmed)
                         ? 'Queue message (Enter)'
                         : 'Send (Enter)'
                     }
@@ -3863,6 +3946,7 @@ export function routeInboundFrame(
               frame.summary,
               approvalFromWire(frame.approval),
               view.turn?.active ?? null,
+              frame.ask,
             ),
           },
         };
@@ -4201,25 +4285,49 @@ export function routeInboundFrame(
       const sid = frame.session_id;
       setViews((prev) => {
         const view = prev[sid] ?? EMPTY_VIEW;
+        const nextAsk: PendingApproval = {
+          kind: 'approval',
+          askId: frame.ask_id,
+          toolCallId: frame.tool_call_id,
+          sessionId: sid,
+          tool: frame.tool,
+          description: frame.description ?? null,
+          paramsPreview: frame.params_preview,
+          accesses: frame.accesses,
+        };
+        const exists = view.pendingAsks.some((a) => a.askId === frame.ask_id);
         return {
           ...prev,
           [sid]: {
             ...view,
-            transcript: frame.tool_call_id
-              ? markStepAwaitingApproval(view.transcript, frame.tool_call_id, frame.ask_id)
-              : view.transcript,
-            pendingApproval: {
-              askId: frame.ask_id,
-              sessionId: sid,
-              tool: frame.tool,
-              description: frame.description ?? null,
-              paramsPreview: frame.params_preview,
-              accesses: frame.accesses,
-            },
-            // Agent has stopped to ask the user something — it's no
-            // longer composing. The approval card is the activity
-            // signal now; suppress the typing dots so the two don't
-            // stack and contradict each other.
+            pendingAsks: exists
+              ? view.pendingAsks.map((a) => (a.askId === frame.ask_id ? nextAsk : a))
+              : [...view.pendingAsks, nextAsk],
+            awaitingReply: false,
+          },
+        };
+      });
+      return;
+    }
+    case 'question_asked': {
+      const sid = frame.session_id;
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        const nextAsk: PendingQuestion = {
+          kind: 'question',
+          askId: frame.ask_id,
+          toolCallId: frame.tool_call_id,
+          sessionId: sid,
+          questions: frame.questions,
+        };
+        const exists = view.pendingAsks.some((a) => a.askId === frame.ask_id);
+        return {
+          ...prev,
+          [sid]: {
+            ...view,
+            pendingAsks: exists
+              ? view.pendingAsks.map((a) => (a.askId === frame.ask_id ? nextAsk : a))
+              : [...view.pendingAsks, nextAsk],
             awaitingReply: false,
           },
         };
@@ -4230,24 +4338,11 @@ export function routeInboundFrame(
       // Every close, decided or not: `/stop`, a closed card or an expired
       // during-execute approval retire the card as surely as an answer.
       setViews((prev) => {
-        // Walk every session bucket since we don't know which one
-        // the ask_id belongs to. Map is small (~tabs visited), so
-        // this is cheap. Return `prev` unchanged when no card matches
-        // — the ask_id may belong to an already-resolved session, and
-        // a fresh object would force every SessionRow to re-render.
-        let next: Record<string, SessionView> | null = null;
-        for (const [sid, view] of Object.entries(prev)) {
-          const transcript = resolveStepApproval(view.transcript, frame.ask_id, frame.decision);
-          const card = view.pendingApproval?.askId === frame.ask_id;
-          if (!card && transcript === view.transcript) continue;
-          next ??= { ...prev };
-          next[sid] = {
-            ...view,
-            transcript,
-            pendingApproval: card ? null : view.pendingApproval,
-          };
+        let next = prev;
+        for (const sid of Object.keys(prev)) {
+          next = removePendingAsk(next, sid, frame.ask_id, frame.decision);
         }
-        return next ?? prev;
+        return next;
       });
       return;
     }
@@ -4506,6 +4601,40 @@ export function pushToolStartedStep(
   return next;
 }
 
+function removePendingAsk(
+  prev: Record<string, SessionView>,
+  sessionId: string,
+  askId: string,
+  approvalDecision?: string,
+): Record<string, SessionView> {
+  if (!(sessionId in prev)) return prev;
+  const view = prev[sessionId];
+  const target = view.pendingAsks.find((a) => a.askId === askId);
+  if (!target) return prev;
+  const pendingAsks = view.pendingAsks.filter((a) => a.askId !== askId);
+  let questionTabByAskId = view.questionTabByAskId;
+  if (askId in questionTabByAskId) {
+    const { [askId]: _removed, ...rest } = questionTabByAskId;
+    void _removed;
+    questionTabByAskId = rest;
+  }
+  const transcript =
+    approvalDecision !== undefined &&
+    target.kind === 'approval' &&
+    target.toolCallId !== undefined
+      ? resolveStepApproval(view.transcript, target.toolCallId, approvalDecision)
+      : view.transcript;
+  return {
+    ...prev,
+    [sessionId]: {
+      ...view,
+      transcript,
+      pendingAsks,
+      questionTabByAskId,
+    },
+  };
+}
+
 /** Resolve a tool step by `callId` with its final status + summary. If
  *  the start was never seen (dropped), synthesize a completed step so the
  *  result still shows. */
@@ -4516,6 +4645,7 @@ export function applyToolCompletedStep(
   summary: string,
   approval: WorkStep['approval'],
   turnActive: boolean | null,
+  ask?: AskStepSummary,
 ): TranscriptRow[] {
   const toolStatus: WorkStep['toolStatus'] =
     status === 'error' ? 'error' : status === 'denied' ? 'denied' : 'ok';
@@ -4530,10 +4660,8 @@ export function applyToolCompletedStep(
       ...nextSteps[sIdx],
       toolStatus,
       toolSummary: summary,
-      // The call is done, so nothing waits on the user any more — a backstop
-      // for an `ask_resolved` this client missed.
-      awaitingApproval: undefined,
       approval: approval ?? nextSteps[sIdx].approval,
+      ask: ask ?? nextSteps[sIdx].ask,
     };
     const next = prev.slice();
     next[i] = { ...row, steps: nextSteps };
@@ -4549,6 +4677,7 @@ export function applyToolCompletedStep(
       toolStatus,
       toolSummary: summary,
       approval,
+      ask,
     },
     turnActive,
   );
@@ -4562,34 +4691,18 @@ function approvalFromWire(decision: string | undefined): WorkStep['approval'] {
     : undefined;
 }
 
-/** Badge the work step of the TOOL call a prompt just blocked. Never opens a
- *  block: an approval frame is not work, and a prompt always follows its
- *  call's `tool_started`. */
-export function markStepAwaitingApproval(
-  prev: TranscriptRow[],
-  toolCallId: string,
-  askId: string,
-): TranscriptRow[] {
-  return rewriteToolStep(prev, (s) => (s.toolCallId === toolCallId ? { ...s, awaitingApproval: askId } : s));
-}
-
-/** A prompt closed (here or on another client): clear the badge, and label
- *  the step when a human decided. Matched by PROMPT id — that is all
- *  `ask_resolved` carries. The label is provisional until the call's own
- *  completion brings the persisted twin. */
+/** Label a tool step with the provisional approval decision a human just gave.
+ *  Matched by `toolCallId` (the waiting badge itself is derived at render time
+ *  from `pendingAsks`). */
 export function resolveStepApproval(
   prev: TranscriptRow[],
-  askId: string,
+  toolCallId: string,
   decision: string | undefined,
 ): TranscriptRow[] {
+  const parsed = approvalFromWire(decision);
+  if (parsed === undefined) return prev;
   return rewriteToolStep(prev, (s) =>
-    s.awaitingApproval === askId
-      ? {
-          ...s,
-          awaitingApproval: undefined,
-          approval: decision === undefined ? s.approval : approvalFromWire(decision),
-        }
-      : s,
+    s.toolCallId === toolCallId ? { ...s, approval: parsed } : s,
   );
 }
 
@@ -5021,6 +5134,24 @@ function attachmentFromApi(a: ApiAttachment): WireAttachment {
  *  same React node identity. A `work` item maps to a finished
  *  (collapsed) work block; a message row carries its `platform_msg_id`
  *  as `clientMsgId` so it reconciles with the optimistic send row. */
+function askSummaryFromApi(
+  api: ApiChatAskStepSummary | null | undefined,
+): AskStepSummary | undefined {
+  if (!api) return undefined;
+  return {
+    declined: api.declined,
+    questions: api.questions?.map((q) => ({
+      header: q.header,
+      question: q.question,
+      options: q.options,
+      multi_select: q.multi_select ?? false,
+      selected: q.selected,
+      other: q.other ?? undefined,
+      skipped: q.skipped ?? false,
+    })),
+  };
+}
+
 export function transcriptItemToRow(sessionId: string, item: ApiTranscriptItem): TranscriptRow {
   const key = transcriptRowKey(sessionId, item.id);
   if (item.kind === 'work') {
@@ -5051,6 +5182,7 @@ export function transcriptItemToRow(sessionId: string, item: ApiTranscriptItem):
         // Persisted on the tool result (`ToolResultMeta::approval`), so a
         // reloaded thread still shows what the user judged.
         approval: approvalFromWire(s.approval ?? undefined),
+        ask: askSummaryFromApi(s.ask),
         // The source row's `created_at`. Times each stretch of work between
         // the model's remarks; absent on rows a pre-`at` gateway reconstructed.
         at: parseEpochMs(s.at) ?? undefined,
@@ -5682,12 +5814,24 @@ export function applySyncReplace(
 
 function approvalFromCard(sessionId: string, card: WireApprovalCard): PendingApproval {
   return {
+    kind: 'approval',
     askId: card.ask_id,
+    toolCallId: card.tool_call_id,
     sessionId,
     tool: card.tool,
     description: card.description ?? null,
     paramsPreview: card.params_preview,
     accesses: card.accesses,
+  };
+}
+
+function questionFromCard(sessionId: string, card: WireQuestionCard): PendingQuestion {
+  return {
+    kind: 'question',
+    askId: card.ask_id,
+    toolCallId: card.tool_call_id,
+    sessionId,
+    questions: card.questions,
   };
 }
 
@@ -5711,6 +5855,7 @@ function workStepFromWire(step: WireWorkStep, i: number): WorkStep {
               : 'running',
       toolSummary: step.summary,
       approval: approvalFromWire(step.approval),
+      ask: step.ask,
       at: parseEpochMs(step.at) ?? undefined,
     };
   }
@@ -5800,29 +5945,27 @@ export function applySubscribeState(
   frame: Extract<Frame, { kind: 'subscribe_state' }>,
   turnEnded: boolean,
 ): SessionView {
-  const cards = frame.pending_approvals ?? [];
+  const pendingAsks: PendingAsk[] = (frame.pending_approvals ?? []).map((card) =>
+    approvalFromCard(frame.session_id, card),
+  );
+  for (const card of frame.pending_questions ?? []) {
+    pendingAsks.splice(card.queue_index, 0, questionFromCard(frame.session_id, card));
+  }
+  const liveIds = new Set(pendingAsks.map((a) => a.askId));
+  const questionTabByAskId: Record<string, number> = {};
+  for (const [id, tab] of Object.entries(view.questionTabByAskId)) {
+    if (liveIds.has(id)) questionTabByAskId[id] = tab;
+  }
   let next: SessionView = {
     ...view,
-    // The view renders one card at a time; the queue's head is the call
-    // the turn is blocked on.
-    pendingApproval: cards.length > 0 ? approvalFromCard(frame.session_id, cards[0]) : null,
+    pendingAsks,
+    questionTabByAskId,
+    awaitingReply: pendingAsks.length > 0 ? false : view.awaitingReply,
   };
   if (turnEnded) return next;
   const startedAt = parseEpochMs(frame.turn.started_at);
   if (frame.turn.active && startedAt !== null) {
-    // The bundle REPLACES the block's steps, so the awaiting badges have to be
-    // re-derived from the authoritative pending set: the `approval_requested`
-    // frame that first set them may predate this connection.
-    const awaitingByCall = new Map(
-      cards.filter((c) => c.tool_call_id).map((c) => [c.tool_call_id as string, c.ask_id]),
-    );
-    const bundle = (frame.work_steps ?? []).map(workStepFromWire).map((step) =>
-      step.kind === 'tool' &&
-      step.toolCallId !== undefined &&
-      awaitingByCall.has(step.toolCallId)
-        ? { ...step, awaitingApproval: awaitingByCall.get(step.toolCallId) }
-        : step,
-    );
+    const bundle = (frame.work_steps ?? []).map(workStepFromWire);
     // The bundle's TRAILING prose step is the answer streaming RIGHT NOW, which
     // this client renders as the live reply below the block — not as a work
     // step. iOS has always routed it there (`applySubscribeState`); web dropped
@@ -5948,6 +6091,7 @@ export function applySessionPatch(
         pinned: patch.pinned ?? false,
         folder_id: patchedFolder,
         title: patch.title,
+        awaiting_human: patch.awaiting_human ?? false,
       },
       ...prev,
     ];
@@ -5972,6 +6116,7 @@ export function applySessionPatch(
     cron_job_id: current.cron_job_id,
     cron_job_title: current.cron_job_title,
     cron_group_pinned: current.cron_group_pinned,
+    awaiting_human: patch.awaiting_human ?? current.awaiting_human,
   };
   if (
     merged.created_at === current.created_at &&
@@ -5979,7 +6124,8 @@ export function applySessionPatch(
     merged.archived === current.archived &&
     merged.pinned === current.pinned &&
     merged.folder_id === current.folder_id &&
-    merged.title === current.title
+    merged.title === current.title &&
+    merged.awaiting_human === current.awaiting_human
   ) {
     return prev;
   }
@@ -6392,12 +6538,15 @@ const NO_COMPACTION_DIVIDERS: ReadonlyMap<string, string> = new Map();
 /// be the second place that decides what a transcript looks like — which is
 /// the shape the iOS mirror is already in.
 ///
+const NO_PENDING_ASKS: readonly PendingAsk[] = [];
+
 /// Everything live is the caller's: `head` takes the scroll-up affordance,
 /// `children` the composer-side chrome (deferred bubbles, the working
-/// indicator, an approval card). A read-only reader passes neither.
+/// indicator, an approval or question card). A read-only reader passes neither.
 export function ThreadView({
   rows,
   turn,
+  pendingAsks = NO_PENDING_ASKS,
   baseUrl,
   adminToken,
   compactionDividerBeforeKey = NO_COMPACTION_DIVIDERS,
@@ -6411,6 +6560,9 @@ export function ThreadView({
   /// Server-authoritative turn state, read only to tell a cancelled turn from
   /// a finished one. `null` where nothing has said yet.
   turn: SessionView['turn'];
+  /// Active pending asks for this session — used to derive tool-step waiting
+  /// badges at render time and suppress `CancelledTurnIndicator` after restart.
+  pendingAsks?: readonly PendingAsk[];
   baseUrl: string;
   adminToken: string | null;
   /// Row key → the instant a pre-compaction divider is drawn above it.
@@ -6476,6 +6628,7 @@ export function ThreadView({
           >
             <MessageBubble
               row={row}
+              pendingAsks={pendingAsks}
               adminToken={adminToken}
               baseUrl={baseUrl}
               onRetry={
@@ -6488,7 +6641,7 @@ export function ThreadView({
             />
           </div>,
         );
-        if (isCancelledWorkAt(arr, i, turn)) {
+        if (isCancelledWorkAt(arr, i, turn, pendingAsks)) {
           nodes.push(
             <CancelledTurnIndicator key={`${row.key}-cancelled`} />,
           );
@@ -6502,11 +6655,13 @@ export function ThreadView({
 
 function MessageBubble({
   row,
+  pendingAsks = NO_PENDING_ASKS,
   adminToken,
   baseUrl,
   onRetry,
 }: {
   row: TranscriptRow;
+  pendingAsks?: readonly PendingAsk[];
   adminToken: string | null;
   baseUrl: string;
   /** Set on a `failed` send row: fires the manual outbox retry (same
@@ -6514,7 +6669,7 @@ function MessageBubble({
   onRetry?: () => void;
 }) {
   if (row.kind === 'work') {
-    return <WorkBlock row={row} />;
+    return <WorkBlock row={row} pendingAsks={pendingAsks} />;
   }
   if (row.notice) {
     // The icon + colored left rail + soft tint carry the severity, so the body
@@ -6731,11 +6886,103 @@ function ReasoningStepView({ text }: { text: string }) {
   );
 }
 
+function AskStepSummaryView({ summary }: { summary: AskStepSummary }) {
+  const qs = summary.questions ?? [];
+  const lead = qs.length === 1 ? 'Asked 1 question' : `Asked ${qs.length} questions`;
+  return (
+    <details className="pl-1 text-ink-soft">
+      <summary className="cursor-pointer select-none hover:text-ink break-words [overflow-wrap:anywhere]">
+        <span className="select-none mr-1.5">⎿</span>
+        <span>{lead}</span>
+        {summary.declined ? (
+          <>
+            <span> · </span>
+            <em className="italic">declined</em>
+          </>
+        ) : (
+          qs.map((q, idx) => {
+            const parts = [
+              ...(q.selected ?? []),
+              ...(q.other !== undefined && q.other !== '' ? [q.other] : []),
+            ];
+            return (
+              <span key={`${q.header}-${idx}`}>
+                <span> · {q.header}: </span>
+                {q.skipped || parts.length === 0 ? (
+                  <em className="italic">skipped</em>
+                ) : (
+                  <span className="text-ink">{parts.join(', ')}</span>
+                )}
+              </span>
+            );
+          })
+        )}
+      </summary>
+      {qs.length > 0 ? (
+        <div className="mt-1.5 ml-4 flex flex-col gap-2 border-l-2 border-black/20 pl-2.5">
+          {qs.map((q, idx) => {
+            const chosen = new Set(q.selected ?? []);
+            return (
+              <div key={`${q.header}-${idx}`} className="flex flex-col gap-1">
+                <div className="flex items-baseline gap-1.5 flex-wrap">
+                  <span className="px-1 py-0.25 border border-black/40 rounded bg-canvas text-[10px] font-bold text-ink">
+                    {q.header}
+                  </span>
+                  <span className="text-ink break-words [overflow-wrap:anywhere]">{q.question}</span>
+                </div>
+                {(q.options ?? []).length > 0 ? (
+                  <ul className="flex flex-col gap-0.5 pl-1">
+                    {(q.options ?? []).map((opt, oIdx) => {
+                      const picked = chosen.has(opt.label);
+                      return (
+                        <li
+                          key={`${opt.label}-${oIdx}`}
+                          className={`flex items-baseline gap-1.5 rounded px-1 ${
+                            picked ? 'bg-brand/25 text-ink font-bold' : 'text-ink-soft'
+                          }`}
+                        >
+                          <span className="select-none shrink-0">{picked ? '✓' : '○'}</span>
+                          <span className="break-words [overflow-wrap:anywhere]">{opt.label}</span>
+                          {opt.description ? (
+                            <span className="text-[11px] font-normal text-ink-soft break-words [overflow-wrap:anywhere]">
+                              — {opt.description}
+                            </span>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
+                {q.other !== undefined && q.other !== '' ? (
+                  <div className="pl-1 whitespace-pre-wrap text-ink">
+                    <span className="font-bold">Other:</span> {q.other}
+                  </div>
+                ) : null}
+                {summary.declined ? (
+                  <div className="pl-1 italic text-ink-soft">declined</div>
+                ) : q.skipped ? (
+                  <div className="pl-1 italic text-ink-soft">skipped</div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
 // One rendered MACHINERY step inside a work block — the reasoning / tool /
 // status / notice visuals. Reused by the live panel and the expanded collapsed
 // view. `prose` never reaches here: `segmentWorkSteps` routes the model's own
 // words to `WorkSpeechRun`, outside the collapse.
-export function WorkStepView({ step }: { step: WorkStep }) {
+export function WorkStepView({
+  step,
+  pendingAsks = NO_PENDING_ASKS,
+}: {
+  step: WorkStep;
+  pendingAsks?: readonly PendingAsk[];
+}) {
   if (step.kind === 'reasoning') {
     return <ReasoningStepView text={step.text ?? ''} />;
   }
@@ -6771,15 +7018,22 @@ export function WorkStepView({ step }: { step: WorkStep }) {
       : step.toolStatus === 'denied'
         ? 'text-warn'
         : 'text-ink-soft';
-  const approvalLabel = step.awaitingApproval
-    ? 'waiting for approval'
-    : step.approval === 'approve'
-      ? 'approved'
-      : step.approval === 'approve_always'
-        ? 'always approved'
-        : step.approval === 'deny'
-          ? 'denied'
-          : null;
+  const pendingAsk =
+    step.toolCallId !== undefined
+      ? pendingAsks.find((a) => a.toolCallId === step.toolCallId)
+      : undefined;
+  const badgeLabel =
+    pendingAsk?.kind === 'approval'
+      ? 'waiting for approval'
+      : pendingAsk?.kind === 'question'
+        ? 'waiting for your answer'
+        : step.approval === 'approve'
+          ? 'approved'
+          : step.approval === 'approve_always'
+            ? 'always approved'
+            : step.approval === 'deny'
+              ? 'denied'
+              : null;
   return (
     <div className="flex flex-col gap-0.5 font-mono text-xs">
       <div className="flex items-center gap-1.5 flex-wrap">
@@ -6788,22 +7042,24 @@ export function WorkStepView({ step }: { step: WorkStep }) {
         {step.toolLabel ? (
           <span className="text-ink-soft break-words [overflow-wrap:anywhere]">({step.toolLabel})</span>
         ) : null}
-        {/* A call parked on the approval card is NOT running — no spinner, or it
-            would read as work in progress while nothing executes. */}
-        {step.toolStatus === 'running' && !step.awaitingApproval ? (
+        {/* A call parked on a pending ask is NOT running — no spinner, or it
+            would read as work in progress while waiting on the human. */}
+        {step.toolStatus === 'running' && pendingAsk === undefined ? (
           <RiLoader4Line className="text-ink-soft animate-spin" title="Running…" />
         ) : null}
-        {approvalLabel ? (
+        {badgeLabel ? (
           <span
             className={`rounded border px-1 ${
-              step.awaitingApproval ? 'border-ink text-ink' : 'border-line text-ink-soft'
+              pendingAsk !== undefined ? 'border-ink text-ink' : 'border-line text-ink-soft'
             }`}
           >
-            {approvalLabel}
+            {badgeLabel}
           </span>
         ) : null}
       </div>
-      {step.toolSummary ? (
+      {step.ask ? (
+        <AskStepSummaryView summary={step.ask} />
+      ) : step.toolSummary ? (
         <div className={`flex items-start gap-1.5 pl-1 ${statusColor}`}>
           <span className="select-none shrink-0">⎿</span>
           <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{step.toolSummary}</span>
@@ -6971,12 +7227,14 @@ function WorkMachineryRun({
   live,
   settling,
   cancelled,
+  pendingAsks = NO_PENDING_ASKS,
 }: {
   seg: WorkSegment;
   /** This run is the one the turn is currently producing into. */
   live: boolean;
   settling: boolean;
   cancelled: boolean;
+  pendingAsks?: readonly PendingAsk[];
 }) {
   const [expanded, setExpanded] = useState(false);
   const { boxed, panelOpen, toggleable } = workBlockDisplay(
@@ -7065,7 +7323,7 @@ function WorkMachineryRun({
         >
           <div className="flex flex-col gap-1.5 px-3 py-2">
             {seg.steps.map((s) => (
-              <WorkStepView key={s.key} step={s} />
+              <WorkStepView key={s.key} step={s} pendingAsks={pendingAsks} />
             ))}
           </div>
         </div>
@@ -7098,7 +7356,13 @@ export function WorkSpeechRun({ steps }: { steps: WorkStep[] }) {
  *
  *  A block that produced no steps (a direct answer) is dropped on close (see
  *  `closeActiveWork`), so every run on screen has work to show. */
-export function WorkBlock({ row }: { row: TranscriptRow }) {
+export function WorkBlock({
+  row,
+  pendingAsks = NO_PENDING_ASKS,
+}: {
+  row: TranscriptRow;
+  pendingAsks?: readonly PendingAsk[];
+}) {
   const active = !!row.workActive;
   const steps = row.steps ?? [];
   const settling = !!row.workSettling;
@@ -7130,6 +7394,7 @@ export function WorkBlock({ row }: { row: TranscriptRow }) {
             settling={settling && i === lastMachineryIndex}
             // The stop landed on whatever run was running.
             cancelled={cancelled && i === lastMachineryIndex}
+            pendingAsks={pendingAsks}
           />
         ),
       )}
@@ -7166,15 +7431,29 @@ function LiveElapsed({ startedAt }: { startedAt: number }) {
 // Only the very last transcript row is considered: a mid-transcript work
 // block followed by a user message is an answered-elsewhere ambiguity we
 // don't flag.
-function isCancelledWorkAt(
+export function isCancelledWorkAt(
   transcript: TranscriptRow[],
   i: number,
   turn: SessionView['turn'],
+  pendingAsks: readonly PendingAsk[] = NO_PENDING_ASKS,
 ): boolean {
   if (i !== transcript.length - 1) return false;
   if (turn === null || turn.active) return false;
   const row = transcript[i];
   if (row.kind !== 'work' || row.workActive === true) return false;
+  // After a restart the trailing block is closed (`workActive: false`) while a
+  // dead ask waits on the user — suppress "Cancelled" so it doesn't sit above
+  // the card asking for input.
+  if (
+    pendingAsks.length > 0 &&
+    (row.steps ?? []).some(
+      (s) =>
+        s.toolCallId !== undefined &&
+        pendingAsks.some((a) => a.toolCallId === s.toolCallId),
+    )
+  ) {
+    return false;
+  }
   // A block whose LAST step is a folded notice ended WITH terminal output —
   // the notice was the turn's reply, folded in rather than committed as its
   // own row — so it isn't a silent cancellation.
@@ -7329,10 +7608,12 @@ function ApprovalCard({
   approval,
   onDecide,
   connected,
+  queuedCount = 0,
 }: {
   approval: PendingApproval;
   onDecide: (decision: ApprovalDecision) => void;
   connected: boolean;
+  queuedCount?: number;
 }) {
   // Local `submitting` guard. The optimistic-dismiss in the parent
   // unmounts this card on the first click, so submitting state never
@@ -7357,7 +7638,11 @@ function ApprovalCard({
         <span className="font-bold uppercase tracking-wider text-sm break-words [overflow-wrap:anywhere]">
           Approval needed: {approval.tool}
         </span>
-        <span className="text-ink-soft font-mono text-xs shrink-0">{approval.askId.slice(0, 8)}</span>
+        {queuedCount > 0 ? (
+          <span className="shrink-0 px-1.5 py-0.5 rounded border border-black bg-canvas font-mono text-[11px] font-bold">
+            +{queuedCount} waiting
+          </span>
+        ) : null}
       </div>
       {approval.description ? (
         <div className="text-sm font-mono text-ink-soft break-words [overflow-wrap:anywhere]">

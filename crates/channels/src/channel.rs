@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
-use baybo_human_ask::{AskQueue, PendingWatcher};
-use baybo_model::human_ask::{AskId, AskResolution};
+use baybo_human_ask::{AskQueue, PendingAsk, PendingWatcher};
+use baybo_model::human_ask::{AskId, AskResolution, Question};
 use baybo_model::{ChannelType, ResourceAccess, SessionId};
-use baybo_tools::{ApprovalGate, ApprovalRequest};
+use baybo_tools::{ApprovalGate, ApprovalRequest, QuestionGate};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -35,12 +35,14 @@ use crate::wire::{ActivityKind, FolderView, Frame, SessionPatch};
 /// invokes the observer after re-narrowing to a `SubscribedView`.
 pub type DispatchObserver = Arc<dyn for<'a> Fn(&SessionEvent, SubscribedView<'a>) + Send + Sync>;
 
-/// Bundle of the channel's ask gate (the `ApprovalGate` trait object the
-/// agent / tool path calls through) and the channel's [`AskQueue`] (the read
-/// model of its pending asks). The gate holds the same queue internally;
-/// this struct keeps it addressable from the channel.
+/// Bundle of the channel's ask gates (the trait objects the agent / tool path
+/// calls through) and the channel's [`AskQueue`] (the read model of its
+/// pending asks). The gates hold the same queue internally; this struct keeps
+/// it addressable from the channel.
 pub struct AskSurface {
     pub approval_gate: Arc<dyn ApprovalGate>,
+    /// `None` for a channel that cannot show questions.
+    pub question_gate: Option<Arc<dyn QuestionGate>>,
     pub queue: AskQueue,
 }
 
@@ -191,25 +193,30 @@ impl Channel {
             .map(|a| Arc::clone(&a.approval_gate))
     }
 
-    /// Snapshot the full pending [`ApprovalRequest`] entries scoped to
-    /// `session_id`, from one atomic queue read. The gateway's subscribe
-    /// path projects these into the `SubscribeState` bundle's
-    /// authoritative `pending_approvals` replacement set — a
-    /// reconnecting client both recovers cards it never received and
-    /// drops locally-cached cards that were resolved while it was down.
-    ///
-    /// Returns empty when this channel has no approval surface or no
-    /// entries match the session.
+    /// The gate `AskUser` raises its questions through on this channel, if it
+    /// can show them.
+    pub fn question_gate(&self) -> Option<Arc<dyn QuestionGate>> {
+        self.approvals
+            .as_ref()
+            .and_then(|a| a.question_gate.clone())
+    }
+
+    /// Pending approval requests for this session in queue order.
     pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest> {
-        let Some(approvals) = self.approvals.as_ref() else {
-            return Vec::new();
-        };
-        approvals
-            .queue
-            .list_approvals()
+        self.pending_asks(session_id)
             .into_iter()
-            .filter(|req| req.session_id == *session_id)
+            .filter_map(|ask| match ask.request {
+                baybo_model::human_ask::AskRequest::Approval(request) => Some(request),
+                baybo_model::human_ask::AskRequest::Question(_) => None,
+            })
             .collect()
+    }
+
+    /// Snapshot this session's pending asks in queue order.
+    pub fn pending_asks(&self, session_id: &SessionId) -> Vec<PendingAsk> {
+        self.ask_queue()
+            .map(|queue| queue.list_for_session(session_id))
+            .unwrap_or_default()
     }
 
     /// Every session with at least one prompt parked on this channel's
@@ -314,6 +321,24 @@ impl Channel {
             accesses,
             params_preview,
             description,
+        });
+    }
+
+    /// Publish a `QuestionAsked` event to subscribers of the call's session.
+    pub fn dispatch_question_asked(
+        &self,
+        ask_id: AskId,
+        tool_call_id: String,
+        session_id: SessionId,
+        user_id: String,
+        questions: Vec<Question>,
+    ) {
+        self.dispatch_event(SessionEvent::QuestionAsked {
+            ask_id,
+            tool_call_id,
+            session_id,
+            user_id,
+            questions,
         });
     }
 

@@ -8102,6 +8102,80 @@
         "type": "string",
         "description": "Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
       },
+      "ChatAskOption": {
+        "type": "object",
+        "description": "One option presented inside a reconstructed `AskUser` step.",
+        "required": [
+          "label",
+          "description"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
+      "ChatAskQuestion": {
+        "type": "object",
+        "description": "One question and its recorded answer inside [`ChatAskStepSummary`].",
+        "required": [
+          "header",
+          "question"
+        ],
+        "properties": {
+          "header": {
+            "type": "string"
+          },
+          "multi_select": {
+            "type": "boolean"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatAskOption"
+            }
+          },
+          "other": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "question": {
+            "type": "string"
+          },
+          "selected": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "skipped": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ChatAskStepSummary": {
+        "type": "object",
+        "description": "Typed summary of a finished `AskUser` call, mirroring\n[`baybo_model::human_ask::AskStepSummary`] on the REST transcript surface.",
+        "required": [
+          "declined"
+        ],
+        "properties": {
+          "declined": {
+            "type": "boolean"
+          },
+          "questions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatAskQuestion"
+            }
+          }
+        }
+      },
       "ChatAttachment": {
         "type": "object",
         "description": "A blob attachment embedded in a historical chat transcript item.",
@@ -8717,6 +8791,17 @@
               "null"
             ],
             "description": "Decision the call's approval prompt returned (`\"approve\"` /\n`\"approve_always\"` / `\"deny\"`), read from the persisted\n`ToolResultMeta`; `None` when the call never prompted (or the row\npredates the field)."
+          },
+          "ask": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatAskStepSummary",
+                "description": "Structured summary for a finished `AskUser` call, matching the live\n`Frame::ToolCompleted.ask` payload so reloads render the same step view."
+              }
+            ]
           },
           "at": {
             "type": [
