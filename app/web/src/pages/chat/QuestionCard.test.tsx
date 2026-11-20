@@ -105,16 +105,37 @@ describe('QuestionCard', () => {
     expect((screen.getByLabelText(/Session/) as HTMLInputElement).checked).toBe(true);
   });
 
-  it('cancels the ask once without submitting draft answers', () => {
+  it('requires a second click on the same button to cancel the ask', async () => {
+    const user = userEvent.setup();
     const onSubmit = vi.fn(() => true);
     render(<StatefulCard onSubmit={onSubmit} />);
 
-    fireEvent.click(screen.getByLabelText(/JWT/));
+    await user.click(screen.getByLabelText(/JWT/));
     const button = screen.getByRole('button', { name: /cancel ask/i });
-    fireEvent.click(button);
-    fireEvent.click(button);
+    await user.click(button);
+    expect(button).toHaveAccessibleName('Confirm cancel?');
+    expect(onSubmit).not.toHaveBeenCalled();
+    await user.click(button);
+    expect(button).toBeDisabled();
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith({ kind: 'cancelled' });
+  });
+
+  it('dismisses cancel confirmation on Escape or when returning to the answer', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn(() => true);
+    render(<StatefulCard onSubmit={onSubmit} />);
+    const button = screen.getByRole('button', { name: 'Cancel ask' });
+    await user.click(button);
+    await user.keyboard('{Escape}');
+    expect(button).toHaveAccessibleName('Cancel ask');
+    await user.keyboard('{Enter}');
+    expect(button).toHaveAccessibleName('Confirm cancel?');
+    await user.click(screen.getByRole('textbox'));
+    expect(button).toHaveAccessibleName('Cancel ask');
+    await user.click(button);
+    expect(button).toHaveAccessibleName('Confirm cancel?');
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 
   it('uses arrows and numbers outside text fields and submits only on explicit activation', () => {
