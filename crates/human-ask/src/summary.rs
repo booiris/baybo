@@ -4,7 +4,9 @@
 //! REST transcript reconstruction (`baybo-gateway::api::admin::chat`), so a
 //! live turn and a reloaded transcript render identical step summaries.
 
-use baybo_model::human_ask::{AskStepQuestion, AskStepSummary};
+use baybo_model::human_ask::{
+    ASK_USER_TOOL_NAME, AskStepQuestion, AskStepSummary, QuestionRequest,
+};
 use serde_json::Value;
 
 /// First question's trimmed `header` from an `AskUser` call's input, used as
@@ -21,13 +23,28 @@ pub fn first_question_header(input: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Derive a typed [`AskStepSummary`] from an `AskUser` call's `input` and
-/// parsed JSON `result`. Returns `None` when the input does not parse as a
-/// non-empty [`QuestionRequest`](baybo_model::human_ask::QuestionRequest) or
-/// the result is not an `answers`, `declined` or `cancelled` envelope.
-pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary> {
-    let req = crate::tools::validate_question_request(input.clone()).ok()?;
+/// The validated questions kept until a tool result arrives.
+pub struct AskStepInput(QuestionRequest);
 
+impl AskStepInput {
+    pub fn from_tool(name: &str, input: &Value) -> Option<Self> {
+        if name != ASK_USER_TOOL_NAME {
+            return None;
+        }
+        crate::tools::validate_question_request(input.clone())
+            .ok()
+            .map(Self)
+    }
+
+    /// Build the structured step and its one-line display text from the same result.
+    pub fn summarize(self, result: &Value) -> Option<(AskStepSummary, String)> {
+        let summary = ask_step_summary(self.0, result)?;
+        let text = format_ask_summary(&summary);
+        Some((summary, text))
+    }
+}
+
+fn ask_step_summary(req: QuestionRequest, result: &Value) -> Option<AskStepSummary> {
     let declined = result.get("declined").and_then(Value::as_bool) == Some(true);
     let cancelled = result.get("cancelled").and_then(Value::as_bool) == Some(true);
     if declined || cancelled {
@@ -106,7 +123,7 @@ pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>
 
 /// One-line human summary for plain-text surfaces and fallback step text:
 /// e.g. `"Asked 2 questions · Auth: JWT · DB: Postgres, Redis"`.
-pub fn format_ask_summary(summary: &AskStepSummary) -> String {
+fn format_ask_summary(summary: &AskStepSummary) -> String {
     let n = summary.questions.len();
     let lead = if n == 1 {
         "Asked 1 question".to_owned()
@@ -171,6 +188,12 @@ mod tests {
         })
     }
 
+    fn sample_step(result: &Value) -> (AskStepSummary, String) {
+        AskStepInput::from_tool(ASK_USER_TOOL_NAME, &sample_input())
+            .and_then(|input| input.summarize(result))
+            .expect("sample ask step")
+    }
+
     #[test]
     fn first_header_pulls_first_question_header() {
         assert_eq!(
@@ -195,16 +218,13 @@ mod tests {
                 other: None,
             },
         ]);
-        let summary = ask_step_summary(&sample_input(), &res).expect("summary");
+        let (summary, text) = sample_step(&res);
         assert!(!summary.declined);
         assert_eq!(summary.questions.len(), 2);
         assert_eq!(summary.questions[0].selected, vec!["JWT"]);
         assert!(!summary.questions[0].skipped);
         assert_eq!(summary.questions[1].selected, vec!["Postgres", "Redis"]);
-        assert_eq!(
-            format_ask_summary(&summary),
-            "Asked 2 questions · Auth: JWT · DB: Postgres, Redis"
-        );
+        assert_eq!(text, "Asked 2 questions · Auth: JWT · DB: Postgres, Redis");
 
         let partial = result::answered(&[
             QuestionAnswer {
@@ -218,38 +238,32 @@ mod tests {
                 other: None,
             },
         ]);
-        let partial_summary = ask_step_summary(&sample_input(), &partial).expect("summary");
+        let (partial_summary, text) = sample_step(&partial);
         assert_eq!(
             partial_summary.questions[0].other.as_deref(),
             Some("OAuth2")
         );
         assert!(!partial_summary.questions[0].skipped);
         assert!(partial_summary.questions[1].skipped);
-        assert_eq!(
-            format_ask_summary(&partial_summary),
-            "Asked 2 questions · Auth: OAuth2 · DB: skipped"
-        );
+        assert_eq!(text, "Asked 2 questions · Auth: OAuth2 · DB: skipped");
     }
 
     #[test]
     fn summarizes_declined_and_abandoned_preserving_questions() {
         for res in [result::declined(), result::abandoned()] {
-            let summary = ask_step_summary(&sample_input(), &res).expect("summary");
+            let (summary, text) = sample_step(&res);
             assert!(summary.declined);
             assert_eq!(summary.questions.len(), 2);
-            assert_eq!(format_ask_summary(&summary), "Asked 2 questions · declined");
+            assert_eq!(text, "Asked 2 questions · declined");
         }
     }
 
     #[test]
     fn cancellation_preserves_the_questions_without_claiming_an_answer() {
-        let summary = ask_step_summary(&sample_input(), &result::cancelled()).expect("summary");
+        let (summary, text) = sample_step(&result::cancelled());
         assert!(summary.cancelled);
         assert!(!summary.declined);
-        assert_eq!(
-            format_ask_summary(&summary),
-            "Asked 2 questions · cancelled"
-        );
+        assert_eq!(text, "Asked 2 questions · cancelled");
         assert!(
             summary
                 .questions
@@ -260,10 +274,9 @@ mod tests {
 
     #[test]
     fn ignores_non_ask_results_and_bad_inputs() {
-        assert_eq!(ask_step_summary(&sample_input(), &json!("error")), None);
-        assert_eq!(
-            ask_step_summary(&json!({ "questions": [] }), &result::declined()),
-            None
-        );
+        assert!(AskStepInput::from_tool("Read", &sample_input()).is_none());
+        assert!(AskStepInput::from_tool(ASK_USER_TOOL_NAME, &json!({ "questions": [] })).is_none());
+        let input = AskStepInput::from_tool(ASK_USER_TOOL_NAME, &sample_input()).expect("input");
+        assert_eq!(input.summarize(&json!("error")), None);
     }
 }

@@ -2,7 +2,7 @@
 
 > Status: **foundation and `AskUser` + web stages implemented; the iOS stage is
 > pending** — `baybo-human-ask` (queue,
-> core, gates, manager, `AskUserTool`, `ask_step_summary`), the ledger, the
+> core, gates, manager, `AskUserTool`, `AskStepInput`), the ledger, the
 > `tools::ask` ports (`QuestionGate`, `QuestionHandle`, `Tool::sole_call`), the
 > agent live/restart/sole-call paths, the gateway doors, question/approval
 > frames, REST reconstruction and boot order, the web `QuestionCard` / composer
@@ -49,11 +49,11 @@ Layering, following the store/storage split the rest of the schema uses:
 
 | Crate | Owns |
 | --- | --- |
-| `baybo-model` (`model::human_ask`, `model::approval`) | Value types: `AskId`, `AskKind`, `AskPhase`, `AskRequest`, `AskResolution`, `AskStepSummary`, the `Question*` payloads, `ApprovalRequest` (moved here from `baybo-tools`), `ResumeRequest`, the tool-name and limit consts. Pure data. |
+| `baybo-model` (`model::human_ask`, `model::approval`) | Value types: `AskId`, `AskKind`, `AskPhase`, `AskRequest`, `AskResolution`, `AskStepSummary`, the `Question*` payloads, `ApprovalRequest` (moved here from `baybo-tools`), `ResumeRequest`, and the `ASK_USER_TOOL_NAME` constant. Pure data. |
 | `baybo-store` (`store::human_ask`) | `HumanAskRow` + the `HumanAskStore` port. No delete method. |
 | `baybo-storage` (`sqlite/human_ask.rs`) | `SqliteHumanAskStore` over the `human_asks` table. DDL in `sqlite/mod.rs` like every other table. |
 | `baybo-tools` (`tools::approval`, new `tools::ask`) | The **tool-facing ports** only: `ApprovalGate`, `ApprovalGateMap`, `AutoDenyGate`, `ApprovalHandle`, `ApprovalOutcome`, `refusal_reason`; new `QuestionGate`, `QuestionHandle`, `AskCancel`, `ParkGauge`, `ToolContext.question`, `Tool::sole_call()`. Never depends on `baybo-human-ask`. |
-| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
+| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `AskStepInput`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`. (The Resume door is not a channel message: it has its own receiver on the router.) |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
 | `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` impl. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingApprovals` and does not depend on this crate.) |
@@ -781,9 +781,9 @@ Bash comment. The approval-mirroring part of the headroom is what is deleted.
 rewritten. Lives in `baybo_human_ask::tools`, registered from
 `crates/baybo/src/runtime.rs` via `agent_tools(manager)` like the task tools.
 
-Input schema (`parameters_schema`), limits as named consts in
-`baybo_model::human_ask` (`MAX_QUESTIONS = 4`, `MIN_OPTIONS = 2`,
-`MAX_OPTIONS = 4`, `MAX_HEADER_CHARS = 12`):
+The input schema (`parameters_schema`) and runtime validation share private
+constants in `baybo_human_ask::tools` (`MAX_QUESTIONS = 4`, `MIN_OPTIONS = 2`,
+`MAX_OPTIONS = 4`, `MAX_HEADER_CHARS = 12`).
 
 ```jsonc
 {
@@ -859,15 +859,14 @@ the channel, bumps the park gauge, awaits the oneshot; no timeout) → map
 `SpanEventKind::Question { outcome }` on the tool span, the sibling of
 `SpanEventKind::Approval`, so traces show what the human did.
 
-**Step summary** — `ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>`
-(in `baybo-human-ask`, typed: question count + per-tab `header` with selected
-labels / other / skipped, declined or cancelled) is the one derivation used by both the
-live plane and REST: the loop computes it at `emit_tool_completed`
-(`agent_loop.rs:~1643`, where `dispatch.arguments` and `executed.output` are
-in hand) and it rides `AgentEvent::ToolCompleted.ask` → `Frame::ToolCompleted.ask`
-→ the in-flight buffer → `WireWorkStep.ask`; the REST reconstruction
-(`chat.rs:3557-3669`) computes it from `ToolUse.input` + `ToolResult.content`
-into `ChatWorkStep.ask`. Without the live field every tab but the one that
+**Step summary** — `AskStepInput::from_tool(name, input)` recognizes an
+`AskUser` call and validates its questions. Its `summarize(result)` method
+returns the per-question `AskStepSummary` and its one-line display text together.
+The agent uses the resolved call and its JSON output for `AgentEvent::ToolCompleted`.
+The structured summary reaches `WireWorkStep.ask` through `Frame::ToolCompleted`
+and the in-flight buffer. REST reconstruction keeps the validated input by
+tool-use ID until the matching result arrives, then uses the same method
+to fill `ChatWorkStep.ask` and `tool_summary`. Without the live field every tab but the one that
 answered would show `summary: "ok"` until a reload (the in-flight buffer
 carries only `ToolStarted`/`ToolCompleted`, `work_steps.rs:36-83`).
 
@@ -1180,7 +1179,11 @@ pub struct ReloadReport { requeued, resumed, abandoned, applied, failed }   // a
 pub trait ResumeSink { fn request_resume(&self, req: ResumeRequest); }   // fire and forget; the router decides whether it opens a Resume turn
 pub trait LivePendingAsks { fn actor_stop_cost(&self, session: &SessionId) -> ActorStopCost; }  // Free | ReleasesTurn { waiting_calls } | AbandonsAsks; combined with ActorStopCost::plus
 #[async_trait] pub trait AskObserver { async fn on_event(&self, ask: &HumanAskRow, event: AskEvent); }
-pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>;
+pub struct AskStepInput(QuestionRequest);
+impl AskStepInput {
+    pub fn from_tool(name: &str, input: &Value) -> Option<Self>;
+    pub fn summarize(self, result: &Value) -> Option<(AskStepSummary, String)>;
+}
 pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<dyn Tool>, ToolManifest)>; }
 
 // baybo_agent
@@ -1477,7 +1480,7 @@ leaves draft.
 - `baybo-tools::ask`: `QuestionGate`, `QuestionHandle`, `ToolContext.question`,
   `Tool::sole_call`; remove the todo stub. `ChannelAskGate` question half;
   `AskUserTool` + registration; `ToolTriggerScope::UserConversation`;
-  `SpanEventKind::Question`; `ask_step_summary`; sole-call batch check.
+  `SpanEventKind::Question`; `AskStepInput`; sole-call batch check.
 - Wire: `QuestionAsked`, `AnswerQuestion`, `QuestionCard`, `pending_questions`,
   `ToolCompleted.ask` / `WireWorkStep.ask`; `SessionEvent::QuestionAsked`;
   `route.rs` `AnswerQuestion` arm; SubscribeState; push question title;
@@ -1559,7 +1562,7 @@ Unit (other crates):
 - `baybo-tools`: `AskUser` validation table; `question: None` → declined.
 - `baybo-wire`: round-trips for the new frames, `pending_questions` in the
   bundle, `awaiting_human` patch, `ToolCompleted.ask`.
-- `ask_step_summary`: REST and live produce identical summaries for the same
+- `AskStepInput`: REST and live produce identical summaries for the same
   input/result.
 
 Integration (`crates/integration-tests`, sqlite-backed harness):

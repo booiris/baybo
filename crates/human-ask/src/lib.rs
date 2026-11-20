@@ -31,7 +31,7 @@ pub use ports::{ActorStopCost, AskObserver, LivePendingAsks, ResumeSink};
 pub use queue::{
     AskQueue, AskQueueEvent, AskQueues, AskWatcher, PendingAsk, PendingEdge, PendingWatcher,
 };
-pub use summary::{ask_step_summary, first_question_header, format_ask_summary};
+pub use summary::{AskStepInput, first_question_header};
 
 #[cfg(test)]
 mod tests;

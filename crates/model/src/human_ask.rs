@@ -16,18 +16,6 @@ use crate::approval::{ApprovalDecision, ApprovalRequest};
 /// Name of the tool that raises question asks.
 pub const ASK_USER_TOOL_NAME: &str = "AskUser";
 
-/// Maximum questions in a single `AskUser` call (one tab per question).
-pub const MAX_QUESTIONS: usize = 4;
-
-/// Minimum options per `AskUser` question.
-pub const MIN_OPTIONS: usize = 2;
-
-/// Maximum options per `AskUser` question.
-pub const MAX_OPTIONS: usize = 4;
-
-/// Maximum characters in an `AskUser` question's tab `header`.
-pub const MAX_HEADER_CHARS: usize = 12;
-
 /// Identity of one ask. A UUID v4 when minted here; an ask raised through the
 /// approval path reuses the [`ApprovalRequest::ask_id`] it was raised with.
 /// One tool call can raise several asks, so this — not the `tool_call_id` —
@@ -300,7 +288,7 @@ pub struct AskStepQuestion {
 }
 
 /// Typed summary of a finished `AskUser` call, derived server-side from its
-/// input and result (`baybo_human_ask::ask_step_summary`) so the live wire and
+/// input and result (`baybo_human_ask::AskStepInput::summarize`) so the live wire and
 /// REST reconstruction agree identically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]

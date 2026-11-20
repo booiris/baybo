@@ -5,15 +5,17 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use baybo_model::human_ask::{
-    ASK_USER_TOOL_NAME, MAX_HEADER_CHARS, MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS, Question,
-    QuestionOption, QuestionRequest,
-};
+use baybo_model::human_ask::{ASK_USER_TOOL_NAME, Question, QuestionOption, QuestionRequest};
 use baybo_model::{ChannelType, TrustLevel};
 use baybo_tools::{
     QuestionOutcome, Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput, ToolTriggerScope,
 };
 use serde_json::{Value, json};
+
+const MAX_QUESTIONS: usize = 4;
+const MIN_OPTIONS: usize = 2;
+const MAX_OPTIONS: usize = 4;
+const MAX_HEADER_CHARS: usize = 12;
 
 const ASK_USER_DESCRIPTION: &str = r#"Ask the user 1 to 4 structured multiple-choice clarifying questions.
 

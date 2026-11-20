@@ -1801,17 +1801,16 @@ impl AgentLoop {
             turn_attachments,
             llm_visible_images,
         } = media;
-        let ask = if dispatch.name == baybo_model::human_ask::ASK_USER_TOOL_NAME
-            && let Ok(ToolOutput::Json(value)) = &executed.output
+        let (status, default_summary) = tool_completion_summary(&executed);
+        let (ask, raw_summary) = if let Ok(ToolOutput::Json(value)) = &executed.output
+            && let Some(input) =
+                baybo_human_ask::AskStepInput::from_tool(&dispatch.name, &dispatch.arguments)
+            && let Some((ask, text)) = input.summarize(value)
         {
-            baybo_human_ask::ask_step_summary(&dispatch.arguments, value)
+            (Some(ask), text)
         } else {
-            None
+            (None, default_summary)
         };
-        let (status, mut raw_summary) = tool_completion_summary(&executed);
-        if let Some(summary) = &ask {
-            raw_summary = baybo_human_ask::format_ask_summary(summary);
-        }
         let call_approval = executed.approval;
         self.emit_tool_completed(
             delta_tx,

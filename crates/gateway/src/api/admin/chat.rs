@@ -3363,7 +3363,7 @@ struct WorkAccumulator {
     pending_tools: HashMap<String, usize>,
     /// `tool_use_id` → `AskUser` call arguments, paired with its `ToolResult`
     /// to derive [`ChatAskStepSummary`] through the same helper the live plane uses.
-    pending_ask_inputs: HashMap<String, serde_json::Value>,
+    pending_ask_inputs: HashMap<String, baybo_human_ask::AskStepInput>,
 }
 
 impl WorkAccumulator {
@@ -3659,8 +3659,10 @@ fn reconstruct_transcript_with_attachments(
                             id, name, input, ..
                         } => {
                             work.pending_tools.insert(id.clone(), work.steps.len());
-                            if name == baybo_model::human_ask::ASK_USER_TOOL_NAME {
-                                work.pending_ask_inputs.insert(id.clone(), input.clone());
+                            if let Some(ask_input) =
+                                baybo_human_ask::AskStepInput::from_tool(name, input)
+                            {
+                                work.pending_ask_inputs.insert(id.clone(), ask_input);
                             }
                             work.steps.push(
                                 ChatWorkStep::tool(
@@ -3772,10 +3774,9 @@ fn reconstruct_transcript_with_attachments(
                             && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(
                                 strip_tool_output_envelope(content),
                             )
-                            && let Some(summary) =
-                                baybo_human_ask::ask_step_summary(&ask_input, &parsed)
+                            && let Some((summary, text)) = ask_input.summarize(&parsed)
                         {
-                            step.tool_summary = Some(baybo_human_ask::format_ask_summary(&summary));
+                            step.tool_summary = Some(text);
                             step.ask = Some(ChatAskStepSummary::from(summary));
                         } else {
                             step.tool_summary = Some(summarize_tool_result(content));
@@ -5412,9 +5413,12 @@ mod tests {
         let work = &items[1];
         assert_eq!(work.steps.len(), 2);
 
-        let expected_answered =
-            baybo_human_ask::ask_step_summary(&answered_input, &answered_output)
-                .expect("answered summary");
+        let (expected_answered, _) = baybo_human_ask::AskStepInput::from_tool(
+            baybo_model::human_ask::ASK_USER_TOOL_NAME,
+            &answered_input,
+        )
+        .and_then(|input| input.summarize(&answered_output))
+        .expect("answered summary");
         assert_eq!(work.steps[0].tool_label.as_deref(), Some("Auth"));
         assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
         assert_eq!(
@@ -5426,9 +5430,12 @@ mod tests {
             Some(ChatAskStepSummary::from(expected_answered))
         );
 
-        let expected_declined =
-            baybo_human_ask::ask_step_summary(&declined_input, &declined_output)
-                .expect("declined summary");
+        let (expected_declined, _) = baybo_human_ask::AskStepInput::from_tool(
+            baybo_model::human_ask::ASK_USER_TOOL_NAME,
+            &declined_input,
+        )
+        .and_then(|input| input.summarize(&declined_output))
+        .expect("declined summary");
         assert_eq!(work.steps[1].tool_label.as_deref(), Some("Confirm"));
         assert_eq!(
             work.steps[1].tool_summary.as_deref(),
