@@ -10,6 +10,7 @@ mod device;
 mod human_ask;
 mod payload;
 mod project;
+mod row;
 mod search;
 mod secret;
 mod session;
@@ -468,7 +469,10 @@ impl SqlitePool {
             } else {
                 f(&mut conn)
             };
-            let out = result.map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")));
+            let out = result.map_err(|e| match e.downcast::<StorageError>() {
+                Ok(error) => error,
+                Err(error) => StorageError::Internal(anyhow::anyhow!("{op}: {error}")),
+            });
             inner.give_back(conn);
             out
         })
@@ -525,23 +529,11 @@ pub(crate) fn values_placeholders(n: usize) -> String {
 /// The **extended** code, not `ErrorCode::ConstraintViolation`. That wider
 /// bucket also holds NOT NULL and CHECK, which are bugs in the statement
 /// rather than a row that lost a race, and reporting one of those as
-/// "somebody got there first" is the same lie one altitude down. (It holds
-/// FOREIGN KEY too, which genuinely *can* be a lost race — a parent deleted
-/// concurrently — but this codebase never enables `PRAGMA foreign_keys`, so
-/// there is no such case to classify.)
+/// "somebody got there first" is the same lie one altitude down.
 ///
 /// Both uniqueness codes are needed. A duplicate `TEXT PRIMARY KEY` reports
 /// `SQLITE_CONSTRAINT_PRIMARYKEY` while its *message* still reads "UNIQUE
 /// constraint failed", so matching on UNIQUE alone would misfile it.
-///
-/// Asked of the code, and therefore only answerable *inside* the pool
-/// closure while the `rusqlite::Error` still exists: once a failure has been
-/// stringified out of one, all that is left to go on is the message. Two
-/// older stores (`device`, `agent_profile`) sniff that string for
-/// `"constraint"` from outside — which does separate a constraint from a
-/// busy database or a broken statement, since neither of those messages
-/// carries the word, but cannot tell a uniqueness refusal from a NOT NULL or
-/// CHECK one. They are worth moving onto this.
 pub(crate) fn already_there(e: &rusqlite::Error) -> bool {
     matches!(
         e,
@@ -549,6 +541,14 @@ pub(crate) fn already_there(e: &rusqlite::Error) -> bool {
             if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                 || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
     )
+}
+
+fn unique_conflict(error: rusqlite::Error, message: impl std::fmt::Display) -> anyhow::Error {
+    if already_there(&error) {
+        StorageError::Conflict(message.to_string()).into()
+    } else {
+        error.into()
+    }
 }
 
 /// Create all required tables if they do not already exist.
