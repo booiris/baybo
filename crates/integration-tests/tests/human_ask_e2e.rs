@@ -386,7 +386,7 @@ fn sample_ask_user_args() -> Value {
 async fn stop_on_live_ask_user_abandons_the_row_and_empties_the_queue() {
     use baybo_integration_tests::SessionBuilder;
     use baybo_model::ChannelType;
-    use baybo_model::human_ask::AskKind;
+    use baybo_model::human_ask::{AskKind, AskRequest};
 
     let session = SessionBuilder::new()
         .id("sess-ask-user-stop")
@@ -396,12 +396,21 @@ async fn stop_on_live_ask_user_abandons_the_row_and_empties_the_queue() {
         .session(session)
         .with_channel_ask_gate()
         .build();
+    let placeholder = "[{REDACTED_SECRET_0123456789abcdef01234567}]";
+    harness
+        .vault
+        .store_secret(placeholder, b"test-credential")
+        .await
+        .unwrap();
+    let mut args = sample_ask_user_args();
+    args["questions"][0]["options"][0]["description"] = json!(placeholder);
+    let expected_request = AskRequest::Question(serde_json::from_value(args.clone()).unwrap());
     harness
         .stub_llm
         .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
             id: CALL_ID.to_string(),
             name: baybo_model::human_ask::ASK_USER_TOOL_NAME.to_string(),
-            arguments: sample_ask_user_args(),
+            arguments: args,
             signature: None,
         })]);
     harness.send_text("ask me").await.expect("send");
@@ -417,6 +426,8 @@ async fn stop_on_live_ask_user_abandons_the_row_and_empties_the_queue() {
     let rows = harness.ask_store.rows();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].kind, AskKind::Question);
+    assert_eq!(rows[0].request, expected_request);
+    assert_eq!(queue.list()[0].request, expected_request);
     let ask_id = rows[0].ask_id.clone();
 
     stop_turn(&harness).await;

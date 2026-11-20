@@ -718,34 +718,42 @@ impl ToolExecutor {
         Some(resolved)
     }
 
-    /// `ToolInvoke` param pre-validation, run against a REVEALED copy of
-    /// the params so constraints on secret-bearing fields judge the real
-    /// value, not the placeholder the model holds. `Some(msg)` is the
-    /// model-visible rejection, already re-masked and leak-scrubbed:
-    /// 1. reveal a local copy (failure ⇒ skip — a gate that cannot see the
-    ///    real values cannot judge them; execution does its own reveal);
-    /// 2. validate via the compiled-schema cache;
-    /// 3. compose the message — secret-path errors go generic, every
-    ///    revealed value is exact-replaced back to its placeholder;
-    /// 4. `sanitize_error` as belt-and-braces before anything escapes into
-    ///    the transcript / trace.
+    async fn execution_params(
+        &self,
+        tool: Option<&dyn baybo_tools::Tool>,
+        params: &Value,
+    ) -> anyhow::Result<Value> {
+        let mut prepared = params.clone();
+        if tool.is_some_and(|tool| tool.reveal_secret_params()) {
+            self.security_gateway
+                .reveal_in_value(&mut prepared)
+                .await
+                .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
+        }
+        Ok(prepared)
+    }
+
+    /// Validate the arguments in the form the tool receives. Re-mask any
+    /// revealed values before returning a rejection to the model.
     async fn validate_invoke_params(
         &self,
         tool: &dyn baybo_tools::Tool,
         params: &Value,
     ) -> Option<String> {
-        let mut revealed = params.clone();
-        if let Err(e) = self.security_gateway.reveal_in_value(&mut revealed).await {
-            debug!(tool = tool.name(), error = %e, "invoke params reveal failed; skipping validation");
-            return None;
-        }
-        let rejection = match self.invoke_validators.validate(tool, &revealed) {
+        let prepared = match self.execution_params(Some(tool), params).await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                debug!(tool = tool.name(), error = %e, "invoke params reveal failed; skipping validation");
+                return None;
+            }
+        };
+        let rejection = match self.invoke_validators.validate(tool, &prepared) {
             Ok(()) => return None,
             Err(rejection) => rejection,
         };
         let mut secrets = Vec::new();
         let mut path = String::new();
-        revealed_secret_values(params, &revealed, &mut path, &mut secrets);
+        revealed_secret_values(params, &prepared, &mut path, &mut secrets);
         let msg = compose_invoke_rejection(tool.name(), &rejection, &secrets);
         match self.security_gateway.sanitize_error(&msg).await {
             Ok(sanitized) => Some(sanitized),
@@ -986,10 +994,7 @@ impl ToolExecutor {
 
                 // `ToolInvoke`-routed params are validated before any
                 // approval prompt fires: a call that cannot execute must not
-                // cost the user a prompt. Validation runs on a revealed
-                // copy (constraints must judge real values, not
-                // placeholders); the reported message comes back re-masked
-                // and sanitized.
+                // cost the user a prompt.
                 if via_invoke
                     && let Some(tool) = pinned_tool.as_ref()
                     && let Some(msg) = self.validate_invoke_params(tool.as_ref(), &params).await
@@ -1174,14 +1179,9 @@ impl ToolExecutor {
                     checkout_git_config: None,
                 };
 
-                let mut params_revealed = params.clone();
-                // The question payload goes straight to the client and the durable ask ledger.
-                if tool_name_owned != baybo_model::human_ask::ASK_USER_TOOL_NAME {
-                    self.security_gateway
-                        .reveal_in_value(&mut params_revealed)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
-                }
+                let execution_params = self
+                    .execution_params(pinned_tool.as_deref(), &params)
+                    .await?;
 
                 let resume_during_execute = matches!(
                     &pre_execute,
@@ -1197,7 +1197,7 @@ impl ToolExecutor {
                         .prepare_approval(
                             pinned_tool.as_deref(),
                             &params,
-                            &params_revealed,
+                            &execution_params,
                             &ctx,
                             &pre_execute,
                         )
@@ -1311,9 +1311,9 @@ impl ToolExecutor {
                                 tool.name()
                             ))
                         })?;
-                        resumer.resume_during_execute(params_revealed, &ctx).await
+                        resumer.resume_during_execute(execution_params, &ctx).await
                     } else {
-                        tool.execute(params_revealed, &ctx).await
+                        tool.execute(execution_params, &ctx).await
                     }
                 };
                 let result = deadline.run(execution).await;
@@ -1505,12 +1505,8 @@ impl InvokeValidatorCache {
     /// * an oversized schema skips (a pathological schema must not stall
     ///   the loop before the execution timeout).
     ///
-    /// The caller hands in the REVEALED copy of the params (see
-    /// [`ToolExecutor::validate_invoke_params`]) so that a `pattern`/`enum`/
-    /// length constraint on a secret-bearing field judges the real value,
-    /// not the `[{REDACTED_SECRET_…}]` placeholder the model holds — and is
-    /// responsible for re-masking every revealed value out of the message
-    /// it reports.
+    /// [`ToolExecutor::validate_invoke_params`] supplies the tool's execution
+    /// arguments and re-masks revealed values in the resulting message.
     fn validate(
         &self,
         tool: &dyn baybo_tools::Tool,

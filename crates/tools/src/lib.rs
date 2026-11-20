@@ -206,7 +206,7 @@ pub trait Tool: Send + Sync {
 
     /// Async pre-execution approval hook with access to [`ToolContext`].
     ///
-    /// Runs before `Tool::execute` on the same revealed parameters. The
+    /// Runs before `Tool::execute` on the same parameters. The
     /// executor re-masks returned approval data before persisting or displaying
     /// it. Returns `Some` when the call should pass through the executor's pre-execute
     /// approval gate (resumable [`AskPhase::BeforeExecute`] ask), or `None`
@@ -238,6 +238,12 @@ pub trait Tool: Send + Sync {
     /// Output provenance for prompt-injection severity; defaults to opaque.
     fn output_source(&self) -> OutputSource {
         OutputSource::default()
+    }
+
+    /// Whether vault placeholders in this tool's arguments should be resolved
+    /// before validation, approval and execution.
+    fn reveal_secret_params(&self) -> bool {
+        true
     }
 
     /// Short preview of this call for the live progress line

@@ -205,6 +205,11 @@ impl Tool for AskUserTool {
         true
     }
 
+    fn reveal_secret_params(&self) -> bool {
+        // The client and the durable ask ledger receive these arguments.
+        false
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let request = match validate_question_request(params) {
             Ok(req) => req,
