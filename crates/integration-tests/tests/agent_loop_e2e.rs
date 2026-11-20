@@ -2560,6 +2560,59 @@ async fn retry_reanchors_prompt_after_compaction_supersedes_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn retry_recovers_a_reanchored_prompt_that_was_itself_compacted() {
+    let mut session = SessionBuilder::new().build();
+    let id = session.id.clone();
+    let content = vec![ContentBlock::Text("frozen background report input".into())];
+    let prompt = baybo_model::ChatMessage::agent_context(content.clone());
+    session.state.background_notifications.active_delivery =
+        Some(baybo_model::BackgroundNotificationDelivery {
+            handle_ids: vec![],
+            result_labels: vec![],
+            content,
+            prompt_ordinal: 0,
+            failed_attempts: 1,
+        });
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_seed_transcript(vec![prompt.clone()])
+        .build();
+    let summary = [baybo_model::ChatMessage::system(vec![ContentBlock::Text(
+        "summary".into(),
+    )])];
+    let manager = &harness.session_manager;
+    manager
+        .apply_session_compaction(&id, &summary)
+        .await
+        .unwrap();
+    // A crash after this append leaves the delivery pointing at ordinal zero.
+    manager
+        .append_session_message_idempotent(
+            &id,
+            "background-notification:legacy-prompt:0:reanchor",
+            &prompt,
+        )
+        .await
+        .unwrap();
+    manager
+        .apply_session_compaction(&id, &summary)
+        .await
+        .unwrap();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("review complete".into())]);
+    harness.drain_outputs(Duration::from_secs(2000)).await;
+    let active = harness
+        .session_manager
+        .load_active_session_messages(&id)
+        .await
+        .unwrap();
+    assert_eq!(active.iter().filter(|row| **row == prompt).count(), 1);
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn actor_stop_preserves_last_active() {
     // The ActorStop final state write (the ledger heal) must NOT move
     // `last_active` in either direction. The chat list orders by it, and:
@@ -3000,7 +3053,7 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
 /// "say 你好 in a minute" stored the bare prompt `你好`; before framing,
 /// the model read `你好` as the user greeting it and greeted back. Drives
 /// the real actor path (`AgentMessage::CronTrigger` →
-/// `AgentActor::dispatch_cron_prompt` → `AgentLoop::append_cron_fire`)
+/// `AgentActor::dispatch_cron_prompt` → `SettledTranscript::append_cron_fire`)
 /// and asserts on the content the `StubLlm` actually received.
 #[tokio::test(start_paused = true)]
 async fn cron_fire_is_framed_as_a_task_not_a_user_message() {

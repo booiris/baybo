@@ -2,29 +2,30 @@
 //! runs before its own append, and the Resume door an answered dead ask
 //! arrives through.
 
-use super::AgentActor;
-use crate::runtime::agent_loop::AsksSettled;
+use super::{AgentActor, VolatileResources};
+use crate::runtime::agent_loop::settled_transcript::SettledTranscript;
 use baybo_model::human_ask::AskId;
 
-impl AgentActor {
-    /// The prelude every door runs before its own append: settle this
-    /// session's unapplied asks. The appends take the [`AsksSettled`] it
-    /// returns, so a door cannot skip it.
-    pub(super) async fn settle_unapplied_asks(&mut self) -> anyhow::Result<AsksSettled> {
-        let (tokens, _release) = self.turn_tokens();
-        let response_tx = self.volatile.response_tx.clone();
-        self.volatile
-            .agent_loop
+impl VolatileResources {
+    pub(super) async fn settle_unapplied_asks(
+        &mut self,
+        session: &mut baybo_model::Session,
+    ) -> anyhow::Result<SettledTranscript<'_>> {
+        let (tokens, _release) = self.turn_tokens(&session.id);
+        let response_tx = self.response_tx.clone();
+        self.agent_loop
             .settle_before_append(
-                &mut self.durable.session,
-                &self.volatile.turn_lifecycle,
-                &self.volatile.span_recorder,
+                session,
+                &self.turn_lifecycle,
+                &self.span_recorder,
                 Some(response_tx),
                 tokens,
             )
             .await
     }
+}
 
+impl AgentActor {
     /// A human answered `ask_id` while no tool future waited on it: run the
     /// Resume turn that applies the answer and carries on from it. Nothing
     /// to do when a door's prelude (or a duplicate route) got there first,

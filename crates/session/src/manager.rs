@@ -696,7 +696,7 @@ impl SessionManager {
 
     /// Mark the currently-active rows for `session_id` as superseded
     /// by the next ordinal and append `new_active` at the next
-    /// contiguous ordinals. Used by `AgentLoop::compact_now` /
+    /// contiguous ordinals. Used by `SettledTranscript::compact_now` /
     /// `compress_if_needed` after a successful compression apply.
     pub async fn apply_session_compaction(
         &self,

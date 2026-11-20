@@ -319,7 +319,37 @@ pub struct AgentActor {
     volatile: VolatileResources,
 }
 
-impl AgentActor {
+impl DurableActorState {
+    async fn persist_with_activity(
+        &mut self,
+        manager: &baybo_session::SessionManager,
+        context: &'static str,
+    ) -> bool {
+        self.session.last_active = chrono::Utc::now();
+        self.save_session_row(manager, context).await
+    }
+
+    async fn save_session_row(
+        &self,
+        manager: &baybo_session::SessionManager,
+        context: &'static str,
+    ) -> bool {
+        match manager.store().save(&self.session).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    session_id = %self.session.id,
+                    context = %context,
+                    error = %e,
+                    "failed to persist actor-owned session state; live actor still has the latest copy in memory"
+                );
+                false
+            }
+        }
+    }
+}
+
+impl VolatileResources {
     /// The tokens one turn runs under. Its `release` side is a per-turn child
     /// of the actor's token: tripping it ends this turn the way a shutdown
     /// would and leaves later turns alone. The supervisor holds it while the
@@ -327,25 +357,25 @@ impl AgentActor {
     /// asks.
     fn turn_tokens(
         &self,
+        session_id: &baybo_model::SessionId,
     ) -> (
         baybo_tools::TurnTokens,
         Option<supervisor::TurnReleaseGuard>,
     ) {
-        let release = self.volatile.actor_token.child_token();
-        let guard = self.volatile.supervisor.as_ref().map(|s| {
-            s.track_turn(
-                &self.durable.session.id,
-                release.clone(),
-                self.volatile.agent_loop.running_calls(),
-            )
-        });
+        let release = self.actor_token.child_token();
+        let guard = self
+            .supervisor
+            .as_ref()
+            .map(|s| s.track_turn(session_id, release.clone(), self.agent_loop.running_calls()));
         let tokens = baybo_tools::TurnTokens {
             turn: release.child_token(),
             release,
         };
         (tokens, guard)
     }
+}
 
+impl AgentActor {
     /// Construct an actor from its durable and volatile halves.
     ///
     /// Production wiring goes through [`crate::actor::router::ActorSpawner`],
@@ -638,7 +668,7 @@ impl AgentActor {
     /// it to the response channel.
     /// Run the loop on the session's *current* context. The triggering
     /// message must already be appended (the callers do this via
-    /// `AgentLoop::append_user_message_with_platform_msg_id` / `append_cron_fire` /
+    /// `SettledTranscript::append_user_message` / `append_cron_fire` /
     /// `append_background_notification_prompt_once`) so framing lives in
     /// `baybo-context` and the loop just iterates.
     async fn run_agent_loop(
@@ -659,7 +689,7 @@ impl AgentActor {
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
-        let (tokens, _release) = self.turn_tokens();
+        let (tokens, _release) = self.volatile.turn_tokens(&self.durable.session.id);
 
         let result = self
             .volatile
@@ -715,10 +745,12 @@ impl AgentActor {
             // framed spelling of the same thing. Same ordering either way.
             brief: baybo_model::prose_with_media(brief.to_string(), &files),
         };
-        let settled = self.settle_unapplied_asks().await?;
-        self.volatile
-            .agent_loop
-            .append_issue_brief(&settled, number, checkout, brief, &files)
+        let mut transcript = self
+            .volatile
+            .settle_unapplied_asks(&mut self.durable.session)
+            .await?;
+        transcript
+            .append_issue_brief(number, checkout, brief, &files)
             .await?;
         self.run_agent_loop(turn_input, None, None, None, None)
             .await?;
@@ -729,7 +761,7 @@ impl AgentActor {
     ///
     /// The cron fire mints a Cron-rooted session, so the turn records
     /// `origin = Cron`. The content the LLM sees is framed + appended by
-    /// `AgentLoop::append_cron_fire` (which uses `baybo_context::prompts::cron`)
+    /// `SettledTranscript::append_cron_fire` (which uses `baybo_context::prompts::cron`)
     /// so the model treats it as a task to perform now rather than a live
     /// user message.
     ///
@@ -754,10 +786,12 @@ impl AgentActor {
             }),
         };
         let prompt_context = builtin.map(|ctx| ctx.prompt_context);
-        let settled = self.settle_unapplied_asks().await?;
-        self.volatile
-            .agent_loop
-            .append_cron_fire(&settled, job_id, prompt, prompt_context.as_deref())
+        let mut transcript = self
+            .volatile
+            .settle_unapplied_asks(&mut self.durable.session)
+            .await?;
+        transcript
+            .append_cron_fire(job_id, prompt, prompt_context.as_deref())
             .await?;
         // Only a recurring fire (which owns a listed conversation) can be
         // silenced by `report_nothing` or leave work in the background; a
@@ -963,9 +997,12 @@ impl AgentActor {
 
         // An assistant row after a dangling `tool_use` wedges the transcript
         // just as a user row does.
-        let settled = self.settle_unapplied_asks().await?;
         let turn_lifecycle = Arc::clone(&self.volatile.turn_lifecycle);
         let origin = self.durable.session.trigger.kind();
+        let mut transcript = self
+            .volatile
+            .settle_unapplied_asks(&mut self.durable.session)
+            .await?;
         let append_outcome = crate::runtime::scope::with_turn(
             &turn_lifecycle,
             // Not a cancellable turn: the append is one store write with
@@ -980,10 +1017,8 @@ impl AgentActor {
                 parent_turn_id: None,
             },
             |_turn_id| async {
-                let append_outcome = self
-                    .volatile
-                    .agent_loop
-                    .append_cron_notification(&settled, content.clone(), source_event_id.as_deref())
+                let append_outcome = transcript
+                    .append_cron_notification(content.clone(), source_event_id.as_deref())
                     .await?;
                 let SessionMessageAppendOutcome::Inserted { ordinal } = append_outcome else {
                     return Err(anyhow::anyhow!(
@@ -1252,10 +1287,12 @@ impl AgentActor {
         // text deltas as `AgentEvent::AnswerDelta` while the final assembled
         // message still flows through the normal path.
         let response_tx = self.volatile.response_tx.clone();
-        let settled = self.settle_unapplied_asks().await?;
-        self.volatile
-            .agent_loop
-            .append_user_message_with_platform_msg_id(&settled, content.clone(), platform_msg_id)
+        let mut transcript = self
+            .volatile
+            .settle_unapplied_asks(&mut self.durable.session)
+            .await?;
+        transcript
+            .append_user_message(content.clone(), platform_msg_id)
             .await?;
         // Single slash-command turn (the non-slash common path is handled by
         // `handle_merged_user_turn`). Slash turns do not drain mid-turn
@@ -1298,27 +1335,20 @@ impl AgentActor {
             combined.extend(incoming.message.content.iter().cloned());
         }
         combined.extend(last.message.content.iter().cloned());
-        let settled = self.settle_unapplied_asks().await?;
+        let mut transcript = self
+            .volatile
+            .settle_unapplied_asks(&mut self.durable.session)
+            .await?;
         // Append every message as its own row ahead of the turn (the last
         // included) so the loop iterates the current context; the combined
         // content rides in `TurnInput` for the turn record only.
         for incoming in batch {
-            self.volatile
-                .agent_loop
-                .append_user_message_with_platform_msg_id(
-                    &settled,
-                    incoming.message.content,
-                    incoming.platform_msg_id,
-                )
+            transcript
+                .append_user_message(incoming.message.content, incoming.platform_msg_id)
                 .await?;
         }
-        self.volatile
-            .agent_loop
-            .append_user_message_with_platform_msg_id(
-                &settled,
-                last.message.content,
-                last.platform_msg_id,
-            )
+        transcript
+            .append_user_message(last.message.content, last.platform_msg_id)
             .await?;
         let response_tx = self.volatile.response_tx.clone();
         // Let the loop drain user messages that arrive *during* this turn and
@@ -1393,8 +1423,9 @@ impl AgentActor {
     /// Persist actor-owned session state and refresh activity so the reaper
     /// does not immediately target an actor that just completed durable work.
     async fn persist_session_state_with_activity(&mut self, context: &'static str) -> bool {
-        self.durable.session.last_active = chrono::Utc::now();
-        self.save_session_row(context).await
+        self.durable
+            .persist_with_activity(&self.volatile.session_manager, context)
+            .await
     }
 
     /// Final actor-state write without stamping `last_active = now`. The chat
@@ -1430,28 +1461,9 @@ impl AgentActor {
                 );
             }
         }
-        self.save_session_row(context).await
-    }
-
-    async fn save_session_row(&mut self, context: &'static str) -> bool {
-        match self
-            .volatile
-            .session_manager
-            .store()
-            .save(&self.durable.session)
+        self.durable
+            .save_session_row(&self.volatile.session_manager, context)
             .await
-        {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(
-                    session_id = %self.durable.session.id,
-                    context = %context,
-                    error = %e,
-                    "failed to persist actor-owned session state; live actor still has the latest copy in memory"
-                );
-                false
-            }
-        }
     }
 
     /// Send a user-turn reply. A blank reply (no non-whitespace text) is
@@ -1511,20 +1523,17 @@ impl AgentActor {
     ) -> anyhow::Result<()> {
         // The summariser reads the transcript, so a dangling `tool_use` has
         // to be answered first.
-        let settled = self.settle_unapplied_asks().await?;
+        let lifecycle = Arc::clone(&self.volatile.turn_lifecycle);
+        let recorder = Arc::clone(&self.volatile.span_recorder);
+        let cancel = self.volatile.actor_token.child_token();
+        let transcript = self
+            .volatile
+            .settle_unapplied_asks(&mut self.durable.session)
+            .await?;
         // `compact_now` mints its own maintenance turn and returns a control
         // notice; it does not emit a chat reply from the actor itself.
-        let notice = self
-            .volatile
-            .agent_loop
-            .compact_now(
-                &settled,
-                &mut self.durable.session,
-                &self.volatile.turn_lifecycle,
-                &self.volatile.span_recorder,
-                None,
-                self.volatile.actor_token.child_token(),
-            )
+        let notice = transcript
+            .compact_now(&self.durable.session, &lifecycle, &recorder, cancel)
             .await?;
         // A failed compaction is recorded — and re-rendered on reload — as the
         // warning it is, not as a confirmation.

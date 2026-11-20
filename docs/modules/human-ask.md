@@ -609,22 +609,17 @@ the dangling assistant row**, i.e. before any of those appends — the
 `repair_tool_pairing` classifies as wedged (`transcript_repair.rs:152-153`),
 and nothing re-runs that repair before an LLM call.
 
-So the rule has one home, `AgentLoop::settle_before_append`, and the types
-keep every door on it: it returns an `AsksSettled` value nothing else can
-construct, and every append a door makes ahead of its turn
-(`append_user_message_with_platform_msg_id`, `append_issue_brief`,
-`append_cron_fire`, `append_cron_notification`,
-`append_background_notification_prompt_once`) and `compact_now` take
-`&AsksSettled`. A new door, or a new append, that skips the prelude does not
-compile. (`append_spawned_prompt` takes none: it opens a subagent's fresh
-session, which has no asks.) `AgentActor::settle_unapplied_asks()` is the
-actor's one-line way to call it with its own turn tokens. (A cleaner shape
-for the same guarantee — the appends as methods on a handle the prelude
-returns, with no token parameter — is deferred:
-[`../todo/ask-prelude-handle.md`](../todo/ask-prelude-handle.md).) The prelude
-does nothing when the manager
-reports no unapplied asks (no turn is opened) and otherwise settles them
-under a `with_turn(TurnInput::AskSettlement)` turn — appends, and for an approved call the re-execution
+`AgentLoop::settle_before_append` returns a `SettledTranscript` borrowing
+that loop exclusively. The actor appends user messages (including a
+coalesced batch), issue briefs, cron prompts and notifications through the
+handle. Background delivery uses the same handle to restore a prompt that
+was compacted away. Manual compaction also runs through the handle because
+its summariser reads the transcript. Compaction consumes the handle. For
+other inputs, the borrow ends before the actor runs the next turn. A newly spawned subagent opens its fresh
+session with `AgentLoop::append_spawned_prompt`.
+
+An empty ledger check returns the handle immediately. Otherwise the prelude
+settles outstanding asks under a `with_turn(TurnInput::AskSettlement)` turn — appends, and for an approved call the re-execution
 under a fresh step (it needs the executor and a turn to open a step under,
 which is why this is a turn and not a bare append; `publish_cron_notification`
 is the precedent for a turn whose body is only an append). The loop's
@@ -664,7 +659,7 @@ the user's next message.
 When a door calls the settlement no *live* ask can exist for the session —
 an actor runs one turn at a time — so `settle_unapplied` only ever meets
 dead entries; a live one is a bug and is logged, not touched. For the
-issue-run requeue the settlement runs as its own Resume turn (`settle_before_append`) and
+issue-run requeue the settlement runs as its own AskSettlement turn (`settle_before_append`) and
 the real `IssueRun` turn with its `IssueRunWaiter` follows; the approved
 call executes exactly once, under the Resume turn, and `finish_run` fires
 once, for the run.
@@ -1190,7 +1185,7 @@ impl AskStepInput {
 pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<dyn Tool>, ToolManifest)>; }
 
 // baybo_agent
-// AgentLoop::settle_unapplied_asks(session, …) is the settlement body; AgentLoop::settle_before_append wraps it in a Resume turn and returns the AsksSettled every door append takes; run_inner calls it for the chat Resume door
+// AgentLoop::settle_unapplied_asks(session, …) is the settlement body; AgentLoop::settle_before_append opens its AskSettlement turn and returns the SettledTranscript used by the door; run_inner calls it for the chat Resume door
 ```
 
 `ApprovalSurface` on `Channel` becomes
@@ -1444,8 +1439,8 @@ leaves draft.
   `run_agent_loop`; `ToolExecutor::new(…, policy_deny)`; `PausableDeadline`
   + `TOOL_DEADLINE_GRACE`; `Ancestor` branch appends/emits nothing, `Turn`
   branch claims `abandon_for_tool_call` before each append;
-  `AgentLoop::settle_before_append` → `AsksSettled`, required by every door
-  append and by `compact_now`; `AgentLoop::settle_unapplied_asks(session, …)`;
+  `AgentLoop::settle_before_append` → `SettledTranscript`, which owns the door
+  appends and `compact_now`; `AgentLoop::settle_unapplied_asks(session, …)`;
   `PreDecided` re-execute; `ResumeSink` impl;
   `AgentMessage::ResumeAsk` / `handle_resume_ask`;
   `restore_from_store(&awaiting_ask)` →
