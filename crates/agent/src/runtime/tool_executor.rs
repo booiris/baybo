@@ -991,7 +991,6 @@ impl ToolExecutor {
                 // read back what any mid-call prompt decided.
                 let approval = ApprovalHandle::new(
                     Arc::clone(&gate),
-                    Arc::clone(approved_resources),
                     tool_use_id.clone(),
                     turn_id,
                     park_gauge.clone(),
@@ -2593,7 +2592,7 @@ mod tests {
                     .approval
                     .as_ref()
                     .expect("approval handle")
-                    .request(
+                    .request_uncached(
                         self.name(),
                         &ctx.session_id,
                         &ctx.user,

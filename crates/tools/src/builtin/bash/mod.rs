@@ -2646,9 +2646,9 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ApprovalHandle;
     use crate::SandboxedOutput;
     use crate::test_support::{FakeApprovalGate, FakeExecSandbox};
-    use crate::{ApprovalHandle, ApprovedResource};
     use baybo_model::{ChannelType, User};
     use parking_lot::Mutex;
     use std::os::unix::fs::PermissionsExt;
@@ -3669,11 +3669,9 @@ mod tests {
         gate: Arc<FakeApprovalGate>,
     ) -> ToolContext {
         let mut ctx = ctx_with(sandbox);
-        let cache: Arc<Mutex<Vec<ApprovedResource>>> = Arc::new(Mutex::new(Vec::new()));
         ctx.approval = Some(
             ApprovalHandle::new(
                 gate,
-                cache,
                 String::new(),
                 baybo_model::TurnId::default(),
                 crate::ParkGauge::new(),

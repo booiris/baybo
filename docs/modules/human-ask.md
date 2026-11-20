@@ -82,7 +82,7 @@ the router) arrives as a port it defines.
   `DuringExecuteResumable` approval (a tool opting in via
   `Tool::during_execute_resumer` + `DuringExecuteResumer`, e.g. Bash's post-failure retry)
   invokes `DuringExecuteResumer::resume_during_execute`. An approval raised via
-  `request` / `request_uncached` is `DuringExecuteNonResumable` even if its tool
+  `request_uncached` is `DuringExecuteNonResumable` even if its tool
   exposes that hook. See
   [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 - **Row states** — `pending` (`resolved_at IS NULL`), `resolved`

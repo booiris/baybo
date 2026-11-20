@@ -735,20 +735,12 @@ pub fn noop_event_sink() -> Arc<dyn ToolEventSink> {
 }
 
 /// Mid-execution approval entry point handed to a tool through
-/// [`ToolContext::approval`]. Wraps the resolved gate plus a shared
-/// handle to the session's approved-resources cache. The handle is
-/// cache-aware in both directions:
-///
-/// - Read: before forwarding to the gate, request filters out
-///   accesses that the cache already covers (matches the pre-execute
-///   gate in `baybo-agent`'s `ToolExecutor`). When *all* accesses are
-///   covered the call short-circuits to `Approve` without prompting.
-/// - Write: on `ApproveAlways` the granted accesses are appended to
-///   the cache so a follow-up call inside the same session does not
-///   re-prompt.
+/// [`ToolContext::approval`]. Mid-execution prompts never consult or populate
+/// the session approval cache; cacheable authorization belongs to the
+/// executor's pre-execute gate.
 ///
 /// Every prompt it raises is a during-execute ask ([`AskPhase::DuringExecuteNonResumable`]
-/// for [`Self::request`] / [`Self::request_uncached`], or
+/// for [`Self::request_uncached`], or
 /// [`AskPhase::DuringExecuteResumable`] for
 /// [`Self::request_resumable_uncached`] when the owning tool wires
 /// [`Tool::during_execute_resumer`]) on the requesting user's channel, raced
@@ -757,10 +749,6 @@ pub fn noop_event_sink() -> Arc<dyn ToolEventSink> {
 #[derive(Clone)]
 pub struct ApprovalHandle {
     gate: Arc<dyn ApprovalGate>,
-    /// Shared cache. Same `Arc` the agent's `ToolExecutor` consults
-    /// for pre-execute approvals, so mid-execution prompts and
-    /// pre-execute prompts use a single source of truth.
-    approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
     /// `tool_use_id` of the call this handle serves, stamped onto every
     /// [`ApprovalRequest`] so clients can badge the right work step.
     tool_call_id: String,
@@ -773,9 +761,8 @@ pub struct ApprovalHandle {
     /// resumable.
     can_resume_during_execute: bool,
     pre_execute_accesses: Vec<ResourceAccess>,
-    /// Last outcome an ACTUAL prompt returned (cache short-circuits never
-    /// record). Shared across clones so the executor reads back what
-    /// mid-execution prompts decided after the tool returns.
+    /// Last outcome a prompt returned. Shared across clones so the executor
+    /// reads back what mid-execution prompts decided after the tool returns.
     last_outcome: Arc<parking_lot::Mutex<Option<ApprovalOutcome>>>,
     park: ParkGauge,
     cancel: AskCancel,
@@ -784,7 +771,6 @@ pub struct ApprovalHandle {
 impl ApprovalHandle {
     pub fn new(
         gate: Arc<dyn ApprovalGate>,
-        approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
         tool_call_id: String,
         turn_id: TurnId,
         park: ParkGauge,
@@ -792,7 +778,6 @@ impl ApprovalHandle {
     ) -> Self {
         Self {
             gate,
-            approved_cache,
             tool_call_id,
             turn_id,
             can_resume_during_execute: false,
@@ -859,7 +844,7 @@ impl ApprovalHandle {
     }
 
     /// Decision of the most recent prompt this handle (or any clone) actually
-    /// raised — `None` when everything was covered by cache. The executor
+    /// raised — `None` before any prompt resolves. The executor
     /// stamps this into the persisted [`baybo_model::ToolResultMeta`].
     pub fn last_decision(&self) -> Option<ApprovalDecision> {
         self.last_outcome().map(|outcome| outcome.decision)
@@ -876,7 +861,7 @@ impl ApprovalHandle {
     /// from a previously-cached one (e.g. an *unsandboxed* re-run of a
     /// command whose sandboxed run was already approved): the cache
     /// entry covers the original privilege but not the elevated one,
-    /// so we must always re-prompt. Never persists the decision —
+    /// so we must always re-prompt. Never caches the decision —
     /// follow-up calls always re-prompt too.
     ///
     /// Returns the full outcome so callers can distinguish denial from expiry.
@@ -945,69 +930,6 @@ impl ApprovalHandle {
             description: None,
         };
         self.raise(req, user.channel.clone(), phase).await
-    }
-
-    /// Forward a request to the gate, filtered by the session approval
-    /// cache. Returns `Approve` without prompting when every access is
-    /// already covered. On `ApproveAlways`, persists the (uncovered)
-    /// accesses into the cache before returning.
-    pub async fn request(
-        &self,
-        tool: &str,
-        session_id: &SessionId,
-        user: &User,
-        accesses: Vec<ResourceAccess>,
-        params_preview: String,
-    ) -> ApprovalOutcome {
-        // Filter against the cache up front. Read-only file accesses
-        // were already a no-op for the pre-execute gate (see
-        // `ToolExecutor::execute`); preserve that behaviour here so
-        // mid-execution prompts do not appear stricter than the
-        // pre-execute pass.
-        let uncovered: Vec<ResourceAccess> = {
-            let cache = self.approved_cache.lock();
-            accesses
-                .into_iter()
-                .filter(|acc| {
-                    if matches!(acc, ResourceAccess::ReadFile { .. }) {
-                        return false;
-                    }
-                    !cache.iter().any(|ar| ar.covers(acc))
-                })
-                .collect()
-        };
-
-        if uncovered.is_empty() {
-            return ApprovalOutcome::policy(ApprovalDecision::Approve);
-        }
-
-        let req = ApprovalRequest {
-            ask_id: baybo_model::human_ask::AskId::new(),
-            tool_call_id: self.tool_call_id.clone(),
-            session_id: session_id.clone(),
-            user_id: user.id.clone(),
-            tool: tool.to_string(),
-            accesses: uncovered.clone(),
-            params_preview,
-            description: None,
-        };
-        let outcome = self
-            .raise(
-                req,
-                user.channel.clone(),
-                AskPhase::DuringExecuteNonResumable,
-            )
-            .await;
-        if outcome.decision == ApprovalDecision::ApproveAlways {
-            let mut cache = self.approved_cache.lock();
-            for access in &uncovered {
-                let entry = access.to_approved();
-                if !cache.iter().any(|existing| existing == &entry) {
-                    cache.push(entry);
-                }
-            }
-        }
-        outcome
     }
 }
 
@@ -1414,7 +1336,6 @@ mod approval_handle_tests {
     fn handle(decision: ApprovalDecision) -> ApprovalHandle {
         ApprovalHandle::new(
             Arc::new(FixedGate(decision)),
-            Arc::new(parking_lot::Mutex::new(Vec::new())),
             "use-1".into(),
             TurnId::default(),
             ParkGauge::new(),
@@ -1436,7 +1357,7 @@ mod approval_handle_tests {
         let probe = h.clone();
         assert_eq!(probe.last_decision(), None);
         let d = h
-            .request(
+            .request_uncached(
                 "Bash",
                 &"s".into(),
                 &user(),
@@ -1448,59 +1369,6 @@ mod approval_handle_tests {
             .await;
         assert_eq!(d, ApprovalOutcome::answered(ApprovalDecision::Deny));
         assert_eq!(probe.last_decision(), Some(ApprovalDecision::Deny));
-    }
-
-    #[tokio::test]
-    async fn cache_short_circuit_records_nothing() {
-        let h = handle(ApprovalDecision::Approve);
-        let probe = h.clone();
-        // ReadFile accesses are exempt from prompting, so the gate is never
-        // consulted and the short-circuit Approve must NOT be recorded as a
-        // prompted decision.
-        let d = h
-            .request(
-                "Read",
-                &"s".into(),
-                &user(),
-                vec![ResourceAccess::ReadFile {
-                    path: std::path::PathBuf::from("/tmp/x"),
-                }],
-                "{}".into(),
-            )
-            .await;
-        assert_eq!(d, ApprovalOutcome::policy(ApprovalDecision::Approve));
-        assert_eq!(probe.last_decision(), None, "no prompt raised, no record");
-    }
-
-    #[tokio::test]
-    async fn a_cached_hit_resolves_as_policy_not_answered() {
-        let cache = Arc::new(parking_lot::Mutex::new(vec![
-            ResourceAccess::ExecCommand {
-                command: "x".into(),
-            }
-            .to_approved(),
-        ]));
-        let h = ApprovalHandle::new(
-            Arc::new(FixedGate(ApprovalDecision::Deny)),
-            cache,
-            "use-1".into(),
-            TurnId::default(),
-            ParkGauge::new(),
-            AskCancel::never(),
-        );
-        let out = h
-            .request(
-                "Bash",
-                &"s".into(),
-                &user(),
-                vec![ResourceAccess::ExecCommand {
-                    command: "x".into(),
-                }],
-                "{}".into(),
-            )
-            .await;
-        assert_eq!(out, ApprovalOutcome::policy(ApprovalDecision::Approve));
-        assert_eq!(h.last_decision(), None);
     }
 
     #[tokio::test]

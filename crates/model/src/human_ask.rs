@@ -135,7 +135,7 @@ pub enum AskPhase {
     /// After its original future goes away, the approved call resumes via
     /// the owning tool's `DuringExecuteResumer` hook.
     DuringExecuteResumable,
-    /// An approval raised via `request` / `request_uncached`, even when the
+    /// An approval raised via `request_uncached`, even when the
     /// tool exposes a resumer. It expires after `DURING_EXECUTE_APPROVAL_TIMEOUT`
     /// and is abandoned if its future dies.
     DuringExecuteNonResumable,

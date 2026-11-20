@@ -895,7 +895,6 @@ mod tests {
 
     use baybo_model::{ArtifactSource, ChannelType, TrustLevel, User};
     use baybo_tools::{ApprovalHandle, AutoDenyGate};
-    use parking_lot::Mutex;
     use tempfile::tempdir;
 
     use super::*;
@@ -934,7 +933,6 @@ mod tests {
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             approval: Some(ApprovalHandle::new(
                 Arc::new(AutoDenyGate),
-                Arc::new(Mutex::new(Vec::new())),
                 String::new(),
                 baybo_model::TurnId::default(),
                 baybo_tools::ParkGauge::new(),

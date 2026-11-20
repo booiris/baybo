@@ -7,7 +7,7 @@
 > `Tool::during_execute_resumer` + `DuringExecuteResumer`
 > (`AskPhase::DuringExecuteResumable`). Plain `AskPhase::DuringExecuteNonResumable`
 > (default for any tool that does not implement `DuringExecuteResumer`, or any
-> prompt raised via `ApprovalHandle::request` / `request_uncached`) stays
+> prompt raised via `ApprovalHandle::request_uncached`) stays
 > non-resumable and keeps `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min) and
 > `ActorStopCost::AbandonsAsks`.
 
@@ -29,7 +29,7 @@ An approval is raised in one of three phases (`AskPhase`):
   to the standard `ToolError::Denied`.
 - **During execute, non-resumable (`AskPhase::DuringExecuteNonResumable`)** — the fail-safe
   default for any tool that raises a mid-execution prompt via
-  `ApprovalHandle::request` / `request_uncached`. Governed by
+  `ApprovalHandle::request_uncached`. Governed by
   `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min), guarded from idle-reaper
   abandonment by `ActorStopCost::AbandonsAsks`, and closed/abandoned if its
   tool future dies.
@@ -80,5 +80,5 @@ An approval is raised in one of three phases (`AskPhase`):
    `Tool::during_execute_resumer().is_some()` at runtime). `PreExecuteGate::PreDecided { decision, phase, accesses }`
    dispatches `DuringExecuteResumer::resume_during_execute` without leaking any
    Bash/sandbox concept into the generic gate or `ToolContext`. Ordinary
-   `request` / `request_uncached` prompts keep `AskPhase::DuringExecuteNonResumable` with
+   `request_uncached` prompts keep `AskPhase::DuringExecuteNonResumable` with
    `DURING_EXECUTE_APPROVAL_TIMEOUT` and `ActorStopCost::AbandonsAsks`.
