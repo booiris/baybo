@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use baybo_model::ChannelType;
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::channel_bot::{ChannelBotRow, ChannelBotStore, Result};
 
 pub struct SqliteChannelBotStore {
@@ -15,6 +14,18 @@ impl SqliteChannelBotStore {
     }
 }
 
+const BOT: RowDecoder<ChannelBotRow> = RowDecoder {
+    table: "channel_bots",
+    key: "bot_id",
+    decode: |row| {
+        Ok(ChannelBotRow {
+            channel_type: ChannelType::from(row.get::<_, String>("channel_type")?.as_str()),
+            bot_id: row.get("bot_id")?,
+            created_at: row.get("created_at")?,
+        })
+    },
+};
+
 #[async_trait]
 impl ChannelBotStore for SqliteChannelBotStore {
     async fn list_live(&self, channel_type: &ChannelType) -> Result<Vec<ChannelBotRow>> {
@@ -26,23 +37,7 @@ impl ChannelBotStore for SqliteChannelBotStore {
                  WHERE channel_type = ?1
                  ORDER BY created_at DESC",
                 )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![channel_type], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows
-                    .into_iter()
-                    .map(|(channel_type_s, bot_id, created_at)| ChannelBotRow {
-                        channel_type: ChannelType::from(channel_type_s.as_str()),
-                        bot_id,
-                        created_at,
-                    })
-                    .collect())
+                BOT.list(stmt.query(rusqlite::params![channel_type])?)
             })
             .await
     }
@@ -52,26 +47,12 @@ impl ChannelBotStore for SqliteChannelBotStore {
         let bot_id = bot_id.to_string();
         self.pool
             .interact("channel_bots.get", move |conn| {
-                let row = conn
-                    .query_row(
+                BOT.optional(
+                    conn.prepare(
                         "SELECT channel_type, bot_id, created_at FROM channel_bots
                  WHERE channel_type = ?1 AND bot_id = ?2",
-                        rusqlite::params![channel_type, bot_id],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
-                Ok(
-                    row.map(|(channel_type_s, bot_id, created_at)| ChannelBotRow {
-                        channel_type: ChannelType::from(channel_type_s.as_str()),
-                        bot_id,
-                        created_at,
-                    }),
+                    )?
+                    .query(rusqlite::params![channel_type, bot_id])?,
                 )
             })
             .await

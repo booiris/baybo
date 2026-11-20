@@ -5,10 +5,8 @@ use baybo_model::{
     AgentFramework, AgentHandle, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName, LlmPin,
     ProjectId, TeamMembership,
 };
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
-use baybo_store::StorageError;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfileUpdate, Result};
 
 /// Card text of the seeded built-in profile. Permanent copy: the builtin's
@@ -56,145 +54,76 @@ impl SqliteAgentProfileStore {
     }
 }
 
-fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
-    StorageError::Internal(anyhow::anyhow!("sqlite {ctx}: {e}"))
-}
-
-/// Map a sqlite write error to [`StorageError::Conflict`] when it tripped a
-/// constraint, else a generic internal error. Same message-sniff as the
-/// device store.
-///
-/// Two constraints reach this. `PRIMARY KEY(id)` is a backstop nothing
-/// hits, since ids are freshly-minted ULIDs. `idx_agent_profiles_handle` is
-/// live: two hires racing for `@dev-1` is exactly what it exists to refuse,
-/// and the loser must see a conflict rather than an internal error.
-fn write_conflict_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
-    let msg = e.to_string();
-    if msg.contains("constraint") || msg.contains("UNIQUE") {
-        StorageError::Conflict(format!("{ctx}: conflicting write"))
-    } else {
-        col_err(ctx, e)
-    }
-}
-
-/// The `SELECT_COLS` columns exactly as sqlite hands them over. Decoding into
-/// an [`AgentProfileRow`] can fail with a non-`Internal` [`StorageError`], which
-/// cannot be built inside the `interact` closure — so the raw columns come out
-/// first and are decoded afterwards.
-type RawProfileRow = (
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    i64,
-    i64,
-);
-
-fn read_raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProfileRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-        row.get(12)?,
-        row.get(13)?,
-    ))
-}
-
-fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
-    let (
-        id,
-        description,
-        avatar_blob_id,
-        framework_raw,
-        llm_entry,
-        llm_model,
-        llm_effort,
-        builtin_col,
-        project_id,
-        handle,
-        hired_by,
-        deleted_at_us,
-        created_at_us,
-        updated_at_us,
-    ) = raw;
-    let framework = AgentFramework::parse(&framework_raw).ok_or_else(|| {
-        StorageError::Storage(format!(
-            "agent_profiles.framework: unknown value {framework_raw:?}"
-        ))
-    })?;
-    let stamp = |column: &str, us: i64| {
-        super::time::from_us(us)
-            .ok_or_else(|| StorageError::Storage(format!("{column} out of range: {us}")))
-    };
-    let created_at = stamp("agent_profiles.created_at", created_at_us)?;
-    let updated_at = stamp("agent_profiles.updated_at", updated_at_us)?;
-    let deleted_at = deleted_at_us
-        .map(|us| stamp("agent_profiles.deleted_at", us))
-        .transpose()?;
-    // Both columns or neither: the pair is what `TeamMembership` means, and
-    // a half-written membership is an agent the roster shows and nobody can
-    // mention, or one that is mentionable and belongs to no board.
-    let team = match (project_id, handle) {
-        (Some(project_id), Some(handle)) => Some(TeamMembership {
-            project_id: ProjectId::parse(project_id)
-                .map_err(|e| StorageError::Storage(e.to_string()))?,
-            handle: AgentHandle::parse(handle).map_err(|e| StorageError::Storage(e.to_string()))?,
-        }),
-        (None, None) => None,
-        (project_id, handle) => {
-            return Err(StorageError::Storage(format!(
-                "agent_profiles: half a team membership (project_id={project_id:?}, \
+const PROFILE: RowDecoder<AgentProfileRow> = RowDecoder {
+    table: "agent_profiles",
+    key: "id",
+    decode: |row| {
+        let id: String = row.get("id")?;
+        let framework_raw: String = row.get("framework")?;
+        let llm_entry: Option<String> = row.get("llm")?;
+        let llm_model: Option<String> = row.get("llm_model")?;
+        let llm_effort: Option<String> = row.get("llm_effort")?;
+        let builtin_col: i64 = row.get("builtin")?;
+        let project_id: Option<String> = row.get("project_id")?;
+        let handle: Option<String> = row.get("handle")?;
+        let hired_by: Option<String> = row.get("hired_by")?;
+        let deleted_at_us: Option<i64> = row.get("deleted_at")?;
+        let created_at_us: i64 = row.get("created_at")?;
+        let updated_at_us: i64 = row.get("updated_at")?;
+        let framework = AgentFramework::parse(&framework_raw).ok_or_else(|| {
+            anyhow::anyhow!("agent_profiles.framework: unknown value {framework_raw:?}")
+        })?;
+        let stamp = |column: &str, us: i64| {
+            super::time::from_us(us).ok_or_else(|| anyhow::anyhow!("{column} out of range: {us}"))
+        };
+        let created_at = stamp("agent_profiles.created_at", created_at_us)?;
+        let updated_at = stamp("agent_profiles.updated_at", updated_at_us)?;
+        let deleted_at = deleted_at_us
+            .map(|us| stamp("agent_profiles.deleted_at", us))
+            .transpose()?;
+        // Both columns or neither: the pair is what `TeamMembership` means, and
+        // a half-written membership is an agent the roster shows and nobody can
+        // mention, or one that is mentionable and belongs to no board.
+        let team = match (project_id, handle) {
+            (Some(project_id), Some(handle)) => Some(TeamMembership {
+                project_id: ProjectId::parse(project_id)?,
+                handle: AgentHandle::parse(handle)?,
+            }),
+            (None, None) => None,
+            (project_id, handle) => {
+                anyhow::bail!(
+                    "agent_profiles: half a team membership (project_id={project_id:?}, \
                  handle={handle:?})"
-            )));
-        }
-    };
-    Ok(AgentProfileRow {
-        // A stored id that fails the grammar is a hard error, not a warn:
-        // this id names the profile's persona directory, and every consumer
-        // of the row joins it back onto the filesystem.
-        id: AgentProfileId::parse(id).map_err(|e| StorageError::Storage(e.to_string()))?,
-        description,
-        avatar_blob_id,
-        framework,
-        llm: LlmPin {
-            entry: llm_entry.map(LlmEntryName::from),
-            model: llm_model,
-            effort: llm_effort,
-        },
-        builtin: builtin_col != 0,
-        team,
-        hired_by: hired_by
-            .map(AgentProfileId::parse)
-            .transpose()
-            .map_err(|e| StorageError::Storage(e.to_string()))?,
-        deleted_at,
-        created_at,
-        updated_at,
-    })
-}
+                );
+            }
+        };
+        Ok(AgentProfileRow {
+            // A stored id that fails the grammar is a hard error, not a warn:
+            // this id names the profile's persona directory, and every consumer
+            // of the row joins it back onto the filesystem.
+            id: AgentProfileId::parse(id)?,
+            description: row.get("description")?,
+            avatar_blob_id: row.get("avatar_blob_id")?,
+            framework,
+            llm: LlmPin {
+                entry: llm_entry.map(LlmEntryName::from),
+                model: llm_model,
+                effort: llm_effort,
+            },
+            builtin: builtin_col != 0,
+            team,
+            hired_by: hired_by.map(AgentProfileId::parse).transpose()?,
+            deleted_at,
+            created_at,
+            updated_at,
+        })
+    },
+};
 
 #[async_trait]
 impl AgentProfileStore for SqliteAgentProfileStore {
     async fn list(&self) -> Result<Vec<AgentProfileRow>> {
-        let raws = self
-            .pool
+        self.pool
             .interact("agent_profiles.list", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     // The scope filter is in the statement so no caller can
@@ -204,68 +133,51 @@ impl AgentProfileStore for SqliteAgentProfileStore {
                      WHERE project_id IS NULL \
                      ORDER BY builtin DESC, id"
                 ))?;
-                let raws = stmt
-                    .query_map([], read_raw_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(raws)
+                PROFILE.list(stmt.query([])?)
             })
-            .await?;
-        raws.into_iter().map(row_from_raw).collect()
+            .await
     }
 
     async fn list_team_history(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>> {
         let project = project.as_str().to_string();
-        let raws = self
-            .pool
+        self.pool
             .interact("agent_profiles.list_team_history", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {SELECT_COLS} FROM agent_profiles \
                      WHERE project_id = ?1 \
                      ORDER BY created_at ASC, id ASC"
                 ))?;
-                let raws = stmt
-                    .query_map(rusqlite::params![project], read_raw_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(raws)
+                PROFILE.list(stmt.query(rusqlite::params![project])?)
             })
-            .await?;
-        raws.into_iter().map(row_from_raw).collect()
+            .await
     }
 
     async fn list_team(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>> {
         let project = project.as_str().to_string();
-        let raws = self
-            .pool
+        self.pool
             .interact("agent_profiles.list_team", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {SELECT_COLS} FROM agent_profiles \
                      WHERE project_id = ?1 AND deleted_at IS NULL \
                      ORDER BY handle"
                 ))?;
-                let raws = stmt
-                    .query_map(rusqlite::params![project], read_raw_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(raws)
+                PROFILE.list(stmt.query(rusqlite::params![project])?)
             })
-            .await?;
-        raws.into_iter().map(row_from_raw).collect()
+            .await
     }
 
     async fn get(&self, id: &AgentProfileId) -> Result<Option<AgentProfileRow>> {
         let id = id.as_str().to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact("agent_profiles.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!("SELECT {SELECT_COLS} FROM agent_profiles WHERE id = ?1"),
-                        rusqlite::params![id],
-                        read_raw_row,
-                    )
-                    .optional()?)
+                PROFILE.optional(
+                    conn.prepare(&format!(
+                        "SELECT {SELECT_COLS} FROM agent_profiles WHERE id = ?1"
+                    ))?
+                    .query(rusqlite::params![id])?,
+                )
             })
-            .await?;
-        raw.map(row_from_raw).transpose()
+            .await
     }
 
     async fn create(&self, row: &AgentProfileRow) -> Result<()> {
@@ -281,15 +193,12 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let hired_by = row.hired_by.as_ref().map(|id| id.as_str().to_string());
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
-        // The write error has to survive the closure as data: `Conflict` is a
-        // non-`Internal` variant and can't be built inside it.
-        let outcome = self
-            .pool
+        self.pool
             .interact_write("agent_profiles.create", move |conn| {
                 // Neither `builtin` nor `deleted_at` is in the column list:
                 // the schema default fills the first (so the seed stays the
                 // only writer of 1) and an agent is never born removed.
-                match conn.execute(
+                conn.execute(
                     "INSERT INTO agent_profiles \
                      (id, description, avatar_blob_id, framework, \
                       llm, llm_model, llm_effort, \
@@ -309,16 +218,13 @@ impl AgentProfileStore for SqliteAgentProfileStore {
                         created_at,
                         updated_at,
                     ],
-                ) {
-                    Ok(_) => Ok(None),
-                    Err(e) => Ok(Some(e.to_string())),
-                }
+                )
+                .map_err(|e| {
+                    super::unique_conflict(e, "create agent profile: conflicting write")
+                })?;
+                Ok(())
             })
-            .await?;
-        match outcome {
-            None => Ok(()),
-            Some(e) => Err(write_conflict_err("create agent profile", e)),
-        }
+            .await
     }
 
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool> {
@@ -326,29 +232,26 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let description = update.description.clone();
         let framework = update.framework.as_str();
         let now = super::time::now_us();
-        let outcome = self
-            .pool
+        self.pool
             .interact_write("agent_profiles.update", move |conn| {
-                match conn.execute(
-                    // The self-reference on the builtin's `framework` is the
-                    // guard: no caller can move it off baybo, while every
-                    // other row takes the requested value.
-                    "UPDATE agent_profiles SET \
+                let affected = conn
+                    .execute(
+                        // The self-reference on the builtin's `framework` is the
+                        // guard: no caller can move it off baybo, while every
+                        // other row takes the requested value.
+                        "UPDATE agent_profiles SET \
                      description = ?2, \
                      framework = CASE WHEN builtin = 1 THEN framework ELSE ?3 END, \
                      updated_at = ?4 \
                      WHERE id = ?1",
-                    rusqlite::params![id, description, framework, now],
-                ) {
-                    Ok(affected) => Ok(Ok(affected)),
-                    Err(e) => Ok(Err(e.to_string())),
-                }
+                        rusqlite::params![id, description, framework, now],
+                    )
+                    .map_err(|e| {
+                        super::unique_conflict(e, "update agent profile: conflicting write")
+                    })?;
+                Ok(affected > 0)
             })
-            .await?;
-        match outcome {
-            Ok(affected) => Ok(affected > 0),
-            Err(e) => Err(write_conflict_err("update agent profile", e)),
-        }
+            .await
     }
 
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool> {
@@ -453,6 +356,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_store::StorageError;
     use chrono::{DateTime, Utc};
 
     async fn open_store() -> SqliteAgentProfileStore {
@@ -560,6 +464,30 @@ mod tests {
             "all three levels of the pin survive the insert, not just the entry"
         );
         assert_eq!(back.created_at, row.created_at);
+    }
+
+    #[tokio::test]
+    async fn a_damaged_profile_does_not_hide_the_builtin() {
+        let store = open_store().await;
+        let profile = custom_row();
+        store.create(&profile).await.unwrap();
+        store
+            .pool
+            .interact_write("test.break_profile", |conn| {
+                conn.execute(
+                    "UPDATE agent_profiles SET framework = 'future' WHERE builtin = 0",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(store.get(&profile.id).await, Err(StorageError::Corrupt {table: "agent_profiles", key, ..}) if key == profile.id.as_str())
+        );
+        let listed = store.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].builtin);
     }
 
     #[tokio::test]
