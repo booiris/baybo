@@ -1,11 +1,11 @@
 //! sqlite implementation of [`TaskStore`] — the per-session planning
 //! checklist (`session_tasks`).
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use baybo_model::{SessionId, Task, TaskId, TaskStatus};
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::StorageError;
 use baybo_store::task::{Result, TaskPatch, TaskStore};
 
@@ -22,54 +22,28 @@ impl SqliteTaskStore {
 const SELECT_COLS: &str =
     "task_id, subject, description, status, depends_on, created_at, updated_at";
 
-/// Parse one already-fetched row into a [`Task`]. `None` (with a `warn!`)
-/// when the row's content can't be made into a valid task — an unknown
-/// status from a future variant, a corrupt timestamp, or malformed
-/// `depends_on` JSON. Skipping rather than erroring keeps `list` from 500ing
-/// on a single bad row, mirroring the session-blob skip discipline.
-fn try_task_from_row(row: &rusqlite::Row<'_>) -> Option<Task> {
-    let task_id_s: String = row.get(0).ok()?;
-    let subject: String = row.get(1).ok()?;
-    let description: String = row.get(2).ok()?;
-    let status_s: String = row.get(3).ok()?;
-    let depends_on_s: String = row.get(4).ok()?;
-    let created_at_us: i64 = row.get(5).ok()?;
-    let updated_at_us: i64 = row.get(6).ok()?;
-
-    let id = match task_id_s.parse::<TaskId>() {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(task_id = %task_id_s, error = %e, "skipping session_tasks row: bad task_id");
-            return None;
-        }
-    };
-    let status = match TaskStatus::from_storage_str(&status_s) {
-        Some(s) => s,
-        None => {
-            tracing::warn!(status = %status_s, %id, "skipping session_tasks row: unknown status");
-            return None;
-        }
-    };
-    let depends_on: Vec<TaskId> = match serde_json::from_str(&depends_on_s) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, %id, "skipping session_tasks row: bad depends_on json");
-            return None;
-        }
-    };
-    let created_at = super::time::from_us(created_at_us)?;
-    let updated_at = super::time::from_us(updated_at_us)?;
-
-    Some(Task {
-        id,
-        subject,
-        description,
-        status,
-        depends_on,
-        created_at,
-        updated_at,
-    })
-}
+const TASK: RowDecoder<Task> = RowDecoder {
+    table: "session_tasks",
+    key: "task_id",
+    decode: |row| {
+        Ok(Task {
+            id: row
+                .get::<_, String>("task_id")?
+                .parse()
+                .context("invalid task_id")?,
+            subject: row.get("subject")?,
+            description: row.get("description")?,
+            status: TaskStatus::from_storage_str(&row.get::<_, String>("status")?)
+                .context("unknown status")?,
+            depends_on: serde_json::from_str(&row.get::<_, String>("depends_on")?)
+                .context("invalid depends_on")?,
+            created_at: super::time::from_us(row.get("created_at")?)
+                .context("invalid created_at")?,
+            updated_at: super::time::from_us(row.get("updated_at")?)
+                .context("invalid updated_at")?,
+        })
+    },
+};
 
 fn depends_on_json(depends_on: &[TaskId]) -> Result<String> {
     serde_json::to_string(depends_on)
@@ -126,12 +100,10 @@ impl TaskStore for SqliteTaskStore {
                 let sql = format!(
                     "SELECT {SELECT_COLS} FROM session_tasks WHERE session_id = ?1 AND task_id = ?2"
                 );
-                let row = conn
-                    .query_row(&sql, rusqlite::params![session_id, task_id], |row| {
-                        Ok(try_task_from_row(row))
-                    })
-                    .optional()?;
-                Ok(row.flatten())
+                TASK.optional(
+                    conn.prepare(&sql)?
+                        .query(rusqlite::params![session_id, task_id])?,
+                )
             })
             .await
     }
@@ -147,15 +119,7 @@ impl TaskStore for SqliteTaskStore {
                      ORDER BY created_at, task_id"
                 );
                 let mut stmt = conn.prepare(&sql)?;
-                let out = stmt
-                    .query_map(rusqlite::params![session_id], |row| {
-                        Ok(try_task_from_row(row))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<Task>>();
-                Ok(out)
+                TASK.list(stmt.query([session_id])?)
             })
             .await
     }
@@ -284,6 +248,32 @@ mod tests {
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session(id)).await.unwrap();
         (SqliteTaskStore::new(pool), SessionId::from(id))
+    }
+
+    #[tokio::test]
+    async fn invalid_sqlite_field_type_is_visible_on_get_and_isolated_on_list() {
+        let (store, sid) = store_with_session("tasks").await;
+        let good = make_task("good", TaskStatus::Pending);
+        let damaged = make_task("damaged", TaskStatus::Pending);
+        for task in [&good, &damaged] {
+            store.create(&sid, task).await.unwrap();
+        }
+        let id = damaged.id.to_string();
+        store
+            .pool
+            .interact_write("test.break_task", move |conn| {
+                conn.execute(
+                    "UPDATE session_tasks SET subject = x'00' WHERE task_id = ?1",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.list(&sid).await.unwrap(), [good]);
+        assert!(
+            matches!(store.get(&sid, &damaged.id).await, Err(StorageError::Corrupt {table: "session_tasks", key, .. }) if key == damaged.id.to_string())
+        );
     }
 
     #[tokio::test]
