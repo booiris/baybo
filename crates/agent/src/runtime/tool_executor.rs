@@ -424,7 +424,7 @@ pub enum PreExecuteGate {
 
 struct PreparedApproval {
     ask: PreExecuteAsk,
-    authorized_accesses: Vec<ResourceAccess>,
+    requested_accesses: Vec<ResourceAccess>,
 }
 
 impl PreparedApproval {
@@ -788,14 +788,14 @@ impl ToolExecutor {
         let Some(ask) = tool.pre_execute_ask(revealed_params, ctx, check).await else {
             return Ok(None);
         };
-        let authorized_accesses = ask.accesses.clone();
+        let requested_accesses = ask.accesses.clone();
         let mut value = serde_json::to_value(ask)?;
         self.security_gateway
             .sanitize_approval_value(&mut value, masked_params)
             .await?;
         Ok(Some(PreparedApproval {
             ask: serde_json::from_value(value)?,
-            authorized_accesses,
+            requested_accesses,
         }))
     }
 
@@ -1192,9 +1192,7 @@ impl ToolExecutor {
                 let needs_approval = prepared
                     .as_ref()
                     // An explicit ask without resources cannot be satisfied by resource grants.
-                    .is_some_and(|p| {
-                        p.authorized_accesses.is_empty() || !p.ask.accesses.is_empty()
-                    });
+                    .is_some_and(|p| p.requested_accesses.is_empty() || !p.ask.accesses.is_empty());
                 let outcome = match (&pre_execute, prepared.as_ref()) {
                     (PreExecuteGate::PreDecided { decision, .. }, _)
                         if resume_during_execute
@@ -1261,7 +1259,7 @@ impl ToolExecutor {
                 if let Some(prepared) = prepared
                     && let Some(approval) = ctx.approval.as_mut()
                 {
-                    approval.record_pre_execute_approval(prepared.authorized_accesses);
+                    approval.record_pre_execute_approval(prepared.requested_accesses);
                 }
 
                 // Re-resolved per call rather than cached, so an operator who
