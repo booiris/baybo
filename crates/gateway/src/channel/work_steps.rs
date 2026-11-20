@@ -67,6 +67,7 @@ pub(crate) fn in_flight_wire_steps(events: Vec<StampedEvent>) -> Vec<WireWorkSte
                 status,
                 summary,
                 approval,
+                ask,
             } => {
                 if let Some(&idx) = pending_tools.get(&call_id)
                     && let Some(step) = steps.get_mut(idx)
@@ -74,6 +75,7 @@ pub(crate) fn in_flight_wire_steps(events: Vec<StampedEvent>) -> Vec<WireWorkSte
                     step.status = Some(tool_status_str(status).to_owned());
                     step.summary = Some(summary);
                     step.approval = approval;
+                    step.ask = ask;
                 }
             }
             _ => {}
@@ -115,6 +117,7 @@ mod tests {
                 status: ToolStatus::Ok,
                 summary: "exit 0".into(),
                 approval: Some(baybo_tools::ApprovalDecision::Approve),
+                ask: None,
             }),
             ev(AgentEvent::AnswerDelta("the answer".into())),
         ]);
@@ -170,6 +173,7 @@ mod tests {
                 status: ToolStatus::Error,
                 summary: "boom".into(),
                 approval: None,
+                ask: None,
             }),
             // Blank reasoning is skipped.
             ev(AgentEvent::Reasoning("   ".into())),

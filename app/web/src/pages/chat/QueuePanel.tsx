@@ -39,8 +39,8 @@ export interface QueuePanelProps {
   sessionId: string;
   baseUrl: string;
   adminToken: string | null;
-  onFire: (item: QueuedItem) => void;
-  onResume: () => void;
+  onFire?: (item: QueuedItem) => void;
+  onResume?: () => void;
 }
 
 export function QueuePanel({
@@ -84,7 +84,7 @@ export function QueuePanel({
 
   return (
     <div className="pointer-events-auto relative z-10 mx-auto w-full max-w-3xl flex flex-col gap-1.5">
-      {pauseReason ? <CancelledBanner reason={pauseReason} onResume={onResume} /> : null}
+      {pauseReason && onResume ? <CancelledBanner reason={pauseReason} onResume={onResume} /> : null}
       {/* Slightly narrower than the input box and resting flush on the pill.
           No bottom border — the pill's top border is the single shared divider
           so the box's bottom coincides with the input box. Scrolls past max
@@ -109,7 +109,7 @@ export function QueuePanel({
                   item={item}
                   baseUrl={baseUrl}
                   adminToken={adminToken}
-                  onFire={() => onFire(item)}
+                  onFire={onFire && (() => onFire(item))}
                 />
               ))}
             </SortableContext>
@@ -139,7 +139,7 @@ function QueuedRow({
   item: QueuedItem;
   baseUrl: string;
   adminToken: string | null;
-  onFire: () => void;
+  onFire?: () => void;
 }) {
   const { removeItem, editItem } = useSessionQueue(sessionId);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -258,14 +258,16 @@ function QueuedRow({
           </>
         ) : (
           <>
-            <RowIconButton
-              onClick={onFire}
-              title="Send now"
-              label="Send this message now"
-              className="bg-brand hover:bg-brand-hover text-ink"
-            >
-              <RiSendPlane2Line className="text-sm" />
-            </RowIconButton>
+            {onFire && (
+              <RowIconButton
+                onClick={onFire}
+                title="Send now"
+                label="Send this message now"
+                className="bg-brand hover:bg-brand-hover text-ink"
+              >
+                <RiSendPlane2Line className="text-sm" />
+              </RowIconButton>
+            )}
             <RowIconButton
               onClick={() => removeItem(item.id)}
               title="Remove from queue"

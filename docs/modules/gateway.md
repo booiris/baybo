@@ -303,18 +303,19 @@ is the one the channel attaches to; the lazy install of an out-of-tree channel
 them from `GatewayDeps`. When a tool call hits the gate the ask is written to
 the `human_asks` ledger and pushed on the queue. Frames come from the queue
 watchers `build_channel` installs, not from the gate: `AskRaised` dispatches
-`SessionEvent::ApprovalRequested` through the channel's fan-out so every
-subscriber of the call's session sees it; every `AskClosed` dispatches
-`SessionEvent::AskResolved` (→ `Frame::AskResolved`), carrying the
-`decision` when a human decided an approval, so all frontends drop the card
-however it closed and can label the step with what was decided. A per-session pending-edge watcher
-broadcasts the `SessionPatch.awaiting_human` list mark. The client echoes a
-`ResolveApproval { ask_id, decision }` frame; the inbound loop checks the ask
-is on this connection's channel queue and calls `HumanAskManager::resolve`,
-which claims the decision in the ledger first and then removes the entry
-(the watchers do the broadcast). A resumable ask waits until a
-human answers it or a verb abandons it (`/stop`, a card close, a new message
-past a dead ask); a non-resumable `DuringExecuteNonResumable` approval expires after
+`SessionEvent::ApprovalRequested` or `SessionEvent::QuestionAsked` through the
+channel's fan-out so every subscriber of the call's session sees it; every
+`AskClosed` dispatches `SessionEvent::AskResolved` (→ `Frame::AskResolved`),
+carrying the `decision` when a human decided an approval, so all frontends drop
+the card however it closed and can label the step with what was decided. A
+per-session pending-edge watcher broadcasts the `SessionPatch.awaiting_human`
+list mark. Clients echo `ResolveApproval { ask_id, decision }` for approvals or
+`AnswerQuestion { ask_id, reply }` for questions; the inbound loop checks the
+ask is on this connection's channel queue and calls `HumanAskManager::resolve`,
+which claims the decision/answer in the ledger first and then removes the entry
+(the watchers do the broadcast). A resumable ask waits until a human answers it
+or a verb abandons it (`/stop`, a card close, a new message past a dead ask); a
+non-resumable `DuringExecuteNonResumable` approval expires after
 `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min). A process exit or idle release
 leaves resumable asks pending for the next boot or Resume turn (see
 [`human-ask.md`](human-ask.md)). The board's
@@ -327,20 +328,21 @@ reload, so a re-queued dead ask pushes once for a session nobody has open;
 `gateway_cmd` takes its stream off `ManagerGraph.ask_push_stream` when it
 spawns the push task.
 
-Approvals resolve through the **channel-level** gate (`ApprovalGateMap`
-keyed by `ChannelType`), with a second **session-level** tier
-(`(ChannelType, SessionId)`) for session-scoped clients;
+Approvals and questions resolve through `ChannelGates` (`ApprovalGateMap` +
+`QuestionGateMap` keyed by `ChannelType`), with a second **session-level** tier
+on approvals (`(ChannelType, SessionId)`) for session-scoped clients;
 `ApprovalGateMap::get` tries session-level first, then type-level, then
 falls back to the fail-closed `AutoDenyGate` (`crates/tools/src/
-approval.rs`). Because the gate lives on the long-lived channel rather
-than on a connection, a sidecar reconnecting does not lose pending
-approvals — a resubscribe re-delivers the full card set in the
-`SubscribeState` bundle's `pending_approvals` half (see the
-`Frame::Subscribe` handler), and a multiplexed sidecar, which has no
+approval.rs`), while `QuestionGateMap` is populated only for
+`ChannelType::owner()` (`AskUser` is owner-only). Because the gates live on the
+long-lived channel rather than on a connection, a client reconnecting does not
+lose pending asks — a resubscribe re-delivers the full card sets in the
+`SubscribeState` bundle's `pending_approvals` and `pending_questions` halves
+(see the `Frame::Subscribe` handler), and a multiplexed sidecar, which has no
 `SubscribeState`, is re-sent every pending approval on its queue right after
 it registers.
 
-### Gateway owns its own DTOs — utoipa stays in the gateway
+### Gateway DTOs and shared model types
 
 Route handlers call the manager `pub async fn` methods directly
 (`SessionManager`, `TurnLifecycle`, `CronScheduler`,
@@ -351,13 +353,11 @@ would force a cross-crate refactor of every `crates/cli/src/commands/`
 module. The duplicated surface is small and the independence is worth
 more than the line count saved.
 
-`baybo-gateway` is the only **crate** in the workspace that depends
-on `utoipa`. Domain crates (`baybo-model`, `baybo-turn`, `baybo-cron`,
-`baybo-tools`) stay HTTP-framework-agnostic — no `#[derive(ToSchema)]`,
-no `#[schema(...)]` attributes leaking into them. The gateway defines
-a mirror type for every domain type that appears on the wire and
-provides `From<Domain>` conversions; handlers build DTOs at the seam
-via `.map(DomainDto::from)`. `api/dto.rs` holds the shared envelopes
+The gateway uses the shared `baybo-model` types directly for the `AskUser`
+step summary, its questions, and their options. These types derive
+`utoipa::ToSchema` in `baybo-model` and keep their published `ChatAsk*`
+schema names. Gateway-specific representations use DTOs with
+`From<Domain>` conversions. `api/dto.rs` holds the shared envelopes
 (`ListResponse`, `ErrorBody`) and the mirrors for the CLI-parity
 families (status, config, llm, cron, channels, turns, traces, logs,
 analytics, tools); the handler modules define their own endpoint DTOs the same
@@ -1001,13 +1001,13 @@ The full frame set (see `crates/wire/src/lib.rs`):
   exactly one `SubscribeState` bundle — it never replays history
   (forward recovery is the REST sync call).
 - **State plane (server → client):** `SubscribeState { session_id,
-  as_of_ordinal?, turn, work_steps, pending_approvals, tasks }` — the
-  one atomic REPLACE bundle sent per Subscribe: turn activity (from the
-  turn store), the in-flight work block's buffered steps, the
-  authoritative pending-approval card set (one atomic queue read), and
-  the planning checklist, stamped with the session's newest persisted
-  ordinal. Staleness of the turn/work halves is judged by turn identity
-  (`started_at`), never by ordinal arithmetic.
+  as_of_ordinal?, turn, work_steps, pending_approvals, pending_questions,
+  tasks }` — the one atomic REPLACE bundle sent per Subscribe: turn activity
+  (from the turn store), the in-flight work block's buffered steps, the
+  authoritative pending-approval and pending-question card sets (one atomic
+  queue read), and the planning checklist, stamped with the session's newest
+  persisted ordinal. Staleness of the turn/work halves is judged by turn
+  identity (`started_at`), never by ordinal arithmetic.
 - **Loss signalling (server → client):** `Gap { session_id? }` — the
   server dropped frames it owed this connection (slow-consumer drop).
   `Some(id)` → the client syncs that session; `None` → it syncs every
@@ -1033,18 +1033,23 @@ The full frame set (see `crates/wire/src/lib.rs`):
   the `SubscribeState` bundle instead. Streaming clients (TUI / web)
   render these live; clients without a partial surface drop them.
   See [`docs/turn-progress-events.md`](../turn-progress-events.md).
-- **Approvals:** `ApprovalRequested` (server → client), `ResolveApproval`
-  (client → server); the on-subscribe
-  authoritative set rides `SubscribeState.pending_approvals`. Approvals
-  survive a restart (the boot reload re-queues them from the `human_asks`
-  ledger) and never time out, except a during-execute approval (30 min). `AskResolved { ask_id, outcome, decision? }` (server →
-  client, session-less, `outcome` ∈ `answered | declined | abandoned`) is
-  sent once on every close of any ask kind; `decision` is set only when a
-  human decided an approval. It is the one close frame. `ResolveApproval` resolves through
+- **Approvals & questions:** `ApprovalRequested` / `QuestionAsked`
+  (server → client), `ResolveApproval` / `AnswerQuestion` (client → server);
+  the on-subscribe authoritative sets ride `SubscribeState.pending_approvals`
+  and `SubscribeState.pending_questions`. Completed `AskUser` steps also carry
+  their server-derived `AskStepSummary` on `ToolCompleted.ask` and
+  `WireWorkStep.ask` (matching REST `ChatWorkStep.ask`). Resumable asks survive
+  a restart (the boot reload re-queues them from the `human_asks` ledger) and
+  never time out, except a `DuringExecuteNonResumable` approval (30 min).
+  `AskResolved { ask_id, outcome, decision? }` (server → client, session-less,
+  `outcome` ∈ `answered | declined | abandoned`) is sent once on every close of
+  any ask kind; `decision` is set only when a human decided an approval. It is
+  the one close frame. `ResolveApproval` and `AnswerQuestion` resolve through
   `HumanAskManager::resolve`, and only for an ask on the connection's own
-  channel queue. A multiplexed sidecar is re-sent every pending approval on
-  its channel's queue right after it registers, since it has no
-  `SubscribeState` catch-up. See [`human-ask.md`](human-ask.md).
+  channel queue. A multiplexed sidecar is re-sent every pending approval on its
+  channel's queue right after it registers, since it has no `SubscribeState`
+  catch-up (`AskUser` is owner-only so question frames never target multiplexed
+  sidecars). See [`human-ask.md`](human-ask.md).
 - **TUI history:** `HistorySnapshot { session_id, entries }`,
   `HistoryAppend { session_id, entry }`.
 - **Bot multiplexing (Multiplexed channels):** `StartBot`, `StopBot`

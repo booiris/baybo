@@ -1,12 +1,14 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **foundation stage implemented; the `AskUser` and iOS stages
+> Status: **foundation and `AskUser` + web stages implemented; the iOS stage is
 > pending** — `baybo-human-ask` (queue,
-> core, gates, manager), the ledger, the `tools::ask` ports, the agent
-> live/restart paths, the gateway doors, frames and boot order, the project
-> bridge and the integration suites exist; see
-> [Implementation notes](#implementation-notes-foundation-stage). The
-> `AskUser` + web stage and the iOS stage are not started. This document is
+> core, gates, manager, `AskUserTool`, `AskStepInput`), the ledger, the
+> `tools::ask` ports (`QuestionGate`, `QuestionHandle`, `Tool::sole_call`), the
+> agent live/restart/sole-call paths, the gateway doors, question/approval
+> frames, REST reconstruction and boot order, the web `QuestionCard` / composer
+> answer / render-time badge UI, the project bridge and the integration suites
+> exist; see [Implementation notes](#implementation-notes-foundation-stage). The
+> iOS stage is not started. This document is
 > the spec the three stages described in [Rollout plan](#rollout-plan) are
 > built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
@@ -47,11 +49,11 @@ Layering, following the store/storage split the rest of the schema uses:
 
 | Crate | Owns |
 | --- | --- |
-| `baybo-model` (`model::human_ask`, `model::approval`) | Value types: `AskId`, `AskKind`, `AskPhase`, `AskRequest`, `AskResolution`, `AskStepSummary`, the `Question*` payloads, `ApprovalRequest` (moved here from `baybo-tools`), `ResumeRequest`, the tool-name and limit consts. Pure data. |
+| `baybo-model` (`model::human_ask`, `model::approval`) | Value types: `AskId`, `AskKind`, `AskPhase`, `AskRequest`, `AskResolution`, `AskStepSummary`, the `Question*` payloads, `ApprovalRequest` (moved here from `baybo-tools`), `ResumeRequest`, and the `ASK_USER_TOOL_NAME` constant. Pure data. |
 | `baybo-store` (`store::human_ask`) | `HumanAskRow` + the `HumanAskStore` port. No delete method. |
 | `baybo-storage` (`sqlite/human_ask.rs`) | `SqliteHumanAskStore` over the `human_asks` table. DDL in `sqlite/mod.rs` like every other table. |
 | `baybo-tools` (`tools::approval`, new `tools::ask`) | The **tool-facing ports** only: `ApprovalGate`, `ApprovalGateMap`, `AutoDenyGate`, `ApprovalHandle`, `ApprovalOutcome`, `refusal_reason`; new `QuestionGate`, `QuestionHandle`, `AskCancel`, `ParkGauge`, `ToolContext.question`, `Tool::sole_call()`. Never depends on `baybo-human-ask`. |
-| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `ask_step_summary`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
+| `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `AskStepInput`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`. (The Resume door is not a channel message: it has its own receiver on the router.) |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
 | `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` impl. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingApprovals` and does not depend on this crate.) |
@@ -749,9 +751,7 @@ settlement's claim loses, `settle_unapplied` returns `Apply` instead, and
 the answer lands before the user row — adjacent either way. Live asks are never touched here:
 a message that reaches the actor while a *live* ask is parked is a mailbox
 interjection, drained at the next iteration boundary as today
-(`agent_loop.rs:1128-1151`). The composer rule in
-[Composer text answers the question](#composer-text-answers-the-question) is
-what keeps a typed answer from becoming such an interjection.
+(`agent_loop.rs:1128-1151`). The web client queues composer messages locally while a question is pending.
 
 ### The outer tool deadline pauses while parked
 
@@ -781,9 +781,9 @@ Bash comment. The approval-mirroring part of the headroom is what is deleted.
 rewritten. Lives in `baybo_human_ask::tools`, registered from
 `crates/baybo/src/runtime.rs` via `agent_tools(manager)` like the task tools.
 
-Input schema (`parameters_schema`), limits as named consts in
-`baybo_model::human_ask` (`MAX_QUESTIONS = 4`, `MIN_OPTIONS = 2`,
-`MAX_OPTIONS = 4`, `MAX_HEADER_CHARS = 12`):
+The input schema (`parameters_schema`) and runtime validation share private
+constants in `baybo_human_ask::tools` (`MAX_QUESTIONS = 4`, `MIN_OPTIONS = 2`,
+`MAX_OPTIONS = 4`, `MAX_HEADER_CHARS = 12`).
 
 ```jsonc
 {
@@ -807,11 +807,17 @@ offered by the UI and not controllable by the model; a model-chosen option
 set that does not fit is the exact case it exists for. No `preview` field in
 v1 (reserved as an optional addition).
 
+Each answer names a distinct requested header. The manager checks option labels
+and single-selection limits before claiming the row. The gateway applies inbound
+secret rules to free-text answers before persistence.
+
 Result, `ToolOutput::Json`, serialized verbatim into the `tool_result`:
 
 ```jsonc
 { "answers": [ { "header": "Auth", "selected": ["JWT"], "other": null } ] }
 // a tab the user did not answer: { "header": "DB", "selected": [], "other": null, "skipped": true }
+// cancelled by the user, with no draft answers submitted:
+{ "cancelled": true }
 // declined as a whole:
 { "declined": true, "note": "the user declined to answer; proceed on your best judgment or ask in plain text" }
 ```
@@ -839,7 +845,7 @@ The agent loop checks the **resolved** dispatch names (`DispatchedToolCall`,
 so a `ToolInvoke { name: "AskUser" }` envelope is caught) after the assistant
 row is persisted: if a sole-call tool shares the response with any sibling,
 that call is not executed and gets
-`ToolOutput::Error("AskUser must be the only tool call in its response; put all questions in one call's `questions` array and wait for the answer before acting")`;
+`ToolOutput::Error("AskUser must be the only tool call in its response")`;
 the siblings run normally. The permit pool cannot express this (an
 `Exclusive` call queues behind siblings rather than rejecting them), so it is
 a pre-dispatch batch check. `AskUser` is also `Exclusive`, which costs
@@ -853,47 +859,25 @@ the channel, bumps the park gauge, awaits the oneshot; no timeout) → map
 `SpanEventKind::Question { outcome }` on the tool span, the sibling of
 `SpanEventKind::Approval`, so traces show what the human did.
 
-**Step summary** — `ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>`
-(in `baybo-human-ask`, typed: question count + per-tab `header` with selected
-labels / other / skipped, or declined) is the one derivation used by both the
-live plane and REST: the loop computes it at `emit_tool_completed`
-(`agent_loop.rs:~1643`, where `dispatch.arguments` and `executed.output` are
-in hand) and it rides `AgentEvent::ToolCompleted.ask` → `Frame::ToolCompleted.ask`
-→ the in-flight buffer → `WireWorkStep.ask`; the REST reconstruction
-(`chat.rs:3557-3669`) computes it from `ToolUse.input` + `ToolResult.content`
-into `ChatWorkStep.ask`. Without the live field every tab but the one that
+**Step summary** — `AskStepInput::from_tool(name, input)` recognizes an
+`AskUser` call and validates its questions. Its `summarize(result)` method
+returns the per-question `AskStepSummary` and its one-line display text together.
+The agent uses the resolved call and its JSON output for `AgentEvent::ToolCompleted`.
+The structured summary reaches `WireWorkStep.ask` through `Frame::ToolCompleted`
+and the in-flight buffer. REST reconstruction keeps the validated input by
+tool-use ID until the matching result arrives, then uses the same method
+to fill `ChatWorkStep.ask` and `tool_summary`. Without the live field every tab but the one that
 answered would show `summary: "ok"` until a reload (the in-flight buffer
 carries only `ToolStarted`/`ToolCompleted`, `work_steps.rs:36-83`).
 
-### Composer text answers the question
+### Composer messages queue while a question is pending
 
-Decided in the interview: while a question card is showing, a message typed
-in the composer is the "other" answer of the tab the user is looking at; any
-other unanswered tab is submitted as skipped.
-
-This has to be a **client-side** rule. Interjections are drained only between
-iterations (`agent_loop.rs:1128-1151`); while `AskUser` is parked the loop is
-inside the tool batch, so a `Message` frame would sit in the mailbox until
-the question resolved some other way. The web composer therefore sends
-`Frame::AnswerQuestion` instead of a `Message` whenever its view has a
-pending question (live or dead — a dead one resumes the turn), bypassing
-`sendToSession` (no optimistic row, no outbox enrolment) but still committing
-input history and clearing the draft. **Skip** is the only way to send a
-plain message while a card is up. A `Message` that does reach the server
-during a live question (another client, a sidecar) stays an interjection, as
-documented in `docs/web-chat.md`.
-
-`decideComposerAction` gains two inputs, `isCommand` and `hasPendingQuestion`;
-its outputs stay `noop | stop | answer | direct | park` (no `command`
-action exists or is added). Order: `noop → stop → answer → direct | park`,
-with `isCommand` only vetoing `answer`. `/stop` must outrank `answer` (it is
-what abandons a live ask). Any other leading-`/` input falls through to the
-existing branch: **parked** while the question is live (the turn is active,
-so `busy` is true — and the actor would hold a slash at the mailbox head
-anyway, `actor/mod.rs:397-410`), **direct** for a dead question. The hint
-says a command will run once the question is resolved. Staged attachments
-cannot ride an answer; the send button is disabled with a hint while
-attachments are staged and a question is pending.
+The web composer parks text and ready attachments in the session's ordinary
+message queue while a live or restored question is pending. The question
+card keeps its draft selections and Other fields until the user chooses Submit
+or Cancel ask. Cancelling closes the question and returns `{"cancelled": true}`
+to the model. Both actions send `Frame::AnswerQuestion`. The continued turn's
+normal completion drains the queue. A typed `/stop` still cancels a live turn.
 
 ### Wire surface
 
@@ -904,9 +888,9 @@ named `ask_id`. `ApprovalResolved` is gone: its decision rides
 
 ```rust
 Frame::QuestionAsked   { ask_id, tool_call_id: String, session_id, user_id, questions: Vec<WireQuestion> }  // session-scoped
-Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | abandoned */,
+Frame::AskResolved     { ask_id, outcome: AskOutcomeKind /* answered | declined | cancelled | abandoned */,
                          decision: Option<ApprovalDecision> /* a human's, on an approval */ }              // session-less, any kind
-Frame::AnswerQuestion  { ask_id, reply: QuestionReply /* Answered { answers: Vec<WireAnswer> } | Declined */ } // client → server
+Frame::AnswerQuestion  { ask_id, reply: QuestionReply /* Answered { answers: Vec<WireAnswer> } | Cancelled */ } // client → server
 Frame::ToolCompleted   { …, ask: Option<AskStepSummary> }                                                   // additive optional field
 SubscribeState { …, pending_questions: Vec<QuestionCard> }   // #[serde(default, skip_serializing_if = "Vec::is_empty")]
 WireWorkStep   { …, ask: Option<AskStepSummary> }
@@ -978,7 +962,8 @@ the **oldest** pending ask; the card shows "+N waiting" when more are queued.
 or one being answered re-pins the scroll.
 
 `applySubscribeState` builds `pendingAsks` from
-`pending_approvals ∪ pending_questions`. The work-step **badge is derived at
+`pending_approvals ∪ pending_questions`, inserting each question at its
+`queue_index` from the session queue snapshot. The work-step **badge is derived at
 render time** from `pendingAsks × step.toolCallId`, and that is its only
 home: `WorkStep.awaitingApproval`, `markStepAwaitingApproval`
 (`ChatPage.tsx:116, :4567-4573`) and the `awaitingByCall` re-derivation in
@@ -1001,20 +986,18 @@ directly above a card that says the turn is waiting on the user.
 pattern:
 
 - tab strip of `header`s, answered tabs ticked; radio for single, checkbox
-  for `multi_select`; a fixed "Other…" input per tab;
-- **Submit** enabled once every tab has a selection or other-text; **Skip**
-  sends `Declined`;
-- keys: `←/→`/`Tab` switch tabs, `1–4` pick, `Enter` submits — inactive
+  for `multi_select`; a multiline "Other…" text area per tab;
+- **Submit** enabled once every tab has a selection or other-text; **Cancel ask** sends `Cancelled`, even with incomplete answers;
+- keys: `←/→`/`Tab` switch tabs, `1–4` pick — inactive
   while the other-input has focus; the active tab index lives per `askId` in
-  `SessionView` so `handleSend` can read it;
-- composer placeholder "Typed text answers "<header>" as Other" and the send
-  button title "Answer (Enter)" while a question is pending.
+  `SessionView`;
+- the composer indicates that messages will queue until the question is resolved.
 
 Work step: "waiting for your answer" while parked, spinner suppressed, and
 `awaitingReply` cleared on `question_asked` so no "Working…" stacks above the
 form. After the answer the step collapses to a summary
 (`Asked 2 questions · Auth: JWT · DB: Postgres, Redis`; skipped tabs read
-*skipped*; declined reads *declined*), expandable to the full questions with
+*skipped*; a closed card shows *declined* or *cancelled*), expandable to the full questions with
 the chosen options highlighted, rendered from `ChatWorkStep.ask` /
 `WireWorkStep.ask` / `tool_completed.ask` — the one server-side derivation;
 no new `ToolResultMeta` field, as decided, and the DTO never exposes raw tool
@@ -1196,7 +1179,11 @@ pub struct ReloadReport { requeued, resumed, abandoned, applied, failed }   // a
 pub trait ResumeSink { fn request_resume(&self, req: ResumeRequest); }   // fire and forget; the router decides whether it opens a Resume turn
 pub trait LivePendingAsks { fn actor_stop_cost(&self, session: &SessionId) -> ActorStopCost; }  // Free | ReleasesTurn { waiting_calls } | AbandonsAsks; combined with ActorStopCost::plus
 #[async_trait] pub trait AskObserver { async fn on_event(&self, ask: &HumanAskRow, event: AskEvent); }
-pub fn ask_step_summary(input: &Value, result: &Value) -> Option<AskStepSummary>;
+pub struct AskStepInput(QuestionRequest);
+impl AskStepInput {
+    pub fn from_tool(name: &str, input: &Value) -> Option<Self>;
+    pub fn summarize(self, result: &Value) -> Option<(AskStepSummary, String)>;
+}
 pub mod tools { pub struct AskUserTool; pub fn agent_tools(manager) -> Vec<(Arc<dyn Tool>, ToolManifest)>; }
 
 // baybo_agent
@@ -1384,7 +1371,7 @@ Where the code differs from the sketch above, and why:
 3. `ChannelAskGate`: row → push → `Raised { kind: Question }` →
    `SessionEvent::QuestionAsked` → `Frame::QuestionAsked`; web shows the card,
    badges the step, clears `awaitingReply`
-4. user answers (card or composer) → `Frame::AnswerQuestion` →
+4. user submits the question card → `Frame::AnswerQuestion` →
    `manager.resolve(ask_id, Answered(..) | Declined)` → `AskResolved` broadcast
 5. the gate stamps `mark_applied`; tool returns `ToolOutput::Json`; loop
    appends it, `tool_completed { ask: summary }` labels the step everywhere
@@ -1493,7 +1480,7 @@ leaves draft.
 - `baybo-tools::ask`: `QuestionGate`, `QuestionHandle`, `ToolContext.question`,
   `Tool::sole_call`; remove the todo stub. `ChannelAskGate` question half;
   `AskUserTool` + registration; `ToolTriggerScope::UserConversation`;
-  `SpanEventKind::Question`; `ask_step_summary`; sole-call batch check.
+  `SpanEventKind::Question`; `AskStepInput`; sole-call batch check.
 - Wire: `QuestionAsked`, `AnswerQuestion`, `QuestionCard`, `pending_questions`,
   `ToolCompleted.ask` / `WireWorkStep.ask`; `SessionEvent::QuestionAsked`;
   `route.rs` `AnswerQuestion` arm; SubscribeState; push question title;
@@ -1501,7 +1488,7 @@ leaves draft.
 - REST reconstruction: `ChatWorkStep.ask`, `tool_label` branch; OpenAPI +
   `schema.d.ts` regen.
 - Web: `pendingAsks[]`, `QuestionCard`, render-time badge, cancelled-pill
-  suppression, composer `'answer'` action with the stated precedence +
+  suppression, composer queue routing +
   per-ask tab state, step summary from `.ask`, sidebar `awaiting_human`
   through `applySessionPatch`'s explicit copy list, `chatWs.ts` +
   `wireSentinel.ts` mirrors.
@@ -1575,7 +1562,7 @@ Unit (other crates):
 - `baybo-tools`: `AskUser` validation table; `question: None` → declined.
 - `baybo-wire`: round-trips for the new frames, `pending_questions` in the
   bundle, `awaiting_human` patch, `ToolCompleted.ask`.
-- `ask_step_summary`: REST and live produce identical summaries for the same
+- `AskStepInput`: REST and live produce identical summaries for the same
   input/result.
 
 Integration (`crates/integration-tests`, sqlite-backed harness):
@@ -1612,8 +1599,8 @@ Integration (`crates/integration-tests`, sqlite-backed harness):
   attempt executes the approved call and `finish_run` is called once.
 
 Web (vitest): `QuestionCard` (tabs, single/multi, other, submit enablement,
-skip, keys), `decideComposerAction` precedence incl. `/stop`, a slash
-command under a live question → `park` and under a dead one → `direct`,
+cancel, keys), `decideComposerAction` precedence incl. `/stop`, a slash
+command under a live or restored question → `park`,
 `transcriptTailSignature` with two asks, render-time badge with
 `turn.active = false` and the bundle arriving before the REST page,
 cancelled-pill suppression, step summary rendering from `.ask`,
@@ -1643,12 +1630,7 @@ implemented as written unless overridden.
    shutdown side. The alternative — treat shutdown like `/stop` — means
    "survives a restart" only covers crashes, not `baybo gateway restart`,
    which is the common restart.
-4. **Composer text answers a dead question too**, and *Skip* is the only way
-   to send a plain message while a card is showing; a leading `/` is never
-   an answer (it parks behind a live question, sends directly past a dead
-   one). The alternative (dead question ⇒ composer sends a message, which
-   abandons the question) is simpler but makes "I came back and typed my
-   answer" silently discard the question.
+4. **Messages queue behind restored questions too.** The card owns its answers and only Submit or Cancel ask sends a question reply.
 
 (Earlier draft decision "user-rooted subagents become unattended" is
 withdrawn: they are already auto-denied by the gate map's fallback for the

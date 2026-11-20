@@ -245,6 +245,8 @@ export type ToolEventPayload =
       command: string;
     };
 
+export type QuestionOutcomeKind = 'answered' | 'declined' | 'cancelled' | 'abandoned';
+
 export type SpanEventKind =
   | {
       kind: 'sanitize_hit';
@@ -256,6 +258,10 @@ export type SpanEventKind =
       kind: 'approval';
       decision: ApprovalDecision;
       resource: ResourceAccess;
+    }
+  | {
+      kind: 'question';
+      outcome: QuestionOutcomeKind;
     }
   | {
       kind: 'tool_event';

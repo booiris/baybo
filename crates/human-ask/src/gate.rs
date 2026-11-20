@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use baybo_model::approval::{ApprovalDecision, ApprovalRequest};
 use baybo_model::human_ask::{AskId, AskKind, AskRequest, AskResolution, resumable};
 use baybo_store::HumanAskRow;
-use baybo_tools::{ApprovalGate, ApprovalOutcome, AskCancel, AskSite, CancelOrigin};
+use baybo_tools::{
+    ApprovalGate, ApprovalOutcome, AskCancel, AskSite, CancelOrigin, QuestionAsk, QuestionGate,
+    QuestionOutcome,
+};
 use chrono::Utc;
 use tokio::sync::oneshot;
 
@@ -159,6 +162,29 @@ impl ApprovalGate for ChannelAskGate {
     }
 }
 
+#[async_trait]
+impl QuestionGate for ChannelAskGate {
+    async fn ask(&self, ask: QuestionAsk, site: AskSite, cancel: AskCancel) -> QuestionOutcome {
+        let row = question_row(ask, site);
+        let ask_id = row.ask_id.clone();
+        let Some(resolution) = self.park(row, cancel).await else {
+            return QuestionOutcome::Abandoned;
+        };
+        match resolution {
+            AskResolution::Answered(answers) => QuestionOutcome::Answered(answers),
+            AskResolution::Declined => QuestionOutcome::Declined,
+            AskResolution::Cancelled => QuestionOutcome::Cancelled,
+            AskResolution::Abandoned | AskResolution::PolicyDenied | AskResolution::TimedOut => {
+                QuestionOutcome::Abandoned
+            }
+            AskResolution::Approval(decision) => {
+                tracing::warn!(%ask_id, ?decision, "question ask resolved as an approval; abandoning");
+                QuestionOutcome::Abandoned
+            }
+        }
+    }
+}
+
 /// Unattended turns: every approval is denied by policy, and the denial is
 /// still written to the ledger — already resolved and applied, with no queue
 /// entry, edge or frame.
@@ -204,6 +230,24 @@ fn approval_row(req: ApprovalRequest, site: AskSite) -> HumanAskRow {
         kind: AskKind::Approval,
         phase: site.phase,
         request: AskRequest::Approval(req),
+        created_at: Utc::now(),
+        resolved_at: None,
+        resolution: None,
+        applied_at: None,
+    }
+}
+
+/// The pending ledger row for a question ask.
+fn question_row(ask: QuestionAsk, site: AskSite) -> HumanAskRow {
+    HumanAskRow {
+        ask_id: ask.ask_id,
+        session_id: ask.session_id,
+        channel: site.channel,
+        tool_call_id: ask.tool_call_id,
+        turn_id: site.turn_id,
+        kind: AskKind::Question,
+        phase: site.phase,
+        request: AskRequest::Question(ask.request),
         created_at: Utc::now(),
         resolved_at: None,
         resolution: None,

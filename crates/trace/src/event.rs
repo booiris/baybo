@@ -5,6 +5,7 @@
 //! event on a given span. Cross-span queries join by `event_kind` when
 //! needed.
 
+use baybo_model::human_ask::QuestionOutcomeKind;
 use baybo_model::{ApprovalDecision, PlaceholderId, ResourceAccess, SecretKind, SpanId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,8 @@ pub enum SpanEventKind {
         decision: ApprovalDecision,
         resource: ResourceAccess,
     },
+    /// Outcome of an `AskUser` prompt raised on this tool span.
+    Question { outcome: QuestionOutcomeKind },
     /// Tool-emitted phase artifact. Each entry corresponds to one
     /// invocation of `ToolEventSink::emit` inside the tool body — the
     /// elapsed time of a sub-action, an HTTP response summary, a
@@ -165,6 +168,7 @@ impl SpanEventKind {
         match self {
             SpanEventKind::SanitizeHit { .. } => "sanitize_hit",
             SpanEventKind::Approval { .. } => "approval",
+            SpanEventKind::Question { .. } => "question",
             SpanEventKind::ToolEvent { .. } => "tool_event",
         }
     }
@@ -309,5 +313,23 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         let back: SpanEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn question_round_trips() {
+        let span = SpanId::new();
+        let e = SpanEvent::new(
+            span,
+            1,
+            SpanEventKind::Question {
+                outcome: QuestionOutcomeKind::Answered,
+            },
+        );
+        let s = serde_json::to_string(&e).unwrap();
+        let back: SpanEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, e);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["kind"]["kind"], "question");
+        assert_eq!(v["kind"]["outcome"], "answered");
     }
 }

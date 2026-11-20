@@ -293,3 +293,52 @@ describe('applySubscribeState — a reply already on screen must not fork', () =
     expect(next.transcript[2].key).toBe('stream-1-1');
   });
 });
+
+describe('applySubscribeState — pendingAsks union (approvals + questions)', () => {
+  it('merges pending_approvals and pending_questions and clears awaitingReply', () => {
+    const bundle = {
+      kind: 'subscribe_state',
+      session_id: 's1',
+      turn: { active: false, started_at: null },
+      work_steps: [],
+      pending_approvals: [
+        {
+          ask_id: 'a1',
+          tool_call_id: 'call-a1',
+          tool: 'Bash',
+          accesses: [],
+          params_preview: '{}',
+        },
+      ],
+      pending_questions: [
+        {
+          queue_index: 0,
+          ask_id: 'q1',
+          tool_call_id: 'call-q1',
+          questions: [
+            {
+              header: 'Auth',
+              question: 'Pick auth',
+              options: [
+                { label: 'JWT', description: 'Token' },
+                { label: 'Cookie', description: 'Session' },
+              ],
+              multi_select: false,
+            },
+          ],
+        },
+      ],
+    } as unknown as Parameters<typeof applySubscribeState>[1];
+
+    const next = applySubscribeState(
+      { ...EMPTY_VIEW, awaitingReply: true, questionTabByAskId: { q1: 1, stale: 2 } },
+      bundle,
+      false,
+    );
+    expect(next.pendingAsks).toHaveLength(2);
+    expect(next.pendingAsks[1]).toMatchObject({ kind: 'approval', askId: 'a1', toolCallId: 'call-a1' });
+    expect(next.pendingAsks[0]).toMatchObject({ kind: 'question', askId: 'q1', toolCallId: 'call-q1' });
+    expect(next.questionTabByAskId).toEqual({ q1: 1 });
+    expect(next.awaitingReply).toBe(false);
+  });
+});

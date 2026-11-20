@@ -742,6 +742,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         incoming_tx: run_handle.incoming_tx.clone(),
         channel_tokens: channel_tokens.clone(),
         secret_vault: Arc::clone(&graph.secret_vault),
+        security_gateway: Arc::clone(&graph.security_gateway),
         stores: graph.stores.clone(),
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),

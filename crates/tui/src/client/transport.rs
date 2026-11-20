@@ -353,11 +353,12 @@ fn map_frame(
         }
         // Every close, answered elsewhere or not: drop the card. A no-op
         // when this client's own answer already removed it.
-        // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
         Frame::AskResolved { ask_id, .. } => {
             approvals.close(&ask_id);
             None
         }
+        // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
+        Frame::QuestionAsked { .. } => None,
         Frame::Reasoning { .. } => {
             // The TUI surfaces an animated "working" indicator instead of
             // the model's reasoning trace, so reasoning frames are dropped
@@ -486,6 +487,7 @@ fn map_frame(
         | Frame::Subscribe { .. }
         | Frame::Unsubscribe { .. }
         | Frame::ResolveApproval { .. }
+        | Frame::AnswerQuestion { .. }
         | Frame::HistoryAppend { .. }
         | Frame::StartBot { .. }
         | Frame::StopBot { .. }
@@ -589,6 +591,7 @@ mod tests {
                 status: "ok".into(),
                 summary: "200 lines".into(),
                 approval: None,
+                ask: None,
             },
             &target,
             &approvals,

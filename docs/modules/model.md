@@ -17,7 +17,7 @@ Contents:
 - **Security types**: `PlaceholderId`, `SecretKind`
 - **Cost & money types**: `CostRecord`, `CostSummary`, `CallReason`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
 - **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
-- **Human asks**: `AskKind`, `AskPhase`, `AskRequest`, `AskResolution`. The during-execute approval phases are `DuringExecuteResumable` and `DuringExecuteNonResumable`, serialized and stored in snake_case. Questions remain resumable by kind.
+- **Human asks**: `AskKind`, `AskPhase`, `AskRequest`, `AskResolution`. The during-execute approval phases are `DuringExecuteResumable` and `DuringExecuteNonResumable`, serialized and stored in snake_case. Questions remain resumable by kind. WebSocket events and REST transcripts share `AskStepSummary`, `AskStepQuestion`, and `QuestionOption`. These types derive `utoipa::ToSchema` for the REST schema.
 - **Approval types**: `ApprovalDecision`, `ApprovedResource`, `HostPattern`, `ResourceAccess`
 - **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentParentContext`, `SubagentResult`, `SubagentExitStatus`, `PendingBackgroundResult`, `BackgroundJobKind`, `OnTimeout`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers (`SUBAGENT_CHANNEL_TAG`, `BACKGROUND_SUBAGENT_HANDLE_PREFIX`, `BACKGROUND_DISPATCH_YIELD_GUIDANCE`)
 - **External-agent types**: `ExternalAgentKind`, `SubagentBackend`, `SubagentBackendKind`, `SubagentBackendTag`, the `BAYBO_BACKEND_TAG` const

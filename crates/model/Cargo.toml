@@ -21,6 +21,7 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 uuid = { workspace = true }
 ulid = { workspace = true }
+utoipa = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

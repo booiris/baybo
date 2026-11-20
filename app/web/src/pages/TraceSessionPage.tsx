@@ -522,11 +522,13 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
                 ? 'sanitize hit'
                 : e.kind.kind === 'approval'
                   ? 'approval'
-                  : e.kind.payload.type === 'phase'
-                    ? 'timer'
-                    : e.kind.payload.type === 'http_fetch'
-                      ? 'http fetch'
-                      : 'llm call'}
+                  : e.kind.kind === 'question'
+                    ? 'question'
+                    : e.kind.payload.type === 'phase'
+                      ? 'timer'
+                      : e.kind.payload.type === 'http_fetch'
+                        ? 'http fetch'
+                        : 'llm call'}
             </span>
             <span className="text-ink-soft font-mono text-[0.75rem]">{formatTime(e.at)}</span>
           </div>
@@ -579,6 +581,21 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
                     ? e.kind.resource.host
                     : e.kind.resource.command}
               </div>
+            </div>
+          ) : e.kind.kind === 'question' ? (
+            <div className="font-mono text-[0.85rem]">
+              Outcome:{' '}
+              <span
+                className={`font-bold uppercase ${
+                  e.kind.outcome === 'answered'
+                    ? 'text-ok'
+                    : e.kind.outcome === 'declined'
+                      ? 'text-warn'
+                      : 'text-err'
+                }`}
+              >
+                {e.kind.outcome}
+              </span>
             </div>
           ) : (
             <ToolEventRow action={e.kind.action} payload={e.kind.payload} />

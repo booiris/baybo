@@ -15,6 +15,8 @@ pub mod manager;
 pub mod ports;
 pub mod queue;
 pub mod result;
+pub mod summary;
+pub mod tools;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -29,6 +31,7 @@ pub use ports::{ActorStopCost, AskObserver, LivePendingAsks, ResumeSink};
 pub use queue::{
     AskQueue, AskQueueEvent, AskQueues, AskWatcher, PendingAsk, PendingEdge, PendingWatcher,
 };
+pub use summary::{AskStepInput, first_question_header};
 
 #[cfg(test)]
 mod tests;

@@ -77,6 +77,7 @@ impl Channel {
     // Kind-agnostic dispatch surface — agent + tool path calls.
     pub fn dispatch_agent(&self, output: AgentOutput);
     pub fn dispatch_approval_requested(&self, ask_id, tool_call_id, session_id, user_id, tool, accesses, params_preview, description);
+    pub fn dispatch_question_asked(&self, ask_id, tool_call_id, session_id, user_id, questions);
     pub fn dispatch_ask_resolved(&self, session_id, ask_id, resolution: &AskResolution);
 
     // Transport lifecycle — gateway WS route calls these.
@@ -89,6 +90,7 @@ impl Channel {
     pub fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>>;
     pub fn has_subscribers(&self, session_id: &SessionId) -> bool;
     pub fn connection_count(&self) -> usize;
+    pub fn pending_asks(&self, session_id: &SessionId) -> Vec<PendingAsk>;
     pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
     pub fn pending_approval_sessions(&self) -> HashSet<SessionId>;
     pub fn ask_queue(&self) -> Option<&AskQueue>;
@@ -314,7 +316,8 @@ channel's `AskSurface` bundles the two. The gate writes the ask to the
 `human_asks` ledger before enqueueing it; only a non-resumable during-execute
 approval times out (`DURING_EXECUTE_APPROVAL_TIMEOUT`, 30 min). Frames are
 dispatched by queue watchers the gateway installs in `build_channel`, not by
-the gate: `AskRaised` → `SessionEvent::ApprovalRequested`, and every
+the gate: `AskRaised` dispatches `SessionEvent::ApprovalRequested` or
+`SessionEvent::QuestionAsked` according to the request kind, and every
 `AskClosed` → `SessionEvent::AskResolved { session_id, ask_id, outcome,
 decision }`, `decision` set when a human decided an approval. So
 concurrent TUI / web tabs drop their card on any close — answered by one of

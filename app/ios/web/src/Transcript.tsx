@@ -2234,7 +2234,7 @@ export function Transcript({
       });
     };
     persistLatest.current();
-  }, [messages, hasMoreOlder, imageDims, compactionPoints]);
+  }, [messages, hasMoreOlder, imageDims, compactionPoints, restored?.oldestOrdinal, restored?.hasMoreOlder]);
 
   // Open the thread at its newest edge — a restored thread would otherwise
   // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.

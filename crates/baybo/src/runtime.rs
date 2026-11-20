@@ -602,6 +602,9 @@ pub async fn build_managers(
     for (tool, manifest) in baybo_task::tools::agent_tools(stores.task.clone()) {
         tool_registry.register(tool, manifest);
     }
+    for (tool, manifest) in baybo_human_ask::tools::agent_tools() {
+        tool_registry.register(tool, manifest);
+    }
 
     // `spawn_subagent` is just another tool from the LLM's perspective.
     // It calls the actor-backed `SubagentSpawner` directly (via the
@@ -709,7 +712,7 @@ pub async fn build_managers(
         Arc::clone(&leak_detector),
         Arc::clone(&secret_vault),
     ));
-    let gate_map = channels_registry.approval_gates();
+    let gates = channels_registry.gates();
 
     let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(
         config.permission,
@@ -874,7 +877,7 @@ pub async fn build_managers(
     // model the surrounding actor is currently using.
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
-        gate_map,
+        gates,
         Arc::clone(&security_gateway),
         sandbox_root,
         workspace_paths.clone(),

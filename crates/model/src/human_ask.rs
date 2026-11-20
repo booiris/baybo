@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::SessionId;
 use crate::approval::{ApprovalDecision, ApprovalRequest};
@@ -200,6 +201,11 @@ pub struct QuestionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
 pub struct Question {
     /// Short tab label; also the key its [`QuestionAnswer`] is matched by.
     pub header: String,
@@ -209,7 +215,14 @@ pub struct Question {
     pub multi_select: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One selectable option in an `AskUser` question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = ChatAskOption)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
@@ -218,12 +231,80 @@ pub struct QuestionOption {
 /// The human's answer to one [`Question`]. `selected` and `other` both empty
 /// means the question was skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
 pub struct QuestionAnswer {
     pub header: String,
     #[serde(default)]
     pub selected: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub other: Option<String>,
+}
+
+/// How an `AskUser` prompt ended on a tool span (`SpanEventKind::Question`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionOutcomeKind {
+    Answered,
+    Declined,
+    Cancelled,
+    Abandoned,
+}
+
+impl QuestionOutcomeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Declined => "declined",
+            Self::Cancelled => "cancelled",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// One question and its recorded answer inside [`AskStepSummary`], for both the
+/// collapsed step line and the expanded question/choice view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = ChatAskQuestion)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct AskStepQuestion {
+    pub header: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub other: Option<String>,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+/// Answered questions and the cancellation or decline status of a finished `AskUser` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = ChatAskStepSummary)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct AskStepSummary {
+    pub declined: bool,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<AskStepQuestion>,
 }
 
 /// How an ask resolved.
@@ -236,6 +317,8 @@ pub enum AskResolution {
     Answered(Vec<QuestionAnswer>),
     /// A human declined to answer the questions.
     Declined,
+    /// The human explicitly cancelled the question.
+    Cancelled,
     /// Nobody answered: `/stop`, the card was closed, the user moved on, or
     /// the ask could not survive a restart.
     Abandoned,

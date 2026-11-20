@@ -1767,6 +1767,30 @@ export interface components {
          *     sidecars like `"slack"` pass through unchanged).
          */
         ChannelType: string;
+        /** @description One selectable option in an `AskUser` question. */
+        ChatAskOption: {
+            description: string;
+            label: string;
+        };
+        /**
+         * @description One question and its recorded answer inside [`AskStepSummary`], for both the
+         *     collapsed step line and the expanded question/choice view.
+         */
+        ChatAskQuestion: {
+            header: string;
+            multi_select?: boolean;
+            options?: components["schemas"]["ChatAskOption"][];
+            other?: string | null;
+            question: string;
+            selected?: string[];
+            skipped?: boolean;
+        };
+        /** @description Answered questions and the cancellation or decline status of a finished `AskUser` call. */
+        ChatAskStepSummary: {
+            cancelled?: boolean;
+            declined: boolean;
+            questions?: components["schemas"]["ChatAskQuestion"][];
+        };
         /** @description A blob attachment embedded in a historical chat transcript item. */
         ChatAttachment: {
             blob_id: string;
@@ -2279,6 +2303,7 @@ export interface components {
              *     predates the field).
              */
             approval?: string | null;
+            ask?: null | components["schemas"]["ChatAskStepSummary"];
             /**
              * Format: date-time
              * @description When this step happened — the `created_at` of the row it came from, or

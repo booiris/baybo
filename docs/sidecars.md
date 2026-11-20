@@ -18,6 +18,8 @@ Existing dispatch:
 - `SidecarSupervisor` (channel restart loop) iterates `domains::CHANNEL`.
 - `baybo_tools::mcp::embedded_servers(&profiles)` consumes the `EmbeddedMcpProfile` list from `baybo_gateway::collect_profiles` (`crates/gateway/src/sidecar/embedded_mcp.rs`); the resulting servers are handed to `runtime::build_managers` (today: just browser when `browser.enable=true`).
 
+**Question frames and multiplexed channel sidecars.** `AskUser` is owner-channel only (`channels: [owner]`), so `Frame::QuestionAsked` never targets multiplexed channel sidecars (`telegram`, `weixin`, `discord`). The TypeScript channel SDK runner (`sidecars/sdk/channel-ts/src/runner.ts`) deliberately omits a `question_asked` branch and silently drops any question frame that arrives.
+
 ## Media side-channel (`/v1/blobs/*`)
 
 Non-text media — a file the agent sends, a screenshot a tool produced, an image a user uploads — **never rides the channel WebSocket**. The bytes live in the gateway's content-addressed `BlobStore` (`crates/store/src/blob.rs`); the wire carries only a `WireAttachment` reference (`kind`, `blob_id`, `mime_type`, `size`, `filename`, `duration_ms`). A 100 MiB file is a tiny frame, and a slow media transfer can't head-of-line-block unrelated traffic on the same multiplexed connection. Bytes move over a separate channel-token-authenticated HTTP route, `POST/GET /v1/blobs/*` (`crates/gateway/src/channel/blobs.rs`), mounted under the same auth middleware as `/channel-ws`.

@@ -410,6 +410,19 @@ async fn session_event_to_frame(
             params_preview,
             description,
         },
+        SessionEvent::QuestionAsked {
+            ask_id,
+            tool_call_id,
+            session_id,
+            user_id,
+            questions,
+        } => Frame::QuestionAsked {
+            ask_id,
+            tool_call_id,
+            session_id,
+            user_id,
+            questions,
+        },
         SessionEvent::AskResolved {
             ask_id,
             outcome,
@@ -461,6 +474,7 @@ async fn agent_output_to_frame(
             status,
             summary,
             approval,
+            ask,
         } => {
             let status = match status {
                 ToolStatus::Ok => "ok",
@@ -474,6 +488,7 @@ async fn agent_output_to_frame(
                 status: status.to_owned(),
                 summary,
                 approval,
+                ask,
             }
         }
         AgentEvent::Status(status) => {

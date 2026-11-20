@@ -1,3 +1,5 @@
+import type { components } from "../../../web/src/api/schema";
+
 /** A media reference carried on a chat message — mirrors the Rust
  * `wire::WireAttachment` (snake_case fields). The bytes never ride the message;
  * only this id does — fetch them with `blobObjectUrl` in bridge.ts. */
@@ -71,6 +73,7 @@ export type WireWorkStepFrame = {
 /// the durable shadow of a progress-narration line (a persisted `progress`
 /// control event folded back into the block).
 export type RestWorkStep = {
+  ask?: components["schemas"]["ChatAskStepSummary"];
   kind: "reasoning" | "prose" | "tool" | "status";
   text?: string;
   /// The call's id — the same one the live `tool_started` / `tool_completed`
@@ -175,7 +178,7 @@ export type WireFrame =
   | {
       kind: "ask_resolved";
       ask_id: string;
-      outcome: "answered" | "declined" | "abandoned";
+      outcome: "answered" | "declined" | "cancelled" | "abandoned";
       decision?: string;
     }
   // `started_at` is present iff `active` — it is the turn's identity for the

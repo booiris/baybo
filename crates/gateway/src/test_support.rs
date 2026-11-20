@@ -294,6 +294,10 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         log_buffer: LogBuffer::new(256),
         incoming_tx,
         channel_tokens: channel_tokens.clone(),
+        security_gateway: Arc::new(baybo_agent::SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::clone(&secret_vault),
+        )),
         secret_vault,
         stores,
         channel_control,

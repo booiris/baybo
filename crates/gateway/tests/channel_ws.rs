@@ -1774,3 +1774,273 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
     shutdown.trigger();
     let _ = server_handle.await;
 }
+
+/// Live question flow over WS: `QuestionAsked` reaches subscribed clients,
+/// a late subscriber receives the card in `SubscribeState.pending_questions`,
+/// `AnswerQuestion` (both `Answered` with blank-`other` normalization and
+/// `Declined`) resolves through the ledger and broadcasts `AskResolved` with
+/// `decision: None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_question_frame_and_subscribe_state_pending_questions() {
+    use baybo_model::human_ask::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    boot::install_channels(
+        &tg.deps.channel_registry,
+        &ChannelsConfig::default(),
+        &tg.deps.ask_channels,
+    )
+    .expect("install");
+    let session = tg
+        .deps
+        .session_manager
+        .create_session(
+            User {
+                id: WEB_OPERATOR_USER_ID.into(),
+                name: None,
+                channel: ChannelType::owner(),
+            },
+            ChannelType::owner(),
+        )
+        .await
+        .expect("create session");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
+        .await
+        .expect("tab_a handshake");
+    send_frame(
+        &mut tab_a,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+        },
+    )
+    .await
+    .expect("tab_a Subscribe");
+    expect_idle_subscribe_state(&mut tab_a, session.id.as_str()).await;
+
+    let gate = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner channel")
+        .question_gate()
+        .expect("question gate");
+    let questions = vec![Question {
+        header: "Auth".into(),
+        question: "Which auth strategy?".into(),
+        options: vec![
+            QuestionOption {
+                label: "JWT".into(),
+                description: "Stateless".into(),
+            },
+            QuestionOption {
+                label: "Cookie".into(),
+                description: "Stateful".into(),
+            },
+        ],
+        multi_select: false,
+    }];
+
+    // 1. Answered flow + late subscriber `SubscribeState.pending_questions`.
+    let gate_clone = Arc::clone(&gate);
+    let q1 = baybo_tools::QuestionAsk {
+        ask_id: "q-ws-1".parse().unwrap(),
+        tool_call_id: "use-q-ws-1".into(),
+        session_id: session.id.clone(),
+        request: QuestionRequest {
+            questions: questions.clone(),
+        },
+    };
+    let parked1 = tokio::spawn(async move {
+        gate_clone
+            .ask(
+                q1,
+                baybo_tools::AskSite::for_test(),
+                baybo_tools::AskCancel::never(),
+            )
+            .await
+    });
+
+    loop {
+        match recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
+            .await
+            .expect("QuestionAsked on tab_a")
+        {
+            Frame::QuestionAsked {
+                ask_id,
+                tool_call_id,
+                questions: qs,
+                ..
+            } => {
+                assert_eq!(ask_id, "q-ws-1");
+                assert_eq!(tool_call_id, "use-q-ws-1");
+                assert_eq!(qs, questions);
+                break;
+            }
+            Frame::SessionUpdated { .. } => {}
+            other => panic!("expected QuestionAsked, got {other:?}"),
+        }
+    }
+
+    // Late subscriber sees the pending question in `SubscribeState`.
+    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
+        .await
+        .expect("tab_b handshake");
+    send_frame(
+        &mut tab_b,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+        },
+    )
+    .await
+    .expect("tab_b Subscribe");
+    match recv_frame(&mut tab_b, Duration::from_secs(2))
+        .await
+        .expect("SubscribeState on tab_b")
+    {
+        Frame::SubscribeState {
+            pending_questions, ..
+        } => {
+            assert_eq!(pending_questions.len(), 1);
+            assert_eq!(pending_questions[0].queue_index, 0);
+            assert_eq!(pending_questions[0].ask_id, "q-ws-1");
+            assert_eq!(pending_questions[0].tool_call_id, "use-q-ws-1");
+            assert_eq!(pending_questions[0].questions, questions);
+        }
+        other => panic!("expected SubscribeState, got {other:?}"),
+    }
+
+    // A malformed reply must leave the gate parked for the subsequent valid one.
+    send_frame(
+        &mut tab_a,
+        Frame::AnswerQuestion {
+            ask_id: "q-ws-1".parse().unwrap(),
+            reply: wire::QuestionReply::Answered {
+                answers: vec![QuestionAnswer {
+                    header: "Auth".into(),
+                    selected: vec!["Missing option".into()],
+                    other: None,
+                }],
+            },
+        },
+    )
+    .await
+    .expect("send malformed answer");
+
+    // Answer with whitespace-only `other` — server normalizes it to `None`.
+    send_frame(
+        &mut tab_a,
+        Frame::AnswerQuestion {
+            ask_id: "q-ws-1".parse().unwrap(),
+            reply: wire::QuestionReply::Answered {
+                answers: vec![QuestionAnswer {
+                    header: "Auth".into(),
+                    selected: vec!["JWT".into()],
+                    other: Some("   ".into()),
+                }],
+            },
+        },
+    )
+    .await
+    .expect("send AnswerQuestion");
+
+    assert_eq!(
+        parked1.await.expect("gate task 1"),
+        baybo_tools::QuestionOutcome::Answered(vec![QuestionAnswer {
+            header: "Auth".into(),
+            selected: vec!["JWT".into()],
+            other: None,
+        }])
+    );
+
+    for (label, ws) in [("tab_a", &mut tab_a), ("tab_b", &mut tab_b)] {
+        loop {
+            match recv_frame_skip_activity(ws, Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|e| panic!("{label} expected AskResolved: {e}"))
+            {
+                Frame::SessionUpdated { .. } => {}
+                Frame::AskResolved {
+                    ask_id,
+                    outcome,
+                    decision,
+                } => {
+                    assert_eq!(ask_id, "q-ws-1", "{label}");
+                    assert_eq!(outcome, wire::AskOutcomeKind::Answered, "{label}");
+                    assert_eq!(decision, None, "{label}");
+                    break;
+                }
+                other => panic!("{label}: expected AskResolved, got {other:?}"),
+            }
+        }
+    }
+
+    // 2. Cancel the entire question card.
+    let q2 = baybo_tools::QuestionAsk {
+        ask_id: "q-ws-2".parse().unwrap(),
+        tool_call_id: "use-q-ws-2".into(),
+        session_id: session.id.clone(),
+        request: QuestionRequest {
+            questions: questions.clone(),
+        },
+    };
+    let parked2 = tokio::spawn(async move {
+        gate.ask(
+            q2,
+            baybo_tools::AskSite::for_test(),
+            baybo_tools::AskCancel::never(),
+        )
+        .await
+    });
+    loop {
+        match recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
+            .await
+            .expect("QuestionAsked 2")
+        {
+            Frame::QuestionAsked { ask_id, .. } if ask_id == "q-ws-2" => break,
+            Frame::SessionUpdated { .. } => {}
+            other => panic!("expected QuestionAsked 2, got {other:?}"),
+        }
+    }
+    send_frame(
+        &mut tab_a,
+        Frame::AnswerQuestion {
+            ask_id: "q-ws-2".parse().unwrap(),
+            reply: wire::QuestionReply::Cancelled,
+        },
+    )
+    .await
+    .expect("send Cancelled");
+    assert_eq!(
+        parked2.await.expect("gate task 2"),
+        baybo_tools::QuestionOutcome::Cancelled
+    );
+    loop {
+        match recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
+            .await
+            .expect("AskResolved 2")
+        {
+            Frame::SessionUpdated { .. } => {}
+            Frame::AskResolved {
+                ask_id,
+                outcome,
+                decision,
+            } => {
+                assert_eq!(ask_id, "q-ws-2");
+                assert_eq!(outcome, wire::AskOutcomeKind::Cancelled);
+                assert_eq!(decision, None);
+                break;
+            }
+            other => panic!("expected AskResolved 2, got {other:?}"),
+        }
+    }
+
+    drop(tab_a);
+    drop(tab_b);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}

@@ -380,6 +380,12 @@ impl ToolRegistry {
             .unwrap_or(ToolConcurrency::Exclusive)
     }
 
+    /// Whether `name` must be the only call in its model response (see
+    /// [`crate::Tool::sole_call`]). `false` for an unknown name.
+    pub fn sole_call(&self, name: &str) -> bool {
+        self.get(name).is_some_and(|tool| tool.sole_call())
+    }
+
     /// Execute a tool by name with the given parameters and context.
     pub async fn execute(
         &self,

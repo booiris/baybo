@@ -367,3 +367,252 @@ async fn a_subagent_hitting_a_gate_is_policy_denied() {
         .expect("send spawn");
     assert_policy_denied(harness, raised, runs).await;
 }
+
+fn sample_ask_user_args() -> Value {
+    json!({
+        "questions": [{
+            "header": "Auth",
+            "question": "Which auth method?",
+            "options": [
+                { "label": "JWT", "description": "Stateless token" },
+                { "label": "Cookie", "description": "Server session" }
+            ],
+            "multi_select": false
+        }]
+    })
+}
+
+#[tokio::test]
+async fn stop_on_live_ask_user_abandons_the_row_and_empties_the_queue() {
+    use baybo_integration_tests::SessionBuilder;
+    use baybo_model::ChannelType;
+    use baybo_model::human_ask::{AskKind, AskRequest};
+
+    let session = SessionBuilder::new()
+        .id("sess-ask-user-stop")
+        .channel(ChannelType::owner())
+        .build();
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_channel_ask_gate()
+        .build();
+    let placeholder = "[{REDACTED_SECRET_0123456789abcdef01234567}]";
+    harness
+        .vault
+        .store_secret(placeholder, b"test-credential")
+        .await
+        .unwrap();
+    let mut args = sample_ask_user_args();
+    args["questions"][0]["options"][0]["description"] = json!(placeholder);
+    let expected_request = AskRequest::Question(serde_json::from_value(args.clone()).unwrap());
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: CALL_ID.to_string(),
+            name: baybo_model::human_ask::ASK_USER_TOOL_NAME.to_string(),
+            arguments: args,
+            signature: None,
+        })]);
+    harness.send_text("ask me").await.expect("send");
+
+    let queue = harness.ask_queues.get_or_create(&harness.session.channel);
+    tokio::time::timeout(PARK_TIMEOUT, async {
+        while queue.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("AskUser should park on a question");
+    let rows = harness.ask_store.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, AskKind::Question);
+    assert_eq!(rows[0].request, expected_request);
+    assert_eq!(queue.list()[0].request, expected_request);
+    let ask_id = rows[0].ask_id.clone();
+
+    stop_turn(&harness).await;
+    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let after = harness.ask_store.row(&ask_id).expect("row kept");
+    assert_eq!(after.resolution, Some(AskResolution::Abandoned));
+    assert!(after.applied_at.is_some());
+    assert!(queue.is_empty());
+    let results = results_for_call(&harness).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].contains("user moved on without answering"),
+        "{results:?}"
+    );
+    assert_eq!(completed_for_call(&outputs), 1);
+
+    tokio::time::timeout(PARK_TIMEOUT, harness.shutdown())
+        .await
+        .expect("actor stops");
+}
+
+struct CountingTool {
+    name: &'static str,
+    sole: bool,
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for CountingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> String {
+        format!("counting tool {}", self.name)
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn sole_call(&self) -> bool {
+        self.sole
+    }
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::Text(format!("ran:{}", self.name)))
+    }
+}
+
+#[tokio::test]
+async fn sole_call_rejects_ask_user_and_tool_invoke_sole_call_when_batched_with_siblings() {
+    use baybo_integration_tests::SessionBuilder;
+    use baybo_model::ChannelType;
+
+    let echo_runs = Arc::new(AtomicUsize::new(0));
+    let deferred_sole_runs = Arc::new(AtomicUsize::new(0));
+    let session = SessionBuilder::new()
+        .id("sess-sole-call")
+        .channel(ChannelType::owner())
+        .build();
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(
+            Arc::new(CountingTool {
+                name: "echo_sibling",
+                sole: false,
+                runs: Arc::clone(&echo_runs),
+            }),
+            ToolManifest {
+                name: "echo_sibling".into(),
+                description: "echo".into(),
+                trust_level: baybo_model::TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: Vec::new(),
+                channels: Vec::new(),
+            },
+        )
+        .with_channel_ask_gate()
+        .build();
+
+    // Also register a deferred sole-call tool to verify ToolInvoke unwrapping
+    // is checked against `sole_call()` before dispatch.
+    harness.tool_registry.register_dynamic_deferred(
+        "ext",
+        Arc::new(CountingTool {
+            name: "ext/sole_prompt",
+            sole: true,
+            runs: Arc::clone(&deferred_sole_runs),
+        }),
+        ToolManifest {
+            name: "ext/sole_prompt".into(),
+            description: "deferred sole-call".into(),
+            trust_level: baybo_model::TrustLevel::Trusted,
+            parameters_schema: json!({"type": "object", "properties": {}}),
+            capabilities: Vec::new(),
+            channels: Vec::new(),
+        },
+    );
+
+    // Turn 1: [echo_sibling, AskUser]
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-echo-1".into(),
+            name: "echo_sibling".into(),
+            arguments: json!({}),
+            signature: None,
+        }),
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-ask-1".into(),
+            name: baybo_model::human_ask::ASK_USER_TOOL_NAME.into(),
+            arguments: sample_ask_user_args(),
+            signature: None,
+        }),
+    ]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("turn 1 done".into())]);
+    harness.send_text("batch direct").await.expect("send 1");
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(echo_runs.load(Ordering::SeqCst), 1, "sibling still ran");
+    assert!(
+        harness.ask_store.rows().is_empty(),
+        "rejected AskUser must not raise an ask"
+    );
+
+    // Turn 2: [echo_sibling, ToolInvoke { name: "ext/sole_prompt", params: {} }]
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-echo-2".into(),
+            name: "echo_sibling".into(),
+            arguments: json!({}),
+            signature: None,
+        }),
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-invoke-sole".into(),
+            name: baybo_tools::builtin::tool_search::TOOL_INVOKE_NAME.into(),
+            arguments: json!({ "name": "ext/sole_prompt", "params": {} }),
+            signature: None,
+        }),
+    ]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("turn 2 done".into())]);
+    harness.send_text("batch invoke").await.expect("send 2");
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(echo_runs.load(Ordering::SeqCst), 2, "second sibling ran");
+    assert_eq!(
+        deferred_sole_runs.load(Ordering::SeqCst),
+        0,
+        "deferred sole_call tool wrapped in ToolInvoke must not run in a batch"
+    );
+
+    let messages = harness
+        .memory_session_store
+        .load_session_messages_with_supersede(&harness.session.id)
+        .await
+        .expect("load messages");
+    let result_for = |id: &str| -> String {
+        messages
+            .iter()
+            .flat_map(|row| row.message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == id => Some(content.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing tool_result for {id}"))
+    };
+    assert!(
+        result_for("call-ask-1").contains("AskUser must be the only tool call in its response"),
+        "got: {}",
+        result_for("call-ask-1")
+    );
+    assert!(
+        result_for("call-invoke-sole")
+            .contains("ext/sole_prompt must be the only tool call in its response"),
+        "got: {}",
+        result_for("call-invoke-sole")
+    );
+
+    tokio::time::timeout(PARK_TIMEOUT, harness.shutdown())
+        .await
+        .expect("actor stops");
+}

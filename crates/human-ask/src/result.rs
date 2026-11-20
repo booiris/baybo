@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 
 const DECLINED_NOTE: &str =
     r#"the user declined to answer; proceed on your best judgment or ask in plain text"#;
+const UNATTENDED_NOTE: &str =
+    r#"this turn runs unattended and cannot ask the user; proceed on your best judgment"#;
 const ABANDONED_REASON: &str = r#"user moved on without answering"#;
 
 /// `{"answers": [...]}`; a question with neither a selection nor free text
@@ -14,12 +16,17 @@ pub fn answered(answers: &[QuestionAnswer]) -> Value {
     let answers: Vec<Value> = answers
         .iter()
         .map(|answer| {
+            let other = answer
+                .other
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             let mut entry = json!({
                 "header": answer.header,
                 "selected": answer.selected,
-                "other": answer.other,
+                "other": other,
             });
-            if answer.selected.is_empty() && answer.other.is_none() {
+            if answer.selected.is_empty() && other.is_none() {
                 entry["skipped"] = Value::Bool(true);
             }
             entry
@@ -31,6 +38,17 @@ pub fn answered(answers: &[QuestionAnswer]) -> Value {
 /// The user declined the questions as a whole.
 pub fn declined() -> Value {
     json!({ "declined": true, "note": DECLINED_NOTE })
+}
+
+/// The human cancelled this question without submitting any draft answers.
+pub fn cancelled() -> Value {
+    json!({ "cancelled": true })
+}
+
+/// Nobody could be asked because this turn has no question gate (unattended
+/// turn or a channel without a question UI).
+pub fn unattended() -> Value {
+    json!({ "declined": true, "note": UNATTENDED_NOTE })
 }
 
 /// Nobody answered, and the conversation moved on.

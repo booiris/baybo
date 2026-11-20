@@ -13,6 +13,9 @@ pub enum HumanAskError {
     #[error("ask {ask_id} is already closed")]
     AskClosed { ask_id: AskId },
 
+    #[error("answers do not match the questions on ask {ask_id}")]
+    InvalidAnswers { ask_id: AskId },
+
     /// The resolution does not fit the ask's kind (an approval decision for a
     /// question, or answers for an approval).
     #[error("ask {ask_id} is a {kind:?} ask; that resolution does not apply to it")]

@@ -124,7 +124,7 @@ impl ApprovalOutcome {
             AskResolution::PolicyDenied => Some(Self::policy(ApprovalDecision::Deny)),
             AskResolution::Abandoned => Some(Self::abandoned()),
             AskResolution::TimedOut => Some(Self::timed_out()),
-            AskResolution::Answered(_) | AskResolution::Declined => None,
+            AskResolution::Answered(_) | AskResolution::Declined | AskResolution::Cancelled => None,
         }
     }
 }

@@ -59,6 +59,10 @@ export interface SessionSummary {
    *  `pinned`, which is this SESSION's own pin. A tombstone group (job deleted)
    *  is always `false`: there is nothing left to hold the bit. */
   cron_group_pinned?: boolean;
+  /** True while an ask of any kind in this session is waiting on the user
+   *  (approval or question). Seeded from the REST list endpoint and updated
+   *  live via `SessionPatch.awaiting_human`. */
+  awaiting_human?: boolean;
 }
 
 /** A user-created chat-list folder. Two-level tree via `parent_id`
