@@ -94,6 +94,11 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
     let runs = Arc::new(AtomicUsize::new(0));
     let store_slot = Arc::new(Mutex::new(None));
     let applied_when_ran = Arc::new(Mutex::new(None));
+    let probe = Arc::new(ProbeWrite {
+        runs: Arc::clone(&runs),
+        store: Arc::clone(&store_slot),
+        applied_when_ran: Arc::clone(&applied_when_ran),
+    });
     let session = baybo_integration_tests::SessionBuilder::new().build();
     let ask_id = AskId::new();
     let request = match kind {
@@ -103,7 +108,7 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
             session_id: session.id.clone(),
             user_id: session.user.id.clone(),
             tool: tool.to_string(),
-            accesses: Vec::new(),
+            accesses: probe.accessed_resources(&json!({})),
             params_preview: "{}".to_string(),
             description: None,
         }),
@@ -145,14 +150,7 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
     ];
     let harness = AgentTestHarness::builder()
         .session(session)
-        .with_tool(
-            Arc::new(ProbeWrite {
-                runs: Arc::clone(&runs),
-                store: Arc::clone(&store_slot),
-                applied_when_ran: Arc::clone(&applied_when_ran),
-            }),
-            manifest(),
-        )
+        .with_tool(probe, manifest())
         .with_channel_ask_gate()
         .with_seed_transcript(transcript)
         .with_seed_ask(row)
@@ -660,5 +658,263 @@ async fn a_background_notification_settles_before_its_prompt() {
     let requests = harness.stub_llm.captured_requests();
     assert_eq!(requests.len(), 1, "the notification turn ran");
     assert_paired(&requests[0]);
+    stop(harness).await;
+}
+
+#[tokio::test]
+async fn skill_env_approval_resumes_without_reprompting_and_does_not_cache() {
+    assert_skill_env_resume(false).await;
+}
+
+#[tokio::test]
+async fn skill_env_resume_refuses_expanded_requirements() {
+    assert_skill_env_resume(true).await;
+}
+
+async fn assert_skill_env_resume(expanded: bool) {
+    use baybo_skills::{AlwaysPass, SkillDefinition, SkillRegistry, SkillRequirements};
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("SKILL.md"), "# Secret Skill Body\n").expect("write skill");
+    let skill_registry = Arc::new(SkillRegistry::new());
+    skill_registry.register(SkillDefinition {
+        name: "env-skill".to_string(),
+        version: "1.0.0".to_string(),
+        description: "needs PATH".to_string(),
+        command: Some("env-skill".to_string()),
+        agent_invocable: true,
+        channels: vec![],
+        argument_hint: None,
+        prompt_template: "# Secret Skill Body\n".to_string(),
+        allowed_tools: vec![],
+        source: baybo_model::ArtifactSource::Workspace,
+        trust_level: baybo_model::TrustLevel::Trusted,
+        requirements: SkillRequirements {
+            required_bins: vec![],
+            required_env: if expanded {
+                vec!["PATH".into(), "HOME".into()]
+            } else {
+                vec!["PATH".into()]
+            },
+            required_models: vec![],
+        },
+        token_budget_hint: 0,
+        source_path: Some(dir.path().to_path_buf()),
+        linked_files: Default::default(),
+    });
+    let (skill_tool, skill_manifest) =
+        baybo_skills::tools::build(skill_registry, Arc::new(AlwaysPass));
+
+    let session = baybo_integration_tests::SessionBuilder::new().build();
+    let ask_id = AskId::new();
+    let now = Utc::now();
+    let row = HumanAskRow {
+        ask_id: ask_id.clone(),
+        session_id: session.id.clone(),
+        channel: session.channel.clone(),
+        tool_call_id: CALL_ID.to_string(),
+        turn_id: baybo_model::TurnId::new(),
+        kind: AskKind::Approval,
+        phase: AskPhase::BeforeExecute,
+        request: AskRequest::Approval(ApprovalRequest {
+            ask_id: ask_id.clone(),
+            tool_call_id: CALL_ID.to_string(),
+            session_id: session.id.clone(),
+            user_id: session.user.id.clone(),
+            tool: baybo_skills::tools::SKILL_TOOL_NAME.to_string(),
+            accesses: vec![ResourceAccess::Env {
+                vars: vec!["PATH".to_string()],
+            }],
+            params_preview: "Skill 'env-skill' env vars: PATH".to_string(),
+            description: None,
+        }),
+        created_at: now,
+        resolved_at: Some(now),
+        resolution: Some(AskResolution::Approval(ApprovalDecision::ApproveAlways)),
+        applied_at: None,
+    };
+    let transcript = vec![
+        ChatMessage::system(vec![ContentBlock::Text(
+            "You are Baybo, a test assistant.".to_string(),
+        )]),
+        ChatMessage::user(vec![ContentBlock::Text("load env-skill".to_string())]),
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: CALL_ID.to_string(),
+            name: baybo_skills::tools::SKILL_TOOL_NAME.to_string(),
+            input: json!({ "skill": "env-skill" }),
+            signature: None,
+        }]),
+    ];
+
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(skill_tool, skill_manifest)
+        .with_channel_ask_gate()
+        .with_seed_transcript(transcript)
+        .with_seed_ask(row)
+        .build();
+    harness
+        .turn_lifecycle
+        .start_turn(
+            harness.session.id.clone(),
+            TriggerKind::User,
+            TurnInput::UserChat {
+                content: vec![ContentBlock::Text("load env-skill".to_string())],
+            },
+            None,
+        )
+        .await
+        .expect("seed raising turn");
+
+    reply(&harness, "loaded env-skill");
+    harness
+        .mailbox
+        .send(AgentMessage::ResumeAsk {
+            ask_id: ask_id.clone(),
+        })
+        .await
+        .expect("send resume");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let result = adjacent_result(&harness).await;
+    if expanded {
+        assert!(!result.contains("Secret Skill Body"));
+        assert!(result.contains("approval requirements changed"), "{result}");
+    } else {
+        assert!(result.contains("Secret Skill Body"), "{result}");
+    }
+    assert_eq!(
+        harness.ask_store.rows().len(),
+        1,
+        "no second ask raised during resume"
+    );
+    let stored_session = harness
+        .session_store
+        .get(&harness.session.id)
+        .await
+        .expect("load session")
+        .expect("session exists");
+    assert!(
+        stored_session.state.approved_resources.is_empty(),
+        "ApproveAlways on resumed uncached Skill env must not persist to session cache"
+    );
+    stop(harness).await;
+}
+
+#[tokio::test]
+async fn during_execute_unsandboxed_retry_resumes_straight_to_unsandboxed_and_does_not_cache() {
+    use baybo_tools::builtin::bash::BashTool;
+    use baybo_tools::builtin::permission::{LivePermissionMode, PermissionMode};
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+    std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+
+    // Manual mode proves Resume dispatches `DuringExecuteResumer::resume_during_execute`
+    // (skipping `pre_execute_ask`) rather than re-running the normal pre-execute gate.
+    let bash = Arc::new(
+        BashTool::new(paths, baybo_process::ProcessManager::transient())
+            .with_permission_handle(Arc::new(LivePermissionMode::new(PermissionMode::Manual))),
+    );
+    let bash_manifest = ToolManifest {
+        name: "Bash".to_string(),
+        description: "bash".to_string(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object", "properties": {}}),
+        capabilities: vec![baybo_tools::ToolCapability::ExecCommand],
+        channels: Vec::new(),
+    };
+
+    let session = baybo_integration_tests::SessionBuilder::new().build();
+    let ask_id = AskId::new();
+    let now = Utc::now();
+    let cmd = "printf 'unsandboxed-resume-ok\\n'";
+    let row = HumanAskRow {
+        ask_id: ask_id.clone(),
+        session_id: session.id.clone(),
+        channel: session.channel.clone(),
+        tool_call_id: CALL_ID.to_string(),
+        turn_id: baybo_model::TurnId::new(),
+        kind: AskKind::Approval,
+        phase: AskPhase::DuringExecuteResumable,
+        request: AskRequest::Approval(ApprovalRequest {
+            ask_id: ask_id.clone(),
+            tool_call_id: CALL_ID.to_string(),
+            session_id: session.id.clone(),
+            user_id: session.user.id.clone(),
+            tool: "Bash".to_string(),
+            accesses: vec![ResourceAccess::ExecCommand {
+                command: cmd.to_string(),
+            }],
+            params_preview: "Sandboxed Bash failed".to_string(),
+            description: None,
+        }),
+        created_at: now,
+        resolved_at: Some(now),
+        resolution: Some(AskResolution::Approval(ApprovalDecision::ApproveAlways)),
+        applied_at: None,
+    };
+    let transcript = vec![
+        ChatMessage::system(vec![ContentBlock::Text(
+            "You are Baybo, a test assistant.".to_string(),
+        )]),
+        ChatMessage::user(vec![ContentBlock::Text("run command".to_string())]),
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: CALL_ID.to_string(),
+            name: "Bash".to_string(),
+            input: json!({ "command": cmd }),
+            signature: None,
+        }]),
+    ];
+
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(bash, bash_manifest)
+        .with_channel_ask_gate()
+        .with_seed_transcript(transcript)
+        .with_seed_ask(row)
+        .build();
+    harness
+        .turn_lifecycle
+        .start_turn(
+            harness.session.id.clone(),
+            TriggerKind::User,
+            TurnInput::UserChat {
+                content: vec![ContentBlock::Text("run command".to_string())],
+            },
+            None,
+        )
+        .await
+        .expect("seed raising turn");
+
+    reply(&harness, "ran unsandboxed");
+    harness
+        .mailbox
+        .send(AgentMessage::ResumeAsk {
+            ask_id: ask_id.clone(),
+        })
+        .await
+        .expect("send resume");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let result = adjacent_result(&harness).await;
+    assert!(
+        result.contains("unsandboxed-resume-ok") && result.contains("sandbox_escalation"),
+        "resumed DuringExecuteResumable approval must execute unsandboxed with escalation note: {result}"
+    );
+    assert_eq!(
+        harness.ask_store.rows().len(),
+        1,
+        "no second ask raised during resume"
+    );
+    let stored_session = harness
+        .session_store
+        .get(&harness.session.id)
+        .await
+        .expect("load session")
+        .expect("session exists");
+    assert!(
+        stored_session.state.approved_resources.is_empty(),
+        "ApproveAlways on resumed unsandboxed retry must not persist to session cache"
+    );
     stop(harness).await;
 }

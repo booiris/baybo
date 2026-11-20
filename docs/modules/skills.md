@@ -232,6 +232,7 @@ Downstream gating happens lazily, on call:
 
 - The `Skill` tool runs the assessor (via `Arc<dyn SkillRiskCheck>`) before returning the body. `Dangerous` aborts with `ToolError::Denied`; `Suspicious` continues but adds a `risk_warning` field to the response and emits a notice (when a `SessionNotifier` is wired).
 - The tool also enforces `SkillRequirements::required_env`: missing host env vars short-circuit the call with `ToolError::Execution` *before* prompting the user. If every required var is present, an approval gate fires (`ResourceAccess::Env { vars }`); the env *values* are never templated into the response.
+- Approval is bound to this invocation's environment requirements. `SkillTool::execute` checks the freshly resolved definition against the executor's per-call grant, so a hot reload that adds required variables refuses the call and asks the model to retry for new approval. Resume carries the original ledger resources and also refuses expanded requirements before execution. Session grants cannot satisfy these uncached asks.
 - `SkillRegistry::validate_all` still reports unmet `required_bins` / `required_env`; callers that care (e.g. `baybo skills check`) act on that report.
 - Trust-level attenuation of the tool ceiling is a design stage not yet wired in.
 

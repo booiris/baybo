@@ -35,6 +35,43 @@ use crate::ask::{AskCancel, AskSite};
 // Core types
 // ---------------------------------------------------------------------------
 
+/// Whether the executor is deciding if a call needs a prompt, or applying an
+/// already-decided prompt on resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreExecuteCheck {
+    /// Live call: run any dynamic check (such as Bash's risk judge) and return
+    /// `Some` when human approval is needed.
+    Evaluate,
+    /// Resumed call: a human already answered this call's pre-execute ask.
+    /// Skip non-deterministic or costly checks (such as an LLM risk judge) and
+    /// return the current accesses and `cacheable` flag. The executor checks
+    /// these against the resources persisted with the original approval.
+    PreDecided,
+}
+
+/// Pre-execution approval request returned by [`crate::Tool::pre_execute_ask`].
+///
+/// The executor runs this before `Tool::execute`, consults the session
+/// approval cache only when `cacheable` is `true`, and raises an
+/// [`baybo_model::human_ask::AskPhase::BeforeExecute`] prompt if any access
+/// remains uncovered.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreExecuteAsk {
+    /// Concrete resources this call asks to access.
+    pub accesses: Vec<ResourceAccess>,
+    /// Whether the session's [`ApprovedResource`] cache may satisfy these
+    /// accesses and whether [`ApprovalDecision::ApproveAlways`] persists them.
+    /// Set `false` for privilege transitions (unsandboxed Bash) and
+    /// per-invocation grants (skill env vars).
+    pub cacheable: bool,
+    /// Optional human-readable summary or warning displayed prominently by
+    /// clients that render descriptions.
+    pub description: Option<String>,
+    /// Optional custom preview text; when `None`, the executor derives a
+    /// truncated JSON preview with [`preview_params`].
+    pub params_preview: Option<String>,
+}
+
 /// What came back from a gate, and *how*. The decision alone is what the
 /// executor acts on; the resolution is what the ledgers downstream (the
 /// issue timeline, span events) need so a torn-down prompt is not written

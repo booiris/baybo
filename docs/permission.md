@@ -229,28 +229,30 @@ that command.
 
 ## Approval Ownership
 
-The executor approval gate and Bash's internal judge intentionally do not both
-own the same prompt.
+All pre-execution Bash prompts go through the executor's `BeforeExecute` gate
+via `BashTool::pre_execute_ask` (so they are resumable across restarts and
+produce at most one ask per call).
 
-In `manual`, Bash declares an `ExecCommand` resource for every executable Bash
-command using `sandbox_permissions=use_default`, so the executor approval gate
-prompts before execution.
+In `manual`, `BashTool::pre_execute_ask` returns a cacheable `ExecCommand` ask
+for every executable Bash command using `sandbox_permissions=use_default`.
 
-In `auto`, Bash declares no execution resource at all — neither for destructive
-nor benign commands. For a destructive command Bash owns the pre-execution judge
-and, when needed, asks the approval gate itself; benign commands run unprompted.
-This avoids double prompts for the same command.
+In `auto`, `BashTool::pre_execute_ask` runs the destructive-command LLM judge
+before execution and returns a cacheable `ExecCommand` ask only when the judge
+requires approval; benign commands return `None` and run unprompted.
 
-In `free`, Bash declares no execution resource because the mode is explicitly
-ungated.
+In `free`, `BashTool::pre_execute_ask` returns `None` because the mode is
+explicitly ungated.
 
-For `sandbox_permissions=require_escalated`, Bash declares no pre-execution
-resource in any global permission mode. Under `auto` or `manual`, it owns one
-uncached mid-execution prompt instead, whose `ExecCommand` access and preview
-both name the exact command. This avoids a double prompt in `manual` and
-prevents the ordinary resource cache from collapsing the sandboxed and
-unsandboxed privilege levels. Under `free`, it raises no prompt because the
-command already runs outside the OS sandbox.
+For `sandbox_permissions=require_escalated`, under `auto` or `manual`,
+`BashTool::pre_execute_ask` returns a single **uncached** (`cacheable: false`)
+`BeforeExecute` ask whose `ExecCommand` access, description, and preview name
+the exact command (merging the destructive-command warning if applicable). That
+avoids double prompting and prevents the session approval cache from promoting
+a sandboxed grant to the host route. Under `free`, it returns `None` because
+the command already runs outside the OS sandbox.
+
+Only the post-failure unsandboxed retry (`request_unsandboxed_retry_approval`)
+remains a mid-execution (`DuringExecuteResumable`) prompt through `ApprovalHandle`.
 
 ## Background Runs
 

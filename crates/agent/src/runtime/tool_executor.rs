@@ -14,9 +14,9 @@ use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalHandle, ApprovalOutcome,
     ApprovalRequest, ApprovalResolution, ApprovedResource, AskCancel, AskSite, ExecSandbox,
-    ParkGauge, ReadTracker, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest,
-    ToolOutput, ToolRegistry, TurnTokens, VirtualReadResolver, approval::preview_params,
-    refusal_reason,
+    ParkGauge, PreExecuteAsk, PreExecuteCheck, ReadTracker, ResourceAccess, ToolCapability,
+    ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry, TurnTokens,
+    VirtualReadResolver, approval::preview_params, refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
@@ -400,6 +400,81 @@ pub(crate) fn cap_trace_output_with_len(value: Value, full_len: usize) -> (Value
     }
 }
 
+/// How the pre-execute approval gate treats a call's uncovered accesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreExecuteGate {
+    /// Raise an ask on the turn's gate, as every live call does.
+    Ask,
+    /// A human already answered this call's ask and the turn prelude is
+    /// re-executing it: take `decision` as the gate's answer without raising
+    /// anything.
+    ///
+    /// - [`AskPhase::BeforeExecute`]: evaluates `pre_execute_ask` in
+    ///   `PreDecided` mode, verifies the original resources still cover the
+    ///   request, seeds cacheable `ApproveAlways` grants and runs `Tool::execute`.
+    /// - [`AskPhase::DuringExecuteResumable`]: skips `pre_execute_ask` (never
+    ///   caches) and runs `DuringExecuteResumer::resume_during_execute` via
+    ///   `Tool::during_execute_resumer`.
+    PreDecided {
+        decision: ApprovalDecision,
+        phase: AskPhase,
+        accesses: Vec<ResourceAccess>,
+    },
+}
+
+struct PreparedApproval {
+    ask: PreExecuteAsk,
+    requested_accesses: Vec<ResourceAccess>,
+}
+
+impl PreparedApproval {
+    fn retain_uncovered(&mut self, cache: &Mutex<Vec<ApprovedResource>>) {
+        if self.ask.cacheable {
+            let approved = cache.lock();
+            self.ask.accesses.retain(|access| {
+                !matches!(access, ResourceAccess::ReadFile { .. })
+                    && !approved.iter().any(|grant| grant.covers(access))
+            });
+        }
+    }
+
+    fn validate_resume(&self, mode: &PreExecuteGate, tool: &str) -> anyhow::Result<()> {
+        if let PreExecuteGate::PreDecided {
+            decision, accesses, ..
+        } = mode
+            && *decision != ApprovalDecision::Deny
+            && self.ask.accesses.iter().any(|access| {
+                !accesses
+                    .iter()
+                    .any(|original| original.to_approved().covers(access))
+            })
+        {
+            return Err(ToolError::Denied {
+                tool: tool.to_owned(),
+                reason: "approval requirements changed; retry the tool call for a new approval"
+                    .to_owned(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+fn require_approval(outcome: ApprovalOutcome, tool: &str, ctx: &ToolContext) -> anyhow::Result<()> {
+    if outcome.decision == ApprovalDecision::Deny {
+        return Err(ToolError::Denied {
+            tool: tool.to_owned(),
+            reason: refusal_reason(outcome.resolution).to_owned(),
+        }
+        .into());
+    }
+    if ctx.cancellation_token.is_cancelled() {
+        anyhow::bail!("tool '{tool}' cancelled while awaiting approval");
+    }
+    info!(tool, decision = ?outcome.decision, "tool call approved");
+    Ok(())
+}
+
 /// A finished tool call: whatever the call produced, plus the approval decision
 /// it went through when it raised a prompt.
 ///
@@ -409,17 +484,6 @@ pub(crate) fn cap_trace_output_with_len(value: Value, full_len: usize) -> (Value
 /// [`baybo_tools::ApprovalHandle`] and turns the refusal into its own error) is
 /// exactly the case that loses its verdict otherwise: it reaches the loop as an
 /// untyped error, indistinguishable from a crash.
-/// How the pre-execute approval gate treats a call's uncovered accesses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreExecuteGate {
-    /// Raise an ask on the turn's gate, as every live call does.
-    Ask,
-    /// A human already answered this call's ask and the turn prelude is
-    /// re-executing it: take `decision` as the gate's answer without raising
-    /// anything. `ApproveAlways` still seeds the session's grants.
-    PreDecided(ApprovalDecision),
-}
-
 pub struct ExecutedTool {
     pub output: anyhow::Result<ToolOutput>,
     /// `None` when the call never prompted (covered by a prior grant, or an
@@ -706,6 +770,57 @@ impl ToolExecutor {
             .map_err(|error| anyhow::anyhow!("security: tool '{}' {error}", tool_name))
     }
 
+    async fn prepare_approval(
+        &self,
+        tool: Option<&dyn baybo_tools::Tool>,
+        masked_params: &Value,
+        revealed_params: &Value,
+        ctx: &ToolContext,
+        mode: &PreExecuteGate,
+    ) -> anyhow::Result<Option<PreparedApproval>> {
+        let Some(tool) = tool else {
+            return Ok(None);
+        };
+        let check = match mode {
+            PreExecuteGate::Ask => PreExecuteCheck::Evaluate,
+            PreExecuteGate::PreDecided { .. } => PreExecuteCheck::PreDecided,
+        };
+        let Some(ask) = tool.pre_execute_ask(revealed_params, ctx, check).await else {
+            return Ok(None);
+        };
+        let requested_accesses = ask.accesses.clone();
+        let mut value = serde_json::to_value(ask)?;
+        self.security_gateway
+            .sanitize_approval_value(&mut value, masked_params)
+            .await?;
+        Ok(Some(PreparedApproval {
+            ask: serde_json::from_value(value)?,
+            requested_accesses,
+        }))
+    }
+
+    /// Drain any pending tool-reported events into span events, sanitizing
+    /// text payloads so leaked secrets never hit the trace store.
+    async fn flush_tool_events(
+        &self,
+        event_sink: &SpanEventRecorder,
+        recorder: &SpanRecorder,
+        span_id: SpanId,
+        event_seq: &mut u32,
+    ) {
+        for (action, mut payload) in event_sink.drain() {
+            self.sanitize_tool_event_payload(&mut payload).await;
+            let _ = recorder
+                .emit_event(
+                    span_id,
+                    *event_seq,
+                    SpanEventKind::ToolEvent { action, payload },
+                )
+                .await;
+            *event_seq += 1;
+        }
+    }
+
     /// Execute a tool call inside the given `step`, with full
     /// observability and approval gating.
     ///
@@ -823,7 +938,6 @@ impl ToolExecutor {
         // the cancel-aware close-on-Err path.
         let cancel_token = tokens.turn.clone();
         let cancel_for_close = cancel_token.clone();
-        let cancel_for_gate = cancel_token.clone();
         let ask_cancel = AskCancel::new(tokens);
         let park_gauge = ParkGauge::new();
         let gate: Arc<dyn ApprovalGate> = if attended {
@@ -836,11 +950,10 @@ impl ToolExecutor {
         // read back after it — including on the paths where the body returns
         // `Err` (denial, tool error, timeout) and the outcome would otherwise
         // die with the closure.
-        let approval_slot: Arc<Mutex<Option<ApprovalOutcome>>> = Arc::new(Mutex::new(None));
-        let approval_sink = Arc::clone(&approval_slot);
-        let handed_over_slot: Arc<parking_lot::Mutex<Option<baybo_tools::background::HandedOver>>> =
-            Arc::default();
-        let handed_over_sink = Arc::clone(&handed_over_slot);
+        let mut approval_outcome = None;
+        let approval_result = &mut approval_outcome;
+        let mut handed_over = None;
+        let background_result = &mut handed_over;
 
         // Open the tool span up front so denials and approval failures still
         // appear in the trace tree. The handle carries the begin-time kind, so
@@ -882,16 +995,14 @@ impl ToolExecutor {
                     return Err(ToolError::InvalidParams(msg).into());
                 }
 
-                // Approval gate: derive resource accesses from the tool
-                // and check them against the session's cached approvals.
-                // Also pull the tool's declared `max_timeout` (default
-                // 30 s) so the executor uses the right deadline below.
-                let (accesses, call_label, effective_timeout, output_source) = pinned_tool
+                // Sync tool metadata needed across execution and output
+                // classification (`declared_accesses` feeds `OutputProvenance`
+                // for `DeclaredFiles` tools like `Read`).
+                let (accesses, effective_timeout, output_source) = pinned_tool
                     .as_ref()
                     .map(|tool| {
                         (
                             tool.accessed_resources(&params),
-                            tool.call_label(&params),
                             tool.max_timeout(),
                             tool.output_source(),
                         )
@@ -899,109 +1010,16 @@ impl ToolExecutor {
                     .unwrap_or_else(|| {
                         (
                             Vec::new(),
-                            None,
                             Duration::from_secs(30),
                             baybo_tools::OutputSource::default(),
                         )
                     });
 
-                let uncovered: Vec<ResourceAccess> = {
-                    let approved = approved_resources.lock();
-                    accesses
-                        .iter()
-                        .filter(|acc| {
-                            !matches!(acc, ResourceAccess::ReadFile { .. })
-                                && !approved.iter().any(|ar| ar.covers(acc))
-                        })
-                        .cloned()
-                        .collect()
-                };
-                #[cfg(test)]
-                if let Some(hook) = &self.after_authorization_hook {
-                    hook();
-                }
-
-                if !uncovered.is_empty() {
-                    let outcome = match pre_execute {
-                        PreExecuteGate::PreDecided(decision) => ApprovalOutcome::answered(decision),
-                        PreExecuteGate::Ask => {
-                            gate.request(
-                                ApprovalRequest {
-                                    ask_id: baybo_model::human_ask::AskId::new(),
-                                    tool_call_id: tool_use_id.clone(),
-                                    session_id: session_id.clone(),
-                                    user_id: user.id.clone(),
-                                    tool: tool_name_owned.clone(),
-                                    accesses: uncovered.clone(),
-                                    params_preview: preview_params(
-                                        &params,
-                                        APPROVAL_PARAMS_PREVIEW_LEN,
-                                    ),
-                                    description: call_label.clone(),
-                                },
-                                AskSite {
-                                    channel: user.channel.clone(),
-                                    turn_id,
-                                    phase: AskPhase::BeforeExecute,
-                                },
-                                ask_cancel.clone(),
-                            )
-                            // The gate itself answers `/stop` (it races the call's
-                            // `AskCancel`); a shutdown leaves it parked until the loop
-                            // drops this future.
-                            .await
-                        }
-                    };
-                    let decision = outcome.decision;
-                    *approval_sink.lock() = Some(outcome);
-                    for access in &uncovered {
-                        let _ = recorder
-                            .emit_event(
-                                span_handle.span_id,
-                                event_seq,
-                                SpanEventKind::Approval {
-                                    decision,
-                                    resource: access.clone(),
-                                },
-                            )
-                            .await;
-                        event_seq += 1;
-                    }
-                    match decision {
-                        ApprovalDecision::Approve => {
-                            info!(tool = %tool_name_owned, "tool call approved once");
-                        }
-                        ApprovalDecision::ApproveAlways => {
-                            info!(tool = %tool_name_owned, "tool call approved always");
-                            let mut approved = approved_resources.lock();
-                            for access in &uncovered {
-                                let entry = access.to_approved();
-                                if !approved.iter().any(|existing| existing == &entry) {
-                                    approved.push(entry);
-                                }
-                            }
-                        }
-                        ApprovalDecision::Deny => {
-                            return Err(anyhow::Error::new(ToolError::Denied {
-                                tool: tool_name_owned.clone(),
-                                reason: refusal_reason(outcome.resolution).to_string(),
-                            }));
-                        }
-                    }
-                    // Approved — but the turn may have been cancelled WHILE the
-                    // prompt was up (the gate only abandons when the token trips
-                    // before the answer). Running now would execute a
-                    // side-effecting call on behalf of a turn the user already
-                    // stopped.
-                    if cancel_for_gate.is_cancelled() {
-                        return Err(anyhow::anyhow!(
-                            "tool '{tool_name_owned}' cancelled while awaiting approval"
-                        ));
-                    }
-                }
-
-                // Build per-call sandbox adapter for tools declaring
-                // ExecCommand.
+                // Build per-call context before `pre_execute_ask` so tools
+                // whose pre-execute gate needs runtime services (e.g. Bash's
+                // risk judge needing `lite_llm`, resolved cwd, `sandbox`
+                // presence, and `events`; Skill's scoped lookup needing
+                // `agent_id` and `user`) can run before execution.
                 let uses_exec_command = pinned_manifest.as_ref().is_some_and(|manifest| {
                     manifest.capabilities.contains(&ToolCapability::ExecCommand)
                 });
@@ -1010,13 +1028,6 @@ impl ToolExecutor {
                     (Some(_), Some(board), Some(project)) => {
                         board_handle(&board.agents, agent_id, project).await
                     }
-                    _ => None,
-                };
-                // Re-resolved per call rather than cached, so an operator who
-                // edits their git identity is obeyed by the next command. It
-                // costs one `git config` against the sandbox spawn below.
-                let checkout_git_config = match (uses_exec_command, &checkout) {
-                    (true, Some(checkout)) => worktree::ensure_identity_config(checkout).await,
                     _ => None,
                 };
                 let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
@@ -1060,18 +1071,23 @@ impl ToolExecutor {
                 // read back what any mid-call prompt decided.
                 let approval = ApprovalHandle::new(
                     Arc::clone(&gate),
-                    Arc::clone(approved_resources),
                     tool_use_id.clone(),
                     turn_id,
                     park_gauge.clone(),
                     ask_cancel.clone(),
+                )
+                .with_resumable_during_execute(
+                    pinned_tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.during_execute_resumer().is_some()),
                 );
                 let approval_probe = approval.clone();
 
                 // Per-call event sink. Drained into span events after
-                // tool execution so phase timers and richer artifacts
-                // (e.g. WebFetch's HTTP response summary, side-LLM I/O)
-                // surface in the trace UI.
+                // `pre_execute_ask` and after tool execution so phase timers
+                // and richer artifacts (risk judge calls, WebFetch HTTP
+                // summaries, side-LLM I/O) surface in the trace UI even when
+                // the pre-execute gate denies.
                 let event_sink = Arc::new(SpanEventRecorder::new());
 
                 // Build tool context. The token comes from the agent
@@ -1079,10 +1095,10 @@ impl ToolExecutor {
                 // TurnLifecycle::cancel or a parent subagent's cascade)
                 // signals the running tool. The billed-LLM handle (if
                 // any) is bound to this exact tool span so a tool that
-                // makes a side-LLM call (e.g. `WebFetch`'s extraction)
-                // sees its `cost_records` row attributed to the running
-                // tool span, not a synthetic placeholder. `bind_source`
-                // is the agent loop's LITE client — see
+                // makes a side-LLM call (e.g. `WebFetch`'s extraction or
+                // Bash's risk judge) sees its `cost_records` row attributed
+                // to the running tool span, not a synthetic placeholder.
+                // `bind_source` is the agent loop's LITE client — see
                 // `ToolContext::lite_llm`.
                 let lite_llm: Option<Arc<dyn BilledChat>> = bind_source.map(|guarded| {
                     let bound = guarded.bind(Attribution {
@@ -1097,7 +1113,7 @@ impl ToolExecutor {
                         Arc::clone(&self.security_gateway),
                     )) as Arc<dyn BilledChat>
                 });
-                let ctx = ToolContext {
+                let mut ctx = ToolContext {
                     session_id: session_id.clone(),
                     session_trigger: session_trigger.clone(),
                     agent_id: agent_id.clone(),
@@ -1130,20 +1146,128 @@ impl ToolExecutor {
                     background_control: self.background_control.clone(),
                     background_dispatch: Default::default(),
                     notify_silence,
-                    checkout_root: checkout.map(|c| c.root),
+                    checkout_root: checkout.as_ref().map(|c| c.root.clone()),
                     agent_handle,
-                    checkout_git_config,
+                    checkout_git_config: None,
                 };
 
-                // Reveal placeholders in the tool's arguments just
-                // before execution. The pre-reveal `params` is what the
-                // trace + approval surfaces saw; the tool itself
-                // receives plaintext for its API call.
                 let mut params_revealed = params.clone();
                 self.security_gateway
                     .reveal_in_value(&mut params_revealed)
                     .await
                     .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
+
+                let resume_during_execute = matches!(
+                    &pre_execute,
+                    PreExecuteGate::PreDecided {
+                        phase: AskPhase::DuringExecuteResumable,
+                        ..
+                    }
+                );
+                let mut prepared = if resume_during_execute {
+                    None
+                } else {
+                    let prepared = self
+                        .prepare_approval(
+                            pinned_tool.as_deref(),
+                            &params,
+                            &params_revealed,
+                            &ctx,
+                            &pre_execute,
+                        )
+                        .await?;
+                    self.flush_tool_events(&event_sink, recorder, ctx.span_id, &mut event_seq)
+                        .await;
+                    prepared
+                };
+                if let Some(prepared) = &mut prepared {
+                    prepared.retain_uncovered(approved_resources);
+                    prepared.validate_resume(&pre_execute, &tool_name_owned)?;
+                }
+                #[cfg(test)]
+                if !resume_during_execute && let Some(hook) = &self.after_authorization_hook {
+                    hook();
+                }
+
+                let needs_approval = prepared
+                    .as_ref()
+                    .is_some_and(|p| !p.ask.accesses.is_empty());
+                let outcome = match (&pre_execute, prepared.as_ref()) {
+                    (PreExecuteGate::PreDecided { decision, .. }, _)
+                        if resume_during_execute
+                            || needs_approval
+                            || *decision == ApprovalDecision::Deny =>
+                    {
+                        Some(ApprovalOutcome::answered(*decision))
+                    }
+                    (PreExecuteGate::Ask, Some(prepared)) if needs_approval => Some(
+                        gate.request(
+                            ApprovalRequest {
+                                ask_id: baybo_model::human_ask::AskId::new(),
+                                tool_call_id: tool_use_id.clone(),
+                                session_id: session_id.clone(),
+                                user_id: user.id.clone(),
+                                tool: tool_name_owned.clone(),
+                                accesses: prepared.ask.accesses.clone(),
+                                params_preview: prepared.ask.params_preview.clone().unwrap_or_else(
+                                    || preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                                ),
+                                description: prepared.ask.description.clone(),
+                            },
+                            AskSite {
+                                channel: user.channel.clone(),
+                                turn_id,
+                                phase: AskPhase::BeforeExecute,
+                            },
+                            ask_cancel.clone(),
+                        )
+                        .await,
+                    ),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    *approval_result = Some(outcome);
+                    if let Some(prepared) = &prepared {
+                        for resource in &prepared.ask.accesses {
+                            let _ = recorder
+                                .emit_event(
+                                    ctx.span_id,
+                                    event_seq,
+                                    SpanEventKind::Approval {
+                                        decision: outcome.decision,
+                                        resource: resource.clone(),
+                                    },
+                                )
+                                .await;
+                            event_seq += 1;
+                        }
+                        if prepared.ask.cacheable
+                            && outcome.decision == ApprovalDecision::ApproveAlways
+                        {
+                            let mut approved = approved_resources.lock();
+                            for access in &prepared.ask.accesses {
+                                let grant = access.to_approved();
+                                if !approved.contains(&grant) {
+                                    approved.push(grant);
+                                }
+                            }
+                        }
+                    }
+                    require_approval(outcome, &tool_name_owned, &ctx)?;
+                }
+                if let Some(prepared) = prepared
+                    && let Some(approval) = ctx.approval.as_mut()
+                {
+                    approval.record_pre_execute_approval(prepared.requested_accesses);
+                }
+
+                // Re-resolved per call rather than cached, so an operator who
+                // edits their git identity is obeyed by the next command. Run
+                // after the pre-execute gate so denied calls spawn nothing.
+                ctx.checkout_git_config = match (uses_exec_command, &checkout) {
+                    (true, Some(checkout)) => worktree::ensure_identity_config(checkout).await,
+                    _ => None,
+                };
 
                 // Execute with timeout enforcement. A `Read` of a virtual path
                 // (e.g. the session transcript) is served inside `ReadTool` from
@@ -1154,7 +1278,17 @@ impl ToolExecutor {
                     let tool = pinned_tool.as_ref().ok_or_else(|| {
                         ToolError::NotFound(format!("tool not found: {tool_name_owned}"))
                     })?;
-                    tool.execute(params_revealed, &ctx).await
+                    if resume_during_execute {
+                        let resumer = tool.during_execute_resumer().ok_or_else(|| {
+                            ToolError::Execution(format!(
+                                "tool '{}' does not support resuming a during-execute approval",
+                                tool.name()
+                            ))
+                        })?;
+                        resumer.resume_during_execute(params_revealed, &ctx).await
+                    } else {
+                        tool.execute(params_revealed, &ctx).await
+                    }
                 };
                 let result = deadline.run(execution).await;
 
@@ -1165,29 +1299,16 @@ impl ToolExecutor {
                 // the loop as the tool's own error, and without this the verdict
                 // would be indistinguishable from a crash.
                 if let Some(outcome) = approval_probe.last_outcome() {
-                    *approval_sink.lock() = Some(outcome);
+                    *approval_result = Some(outcome);
                 }
-                *handed_over_sink.lock() = ctx.background_dispatch.take();
+                *background_result = ctx.background_dispatch.take();
 
                 // Flush tool-reported events as span events, regardless
                 // of whether the tool succeeded, failed, or hit the
                 // outer timeout. Each entry continues the span-local
                 // seq sequence that approval emission left off at.
-                // Text fields inside the payload are sanitized so any
-                // leaked secrets get minted into placeholders before
-                // they hit the trace store. Drops on emit_event errors
-                // are intentional — events are non-load-bearing.
-                for (action, mut payload) in event_sink.drain() {
-                    self.sanitize_tool_event_payload(&mut payload).await;
-                    let _ = recorder
-                        .emit_event(
-                            span_handle.span_id,
-                            event_seq,
-                            SpanEventKind::ToolEvent { action, payload },
-                        )
-                        .await;
-                    event_seq += 1;
-                }
+                self.flush_tool_events(&event_sink, recorder, span_handle.span_id, &mut event_seq)
+                    .await;
 
                 match result {
                     Some(Ok(mut output)) => {
@@ -1283,7 +1404,7 @@ impl ToolExecutor {
                         // text. The error's TYPE is lost here (a
                         // `ToolError::Denied` a tool raised from a mid-call
                         // prompt included) — the decision that shaped it rides
-                        // `approval_slot` instead, read back by the caller.
+                        // `approval_outcome` instead, read back by the caller.
                         let raw = e.to_string();
                         let sanitized = self
                             .security_gateway
@@ -1302,12 +1423,12 @@ impl ToolExecutor {
         )
         .await;
 
-        let outcome = *approval_slot.lock();
+        let outcome = approval_outcome;
         ExecutedTool {
             output,
             approval: outcome.map(|o| o.decision),
             abandoned: outcome.is_some_and(|o| o.resolution == ApprovalResolution::Abandoned),
-            handed_over: handed_over_slot.lock().take(),
+            handed_over,
         }
     }
 }
@@ -2458,7 +2579,7 @@ mod tests {
                     .approval
                     .as_ref()
                     .expect("approval handle")
-                    .request(
+                    .request_uncached(
                         self.name(),
                         &ctx.session_id,
                         &ctx.user,
@@ -2771,7 +2892,7 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst));
         assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
         assert!(approved.lock().is_empty());
-        assert_one_policy_denial(&ledger, AskPhase::DuringExecute);
+        assert_one_policy_denial(&ledger, AskPhase::DuringExecuteNonResumable);
     }
 
     #[tokio::test]
@@ -2819,7 +2940,11 @@ mod tests {
             Arc::clone(&approved),
             true,
             None,
-            PreExecuteGate::PreDecided(decision),
+            PreExecuteGate::PreDecided {
+                decision,
+                phase: AskPhase::BeforeExecute,
+                accesses: vec![McpShapedTool::declared_access()],
+            },
         )
         .await;
         let grants = approved.lock().clone();
@@ -3096,5 +3221,1116 @@ mod tests {
         )
         .await;
         assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+    }
+
+    type RecordedAsks = Arc<Mutex<Vec<(ApprovalRequest, AskSite)>>>;
+
+    struct RecordingGate {
+        outcome: ApprovalOutcome,
+        recorded: RecordedAsks,
+    }
+
+    impl RecordingGate {
+        fn new(outcome: ApprovalOutcome) -> (Arc<Self>, RecordedAsks) {
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    outcome,
+                    recorded: Arc::clone(&recorded),
+                }),
+                recorded,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for RecordingGate {
+        async fn request(
+            &self,
+            req: ApprovalRequest,
+            site: AskSite,
+            _cancel: AskCancel,
+        ) -> ApprovalOutcome {
+            self.recorded.lock().push((req, site));
+            self.outcome
+        }
+    }
+
+    struct UncachedPreAskTool {
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl baybo_tools::Tool for UncachedPreAskTool {
+        fn name(&self) -> &str {
+            "uncached_pre_ask"
+        }
+        fn description(&self) -> String {
+            "raises an uncached before-execute ask".to_owned()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn pre_execute_ask(
+            &self,
+            _params: &Value,
+            _ctx: &ToolContext,
+            _check: PreExecuteCheck,
+        ) -> Option<baybo_tools::PreExecuteAsk> {
+            Some(baybo_tools::PreExecuteAsk {
+                accesses: vec![ResourceAccess::ExecCommand {
+                    command: "echo elevated".to_owned(),
+                }],
+                cacheable: false,
+                description: Some("Custom escalation description".to_owned()),
+                params_preview: Some("Custom escalation preview".to_owned()),
+            })
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(ToolOutput::Text("ok".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn uncached_pre_execute_ask_ignores_cache_never_persists_and_uses_before_execute_phase() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let (gate, recorded) =
+            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::ApproveAlways));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            Arc::new(UncachedPreAskTool {
+                ran: Arc::clone(&ran),
+            }),
+            authorization_manifest("uncached_pre_ask"),
+        );
+        // Pre-seed the exact same ExecCommand grant in session cache.
+        let cached_entry = ApprovedResource::ExecCommand {
+            command: "echo elevated".to_owned(),
+        };
+        let approved = Arc::new(Mutex::new(vec![cached_entry.clone()]));
+        let (executed, _) = execute_authorization_registration(
+            Arc::new(registry),
+            "uncached_pre_ask".to_owned(),
+            gate,
+            Arc::clone(&approved),
+            true,
+            None,
+            PreExecuteGate::Ask,
+        )
+        .await;
+
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert!(ran.load(Ordering::SeqCst));
+        {
+            let asks = recorded.lock();
+            assert_eq!(asks.len(), 1, "cached grant must not bypass uncached ask");
+            assert_eq!(asks[0].1.phase, AskPhase::BeforeExecute);
+            assert_eq!(
+                asks[0].0.description.as_deref(),
+                Some("Custom escalation description")
+            );
+            assert_eq!(asks[0].0.params_preview, "Custom escalation preview");
+        }
+
+        let ran2 = Arc::new(AtomicBool::new(false));
+        let (gate2, recorded2) =
+            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::ApproveAlways));
+        let mut registry2 = ToolRegistry::new();
+        registry2.register(
+            Arc::new(UncachedPreAskTool {
+                ran: Arc::clone(&ran2),
+            }),
+            authorization_manifest("uncached_pre_ask"),
+        );
+        let empty_cache = Arc::new(Mutex::new(Vec::new()));
+        let (executed2, _) = execute_authorization_registration(
+            Arc::new(registry2),
+            "uncached_pre_ask".to_owned(),
+            gate2,
+            Arc::clone(&empty_cache),
+            true,
+            None,
+            PreExecuteGate::Ask,
+        )
+        .await;
+        assert!(executed2.output.is_ok());
+        assert_eq!(recorded2.lock().len(), 1);
+        assert!(
+            empty_cache.lock().is_empty(),
+            "ApproveAlways on an uncached ask must never seed session grants"
+        );
+
+        // PreDecided(ApproveAlways) on an uncached ask must also not seed grants.
+        let ran3 = Arc::new(AtomicBool::new(false));
+        let (gate3, recorded3) =
+            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::Deny));
+        let mut registry3 = ToolRegistry::new();
+        registry3.register(
+            Arc::new(UncachedPreAskTool {
+                ran: Arc::clone(&ran3),
+            }),
+            authorization_manifest("uncached_pre_ask"),
+        );
+        let predecided_cache = Arc::new(Mutex::new(Vec::new()));
+        let (executed3, _) = execute_authorization_registration(
+            Arc::new(registry3),
+            "uncached_pre_ask".to_owned(),
+            gate3,
+            Arc::clone(&predecided_cache),
+            true,
+            None,
+            PreExecuteGate::PreDecided {
+                decision: ApprovalDecision::ApproveAlways,
+                phase: AskPhase::BeforeExecute,
+                accesses: vec![ResourceAccess::ExecCommand {
+                    command: "echo elevated".to_owned(),
+                }],
+            },
+        )
+        .await;
+        assert!(executed3.output.is_ok());
+        assert!(ran3.load(Ordering::SeqCst));
+        assert!(recorded3.lock().is_empty(), "PreDecided never re-prompts");
+        assert!(
+            predecided_cache.lock().is_empty(),
+            "PreDecided(ApproveAlways) on an uncached ask must not seed session grants"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_auto_risk_judge_runs_before_execute_flushes_events_and_skips_llm_on_pre_decided()
+    {
+        use baybo_llm::test_support::StubLlm;
+        use baybo_llm::{LlmCompletion, LlmResponse, TokenUsage};
+        use baybo_tools::builtin::bash::BashTool;
+        use baybo_trace::{Span, SpanEvent, TraceStore};
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let bash = Arc::new(BashTool::new(
+            paths.clone(),
+            baybo_process::ProcessManager::transient(),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            bash,
+            ToolManifest {
+                name: "Bash".to_owned(),
+                description: "bash".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: vec![ToolCapability::ExecCommand],
+                channels: Vec::new(),
+            },
+        );
+
+        let (gate, recorded) =
+            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::Deny));
+        let gates = ApprovalGateMap::new();
+        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(gates),
+            security_gateway,
+            sandbox_root.clone(),
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            policy_deny_gate().1,
+        );
+
+        let stub_llm = Arc::new(StubLlm::new());
+        stub_llm.push_response(LlmResponse {
+            content: r#"{"risk":"risky","rationale":"deletes target"}"#.to_owned(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+        let bind_source = Arc::new(BillableLlm::passthrough(
+            Arc::clone(&stub_llm) as Arc<dyn LlmCompletion>
+        ));
+
+        let trace_store = Arc::new(baybo_trace::test_support::MemoryTraceStore::new());
+        let session_id = SessionId::from("sess-bash-auto");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::clone(&trace_store) as Arc<dyn baybo_trace::TraceStore>,
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+        let target = sandbox_root.join("to-delete.txt");
+        std::fs::write(&target, "keep").expect("write");
+        let params = json!({
+            "command": format!("rm {}", target.display()),
+        });
+        let approved = Arc::new(Mutex::new(Vec::new()));
+
+        // 1. Live call: judge says risky -> raises BeforeExecute ask -> denied ->
+        //    file untouched, risk_judge trace events flushed.
+        let executed = executor
+            .execute(
+                "Bash",
+                params.clone(),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-bash-1".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                Some(&bind_source),
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+
+        let err = executed.output.expect_err("denied by gate");
+        assert!(matches!(
+            err.downcast_ref::<ToolError>(),
+            Some(ToolError::Denied { .. })
+        ));
+        assert!(target.exists(), "denied command must not run");
+        assert_eq!(stub_llm.captured_requests().len(), 1);
+        {
+            let asks = recorded.lock();
+            assert_eq!(asks.len(), 1);
+            assert_eq!(asks[0].1.phase, AskPhase::BeforeExecute);
+            assert!(asks[0].0.params_preview.contains("deletes target"));
+        }
+
+        // Verify risk_judge span events were flushed even though the call was denied.
+        let spans = trace_store
+            .list_spans_by_step(&step.step_id)
+            .await
+            .expect("list spans");
+        let span = Span::from_row(spans[0].clone()).expect("decode span");
+        let event_rows = trace_store
+            .list_span_events(&span.id)
+            .await
+            .expect("list span events");
+        let events: Vec<SpanEvent> = event_rows
+            .into_iter()
+            .map(|r| SpanEvent::from_row(r).expect("decode span event"))
+            .collect();
+        assert!(
+            events.iter().any(|ev| matches!(
+                &ev.kind,
+                SpanEventKind::ToolEvent { action, payload: ToolEventPayload::LlmCall { .. } }
+                    if action == "risk_judge"
+            )),
+            "risk_judge events must be flushed on pre-execute denial: {events:?}"
+        );
+
+        // 2. Resumed PreDecided(ApproveAlways): runs without calling the judge LLM
+        //    again, without re-prompting, and seeds the session cache.
+        let original_accesses = recorded.lock()[0].0.accesses.clone();
+        let executed_resumed = executor
+            .execute(
+                "Bash",
+                params,
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-bash-1".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                Some(&bind_source),
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::PreDecided {
+                    decision: ApprovalDecision::ApproveAlways,
+                    phase: AskPhase::BeforeExecute,
+                    accesses: original_accesses,
+                },
+            )
+            .await;
+
+        assert!(
+            executed_resumed.output.is_ok(),
+            "{:?}",
+            executed_resumed.output.err()
+        );
+        assert!(!target.exists(), "resumed approved command executed");
+        assert_eq!(
+            stub_llm.captured_requests().len(),
+            1,
+            "PreDecided must not call the risk judge LLM a second time"
+        );
+        assert_eq!(recorded.lock().len(), 1, "PreDecided must not re-prompt");
+        assert_eq!(
+            *approved.lock(),
+            vec![ApprovedResource::ExecCommand {
+                command: format!("rm {}", target.display()),
+            }],
+            "ApproveAlways on auto destructive ask seeds the session cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_env_approval_runs_before_execute_uncached_and_errors_first_when_missing() {
+        use baybo_skills::{AlwaysPass, SkillDefinition, SkillRegistry, SkillRequirements};
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let skill_dir = home.path().join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# Demo\n").expect("skill md");
+
+        let make_skill = |name: &str, required_env: Vec<String>| SkillDefinition {
+            name: name.to_owned(),
+            version: "1.0.0".to_owned(),
+            description: "demo".to_owned(),
+            command: Some(name.to_owned()),
+            agent_invocable: true,
+            channels: vec![],
+            argument_hint: None,
+            prompt_template: "# Demo\n".to_owned(),
+            allowed_tools: vec![],
+            source: baybo_model::ArtifactSource::Workspace,
+            trust_level: TrustLevel::Trusted,
+            requirements: SkillRequirements {
+                required_bins: vec![],
+                required_env,
+                required_models: vec![],
+            },
+            token_budget_hint: 0,
+            source_path: Some(skill_dir.clone()),
+            linked_files: Default::default(),
+        };
+
+        let skill_registry = Arc::new(SkillRegistry::new());
+        skill_registry.register(make_skill(
+            "missing-env",
+            vec!["BAYBO_TEST_DEFINITELY_UNSET_VAR".to_owned()],
+        ));
+        skill_registry.register(make_skill("present-env", vec!["PATH".to_owned()]));
+
+        let (skill_tool, skill_manifest) =
+            baybo_skills::tools::build(skill_registry, Arc::new(AlwaysPass));
+        let mut registry = ToolRegistry::new();
+        registry.register(skill_tool, skill_manifest);
+
+        let (gate, recorded) =
+            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::ApproveAlways));
+        let gates = ApprovalGateMap::new();
+        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(gates),
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            policy_deny_gate().1,
+        );
+
+        let session_id = SessionId::from("sess-skill-env");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+        let agent_id = baybo_model::AgentProfileId::builtin();
+        let approved = Arc::new(Mutex::new(Vec::new()));
+
+        // 1. Missing env var errors without ever prompting.
+        let missing_res = executor
+            .execute(
+                baybo_skills::tools::SKILL_TOOL_NAME,
+                json!({ "skill": "missing-env" }),
+                &session_id,
+                &ordinary_trigger(),
+                &agent_id,
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-skill-missing".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+        let err = missing_res.output.expect_err("missing env must fail");
+        assert!(
+            err.to_string().contains("BAYBO_TEST_DEFINITELY_UNSET_VAR"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            recorded.lock().is_empty(),
+            "missing env var must not raise an approval prompt"
+        );
+
+        // 2. Present env var raises an uncached BeforeExecute ask; ApproveAlways
+        //    runs the skill and does not cache the env grant.
+        let present_res = executor
+            .execute(
+                baybo_skills::tools::SKILL_TOOL_NAME,
+                json!({ "skill": "present-env" }),
+                &session_id,
+                &ordinary_trigger(),
+                &agent_id,
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-skill-present".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+        assert!(present_res.output.is_ok(), "{:?}", present_res.output.err());
+        assert_eq!(recorded.lock().len(), 1);
+        assert_eq!(recorded.lock()[0].1.phase, AskPhase::BeforeExecute);
+        assert_eq!(
+            recorded.lock()[0].0.accesses,
+            vec![ResourceAccess::Env {
+                vars: vec!["PATH".to_owned()],
+            }]
+        );
+        assert!(
+            approved.lock().is_empty(),
+            "ApproveAlways on Skill env must not persist to session cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_require_escalated_runs_before_execute_uncached_and_merges_destructive_warning() {
+        for decision in [ApprovalDecision::Deny, ApprovalDecision::ApproveAlways] {
+            assert_masked_bash_escalation(decision).await;
+        }
+    }
+
+    async fn assert_masked_bash_escalation(decision: ApprovalDecision) {
+        use baybo_tools::builtin::bash::BashTool;
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let bash = Arc::new(BashTool::new(
+            paths.clone(),
+            baybo_process::ProcessManager::transient(),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            bash,
+            ToolManifest {
+                name: "Bash".to_owned(),
+                description: "bash".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: vec![ToolCapability::ExecCommand],
+                channels: Vec::new(),
+            },
+        );
+
+        let (gate, recorded) = RecordingGate::new(ApprovalOutcome::answered(decision));
+        let gates = ApprovalGateMap::new();
+        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let vault = Arc::new(baybo_security::SecretVault::new(
+            key,
+            Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+        ));
+        let placeholder = "[{REDACTED_SECRET_0123456789abcdef01234567}]";
+        vault
+            .store_secret(placeholder, sandbox_root.to_str().unwrap().as_bytes())
+            .await
+            .unwrap();
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            vault,
+        ));
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(gates),
+            security_gateway,
+            sandbox_root.clone(),
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            policy_deny_gate().1,
+        );
+
+        let session_id = SessionId::from("sess-bash-esc");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+
+        let target = sandbox_root.join("esc-delete.txt");
+        std::fs::write(&target, "x").expect("write");
+        let cmd = format!("rm {placeholder}/esc-delete.txt");
+        let params = json!({
+            "command": cmd,
+            "cwd": placeholder,
+            "sandbox_permissions": "require_escalated",
+            "justification": "Need host rm",
+        });
+
+        // Pre-seed the sandboxed form of this exact command in the cache; it
+        // must NOT authorize `require_escalated`.
+        let pre_seeded = ApprovedResource::ExecCommand {
+            command: cmd.clone(),
+        };
+        let approved = Arc::new(Mutex::new(vec![pre_seeded.clone()]));
+
+        let executed = executor
+            .execute(
+                "Bash",
+                params.clone(),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-esc-1".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::Ask,
+            )
+            .await;
+
+        assert_eq!(
+            recorded.lock().len(),
+            1,
+            "masked cwd must not bypass approval"
+        );
+        let request_json = serde_json::to_string(&recorded.lock()[0].0).unwrap();
+        assert!(request_json.contains(placeholder));
+        assert!(!request_json.contains(sandbox_root.to_str().unwrap()));
+        if decision == ApprovalDecision::Deny {
+            assert!(executed.output.is_err());
+            assert!(target.exists(), "denied masked command must not run");
+            return;
+        }
+        assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        assert!(!target.exists(), "approved escalated command ran");
+        {
+            let asks = recorded.lock();
+            assert_eq!(asks.len(), 1, "one merged ask, not two");
+            assert_eq!(asks[0].1.phase, AskPhase::BeforeExecute);
+            let desc = asks[0].0.description.as_deref().expect("description");
+            assert!(
+                desc.contains("Need host rm")
+                    && desc.contains("without the OS sandbox")
+                    && desc.contains("Destructive command"),
+                "merged description must carry justification, sandbox warning, and destructive warning: {desc}"
+            );
+        }
+
+        // Now verify PreDecided(ApproveAlways) runs without prompting and
+        // never inserts into an empty session cache.
+        std::fs::write(&target, "y").expect("write again");
+        let empty_cache = Arc::new(Mutex::new(Vec::new()));
+        let original_accesses = recorded.lock()[0].0.accesses.clone();
+        let executed_resumed = executor
+            .execute(
+                "Bash",
+                params,
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &empty_cache,
+                &recorder,
+                &step,
+                None,
+                "call-esc-2".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::PreDecided {
+                    decision: ApprovalDecision::ApproveAlways,
+                    phase: AskPhase::BeforeExecute,
+                    accesses: original_accesses,
+                },
+            )
+            .await;
+        assert!(
+            executed_resumed.output.is_ok(),
+            "{:?}",
+            executed_resumed.output.err()
+        );
+        assert!(!target.exists());
+        assert_eq!(recorded.lock().len(), 1, "PreDecided must not re-prompt");
+        assert!(
+            empty_cache.lock().is_empty(),
+            "PreDecided(ApproveAlways) on require_escalated must not cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_unsandboxed_skips_pre_execute_ask_does_not_cache_and_runs_unsandboxed() {
+        use baybo_tools::builtin::bash::BashTool;
+        use baybo_tools::builtin::permission::{LivePermissionMode, PermissionMode};
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        // Manual mode would normally raise a BeforeExecute prompt if
+        // `PreDecided { phase: DuringExecuteResumable }` consulted `pre_execute_ask`.
+        let bash = Arc::new(
+            BashTool::new(paths.clone(), baybo_process::ProcessManager::transient())
+                .with_permission_handle(Arc::new(LivePermissionMode::new(PermissionMode::Manual))),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            bash,
+            ToolManifest {
+                name: "Bash".to_owned(),
+                description: "bash".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: vec![ToolCapability::ExecCommand],
+                channels: Vec::new(),
+            },
+        );
+
+        let (gate, recorded) =
+            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::Deny));
+        let gates = ApprovalGateMap::new();
+        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(gates),
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            policy_deny_gate().1,
+        );
+
+        let session_id = SessionId::from("sess-retry-unsandboxed");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+        let approved = Arc::new(Mutex::new(Vec::new()));
+
+        let executed = executor
+            .execute(
+                "Bash",
+                json!({ "command": "printf 'retried-ok\\n'" }),
+                &session_id,
+                &ordinary_trigger(),
+                &baybo_model::AgentProfileId::generate(),
+                &user,
+                &approved,
+                &recorder,
+                &step,
+                None,
+                "call-retry-1".to_owned(),
+                None,
+                None,
+                idle_tokens(),
+                None,
+                None,
+                TurnBackground::NONE,
+                true,
+                ReadTracker::default(),
+                None,
+                false,
+                PreExecuteGate::PreDecided {
+                    decision: ApprovalDecision::ApproveAlways,
+                    phase: AskPhase::DuringExecuteResumable,
+                    accesses: Vec::new(),
+                },
+            )
+            .await;
+
+        let out = executed.output.expect("resumed unsandboxed retry runs");
+        let ToolOutput::Json(v) = out else {
+            panic!("expected Json")
+        };
+        assert_eq!(v["stdout"], "retried-ok\n");
+        assert!(
+            v["sandbox_escalation"].as_str().is_some(),
+            "expected sandbox_escalation note: {v}"
+        );
+        assert_eq!(executed.approval, Some(ApprovalDecision::ApproveAlways));
+        assert!(
+            recorded.lock().is_empty(),
+            "PreDecided(DuringExecuteResumable) must not re-prompt"
+        );
+        assert!(
+            approved.lock().is_empty(),
+            "ApproveAlways on a resumed during-execute retry must never seed session grants"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_handle_stamps_during_execute_phase_from_tool_capability() {
+        use baybo_tools::{DuringExecuteResumer, Tool};
+
+        struct PlainTool;
+
+        #[async_trait::async_trait]
+        impl Tool for PlainTool {
+            fn name(&self) -> &str {
+                "plain_tool"
+            }
+            fn description(&self) -> String {
+                "asks non-resumable during execute".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+                ctx: &ToolContext,
+            ) -> baybo_tools::Result<ToolOutput> {
+                let _ = ctx
+                    .approval
+                    .as_ref()
+                    .expect("approval handle")
+                    .request_uncached(
+                        self.name(),
+                        &ctx.session_id,
+                        &ctx.user,
+                        vec![ResourceAccess::WriteFile {
+                            path: PathBuf::from("/tmp/probe"),
+                        }],
+                        "probe".into(),
+                    )
+                    .await;
+                Ok(ToolOutput::Text("ok".into()))
+            }
+        }
+
+        struct ResumableTool;
+
+        #[async_trait::async_trait]
+        impl Tool for ResumableTool {
+            fn name(&self) -> &str {
+                "resumable_tool"
+            }
+            fn description(&self) -> String {
+                "asks both non-resumable and resumable during execute".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            fn during_execute_resumer(&self) -> Option<&dyn DuringExecuteResumer> {
+                Some(self)
+            }
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+                ctx: &ToolContext,
+            ) -> baybo_tools::Result<ToolOutput> {
+                let approval = ctx.approval.as_ref().expect("approval handle");
+                let _ = approval
+                    .request_uncached(
+                        self.name(),
+                        &ctx.session_id,
+                        &ctx.user,
+                        vec![ResourceAccess::WriteFile {
+                            path: PathBuf::from("/tmp/probe-plain"),
+                        }],
+                        "plain".into(),
+                    )
+                    .await;
+                let _ = approval
+                    .request_resumable_uncached(
+                        self,
+                        self.name(),
+                        &ctx.session_id,
+                        &ctx.user,
+                        vec![ResourceAccess::WriteFile {
+                            path: PathBuf::from("/tmp/probe-resumable"),
+                        }],
+                        "resumable".into(),
+                    )
+                    .await;
+                Ok(ToolOutput::Text("ok".into()))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl DuringExecuteResumer for ResumableTool {
+            async fn resume_during_execute(
+                &self,
+                _params: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> baybo_tools::Result<ToolOutput> {
+                Ok(ToolOutput::Text("resumed".into()))
+            }
+        }
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(home.path().join(".baybo"));
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            Arc::new(PlainTool),
+            ToolManifest {
+                name: "plain_tool".to_owned(),
+                description: "test".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object"}),
+                capabilities: Vec::new(),
+                channels: Vec::new(),
+            },
+        );
+        registry.register(
+            Arc::new(ResumableTool),
+            ToolManifest {
+                name: "resumable_tool".to_owned(),
+                description: "test".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object"}),
+                capabilities: Vec::new(),
+                channels: Vec::new(),
+            },
+        );
+
+        let (gate, recorded) =
+            RecordingGate::new(ApprovalOutcome::answered(ApprovalDecision::Approve));
+        let gates = ApprovalGateMap::new();
+        gates.insert(baybo_model::ChannelType::tui(), gate);
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(gates),
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            policy_deny_gate().1,
+        );
+
+        let session_id = SessionId::from("sess-phase-stamp");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+        let approved = Arc::new(Mutex::new(Vec::new()));
+
+        for tool_name in ["plain_tool", "resumable_tool"] {
+            let executed = executor
+                .execute(
+                    tool_name,
+                    json!({}),
+                    &session_id,
+                    &ordinary_trigger(),
+                    &baybo_model::AgentProfileId::generate(),
+                    &user,
+                    &approved,
+                    &recorder,
+                    &step,
+                    None,
+                    format!("call-{tool_name}"),
+                    None,
+                    None,
+                    idle_tokens(),
+                    None,
+                    None,
+                    TurnBackground::NONE,
+                    true,
+                    ReadTracker::default(),
+                    None,
+                    false,
+                    PreExecuteGate::Ask,
+                )
+                .await;
+            assert!(executed.output.is_ok(), "{:?}", executed.output.err());
+        }
+
+        let asks = recorded.lock();
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[0].0.tool, "plain_tool");
+        assert_eq!(asks[0].1.phase, AskPhase::DuringExecuteNonResumable);
+        assert_eq!(asks[1].0.tool, "resumable_tool");
+        assert_eq!(asks[1].0.params_preview, "plain");
+        assert_eq!(asks[1].1.phase, AskPhase::DuringExecuteNonResumable);
+        assert_eq!(asks[2].0.tool, "resumable_tool");
+        assert_eq!(asks[2].0.params_preview, "resumable");
+        assert_eq!(asks[2].1.phase, AskPhase::DuringExecuteResumable);
     }
 }

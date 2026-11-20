@@ -70,18 +70,21 @@ the router) arrives as a port it defines.
   carries it as `ApprovalRequest.ask_id`, formerly `call_id`). One tool call can raise more than one ask over
   its life, so `tool_call_id` is **not** unique; `ask_id` is.
 - **`AskKind`** — `Approval | Question`.
-- **`AskPhase`** — `BeforeExecute` (the executor's pre-execute gate) or
-  `DuringExecute` (raised from inside `Tool::execute` through a handle).
-  `AskUser`'s question is raised from inside its own `execute`, so it is
-  `DuringExecute` by construction.
-- **Resumable** — an ask whose answer can be applied after the original tool
-  future is gone. Exactly one definition, `resumable(kind, phase)`:
-  `kind == Question || phase == BeforeExecute`. A `Question` is resumable
-  because `AskUser` has no state besides the wait; a `BeforeExecute` approval
-  is resumable because approving means "run this exact call", which can be
-  re-dispatched from the persisted `tool_use` block; a `DuringExecute`
-  approval (Bash asking mid-command to go unsandboxed) is not, because the
-  command's partial state died with the process.
+- **`AskPhase`** — `BeforeExecute` (the executor's pre-execute gate),
+  `DuringExecuteResumable` (an explicit continuation for this approval), or
+  `DuringExecuteNonResumable` (an approval that needs its live tool future).
+  Both use their snake_case names in storage and serialization.
+  Questions are resumable by kind regardless of phase.
+- **Resumable** — an ask whose answer can still be applied after the original
+  tool future is gone: `resumable(kind, phase)` is `kind == Question || matches!(phase, BeforeExecute | DuringExecuteResumable)`.
+  A `Question` has no state besides the wait; a `BeforeExecute` approval
+  re-dispatches `Tool::execute` with `PreExecuteGate::PreDecided`; a
+  `DuringExecuteResumable` approval (a tool opting in via
+  `Tool::during_execute_resumer` + `DuringExecuteResumer`, e.g. Bash's post-failure retry)
+  invokes `DuringExecuteResumer::resume_during_execute`. An approval raised via
+  `request_uncached` is `DuringExecuteNonResumable` even if its tool
+  exposes that hook. See
+  [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 - **Row states** — `pending` (`resolved_at IS NULL`), `resolved`
   (`resolved_at` set, `applied_at IS NULL`: a human or a policy decided, but
   no turn has consumed the decision yet), `applied`. Only `applied` rows
@@ -159,7 +162,7 @@ CREATE TABLE IF NOT EXISTS human_asks (
     channel       TEXT NOT NULL,            -- ChannelType; which queue to reload into
     tool_call_id  TEXT NOT NULL,            -- the LLM tool_use id the ask blocks
     kind          TEXT NOT NULL,            -- 'approval' | 'question'
-    phase         TEXT NOT NULL,            -- 'before_execute' | 'during_execute'
+    phase         TEXT NOT NULL,            -- 'before_execute' | 'during_execute_resumable' | 'during_execute_non_resumable'
     request       TEXT NOT NULL,            -- AskRequest JSON (ApprovalRequest | QuestionRequest)
     created_at    INTEGER NOT NULL,         -- unix µs, sqlite/time.rs
     resolved_at   INTEGER,                  -- NULL = pending
@@ -199,13 +202,13 @@ CREATE INDEX IF NOT EXISTS idx_human_asks_unapplied
   caller. That is the one point common to both phases and both kinds that
   holds the `ask_id` — the executor and the loop only ever see
   `ApprovalOutcome` / `ExecutedTool.approval`, neither of which carries an id
-  (`tool_executor.rs:371-377`, `approval.rs:81-84`), and a `DuringExecute`
+  (`tool_executor.rs:371-377`, `approval.rs:81-84`), and a `DuringExecuteResumable`
   approval raised from inside Bash (`bash/mod.rs:1981, :2117, :2221`) passes
   through `ApprovalHandle`, which keeps nothing but `last_decision`. For a
   `BeforeExecute` approval this is literally "before the tool executes", so a
   crash mid-execution leaves an applied row and a dangling `tool_use` that
   hydration fills as "interrupted" like any other crashed call — never a
-  second execution with side effects. For a question or a `DuringExecute`
+  second execution with side effects. For a question or a during-execute
   approval the window between stamp and the `tool_result` append is accepted
   on the same terms: the ledger has the decision, the transcript gets the
   interrupted fill, the model asks again. **Resume path**: by the prelude —
@@ -274,18 +277,14 @@ call failed. The one deny that is *not* ledgered is `ApprovalGateMap`'s
 or a sidecar type that has not connected since boot; that is a
 misconfiguration guard, not a policy.
 
-**No timeout in attended turns — except a during-execute approval.**
+**No timeout in attended turns — except a non-resumable during-execute approval.**
 `APPROVAL_TIMEOUT` (`boot.rs:33`), `ChannelApprovalGate.timeout` and
-`APPROVAL_HEADROOM` (`tool_executor.rs:121`) are deleted: a resumable ask
-waits until it is answered, and a dead one is answered through the Resume
-door. A during-execute approval cannot outlive its tool future, so it
-alone keeps a deadline, `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min): the gate
-claims `AskResolution::TimedOut`, closes the card, and the tool returns a
-`ApprovalResolution::TimedOut` denial (`REFUSAL_TIMED_OUT`) and carries on —
-nothing is replayed. If that claim cannot be written the tool still gets its
-timeout, but the row is left pending **and unapplied**, so the session's next
-settlement or the next boot closes it as a dead non-resumable ask. See
-[`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
+`APPROVAL_HEADROOM` (`tool_executor.rs:121`) are deleted: resumable asks
+(`Question`, `BeforeExecute`, and `DuringExecuteResumable`) wait with no
+deadline and survive restarts through the Resume door. A non-resumable
+`DuringExecuteNonResumable` approval (a prompt without resumable continuation) keeps
+`DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min) so it cannot pin a turn in memory
+forever. See [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 `baybo prompt` (`prompt_cmd.rs:258-264`) keeps working through the session
 tier of `ApprovalGateMap` (`AutoApprove`/`AutoDeny` per session); the tier
@@ -646,7 +645,7 @@ For each `SettledAsk` the manager returns, the settlement appends what its
   - `Approve | ApproveAlways` → `mark_applied` **first**, then re-execute:
     open a step under the Resume turn and call `ToolExecutor::execute` with
     the persisted `tool_use` block's name and params and
-    `PreDecided(decision)` so the gate short-circuits without raising
+    `PreDecided { decision, phase, accesses }` so the gate short-circuits without raising
     (`ApproveAlways` also seeds `approved_resources`, as live); append the
     result through the same post-processing helper the batch loop uses. The
     original turn's step/span rows were closed by recovery; the re-execution
@@ -758,7 +757,7 @@ what keeps a typed answer from becoming such an interjection.
 
 `tokio::time::timeout(ctx.timeout + APPROVAL_HEADROOM, tool.execute(..))`
 (`tool_executor.rs:1051-1058`) is the only wall-clock bound on a tool body and
-would kill a parked `DuringExecute` approval at `max_timeout + 300 s`. It is
+would kill a parked `DuringExecuteNonResumable` approval at `max_timeout + 300 s`. It is
 replaced by a `PausableDeadline`: `ApprovalHandle` and `QuestionHandle` share
 a `ParkGauge` (`Arc<AtomicUsize>`) they increment for the duration of a parked
 request; the deadline future accrues elapsed time only while the gauge reads
@@ -1059,12 +1058,10 @@ fires for either kind.
 `AgentSupervisor::new` takes `Arc<dyn LivePendingAsks>`
 (`fn actor_stop_cost(&self, &SessionId) -> ActorStopCost`, over the in-memory
 queues): what stopping the actor would cost the asks a tool future is parked
-on. `Free` (none), `ReleasesTurn { waiting_calls }` (every live ask is a
-question or a before-execute approval; `waiting_calls` counts them, one per
-tool call) or `AbandonsAsks` (at least one during-execute approval). Several
-asks cost their `ActorStopCost::plus`: abandoning outweighs the rest and
-waiting calls add up. `AbandonsAsks` goes away once the during-execute
-approvals move before execute.
+on. `Free` (none), `ReleasesTurn { waiting_calls }` (every live ask is
+resumable; `waiting_calls` counts them, one per tool call), or `AbandonsAsks`
+(at least one non-resumable `DuringExecuteNonResumable` approval). Several asks cost their
+`ActorStopCost::plus`: abandoning outweighs the rest and waiting calls add up.
 
 `ActorStop` is served between turns, so a turn parked on an ask would hold
 its actor — transcript, tool future and all — for as long as nobody answers.
@@ -1086,12 +1083,6 @@ stays in the queue with no waiter, its row stays pending. The actor exits
 after the turn; an answer later goes through the Resume door, which spawns a
 fresh actor. The release token is per turn, so a message queued ahead of the
 lowest-priority `ActorStop` still runs normally.
-
-An `AbandonsAsks` session is skipped: ending its turn would abandon the
-during-execute approval. It is bounded by that approval's own deadline
-(`DURING_EXECUTE_APPROVAL_TIMEOUT`): the turn carries on with a timed-out
-denial, and the next idle tick reaps it — see
-[`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 ### Observability
 
@@ -1139,7 +1130,7 @@ denial, and the next idle tick reaps it — see
 // baybo_model::human_ask
 pub struct AskId(String);                       // uuid v4, Display/FromStr
 pub enum AskKind  { Approval, Question }
-pub enum AskPhase { BeforeExecute, DuringExecute }
+pub enum AskPhase { BeforeExecute, DuringExecuteResumable, DuringExecuteNonResumable }
 pub fn resumable(kind: AskKind, phase: AskPhase) -> bool;
 pub enum AskRequest {
     Approval(ApprovalRequest),                  // moved from baybo_tools::approval; tool_call_id: String
@@ -1235,7 +1226,7 @@ Where the code differs from the sketch above, and why:
   reloads into) and the phase (resumability), and neither is on
   `ApprovalRequest`. Rather than widen the payload, every gate call carries
   `AskSite { channel, phase }`: the executor passes `BeforeExecute` and the
-  session user's channel; `ApprovalHandle` passes `DuringExecute` and the
+  session user's channel; `ApprovalHandle` passes `DuringExecuteNonResumable` and the
   requesting user's channel. `PolicyDenyGate` needs the channel too, since it
   is built once and serves every channel.
 - **Issue sessions and the resume sink.** The manager hands every answered
@@ -1299,7 +1290,7 @@ Where the code differs from the sketch above, and why:
   `IssueDetail` type stays pinned both ways to `IssueDto`.
 - **The settlement.** The loop calls the manager's `unapplied_for_session`,
   `settle_unapplied`, `mark_applied` and `get`. The approval re-execution
-  passes `PreExecuteGate::PreDecided(decision)` to `ToolExecutor::execute`
+  passes `PreExecuteGate::PreDecided { decision, phase, accesses }` to `ToolExecutor::execute`
   (`PreExecuteGate::Ask` everywhere else) and runs under a fresh
   `StepKind::LlmIteration` step that carries the tool span but no `LlmCall`
   span — no new step kind, so no trace-viewer mirror changes. An
@@ -1432,7 +1423,7 @@ user turn. See [above](#a-new-message-while-a-dead-ask-is-pending).
 **Unattended turn hits a gate** — `PolicyDenyGate` writes an already-applied
 `PolicyDenied` row, returns `policy(Deny)`, executor returns
 `ToolError::Denied` with `refusal_reason(Policy)`, no queue entry, no frame,
-no wait. Identical for `BeforeExecute` and `DuringExecute`.
+no wait. Identical for `BeforeExecute` and `DuringExecuteNonResumable`.
 
 ## Rollout plan
 

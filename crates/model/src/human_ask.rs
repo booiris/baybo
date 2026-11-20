@@ -123,22 +123,31 @@ impl AskKind {
     }
 }
 
-/// Where in a tool call's life the ask was raised.
+/// Where an ask was raised and how a during-execute approval resumes.
+/// Questions are resumable regardless of phase; see [`resumable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AskPhase {
-    /// The executor's pre-execute gate — the tool has not started.
+    /// The executor's pre-execute gate — the tool has not started. Resumable
+    /// by re-dispatching the persisted `tool_use` with the decision applied.
     BeforeExecute,
-    /// From inside `Tool::execute`, through a handle on the tool context.
-    DuringExecute,
+    /// An approval explicitly raised via `request_resumable_uncached`.
+    /// After its original future goes away, the approved call resumes via
+    /// the owning tool's `DuringExecuteResumer` hook.
+    DuringExecuteResumable,
+    /// An approval raised via `request_uncached`, even when the
+    /// tool exposes a resumer. It expires after `DURING_EXECUTE_APPROVAL_TIMEOUT`
+    /// and is abandoned if its future dies.
+    DuringExecuteNonResumable,
 }
 
 impl AskPhase {
-    /// Canonical db/wire spelling, matching the `snake_case` serde form.
+    /// Canonical db/wire spelling, matching the serde form.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::BeforeExecute => "before_execute",
-            Self::DuringExecute => "during_execute",
+            Self::DuringExecuteResumable => "during_execute_resumable",
+            Self::DuringExecuteNonResumable => "during_execute_non_resumable",
         }
     }
 
@@ -146,7 +155,8 @@ impl AskPhase {
     pub fn from_storage_str(s: &str) -> Option<Self> {
         match s {
             "before_execute" => Some(Self::BeforeExecute),
-            "during_execute" => Some(Self::DuringExecute),
+            "during_execute_resumable" => Some(Self::DuringExecuteResumable),
+            "during_execute_non_resumable" => Some(Self::DuringExecuteNonResumable),
             _ => None,
         }
     }
@@ -154,10 +164,16 @@ impl AskPhase {
 
 /// Whether an ask's answer can still be applied after the tool future that
 /// raised it is gone. A question has no state besides the wait; a
-/// before-execute approval can re-dispatch the persisted `tool_use`. A
-/// during-execute approval cannot: the command's partial state died with it.
+/// [`AskPhase::BeforeExecute`] approval re-dispatches the persisted `tool_use`;
+/// a [`AskPhase::DuringExecuteResumable`] approval invokes the tool's
+/// `resume_during_execute` continuation. A plain [`AskPhase::DuringExecuteNonResumable`]
+/// approval cannot be resumed once its future dies.
 pub fn resumable(kind: AskKind, phase: AskPhase) -> bool {
-    kind == AskKind::Question || phase == AskPhase::BeforeExecute
+    kind == AskKind::Question
+        || matches!(
+            phase,
+            AskPhase::BeforeExecute | AskPhase::DuringExecuteResumable
+        )
 }
 
 /// The payload of one ask.
@@ -243,11 +259,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resumable_is_question_or_before_execute() {
-        assert!(resumable(AskKind::Question, AskPhase::DuringExecute));
+    fn resumable_matches_kind_and_phase() {
+        assert!(resumable(
+            AskKind::Question,
+            AskPhase::DuringExecuteNonResumable
+        ));
+        assert!(resumable(
+            AskKind::Question,
+            AskPhase::DuringExecuteResumable
+        ));
         assert!(resumable(AskKind::Question, AskPhase::BeforeExecute));
         assert!(resumable(AskKind::Approval, AskPhase::BeforeExecute));
-        assert!(!resumable(AskKind::Approval, AskPhase::DuringExecute));
+        assert!(resumable(
+            AskKind::Approval,
+            AskPhase::DuringExecuteResumable
+        ));
+        assert!(!resumable(
+            AskKind::Approval,
+            AskPhase::DuringExecuteNonResumable
+        ));
     }
 
     #[test]
@@ -259,7 +289,11 @@ mod tests {
                 format!("\"{}\"", kind.as_str())
             );
         }
-        for phase in [AskPhase::BeforeExecute, AskPhase::DuringExecute] {
+        for phase in [
+            AskPhase::BeforeExecute,
+            AskPhase::DuringExecuteResumable,
+            AskPhase::DuringExecuteNonResumable,
+        ] {
             assert_eq!(AskPhase::from_storage_str(phase.as_str()), Some(phase));
             assert_eq!(
                 serde_json::to_string(&phase).unwrap(),

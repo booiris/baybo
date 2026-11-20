@@ -114,7 +114,7 @@ pub enum AgentEvent {
     /// `AnswerDelta`.
     Reasoning(String),
     /// A tool call has started. `label` is the human preview
-    /// (`Tool::call_label`), falling back to the tool name client-side;
+    /// (`Tool::progress_label`), falling back to the tool name client-side;
     /// `call_id` pairs this with the matching [`AgentEvent::ToolCompleted`].
     ToolStarted {
         call_id: String,

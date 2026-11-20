@@ -172,9 +172,9 @@ fn row(ask_id: &str, session_id: &str, phase: AskPhase) -> HumanAskRow {
 fn question_row(call_id: &str, session_id: &str) -> HumanAskRow {
     HumanAskRow {
         kind: AskKind::Question,
-        phase: AskPhase::DuringExecute,
+        phase: AskPhase::DuringExecuteNonResumable,
         request: AskRequest::Question(QuestionRequest { questions: vec![] }),
-        ..row(call_id, session_id, AskPhase::DuringExecute)
+        ..row(call_id, session_id, AskPhase::DuringExecuteNonResumable)
     }
 }
 
@@ -250,9 +250,16 @@ async fn an_answer_that_lands_before_the_queue_push_still_reaches_the_gate() {
             AskPhase::BeforeExecute,
             ApprovalOutcome::answered(ApprovalDecision::Approve),
         ),
-        // Not on the queue yet, so it reads as a dead during-execute ask and
-        // is closed; the gate must hear that instead of parking forever.
-        (AskPhase::DuringExecute, ApprovalOutcome::abandoned()),
+        (
+            AskPhase::DuringExecuteResumable,
+            ApprovalOutcome::answered(ApprovalDecision::Approve),
+        ),
+        // Not on the queue yet, so a non-resumable during-execute ask reads as
+        // dead and is closed; the gate must hear that instead of parking forever.
+        (
+            AskPhase::DuringExecuteNonResumable,
+            ApprovalOutcome::abandoned(),
+        ),
     ] {
         let h = harness();
         h.core.add_observer(Arc::new(AnswerOnRaise {
@@ -292,7 +299,7 @@ async fn a_failing_create_raises_no_entry_and_no_edge() {
 #[tokio::test]
 async fn live_resolve_persists_first_then_fires_and_the_gate_stamps_applied() {
     let h = harness();
-    let task = park(&h, "a", "s1", AskPhase::DuringExecute, tokens()).await;
+    let task = park(&h, "a", "s1", AskPhase::DuringExecuteNonResumable, tokens()).await;
     h.manager.resolve(&id("a"), APPROVE).await.expect("resolve");
     assert_eq!(
         task.await.expect("join"),
@@ -321,7 +328,7 @@ const PAST_DEADLINE: Duration =
 #[tokio::test(start_paused = true)]
 async fn an_unanswered_during_execute_approval_times_out() {
     let h = harness();
-    let task = park(&h, "a", "s1", AskPhase::DuringExecute, tokens()).await;
+    let task = park(&h, "a", "s1", AskPhase::DuringExecuteNonResumable, tokens()).await;
     tokio::time::sleep(PAST_DEADLINE).await;
     assert_eq!(task.await.expect("join"), ApprovalOutcome::timed_out());
     let stored = h.store.row(&id("a")).expect("row");
@@ -353,7 +360,7 @@ async fn an_unanswered_during_execute_approval_times_out() {
 #[tokio::test(start_paused = true)]
 async fn a_timeout_the_ledger_could_not_record_stays_listed_for_the_reconcile() {
     let h = harness();
-    let task = park(&h, "a", "s1", AskPhase::DuringExecute, tokens()).await;
+    let task = park(&h, "a", "s1", AskPhase::DuringExecuteNonResumable, tokens()).await;
     h.store.fail_resolves(true);
     tokio::time::sleep(PAST_DEADLINE).await;
     assert_eq!(
@@ -383,27 +390,34 @@ async fn a_timeout_the_ledger_could_not_record_stays_listed_for_the_reconcile() 
 
 #[tokio::test(start_paused = true)]
 async fn resumable_asks_have_no_deadline() {
-    let h = harness();
-    let before = park(&h, "b", "s1", AskPhase::BeforeExecute, tokens()).await;
-    tokio::time::sleep(PAST_DEADLINE).await;
-    assert!(
-        h.queue.contains(&id("b")),
-        "a before-execute approval still waits"
-    );
-    assert!(h.store.row(&id("b")).expect("row").is_pending());
-    h.manager.resolve(&id("b"), APPROVE).await.expect("resolve");
-    assert_eq!(
-        before.await.expect("join"),
-        ApprovalOutcome::answered(ApprovalDecision::Approve)
-    );
+    for (name, phase) in [
+        ("b", AskPhase::BeforeExecute),
+        ("r", AskPhase::DuringExecuteResumable),
+    ] {
+        let h = harness();
+        let task = park(&h, name, "s1", phase, tokens()).await;
+        tokio::time::sleep(PAST_DEADLINE).await;
+        assert!(
+            h.queue.contains(&id(name)),
+            "{phase:?}: still waits with no deadline"
+        );
+        assert!(h.store.row(&id(name)).expect("row").is_pending());
+        h.manager
+            .resolve(&id(name), APPROVE)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            task.await.expect("join"),
+            ApprovalOutcome::answered(ApprovalDecision::Approve)
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn an_answer_that_claims_first_beats_the_deadline() {
     use baybo_store::HumanAskStore as _;
     let h = harness();
-    let task = park(&h, "a", "s1", AskPhase::DuringExecute, tokens()).await;
-    // A verb's claim landed, but its queue resolve has not run yet.
+    let task = park(&h, "a", "s1", AskPhase::DuringExecuteNonResumable, tokens()).await;
     assert!(
         h.store
             .resolve(&id("a"), &APPROVE, Utc::now())
@@ -516,8 +530,10 @@ async fn abandon_for_tool_call_consumes_an_answer_that_won_the_race() {
     let h = harness();
     h.store
         .insert(resolved(row("a", "s1", AskPhase::BeforeExecute), APPROVE));
-    h.store
-        .insert(resolved(row("b", "s1", AskPhase::DuringExecute), APPROVE));
+    h.store.insert(resolved(
+        row("b", "s1", AskPhase::DuringExecuteNonResumable),
+        APPROVE,
+    ));
     for call in ["use-a", "use-b"] {
         assert!(
             h.manager
@@ -552,7 +568,14 @@ async fn abandon_for_tool_call_consumes_an_answer_that_won_the_race() {
 async fn a_mid_run_answer_racing_stop_still_gets_one_result() {
     let h = harness();
     let t = tokens();
-    let task = park(&h, "a", "s1", AskPhase::DuringExecute, t.clone()).await;
+    let task = park(
+        &h,
+        "a",
+        "s1",
+        AskPhase::DuringExecuteNonResumable,
+        t.clone(),
+    )
+    .await;
     t.turn.cancel();
     assert_eq!(task.await.expect("join"), ApprovalOutcome::abandoned());
     assert!(
@@ -630,7 +653,7 @@ async fn policy_deny_writes_an_applied_row_and_no_entry() {
     let out = gate
         .request(
             req("a", "s1"),
-            site(AskPhase::DuringExecute),
+            site(AskPhase::DuringExecuteNonResumable),
             AskCancel::never(),
         )
         .await;
@@ -709,7 +732,8 @@ async fn reload_resumes_resolved_rows_without_showing_them() {
 #[tokio::test]
 async fn reload_carries_on_past_a_row_it_cannot_write() {
     let h = harness();
-    h.store.insert(row("p", "s1", AskPhase::DuringExecute));
+    h.store
+        .insert(row("p", "s1", AskPhase::DuringExecuteNonResumable));
     h.store.insert(row("a", "s2", AskPhase::BeforeExecute));
     h.store.fail_resolves(true);
     let report = h.manager.reload_pending().await.expect("reload");
@@ -728,7 +752,8 @@ async fn reload_carries_on_past_a_row_it_cannot_write() {
 #[tokio::test]
 async fn an_answer_to_a_dead_during_execute_ask_is_refused_and_closes_it() {
     let h = harness();
-    h.store.insert(row("d", "s1", AskPhase::DuringExecute));
+    h.store
+        .insert(row("d", "s1", AskPhase::DuringExecuteNonResumable));
     let refused = h.manager.resolve(&id("d"), APPROVE).await;
     assert!(
         matches!(refused, Err(HumanAskError::AskClosed { .. })),
@@ -753,11 +778,38 @@ async fn an_answer_to_a_dead_during_execute_ask_is_refused_and_closes_it() {
 }
 
 #[tokio::test]
+async fn an_answer_to_a_dead_resumable_during_execute_ask_requests_a_resume() {
+    let h = harness();
+    h.store
+        .insert(row("dr", "s1", AskPhase::DuringExecuteResumable));
+    h.manager.reload_pending().await.expect("reload");
+    assert_eq!(h.queue.liveness(&id("dr")), Some(false));
+
+    h.manager
+        .resolve(&id("dr"), APPROVE)
+        .await
+        .expect("resumable during-execute approval is answerable after restart");
+    let stored = h.store.row(&id("dr")).expect("row");
+    assert_eq!(stored.resolution, Some(APPROVE));
+    assert!(stored.applied_at.is_none());
+    assert_eq!(
+        *h.sink.requests.lock(),
+        vec![ResumeRequest {
+            session_id: "s1".into(),
+            ask_id: id("dr"),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn reload_reconciles_non_resumable_rows() {
     let h = harness();
-    h.store.insert(row("p", "s1", AskPhase::DuringExecute));
     h.store
-        .insert(resolved(row("r", "s1", AskPhase::DuringExecute), APPROVE));
+        .insert(row("p", "s1", AskPhase::DuringExecuteNonResumable));
+    h.store.insert(resolved(
+        row("r", "s1", AskPhase::DuringExecuteNonResumable),
+        APPROVE,
+    ));
     let report = h.manager.reload_pending().await.expect("reload");
     assert_eq!((report.abandoned, report.applied), (1, 1));
     let p = h.store.row(&id("p")).expect("row");
@@ -791,18 +843,21 @@ async fn settle_unapplied_handles_every_row_state() {
         APPROVE,
     ));
     h.store.insert(resolved(
-        row("midrun", "s1", AskPhase::DuringExecute),
+        row("resumable_mid", "s1", AskPhase::DuringExecuteResumable),
+        APPROVE,
+    ));
+    h.store.insert(resolved(
+        row("midrun", "s1", AskPhase::DuringExecuteNonResumable),
         APPROVE,
     ));
     h.manager.reload_pending().await.expect("reload");
-    // `midrun` was stamped applied by the reload; seed a fresh one.
+    // `midrun` was stamped applied by the reload; seed a fresh non-resumable one.
     h.store.insert(resolved(
-        row("midrun2", "s1", AskPhase::DuringExecute),
+        row("midrun2", "s1", AskPhase::DuringExecuteNonResumable),
         APPROVE,
     ));
-    // Pending, non-resumable, its waiter gone (an unwound actor): hydration
-    // already filled its call.
-    h.store.insert(row("orphan", "s1", AskPhase::DuringExecute));
+    h.store
+        .insert(row("orphan", "s1", AskPhase::DuringExecuteNonResumable));
     h.sink.requests.lock().clear();
 
     let settled = h
@@ -817,22 +872,31 @@ async fn settle_unapplied_handles_every_row_state() {
                 ask_id: id("dead"),
                 tool_call_id: "use-dead".into(),
                 kind: AskKind::Approval,
+                phase: AskPhase::BeforeExecute,
+                accesses: req("dead", "s1").accesses,
                 resolution: AskResolution::Abandoned,
             },
             SettledAsk {
                 ask_id: id("answered"),
                 tool_call_id: "use-answered".into(),
                 kind: AskKind::Approval,
+                phase: AskPhase::BeforeExecute,
+                accesses: req("answered", "s1").accesses,
+                resolution: APPROVE,
+            },
+            SettledAsk {
+                ask_id: id("resumable_mid"),
+                tool_call_id: "use-resumable_mid".into(),
+                kind: AskKind::Approval,
+                phase: AskPhase::DuringExecuteResumable,
+                accesses: req("resumable_mid", "s1").accesses,
                 resolution: APPROVE,
             },
         ]
     );
     let dead = h.store.row(&id("dead")).expect("row");
     assert_eq!(dead.resolution, Some(AskResolution::Abandoned));
-    assert!(
-        dead.applied_at.is_none(),
-        "abandoned, but applied only once the caller has appended its result"
-    );
+    assert!(dead.applied_at.is_none());
     let orphan = h.store.row(&id("orphan")).expect("row");
     assert_eq!(orphan.resolution, Some(AskResolution::Abandoned));
     assert!(orphan.applied_at.is_some(), "reconciled, nothing appended");
@@ -846,6 +910,14 @@ async fn settle_unapplied_handles_every_row_state() {
     assert!(
         h.store
             .row(&id("answered"))
+            .expect("row")
+            .applied_at
+            .is_none(),
+        "the caller stamps what it appends"
+    );
+    assert!(
+        h.store
+            .row(&id("resumable_mid"))
             .expect("row")
             .applied_at
             .is_none(),
@@ -987,6 +1059,8 @@ async fn settle_unapplied_returns_apply_when_a_resolve_wins_the_claim() {
             ask_id: id("a"),
             tool_call_id: "use-a".into(),
             kind: AskKind::Approval,
+            phase: AskPhase::BeforeExecute,
+            accesses: req("a", "s1").accesses,
             resolution: APPROVE,
         }]
     );

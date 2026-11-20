@@ -41,8 +41,8 @@ pub struct ApprovalRequest {
     pub accesses: Vec<ResourceAccess>,
     /// Short truncated JSON preview of the parameters, for UI display only.
     pub params_preview: String,
-    /// Caller-supplied label produced by `baybo_tools::Tool::call_label`
-    /// (e.g. Bash's `description` parameter). Missing on input deserializes
+    /// Optional label or warning attached by `baybo_tools::Tool::pre_execute_ask`
+    /// (defaulting to `Tool::progress_label`). Missing on input deserializes
     /// to `None`; `None` is omitted on serialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -100,8 +100,9 @@ pub enum ApprovalResolution {
     /// rows written before this distinction existed read as answered.
     #[default]
     Answered,
-    /// Nobody answered a during-execute approval within its deadline
-    /// (`DURING_EXECUTE_APPROVAL_TIMEOUT` in `baybo-human-ask`). Denied.
+    /// Nobody answered a non-resumable during-execute approval within its
+    /// deadline (`DURING_EXECUTE_APPROVAL_TIMEOUT` in `baybo-human-ask`).
+    /// Denied.
     TimedOut,
     /// The prompt went away undecided — its turn was cancelled or its
     /// process shut down. Denied by default.

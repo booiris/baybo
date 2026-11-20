@@ -410,7 +410,35 @@ impl SecurityGateway {
             }
         }
 
-        substitute_in_value(value, &resolved);
+        substitute_in_value(value, &resolved.into_iter().collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// Restore the input's placeholders in approval data before it reaches
+    /// the ledger, cache or UI, including secrets custom rules no longer match.
+    pub(crate) async fn sanitize_approval_value(
+        &self,
+        value: &mut serde_json::Value,
+        masked_params: &serde_json::Value,
+    ) -> Result<()> {
+        let mut placeholders = HashSet::new();
+        collect_placeholders(masked_params, &mut placeholders);
+        let mut replacements = Vec::new();
+        for placeholder in placeholders {
+            let plain = self.reveal_in_text(&placeholder).await?;
+            if !plain.is_empty() && plain != placeholder {
+                replacements.push((plain, placeholder));
+            }
+        }
+        replacements.sort_by_key(|(plain, _)| std::cmp::Reverse(plain.len()));
+        substitute_in_value(value, &replacements);
+        let mut mints = Vec::new();
+        sanitize_value(value, &self.leak_detector, &self.minter, &mut mints);
+        for mint in mints {
+            self.secret_vault
+                .store_secret(&mint.placeholder, mint.original.as_bytes())
+                .await?;
+        }
         Ok(())
     }
 
@@ -755,7 +783,7 @@ fn collect_placeholders(value: &serde_json::Value, out: &mut HashSet<String>) {
     }
 }
 
-fn substitute_in_value(value: &mut serde_json::Value, resolved: &HashMap<String, String>) {
+fn substitute_in_value(value: &mut serde_json::Value, resolved: &[(String, String)]) {
     match value {
         serde_json::Value::String(s) => {
             for (ph, plain) in resolved {

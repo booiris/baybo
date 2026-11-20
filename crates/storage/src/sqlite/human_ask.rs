@@ -357,7 +357,7 @@ mod tests {
         let question = HumanAskRow {
             ask_id: "q1".parse().unwrap(),
             kind: AskKind::Question,
-            phase: AskPhase::DuringExecute,
+            phase: AskPhase::DuringExecuteNonResumable,
             request: AskRequest::Question(QuestionRequest {
                 questions: vec![Question {
                     header: "Lang".into(),

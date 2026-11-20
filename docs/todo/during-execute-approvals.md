@@ -1,90 +1,84 @@
 # During-execute approvals
 
-> **Status:** partly shipped. A during-execute approval now expires after
-> `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min). Moving three of the four
-> during-execute prompts to before-execute is planned, not started.
+> **Status:** shipped. All four approval prompts are now resumable across
+> restarts and idle releases: the three pre-work prompts moved to
+> before-execute (`Tool::pre_execute_ask`), and Bash's post-failure unsandboxed
+> retry opts in to resumable during-execute continuation via
+> `Tool::during_execute_resumer` + `DuringExecuteResumer`
+> (`AskPhase::DuringExecuteResumable`). Plain `AskPhase::DuringExecuteNonResumable`
+> (default for any tool that does not implement `DuringExecuteResumer`, or any
+> prompt raised via `ApprovalHandle::request_uncached`) stays
+> non-resumable and keeps `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min) and
+> `ActorStopCost::AbandonsAsks`.
 
-## The two phases
+## The phases
 
-An approval is raised in one of two phases (`AskPhase`):
+An approval is raised in one of three phases (`AskPhase`):
 
-- **Before execute** — the executor's pre-execute gate, before the tool runs.
-  If the tool future goes away, the persisted `tool_use` can be dispatched
-  again with the decision already made (`PreExecuteGate::PreDecided`), so the
-  ask is **resumable**.
-- **During execute** — a tool that is already running asks through
-  `ApprovalHandle`. `resumable()` (`crates/model/src/human_ask.rs`) treats
-  every such approval as **not resumable**: the prompt is a suspension point
-  inside `execute()`, and that future is the only thing that can carry on
-  from it.
+- **Before execute (`AskPhase::BeforeExecute`)** — the executor's pre-execute
+  gate (`Tool::pre_execute_ask`), before the tool runs. Resumable: re-dispatches
+  the persisted `tool_use` through `Tool::execute` with
+  `PreExecuteGate::PreDecided { decision, phase: BeforeExecute, accesses }`.
+- **During execute, resumable (`AskPhase::DuringExecuteResumable`)** — raised
+  through `ApprovalHandle::request_resumable_uncached(self, ...)` by a tool
+  that implements `DuringExecuteResumer` and returns `Some(self)` from
+  `Tool::during_execute_resumer()` (today: `BashTool` for its post-failure
+  unsandboxed retry). Resumable with no deadline: an approval after a restart
+  or idle release skips `pre_execute_ask` (uncached) and invokes
+  `DuringExecuteResumer::resume_during_execute`. A dead denial/abandon resolves
+  to the standard `ToolError::Denied`.
+- **During execute, non-resumable (`AskPhase::DuringExecuteNonResumable`)** — the fail-safe
+  default for any tool that raises a mid-execution prompt via
+  `ApprovalHandle::request_uncached`. Governed by
+  `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min), guarded from idle-reaper
+  abandonment by `ActorStopCost::AbandonsAsks`, and closed/abandoned if its
+  tool future dies.
 
-When the tool future of a during-execute approval goes away — a gateway
-restart, an actor panic, `/stop` — the ask is abandoned: the card disappears
-and the call's result is the abandoned refusal. The idle reaper never ends
-such a turn (`ActorStopCost::AbandonsAsks`), because ending it would abandon
-the prompt. Once this move lands that variant can no longer happen and the
-enum collapses to whether anything is live.
+## Where each approval runs
 
-## Shipped: a deadline on during-execute approvals
+| Prompt | Where | Phase | On Resume (`Approve` / `ApproveAlways`) |
+|---|---|---|---|
+| Bash `require_escalated` | `BashTool::pre_execute_ask` (uncached, merges destructive warning) | `BeforeExecute` | `Tool::execute` (uncached) |
+| Bash risk judge (`permission = auto`) | `BashTool::pre_execute_ask` (cached; skipped on `PreDecided`) | `BeforeExecute` | `Tool::execute` (cached if `ApproveAlways`, skips judge) |
+| Skill env vars | `SkillTool::pre_execute_ask` (uncached; after host-env and risk-block checks) | `BeforeExecute` | `Tool::execute` (uncached) |
+| Bash retry after a sandbox failure | `request_unsandboxed_retry_approval` | `DuringExecuteResumable` | `BashTool::resume_during_execute` (uncached, runs unsandboxed directly with `sandbox_escalation`) |
 
-Before-execute approvals and questions wait with no timeout; a dead one is
-answered later through the Resume door. A during-execute approval cannot be,
-so without a deadline it would hold its turn — actor, transcript, tool
-future — in memory for as long as nobody answers.
+`permission = manual` Bash declares its commands through `accessed_resources` /
+`pre_execute_ask`, so those prompts are `BeforeExecute` as well.
 
-`ChannelAskGate` therefore races a non-resumable ask against
-`DURING_EXECUTE_APPROVAL_TIMEOUT`. On expiry it claims `AskResolution::TimedOut`
-on the still-pending row (an answer that won the claim is taken instead),
-closes the card, and returns `ApprovalResolution::TimedOut`. The tool future
-is still alive, so the tool returns its own denial and the turn carries on —
-**nothing is replayed**. The deadline also bounds how long the idle reaper
-keeps such a session.
+## Summary of what shipped
 
-## Who raises during-execute approvals
-
-| Prompt | Where | Has anything run when it asks? |
-|---|---|---|
-| Bash `require_escalated` | `request_explicit_unsandboxed_approval`, right after the route is picked | No |
-| Bash risk judge (`permission = auto`) | `pre_exec_gate`, after only env preparation (secret env, commit trailer, git config) | No |
-| Skill env vars | `request_uncached`, after the host-env check, before the skill gets them | No |
-| Bash retry after a sandbox failure | `request_unsandboxed_retry_approval` | **Yes** — the sandboxed attempt ran |
-
-`permission = manual` Bash already declares its commands through
-`accessed_resources`, so those prompts are before-execute.
-
-## Plan: move the first three to before-execute
-
-Nothing has run at those three points, so re-dispatching the call with the
-decision applied is as safe as for any before-execute approval. The executor's
-pre-execute gate cannot host them today: it only reads
-`accessed_resources(&self, params) -> Vec<ResourceAccess>`, which is
-synchronous, params-only, and always satisfied by the approval cache.
-
-1. **An async pre-execute hook with the tool context**, e.g.
-   `async fn pre_execute_ask(&self, params, ctx) -> Option<PreExecuteAsk>`
-   carrying the accesses, whether the cache may satisfy them, a description
-   and a preview. `accessed_resources` becomes its simplest case. The risk
-   judge needs the LLM, the resolved cwd, whether the route is sandboxed
-   (`ctx.sandbox`) and `ctx.events`.
-2. **Uncached asks in the executor's gate.** A cached sandboxed approval must
-   never authorize the unsandboxed form, and skill env approval is
-   per-invocation.
-3. **At most one ask per call.** A Bash call can prompt twice today
-   (escalation, then the judge); a resumed re-execution carries one
-   `PreDecided` decision. Merge both into one ask, uncached if either part is.
-4. **The tools stop asking at those points**, so a resumed re-execution under
-   `PreDecided` never prompts again.
-5. **Order kept**: a skill with missing env vars still errors before anyone
-   is asked.
-
-Afterwards only the post-failure retry stays during-execute, and the deadline
-above is the only thing that governs it. One further option for that case:
-an approval that outlives its future could re-dispatch straight to the
-unsandboxed attempt, since the sandboxed one already failed.
-
-## Open questions
-
-- Is 30 minutes right for the deadline, and should the card say when it
-  expires?
-- After the move, should the post-failure retry be made resumable as above,
-  or keep the deadline?
+1. **Async pre-execute hook with the tool context**:
+   `Tool::pre_execute_ask(&self, params, ctx, check: PreExecuteCheck) -> Option<PreExecuteAsk>`
+   carries `accesses`, `cacheable`, `description`, and `params_preview`. Its
+   default delegates to `accessed_resources` + `progress_label` (`cacheable: true`).
+   `ToolExecutor` constructs `ToolContext` ahead of the gate and runs
+   `pre_execute_ask` on the same revealed params as execution. Returned approval
+   data is re-masked before use; the original ledger resources bound resumed
+   approvals, and Skill checks its current env requirements against the per-call
+   grant. The executor flushes any `ctx.events` (such as
+   risk-judge `LlmCall`/`Phase` events) before the gate returns.
+2. **Uncached asks in the executor's gate**: when `PreExecuteAsk::cacheable` is
+   `false`, the executor neither consults `approved_resources` before prompting
+   nor persists `ApproveAlways` into `approved_resources` (live or `PreDecided`).
+3. **At most one ask per call**: `BashTool::pre_execute_ask` produces a single
+   `PreExecuteAsk`, merging the destructive-command warning into an uncached
+   `require_escalated` prompt rather than prompting twice.
+4. **Tools stop asking at those three points**: `BashTool::execute` and
+   `SkillTool::execute` no longer prompt for escalation, pre-exec risk judge,
+   or skill env vars, and `PreExecuteCheck::PreDecided` lets resumed calls skip
+   redundant LLM/risk checks without re-prompting.
+5. **Order kept**: a skill with missing host env vars (or blocked by the risk
+   assessor) returns `None` from `pre_execute_ask` and still errors in
+   `execute()` before anyone is asked.
+6. **Generic tool-owned during-execute resume**: `Tool` exposes a single
+   capability method `during_execute_resumer(&self) -> Option<&dyn DuringExecuteResumer>`
+   (default `None`), binding declaration and continuation implementation into a
+   single source of truth at compile time. Tools that can resume a mid-call
+   prompt call `ApprovalHandle::request_resumable_uncached(self, ...)` (which
+   requires `&dyn DuringExecuteResumer` at compile time and verifies
+   `Tool::during_execute_resumer().is_some()` at runtime). `PreExecuteGate::PreDecided { decision, phase, accesses }`
+   dispatches `DuringExecuteResumer::resume_during_execute` without leaking any
+   Bash/sandbox concept into the generic gate or `ToolContext`. Ordinary
+   `request_uncached` prompts keep `AskPhase::DuringExecuteNonResumable` with
+   `DURING_EXECUTE_APPROVAL_TIMEOUT` and `ActorStopCost::AbandonsAsks`.

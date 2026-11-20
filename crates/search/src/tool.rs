@@ -33,7 +33,7 @@ const MAX_URL_CHARS: usize = 300;
 const MAX_AGE_CHARS: usize = 40;
 
 /// Longest progress/approval label, cut on a char boundary.
-const CALL_LABEL_MAX: usize = 120;
+const PROGRESS_LABEL_MAX: usize = 120;
 
 /// Ceiling on either domain list. Brave encodes them as `site:` operators
 /// inside a query capped at 400 characters, so an unbounded list is a
@@ -349,12 +349,12 @@ impl Tool for WebSearchTool {
         })
     }
 
-    fn call_label(&self, params: &Value) -> Option<String> {
+    fn progress_label(&self, params: &Value) -> Option<String> {
         let query = params.get("query")?.as_str()?.trim();
         if query.is_empty() {
             return None;
         }
-        Some(truncate_chars(query, CALL_LABEL_MAX))
+        Some(truncate_chars(query, PROGRESS_LABEL_MAX))
     }
 
     /// Read-only network call over no shared mutable state.
@@ -662,19 +662,19 @@ mod tests {
     }
 
     #[test]
-    fn the_call_label_is_the_query_cut_on_a_char_boundary() {
+    fn the_progress_label_is_the_query_cut_on_a_char_boundary() {
         let tool = tool_with(StubProvider::returning(vec![]));
         let long = "日本語".repeat(200);
         let label = tool
-            .call_label(&json!({ "query": long }))
+            .progress_label(&json!({ "query": long }))
             .expect("query labels the call");
         assert_eq!(
             label.chars().count(),
-            CALL_LABEL_MAX + 1,
+            PROGRESS_LABEL_MAX + 1,
             "cut plus ellipsis"
         );
         assert!(label.ends_with('…'));
-        assert!(tool.call_label(&json!({})).is_none());
+        assert!(tool.progress_label(&json!({})).is_none());
     }
 
     #[tokio::test]
