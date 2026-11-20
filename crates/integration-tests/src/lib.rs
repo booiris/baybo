@@ -13,6 +13,7 @@
 
 pub mod fixtures;
 pub mod harness;
+pub mod human_ask;
 pub mod tracing_capture;
 
 pub use fixtures::{SessionBuilder, gateway_with_memory_vault, master_key_for_tests};

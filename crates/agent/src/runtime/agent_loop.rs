@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, StatusPhase, ToolStatus};
 use baybo_context::ContextManager;
@@ -372,6 +372,39 @@ fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
     blocks
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("turn cancelled")]
+pub(crate) struct TurnCancelled(pub(crate) CancelOrigin);
+
+/// Keep the origin the loop acted on through asynchronous transcript and
+/// lifecycle writes. The release token can trip while those writes finish.
+struct TurnCancellation {
+    tokens: TurnTokens,
+    observed: OnceLock<CancelOrigin>,
+}
+
+impl TurnCancellation {
+    fn origin(&self) -> Option<CancelOrigin> {
+        self.tokens.turn.is_cancelled().then(|| self.observe())
+    }
+
+    fn observe(&self) -> CancelOrigin {
+        *self.observed.get_or_init(|| CancelOrigin::of(&self.tokens))
+    }
+
+    async fn cancelled(&self) {
+        self.tokens.turn.cancelled().await;
+        self.observe();
+    }
+
+    fn classify(&self, error: anyhow::Error) -> anyhow::Error {
+        match self.origin() {
+            Some(origin) => error.context(TurnCancelled(origin)),
+            None => error,
+        }
+    }
+}
+
 /// Error returned by `call_llm` when the turn is cancelled while the LLM
 /// call is in flight. Carries the partial assistant content salvaged from a
 /// mid-stream cancel so `run_iteration` can persist it — keeping the
@@ -379,17 +412,17 @@ fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
 /// propagating the abort. `partial` is empty when nothing was produced
 /// (a non-streaming call dropped before its single response).
 #[derive(Debug)]
-struct CancelledTurn {
+struct CancelledLlmCall {
     partial: Vec<ContentBlock>,
 }
 
-impl std::fmt::Display for CancelledTurn {
+impl std::fmt::Display for CancelledLlmCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("LLM call cancelled mid-flight")
     }
 }
 
-impl std::error::Error for CancelledTurn {}
+impl std::error::Error for CancelledLlmCall {}
 
 /// `try_send` drops on a full channel: notices are non-load-bearing
 /// (the verdict still lands in the trace) and `SessionNotifier::emit`
@@ -955,9 +988,13 @@ impl AgentLoop {
         // launched inside the body would persist memory for a turn the
         // runtime later treats as cancelled. Carry `PendingMemoryWrite` up
         // through `with_turn`'s `T` and fire only once it has returned Ok.
-        let (outgoing, pending_write) = crate::runtime::scope::with_turn(
+        let cancellation = &TurnCancellation {
+            tokens,
+            observed: OnceLock::new(),
+        };
+        let (outgoing, pending_write) = crate::runtime::scope::with_turn_reporting_cancel(
             turn_lifecycle,
-            tokens.turn.clone(),
+            cancellation.tokens.turn.clone(),
             spec,
             |turn_id| async move {
                 let (outgoing, pending) = self
@@ -966,7 +1003,7 @@ impl AgentLoop {
                         span_recorder,
                         turn_id,
                         delta_tx,
-                        tokens,
+                        cancellation,
                         interjections,
                         memory_query,
                         turn_kind,
@@ -998,6 +1035,7 @@ impl AgentLoop {
                 let pending_with_id = pending.map(|p| (turn_id, p));
                 Ok((output, (outgoing, pending_with_id)))
             },
+            |e| cancellation.classify(e),
         )
         .await?;
         // Past the cancel-race window — `with_turn` returned Ok, so the turn
@@ -1026,13 +1064,13 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         turn_id: TurnId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        tokens: TurnTokens,
+        cancellation: &TurnCancellation,
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
         turn_kind: TurnInputKind,
         cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
-        let cancel_token = tokens.turn.clone();
+        let cancel_token = cancellation.tokens.turn.clone();
         // Title generation stays `UserChat`-only: a `Resume` turn's session
         // already has its opening message titled.
         let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
@@ -1093,7 +1131,7 @@ impl AgentLoop {
                     span_recorder,
                     turn_id,
                     kind: turn_kind,
-                    tokens: &tokens,
+                    tokens: &cancellation.tokens,
                     delta_tx: delta_tx.as_ref(),
                 },
                 &mut turn_attachments,
@@ -1139,7 +1177,7 @@ impl AgentLoop {
             // compress / tool-call before observing the cancel. Tools
             // and the LLM still get the token via their own paths;
             // this catches the orchestration-layer wait windows.
-            if cancel_token.is_cancelled() {
+            if cancellation.origin().is_some() {
                 warn!(turn_id = %turn_id, iterations, "cancel observed at iteration boundary; aborting loop");
                 return Err(anyhow::anyhow!("agent loop cancelled"));
             }
@@ -1233,7 +1271,7 @@ impl AgentLoop {
                         iterations,
                         iter_delta_tx,
                         notifier.clone(),
-                        &tokens,
+                        cancellation,
                         &mut turn_attachments,
                         background,
                         attended,
@@ -1320,7 +1358,7 @@ impl AgentLoop {
 
     /// Persist cancellation-safe partial blocks, excluding dangling tool uses.
     async fn persist_cancelled_partial(&mut self, e: anyhow::Error) -> anyhow::Error {
-        if let Some(cancelled) = e.downcast_ref::<CancelledTurn>()
+        if let Some(cancelled) = e.downcast_ref::<CancelledLlmCall>()
             && !cancelled.partial.is_empty()
             && let Err(append_error) = self
                 .context_manager
@@ -1388,7 +1426,7 @@ impl AgentLoop {
         iterations: usize,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
-        tokens: &TurnTokens,
+        cancellation: &TurnCancellation,
         turn_attachments: &mut Vec<ContentBlock>,
         // What this turn lets its calls leave running past it — computed once
         // per turn in `run_inner`.
@@ -1398,9 +1436,10 @@ impl AgentLoop {
         attended: bool,
         cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<IterationOutcome> {
+        let tokens = &cancellation.tokens;
         let cancel_token = &tokens.turn;
         let (response, llm_span_id) = match self
-            .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
+            .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancellation)
             .await
         {
             Ok(pair) => pair,
@@ -1454,8 +1493,8 @@ impl AgentLoop {
         }
 
         // Bail before persisting tool-use ids, but let an already-finished answer win.
-        if cancel_token.is_cancelled() {
-            let cancelled = CancelledTurn {
+        if cancellation.origin().is_some() {
+            let cancelled = CancelledLlmCall {
                 partial: salvage_partial_blocks(&response),
             };
             return Err(self
@@ -1695,16 +1734,12 @@ impl AgentLoop {
                     Some((idx, executed)) => tool_results[idx] = Some(executed),
                     None => break false,
                 },
-                _ = cancel_token.cancelled() => break true,
+                _ = cancellation.cancelled() => break true,
             }
         };
         drop(pending);
-        // Read once, after the batch: a turn cancel (`/stop`) settles the
-        // calls it interrupted; an ancestor cancel (shutdown) leaves them
-        // exactly as a crash would, so a parked ask survives the restart.
-        let cancel_origin = cancel_token
-            .is_cancelled()
-            .then(|| CancelOrigin::of(tokens));
+        // One origin governs both unfinished calls and the actor's mailbox cleanup.
+        let cancel_origin = cancellation.origin();
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
@@ -2031,12 +2066,12 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-        cancel_token: &CancellationToken,
+        cancel: &TurnCancellation,
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
             match self
-                .call_llm(session, span_recorder, step, delta_tx, cancel_token)
+                .call_llm(session, span_recorder, step, delta_tx, cancel)
                 .await
             {
                 Ok(pair) => return Ok(pair),
@@ -2046,7 +2081,7 @@ impl AgentLoop {
                     // a cancellation can otherwise read as a transient error.
                     // A cancellation is not a failure, so it never logs a
                     // give-up line.
-                    if cancel_token.is_cancelled() {
+                    if cancel.origin().is_some() {
                         return Err(e);
                     }
                     if !self.error_handler.should_retry(attempt, &e) {
@@ -2087,7 +2122,7 @@ impl AgentLoop {
                     // `/stop` isn't stalled waiting out the sleep.
                     tokio::select! {
                         biased;
-                        _ = cancel_token.cancelled() => return Err(e),
+                        _ = cancel.cancelled() => return Err(e),
                         _ = tokio::time::sleep(backoff) => {}
                     }
                     attempt += 1;
@@ -2107,7 +2142,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-        cancel_token: &CancellationToken,
+        cancel: &TurnCancellation,
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
@@ -2163,7 +2198,6 @@ impl AgentLoop {
             }
         };
 
-        let cancel = cancel_token.clone();
         crate::runtime::scope::with_llm_span(
             span_recorder.as_ref(),
             step,
@@ -2176,7 +2210,7 @@ impl AgentLoop {
                 temperature: None,
                 tools,
             },
-            Some((cancel_token, baybo_turn::CancelReason::ParentCancelled)),
+            Some((&cancel.tokens.turn, baybo_turn::CancelReason::ParentCancelled)),
             |span| async move {
                 // Bind this call to its `LlmCall` span so the spend lands
                 // on the right span. `BoundBilledLlm` does gate → call →
@@ -2196,7 +2230,7 @@ impl AgentLoop {
                 // `RecordingStream` still bills its partial usage on drop).
                 let (partial_usage, llm_result): (TokenUsage, baybo_llm::Result<LlmResponse>) =
                     match delta_tx {
-                        Some(tx) => self.chat_streaming(&bound, &request, session, tx, &cancel).await,
+                        Some(tx) => self.chat_streaming(&bound, &request, session, tx, cancel).await,
                         None => tokio::select! {
                             biased;
                             _ = cancel.cancelled() => (TokenUsage::default(), Ok(empty_llm_response())),
@@ -2209,10 +2243,10 @@ impl AgentLoop {
 
                 // Cancelled while the call was in flight: salvage any partial
                 // assistant content the stream produced and hand it up via
-                // `CancelledTurn` so `run_iteration` persists it (the work
+                // `CancelledLlmCall` so `run_iteration` persists it (the work
                 // block then survives a reload). The span closes `Cancelled`
                 // via the cancel context, and the retry loop won't re-issue.
-                if cancel.is_cancelled() {
+                if cancel.origin().is_some() {
                     // Record the partial output the model produced before the
                     // abort onto the span too — otherwise the trace detail
                     // shows a blank LLM call even though text/thinking were
@@ -2250,7 +2284,7 @@ impl AgentLoop {
                         cached_input_tokens: partial_usage.cached_input_tokens,
                         cache_creation_input_tokens: partial_usage.cache_creation_input_tokens,
                     };
-                    return (finalize, Err(anyhow::Error::new(CancelledTurn { partial })));
+                    return (finalize, Err(anyhow::Error::new(CancelledLlmCall { partial })));
                 }
                 let (finalize, value_result) = match llm_result {
                     Ok(mut response) => {
@@ -2683,7 +2717,7 @@ impl AgentLoop {
         request: &ChatRequest,
         session: &Session,
         delta_tx: &mpsc::Sender<AgentOutput>,
-        cancel: &CancellationToken,
+        cancel: &TurnCancellation,
     ) -> (TokenUsage, baybo_llm::Result<LlmResponse>) {
         let mut stream = match tokio::select! {
             biased;
@@ -3584,6 +3618,32 @@ fn trim_response_text_edges(response: &mut LlmResponse) {
                 *t = trimmed.to_string();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn release_during_cleanup_preserves_the_stop_the_loop_observed() {
+        let release = CancellationToken::new();
+        let turn = release.child_token();
+        let cancellation = TurnCancellation {
+            tokens: TurnTokens {
+                turn: turn.clone(),
+                release: release.clone(),
+            },
+            observed: OnceLock::new(),
+        };
+        turn.cancel();
+        cancellation.cancelled().await;
+        release.cancel();
+        let error = cancellation.classify(anyhow::anyhow!("turn interrupted"));
+        assert_eq!(
+            error.downcast_ref::<TurnCancelled>().map(|c| c.0),
+            Some(CancelOrigin::Turn)
+        );
     }
 }
 

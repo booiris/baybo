@@ -55,6 +55,9 @@ RUST_LOG=baybo_agent=debug cargo run          # agent crate only
 
 ## Pull Requests
 
+Match recent merged PR titles in the same area. Use `type(scope): summary`,
+with the type describing the change and a short English summary.
+
 **Open every PR as a draft (`gh pr create --draft`), and never mark it ready
 yourself.** The owner reviews it first and says when it may go ready. Marking it
 ready is what starts CI and what puts it in front of reviewers — that is the

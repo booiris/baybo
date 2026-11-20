@@ -150,9 +150,8 @@ through `AgentLoop::run` → `run_inner` → `run_iteration`; each call gets a
 child of the turn token plus the turn's release token. `run_agent_loop`
 reports a user stop only for a `Turn` cancel, so messages queued behind a
 turn the idle reaper released still run; an actor whose own token is
-cancelled (shutdown) takes no further message but `ActorStop`. After the
-batch the loop reads
-`CancelOrigin::of(tokens)` once. On `Ancestor` (shutdown, or the idle reaper's release) it appends
+cancelled (shutdown) takes no further message but `ActorStop`. The loop captures `CancelOrigin` when it observes cancellation and returns
+that same origin to the actor after the turn settles. On `Ancestor` (shutdown, or the idle reaper's release) it appends
 and emits nothing for a call that never finished or whose ask came back
 abandoned — the transcript is left as a crash would leave it, the ask row
 stays pending, and hydration repairs the siblings. On `Turn` (`/stop`, board

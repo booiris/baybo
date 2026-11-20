@@ -168,6 +168,22 @@ where
     F: FnOnce(TurnId) -> Fut,
     Fut: Future<Output = anyhow::Result<(TurnOutput, T)>>,
 {
+    with_turn_reporting_cancel(lifecycle, cancel_token, spec, body, std::convert::identity).await
+}
+
+/// A loop that distinguishes stop from release records its origin at the
+/// same checkpoint that decides the turn's durable terminal state.
+pub(crate) async fn with_turn_reporting_cancel<F, Fut, T>(
+    lifecycle: &TurnLifecycle,
+    cancel_token: CancellationToken,
+    spec: TurnSpec,
+    body: F,
+    classify: impl Fn(anyhow::Error) -> anyhow::Error,
+) -> anyhow::Result<T>
+where
+    F: FnOnce(TurnId) -> Fut,
+    Fut: Future<Output = anyhow::Result<(TurnOutput, T)>>,
+{
     let turn = lifecycle
         .start_turn(
             spec.session_id,
@@ -175,30 +191,30 @@ where
             spec.input,
             spec.parent_turn_id,
         )
-        .await?;
+        .await
+        .map_err(|e| classify(e.into()))?;
     let turn_id = turn.id;
     let _cancel_guard = lifecycle.register_running(turn_id, cancel_token.clone());
 
     if let Err(e) = lifecycle.start(&turn_id).await {
+        let reason = format!("start failed: {e}");
+        let e = classify(e.into());
         // Pending row exists from start_turn; mark Failed so it doesn't
         // leak as forever-Pending.
-        lifecycle
-            .fail(&turn_id, format!("start failed: {e}"))
-            .await
-            .ok();
-        return Err(e.into());
+        lifecycle.fail(&turn_id, reason).await.ok();
+        return Err(e);
     }
 
     let settlement = match (body(turn_id).await, cancel_token.is_cancelled()) {
         (Ok((output, value)), false) => TurnSettlement::Complete(output, value),
         (Ok(_), true) => {
             warn!(turn_id = %turn_id, "cancel observed after body returned Ok; suppressing complete");
-            TurnSettlement::Cancel(anyhow::anyhow!("turn cancelled mid-flight"))
+            TurnSettlement::Cancel(classify(anyhow::anyhow!("turn cancelled mid-flight")))
         }
-        (Err(e), true) => TurnSettlement::Cancel(e),
+        (Err(e), true) => TurnSettlement::Cancel(classify(e)),
         (Err(e), false) => TurnSettlement::Fail(e),
     };
-    settle_turn(lifecycle, turn_id, settlement).await
+    settle_turn(lifecycle, turn_id, settlement, classify).await
 }
 
 /// How a finished body settles its turn row. Every exit from
@@ -217,6 +233,7 @@ async fn settle_turn<T>(
     lifecycle: &TurnLifecycle,
     turn_id: TurnId,
     settlement: TurnSettlement<T>,
+    classify: impl FnOnce(anyhow::Error) -> anyhow::Error,
 ) -> anyhow::Result<T> {
     match settlement {
         TurnSettlement::Complete(output, value) => match lifecycle.complete(&turn_id, output).await
@@ -224,8 +241,9 @@ async fn settle_turn<T>(
             Ok(()) => Ok(value),
             Err(e) => {
                 warn!(error = %e, turn_id = %turn_id, "complete() rejected; treating as cancelled");
+                let error = classify(anyhow::anyhow!("turn already terminal: {e}"));
                 cancel_row(lifecycle, turn_id).await;
-                Err(anyhow::anyhow!("turn already terminal: {e}"))
+                Err(error)
             }
         },
         TurnSettlement::Cancel(e) => {

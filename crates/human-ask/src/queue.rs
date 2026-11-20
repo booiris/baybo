@@ -22,7 +22,7 @@ use baybo_model::human_ask::{
 use baybo_model::{ChannelType, SessionId};
 use baybo_store::HumanAskRow;
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::ports::ActorStopCost;
 
@@ -81,6 +81,7 @@ impl PendingAsk {
 struct Entry {
     ask: PendingAsk,
     responder: Option<oneshot::Sender<AskResolution>>,
+    answering: Option<watch::Sender<()>>,
 }
 
 /// Which way a session crossed the "has at least one pending ask" boundary,
@@ -333,6 +334,42 @@ impl AskQueue {
         self.liveness(ask_id).is_some()
     }
 
+    /// The receiver keeps the waiter open through the ledger claim and
+    /// delivery. Taking the sender under the same lock stops new answers.
+    pub(crate) fn begin_answer(
+        &self,
+        ask_id: &AskId,
+    ) -> crate::error::Result<Option<watch::Receiver<()>>> {
+        let entries = self.inner.lock();
+        let Some(entry) = entries
+            .iter()
+            .find(|e| &e.ask.ask_id == ask_id && e.responder.is_some())
+        else {
+            return Ok(None);
+        };
+        entry
+            .answering
+            .as_ref()
+            .map(|tx| Some(tx.subscribe()))
+            .ok_or_else(|| crate::error::HumanAskError::AskClosed {
+                ask_id: ask_id.clone(),
+            })
+    }
+
+    pub(crate) async fn close_after_failed_timeout(&self, ask_id: &AskId) -> bool {
+        let answering = self
+            .inner
+            .lock()
+            .iter_mut()
+            .find(|e| &e.ask.ask_id == ask_id)
+            .and_then(|entry| entry.answering.take());
+        let Some(answering) = answering else {
+            return false;
+        };
+        answering.closed().await;
+        self.resolve(ask_id, AskResolution::TimedOut).is_some()
+    }
+
     fn push(&self, ask: PendingAsk, responder: Option<oneshot::Sender<AskResolution>>) {
         let session_id = ask.session_id.clone();
         let raised = PendingEdge::Raised {
@@ -345,6 +382,8 @@ impl AskQueue {
             let was_pending = q.iter().any(|e| e.ask.session_id == session_id);
             q.push_back(Entry {
                 ask: ask.clone(),
+                answering: (responder.is_some() && !ask.is_resumable())
+                    .then(|| watch::Sender::new(())),
                 responder,
             });
             self.note_pending_edge(&q, &session_id, was_pending, raised);

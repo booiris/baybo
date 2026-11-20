@@ -40,7 +40,7 @@ impl ResumeSink for RouterResumeSink {
 /// The message that resumes `session` on the answer in `req`, or `None` when
 /// the answer is applied some other way: an issue session's own run re-drive
 /// applies it under the real run, so it opens no chat Resume turn.
-pub fn resume_message(session: &Session, req: &ResumeRequest) -> Option<AgentMessage> {
+pub(crate) fn resume_message(session: &Session, req: &ResumeRequest) -> Option<AgentMessage> {
     if session.trigger.is_issue_session() {
         return None;
     }

@@ -6,7 +6,7 @@
 //! The wired LLM is a strict provider: any request whose `tool_use` is not
 //! answered by the very next message is refused.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -16,67 +16,25 @@ use baybo_config::ChannelsConfig;
 use baybo_gateway::channel::boot;
 use baybo_gateway::push::ask::{AskPushRelay, AskPushStream};
 use baybo_human_ask::AskQueueEvent;
+use baybo_integration_tests::human_ask::{
+    CALL_ID, GATED_TOOL, GatedWrite, WRITTEN, adjacent_result, reply, result_text, resume_turns,
+    tool_use_at, transcript,
+};
 use baybo_integration_tests::{AgentTestHarness, AgentTestHarnessBuilder, SessionBuilder};
 use baybo_llm::{LlmResponse, StreamEvent, TokenUsage, ToolCallInfo};
 use baybo_model::human_ask::{AskId, AskResolution};
 use baybo_model::{
-    ApprovalDecision, ChannelType, ChatMessage, ContentBlock, ResourceAccess, Session,
-    TriggerSource,
+    ApprovalDecision, ChannelType, ChatMessage, ContentBlock, Session, TriggerSource,
 };
 use baybo_storage::Store;
 use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
-use baybo_turn::TurnInputKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(10);
-const GATED_TOOL: &str = "gated_write";
-const CALL_ID: &str = "call-restart";
-const WRITTEN: &str = "written";
 const DB_FILE: &str = "baybo.db";
-
-/// Asks to write a file before it runs; counts how often it actually ran.
-struct GatedWrite {
-    runs: Arc<AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl Tool for GatedWrite {
-    fn name(&self) -> &str {
-        GATED_TOOL
-    }
-    fn description(&self) -> String {
-        "writes after asking".to_string()
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({"type": "object", "properties": {}})
-    }
-    fn concurrency(&self) -> ToolConcurrency {
-        ToolConcurrency::Concurrent
-    }
-    fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
-        vec![ResourceAccess::WriteFile {
-            path: PathBuf::from("/tmp/human-ask-restart-e2e"),
-        }]
-    }
-    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
-        self.runs.fetch_add(1, Ordering::SeqCst);
-        Ok(ToolOutput::Text(WRITTEN.to_string()))
-    }
-}
-
-fn manifest() -> ToolManifest {
-    ToolManifest {
-        name: GATED_TOOL.to_string(),
-        description: "writes after asking".to_string(),
-        trust_level: baybo_model::TrustLevel::Trusted,
-        parameters_schema: json!({"type": "object", "properties": {}}),
-        capabilities: vec![baybo_tools::ToolCapability::WriteFile],
-        channels: Vec::new(),
-    }
-}
 
 /// One boot of the process over `db`: the agent side, plus the gateway's
 /// owner channel and push relay over the same ask queues.
@@ -89,15 +47,12 @@ struct Node {
 }
 
 fn builder(session: &Session, store: Store, runs: &Arc<AtomicUsize>) -> AgentTestHarnessBuilder {
+    let tool = GatedWrite::new(Arc::clone(runs));
+    let manifest = tool.manifest();
     AgentTestHarness::builder()
         .session(session.clone())
         .with_store(store)
-        .with_tool(
-            Arc::new(GatedWrite {
-                runs: Arc::clone(runs),
-            }),
-            manifest(),
-        )
+        .with_tool(Arc::new(tool), manifest)
         .with_channel_ask_gate()
         .with_strict_tool_pairing()
 }
@@ -219,68 +174,6 @@ fn completed_for_call(outputs: &[AgentOutput]) -> usize {
         .count()
 }
 
-async fn transcript(harness: &AgentTestHarness) -> Vec<ChatMessage> {
-    harness
-        .session_store
-        .load_session_messages_with_supersede(&harness.session.id)
-        .await
-        .expect("load transcript")
-        .into_iter()
-        .map(|row| row.message)
-        .collect()
-}
-
-fn result_text(message: &ChatMessage) -> Option<String> {
-    message.content.iter().find_map(|block| match block {
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } if tool_use_id == CALL_ID => Some(content.to_string()),
-        _ => None,
-    })
-}
-
-fn tool_use_at(rows: &[ChatMessage]) -> Option<usize> {
-    rows.iter().position(|m| {
-        m.content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == CALL_ID))
-    })
-}
-
-/// The call's single result, which must sit right after its `tool_use`.
-async fn adjacent_result(harness: &AgentTestHarness) -> String {
-    let rows = transcript(harness).await;
-    let results: Vec<String> = rows.iter().filter_map(result_text).collect();
-    assert_eq!(results.len(), 1, "exactly one result: {rows:#?}");
-    let at = tool_use_at(&rows).expect("the tool_use row is kept");
-    let result = result_text(&rows[at + 1])
-        .unwrap_or_else(|| panic!("the result must be adjacent to its tool_use: {rows:#?}"));
-    assert!(
-        !result.contains("interrupted"),
-        "a parked call is never crash-filled: {result}"
-    );
-    result
-}
-
-async fn resume_turns(harness: &AgentTestHarness) -> usize {
-    harness
-        .turn_lifecycle
-        .list_by_session(&harness.session.id, None)
-        .await
-        .expect("list turns")
-        .iter()
-        .filter(|turn| turn.input.input_kind() == TurnInputKind::Resume)
-        .count()
-}
-
-fn reply(harness: &AgentTestHarness, text: &str) {
-    harness
-        .stub_llm
-        .push_stream(vec![StreamEvent::Text(text.to_string())]);
-}
-
 fn replied(outputs: &[AgentOutput], text: &str) -> bool {
     outputs.iter().any(|o| {
         matches!(
@@ -388,26 +281,19 @@ async fn a_released_parked_turn_is_resumed_by_its_answer() {
         .expect("save the session");
     let runs = Arc::new(AtomicUsize::new(0));
     let mut harness = builder(&session, store, &runs).with_resume_door().build();
-    harness
-        .stub_llm
-        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
-            id: CALL_ID.to_string(),
-            name: GATED_TOOL.to_string(),
-            arguments: json!({}),
-            signature: None,
-        })]);
+    call_gated_write(&harness);
     harness.send_text("write it").await.expect("send");
+    let ask_id = parked_ask(&harness).await;
     let queue = harness.ask_queues.get_or_create(&session.channel);
+
+    assert_eq!(reap_idle(&harness).await, 1);
     tokio::time::timeout(WAIT_TIMEOUT, async {
-        while !harness.human_asks.has_live_pending_ask(&session.id) {
+        while !harness.supervisor.is_empty() {
             tokio::time::sleep(POLL).await;
         }
     })
     .await
-    .expect("the call parks on an approval");
-    let ask_id = queue.list()[0].ask_id.clone();
-
-    assert!(harness.supervisor.release_parked_turn(&session.id));
+    .expect("the released actor exits before the answer");
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
         completed_for_call(&outputs),
@@ -419,11 +305,25 @@ async fn a_released_parked_turn_is_resumed_by_its_answer() {
         Some(false),
         "the card stays, with no waiter behind it"
     );
-    assert!(row(&harness, &ask_id).await.is_pending());
+    let parked = row(&harness, &ask_id).await;
+    assert!(parked.is_pending());
+    let original = harness
+        .turn_lifecycle
+        .get(&parked.turn_id)
+        .await
+        .expect("read turn")
+        .expect("raising turn");
+    assert!(matches!(
+        original.status,
+        baybo_turn::TurnStatus::Cancelled { .. }
+    ));
     assert!(
-        !harness.supervisor.release_parked_turn(&session.id),
-        "nothing is parked any more"
+        transcript(&harness)
+            .await
+            .iter()
+            .all(|row| result_text(row).is_none())
     );
+    assert_eq!(resume_turns(&harness).await, 0);
 
     reply(&harness, "all done");
     harness
@@ -432,6 +332,10 @@ async fn a_released_parked_turn_is_resumed_by_its_answer() {
         .await
         .expect("answer the released ask");
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        harness.supervisor.registered_session_ids(),
+        vec![session.id.clone()]
+    );
 
     assert_eq!(runs.load(Ordering::SeqCst), 1, "executed exactly once");
     assert!(adjacent_result(&harness).await.contains(WRITTEN));
@@ -467,7 +371,7 @@ async fn a_message_queued_behind_a_released_turn_still_runs() {
 
     harness.send_text("never mind").await.expect("send");
     reply(&harness, "ok");
-    assert!(harness.supervisor.release_parked_turn(&session.id));
+    assert_eq!(reap_idle(&harness).await, 1);
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     assert!(
@@ -522,7 +426,7 @@ const SLOW_TOOL: &str = "slow_sibling";
 
 /// Runs until it is told to finish, so a test can hold it mid-execution.
 struct SlowSibling {
-    started: Arc<tokio::sync::Notify>,
+    started: tokio::sync::mpsc::Sender<tokio_util::sync::CancellationToken>,
     finish: Arc<tokio::sync::Notify>,
 }
 
@@ -540,8 +444,10 @@ impl Tool for SlowSibling {
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Concurrent
     }
-    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
-        self.started.notify_one();
+    async fn execute(&self, _params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        self.started
+            .try_send(ctx.cancellation_token.clone())
+            .expect("report sibling start");
         self.finish.notified().await;
         Ok(ToolOutput::Text("done".to_string()))
     }
@@ -563,12 +469,12 @@ async fn a_parked_turn_is_not_released_while_a_sibling_call_runs() {
         .await
         .expect("save the session");
     let runs = Arc::new(AtomicUsize::new(0));
-    let started = Arc::new(tokio::sync::Notify::new());
+    let (started, mut running) = tokio::sync::mpsc::channel(1);
     let finish = Arc::new(tokio::sync::Notify::new());
     let mut harness = builder(&session, store, &runs)
         .with_tool(
             Arc::new(SlowSibling {
-                started: Arc::clone(&started),
+                started,
                 finish: Arc::clone(&finish),
             }),
             ToolManifest {
@@ -597,32 +503,47 @@ async fn a_parked_turn_is_not_released_while_a_sibling_call_runs() {
     ]);
     harness.send_text("write it").await.expect("send");
     let ask_id = parked_ask(&harness).await;
-    tokio::time::timeout(WAIT_TIMEOUT, started.notified())
+    let sibling_token = tokio::time::timeout(WAIT_TIMEOUT, running.recv())
         .await
-        .expect("the sibling starts");
+        .expect("the sibling starts")
+        .expect("sibling token");
 
+    assert_eq!(reap_idle(&harness).await, 1);
     assert!(
-        !harness.supervisor.release_parked_turn(&session.id),
-        "the sibling is still running"
+        !sibling_token.is_cancelled(),
+        "reaping must let the sibling finish"
     );
     assert_eq!(queue_liveness(&harness, &session, &ask_id), Some(true));
 
     finish.notify_one();
     tokio::time::timeout(WAIT_TIMEOUT, async {
-        while !harness.supervisor.release_parked_turn(&session.id) {
+        while !harness.supervisor.is_empty() {
+            reap_idle(&harness).await;
             tokio::time::sleep(POLL).await;
         }
     })
     .await
-    .expect("released once only the parked call is left");
-    tokio::time::timeout(WAIT_TIMEOUT, async {
-        while queue_liveness(&harness, &session, &ask_id) != Some(false) {
-            tokio::time::sleep(POLL).await;
-        }
-    })
-    .await
-    .expect("the card stays, with no waiter behind it");
+    .expect("the reaper releases the turn once its sibling finishes");
+    assert!(
+        transcript(&harness)
+            .await
+            .iter()
+            .flat_map(|row| &row.content)
+            .any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id, content, .. }
+            if tool_use_id == "call-slow" && content.to_string().contains("done"))
+            }),
+        "the reaper let the sibling finish"
+    );
+    assert_eq!(queue_liveness(&harness, &session, &ask_id), Some(false));
     assert!(row(&harness, &ask_id).await.is_pending());
+}
+
+async fn reap_idle(harness: &AgentTestHarness) -> usize {
+    harness
+        .supervisor
+        .reap_idle(&harness.session_manager, chrono::Duration::zero())
+        .await
 }
 
 fn queue_liveness(harness: &AgentTestHarness, session: &Session, ask_id: &AskId) -> Option<bool> {

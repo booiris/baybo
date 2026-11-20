@@ -11,76 +11,25 @@ use baybo_agent::actor::{AgentMessage, CronDelivery};
 use baybo_channels::{AgentEvent, AgentOutput};
 use baybo_human_ask::test_support::MemoryHumanAskStore;
 use baybo_integration_tests::AgentTestHarness;
-use baybo_llm::{ChatRequest, LlmResponse, StreamEvent, TokenUsage};
+use baybo_integration_tests::human_ask::{
+    CALL_ID, GATED_TOOL, GatedWrite, WRITTEN, adjacent_result, reply, resume_turns,
+    settlement_turns,
+};
+use baybo_llm::{ChatRequest, LlmResponse, TokenUsage};
 use baybo_model::approval::ApprovalRequest;
 use baybo_model::human_ask::{
     AskId, AskKind, AskPhase, AskRequest, AskResolution, Question, QuestionAnswer, QuestionRequest,
 };
 use baybo_model::{ApprovalDecision, ChatMessage, ContentBlock, ResourceAccess, TriggerKind};
-use baybo_session::SessionStore;
 use baybo_store::HumanAskRow;
-use baybo_tools::{Tool, ToolContext, ToolManifest, ToolOutput};
-use baybo_turn::{TurnInput, TurnInputKind};
+use baybo_tools::{Tool, ToolManifest};
+use baybo_turn::TurnInput;
 use chrono::Utc;
 use parking_lot::Mutex;
-use serde_json::{Value, json};
+use serde_json::json;
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const GATED_TOOL: &str = "gated_write";
-const CALL_ID: &str = "call-parked";
-const WRITTEN: &str = "written";
-
-/// The ledger and ask id the probe reads once the fixture has raised the ask.
-type ProbeTarget = Arc<Mutex<Option<(Arc<MemoryHumanAskStore>, AskId)>>>;
-
-/// A gated write that records, when it runs, whether its ask was already
-/// stamped applied.
-struct ProbeWrite {
-    runs: Arc<AtomicUsize>,
-    store: ProbeTarget,
-    applied_when_ran: Arc<Mutex<Option<bool>>>,
-}
-
-#[async_trait::async_trait]
-impl Tool for ProbeWrite {
-    fn name(&self) -> &str {
-        GATED_TOOL
-    }
-    fn description(&self) -> String {
-        "writes after asking".to_string()
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({"type": "object", "properties": {}})
-    }
-    fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
-        vec![ResourceAccess::WriteFile {
-            path: std::path::PathBuf::from("/tmp/human-ask-settle-e2e"),
-        }]
-    }
-    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
-        self.runs.fetch_add(1, Ordering::SeqCst);
-        if let Some((store, ask_id)) = self.store.lock().clone() {
-            let applied = store
-                .row(&ask_id)
-                .is_some_and(|row| row.applied_at.is_some());
-            *self.applied_when_ran.lock() = Some(applied);
-        }
-        Ok(ToolOutput::Text(WRITTEN.to_string()))
-    }
-}
-
-fn manifest() -> ToolManifest {
-    ToolManifest {
-        name: GATED_TOOL.to_string(),
-        description: "writes after asking".to_string(),
-        trust_level: baybo_model::TrustLevel::Trusted,
-        parameters_schema: json!({"type": "object", "properties": {}}),
-        capabilities: vec![baybo_tools::ToolCapability::WriteFile],
-        channels: Vec::new(),
-    }
-}
-
 struct Fixture {
     harness: AgentTestHarness,
     runs: Arc<AtomicUsize>,
@@ -92,15 +41,24 @@ struct Fixture {
 /// transcript, an ask row for the call, and the turn that raised it.
 async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>) -> Fixture {
     let runs = Arc::new(AtomicUsize::new(0));
-    let store_slot = Arc::new(Mutex::new(None));
+    let store_slot = Arc::new(std::sync::OnceLock::<Arc<MemoryHumanAskStore>>::new());
     let applied_when_ran = Arc::new(Mutex::new(None));
-    let probe = Arc::new(ProbeWrite {
-        runs: Arc::clone(&runs),
-        store: Arc::clone(&store_slot),
-        applied_when_ran: Arc::clone(&applied_when_ran),
+    let ask_id = AskId::new();
+    let probe = GatedWrite::new(Arc::clone(&runs)).on_execute({
+        let store = Arc::clone(&store_slot);
+        let observed = Arc::clone(&applied_when_ran);
+        let id = ask_id.clone();
+        move || {
+            *observed.lock() = Some(
+                store
+                    .get()
+                    .expect("store wired")
+                    .row(&id)
+                    .is_some_and(|row| row.applied_at.is_some()),
+            );
+        }
     });
     let session = baybo_integration_tests::SessionBuilder::new().build();
-    let ask_id = AskId::new();
     let request = match kind {
         AskKind::Approval => AskRequest::Approval(ApprovalRequest {
             ask_id: ask_id.clone(),
@@ -148,14 +106,15 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
             signature: None,
         }]),
     ];
+    let manifest = probe.manifest();
     let harness = AgentTestHarness::builder()
         .session(session)
-        .with_tool(probe, manifest())
+        .with_tool(Arc::new(probe), manifest)
         .with_channel_ask_gate()
         .with_seed_transcript(transcript)
         .with_seed_ask(row)
         .build();
-    *store_slot.lock() = Some((Arc::clone(&harness.ask_store), ask_id.clone()));
+    assert!(store_slot.set(Arc::clone(&harness.ask_store)).is_ok());
     harness
         .turn_lifecycle
         .start_turn(
@@ -176,51 +135,6 @@ async fn restarted(tool: &str, kind: AskKind, resolution: Option<AskResolution>)
     }
 }
 
-async fn transcript(harness: &AgentTestHarness) -> Vec<ChatMessage> {
-    harness
-        .memory_session_store
-        .load_session_messages_with_supersede(&harness.session.id)
-        .await
-        .expect("load transcript")
-        .into_iter()
-        .map(|row| row.message)
-        .collect()
-}
-
-fn result_text(message: &ChatMessage) -> Option<String> {
-    message.content.iter().find_map(|block| match block {
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } if tool_use_id == CALL_ID => Some(content.to_string()),
-        _ => None,
-    })
-}
-
-/// The parked call's results, and the index of the one right after its
-/// `tool_use` row (adjacency).
-async fn adjacent_result(harness: &AgentTestHarness) -> String {
-    let rows = transcript(harness).await;
-    let results: Vec<String> = rows.iter().filter_map(result_text).collect();
-    assert_eq!(
-        results.len(),
-        1,
-        "exactly one result for the call: {rows:#?}"
-    );
-    let use_at = rows
-        .iter()
-        .position(|m| {
-            m.content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == CALL_ID))
-        })
-        .expect("the tool_use row is kept");
-    result_text(&rows[use_at + 1]).unwrap_or_else(|| {
-        panic!("the result must be adjacent to its tool_use: {rows:#?}");
-    })
-}
-
 /// A strict provider: every `tool_use` is answered by the very next message.
 fn assert_paired(request: &ChatRequest) {
     let messages = &request.messages;
@@ -239,33 +153,6 @@ fn assert_paired(request: &ChatRequest) {
             }
         }
     }
-}
-
-async fn turns_of(harness: &AgentTestHarness, kind: TurnInputKind) -> usize {
-    harness
-        .turn_lifecycle
-        .list_by_session(&harness.session.id, None)
-        .await
-        .expect("list turns")
-        .iter()
-        .filter(|turn| turn.input.input_kind() == kind)
-        .count()
-}
-
-/// Turns of the chat Resume door: an answer carried on into a reply.
-async fn resume_turns(harness: &AgentTestHarness) -> usize {
-    turns_of(harness, TurnInputKind::Resume).await
-}
-
-/// Turns of a door's prelude: asks settled ahead of the door's own turn.
-async fn settlement_turns(harness: &AgentTestHarness) -> usize {
-    turns_of(harness, TurnInputKind::AskSettlement).await
-}
-
-fn reply(harness: &AgentTestHarness, text: &str) {
-    harness
-        .stub_llm
-        .push_stream(vec![StreamEvent::Text(text.to_string())]);
 }
 
 async fn stop(harness: AgentTestHarness) {

@@ -14,7 +14,7 @@ pub mod supervisor;
 
 use std::sync::Arc;
 
-use crate::runtime::agent_loop::{InterjectionSource, UserInterjectionInput};
+use crate::runtime::agent_loop::{InterjectionSource, TurnCancelled, UserInterjectionInput};
 use baybo_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
@@ -44,16 +44,6 @@ const EMPTY_USER_REPLY_NOTICE: &str =
 
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
-
-/// Attached (via anyhow context) to the error a turn returns when its
-/// cancellation token tripped — a user `/stop` or actor shutdown, which is
-/// normal operation, not a failure. The mailbox log sites downcast on it to
-/// log the outcome at info instead of error, keeping ERROR a page-worthy
-/// signal. `run_agent_loop` is the single choke point that tags it, since the
-/// token discriminator only exists there.
-#[derive(Debug, thiserror::Error)]
-#[error("turn cancelled")]
-pub(crate) struct TurnCancelled;
 
 /// True when `err` carries the [`TurnCancelled`] marker anywhere in its
 /// context chain — i.e. the turn ended via `/stop` or shutdown, not a failure.
@@ -651,28 +641,18 @@ impl AgentActor {
     /// `AgentLoop::append_user_message_with_platform_msg_id` / `append_cron_fire` /
     /// `append_background_notification_prompt_once`) so framing lives in
     /// `baybo-context` and the loop just iterates.
-    #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
         &mut self,
         turn_input: TurnInput,
         parent_turn_id: Option<baybo_model::TurnId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
-        // Set to whether the user stopped this turn (`/stop`), so the user-turn
-        // caller can drop queued interjections a `/stop` would otherwise leave
-        // to run as follow-up turns. Not set for a released turn (the idle
-        // reaper, shutdown): what the user queued behind it must still run.
-        // Caught after the loop fully returns, so it covers every cancellation
-        // path (incl. mid-LLM-call).
-        stopped_out: Option<&mut bool>,
         // A recurring cron fire's turn (its own, or its report's): the
         // `report_nothing` silence and the record of what it hands to the
         // background. `None` for every other turn. See `dispatch_cron_prompt`.
         cron_report: Option<crate::runtime::cron_report_turn::CronReportTurn>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = turn_input.input_kind().is_user_facing();
-        // Kept so the error path below can tell a user `/stop` (token
-        // tripped via the turn cancel) apart from a genuine failure.
         // The actor emits no `TurnState`: both edges are projected from the
         // turn store by `spawn_turn_state_projector` — the start edge from
         // this turn's turn `start()` (`Pending → InProgress`) inside
@@ -680,7 +660,7 @@ impl AgentActor {
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
         let (tokens, _release) = self.turn_tokens();
-        let turn_tokens = tokens.clone();
+
         let result = self
             .volatile
             .agent_loop
@@ -696,19 +676,14 @@ impl AgentActor {
                 cron_report,
             )
             .await;
-        let cancelled = turn_tokens.turn.is_cancelled();
-        if let Some(out) = stopped_out {
-            *out = cancelled
-                && baybo_tools::CancelOrigin::of(&turn_tokens) == baybo_tools::CancelOrigin::Turn;
-        }
         // A user is waiting on this turn — a genuine failure must surface as
         // a terminal notice, not silence (the log line alone leaves the chat
         // dangling on its last progress frame). Cancellation stays quiet:
         // `/stop` already acknowledged with its own notice. Non-user turns
         // keep their own policies (cron logs, background-notification retries).
         if is_user_turn
-            && !cancelled
             && let Err(e) = &result
+            && !is_turn_cancelled(e)
         {
             let notice = AgentOutput {
                 session_id: self.durable.session.id.clone(),
@@ -723,15 +698,7 @@ impl AgentActor {
             };
             self.send_response(notice, "user_turn_failed").await;
         }
-        // Tag a cancelled turn's error so the mailbox log sites classify a
-        // user `/stop` (or shutdown) as info, not a page-worthy error. The
-        // token check is the one discriminator that also covers the untyped
-        // cancellation errors on this path (agent-loop-cancelled, and the
-        // `scope.rs` turn-cancelled / already-terminal strings).
-        match result {
-            Err(e) if cancelled => Err(e.context(TurnCancelled)),
-            other => other,
-        }
+        result
     }
 
     async fn dispatch_issue_run(
@@ -753,7 +720,7 @@ impl AgentActor {
             .agent_loop
             .append_issue_brief(&settled, number, checkout, brief, &files)
             .await?;
-        self.run_agent_loop(turn_input, None, None, None, None, None)
+        self.run_agent_loop(turn_input, None, None, None, None)
             .await?;
         Ok(())
     }
@@ -799,7 +766,7 @@ impl AgentActor {
         let cron_report = matches!(delivery, CronDelivery::Channel)
             .then(crate::runtime::cron_report_turn::CronReportTurn::new);
         let ran = self
-            .run_agent_loop(turn_input, None, None, None, None, cron_report.clone())
+            .run_agent_loop(turn_input, None, None, None, cron_report.clone())
             .await;
         // Recorded whether or not the turn went on to fail: work it handed
         // over runs on, and its follow-up is the fire's report either way.
@@ -1301,7 +1268,6 @@ impl AgentActor {
                 Some(response_tx),
                 None,
                 None,
-                None,
             )
             .await?;
         self.send_user_reply(response).await;
@@ -1361,14 +1327,13 @@ impl AgentActor {
         // already appended; this only pulls messages that land after the turn
         // starts. Anything still queued at turn-end falls to the next turn.
         let mut interjections = MailboxInterjections { rx: mailbox };
-        let mut stopped = false;
+
         let result = self
             .run_agent_loop(
                 TurnInput::UserChat { content: combined },
                 None,
                 Some(response_tx),
                 Some(&mut interjections),
-                Some(&mut stopped),
                 None,
             )
             .await;
@@ -1377,11 +1342,15 @@ impl AgentActor {
         // as follow-up turns once we return to the actor's main loop. Stops at
         // the first slash / other-kind message — the same barrier the coalescer
         // and the in-turn interjection drain use.
-        if stopped {
-            interjections.discard_pending();
-        }
-        let response = result?;
-        self.settle_background_notification_after_user_turn(stopped, &response.content)
+        let response = result.inspect_err(|e| {
+            if matches!(
+                e.downcast_ref::<TurnCancelled>(),
+                Some(TurnCancelled(baybo_tools::CancelOrigin::Turn))
+            ) {
+                interjections.discard_pending();
+            }
+        })?;
+        self.settle_background_notification_after_user_turn(&response.content)
             .await;
         self.send_user_reply(response).await;
         Ok(())
@@ -1624,7 +1593,6 @@ impl AgentActor {
                 Some(response_tx),
                 None,
                 None,
-                None,
             )
             .await?;
         self.send_response(response.into(), "subagent").await;
@@ -1753,15 +1721,10 @@ mod tests {
         }]));
     }
 
-    // The cancellation classification hinges on anyhow's downcast walking the
-    // context chain: `run_agent_loop` tags a cancelled turn's error with
-    // `.context(TurnCancelled)`, and the mailbox log sites downcast on it after
-    // the error propagates up. Lock in that the marker survives — including
-    // under further context a caller might add — and that a genuine failure is
-    // never misclassified.
     #[test]
     fn turn_cancelled_marker_is_downcastable_through_context() {
-        let tagged = anyhow::anyhow!("agent loop cancelled").context(TurnCancelled);
+        let tagged = anyhow::anyhow!("agent loop cancelled")
+            .context(TurnCancelled(baybo_tools::CancelOrigin::Turn));
         assert!(is_turn_cancelled(&tagged));
 
         let wrapped = tagged.context("failed to handle user input");

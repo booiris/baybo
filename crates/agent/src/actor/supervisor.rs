@@ -122,7 +122,7 @@ impl AgentSupervisor {
     /// The cost is read here, at the moment of the cancel, and not taken from
     /// an earlier probe: an answer landing in between turns the parked call
     /// back into running work, which the cancel must not cut.
-    pub fn release_parked_turn(&self, session_id: &SessionId) -> bool {
+    fn release_parked_turn(&self, session_id: &SessionId) -> bool {
         let ActorStopCost::ReleasesTurn { waiting_calls } =
             self.live_asks.actor_stop_cost(session_id)
         else {
