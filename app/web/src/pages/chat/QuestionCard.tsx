@@ -271,12 +271,16 @@ export function QuestionCard({
             disabled={submitDisabled}
             className="px-3 py-1.5 bg-brand text-ink border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal-sm"
           >
-            Submit
+            <RiCheckLine /> Submit
           </button>
           <div
             role="group"
             aria-label="Cancel ask"
-            className="flex w-22 items-center justify-center gap-1"
+            className={`flex w-24 overflow-hidden rounded-md ${
+              confirmingCancel
+                ? 'border border-ink/25 bg-canvas/60'
+                : 'border-2 border-black bg-white text-ink shadow-brutal-sm'
+            }`}
             onBlur={(event) => {
               if (!event.currentTarget.contains(event.relatedTarget)) setConfirmingCancel(false);
             }}
@@ -298,13 +302,13 @@ export function QuestionCard({
                 setConfirmingCancel(!confirmingCancel);
               }}
               disabled={submitting || !connected}
-              className={`flex h-8 items-center justify-center rounded-full transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink disabled:opacity-50 disabled:cursor-not-allowed ${
+              className={`flex flex-1 items-center justify-center focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ink disabled:opacity-50 disabled:cursor-not-allowed ${
                 confirmingCancel
-                  ? 'w-9 bg-err/10 text-red-800 hover:bg-err/20'
-                  : 'w-full text-xs font-medium text-ink-soft hover:bg-canvas hover:text-ink'
+                  ? 'text-ink hover:bg-err/10 hover:text-red-800'
+                  : 'py-1.5 text-xs font-bold uppercase tracking-wider hover:bg-gray-100'
               }`}
             >
-              {confirmingCancel ? <RiCheckLine aria-hidden="true" size={16} /> : 'Cancel ask'}
+              {confirmingCancel ? <RiCheckLine aria-hidden="true" size={18} /> : 'Cancel ask'}
             </button>
             {confirmingCancel && (
               <button
@@ -316,9 +320,9 @@ export function QuestionCard({
                   setConfirmingCancel(false);
                 }}
                 disabled={submitting || !connected}
-                className="flex h-8 w-9 items-center justify-center rounded-full bg-ink/5 text-ink-soft transition-colors hover:bg-ink/10 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink disabled:opacity-50 disabled:cursor-not-allowed"
+                className="relative flex flex-1 items-center justify-center text-ink-soft before:absolute before:inset-y-2 before:left-0 before:w-px before:bg-ink/20 hover:bg-ink/5 hover:text-ink focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ink disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <RiCloseLine aria-hidden="true" size={16} />
+                <RiCloseLine aria-hidden="true" size={18} />
               </button>
             )}
           </div>
