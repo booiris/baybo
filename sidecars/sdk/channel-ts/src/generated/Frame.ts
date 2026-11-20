@@ -77,8 +77,8 @@ started_at?: string, } | { "kind": "approval_requested", ask_id: string,
  */
 tool_call_id?: string, session_id: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, 
 /**
- * Optional human-readable label the tool produced via
- * `Tool::call_label` (e.g. Bash's `description` parameter).
+ * Optional human-readable label or warning the tool attached via
+ * `Tool::pre_execute_ask` (defaulting to `Tool::progress_label`).
  */
 description?: string | null, } | { "kind": "ask_resolved", ask_id: string, outcome: AskOutcomeKind, 
 /**
