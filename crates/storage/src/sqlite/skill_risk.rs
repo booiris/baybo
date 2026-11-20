@@ -1,8 +1,6 @@
 use async_trait::async_trait;
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
-use baybo_store::StorageError;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::skill_risk::{
     AssessmentJob, AssessmentJobStatus, Result, RiskLevel, RiskVerdict, SkillRiskStore,
 };
@@ -17,45 +15,57 @@ impl SqliteSkillRiskStore {
     }
 }
 
+const VERDICT: RowDecoder<RiskVerdict> = RowDecoder {
+    table: "skill_risk_assessments",
+    key: "skill_name",
+    decode: |row| {
+        Ok(RiskVerdict {
+            skill_name: row.get("skill_name")?,
+            content_hash: row.get("content_hash")?,
+            level: RiskLevel::parse(&row.get::<_, String>("level")?)
+                .ok_or_else(|| anyhow::anyhow!("unrecognized risk level in cache"))?,
+            rationale: row.get("rationale")?,
+            model: row.get("model")?,
+            assessed_at: row.get("assessed_at")?,
+        })
+    },
+};
+
+const JOB: RowDecoder<AssessmentJob> = RowDecoder {
+    table: "skill_risk_assessment_jobs",
+    key: "skill_name",
+    decode: |row| {
+        Ok(AssessmentJob {
+            skill_name: row.get("skill_name")?,
+            content_hash: row.get("content_hash")?,
+            source_path: row.get("source_path")?,
+            status: AssessmentJobStatus::parse(&row.get::<_, String>("status")?)
+                .ok_or_else(|| anyhow::anyhow!("unrecognised risk-job status in cache"))?,
+            attempts: row.get::<_, i64>("attempts")?.max(0).try_into()?,
+            last_error: row.get("last_error")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        })
+    },
+};
+
 #[async_trait]
 impl SkillRiskStore for SqliteSkillRiskStore {
     async fn get(&self, skill_name: &str, content_hash: &str) -> Result<Option<RiskVerdict>> {
         let name = skill_name.to_string();
         let hash = content_hash.to_string();
-        let row: Option<(String, String, String, i64)> = self
-            .pool
+        self.pool
             .interact("skill_risk.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT level, rationale, model, assessed_at \
+                VERDICT.optional(
+                    conn.prepare(
+                        "SELECT skill_name, content_hash, level, rationale, model, assessed_at \
                          FROM skill_risk_assessments \
                          WHERE skill_name = ?1 AND content_hash = ?2",
-                        rusqlite::params![name, hash],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .optional()?)
+                    )?
+                    .query(rusqlite::params![name, hash])?,
+                )
             })
-            .await?;
-
-        match row {
-            Some((level, rationale, model, assessed_at)) => {
-                let Some(level) = RiskLevel::parse(&level) else {
-                    return Err(StorageError::Storage(format!(
-                        "unrecognized risk level '{level}' in cache"
-                    )));
-                };
-
-                Ok(Some(RiskVerdict {
-                    skill_name: skill_name.to_string(),
-                    content_hash: content_hash.to_string(),
-                    level,
-                    rationale,
-                    model,
-                    assessed_at,
-                }))
-            }
-            None => Ok(None),
-        }
+            .await
     }
 
     async fn put(&self, verdict: &RiskVerdict) -> Result<()> {
@@ -191,18 +201,7 @@ impl SkillRiskStore for SqliteSkillRiskStore {
     }
 
     async fn load_pending_jobs(&self) -> Result<Vec<AssessmentJob>> {
-        type TurnRow = (
-            String,
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-            i64,
-            i64,
-        );
-        let rows: Vec<TurnRow> = self
-            .pool
+        self.pool
             .interact("skill_risk.load_pending_jobs", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT skill_name, content_hash, source_path, status, attempts, last_error, \
@@ -210,54 +209,9 @@ impl SkillRiskStore for SqliteSkillRiskStore {
                      FROM skill_risk_assessment_jobs \
                      ORDER BY created_at ASC",
                 )?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                            row.get(7)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                JOB.list(stmt.query([])?)
             })
-            .await?;
-
-        let mut out = Vec::new();
-        for (
-            skill_name,
-            content_hash,
-            source_path,
-            status,
-            attempts,
-            last_error,
-            created_at,
-            updated_at,
-        ) in rows
-        {
-            let Some(status) = AssessmentJobStatus::parse(&status) else {
-                return Err(StorageError::Storage(format!(
-                    "unrecognised risk-job status '{status}' in cache"
-                )));
-            };
-
-            out.push(AssessmentJob {
-                skill_name,
-                content_hash,
-                source_path,
-                status,
-                attempts: attempts.max(0) as u32,
-                last_error,
-                created_at,
-                updated_at,
-            });
-        }
-        Ok(out)
+            .await
     }
 }
 
