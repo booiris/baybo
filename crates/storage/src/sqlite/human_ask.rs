@@ -3,13 +3,13 @@
 //! Rows are never deleted. Both state transitions are single-statement claim
 //! `UPDATE`s, so a BUSY re-run of the write closure cannot double-apply.
 
+use anyhow::Context as _;
 use async_trait::async_trait;
-use baybo_model::human_ask::{AskId, AskKind, AskPhase, AskRequest, AskResolution};
+use baybo_model::human_ask::{AskId, AskKind, AskPhase, AskResolution};
 use baybo_model::{ChannelType, SessionId};
 use chrono::{DateTime, Utc};
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::StorageError;
 use baybo_store::human_ask::{HumanAskRow, HumanAskStore, Result};
 
@@ -26,112 +26,39 @@ impl SqliteHumanAskStore {
 const SELECT_COLS: &str = "ask_id, session_id, channel, tool_call_id, turn_id, kind, phase, \
      request, created_at, resolved_at, resolution, applied_at";
 
-/// One row's columns as sqlite returned them, before any domain decoding, so
-/// a row this build cannot interpret is skipped instead of failing the query.
-struct RawRow {
-    ask_id: String,
-    session_id: String,
-    channel: String,
-    tool_call_id: String,
-    turn_id: String,
-    kind: String,
-    phase: String,
-    request: String,
-    created_at: i64,
-    resolved_at: Option<i64>,
-    resolution: Option<String>,
-    applied_at: Option<i64>,
-}
-
-fn read_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
-    Ok(RawRow {
-        ask_id: row.get(0)?,
-        session_id: row.get(1)?,
-        channel: row.get(2)?,
-        tool_call_id: row.get(3)?,
-        turn_id: row.get(4)?,
-        kind: row.get(5)?,
-        phase: row.get(6)?,
-        request: row.get(7)?,
-        created_at: row.get(8)?,
-        resolved_at: row.get(9)?,
-        resolution: row.get(10)?,
-        applied_at: row.get(11)?,
-    })
-}
-
-fn optional_time(ask_id: &str, column: &str, us: Option<i64>) -> Option<Option<DateTime<Utc>>> {
-    match us {
-        None => Some(None),
-        Some(us) => match super::time::from_us(us) {
-            Some(t) => Some(Some(t)),
-            None => {
-                tracing::warn!(ask_id, column, us, "skipping human_asks row: bad timestamp");
-                None
-            }
-        },
-    }
-}
-
-fn decode(raw: RawRow) -> Option<HumanAskRow> {
-    let id = raw.ask_id.as_str();
-    let ask_id = match raw.ask_id.parse::<AskId>() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(error = %e, "skipping human_asks row: bad ask_id");
-            return None;
-        }
-    };
-    let Some(kind) = AskKind::from_storage_str(&raw.kind) else {
-        tracing::warn!(ask_id = id, kind = %raw.kind, "skipping human_asks row: unknown kind");
-        return None;
-    };
-    let Some(phase) = AskPhase::from_storage_str(&raw.phase) else {
-        tracing::warn!(ask_id = id, phase = %raw.phase, "skipping human_asks row: unknown phase");
-        return None;
-    };
-    let request: AskRequest = match serde_json::from_str(&raw.request) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(ask_id = id, error = %e, "skipping human_asks row: bad request json");
-            return None;
-        }
-    };
-    let resolution: Option<AskResolution> = match raw.resolution.as_deref() {
-        None => None,
-        Some(json) => match serde_json::from_str(json) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!(ask_id = id, error = %e, "skipping human_asks row: bad resolution json");
-                return None;
-            }
-        },
-    };
-    let Ok(turn_id) = raw.turn_id.parse() else {
-        tracing::warn!(ask_id = id, "skipping human_asks row: bad turn_id");
-        return None;
-    };
-    let Some(created_at) = super::time::from_us(raw.created_at) else {
-        tracing::warn!(ask_id = id, "skipping human_asks row: bad created_at");
-        return None;
-    };
-    let resolved_at = optional_time(id, "resolved_at", raw.resolved_at)?;
-    let applied_at = optional_time(id, "applied_at", raw.applied_at)?;
-    Some(HumanAskRow {
-        ask_id,
-        session_id: SessionId::from(raw.session_id),
-        channel: ChannelType::from(raw.channel),
-        tool_call_id: raw.tool_call_id,
-        turn_id,
-        kind,
-        phase,
-        request,
-        created_at,
-        resolved_at,
-        resolution,
-        applied_at,
-    })
-}
+const ASK: RowDecoder<HumanAskRow> = RowDecoder {
+    table: "human_asks",
+    key: "ask_id",
+    decode: |row| {
+        let text = |column: &str| row.get::<_, String>(column);
+        let timestamp = |us| super::time::from_us(us).context("timestamp out of range");
+        Ok(HumanAskRow {
+            ask_id: text("ask_id")?.parse().context("invalid ask_id")?,
+            session_id: SessionId::from(text("session_id")?),
+            channel: ChannelType::from(text("channel")?),
+            tool_call_id: row.get("tool_call_id")?,
+            turn_id: text("turn_id")?.parse().context("invalid turn_id")?,
+            kind: AskKind::from_storage_str(&text("kind")?).context("unknown kind")?,
+            phase: AskPhase::from_storage_str(&text("phase")?).context("unknown phase")?,
+            request: serde_json::from_str(&text("request")?).context("invalid request")?,
+            created_at: timestamp(row.get("created_at")?)?,
+            resolved_at: row
+                .get::<_, Option<i64>>("resolved_at")?
+                .map(timestamp)
+                .transpose()?,
+            resolution: row
+                .get::<_, Option<String>>("resolution")?
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("invalid resolution")?,
+            applied_at: row
+                .get::<_, Option<i64>>("applied_at")?
+                .map(timestamp)
+                .transpose()?,
+        })
+    },
+};
 
 fn to_json<T: serde::Serialize>(what: &str, value: &T) -> Result<String> {
     serde_json::to_string(value)
@@ -142,16 +69,13 @@ fn list_where(
     conn: &rusqlite::Connection,
     filter: &str,
     params: impl rusqlite::Params,
-) -> rusqlite::Result<Vec<HumanAskRow>> {
+) -> anyhow::Result<Vec<HumanAskRow>> {
     let sql = format!(
         "SELECT {SELECT_COLS} FROM human_asks WHERE applied_at IS NULL {filter} \
          ORDER BY created_at, ask_id"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let raws = stmt
-        .query_map(params, read_raw)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(raws.into_iter().filter_map(decode).collect())
+    ASK.list(stmt.query(params)?)
 }
 
 #[async_trait]
@@ -244,10 +168,7 @@ impl HumanAskStore for SqliteHumanAskStore {
         self.pool
             .interact("human_asks.get", move |conn| {
                 let sql = format!("SELECT {SELECT_COLS} FROM human_asks WHERE ask_id = ?1");
-                let raw = conn
-                    .query_row(&sql, rusqlite::params![ask_id], read_raw)
-                    .optional()?;
-                Ok(raw.and_then(decode))
+                ASK.optional(conn.prepare(&sql)?.query([ask_id])?)
             })
             .await
     }
@@ -255,7 +176,7 @@ impl HumanAskStore for SqliteHumanAskStore {
     async fn list_unapplied(&self) -> Result<Vec<HumanAskRow>> {
         self.pool
             .interact("human_asks.list_unapplied", move |conn| {
-                Ok(list_where(conn, "", [])?)
+                list_where(conn, "", [])
             })
             .await
     }
@@ -264,11 +185,7 @@ impl HumanAskStore for SqliteHumanAskStore {
         let session_id = session_id.as_str().to_owned();
         self.pool
             .interact("human_asks.list_unapplied_for_session", move |conn| {
-                Ok(list_where(
-                    conn,
-                    "AND session_id = ?1",
-                    rusqlite::params![session_id],
-                )?)
+                list_where(conn, "AND session_id = ?1", rusqlite::params![session_id])
             })
             .await
     }
@@ -278,7 +195,7 @@ impl HumanAskStore for SqliteHumanAskStore {
 mod tests {
     use super::*;
     use baybo_model::approval::{ApprovalDecision, ApprovalRequest, ResourceAccess};
-    use baybo_model::human_ask::{Question, QuestionOption, QuestionRequest};
+    use baybo_model::human_ask::{AskRequest, Question, QuestionOption, QuestionRequest};
     use baybo_model::{Session, SessionState, TriggerSource, User};
     use baybo_store::SessionStore;
 
@@ -490,6 +407,8 @@ mod tests {
         let rows = store.list_unapplied().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ask_id.as_str(), "good");
-        assert_eq!(store.get(&"future".parse().unwrap()).await.unwrap(), None);
+        assert!(
+            matches!(store.get(&"future".parse().unwrap()).await, Err(StorageError::Corrupt { table: "human_asks", key, .. }) if key == "future")
+        );
     }
 }

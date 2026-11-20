@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use baybo_model::{ChannelType, SessionId};
-use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
 use baybo_store::channel_session::{ChannelSessionStore, Result};
@@ -20,20 +19,20 @@ impl ChannelSessionStore for SqliteChannelSessionStore {
     async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<SessionId>> {
         let channel_type = channel_type.as_str().to_string();
         let user_id = user_id.to_string();
-        let session_id = self
-            .pool
+        self.pool
             .interact("channel_sessions.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT session_id FROM channel_sessions
-                 WHERE channel_type = ?1 AND user_id = ?2",
-                        rusqlite::params![channel_type, user_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?)
+                let mut stmt = conn.prepare(
+                    "SELECT user_id, session_id FROM channel_sessions
+                     WHERE channel_type = ?1 AND user_id = ?2",
+                )?;
+                let binding = super::row::RowDecoder {
+                    table: "channel_sessions",
+                    key: "user_id",
+                    decode: |row| Ok(SessionId::from(row.get::<_, String>("session_id")?)),
+                };
+                binding.optional(stmt.query(rusqlite::params![channel_type, user_id])?)
             })
-            .await?;
-        Ok(session_id.map(SessionId::from))
+            .await
     }
 
     async fn put(

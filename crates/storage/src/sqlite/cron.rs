@@ -13,8 +13,8 @@ use baybo_store::cron::{CronFire, CronStore, ExecutionCompletion, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
 use super::time::{from_us, to_us};
+use super::{SqlitePool, row::RowDecoder};
 
 pub struct SqliteCronStore {
     pool: SqlitePool,
@@ -26,20 +26,9 @@ impl SqliteCronStore {
     }
 }
 
-// ── Row helpers ───────────────────────────────────────────────────────
-//
-// Decoding runs *outside* the connection closure: a `query_map` row
-// callback may only fail with a rusqlite error, so the queries below pull
-// the raw columns out and hand them here.
-
-fn job_from_row(
-    deleted_us: Option<i64>,
-    pinned_col: i64,
-    builtin_col: i64,
-    data: &str,
-) -> Result<CronJob> {
-    let mut job: CronJob = serde_json::from_str(data)
-        .map_err(|e| StorageError::Storage(format!("failed to deserialize cron job: {e}")))?;
+fn job_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<CronJob> {
+    let mut job: CronJob = serde_json::from_str(&row.get::<_, String>("data")?)?;
+    let deleted_us: Option<i64> = row.get("deleted_at")?;
     // The row-level `deleted_at` column is the source of truth — `delete` and
     // `restore` own it and `save` never writes it, so a caller holding a
     // snapshot from before a deletion cannot write the job back to life.
@@ -55,29 +44,26 @@ fn job_from_row(
     // Same discipline for `pinned`: the flat column is authoritative,
     // `set_pinned` owns it, `save` never writes it, and it is `#[serde(skip)]`
     // so the blob never carries it either.
-    job.pinned = pinned_col != 0;
+    job.pinned = row.get("pinned")?;
     // And for `builtin`: written once by the seed, never by `save`, and
     // `#[serde(skip)]` so no blob write can invent it.
-    job.builtin = builtin_col != 0;
+    job.builtin = row.get("builtin")?;
     Ok(job)
 }
 
-fn execution_from_row(status_col: &str, data: &str) -> Result<CronExecution> {
-    let mut exec: CronExecution = serde_json::from_str(data)
-        .map_err(|e| StorageError::Storage(format!("failed to deserialize execution: {e}")))?;
+fn execution_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<CronExecution> {
+    let mut exec: CronExecution = serde_json::from_str(&row.get::<_, String>("data")?)?;
+    let status: String = row.get("status")?;
     // The row-level `status` column is the source of truth — `update_execution_status`
     // touches the column without rewriting `data`.
-    exec.status = match status_col {
+    exec.status = match status.as_str() {
         "dispatched" => ExecutionStatus::Dispatched,
         _ => ExecutionStatus::Pending,
     };
     Ok(exec)
 }
 
-/// Columns every job query selects; [`job_from_row`] takes the `deleted_at`
-/// (index 4), `pinned` (index 5), `builtin` (index 6) and `data` (index 7)
-/// columns out of that list.
-const JOB_COLS: &str = "id, user_id, status, next_trigger_at, deleted_at, pinned, builtin, data";
+const JOB_COLS: &str = "id, deleted_at, pinned, builtin, data";
 
 /// The predicate that keeps recycled jobs out of a query. Applied in SQL — not
 /// in the caller — so no listing can forget it.
@@ -103,6 +89,19 @@ struct Unmoved {
     next_trigger_us: i64,
 }
 
+impl Unmoved {
+    fn load(&self, conn: &rusqlite::Connection, id: &str) -> anyhow::Result<Option<CronJob>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {JOB_COLS} FROM cron_jobs WHERE id = :id AND {UNMOVED}"
+        ))?;
+        JOB.optional(stmt.query(rusqlite::named_params! {
+            ":id": id,
+            ":expected_status": self.status,
+            ":expected_next_trigger_at": self.next_trigger_us,
+        })?)
+    }
+}
+
 impl From<&CronJob> for Unmoved {
     fn from(job: &CronJob) -> Self {
         Self {
@@ -112,16 +111,7 @@ impl From<&CronJob> for Unmoved {
     }
 }
 
-/// The `(deleted_at, pinned, builtin, data)` tuple each job query lifts out
-/// of a row.
-type TurnRow = (Option<i64>, i64, i64, String);
-
-/// Columns every execution query selects; [`execution_from_row`] takes the
-/// `status` (index 5) and `data` (index 6) columns out of that list.
-const EXECUTION_COLS: &str = "id, job_id, user_id, scheduled_fire_time, triggered_at, status, data";
-
-/// The `(status, data)` pair each execution query lifts out of a row.
-type ExecutionRow = (String, String);
+const EXECUTION_COLS: &str = "id, status, data";
 
 fn execution_status_str(status: ExecutionStatus) -> &'static str {
     match status {
@@ -147,30 +137,17 @@ fn serialize_execution(exec: &CronExecution) -> Result<String> {
         .map_err(|e| StorageError::Storage(format!("failed to serialize execution: {e}")))
 }
 
-fn decode_jobs(rows: Vec<TurnRow>) -> Result<Vec<CronJob>> {
-    rows.iter()
-        .map(|(deleted_us, pinned, builtin, data)| {
-            job_from_row(*deleted_us, *pinned, *builtin, data)
-        })
-        .collect()
-}
+const JOB: RowDecoder<CronJob> = RowDecoder {
+    table: "cron_jobs",
+    key: "id",
+    decode: job_from_row,
+};
 
-/// Lift the `(deleted_at, pinned, builtin, data)` tuple out of a row
-/// selected with [`JOB_COLS`].
-fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRow> {
-    Ok((
-        row.get::<_, Option<i64>>(4)?,
-        row.get::<_, i64>(5)?,
-        row.get::<_, i64>(6)?,
-        row.get::<_, String>(7)?,
-    ))
-}
-
-fn decode_executions(rows: Vec<ExecutionRow>) -> Result<Vec<CronExecution>> {
-    rows.iter()
-        .map(|(status, data)| execution_from_row(status, data))
-        .collect()
-}
+const EXECUTION: RowDecoder<CronExecution> = RowDecoder {
+    table: "cron_executions",
+    key: "id",
+    decode: execution_from_row,
+};
 
 #[async_trait]
 impl CronStore for SqliteCronStore {
@@ -196,25 +173,13 @@ impl CronStore for SqliteCronStore {
 
     async fn get(&self, job_id: &str) -> Result<Option<CronJob>> {
         let job_id = job_id.to_string();
-        let row: Option<TurnRow> = self
-            .pool
+        self.pool
             .interact("cron.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!("SELECT {JOB_COLS} FROM cron_jobs WHERE id = ?1"),
-                        rusqlite::params![job_id],
-                        job_row,
-                    )
-                    .optional()?)
+                let mut stmt =
+                    conn.prepare(&format!("SELECT {JOB_COLS} FROM cron_jobs WHERE id = ?1"))?;
+                JOB.optional(stmt.query([job_id])?)
             })
-            .await?;
-
-        match row {
-            Some((deleted_us, pinned, builtin, data)) => {
-                Ok(Some(job_from_row(deleted_us, pinned, builtin, &data)?))
-            }
-            None => Ok(None),
-        }
+            .await
     }
 
     /// Persist everything about a job **except** its recycle-bin state, which
@@ -286,17 +251,7 @@ impl CronStore for SqliteCronStore {
                 // — every field of it, not just the two the columns project.
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let stored: Option<String> = tx
-                    .query_row(
-                        &format!("SELECT data FROM cron_jobs WHERE id = :id AND {UNMOVED}"),
-                        rusqlite::named_params! {
-                            ":id": id,
-                            ":expected_status": expected.status,
-                            ":expected_next_trigger_at": expected.next_trigger_us,
-                        },
-                        |row| row.get(0),
-                    )
-                    .optional()?;
+                let stored = expected.load(&tx, &id)?;
                 let Some(stored) = stored else {
                     return Ok(false);
                 };
@@ -306,7 +261,7 @@ impl CronStore for SqliteCronStore {
                 // cannot see it. `updated_at` is the one field every writer
                 // stamps, which makes it the row's version: a snapshot still
                 // carrying the stored one is a snapshot nothing has landed on.
-                if job_from_row(None, 0, 0, &stored)?.updated_at != expected_updated_at {
+                if stored.updated_at != expected_updated_at {
                     return Ok(false);
                 }
 
@@ -334,22 +289,11 @@ impl CronStore for SqliteCronStore {
                 // it.
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let data: Option<String> = tx
-                    .query_row(
-                        &format!("SELECT data FROM cron_jobs WHERE id = :id AND {UNMOVED}"),
-                        rusqlite::named_params! {
-                            ":id": id,
-                            ":expected_status": expected.status,
-                            ":expected_next_trigger_at": expected.next_trigger_us,
-                        },
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let Some(data) = data else {
+                let stored = expected.load(&tx, &id)?;
+                let Some(mut job) = stored else {
                     return Ok(false);
                 };
 
-                let mut job = job_from_row(None, 0, 0, &data)?;
                 job.status = fire.status.clone();
                 job.next_trigger_at = fire.next_trigger_at;
                 job.last_triggered_at = Some(fire.last_triggered_at);
@@ -395,86 +339,61 @@ impl CronStore for SqliteCronStore {
 
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<CronJob>> {
         let user_id = user_id.to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_by_user", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {JOB_COLS} FROM cron_jobs WHERE user_id = ?1 AND {LIVE_ONLY}"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![user_id], job_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                JOB.list(stmt.query(rusqlite::params![user_id])?)
             })
-            .await?;
-        decode_jobs(rows)
+            .await
     }
 
     async fn list_all(&self) -> Result<Vec<CronJob>> {
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_all", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {JOB_COLS} FROM cron_jobs WHERE {LIVE_ONLY}"
                 ))?;
-                let rows = stmt
-                    .query_map([], job_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                JOB.list(stmt.query([])?)
             })
-            .await?;
-        decode_jobs(rows)
+            .await
     }
 
     async fn list_enabled(&self) -> Result<Vec<CronJob>> {
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_enabled", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {JOB_COLS} FROM cron_jobs WHERE status = 'enabled' AND {LIVE_ONLY}"
                 ))?;
-                let rows = stmt
-                    .query_map([], job_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                JOB.list(stmt.query([])?)
             })
-            .await?;
-        decode_jobs(rows)
+            .await
     }
 
     async fn list_deleted(&self) -> Result<Vec<CronJob>> {
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_deleted", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {JOB_COLS} FROM cron_jobs \
                      WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC"
                 ))?;
-                let rows = stmt
-                    .query_map([], job_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                JOB.list(stmt.query([])?)
             })
-            .await?;
-        decode_jobs(rows)
+            .await
     }
 
     async fn list_due(&self, now_us: i64) -> Result<Vec<CronJob>> {
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_due", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {JOB_COLS} FROM cron_jobs \
                      WHERE {LIVE_ONLY} AND status = 'enabled' \
                      AND next_trigger_at != 0 AND next_trigger_at <= ?1"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![now_us], job_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                JOB.list(stmt.query(rusqlite::params![now_us])?)
             })
-            .await?;
-        decode_jobs(rows)
+            .await
     }
 
     // ── Execution records ──
@@ -503,22 +422,11 @@ impl CronStore for SqliteCronStore {
                 // (and its documented fire-time snapshot) already existed.
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let stored: Option<String> = tx
-                    .query_row(
-                        &format!("SELECT data FROM cron_jobs WHERE id = :id AND {UNMOVED}"),
-                        rusqlite::named_params! {
-                            ":id": job_id,
-                            ":expected_status": expected.status,
-                            ":expected_next_trigger_at": expected.next_trigger_us,
-                        },
-                        |row| row.get(0),
-                    )
-                    .optional()?;
+                let stored = expected.load(&tx, &job_id)?;
                 let Some(stored) = stored else {
                     return Ok(0_u8);
                 };
-                let stored_job = job_from_row(None, 0, 0, &stored)?;
-                if stored_job.updated_at != expected_updated_at {
+                if stored.updated_at != expected_updated_at {
                     return Ok(0_u8);
                 }
 
@@ -553,40 +461,22 @@ impl CronStore for SqliteCronStore {
 
     async fn list_executions_by_job(&self, job_id: &str) -> Result<Vec<CronExecution>> {
         let job_id = job_id.to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_executions_by_job", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE job_id = ?1 ORDER BY triggered_at DESC",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![job_id], |row| {
-                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
-                Ok(rows)
+                let mut stmt = conn.prepare(&format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE job_id = ?1 ORDER BY triggered_at DESC"))?;
+                EXECUTION.list(stmt.query(rusqlite::params![job_id])?)
             })
-            .await?;
-        decode_executions(rows)
+            .await
     }
 
     async fn list_executions_by_user(&self, user_id: &str) -> Result<Vec<CronExecution>> {
         let user_id = user_id.to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_executions_by_user", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE user_id = ?1 ORDER BY triggered_at DESC",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![user_id], |row| {
-                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
-                Ok(rows)
+                let mut stmt = conn.prepare(&format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE user_id = ?1 ORDER BY triggered_at DESC"))?;
+                EXECUTION.list(stmt.query(rusqlite::params![user_id])?)
             })
-            .await?;
-        decode_executions(rows)
+            .await
     }
 
     async fn has_execution_for_schedule(
@@ -637,21 +527,14 @@ impl CronStore for SqliteCronStore {
         status: ExecutionStatus,
     ) -> Result<Vec<CronExecution>> {
         let status = execution_status_str(status).to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_executions_by_status", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {EXECUTION_COLS} FROM cron_executions WHERE status = ?1"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![status], |row| {
-                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
-                Ok(rows)
+                EXECUTION.list(stmt.query(rusqlite::params![status])?)
             })
-            .await?;
-        decode_executions(rows)
+            .await
     }
 
     // ── Delivery ledger ──
@@ -706,23 +589,16 @@ impl CronStore for SqliteCronStore {
     }
 
     async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
-        let rows = self
-            .pool
+        self.pool
             .interact("cron.list_executions_awaiting_delivery", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {EXECUTION_COLS} FROM cron_executions \
                      WHERE completed_at IS NOT NULL AND notified_at IS NULL \
                      ORDER BY completed_at ASC"
                 ))?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
-                Ok(rows)
+                EXECUTION.list(stmt.query([])?)
             })
-            .await?;
-        decode_executions(rows)
+            .await
     }
 }
 
@@ -765,23 +641,15 @@ impl SqliteCronStore {
     /// the blob's copy (see [`execution_from_row`]).
     async fn load_execution(&self, execution_id: &str) -> Result<CronExecution> {
         let id = execution_id.to_string();
-        let row: Option<ExecutionRow> = self
-            .pool
+        self.pool
             .interact("cron.load_execution", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE id = ?1"),
-                        rusqlite::params![id],
-                        |row| Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?)),
-                    )
-                    .optional()?)
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {EXECUTION_COLS} FROM cron_executions WHERE id = ?1"
+                ))?;
+                EXECUTION.optional(stmt.query([id])?)
             })
-            .await?;
-
-        match row {
-            Some((status, data)) => execution_from_row(&status, &data),
-            None => Err(StorageError::NotFound(execution_id.to_string())),
-        }
+            .await?
+            .ok_or_else(|| StorageError::NotFound(execution_id.to_owned()))
     }
 }
 
@@ -864,6 +732,51 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn unreadable_jobs_and_executions_do_not_block_their_neighbors() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteCronStore::new(pool.clone());
+        for id in ["first", "bad", "last"] {
+            record_test_execution(&store, test_execution(id, id, "owner")).await;
+        }
+        pool.interact_write("test.break_cron_rows", |conn| {
+            conn.execute("UPDATE cron_jobs SET data = '{' WHERE id = 'bad'", [])?;
+            conn.execute(
+                "UPDATE cron_executions SET data = x'FF' WHERE id = 'bad'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let mut jobs: Vec<_> = store
+            .list_due(i64::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        jobs.sort();
+        assert_eq!(jobs, ["first", "last"]);
+        let mut executions: Vec<_> = store
+            .list_executions_by_user("owner")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        executions.sort();
+        assert_eq!(executions, ["first", "last"]);
+        assert!(
+            matches!(store.get("bad").await, Err(StorageError::Corrupt { table: "cron_jobs", key, .. }) if key == "bad")
+        );
+        assert!(
+            matches!(store.load_execution("bad").await, Err(StorageError::Corrupt { table: "cron_executions", key, .. }) if key == "bad")
+        );
+        assert!(store.get("absent").await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -63,6 +63,7 @@ pub trait HumanAskStore: Send + Sync {
     /// one caller that won; `Ok(false)` when already applied or absent.
     async fn mark_applied(&self, ask_id: &AskId, now: DateTime<Utc>) -> Result<bool>;
 
+    /// A missing ask returns `None`. An unreadable stored ask returns a corruption error.
     async fn get(&self, ask_id: &AskId) -> Result<Option<HumanAskRow>>;
 
     /// Every row not yet applied (pending or resolved), oldest first. A row

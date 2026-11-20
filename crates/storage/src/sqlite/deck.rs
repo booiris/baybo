@@ -2,10 +2,8 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
-use baybo_store::StorageError;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::deck::{
     DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow, Result,
 };
@@ -27,103 +25,63 @@ impl SqliteDeckCardStore {
     }
 }
 
-/// Raw column tuple: (id, title, position, size, sizes, maximize, enabled,
-/// quarantined_at µs, deleted_at µs, spec_hash, last_seq, created_at µs).
-type RawCard = (
-    String,
-    String,
-    i64,
-    String,
-    String,
-    bool,
-    bool,
-    Option<i64>,
-    Option<i64>,
-    String,
-    i64,
-    i64,
-);
-
 const CARD_COLUMNS: &str = "id, title, position, size, sizes, maximize, enabled, \
      quarantined_at, deleted_at, spec_hash, last_seq, created_at";
 
-fn card_from_raw(raw: RawCard) -> Result<DeckCardRow> {
-    let (
-        id,
-        title,
-        position,
-        size,
-        sizes,
-        maximize,
-        enabled,
-        quarantined_us,
-        deleted_us,
-        spec_hash,
-        last_seq,
-        created_us,
-    ) = raw;
-    let size = DeckSize::parse(&size)
-        .ok_or_else(|| StorageError::Storage(format!("deck_cards.size unknown: {size}")))?;
-    // A blank column (legacy row) means the card declared no set — it is a
-    // single-size, never-adapted card, so [size] is the honest fallback.
-    let sizes = DeckSize::parse_list(&sizes).unwrap_or_else(|| vec![size]);
-    let ts = |us: i64, col: &str| {
-        super::time::from_us(us)
-            .ok_or_else(|| StorageError::Storage(format!("deck_cards.{col} out of range: {us}")))
-    };
-    Ok(DeckCardRow {
-        id,
-        title,
-        position,
-        size,
-        sizes,
-        maximize,
-        enabled,
-        quarantined_at: quarantined_us
-            .map(|us| ts(us, "quarantined_at"))
-            .transpose()?,
-        deleted_at: deleted_us.map(|us| ts(us, "deleted_at")).transpose()?,
-        spec_hash,
-        last_seq,
-        created_at: ts(created_us, "created_at")?,
-    })
-}
+const CARD: RowDecoder<DeckCardRow> = RowDecoder {
+    table: "deck_cards",
+    key: "id",
+    decode: |row| {
+        let size: String = row.get("size")?;
+        let sizes: String = row.get("sizes")?;
+        let quarantined_us: Option<i64> = row.get("quarantined_at")?;
+        let deleted_us: Option<i64> = row.get("deleted_at")?;
+        let created_us: i64 = row.get("created_at")?;
+        let size = DeckSize::parse(&size)
+            .ok_or_else(|| anyhow::anyhow!("deck_cards.size unknown: {size}"))?;
+        // A blank column (legacy row) means the card declared no set — it is a
+        // single-size, never-adapted card, so [size] is the honest fallback.
+        let sizes = DeckSize::parse_list(&sizes).unwrap_or_else(|| vec![size]);
+        let ts = |us: i64, col: &str| {
+            super::time::from_us(us)
+                .ok_or_else(|| anyhow::anyhow!("deck_cards.{col} out of range: {us}"))
+        };
+        Ok(DeckCardRow {
+            id: row.get("id")?,
+            title: row.get("title")?,
+            position: row.get("position")?,
+            size,
+            sizes,
+            maximize: row.get("maximize")?,
+            enabled: row.get("enabled")?,
+            quarantined_at: quarantined_us
+                .map(|us| ts(us, "quarantined_at"))
+                .transpose()?,
+            deleted_at: deleted_us.map(|us| ts(us, "deleted_at")).transpose()?,
+            spec_hash: row.get("spec_hash")?,
+            last_seq: row.get("last_seq")?,
+            created_at: ts(created_us, "created_at")?,
+        })
+    },
+};
 
-fn read_raw_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawCard> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-    ))
-}
-
-/// Raw column tuple: (card_id, seq, payload, fetched_at µs, error).
-type RawSnapshot = (String, i64, String, i64, Option<String>);
-
-fn snapshot_from_raw(raw: RawSnapshot) -> Result<DeckSnapshotRow> {
-    let (card_id, seq, payload, fetched_us, error) = raw;
-    let fetched_at = super::time::from_us(fetched_us).ok_or_else(|| {
-        StorageError::Storage(format!(
-            "deck_snapshots.fetched_at out of range: {fetched_us}"
-        ))
-    })?;
-    Ok(DeckSnapshotRow {
-        card_id,
-        seq,
-        payload,
-        fetched_at,
-        error,
-    })
-}
+const SNAPSHOT: RowDecoder<DeckSnapshotRow> = RowDecoder {
+    table: "deck_snapshots",
+    key: "card_id",
+    decode: |row| {
+        let fetched_us: i64 = row.get("fetched_at")?;
+        let fetched_at = super::time::from_us(fetched_us).ok_or_else(|| {
+            anyhow::anyhow!("deck_snapshots.fetched_at out of range: {fetched_us}")
+        })?;
+        Ok(DeckSnapshotRow {
+            card_id: row.get("card_id")?,
+            seq: row.get("seq")?,
+            payload: row.get("payload")?,
+            fetched_at,
+            error: row.get("error")?,
+        })
+    },
+};
 
 #[async_trait]
 impl DeckCardStore for SqliteDeckCardStore {
@@ -161,53 +119,40 @@ impl DeckCardStore for SqliteDeckCardStore {
 
     async fn get(&self, id: &str) -> Result<Option<DeckCardRow>> {
         let id = id.to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact("deck_cards.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!("SELECT {CARD_COLUMNS} FROM deck_cards WHERE id = ?1"),
-                        rusqlite::params![id],
-                        read_raw_card,
-                    )
-                    .optional()?)
+                CARD.optional(
+                    conn.prepare(&format!(
+                        "SELECT {CARD_COLUMNS} FROM deck_cards WHERE id = ?1"
+                    ))?
+                    .query(rusqlite::params![id])?,
+                )
             })
-            .await?;
-        raw.map(card_from_raw).transpose()
+            .await
     }
 
     async fn list_live(&self) -> Result<Vec<DeckCardRow>> {
-        let raws = self
-            .pool
+        self.pool
             .interact("deck_cards.list_live", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {CARD_COLUMNS} FROM deck_cards \
                      WHERE deleted_at IS NULL ORDER BY position, id"
                 ))?;
-                let raws = stmt
-                    .query_map([], read_raw_card)?
-                    .collect::<rusqlite::Result<Vec<RawCard>>>()?;
-                Ok(raws)
+                CARD.list(stmt.query([])?)
             })
-            .await?;
-        raws.into_iter().map(card_from_raw).collect()
+            .await
     }
 
     async fn list_deleted(&self) -> Result<Vec<DeckCardRow>> {
-        let raws = self
-            .pool
+        self.pool
             .interact("deck_cards.list_deleted", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {CARD_COLUMNS} FROM deck_cards \
                      WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC, id"
                 ))?;
-                let raws = stmt
-                    .query_map([], read_raw_card)?
-                    .collect::<rusqlite::Result<Vec<RawCard>>>()?;
-                Ok(raws)
+                CARD.list(stmt.query([])?)
             })
-            .await?;
-        raws.into_iter().map(card_from_raw).collect()
+            .await
     }
 
     async fn count_live(&self) -> Result<u64> {
@@ -383,8 +328,7 @@ impl DeckCardStore for SqliteDeckCardStore {
     }
 
     async fn latest_snapshots(&self) -> Result<Vec<DeckSnapshotRow>> {
-        let raws = self
-            .pool
+        self.pool
             .interact("deck_cards.latest_snapshots", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT s.card_id, s.seq, s.payload, s.fetched_at, s.error \
@@ -394,48 +338,25 @@ impl DeckCardStore for SqliteDeckCardStore {
                                     WHERE card_id = s.card_id) \
                      ORDER BY s.card_id",
                 )?;
-                let raws = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<RawSnapshot>>>()?;
-                Ok(raws)
+                SNAPSHOT.list(stmt.query([])?)
             })
-            .await?;
-        raws.into_iter().map(snapshot_from_raw).collect()
+            .await
     }
 
     async fn latest_snapshot(&self, card_id: &str) -> Result<Option<DeckSnapshotRow>> {
         let card_id = card_id.to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact("deck_cards.latest_snapshot", move |conn| {
-                Ok(conn
-                    .query_row(
+                SNAPSHOT.optional(
+                    conn.prepare(
                         "SELECT card_id, seq, payload, fetched_at, error \
                          FROM deck_snapshots WHERE card_id = ?1 \
                          ORDER BY seq DESC LIMIT 1",
-                        rusqlite::params![card_id],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?)
+                    )?
+                    .query(rusqlite::params![card_id])?,
+                )
             })
-            .await?;
-        raw.map(snapshot_from_raw).transpose()
+            .await
     }
 }
 

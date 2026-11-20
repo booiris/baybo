@@ -33,6 +33,20 @@ const INFLIGHT_TMP_DIR: &str = ".tmp";
 /// belong to a live upload in another process and is left alone.
 const INFLIGHT_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+const BLOB: super::row::RowDecoder<BlobMeta> = super::row::RowDecoder {
+    table: "blobs",
+    key: "redacted_id",
+    decode: |row| {
+        Ok(BlobMeta {
+            blob_id: row.get("blob_id")?,
+            mime_type: row.get("mime_type")?,
+            size: row.get::<_, i64>("size")?.try_into()?,
+            created_at: row.get("created_at")?,
+            read_token: row.get("read_token")?,
+        })
+    },
+};
+
 pub struct SqliteBlobStore {
     pool: SqlitePool,
     root: PathBuf,
@@ -514,34 +528,22 @@ impl BlobStore for SqliteBlobStore {
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta> {
         let (_hex, token) = split_id(blob_id)?;
         let id_param = blob_id.to_string();
-        let row = self
+        let diagnostic_id = redacted_blob_id(blob_id);
+        let meta = self
             .pool
             .interact("blobs.stat", move |conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT blob_id, mime_type, size, created_at, read_token \
-                         FROM blobs WHERE blob_id = ?1",
-                        rusqlite::params![id_param],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, Option<String>>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?)
+                let mut stmt = conn.prepare(
+                    "SELECT blob_id, mime_type, size, created_at, read_token, ?2 AS redacted_id
+                     FROM blobs WHERE blob_id = ?1",
+                )?;
+                BLOB.optional(stmt.query(rusqlite::params![id_param, diagnostic_id])?)
             })
-            .await?;
-
-        let (id, mime_type, size, created_at, read_token) = row
+            .await?
             .ok_or_else(|| StorageError::NotFound(format!("blob {}", redacted_blob_id(blob_id))))?;
 
         // Enforce the unguessable token match. Legacy blobs without a
         // token are open (backward compatibility).
-        if let Some(expected) = read_token.as_deref()
+        if let Some(expected) = meta.read_token.as_deref()
             && expected != token
         {
             return Err(StorageError::NotFound(format!(
@@ -557,13 +559,7 @@ impl BlobStore for SqliteBlobStore {
         // wrong token wouldn't extend a victim's TTL under that sweep.
         self.touch(blob_id).await;
 
-        Ok(BlobMeta {
-            blob_id: id,
-            mime_type,
-            size: size as u64,
-            created_at,
-            read_token,
-        })
+        Ok(meta)
     }
 
     async fn delete(&self, blob_id: &str) -> Result<()> {
@@ -580,7 +576,7 @@ impl BlobStore for SqliteBlobStore {
                     .query_row(
                         "SELECT mime_type FROM blobs WHERE blob_id = ?1",
                         rusqlite::params![id_param],
-                        |row| row.get::<_, String>(0),
+                        |row| row.get::<_, String>("mime_type"),
                     )
                     .optional()?)
             })
@@ -667,7 +663,7 @@ impl SqliteBlobStore {
                     .prepare("SELECT mime_type FROM blobs WHERE blob_id >= ?1 AND blob_id < ?2")?;
                 let mut rows = stmt.query(rusqlite::params![lower, upper])?;
                 while let Some(row) = rows.next()? {
-                    let other_mime: String = row.get(0)?;
+                    let other_mime: String = row.get("mime_type")?;
                     if mime_extension(&other_mime) == ext {
                         return Ok(true);
                     }
@@ -794,6 +790,26 @@ mod tests {
         assert_eq!(
             store.stat(&b.blob_id).await.unwrap().mime_type,
             "image/jpeg"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corruption_error_redacts_the_blob_capability() {
+        let (store, _dir) = build().await;
+        let blob = store.put(b"private", "text/plain", None).await.unwrap();
+        store
+            .pool
+            .interact_write("test.break_blob", |conn| {
+                conn.execute("UPDATE blobs SET size = -1", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let err = store.stat(&blob.blob_id).await.unwrap_err();
+        let (_, token) = split_id(&blob.blob_id).unwrap();
+        assert!(!err.to_string().contains(token));
+        assert!(
+            matches!(err, StorageError::Corrupt { table: "blobs", key, .. } if key == redacted_blob_id(&blob.blob_id))
         );
     }
 

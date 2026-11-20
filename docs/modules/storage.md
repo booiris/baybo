@@ -63,6 +63,12 @@ connection with it rather than returning one that may sit mid-statement —
 
 Owning those lines is also what keeps the `rusqlite` version free to move: a pool crate pinning an older `rusqlite` is what stranded this workspace on SQLite 3.51.1, whose `unixLock` → `unixIsSharingShmNode` → `unixEnterMutex` path takes the process-global `unixBigLock` while holding a file's inode mutex — the exact order sqlite's own comment marks ERROR. One thread closing a database while another opened one deadlocked the pair, across *unrelated* files, and the suite hung roughly one run in fifty. Upstream fixed it in 3.51.3; the workspace `rusqlite = "0.40"` floor (SQLite 3.53.2) is what keeps it fixed.
 
+### Reading SQLite records
+
+SQLite record decoders read named columns while the statement holds the row. Give computed columns a stable SQL alias. An optional lookup returns `None` for a missing record. An existing record whose fields cannot be decoded yields `StorageError::Corrupt { table, key, reason }`. The pool preserves this error up to the store boundary.
+
+Independent records can be read with `RowDecoder::list`. It warns with the table and record key and continues past a damaged record. A broken SQL projection, a failed statement, or a database error still fails the query. Transcript replay, cursor-based history, project scheduling decisions and run recovery use complete reads. An unreadable record there fails the operation so callers cannot advance a cursor or a state transition on partial data. Session lists keep their existing display fallback for an invalid agent binding. Hydrating the same session fails.
+
 ### All store traits live in the ports crate
 
 Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *implements* them. Most traits trade in plain value types (`baybo-model` domain types, or row/DTO types defined alongside the trait in `baybo-store`). Two of them — `TurnStore` and `TraceStore` — trade in **row DTOs** (`TurnRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Turn` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `baybo-turn` / `baybo-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary. `TraceStore::list_unfinished_steps` is the recovery-oriented indexed query: it returns steps that are themselves open or have an open child span, including detached steps under terminal turns. Both traits also expose aggregate queries that answer list-surface questions without shipping `data` blobs: `TraceStore::trace_counts_by_turn` (a turn's step/span counts) and `TurnStore::session_turn_stats` (per-session turn count + latest turn's `status_kind`, one grouped query).
@@ -262,8 +268,7 @@ consumed the decision; the partial index `idx_human_asks_unapplied` on
 `mark_applied` are single-statement claim `UPDATE`s guarded by
 `resolved_at IS NULL` / `applied_at IS NULL` and return whether this caller
 won, so a BUSY re-run is idempotent and two claimers have exactly one winner.
-Reads decode the raw columns outside sqlite and skip (with a `warn!`) a row
-whose kind, phase or JSON this build cannot read.
+Unapplied lists warn and skip a row whose kind, phase or JSON this build cannot read. Looking up that ask by ID returns a corruption error.
 
 **Rows are never deleted.** There is no `HumanAskStore::delete` and no janitor
 sweep: resolved rows are the audit ledger of who answered what, when, and how.
