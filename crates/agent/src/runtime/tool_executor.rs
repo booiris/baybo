@@ -14,9 +14,9 @@ use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalHandle, ApprovalOutcome,
     ApprovalRequest, ApprovalResolution, ApprovedResource, AskCancel, AskSite, ExecSandbox,
-    ParkGauge, PreExecuteCheck, ReadTracker, ResourceAccess, ToolCapability, ToolContext,
-    ToolError, ToolManifest, ToolOutput, ToolRegistry, TurnTokens, VirtualReadResolver,
-    approval::preview_params, refusal_reason,
+    ParkGauge, PreExecuteAsk, PreExecuteCheck, ReadTracker, ResourceAccess, ToolCapability,
+    ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry, TurnTokens,
+    VirtualReadResolver, approval::preview_params, refusal_reason,
 };
 use baybo_trace::{
     LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
@@ -400,15 +400,6 @@ pub(crate) fn cap_trace_output_with_len(value: Value, full_len: usize) -> (Value
     }
 }
 
-/// A finished tool call: whatever the call produced, plus the approval decision
-/// it went through when it raised a prompt.
-///
-/// `output` keeps the call's own `Result` rather than making the whole struct
-/// one, because `approval` must survive EVERY exit — a denial, a tool error, a
-/// timeout — not just success. A mid-call denial (a tool that asks through
-/// [`baybo_tools::ApprovalHandle`] and turns the refusal into its own error) is
-/// exactly the case that loses its verdict otherwise: it reaches the loop as an
-/// untyped error, indistinguishable from a crash.
 /// How the pre-execute approval gate treats a call's uncovered accesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreExecuteGate {
@@ -431,6 +422,68 @@ pub enum PreExecuteGate {
     },
 }
 
+struct PreparedApproval {
+    ask: PreExecuteAsk,
+    authorized_accesses: Vec<ResourceAccess>,
+}
+
+impl PreparedApproval {
+    fn retain_uncovered(&mut self, cache: &Mutex<Vec<ApprovedResource>>) {
+        if self.ask.cacheable {
+            let approved = cache.lock();
+            self.ask.accesses.retain(|access| {
+                !matches!(access, ResourceAccess::ReadFile { .. })
+                    && !approved.iter().any(|grant| grant.covers(access))
+            });
+        }
+    }
+
+    fn validate_resume(&self, mode: &PreExecuteGate, tool: &str) -> anyhow::Result<()> {
+        if let PreExecuteGate::PreDecided {
+            decision, accesses, ..
+        } = mode
+            && *decision != ApprovalDecision::Deny
+            && self.ask.accesses.iter().any(|access| {
+                !accesses
+                    .iter()
+                    .any(|original| original.to_approved().covers(access))
+            })
+        {
+            return Err(ToolError::Denied {
+                tool: tool.to_owned(),
+                reason: "approval requirements changed; retry the tool call for a new approval"
+                    .to_owned(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+fn require_approval(outcome: ApprovalOutcome, tool: &str, ctx: &ToolContext) -> anyhow::Result<()> {
+    if outcome.decision == ApprovalDecision::Deny {
+        return Err(ToolError::Denied {
+            tool: tool.to_owned(),
+            reason: refusal_reason(outcome.resolution).to_owned(),
+        }
+        .into());
+    }
+    if ctx.cancellation_token.is_cancelled() {
+        anyhow::bail!("tool '{tool}' cancelled while awaiting approval");
+    }
+    info!(tool, decision = ?outcome.decision, "tool call approved");
+    Ok(())
+}
+
+/// A finished tool call: whatever the call produced, plus the approval decision
+/// it went through when it raised a prompt.
+///
+/// `output` keeps the call's own `Result` rather than making the whole struct
+/// one, because `approval` must survive EVERY exit — a denial, a tool error, a
+/// timeout — not just success. A mid-call denial (a tool that asks through
+/// [`baybo_tools::ApprovalHandle`] and turns the refusal into its own error) is
+/// exactly the case that loses its verdict otherwise: it reaches the loop as an
+/// untyped error, indistinguishable from a crash.
 pub struct ExecutedTool {
     pub output: anyhow::Result<ToolOutput>,
     /// `None` when the call never prompted (covered by a prior grant, or an
@@ -717,19 +770,35 @@ impl ToolExecutor {
             .map_err(|error| anyhow::anyhow!("security: tool '{}' {error}", tool_name))
     }
 
-    /// Execute a tool call inside the given `step`, with full
-    /// observability and approval gating.
-    ///
-    /// Tool calls live as `Span`s under their parent agent-loop `Step`
-    /// (see `docs/modules/trace.md`). `triggering_llm_span` is the LLM
-    /// span that emitted the `tool_use` block; `parallel_group` ties
-    /// concurrent siblings together; `turn_id` is the parent turn (for
-    /// the WAL log).
-    ///
-    /// `approved_resources` is a shared, mutable set of session-scoped
-    /// approvals. The executor reads it to check coverage and writes to
-    /// it on `ApproveAlways`, so concurrent tool calls within a turn
-    /// see each other's grants immediately.
+    async fn prepare_approval(
+        &self,
+        tool: Option<&dyn baybo_tools::Tool>,
+        masked_params: &Value,
+        revealed_params: &Value,
+        ctx: &ToolContext,
+        mode: &PreExecuteGate,
+    ) -> anyhow::Result<Option<PreparedApproval>> {
+        let Some(tool) = tool else {
+            return Ok(None);
+        };
+        let check = match mode {
+            PreExecuteGate::Ask => PreExecuteCheck::Evaluate,
+            PreExecuteGate::PreDecided { .. } => PreExecuteCheck::PreDecided,
+        };
+        let Some(ask) = tool.pre_execute_ask(revealed_params, ctx, check).await else {
+            return Ok(None);
+        };
+        let authorized_accesses = ask.accesses.clone();
+        let mut value = serde_json::to_value(ask)?;
+        self.security_gateway
+            .sanitize_approval_value(&mut value, masked_params)
+            .await?;
+        Ok(Some(PreparedApproval {
+            ask: serde_json::from_value(value)?,
+            authorized_accesses,
+        }))
+    }
+
     /// Drain any pending tool-reported events into span events, sanitizing
     /// text payloads so leaked secrets never hit the trace store.
     async fn flush_tool_events(
@@ -752,6 +821,19 @@ impl ToolExecutor {
         }
     }
 
+    /// Execute a tool call inside the given `step`, with full
+    /// observability and approval gating.
+    ///
+    /// Tool calls live as `Span`s under their parent agent-loop `Step`
+    /// (see `docs/modules/trace.md`). `triggering_llm_span` is the LLM
+    /// span that emitted the `tool_use` block; `parallel_group` ties
+    /// concurrent siblings together; `turn_id` is the parent turn (for
+    /// the WAL log).
+    ///
+    /// `approved_resources` is a shared, mutable set of session-scoped
+    /// approvals. The executor reads it to check coverage and writes to
+    /// it on `ApproveAlways`, so concurrent tool calls within a turn
+    /// see each other's grants immediately.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
@@ -856,7 +938,6 @@ impl ToolExecutor {
         // the cancel-aware close-on-Err path.
         let cancel_token = tokens.turn.clone();
         let cancel_for_close = cancel_token.clone();
-        let cancel_for_gate = cancel_token.clone();
         let ask_cancel = AskCancel::new(tokens);
         let park_gauge = ParkGauge::new();
         let gate: Arc<dyn ApprovalGate> = if attended {
@@ -869,11 +950,10 @@ impl ToolExecutor {
         // read back after it — including on the paths where the body returns
         // `Err` (denial, tool error, timeout) and the outcome would otherwise
         // die with the closure.
-        let approval_slot: Arc<Mutex<Option<ApprovalOutcome>>> = Arc::new(Mutex::new(None));
-        let approval_sink = Arc::clone(&approval_slot);
-        let handed_over_slot: Arc<parking_lot::Mutex<Option<baybo_tools::background::HandedOver>>> =
-            Arc::default();
-        let handed_over_sink = Arc::clone(&handed_over_slot);
+        let mut approval_outcome = None;
+        let approval_result = &mut approval_outcome;
+        let mut handed_over = None;
+        let background_result = &mut handed_over;
 
         // Open the tool span up front so denials and approval failures still
         // appear in the trace tree. The handle carries the begin-time kind, so
@@ -1077,13 +1157,6 @@ impl ToolExecutor {
                     .await
                     .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
 
-                // Pre-execute approval gate: ask the tool what needs human
-                // approval using the same arguments execution will receive. Check the
-                // session cache only when the ask is cacheable, and raise a
-                // resumable `BeforeExecute` prompt if anything remains. When
-                // resuming an answered `DuringExecuteResumable` approval, skip the
-                // pre-execute gate (never caching) and dispatch the tool's
-                // `resume_during_execute` hook below.
                 let resume_during_execute = matches!(
                     &pre_execute,
                     PreExecuteGate::PreDecided {
@@ -1091,187 +1164,101 @@ impl ToolExecutor {
                         ..
                     }
                 );
-                if let PreExecuteGate::PreDecided {
-                    decision,
-                    phase: AskPhase::DuringExecuteResumable,
-                    ..
-                } = &pre_execute
-                {
-                    let outcome = ApprovalOutcome::answered(*decision);
-                    *approval_sink.lock() = Some(outcome);
-                    if *decision == ApprovalDecision::Deny {
-                        return Err(anyhow::Error::new(ToolError::Denied {
-                            tool: tool_name_owned.clone(),
-                            reason: refusal_reason(outcome.resolution).to_string(),
-                        }));
-                    }
-                    if cancel_for_gate.is_cancelled() {
-                        return Err(anyhow::anyhow!(
-                            "tool '{tool_name_owned}' cancelled while awaiting approval"
-                        ));
-                    }
+                let mut prepared = if resume_during_execute {
+                    None
                 } else {
-                    let pre_check = match &pre_execute {
-                        PreExecuteGate::Ask => PreExecuteCheck::Evaluate,
-                        PreExecuteGate::PreDecided { .. } => PreExecuteCheck::PreDecided,
-                    };
-                    let pre_ask = match pinned_tool.as_ref() {
-                        Some(tool) => tool.pre_execute_ask(&params_revealed, &ctx, pre_check).await,
-                        None => None,
-                    };
-                    let authorized_accesses = pre_ask
-                        .as_ref()
-                        .map(|ask| ask.accesses.clone())
-                        .unwrap_or_default();
-                    let pre_ask = if let Some(ask) = pre_ask {
-                        let mut value = serde_json::to_value(ask)?;
-                        self.security_gateway
-                            .sanitize_approval_value(&mut value, &params)
-                            .await?;
-                        Some(serde_json::from_value::<baybo_tools::PreExecuteAsk>(value)?)
-                    } else {
-                        None
-                    };
-                    self.flush_tool_events(
-                        &event_sink,
-                        recorder,
-                        span_handle.span_id,
-                        &mut event_seq,
-                    )
-                    .await;
+                    let prepared = self
+                        .prepare_approval(
+                            pinned_tool.as_deref(),
+                            &params,
+                            &params_revealed,
+                            &ctx,
+                            &pre_execute,
+                        )
+                        .await?;
+                    self.flush_tool_events(&event_sink, recorder, ctx.span_id, &mut event_seq)
+                        .await;
+                    prepared
+                };
+                if let Some(prepared) = &mut prepared {
+                    prepared.retain_uncovered(approved_resources);
+                    prepared.validate_resume(&pre_execute, &tool_name_owned)?;
+                }
+                #[cfg(test)]
+                if !resume_during_execute && let Some(hook) = &self.after_authorization_hook {
+                    hook();
+                }
 
-                    let (uncovered, ask_cacheable, ask_description, ask_preview) = match pre_ask {
-                        Some(ask) => {
-                            let uncovered: Vec<ResourceAccess> = if ask.cacheable {
-                                let approved = approved_resources.lock();
-                                ask.accesses
-                                    .into_iter()
-                                    .filter(|acc| {
-                                        !matches!(acc, ResourceAccess::ReadFile { .. })
-                                            && !approved.iter().any(|ar| ar.covers(acc))
-                                    })
-                                    .collect()
-                            } else {
-                                ask.accesses
-                            };
-                            (
-                                uncovered,
-                                ask.cacheable,
-                                ask.description,
-                                ask.params_preview,
-                            )
-                        }
-                        None => (Vec::new(), true, None, None),
-                    };
-                    if let PreExecuteGate::PreDecided { decision, accesses, .. } = &pre_execute {
-                        if *decision == ApprovalDecision::Deny {
-                            let outcome = ApprovalOutcome::answered(*decision);
-                            *approval_sink.lock() = Some(outcome);
-                            return Err(ToolError::Denied {
-                                tool: tool_name_owned.clone(),
-                                reason: refusal_reason(outcome.resolution).to_owned(),
-                            }.into());
-                        }
-                        let changed = uncovered.iter().any(|access| {
-                            !accesses.iter().any(|original| original.to_approved().covers(access))
-                        });
-                        if changed {
-                            return Err(ToolError::Denied {
-                                tool: tool_name_owned.clone(),
-                                reason: "approval requirements changed; retry the tool call for a new approval".to_owned(),
-                            }.into());
-                        }
+                let needs_approval = prepared
+                    .as_ref()
+                    .is_some_and(|p| !p.ask.accesses.is_empty());
+                let outcome = match (&pre_execute, prepared.as_ref()) {
+                    (PreExecuteGate::PreDecided { decision, .. }, _)
+                        if resume_during_execute
+                            || needs_approval
+                            || *decision == ApprovalDecision::Deny =>
+                    {
+                        Some(ApprovalOutcome::answered(*decision))
                     }
-
-                    #[cfg(test)]
-                    if let Some(hook) = &self.after_authorization_hook {
-                        hook();
-                    }
-
-                    if !uncovered.is_empty() {
-                        let outcome = match &pre_execute {
-                            PreExecuteGate::PreDecided { decision, .. } => {
-                                ApprovalOutcome::answered(*decision)
-                            }
-                            PreExecuteGate::Ask => {
-                                gate.request(
-                                    ApprovalRequest {
-                                        ask_id: baybo_model::human_ask::AskId::new(),
-                                        tool_call_id: tool_use_id.clone(),
-                                        session_id: session_id.clone(),
-                                        user_id: user.id.clone(),
-                                        tool: tool_name_owned.clone(),
-                                        accesses: uncovered.clone(),
-                                        params_preview: ask_preview.unwrap_or_else(|| {
-                                            preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN)
-                                        }),
-                                        description: ask_description,
-                                    },
-                                    AskSite {
-                                        channel: user.channel.clone(),
-                                        turn_id,
-                                        phase: AskPhase::BeforeExecute,
-                                    },
-                                    ask_cancel.clone(),
-                                )
-                                // The gate itself answers `/stop` (it races the call's
-                                // `AskCancel`); a shutdown leaves it parked until the loop
-                                // drops this future.
-                                .await
-                            }
-                        };
-                        let decision = outcome.decision;
-                        *approval_sink.lock() = Some(outcome);
-                        for access in &uncovered {
+                    (PreExecuteGate::Ask, Some(prepared)) if needs_approval => Some(
+                        gate.request(
+                            ApprovalRequest {
+                                ask_id: baybo_model::human_ask::AskId::new(),
+                                tool_call_id: tool_use_id.clone(),
+                                session_id: session_id.clone(),
+                                user_id: user.id.clone(),
+                                tool: tool_name_owned.clone(),
+                                accesses: prepared.ask.accesses.clone(),
+                                params_preview: prepared.ask.params_preview.clone().unwrap_or_else(
+                                    || preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                                ),
+                                description: prepared.ask.description.clone(),
+                            },
+                            AskSite {
+                                channel: user.channel.clone(),
+                                turn_id,
+                                phase: AskPhase::BeforeExecute,
+                            },
+                            ask_cancel.clone(),
+                        )
+                        .await,
+                    ),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    *approval_result = Some(outcome);
+                    if let Some(prepared) = &prepared {
+                        for resource in &prepared.ask.accesses {
                             let _ = recorder
                                 .emit_event(
-                                    span_handle.span_id,
+                                    ctx.span_id,
                                     event_seq,
                                     SpanEventKind::Approval {
-                                        decision,
-                                        resource: access.clone(),
+                                        decision: outcome.decision,
+                                        resource: resource.clone(),
                                     },
                                 )
                                 .await;
                             event_seq += 1;
                         }
-                        match decision {
-                            ApprovalDecision::Approve => {
-                                info!(tool = %tool_name_owned, "tool call approved once");
-                            }
-                            ApprovalDecision::ApproveAlways => {
-                                info!(tool = %tool_name_owned, "tool call approved always");
-                                if ask_cacheable {
-                                    let mut approved = approved_resources.lock();
-                                    for access in &uncovered {
-                                        let entry = access.to_approved();
-                                        if !approved.iter().any(|existing| existing == &entry) {
-                                            approved.push(entry);
-                                        }
-                                    }
+                        if prepared.ask.cacheable
+                            && outcome.decision == ApprovalDecision::ApproveAlways
+                        {
+                            let mut approved = approved_resources.lock();
+                            for access in &prepared.ask.accesses {
+                                let grant = access.to_approved();
+                                if !approved.contains(&grant) {
+                                    approved.push(grant);
                                 }
                             }
-                            ApprovalDecision::Deny => {
-                                return Err(anyhow::Error::new(ToolError::Denied {
-                                    tool: tool_name_owned.clone(),
-                                    reason: refusal_reason(outcome.resolution).to_string(),
-                                }));
-                            }
-                        }
-                        // Approved — but the turn may have been cancelled WHILE the
-                        // prompt was up (the gate only abandons when the token trips
-                        // before the answer). Running now would execute a
-                        // side-effecting call on behalf of a turn the user already
-                        // stopped.
-                        if cancel_for_gate.is_cancelled() {
-                            return Err(anyhow::anyhow!(
-                                "tool '{tool_name_owned}' cancelled while awaiting approval"
-                            ));
                         }
                     }
-                    if let Some(approval) = ctx.approval.as_mut() {
-                        approval.record_pre_execute_approval(authorized_accesses);
-                    }
+                    require_approval(outcome, &tool_name_owned, &ctx)?;
+                }
+                if let Some(prepared) = prepared
+                    && let Some(approval) = ctx.approval.as_mut()
+                {
+                    approval.record_pre_execute_approval(prepared.authorized_accesses);
                 }
 
                 // Re-resolved per call rather than cached, so an operator who
@@ -1312,9 +1299,9 @@ impl ToolExecutor {
                 // the loop as the tool's own error, and without this the verdict
                 // would be indistinguishable from a crash.
                 if let Some(outcome) = approval_probe.last_outcome() {
-                    *approval_sink.lock() = Some(outcome);
+                    *approval_result = Some(outcome);
                 }
-                *handed_over_sink.lock() = ctx.background_dispatch.take();
+                *background_result = ctx.background_dispatch.take();
 
                 // Flush tool-reported events as span events, regardless
                 // of whether the tool succeeded, failed, or hit the
@@ -1417,7 +1404,7 @@ impl ToolExecutor {
                         // text. The error's TYPE is lost here (a
                         // `ToolError::Denied` a tool raised from a mid-call
                         // prompt included) — the decision that shaped it rides
-                        // `approval_slot` instead, read back by the caller.
+                        // `approval_outcome` instead, read back by the caller.
                         let raw = e.to_string();
                         let sanitized = self
                             .security_gateway
@@ -1436,12 +1423,12 @@ impl ToolExecutor {
         )
         .await;
 
-        let outcome = *approval_slot.lock();
+        let outcome = approval_outcome;
         ExecutedTool {
             output,
             approval: outcome.map(|o| o.decision),
             abandoned: outcome.is_some_and(|o| o.resolution == ApprovalResolution::Abandoned),
-            handed_over: handed_over_slot.lock().take(),
+            handed_over,
         }
     }
 }
