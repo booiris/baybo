@@ -286,7 +286,10 @@ misconfiguration guard, not a policy.
 deadline and survive restarts through the Resume door. A non-resumable
 `DuringExecuteNonResumable` approval (a prompt without resumable continuation) keeps
 `DURING_EXECUTE_APPROVAL_TIMEOUT` (30 min) so it cannot pin a turn in memory
-forever. See [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
+forever. If the timeout claim fails to persist, the gate keeps the waiter
+open for human answers already attempting their claim. Once those finish,
+it closes an unanswered card and leaves the pending row for reconciliation.
+See [`../todo/during-execute-approvals.md`](../todo/during-execute-approvals.md).
 
 `baybo prompt` (`prompt_cmd.rs:258-264`) keeps working through the session
 tier of `ApprovalGateMap` (`AutoApprove`/`AutoDeny` per session); the tier
@@ -1333,10 +1336,10 @@ Where the code differs from the sketch above, and why:
   `Channel::pending_approval_sessions` (REST `awaiting_human`), the
   `AskPushStream`, and the queue's `AskClosed` event (what the gateway
   watcher turns into `AskResolved`; the frame mapping is covered by
-  `crates/gateway/tests/channel_ws.rs`). The router is replaced by a
-  forwarder from `RouterResumeSink`'s receiver into the actor mailbox, through
-  the same `resume_message` rule.
-  The question half of the restart case waits for the `AskUser` stage. The issue-run case
+  `crates/gateway/tests/channel_ws.rs`). The real router drains the resume sink. The idle-reaper case
+  waits for the parked actor to exit before answering and verifies that a
+  newly hydrated actor applies the decision. The restart suite also covers
+  answering a question. The issue-run case
   asserts the approved call runs once and the run's own LLM call sees the
   settled result; `finish_run` is the router's `IssueRunWaiter`, which the
   harness does not host, so "called once" is not asserted there. The lazy

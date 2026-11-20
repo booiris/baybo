@@ -17,6 +17,8 @@ pub struct MemoryHumanAskStore {
     rows: Mutex<Vec<HumanAskRow>>,
     fail_create: AtomicBool,
     fail_resolve: AtomicBool,
+    #[cfg(test)]
+    pause_approval: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl MemoryHumanAskStore {
@@ -32,6 +34,13 @@ impl MemoryHumanAskStore {
     /// Make every later `resolve` fail (`true`) or work again (`false`).
     pub fn fail_resolves(&self, fail: bool) {
         self.fail_resolve.store(fail, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_approval(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        *self.pause_approval.lock() = Some(wait);
+        resume
     }
 
     /// Every row, in insertion order.
@@ -72,6 +81,13 @@ impl HumanAskStore for MemoryHumanAskStore {
         resolution: &AskResolution,
         now: DateTime<Utc>,
     ) -> baybo_store::human_ask::Result<bool> {
+        #[cfg(test)]
+        if matches!(resolution, AskResolution::Approval(_)) {
+            let paused = self.pause_approval.lock().take();
+            if let Some(wait) = paused {
+                let _ = wait.await;
+            }
+        }
         if self.fail_resolve.load(Ordering::SeqCst) {
             return Err(StorageError::Storage("resolve disabled by test".into()));
         }

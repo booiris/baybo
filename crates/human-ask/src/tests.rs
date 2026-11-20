@@ -389,6 +389,48 @@ async fn a_timeout_the_ledger_could_not_record_stays_listed_for_the_reconcile() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_failed_timeout_write_waits_for_an_admitted_answer() {
+    let h = harness();
+    let ask_id = id("a");
+    let task = park(&h, "a", "s1", AskPhase::DuringExecuteNonResumable, tokens()).await;
+    let resume_write = h.store.pause_next_approval();
+    let answer = h.manager.resolve(&ask_id, APPROVE);
+    tokio::pin!(answer);
+    tokio::select! {
+        biased;
+        result = &mut answer => panic!("the approval write should be paused: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    h.store.fail_resolves(true);
+    tokio::time::sleep(PAST_DEADLINE).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "the admitted answer still has a waiter"
+    );
+
+    assert!(
+        matches!(
+            h.manager.resolve(&ask_id, APPROVE).await,
+            Err(HumanAskError::AskClosed { .. })
+        ),
+        "the deadline has closed admission to later answers"
+    );
+    h.store.fail_resolves(false);
+    resume_write.send(()).expect("approval is writing");
+    answer.await.expect("answer accepted");
+    assert_eq!(
+        task.await.expect("join"),
+        ApprovalOutcome::answered(ApprovalDecision::Approve)
+    );
+    let stored = h.store.row(&ask_id).expect("row");
+    assert_eq!(stored.resolution, Some(APPROVE));
+    assert!(stored.applied_at.is_some());
+    assert!(h.queue.is_empty());
+    assert!(h.sink.requests.lock().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn resumable_asks_have_no_deadline() {
     for (name, phase) in [
         ("b", AskPhase::BeforeExecute),

@@ -805,7 +805,6 @@ impl AgentActor {
                 None,
                 response_tx,
                 None,
-                None,
                 cron_report.clone(),
             )
             .await;
@@ -964,11 +963,9 @@ impl AgentActor {
     /// usable reply and leave the ledger open.
     pub(super) async fn settle_background_notification_after_user_turn(
         &mut self,
-        stopped: bool,
         response_content: &[ContentBlock],
     ) {
-        if stopped
-            || is_blank_reply(response_content)
+        if is_blank_reply(response_content)
             || self
                 .durable
                 .session

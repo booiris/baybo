@@ -118,27 +118,25 @@ impl ChannelAskGate {
     async fn expire(
         &self,
         row: &HumanAskRow,
-        mut rx: oneshot::Receiver<AskResolution>,
+        rx: oneshot::Receiver<AskResolution>,
     ) -> Option<AskResolution> {
         let timed_out = AskResolution::TimedOut;
         let mut claimed = row.clone();
-        let recorded = match self.core.claim(&mut claimed, timed_out.clone()).await {
-            Ok(true) => true,
-            Ok(false) => return Some(rx.await.unwrap_or(AskResolution::Abandoned)),
+        match self.core.claim(&mut claimed, timed_out.clone()).await {
+            Ok(true) => {
+                self.queue.resolve(&row.ask_id, timed_out.clone());
+                tracing::info!(ask_id = %row.ask_id, "during-execute approval timed out");
+                Some(timed_out)
+            }
+            Ok(false) => Some(rx.await.unwrap_or(AskResolution::Abandoned)),
             Err(e) => {
                 tracing::warn!(ask_id = %row.ask_id, error = %e, "could not record an ask timing out");
-                false
+                if self.queue.close_after_failed_timeout(&row.ask_id).await {
+                    return None;
+                }
+                Some(rx.await.unwrap_or(AskResolution::Abandoned))
             }
-        };
-        let closed_here = self.queue.resolve(&row.ask_id, timed_out.clone()).is_some();
-        if !recorded
-            && !closed_here
-            && let Ok(answered) = rx.try_recv()
-        {
-            return Some(answered);
         }
-        tracing::info!(ask_id = %row.ask_id, "during-execute approval timed out");
-        recorded.then_some(timed_out)
     }
 }
 

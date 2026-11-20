@@ -38,7 +38,7 @@ baybo-security = { workspace = true, features = ["test-support"] }
 baybo-session = { workspace = true, features = ["test-support"] }
 baybo-skills = { workspace = true }
 baybo-storage = { workspace = true, features = ["test-support"] }
-baybo-store = { workspace = true }
+baybo-store = { workspace = true, features = ["test-support"] }
 baybo-subagent = { workspace = true }
 baybo-task = { workspace = true, features = ["test-support"] }
 baybo-tools = { workspace = true, features = ["test-support"] }

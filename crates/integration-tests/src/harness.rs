@@ -112,10 +112,7 @@ pub struct AgentTestHarness {
     /// Parent of the actor's token. Cancelling it is what process shutdown
     /// does: every turn the actor runs reads the cancel as `Ancestor`.
     pub actor_parent_token: tokio_util::sync::CancellationToken,
-    /// The supervisor the actor registers each turn's release token with, so
-    /// a test can end a parked turn the way the idle reaper does
-    /// ([`baybo_agent::AgentSupervisor::release_parked_turn`]). The actor is
-    /// not in its registry: the harness routes to the mailbox directly.
+    /// Supervises the harness session across idle eviction and rehydration.
     pub supervisor: baybo_agent::AgentSupervisor,
     /// LLM requests the strict provider fake refused because a `tool_use`
     /// was not answered by the very next message. Stays 0 unless
@@ -123,7 +120,8 @@ pub struct AgentTestHarness {
     pub strict_rejections: Arc<AtomicUsize>,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
-    actor_handle: Option<JoinHandle<()>>,
+    actor_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    router_task: Option<JoinHandle<()>>,
 }
 
 impl AgentTestHarness {
@@ -207,12 +205,17 @@ impl AgentTestHarness {
             .collect()
     }
 
-    /// Send `Shutdown` and await actor termination. Idempotent — calling
-    /// twice on the same harness is safe.
-    pub async fn shutdown(mut self) {
-        let _ = self.mailbox.send(AgentMessage::ActorStop).await;
-        if let Some(handle) = self.actor_handle.take() {
-            let _ = handle.await;
+    /// Stop routing and join every actor, including actors spawned after eviction.
+    pub async fn shutdown(self) {
+        if let Some(router) = self.router_task {
+            router.abort();
+            let _ = router.await;
+        }
+        self.actor_parent_token.cancel();
+        self.supervisor.shutdown_all().await;
+        let tasks = std::mem::take(&mut *self.actor_tasks.lock());
+        for task in tasks {
+            task.await.expect("harness actor exited cleanly");
         }
     }
 }
@@ -271,8 +274,7 @@ pub struct AgentTestHarnessBuilder {
     /// instead of the in-memory fakes, so a test can drop the harness and
     /// build another over the same database — a restart.
     store: Option<baybo_storage::Store>,
-    /// Route an answer to a dead ask back into this actor's mailbox, the way
-    /// the router's Resume door does.
+    /// Run the router to deliver answers to dead asks.
     resume_door: bool,
     /// Refuse any LLM request whose `tool_use` is not answered by the very
     /// next message, as a real provider does.
@@ -329,9 +331,7 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Wire the chat Resume door: the manager's real `RouterResumeSink`,
-    /// with the router's routing replaced by a forward into this actor's
-    /// mailbox.
+    /// Route answers to dead asks through the router and its actor spawner.
     pub fn with_resume_door(mut self) -> Self {
         self.resume_door = true;
         self
@@ -511,18 +511,7 @@ impl AgentTestHarnessBuilder {
         let cost_store = Arc::new(MemoryCostStore::new());
         let trace_store = Arc::new(MemoryTraceStore::new());
 
-        // One shared bus per harness — the recorder publishes into it
-        // and the cost subscriber drains the same bus. Constructing it
-        // upfront keeps both sides explicit about which stream they
-        // share (forgetting this is the silent under-billing bug
-        // SpanRecorder::new now refuses to compile around).
         let trace_event_stream = TraceEventStream::new();
-        let span_recorder = Arc::new(SpanRecorder::new(
-            session.id.clone(),
-            session.user.id.clone(),
-            trace_store.clone() as Arc<dyn TraceStore>,
-            trace_event_stream.clone(),
-        ));
         // Cost ledger. Default builder leaves pricing empty (cost_usd
         // resolves to 0) and limits as `None` (no budget gate). Tests
         // that exercise budgeting use `with_pricing` / `with_spending_limits`.
@@ -627,14 +616,11 @@ impl AgentTestHarnessBuilder {
             Arc::clone(&session_store),
             folder_store,
         ));
-        let (mailbox_tx, mailbox_rx) = baybo_agent::mailbox::channel(self.mailbox_capacity);
         let ask_core = Arc::new(AskCore::new(Arc::clone(&ask_ledger)));
         let ask_queues = AskQueues::new();
+        let (resume_sink, resume_rx) = baybo_agent::runtime::asks::RouterResumeSink::channel();
         let resume_sink: Arc<dyn ResumeSink> = if self.resume_door {
-            Arc::new(resume_door(
-                Arc::clone(&session_manager),
-                mailbox_tx.clone(),
-            ))
+            Arc::new(resume_sink)
         } else {
             Arc::new(baybo_human_ask::test_support::NoResume)
         };
@@ -707,25 +693,6 @@ impl AgentTestHarnessBuilder {
             source_path: None,
             tools: None,
         });
-        let context_manager = ContextManager::from_config(ContextManagerConfig {
-            agent: None,
-            tokenizer,
-            workspace: Arc::clone(&workspace),
-            keep_recent,
-            compression_threshold,
-            // The harness drives compaction through the window share and a
-            // deliberately small stub window; an absolute cap on top would
-            // be a second trigger every such test has to reason about.
-            max_active_tokens: 0,
-            skill_registry: Arc::clone(&skill_registry),
-            channel: session.channel.clone(),
-            shape: baybo_context::prompts::soul::PromptShape::for_trigger(&session.trigger),
-            session_id: session.id.clone(),
-            sessions: Arc::clone(&session_manager),
-            subagent_profile: Some((subagent_registry, "harness".to_string())),
-            builtin_memory: false,
-            deferred_tool_servers: Vec::new(),
-        });
 
         let guarded_llm =
             baybo_llm::BillableLlm::new(Arc::clone(&wired_llm), cost_hooks(&cost_manager));
@@ -742,26 +709,7 @@ impl AgentTestHarnessBuilder {
         )));
 
         let actor_parent_token = tokio_util::sync::CancellationToken::new();
-        let actor_token = actor_parent_token.child_token();
 
-        let agent_loop = AgentLoop::from_config(baybo_agent::agent_loop::AgentLoopConfig {
-            llm_pool,
-            initial_llm: None,
-            initial_model: None,
-            initial_effort: None,
-            tool_registry: tool_registry.clone(),
-            tool_executor: tool_executor.clone(),
-            context_manager,
-            max_iterations: 20,
-            security_gateway: gateway.clone(),
-            // Mirror production for the progress observer's durable shadow and
-            // title-generation paths.
-            sessions: Some(Arc::clone(&session_manager)),
-            memory: self.memory,
-            task_store: task_store.clone(),
-            title_sink: self.title_sink,
-            asks: human_asks.clone(),
-        });
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
         // Mirror production's turn-state projector so the turn-*ended*
@@ -776,26 +724,142 @@ impl AgentTestHarnessBuilder {
         );
 
         let cron_store = Arc::new(baybo_cron::test_support::InMemoryCronStore::new());
-        let turn_lifecycle_for_harness = Arc::clone(&turn_lifecycle);
+
         let supervisor = baybo_agent::AgentSupervisor::new(
             output_tx.clone(),
             Arc::clone(&human_asks) as Arc<dyn baybo_human_ask::LivePendingAsks>,
         );
-        let actor = AgentActor::from_parts(
-            baybo_agent::state::DurableActorState::new(session.clone()),
-            baybo_agent::state::VolatileResources {
-                agent_loop,
-                response_tx: output_tx,
-                turn_lifecycle,
-                span_recorder,
-                actor_token,
-                supervisor: Some(supervisor.clone()),
-                session_manager: Arc::clone(&session_manager),
-                cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
-                workspace: Arc::clone(&workspace),
-            },
+
+        let actor_tasks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let actor_spawner: baybo_agent::router::ActorSpawner = {
+            let trace_store = trace_store.clone();
+            let actor_tasks = actor_tasks.clone();
+            let skill_registry = skill_registry.clone();
+            let session_manager = session_manager.clone();
+            let workspace = workspace.clone();
+            let tool_registry = tool_registry.clone();
+            let gateway = gateway.clone();
+            let task_store = task_store.clone();
+            let human_asks = human_asks.clone();
+            let turn_lifecycle = turn_lifecycle.clone();
+            let supervisor = supervisor.clone();
+            let cron_store = cron_store.clone();
+            Arc::new(
+                move |session,
+                      initial_llm,
+                      initial_model,
+                      initial_effort,
+                      response_tx,
+                      actor_token| {
+                    let (mailbox_tx, mailbox_rx) =
+                        baybo_agent::mailbox::channel(self.mailbox_capacity);
+                    let context_manager = ContextManager::from_config(ContextManagerConfig {
+                        agent: None,
+                        tokenizer: tokenizer.clone(),
+                        workspace: Arc::clone(&workspace),
+                        keep_recent,
+                        compression_threshold,
+                        // The harness drives compaction through the window share and a
+                        // deliberately small stub window; an absolute cap on top would
+                        // be a second trigger every such test has to reason about.
+                        max_active_tokens: 0,
+                        skill_registry: Arc::clone(&skill_registry),
+                        channel: session.channel.clone(),
+                        shape: baybo_context::prompts::soul::PromptShape::for_trigger(
+                            &session.trigger,
+                        ),
+                        session_id: session.id.clone(),
+                        sessions: Arc::clone(&session_manager),
+                        subagent_profile: Some((subagent_registry.clone(), "harness".to_string())),
+                        builtin_memory: false,
+                        deferred_tool_servers: Vec::new(),
+                    });
+                    let agent_loop =
+                        AgentLoop::from_config(baybo_agent::agent_loop::AgentLoopConfig {
+                            llm_pool: llm_pool.clone(),
+                            initial_llm,
+                            initial_model,
+                            initial_effort,
+                            tool_registry: tool_registry.clone(),
+                            tool_executor: tool_executor.clone(),
+                            context_manager,
+                            max_iterations: 20,
+                            security_gateway: gateway.clone(),
+                            // Mirror production for the progress observer's durable shadow and
+                            // title-generation paths.
+                            sessions: Some(Arc::clone(&session_manager)),
+                            memory: self.memory.clone(),
+                            task_store: task_store.clone(),
+                            title_sink: self.title_sink.clone(),
+                            asks: human_asks.clone(),
+                        });
+                    let span_recorder = Arc::new(SpanRecorder::new(
+                        session.id.clone(),
+                        session.user.id.clone(),
+                        trace_store.clone() as Arc<dyn TraceStore>,
+                        trace_event_stream.clone(),
+                    ));
+                    let actor = AgentActor::from_parts(
+                        baybo_agent::state::DurableActorState::new(session),
+                        baybo_agent::state::VolatileResources {
+                            agent_loop,
+                            response_tx,
+                            turn_lifecycle: turn_lifecycle.clone(),
+                            span_recorder,
+                            actor_token,
+                            supervisor: Some(supervisor.clone()),
+                            session_manager: Arc::clone(&session_manager),
+                            cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
+                            workspace: Arc::clone(&workspace),
+                        },
+                    );
+                    actor_tasks.lock().push(tokio::spawn(actor.run(mailbox_rx)));
+                    mailbox_tx
+                },
+            )
+        };
+        let mailbox_tx = actor_spawner(
+            session.clone(),
+            None,
+            None,
+            None,
+            output_tx,
+            actor_parent_token.child_token(),
         );
-        let actor_handle = tokio::spawn(actor.run(mailbox_rx));
+        assert!(
+            supervisor
+                .register_if_absent(session.id.clone(), mailbox_tx.clone())
+                .is_ok()
+        );
+        let router_task = self.resume_door.then(|| {
+            let agent_profiles = self
+                .store
+                .as_ref()
+                .map(|store| store.agent_profile.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new())
+                });
+            let router = baybo_agent::Router::from_config(baybo_agent::router::RouterConfig {
+                session_manager: session_manager.clone(),
+                supervisor: supervisor.clone(),
+                channels: Arc::new(baybo_channels::ChannelRegistry::new()),
+                security_gateway: gateway.clone(),
+                cost_manager: cost_manager.clone(),
+                actor_spawner,
+                turn_lifecycle: turn_lifecycle.clone(),
+                cron_store: cron_store.clone(),
+                agent_profiles,
+                cron_trigger_rx: mpsc::channel(1).1,
+                issue_run_rx: None,
+                ask_resume_rx: Some(resume_rx),
+                board: None,
+                actor_parent_token: actor_parent_token.clone(),
+                rate_limit: baybo_agent::router::LiveRateLimit::new(1, Duration::from_secs(1)),
+                workspace,
+                inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),
+            });
+            tokio::spawn(router.run(mpsc::channel(1).1, mpsc::channel(1).1))
+        });
 
         AgentTestHarness {
             session,
@@ -804,7 +868,7 @@ impl AgentTestHarnessBuilder {
             vault,
             secret_store,
             turn_store,
-            turn_lifecycle: turn_lifecycle_for_harness,
+            turn_lifecycle,
             cost_store,
             trace_store,
             tool_registry,
@@ -825,7 +889,8 @@ impl AgentTestHarnessBuilder {
             strict_rejections,
             mailbox: mailbox_tx,
             outputs: output_rx,
-            actor_handle: Some(actor_handle),
+            actor_tasks,
+            router_task,
         }
     }
 }
@@ -897,30 +962,6 @@ impl LlmCompletion for GatedChat {
     fn audio_delivery(&self) -> baybo_llm::AudioDelivery {
         self.inner.audio_delivery()
     }
-}
-
-/// The chat Resume door with the router cut out: the production sink queues
-/// the request, and this forwards what the router's own rule
-/// (`resume_message`) makes of it to the one actor the harness hosts.
-fn resume_door(
-    sessions: Arc<baybo_agent::SessionManager>,
-    mailbox: MailboxSender<AgentMessage>,
-) -> baybo_agent::runtime::asks::RouterResumeSink {
-    let (sink, mut rx) = baybo_agent::runtime::asks::RouterResumeSink::channel();
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            let Ok(Some(session)) = sessions.get(&req.session_id).await else {
-                continue;
-            };
-            let Some(message) = baybo_agent::runtime::asks::resume_message(&session, &req) else {
-                continue;
-            };
-            if mailbox.send(message).await.is_err() {
-                return;
-            }
-        }
-    });
-    sink
 }
 
 /// A provider that rejects a transcript whose `tool_use` is not answered

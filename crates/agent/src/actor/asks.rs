@@ -44,7 +44,6 @@ impl AgentActor {
                 Some(response_tx),
                 None,
                 None,
-                None,
             )
             .await?;
         self.send_user_reply(response).await;

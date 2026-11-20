@@ -111,15 +111,31 @@ impl HumanAskManager {
                 ask_id: ask_id.clone(),
             });
         }
-        if self.close_if_unanswerable(&mut row).await?
-            || !self.core.claim(&mut row, resolution.clone()).await?
-        {
+        let queue = self.queues.get(&row.channel);
+        let _answer = if row.is_pending() && !resumable(row.kind, row.phase) {
+            let guard = match &queue {
+                Some(queue) => queue.begin_answer(ask_id)?,
+                None => None,
+            };
+            if guard.is_none() {
+                if self.abandon_row(&mut row).await? {
+                    self.core.mark_applied(ask_id).await?;
+                }
+                return Err(HumanAskError::AskClosed {
+                    ask_id: ask_id.clone(),
+                });
+            }
+            guard
+        } else {
+            None
+        };
+        if !self.core.claim(&mut row, resolution.clone()).await? {
             return Err(HumanAskError::AskClosed {
                 ask_id: ask_id.clone(),
             });
         }
 
-        let delivered = match self.queues.get(&row.channel) {
+        let delivered = match queue {
             Some(queue) => queue
                 .resolve(ask_id, resolution)
                 .is_some_and(|removed| removed.delivered),
@@ -347,19 +363,6 @@ impl HumanAskManager {
             .get(&row.channel)
             .and_then(|queue| queue.liveness(&row.ask_id))
             .unwrap_or(false)
-    }
-
-    /// A pending ask nothing can apply an answer to: not resumable, and the
-    /// tool future that raised it is gone. Close it as abandoned so a late
-    /// answer is refused instead of recorded as a decision nothing carries
-    /// out. `Ok(true)` when `row` was such an ask.
-    async fn close_if_unanswerable(&self, row: &mut HumanAskRow) -> Result<bool> {
-        if !row.is_pending() || resumable(row.kind, row.phase) || self.is_live(row) {
-            return Ok(false);
-        }
-        self.abandon_row(row).await?;
-        self.core.mark_applied(&row.ask_id).await?;
-        Ok(true)
     }
 
     async fn abandon_row(&self, row: &mut HumanAskRow) -> Result<bool> {
