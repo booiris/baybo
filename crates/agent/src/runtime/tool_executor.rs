@@ -1191,7 +1191,10 @@ impl ToolExecutor {
 
                 let needs_approval = prepared
                     .as_ref()
-                    .is_some_and(|p| !p.ask.accesses.is_empty());
+                    // An explicit ask without resources cannot be satisfied by resource grants.
+                    .is_some_and(|p| {
+                        p.authorized_accesses.is_empty() || !p.ask.accesses.is_empty()
+                    });
                 let outcome = match (&pre_execute, prepared.as_ref()) {
                     (PreExecuteGate::PreDecided { decision, .. }, _)
                         if resume_during_execute
@@ -3293,6 +3296,96 @@ mod tests {
         ) -> baybo_tools::Result<ToolOutput> {
             self.ran.store(true, Ordering::SeqCst);
             Ok(ToolOutput::Text("ok".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_free_pre_execute_asks_require_a_decision() {
+        struct ConfirmationTool {
+            cacheable: bool,
+            ran: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl baybo_tools::Tool for ConfirmationTool {
+            fn name(&self) -> &str {
+                "confirmation"
+            }
+            fn description(&self) -> String {
+                "requires explicit confirmation".to_owned()
+            }
+            fn parameters_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            async fn pre_execute_ask(
+                &self,
+                _params: &Value,
+                _ctx: &ToolContext,
+                _check: PreExecuteCheck,
+            ) -> Option<PreExecuteAsk> {
+                Some(PreExecuteAsk {
+                    accesses: Vec::new(),
+                    cacheable: self.cacheable,
+                    description: Some("Confirm this operation".to_owned()),
+                    params_preview: None,
+                })
+            }
+            async fn execute(
+                &self,
+                _params: Value,
+                _ctx: &ToolContext,
+            ) -> baybo_tools::Result<ToolOutput> {
+                self.ran.store(true, Ordering::SeqCst);
+                Ok(ToolOutput::Text("ok".to_owned()))
+            }
+        }
+
+        for cacheable in [false, true] {
+            for decision in [ApprovalDecision::Deny, ApprovalDecision::ApproveAlways] {
+                for resumed in [false, true] {
+                    let ran = Arc::new(AtomicBool::new(false));
+                    let (gate, recorded) = RecordingGate::new(ApprovalOutcome::answered(decision));
+                    let mut registry = ToolRegistry::new();
+                    registry.register(
+                        Arc::new(ConfirmationTool {
+                            cacheable,
+                            ran: Arc::clone(&ran),
+                        }),
+                        authorization_manifest("confirmation"),
+                    );
+                    let grants = vec![ApprovedResource::ExecCommand {
+                        command: "echo elevated".to_owned(),
+                    }];
+                    let approved = Arc::new(Mutex::new(grants.clone()));
+                    let mode = if resumed {
+                        PreExecuteGate::PreDecided {
+                            decision,
+                            phase: AskPhase::BeforeExecute,
+                            accesses: Vec::new(),
+                        }
+                    } else {
+                        PreExecuteGate::Ask
+                    };
+                    let (executed, _) = execute_authorization_registration(
+                        Arc::new(registry),
+                        "confirmation".to_owned(),
+                        gate,
+                        Arc::clone(&approved),
+                        true,
+                        None,
+                        mode,
+                    )
+                    .await;
+                    assert_eq!(recorded.lock().len(), usize::from(!resumed));
+                    assert_eq!(executed.approval, Some(decision));
+                    assert_eq!(executed.output.is_ok(), decision != ApprovalDecision::Deny);
+                    assert_eq!(
+                        ran.load(Ordering::SeqCst),
+                        decision != ApprovalDecision::Deny
+                    );
+                    assert_eq!(*approved.lock(), grants);
+                }
+            }
         }
     }
 

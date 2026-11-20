@@ -54,7 +54,8 @@ pub enum PreExecuteCheck {
 /// The executor runs this before `Tool::execute`, consults the session
 /// approval cache only when `cacheable` is `true`, and raises an
 /// [`baybo_model::human_ask::AskPhase::BeforeExecute`] prompt if any access
-/// remains uncovered.
+/// remains uncovered. An explicit ask with no accesses always requires a
+/// decision; resource grants cannot satisfy an operation-level confirmation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreExecuteAsk {
     /// Concrete resources this call asks to access.
