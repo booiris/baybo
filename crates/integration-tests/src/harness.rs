@@ -111,7 +111,7 @@ pub struct AgentTestHarness {
     pub human_asks: Arc<HumanAskManager>,
     /// Parent of the actor's token. Cancelling it is what process shutdown
     /// does: every turn the actor runs reads the cancel as `Ancestor`.
-    pub actor_parent_token: tokio_util::sync::CancellationToken,
+    pub actor_root_token: tokio_util::sync::CancellationToken,
     /// Supervises the harness session across idle eviction and rehydration.
     pub supervisor: baybo_agent::AgentSupervisor,
     /// LLM requests the strict provider fake refused because a `tool_use`
@@ -704,7 +704,7 @@ impl AgentTestHarnessBuilder {
                 .expect("stub pool default present"),
         )));
 
-        let actor_parent_token = tokio_util::sync::CancellationToken::new();
+        let actor_root_token = tokio_util::sync::CancellationToken::new();
 
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
@@ -716,7 +716,7 @@ impl AgentTestHarnessBuilder {
             Arc::clone(&turn_lifecycle),
             Arc::clone(&session_manager),
             output_tx.clone(),
-            actor_parent_token.child_token(),
+            actor_root_token.child_token(),
         );
 
         let cron_store = Arc::new(baybo_cron::test_support::InMemoryCronStore::new());
@@ -724,7 +724,7 @@ impl AgentTestHarnessBuilder {
         let supervisor = baybo_agent::AgentSupervisor::new(
             output_tx.clone(),
             Arc::clone(&human_asks) as Arc<dyn baybo_human_ask::LivePendingAsks>,
-            actor_parent_token.clone(),
+            actor_root_token.clone(),
         );
 
         let actor_spawner: baybo_agent::router::ActorSpawner = {
@@ -805,7 +805,7 @@ impl AgentTestHarnessBuilder {
             baybo_model::LlmPin::unpinned(),
             Some(supervisor.clone()),
             output_tx,
-            actor_parent_token.child_token(),
+            actor_root_token.child_token(),
         );
         assert!(
             supervisor
@@ -864,7 +864,7 @@ impl AgentTestHarnessBuilder {
             ask_core,
             ask_queues,
             human_asks,
-            actor_parent_token,
+            actor_root_token,
             supervisor,
             strict_rejections,
             #[cfg(test)]
@@ -1031,7 +1031,7 @@ mod tests {
             baybo_model::LlmPin::unpinned(),
             None,
             tx,
-            harness.supervisor.parent_token().child_token(),
+            harness.supervisor.root_token().child_token(),
         );
         (mailbox, rx)
     }
@@ -1061,7 +1061,7 @@ mod tests {
     async fn shutdown_joins_open_mailboxes_and_rejects_a_racing_spawn() {
         let harness = AgentTestHarness::builder().build();
         let (once, _outputs) = spawn_oneshot(&harness);
-        let shutdown = harness.supervisor.parent_token();
+        let shutdown = harness.supervisor.root_token();
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(harness.supervisor.shutdown_all(), async {
                 shutdown.cancelled().await;

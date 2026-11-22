@@ -84,12 +84,9 @@ pub struct VolatileResources {
     pub response_tx: mpsc::Sender<AgentOutput>,
     pub turn_lifecycle: Arc<TurnLifecycle>,
     pub span_recorder: Arc<SpanRecorder>,
-    /// Lifetime token for this actor. Derived as a child of the
-    /// `parent_token` passed at construction. For top-level user/cron
-    /// sessions the parent is the process-wide actor parent token; for
-    /// subagent children it is the originating parent actor's
-    /// `actor_token`, so parent shutdown cascades automatically via the
-    /// `tokio_util` token tree.
+    /// Lifetime token for this actor. Top-level actors and background-eligible
+    /// subagents derive it from the supervisor's root token. Foreground-only
+    /// subagents derive it from the spawning call's cancellation token.
     pub actor_token: CancellationToken,
     /// Routed actors register their active turn for idle release and remove their
     /// mailbox on exit. One-shot actors have no routing entry.

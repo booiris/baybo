@@ -56,7 +56,7 @@ pub struct InFlightJob {
 /// suppress signal (an escort whose entry is gone delivers nothing). Process-local (background dispatches don't survive restart).
 #[derive(Clone)]
 pub struct AgentSupervisor {
-    parent: CancellationToken,
+    root: CancellationToken,
     tasks: TaskTracker,
     actors: Arc<DashMap<SessionId, MailboxSender<AgentMessage>>>,
     response_tx: mpsc::Sender<AgentOutput>,
@@ -96,10 +96,10 @@ impl AgentSupervisor {
     pub fn new(
         response_tx: mpsc::Sender<AgentOutput>,
         live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
-        parent: CancellationToken,
+        root: CancellationToken,
     ) -> Self {
         Self {
-            parent,
+            root,
             tasks: TaskTracker::new(),
             actors: Arc::new(DashMap::new()),
             response_tx,
@@ -109,8 +109,9 @@ impl AgentSupervisor {
         }
     }
 
-    pub fn parent_token(&self) -> CancellationToken {
-        self.parent.clone()
+    /// Root of the actor cancellation tree, a child of the process shutdown token.
+    pub fn root_token(&self) -> CancellationToken {
+        self.root.clone()
     }
 
     pub fn spawn_actor(
@@ -125,7 +126,7 @@ impl AgentSupervisor {
         let task =
             self.tasks
                 .track_future(crate::actor::runner::run_actor(actor, mailbox, trace_store));
-        if !self.parent.is_cancelled() {
+        if !self.root.is_cancelled() {
             tokio::spawn(task);
         }
         sender
@@ -345,7 +346,7 @@ impl AgentSupervisor {
         spawn: &crate::actor::router::ActorSpawner,
         pins: impl Future<Output = baybo_model::LlmPin>,
     ) -> bool {
-        if self.parent.is_cancelled() {
+        if self.root.is_cancelled() {
             return false;
         }
         let sender = self.actors.get(&session.id).map(|e| e.value().clone());
@@ -364,7 +365,7 @@ impl AgentSupervisor {
                 pins,
                 Some(self.clone()),
                 self.response_tx.clone(),
-                self.parent.child_token(),
+                self.root.child_token(),
             )
         })
         .await
@@ -381,7 +382,7 @@ impl AgentSupervisor {
         F: FnOnce() -> MailboxSender<AgentMessage>,
     {
         use dashmap::Entry;
-        if self.parent.is_cancelled() {
+        if self.root.is_cancelled() {
             return false;
         }
         let sender = match self.actors.entry(session_id.clone()) {
@@ -545,7 +546,7 @@ impl AgentSupervisor {
 
     /// Cancel actors and wait for their final writes, including panic recovery.
     pub async fn shutdown_all(&self) {
-        self.parent.cancel();
+        self.root.cancel();
         self.tasks.close();
         self.tasks.wait().await;
     }

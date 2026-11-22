@@ -732,7 +732,7 @@ impl Router {
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) =
-            self.spawn_oneshot_actor(session, pins, response_tx, &self.supervisor.parent_token());
+            self.spawn_oneshot_actor(session, pins, response_tx, &self.supervisor.root_token());
 
         match mailbox.send(trigger).await {
             Ok(()) => {

@@ -42,7 +42,7 @@ pub struct SubagentSpawnerConfig {
     pub dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
     pub cost_manager: Arc<CostManager>,
     pub turn_lifecycle: Arc<TurnLifecycle>,
-    pub actor_parent_token: CancellationToken,
+    pub actor_root_token: CancellationToken,
     pub external_agents: Arc<ExternalAgentRegistry>,
     pub llm_pool: LlmPoolHandle,
     pub workspace_paths: Arc<WorkspacePaths>,
@@ -60,7 +60,7 @@ pub struct ActorSubagentSpawner {
     dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
     cost_manager: Arc<CostManager>,
     turn_lifecycle: Arc<TurnLifecycle>,
-    actor_parent_token: CancellationToken,
+    actor_root_token: CancellationToken,
     external_agents: Arc<ExternalAgentRegistry>,
     llm_pool: LlmPoolHandle,
     workspace_paths: Arc<WorkspacePaths>,
@@ -74,7 +74,7 @@ impl ActorSubagentSpawner {
             dispatch_limiter,
             cost_manager,
             turn_lifecycle,
-            actor_parent_token,
+            actor_root_token,
             external_agents,
             llm_pool,
             workspace_paths,
@@ -85,7 +85,7 @@ impl ActorSubagentSpawner {
             dispatch_limiter,
             cost_manager,
             turn_lifecycle,
-            actor_parent_token,
+            actor_root_token,
             external_agents,
             llm_pool,
             workspace_paths,
@@ -148,12 +148,12 @@ impl ActorSubagentSpawner {
     /// The token a child's work hangs off. A child the parent may hand to the
     /// background must outlive the dispatching turn — the turn that emitted
     /// `spawn_subagent` ends as soon as the tool returns — so it anchors to
-    /// the process-wide token (shutdown still cascades). Otherwise it stays
+    /// the actor root token (shutdown still cascades). Otherwise it stays
     /// on the parent's per-turn scope. Either way the parent stops it through
     /// the run's own `cancel` while it waits in the foreground.
     fn anchor(&self, parent_ctx: &SubagentParentContext) -> CancellationToken {
         if parent_ctx.background_eligible {
-            self.actor_parent_token.clone()
+            self.actor_root_token.clone()
         } else {
             parent_ctx.cancel_token.clone()
         }

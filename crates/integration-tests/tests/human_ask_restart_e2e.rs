@@ -157,7 +157,7 @@ async fn raise_then_shut_down(db: &Path, session: &Session, runs: &Arc<AtomicUsi
     assert_eq!(rows.len(), 1, "{rows:?}");
     let ask_id = rows[0].ask_id.clone();
 
-    harness.actor_parent_token.cancel();
+    harness.actor_root_token.cancel();
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
         completed_for_call(&outputs),
@@ -418,7 +418,7 @@ async fn a_message_queued_behind_a_parked_turn_does_not_run_at_shutdown() {
 
     harness.send_text("never mind").await.expect("send");
     reply(&harness, "ok");
-    harness.actor_parent_token.cancel();
+    harness.actor_root_token.cancel();
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     assert!(!replied(&outputs, "ok"), "{outputs:#?}");
@@ -628,7 +628,7 @@ async fn an_answer_to_a_repeated_tool_use_id_survives_a_restart() {
             renamed, CALL_ID,
             "the repeat is renamed before it is recorded"
         );
-        harness.actor_parent_token.cancel();
+        harness.actor_root_token.cancel();
         harness.drain_outputs(DRAIN_TIMEOUT).await;
         tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
             .await
@@ -944,7 +944,7 @@ async fn a_turn_parked_on_two_asks_resumes_on_the_last_answer() {
         })
         .await
         .expect("both calls park on an approval");
-        harness.actor_parent_token.cancel();
+        harness.actor_root_token.cancel();
         harness.drain_outputs(DRAIN_TIMEOUT).await;
         tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
             .await

@@ -218,7 +218,7 @@ async fn a_turn_cancel_racing_an_answer_still_appends_exactly_one_result() {
 async fn shutdown_leaves_the_parked_ask_pending_and_the_tool_use_dangling() {
     let (mut harness, runs, row) = parked_turn().await;
 
-    harness.actor_parent_token.cancel();
+    harness.actor_root_token.cancel();
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     let after = harness.ask_store.row(&row.ask_id).expect("row kept");

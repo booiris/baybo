@@ -387,7 +387,7 @@ impl Router {
         let mut cron_rx = self.cron_trigger_rx.take();
         let mut issue_rx = self.issue_run_rx.take();
         let mut resume_rx = self.ask_resume_rx.take();
-        let shutdown = self.supervisor.parent_token();
+        let shutdown = self.supervisor.root_token();
 
         loop {
             tokio::select! {

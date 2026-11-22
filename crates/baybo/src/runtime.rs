@@ -1142,7 +1142,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     baybo_agent::supervisor::spawn_idle_reaper(
         supervisor.clone(),
         Arc::clone(&graph.session_manager),
-        supervisor.parent_token(),
+        supervisor.root_token(),
     );
 
     // Turn-state projector: the single producer of the web chat's live
@@ -1154,7 +1154,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         Arc::clone(&graph.turn_lifecycle),
         Arc::clone(&graph.session_manager),
         supervisor.response_tx().clone(),
-        supervisor.parent_token(),
+        supervisor.root_token(),
     );
 
     let workspace_paths_for_router = Arc::new(baybo_workspace::WorkspacePaths::new(
@@ -1189,7 +1189,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                 dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
                 cost_manager: Arc::clone(&cost_manager),
                 turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
-                actor_parent_token: supervisor.parent_token(),
+                actor_root_token: supervisor.root_token(),
                 external_agents: Arc::clone(&external_agents),
                 llm_pool: Arc::clone(&llm_pool),
                 workspace_paths: Arc::clone(&workspace_paths_for_router),

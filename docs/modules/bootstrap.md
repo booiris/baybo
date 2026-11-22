@@ -100,7 +100,7 @@ GatewayServer + ChannelServer bound; tokio::select! { admin, channel, router, sh
 `build_managers` constructs the shared `AgentSupervisor` with the router
 response channel. During teardown, `ManagerGraph::shutdown` calls
 `AgentSupervisor::shutdown_all`, which closes actor admission and cancels
-the parent token shared by session and one-shot actors. It waits for turn
+the root of the actor cancellation tree. It waits for turn
 settlement, final session saves and actor panic recovery alongside MCP and
 sandbox shutdown, under the same deadline.
 

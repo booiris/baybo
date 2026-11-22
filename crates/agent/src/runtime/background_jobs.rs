@@ -100,7 +100,7 @@ impl BackgroundJobControl for BackgroundJobManager {
 /// cannot tear the parent down between the job ending and its result
 /// reaching the mailbox.
 async fn escort(supervisor: AgentSupervisor, job: DetachedJob) {
-    let shutdown = supervisor.parent_token();
+    let shutdown = supervisor.root_token();
     let DetachedJob {
         handle,
         parent,

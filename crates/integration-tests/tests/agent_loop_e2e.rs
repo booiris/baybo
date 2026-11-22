@@ -1747,7 +1747,7 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
     let supervisor = harness.supervisor.clone();
-    let shutdown = supervisor.parent_token();
+    let shutdown = supervisor.root_token();
     let killed = CancellationToken::new();
     let manager =
         BackgroundJobManager::new(supervisor.clone(), Arc::clone(&harness.session_manager));

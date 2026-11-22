@@ -70,13 +70,13 @@ impl Router {
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
             board: Arc::clone(&board),
-            shutdown: self.supervisor.parent_token(),
+            shutdown: self.supervisor.root_token(),
         };
 
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) =
-            self.spawn_oneshot_actor(session, pins, response_tx, &self.supervisor.parent_token());
+            self.spawn_oneshot_actor(session, pins, response_tx, &self.supervisor.root_token());
 
         let trigger = AgentMessage::IssueRun {
             run_id: run_id.clone(),
