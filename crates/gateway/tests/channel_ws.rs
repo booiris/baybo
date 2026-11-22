@@ -1782,6 +1782,15 @@ async fn resolve_approval_frame_answers_through_the_ledger() {
 /// `decision: None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn answer_question_frame_and_subscribe_state_pending_questions() {
+    exercise_question_clients(ChannelType::owner()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_clients_restore_answer_and_close_a_shared_question() {
+    exercise_question_clients(ChannelType::tui()).await;
+}
+
+async fn exercise_question_clients(channel: ChannelType) {
     use baybo_model::human_ask::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
@@ -1798,9 +1807,9 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
             User {
                 id: WEB_OPERATOR_USER_ID.into(),
                 name: None,
-                channel: ChannelType::owner(),
+                channel: channel.clone(),
             },
-            ChannelType::owner(),
+            channel.clone(),
         )
         .await
         .expect("create session");
@@ -1809,24 +1818,47 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
     let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
         .await
         .expect("bind admin server");
-    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
+    let tui_token = (channel == ChannelType::tui()).then(|| {
+        tg.deps.channel_tokens.mint(ClientIdentity {
+            pid: std::process::id(),
+            label: TUI_CLIENT_LABEL.to_string(),
+            bound_channel_type: None,
+        })
+    });
+    let subscribe = async || {
+        let mut ws = if let Some(handle) = &tui_token {
+            connect_register_with_channel_token(port, handle.token(), channel.clone())
+                .await
+                .expect("TUI handshake")
+        } else {
+            connect_register(port, &tg.deps.admin_token, channel.clone())
+                .await
+                .expect("owner handshake")
+        };
+        send_frame(
+            &mut ws,
+            Frame::Subscribe {
+                session_id: session.id.clone(),
+            },
+        )
         .await
-        .expect("tab_a handshake");
-    send_frame(
-        &mut tab_a,
-        Frame::Subscribe {
-            session_id: session.id.clone(),
-        },
-    )
-    .await
-    .expect("tab_a Subscribe");
+        .expect("subscribe");
+        if channel == ChannelType::tui() {
+            assert!(matches!(
+                recv_frame(&mut ws, Duration::from_secs(2)).await.unwrap(),
+                Frame::HistorySnapshot { .. }
+            ));
+        }
+        ws
+    };
+    let mut tab_a = subscribe().await;
     expect_idle_subscribe_state(&mut tab_a, session.id.as_str()).await;
 
     let gate = tg
         .deps
         .channel_registry
-        .get(&ChannelType::owner())
-        .expect("owner channel")
+        .get(&channel)
+        .expect("installed channel")
         .question_gate()
         .expect("question gate");
     let questions = vec![Question {
@@ -1855,13 +1887,14 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
             questions: questions.clone(),
         },
     };
+    let site = baybo_tools::AskSite {
+        channel: channel.clone(),
+        ..baybo_tools::AskSite::for_test()
+    };
+    let first_site = site.clone();
     let parked1 = tokio::spawn(async move {
         gate_clone
-            .ask(
-                q1,
-                baybo_tools::AskSite::for_test(),
-                baybo_tools::AskCancel::never(),
-            )
+            .ask(q1, first_site, baybo_tools::AskCancel::never())
             .await
     });
 
@@ -1887,17 +1920,7 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
     }
 
     // Late subscriber sees the pending question in `SubscribeState`.
-    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
-        .await
-        .expect("tab_b handshake");
-    send_frame(
-        &mut tab_b,
-        Frame::Subscribe {
-            session_id: session.id.clone(),
-        },
-    )
-    .await
-    .expect("tab_b Subscribe");
+    let mut tab_b = subscribe().await;
     match recv_frame(&mut tab_b, Duration::from_secs(2))
         .await
         .expect("SubscribeState on tab_b")
@@ -1988,14 +2011,8 @@ async fn answer_question_frame_and_subscribe_state_pending_questions() {
             questions: questions.clone(),
         },
     };
-    let parked2 = tokio::spawn(async move {
-        gate.ask(
-            q2,
-            baybo_tools::AskSite::for_test(),
-            baybo_tools::AskCancel::never(),
-        )
-        .await
-    });
+    let parked2 =
+        tokio::spawn(async move { gate.ask(q2, site, baybo_tools::AskCancel::never()).await });
     loop {
         match recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
             .await

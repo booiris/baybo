@@ -27,6 +27,7 @@ use std::time::Duration;
 use baybo_channels::MessageRole;
 use baybo_channels::wire::{self, Frame, Message};
 use baybo_model::ResourceAccess;
+use baybo_model::human_ask::{Question, QuestionOption};
 use baybo_model::{ChannelType, SessionId};
 use baybo_tui::TuiAdapter;
 use baybo_tui::client::WsTransport;
@@ -92,6 +93,21 @@ async fn stub_gateway(listener: TcpListener) {
             }
             // The TUI echoes this back when the user resolves the approval
             // modal; close the loop with a follow-up reply.
+            Frame::AnswerQuestion {
+                ask_id,
+                reply: wire::QuestionReply::Answered { answers },
+            } if answers.len() == 1 && answers[0].selected == ["Release"] => {
+                send(
+                    &mut sink,
+                    &Frame::AskResolved {
+                        ask_id,
+                        outcome: wire::AskOutcomeKind::Answered,
+                        decision: None,
+                    },
+                )
+                .await;
+                send(&mut sink, &reply(&session_id, QUESTION_REPLY)).await;
+            }
             Frame::ResolveApproval { .. } => {
                 send(&mut sink, &reply(&session_id, APPROVAL_REPLY)).await;
             }
@@ -118,6 +134,29 @@ async fn dispatch(sink: &mut SplitWsSink, sid: &SessionId, text: &str) {
             )
             .await;
             send(sink, &reply(sid, SUBAGENT_REPLY)).await;
+        }
+        SAY_QUESTION => {
+            send(
+                sink,
+                &Frame::QuestionAsked {
+                    ask_id: "build".parse().expect("test ask id"),
+                    session_id: sid.clone(),
+                    tool_call_id: "call-build".into(),
+                    user_id: String::new(),
+                    questions: vec![Question {
+                        header: "Build".into(),
+                        question: QUESTION_TEXT.into(),
+                        options: ["Debug", "Release"]
+                            .map(|label| QuestionOption {
+                                label: label.into(),
+                                description: format!("{label} build"),
+                            })
+                            .into(),
+                        multi_select: false,
+                    }],
+                },
+            )
+            .await;
         }
         SAY_APPROVAL => {
             send(sink, &approval_request(sid)).await;

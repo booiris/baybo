@@ -182,6 +182,8 @@ so `prompt` uses lock acquisition as a gateway-presence probe:
   `tui` channel and subscribing it to the session — the in-process mirror
   of the gateway's WS sink.
 
+A gateway-backed `baybo prompt` cancels structured questions because the command has no interactive form. In-process turns run without a question gate. `--dangerously-allow-all` controls tool approvals only.
+
 **Output.** stdout carries only the assistant's answer (streamed as it
 generates); reasoning / tool / status events are dropped and notices go to
 stderr, so `baybo prompt … > out.txt` captures just the answer. Tracing

@@ -244,9 +244,7 @@ pub enum Commands {
     /// `gateway.tui_token`. If the gateway is unreachable the
     /// command exits with an error block describing how to start one.
     Tui {
-        /// Resume an existing session by id instead of creating a new
-        /// one. Sessions created with a different channel (http) are
-        /// acceptable; the TUI just pins to that id.
+        /// Resume an existing TUI session and its pending questions or approvals.
         #[arg(long, value_name = "SESSION_ID")]
         session: Option<String>,
         /// Dev-only: if the gateway is unreachable, spawn one as a

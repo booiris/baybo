@@ -219,9 +219,15 @@ Typing while the agent is busy no longer parks the message in a hidden queue wit
 - Approval requests render **inline** (no overlay modal): while pending, as a live prompt in the bottom region driven by `AppState.pending_approval: Option<ApprovalChatEntry>`; once resolved, as a committed scrollback line (see below).
 - When pending, the entry is expanded: tool name, resource accesses, params preview, and three selectable options (`Approve` / `Always approve` / `Deny`). The user navigates options with `Up`/`Down` (or `k`/`j`) and confirms with `Enter`, or presses a direct shortcut (`a`/`A`/`d`).
 - After resolution the entry collapses to a single dot-led line with the decision, tool name, and the first resource access detail — e.g. `● approved: Bash (echo hello)` or `● denied: Read (/etc/shadow)`. Because the tool's scrollback block is deferred until completion, this line is **buffered onto its `RunningTool`** (matched by the approval's `tool_call_id`, via `AppState::buffer_approval_line`) rather than committed immediately, so it lands between the tool's `●` and `⎿` when the block commits. If no in-flight tool matches (shouldn't happen), it's committed standalone so the decision isn't lost. Normal input resumes immediately.
-- Approvals originate on the gateway, which owns the ask. The WS transport shows each `Frame::ApprovalRequested` (and each card in a `SubscribeState`) on the client's own `PendingApprovals` list (`crates/tui/src/client/approvals.rs`); a re-sent card replaces itself in place. The modal renders the list's head, and `answer_head(decision)` takes it off and queues the answer, which a task spawned by `WsTransport::connect` sends as `Frame::ResolveApproval` over the same socket. Inbound `Frame::AskResolved` frames close the card — useful when a second frontend resolves the same entry, or the ask closes undecided.
+- The gateway owns the asks. The TUI displays the oldest card in its session and sends approval decisions with the displayed ask ID. A close from another client or an abandoned turn immediately advances the queue.
 - The server side does not time out (only a during-execute approval expires, after 30 min): the gateway's ask stays pending (durably, across a restart) until someone answers it or the turn moves on, and `Frame::AskResolved` closes the card whichever way it ends.
 - If multiple approvals are queued (concurrent tool calls), resolving one auto-surfaces the next into the scrollback.
+
+### AskUser questions
+
+A structured question takes the place of the chat input. Its draft is separate from the chat draft and input history. Use the number beside an option to select it. For a multi-select question, pressing the number again removes the selection. Press `o` to type a custom answer and `Enter` to finish editing it. Use `Tab` to review the other questions. `Enter` moves to the first unanswered question or submits the completed form. Outside the text editor, `Esc` cancels the ask, `Ctrl-X` sends `/stop`, and `Ctrl-C` exits with the ask still pending.
+
+Reopen the same session with `baybo tui --session <id>` to restore its outstanding cards. A subscribe snapshot replaces the local queue in gateway order. A live `AskResolved` removes the matching card on every subscribed terminal. Draft answers stay local until submitted.
 
 ### Dashboard
 
@@ -415,12 +421,8 @@ concrete transport used by the TUI. The adapter holds an
   the same WS for the currently pinned session (the pump re-reads the
   pin on every frame, so a `/new`-driven `switch_session(new_id)` rolls
   over without a stream restart) and translate them into
-  `TransportEvent::{StreamDelta, ToolStarted, ToolCompleted, Status, Response, Notice, ApprovalRequested}`. `Frame::Reasoning` is dropped (no variant) — the TUI shows a working indicator instead of the thinking trace.
-- `approvals()` — the transport's `PendingApprovals`. On construction,
-  `WsTransport::connect` spawns the task that sends each
-  `answer_head(decision)` back as `Frame::ResolveApproval { ask_id, decision }`
-  over the WS; without it the modal would close the card while the gateway
-  went on waiting.
+  `TransportEvent::{StreamDelta, ToolStarted, ToolCompleted, Status, Response, Notice, AsksChanged}`. `Frame::Reasoning` is dropped (no variant) — the TUI shows a working indicator instead of the thinking trace.
+- `asks()` returns the unified pending-card queue. The subscribe pump sends `ResolveApproval` and `AnswerQuestion` over the registered socket.
 
 The old `TuiTransport` trait was collapsed away — there was only
 ever one production impl, no mocks used it, and the wire path always
@@ -436,7 +438,7 @@ does not need to know about the transport:
 - `ToolStarted { call_id, tool, label }` / `ToolCompleted { call_id, status, summary }` → the matching `AppEvent` variants. `ToolStarted` records a live `RunningTool` (working-zone row) and commits nothing; `ToolCompleted` pops it and commits the whole `● tool` + (buffered approval) + `⎿ summary` block as one unit, so results stay under their tool across concurrent calls — see [Chat](#chat). `Frame::Reasoning` has no `TransportEvent`/`AppEvent` mapping — the pump drops it (the working indicator stands in for the thinking trace).
 - `Response(blocks)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. Finalises the response via `finalize_stream` (commit the trailing partial + non-text extras, or render the body from blocks when nothing streamed — see [Chat](#chat)), then clears `AppState.streaming`.
 - `Notice { level, text }` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log surface.
-- `ApprovalRequested` / `AskResolved` — see [Inline approval prompt](#inline-approval-prompt).
+- `ApprovalRequested`, `QuestionAsked`, and `AskResolved` update the shared pending list and emit `AsksChanged`.
 
 Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS frames are fed in.
 
@@ -481,7 +483,7 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 | `model`    | `ContentBlock` for rendering assistant messages; `ChannelType::tui()`, `User` used when constructing `IncomingMessage` |
 | `gateway`  | Server-side owner of sessions, approvals, outbound frame fan-out, and the vault-encrypted input-history store. The TUI talks to it over `/v1/channel-ws` (WebSocket + MessagePack) |
 | `channels` | Trait definitions only: `SlashHandler`, `SlashOutcome`, `ViewKind`, `DashboardProvider`, `DashboardSnapshot`, `IncomingMessage`, `NoticeLevel`, `ChannelError`. No TUI code. |
-| `tools` | Approval payload types: `ApprovalDecision`, `ApprovalRequest`, `ResourceAccess`. The TUI's own `PendingApprovals` holds the cards; it does not depend on `human-ask`. |
+| `tools` | Approval payload types: `ApprovalDecision`, `ApprovalRequest`, `ResourceAccess`. The TUI's own `PendingAsks` holds the cards; it does not depend on `human-ask`. |
 
 ## Verification
 

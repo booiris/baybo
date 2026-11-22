@@ -455,11 +455,6 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                         tracing::warn!(error = %e, %session_id, "subscribe channel check failed; proceeding");
                     }
                 }
-                let conn_id = sidecar.connection_id();
-                if let Err(e) = sub.subscribe(conn_id, session_id.clone()) {
-                    tracing::warn!(error = %e, %session_id, "subscribe failed");
-                    continue;
-                }
                 // TUI clients get a one-shot input-history ring
                 // from the gateway-owned vault when they
                 // subscribe so they can rehydrate scrollback.
@@ -487,6 +482,13 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                     {
                         tracing::warn!(error = %e, "failed to send HistorySnapshot");
                     }
+                }
+                // A live ask can fan out as soon as this connection subscribes. Queue
+                // TUI history first to keep that handshake frame ahead of live events.
+                let conn_id = sidecar.connection_id();
+                if let Err(e) = sub.subscribe(conn_id, session_id.clone()) {
+                    tracing::warn!(error = %e, %session_id, "subscribe failed");
+                    continue;
                 }
                 // The one atomic state-plane bundle — everything a
                 // client needs to know the moment it starts listening.

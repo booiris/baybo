@@ -20,8 +20,10 @@ use ratatui::widgets::TableState;
 
 use baybo_tools::{ApprovalDecision, ResourceAccess};
 
-use crate::client::PendingApprovals;
+use crate::client::{PendingAsks, PendingCard};
 use crate::markdown::MarkdownStream;
+use crate::question::QuestionForm;
+use baybo_model::human_ask::AskId;
 
 const HISTORY_CAP: usize = 500;
 
@@ -29,6 +31,7 @@ const HISTORY_CAP: usize = 500;
 /// committed as a one-line summary to scrollback (once resolved).
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovalChatEntry {
+    pub ask_id: AskId,
     /// The blocked tool call, which keys its in-flight [`RunningTool`].
     pub tool_call_id: String,
     pub tool: String,
@@ -196,8 +199,9 @@ pub(crate) struct AppState {
     /// never doubling up, never missing one.
     pub(crate) last_row_blank: bool,
     /// Active inline approval prompt. At most one is live at a time; further
-    /// queued requests stay on [`PendingApprovals`] until the head is resolved.
+    /// queued requests stay on [`PendingAsks`] until the head is resolved.
     pub(crate) pending_approval: Option<ApprovalChatEntry>,
+    pub(crate) question: Option<QuestionForm>,
     /// Full list of slash commands for completion; sourced once at startup
     /// from `SlashHandler::commands()`.
     pub(crate) commands: Vec<SlashCommand>,
@@ -208,10 +212,8 @@ pub(crate) struct AppState {
     /// (see [`CONFIRM_EXIT_WINDOW`]) commits the exit. Cleared by any other
     /// key so the confirmation doesn't linger across unrelated input.
     pub(crate) confirm_exit_at: Option<Instant>,
-    /// Shared pending approval cards. Cloned into the event loop so key
-    /// handlers can answer them. `None` means approval gating is disabled
-    /// for the test harness — production always wires this up.
-    pub(crate) approval: Option<PendingApprovals>,
+    /// Ordered cards shared with the transport pump.
+    pub(crate) asks: PendingAsks,
     /// Plain (non-slash) messages submitted while a turn is in flight.
     /// Unlike [`AppState::outgoing_queue`], these are dispatched to the agent
     /// **immediately** (mid-turn steering — the agent folds them in once
@@ -252,7 +254,12 @@ pub(crate) struct AppState {
 pub(crate) const CONFIRM_EXIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl AppState {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_asks(PendingAsks::new().0)
+    }
+
+    pub(crate) fn with_asks(asks: PendingAsks) -> Self {
         Self {
             mode: ViewMode::Chat,
             session_id: SessionId::from(""),
@@ -271,10 +278,11 @@ impl AppState {
             last_block: None,
             last_row_blank: true,
             pending_approval: None,
+            question: None,
             commands: Vec::new(),
             completion_cursor: 0,
             confirm_exit_at: None,
-            approval: None,
+            asks,
             pending_interjections: VecDeque::new(),
             outgoing_queue: VecDeque::new(),
             outstanding_responses: 0,
@@ -291,6 +299,7 @@ impl AppState {
     pub(crate) fn is_busy(&self) -> bool {
         self.streaming.is_some()
             || self.pending_approval.is_some()
+            || self.question.is_some()
             || self.outstanding_responses > 0
     }
 
@@ -332,7 +341,7 @@ impl AppState {
     /// the live region (during an approval the agent is blocked on the
     /// user, not working).
     pub(crate) fn show_working(&self) -> bool {
-        self.working_since.is_some() && self.pending_approval.is_none()
+        self.working_since.is_some() && self.pending_approval.is_none() && self.question.is_none()
     }
 
     /// Seconds elapsed since the working clock armed, for the indicator's
@@ -459,20 +468,49 @@ impl AppState {
         self.outgoing_queue.clear();
     }
 
-    pub(crate) fn with_approval(mut self, shared: PendingApprovals) -> Self {
-        self.approval = Some(shared);
-        self
-    }
-
     /// True iff an inline approval prompt is currently live in the viewport.
     pub(crate) fn approval_pending(&self) -> bool {
         self.pending_approval.is_some()
     }
 
-    /// Install a fresh approval entry as the live prompt. Caller has
-    /// already confirmed no entry is currently pending.
-    pub(crate) fn set_pending_approval(&mut self, entry: ApprovalChatEntry) {
-        self.pending_approval = Some(entry);
+    pub(crate) fn refresh_asks(&mut self) {
+        match self.asks.head() {
+            Some(PendingCard::Approval(req)) => {
+                self.question = None;
+                let state = self
+                    .pending_approval
+                    .as_ref()
+                    .filter(|entry| entry.ask_id == req.ask_id)
+                    .map_or(ApprovalChatState::Pending { selected: 0 }, |entry| {
+                        entry.state
+                    });
+                self.pending_approval = Some(ApprovalChatEntry {
+                    ask_id: req.ask_id,
+                    tool_call_id: req.tool_call_id,
+                    tool: req.tool,
+                    accesses: req.accesses,
+                    params_preview: req.params_preview,
+                    state,
+                });
+            }
+            Some(PendingCard::Question {
+                ask_id,
+                questions,
+                submitting,
+            }) => {
+                self.pending_approval = None;
+                if self.question.as_ref().is_none_or(|q| q.id != ask_id) {
+                    self.question = Some(QuestionForm::new(ask_id, questions));
+                }
+                if let Some(form) = &mut self.question {
+                    form.submitting = submitting;
+                }
+            }
+            None => {
+                self.pending_approval = None;
+                self.question = None;
+            }
+        }
     }
 
     /// Move the selection cursor up on the live approval.
@@ -518,17 +556,10 @@ impl AppState {
         let mut entry = self.pending_approval.take()?;
         entry.state = ApprovalChatState::Resolved(decision);
 
-        if let Some(approvals) = self.approval.as_ref() {
-            approvals.answer_head(decision);
-            if let Some(req) = approvals.head() {
-                self.pending_approval = Some(ApprovalChatEntry {
-                    tool_call_id: req.tool_call_id,
-                    tool: req.tool,
-                    accesses: req.accesses,
-                    params_preview: req.params_preview,
-                    state: ApprovalChatState::Pending { selected: 0 },
-                });
-            }
+        let sent = self.asks.answer_approval(&entry.ask_id, decision);
+        self.refresh_asks();
+        if !sent {
+            return None;
         }
         Some(ResolvedApproval { resolved: entry })
     }
@@ -1205,7 +1236,8 @@ mod tests {
         let mut app = AppState::new();
         app.note_response_pending();
         assert!(app.show_working());
-        app.set_pending_approval(ApprovalChatEntry {
+        app.pending_approval = Some(ApprovalChatEntry {
+            ask_id: "ask".parse().unwrap(),
             tool_call_id: "use-1".into(),
             tool: "Bash".into(),
             accesses: Vec::new(),

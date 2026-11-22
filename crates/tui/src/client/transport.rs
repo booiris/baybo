@@ -1,13 +1,11 @@
 //! WebSocket + MessagePack-backed TUI transport.
 //!
-//! Wraps [`WsClient`] and the client's [`PendingApprovals`]. User input is
+//! Wraps [`WsClient`] and the client's [`PendingAsks`]. User input is
 //! sent as [`wire::Message`](baybo_channels::wire::Message) frames; streaming deltas, final responses,
-//! notices, and approval events flow back as typed [`wire::Frame`](baybo_channels::wire::Frame)s
+//! notices, approvals, and questions flow back as typed [`wire::Frame`](baybo_channels::wire::Frame)s
 //! and are mapped onto the TUI's [`TransportEvent`].
 //!
-//! Outbound approvals — driven by the TUI's modal — travel over the
-//! same socket as [`wire::Frame::ResolveApproval`](baybo_channels::wire::Frame::ResolveApproval), and the gateway
-//! hands the decision to the parked tool call.
+//! The subscribe pump sends both approval decisions and structured question replies.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
-use super::approvals::{ApprovalAnswer, PendingApprovals};
+use super::asks::{PendingAsks, PendingCard};
 use super::ws::{WsClient, WsClientError};
 use crate::transport::{TransportEvent, TransportEventStream};
 
@@ -41,10 +39,9 @@ const HTTP_FORBIDDEN: u16 = 403;
 /// process — the TUI multiplexes all sessions over it.
 pub struct WsTransport {
     client: Arc<WsClient>,
-    approvals: PendingApprovals,
-    // Hold subscribe()'s pump handles so a second subscribe on a new
-    // session doesn't race the previous one on the shared source.
-    subscribe_lock: Arc<Mutex<()>>,
+    asks: PendingAsks,
+    // One pump owns both the outbound replies and the inbound WS stream.
+    answers: Arc<Mutex<mpsc::UnboundedReceiver<Frame>>>,
     /// Pinned session this connection is currently bound to. Shared
     /// with the subscribe pump (which reads it on every inbound frame
     /// to drop messages that target the old session after a `/new`
@@ -91,13 +88,12 @@ impl WsTransport {
         })?;
         let client = Arc::new(client);
 
-        let (approvals, answers) = PendingApprovals::new();
-        tokio::spawn(send_answers(Arc::clone(&client), answers));
+        let (asks, answers) = PendingAsks::new();
 
         Ok(Self {
             client,
-            approvals,
-            subscribe_lock: Arc::new(Mutex::new(())),
+            asks,
+            answers: Arc::new(Mutex::new(answers)),
             session_pin: Arc::new(RwLock::new(session_id)),
             initial_history: Mutex::new(Some(initial_history)),
         })
@@ -152,31 +148,61 @@ impl WsTransport {
     pub async fn subscribe(&self) -> Result<TransportEventStream> {
         let (tx, rx) = mpsc::channel::<Result<TransportEvent>>(EVENT_CHAN_CAPACITY);
         let client: Arc<WsClient> = Arc::clone(&self.client);
-        let approvals = self.approvals.clone();
+        let asks = self.asks.clone();
         let target = Arc::clone(&self.session_pin);
-        let subscribe_lock = Arc::clone(&self.subscribe_lock);
+        let answers = Arc::clone(&self.answers);
 
         tokio::spawn(async move {
             // Serialize pump tasks so a second subscribe (e.g. on
             // session switch) doesn't concurrently drain the shared
             // WS source.
-            let _guard = subscribe_lock.lock().await;
+            let mut answers = answers.lock().await;
             loop {
-                let frame = match client.recv_any().await {
+                let received = tokio::select! {
+                    Some(answer) = answers.recv() => {
+                        if let Err(e) = client.send_raw(&answer).await {
+                            asks.send_failed(&answer);
+                            let _ = tx.send(Err(ChannelError::Send(format!("tui ws answer: {e}")))).await;
+                            let _ = tx.send(Ok(TransportEvent::AsksChanged)).await;
+                        }
+                        continue;
+                    }
+                    frame = client.recv_any() => frame,
+                };
+                let frame = match received {
                     Ok(f) => f,
                     Err(WsClientError::PeerClosed) => {
-                        debug!("tui ws peer closed; subscribe pump exiting");
+                        answers.close();
+                        let _ = tx
+                            .send(Ok(TransportEvent::Notice {
+                                level: NoticeLevel::Warn,
+                                text: "Gateway disconnected. Reopen the same session to continue."
+                                    .into(),
+                            }))
+                            .await;
                         return;
                     }
                     Err(e) => {
+                        answers.close();
                         let _ = tx
-                            .send(Err(ChannelError::Send(format!("tui ws recv: {e}"))))
+                            .send(Err(ChannelError::Send(format!("tui ws disconnected: {e}"))))
                             .await;
                         return;
                     }
                 };
-                let target_snapshot = target.read().clone();
-                if let Some(event) = map_frame(frame, &target_snapshot, &approvals)
+                if let Frame::Gap { session_id } = frame {
+                    let pin = target.read().clone();
+                    if session_id.is_none_or(|id| id == pin)
+                        && let Err(e) = client.send_raw(&Frame::Subscribe { session_id: pin }).await
+                    {
+                        let _ = tx
+                            .send(Err(ChannelError::Send(format!("tui ws resubscribe: {e}"))))
+                            .await;
+                    }
+                    continue;
+                }
+                let event = map_frame(frame, &target.read(), &asks);
+                if let Some(event) = event
                     && tx.send(Ok(event)).await.is_err()
                 {
                     return;
@@ -197,8 +223,8 @@ impl WsTransport {
 
     /// Abandon the current session and start a fresh one. Sends an
     /// `Unsubscribe` for the old id and a `Subscribe` for `new_id` on
-    /// the existing WS, then rewrites the shared pin so the subscribe
-    /// pump and `append_history` immediately target the new session.
+    /// the existing WS, pinning the new session before subscribing so the
+    /// pump accepts the first snapshot even if the gateway replies immediately.
     /// No new gateway round-trip is needed beyond the two control
     /// frames: the session row itself is created lazily on the agent
     /// side when the first user message lands (see
@@ -215,20 +241,26 @@ impl WsTransport {
             })
             .await
             .map_err(|e| ChannelError::Send(format!("tui ws unsubscribe: {e}")))?;
-        self.client
-            .send_raw(&Frame::Subscribe {
-                session_id: new_id.clone(),
-            })
+        {
+            let mut pin = self.session_pin.write();
+            *pin = new_id.clone();
+            self.asks.clear();
+        }
+        if let Err(e) = self
+            .client
+            .send_raw(&Frame::Subscribe { session_id: new_id })
             .await
-            .map_err(|e| ChannelError::Send(format!("tui ws subscribe: {e}")))?;
-        *self.session_pin.write() = new_id;
+        {
+            *self.session_pin.write() = old_id;
+            return Err(ChannelError::Send(format!("tui ws subscribe: {e}")));
+        }
         Ok(())
     }
 
-    /// The approval cards the gateway asked this client to show. The TUI
-    /// renders the head; an answer goes back as [`Frame::ResolveApproval`].
-    pub fn approvals(&self) -> PendingApprovals {
-        self.approvals.clone()
+    /// The pending approvals and questions in gateway order. The TUI
+    /// renders the head and replies over the same socket.
+    pub fn asks(&self) -> PendingAsks {
+        self.asks.clone()
     }
 
     /// Consume the one-shot history ring the gateway pushed right after
@@ -254,24 +286,10 @@ impl WsTransport {
     }
 }
 
-/// Send each answer the UI gives as a [`Frame::ResolveApproval`], in order,
-/// until every [`PendingApprovals`] handle is gone.
-async fn send_answers(client: Arc<WsClient>, mut answers: mpsc::UnboundedReceiver<ApprovalAnswer>) {
-    while let Some((ask_id, decision)) = answers.recv().await {
-        let frame = Frame::ResolveApproval {
-            ask_id: ask_id.clone(),
-            decision,
-        };
-        if let Err(e) = client.send_raw(&frame).await {
-            warn!(%ask_id, "approval answer not sent: {e}");
-        }
-    }
-}
-
 fn map_frame(
     frame: Frame,
     target_session: &SessionId,
-    approvals: &PendingApprovals,
+    asks: &PendingAsks,
 ) -> Option<TransportEvent> {
     match frame {
         Frame::AnswerDelta {
@@ -339,7 +357,7 @@ fn map_frame(
                 return None;
             }
             debug!(%ask_id, tool, "approval added from gateway");
-            approvals.show(ApprovalRequest {
+            asks.show(PendingCard::Approval(ApprovalRequest {
                 ask_id,
                 tool_call_id: tool_call_id.unwrap_or_default(),
                 session_id,
@@ -348,17 +366,22 @@ fn map_frame(
                 accesses,
                 params_preview,
                 description,
-            });
-            Some(TransportEvent::ApprovalRequested)
+            }));
+            Some(TransportEvent::AsksChanged)
         }
         // Every close, answered elsewhere or not: drop the card. A no-op
         // when this client's own answer already removed it.
         Frame::AskResolved { ask_id, .. } => {
-            approvals.close(&ask_id);
-            None
+            asks.close(&ask_id);
+            Some(TransportEvent::AsksChanged)
         }
-        // TODO(human-ask): render AskUser questions inline like ApprovalChatEntry
-        Frame::QuestionAsked { .. } => None,
+        Frame::QuestionAsked { ask_id, session_id, questions, .. } => {
+            if &session_id != target_session || questions.is_empty() {
+                return None;
+            }
+            asks.show(PendingCard::question(ask_id, questions));
+            Some(TransportEvent::AsksChanged)
+        }
         Frame::Reasoning { .. } => {
             // The TUI surfaces an animated "working" indicator instead of
             // the model's reasoning trace, so reasoning frames are dropped
@@ -380,30 +403,14 @@ fn map_frame(
         Frame::SubscribeState {
             session_id,
             pending_approvals,
+            pending_questions,
             ..
         } => {
-            // The subscribe-time state bundle. The TUI tracks turn
-            // activity locally and renders neither work steps nor the
-            // task checklist, so only the pending-approval half matters:
-            // show each card (a re-sent one replaces itself, so a
-            // re-subscribe is idempotent) so a prompt raised while this
-            // client was away still renders.
-            if &session_id != target_session || pending_approvals.is_empty() {
+            if &session_id != target_session {
                 return None;
             }
-            for card in pending_approvals {
-                approvals.show(ApprovalRequest {
-                    ask_id: card.ask_id,
-                    tool_call_id: card.tool_call_id.unwrap_or_default(),
-                    session_id: session_id.clone(),
-                    user_id: card.user_id,
-                    tool: card.tool,
-                    accesses: card.accesses,
-                    params_preview: card.params_preview,
-                    description: card.description,
-                });
-            }
-            Some(TransportEvent::ApprovalRequested)
+            asks.replace(&session_id, pending_approvals, pending_questions);
+            Some(TransportEvent::AsksChanged)
         }
         Frame::ToolStarted {
             session_id,
@@ -458,13 +465,8 @@ fn map_frame(
             // ignores rather than warning.
             None
         }
-        Frame::Gap { .. } => {
-            // The server dropped frames it owed this connection. The
-            // TUI renders live-only (it never syncs a transcript), so
-            // there is nothing to recover — the durable record is
-            // intact server-side and a reload shows it.
-            None
-        }
+        // The pump requests a fresh pending set on a gap.
+        Frame::Gap { .. } => None,
         Frame::Ping | Frame::Pong => {
             // The TUI doesn't currently drive the heartbeat itself —
             // its tokio task is already idle-aware. Accept either
@@ -512,15 +514,105 @@ mod tests {
     }
 
     #[test]
+    fn live_and_restored_questions_share_the_queue_and_only_the_displayed_id_can_answer() {
+        use crate::app::AppState;
+        use baybo_channels::wire::{
+            ApprovalCard, AskOutcomeKind, QuestionCard, QuestionReply, TurnSnapshot,
+        };
+        use baybo_model::human_ask::Question;
+
+        let (asks, mut answers) = PendingAsks::new();
+        let mut state = AppState::with_asks(asks.clone());
+        let session = sid("here");
+        let q = QuestionCard {
+            queue_index: 0,
+            ask_id: "question".parse().unwrap(),
+            tool_call_id: "call".into(),
+            user_id: String::new(),
+            questions: vec![Question {
+                header: "Mode".into(),
+                question: "Which mode?".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        };
+        let a = ApprovalCard {
+            ask_id: "approval".parse().unwrap(),
+            tool_call_id: None,
+            user_id: String::new(),
+            tool: "Read".into(),
+            accesses: vec![],
+            params_preview: String::new(),
+            description: None,
+        };
+        let snapshot = |pending_questions, pending_approvals| Frame::SubscribeState {
+            session_id: session.clone(),
+            as_of_ordinal: None,
+            turn: TurnSnapshot {
+                active: true,
+                started_at: None,
+            },
+            work_steps: vec![],
+            tasks: vec![],
+            pending_questions,
+            pending_approvals,
+        };
+        let live = |session_id| Frame::QuestionAsked {
+            session_id,
+            ask_id: q.ask_id.clone(),
+            tool_call_id: q.tool_call_id.clone(),
+            user_id: String::new(),
+            questions: q.questions.clone(),
+        };
+        assert!(map_frame(live(sid("other")), &session, &asks).is_none());
+        assert!(asks.head().is_none());
+        map_frame(snapshot(vec![q.clone()], vec![a.clone()]), &session, &asks);
+        map_frame(live(session.clone()), &session, &asks);
+        state.refresh_asks();
+        assert_eq!(state.question.as_ref().unwrap().id, q.ask_id);
+        assert!(asks.answer_question(&q.ask_id, QuestionReply::Cancelled));
+        assert!(!asks.answer_question(&q.ask_id, QuestionReply::Cancelled));
+        assert_eq!(
+            answers.try_recv().unwrap(),
+            Frame::AnswerQuestion {
+                ask_id: q.ask_id.clone(),
+                reply: QuestionReply::Cancelled
+            }
+        );
+        // The gateway re-sends its authoritative set if an answer is rejected.
+        map_frame(snapshot(vec![q.clone()], vec![a.clone()]), &session, &asks);
+        state.refresh_asks();
+        assert!(!state.question.as_ref().unwrap().submitting);
+        map_frame(
+            Frame::AskResolved {
+                ask_id: q.ask_id.clone(),
+                decision: None,
+                outcome: AskOutcomeKind::Abandoned,
+            },
+            &session,
+            &asks,
+        );
+        assert!(!asks.answer_question(&q.ask_id, QuestionReply::Cancelled));
+        state.refresh_asks();
+        assert!(state.question.is_none());
+        assert_eq!(state.pending_approval.as_ref().unwrap().ask_id, a.ask_id);
+        map_frame(snapshot(vec![], vec![]), &session, &asks);
+        state.refresh_asks();
+        assert!(state.pending_approval.is_none());
+        assert!(!asks.answer_approval(&a.ask_id, baybo_tools::ApprovalDecision::Approve));
+        assert!(answers.try_recv().is_err());
+    }
+
+    #[test]
     fn map_frame_forwards_delta_for_pinned_session() {
-        let (approvals, _answers) = PendingApprovals::new();
+        let (asks, _answers) = PendingAsks::new();
         let target = sid("alpha");
         let frame = Frame::AnswerDelta {
             session_id: target.clone(),
             user_id: String::new(),
             text: "tick".into(),
         };
-        match map_frame(frame, &target, &approvals) {
+        match map_frame(frame, &target, &asks) {
             Some(TransportEvent::StreamDelta(text)) => assert_eq!(text, "tick"),
             other => panic!("expected StreamDelta, got {other:?}"),
         }
@@ -532,14 +624,14 @@ mod tests {
         // more Deltas for the old session id before our Unsubscribe
         // reaches it; the pump's filter must drop them rather than
         // leak old-session output into the new transcript.
-        let (approvals, _answers) = PendingApprovals::new();
+        let (asks, _answers) = PendingAsks::new();
         let target = sid("beta");
         let frame = Frame::AnswerDelta {
             session_id: sid("alpha"),
             user_id: String::new(),
             text: "stale".into(),
         };
-        assert!(map_frame(frame, &target, &approvals).is_none());
+        assert!(map_frame(frame, &target, &asks).is_none());
     }
 
     #[test]
@@ -548,18 +640,18 @@ mod tests {
         // (including the `/new`-driven re-subscribe). Input history is
         // global to the TUI process, so the resend carries nothing the
         // pump cares about — it must be dropped, not warned about.
-        let (approvals, _answers) = PendingApprovals::new();
+        let (asks, _answers) = PendingAsks::new();
         let target = sid("alpha");
         let frame = Frame::HistorySnapshot {
             session_id: target.clone(),
             entries: vec!["echo".into()],
         };
-        assert!(map_frame(frame, &target, &approvals).is_none());
+        assert!(map_frame(frame, &target, &asks).is_none());
     }
 
     #[test]
     fn map_frame_forwards_tool_lifecycle_for_pinned_session() {
-        let (approvals, _answers) = PendingApprovals::new();
+        let (asks, _answers) = PendingAsks::new();
         let target = sid("alpha");
         match map_frame(
             Frame::ToolStarted {
@@ -570,7 +662,7 @@ mod tests {
                 label: Some("foo.rs".into()),
             },
             &target,
-            &approvals,
+            &asks,
         ) {
             Some(TransportEvent::ToolStarted {
                 call_id,
@@ -594,7 +686,7 @@ mod tests {
                 ask: None,
             },
             &target,
-            &approvals,
+            &asks,
         ) {
             Some(TransportEvent::ToolCompleted {
                 call_id,
@@ -614,14 +706,14 @@ mod tests {
         // The TUI renders an animated working indicator instead of the
         // reasoning trace, so a Reasoning frame is dropped unconditionally
         // — including one addressed to the pinned session.
-        let (approvals, _answers) = PendingApprovals::new();
+        let (asks, _answers) = PendingAsks::new();
         let target = sid("alpha");
         let frame = Frame::Reasoning {
             session_id: target.clone(),
             user_id: String::new(),
             text: "a thought".into(),
         };
-        assert!(map_frame(frame, &target, &approvals).is_none());
+        assert!(map_frame(frame, &target, &asks).is_none());
     }
 
     #[test]
@@ -629,7 +721,7 @@ mod tests {
         // Subscribed-kind channels echo inbound to every subscriber —
         // including the sender. The TUI already rendered its own
         // prompt locally, so the echo must not duplicate the row.
-        let (approvals, _answers) = PendingApprovals::new();
+        let (asks, _answers) = PendingAsks::new();
         let target = sid("alpha");
         let echo = Frame::Message(WireMessage {
             content: "hi".into(),
@@ -642,6 +734,6 @@ mod tests {
             role: MessageRole::User,
             ordinal: None,
         });
-        assert!(map_frame(echo, &target, &approvals).is_none());
+        assert!(map_frame(echo, &target, &asks).is_none());
     }
 }

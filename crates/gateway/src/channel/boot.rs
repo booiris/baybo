@@ -118,8 +118,9 @@ pub(crate) fn build_channel(
 ) -> Arc<Channel> {
     let ChannelAsks { queue, gate } = asks;
     let approval_gate: Arc<dyn ApprovalGate> = Arc::clone(&gate) as Arc<dyn ApprovalGate>;
-    let question_gate: Option<Arc<dyn QuestionGate>> =
-        (channel_type == ChannelType::owner()).then_some(gate as Arc<dyn QuestionGate>);
+    let question_gate: Option<Arc<dyn QuestionGate>> = baybo_human_ask::tools::question_channels()
+        .contains(&channel_type)
+        .then_some(gate as Arc<dyn QuestionGate>);
     let approvals = AskSurface {
         approval_gate,
         question_gate,
@@ -469,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn build_channel_attaches_question_gate_only_on_owner_channel() {
+    fn build_channel_attaches_question_gate_to_interactive_channels() {
         let channels = test_ask_channels();
         let owner = build_channel(
             ChannelType::owner(),
@@ -487,7 +488,7 @@ mod tests {
             channels.for_channel(&ChannelType::telegram()),
         );
         assert!(owner.question_gate().is_some());
-        assert!(tui.question_gate().is_none());
+        assert!(tui.question_gate().is_some());
         assert!(telegram.question_gate().is_none());
     }
 
