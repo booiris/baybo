@@ -29,7 +29,12 @@ Rules:
 /// Tool that raises a durable question ask through [`ToolContext::question`].
 pub struct AskUserTool;
 
-/// Build the `AskUser` tool and its owner-only manifest for runtime registration.
+/// Channels with an interactive surface for structured questions.
+pub fn question_channels() -> [ChannelType; 2] {
+    [ChannelType::owner(), ChannelType::tui()]
+}
+
+/// Build the `AskUser` tool and its manifest for runtime registration.
 pub fn agent_tools() -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let tool = AskUserTool;
     let manifest = ToolManifest {
@@ -38,7 +43,7 @@ pub fn agent_tools() -> Vec<(Arc<dyn Tool>, ToolManifest)> {
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: Vec::new(),
-        channels: vec![ChannelType::owner()],
+        channels: question_channels().to_vec(),
     };
     vec![(Arc::new(tool), manifest)]
 }
@@ -497,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_owner_only_user_conversation_sole_call() {
+    fn manifest_limits_questions_to_interactive_user_conversations() {
         let tools = agent_tools();
         assert_eq!(tools.len(), 1);
         let (tool, manifest) = &tools[0];
@@ -505,7 +510,10 @@ mod tests {
         assert!(tool.sole_call());
         assert_eq!(tool.concurrency(), ToolConcurrency::Exclusive);
         assert_eq!(tool.trigger_scope(), ToolTriggerScope::UserConversation);
-        assert_eq!(manifest.channels, vec![ChannelType::owner()]);
+        assert_eq!(
+            manifest.channels,
+            [ChannelType::owner(), ChannelType::tui()]
+        );
         assert_eq!(
             tool.progress_label(&valid_params()).as_deref(),
             Some("Auth")

@@ -10,6 +10,9 @@
 /// the test types these to trigger each scenario.
 pub const SAY_TOOL: &str = "tool";
 pub const SAY_SUBAGENT: &str = "subagent";
+pub const SAY_QUESTION: &str = "question";
+pub const QUESTION_TEXT: &str = "Which build should run?";
+pub const QUESTION_REPLY: &str = "Starting the release build";
 pub const SAY_APPROVAL: &str = "approval";
 pub const SAY_TASK: &str = "task";
 pub const SAY_MARKDOWN: &str = "markdown";

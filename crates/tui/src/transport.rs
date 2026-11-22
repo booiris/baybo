@@ -39,10 +39,8 @@ pub enum TransportEvent {
     Response(Vec<ContentBlock>),
     /// Out-of-band notice surfaced by the agent.
     Notice { level: NoticeLevel, text: String },
-    /// A new approval card is on the shared
-    /// [`PendingApprovals`](crate::client::PendingApprovals); the loop
-    /// should refresh the approval UI.
-    ApprovalRequested,
+    /// The gateway updated the pending approval and question cards.
+    AsksChanged,
 }
 
 /// Stream of [`TransportEvent`]s produced by [`crate::client::WsTransport::subscribe`].

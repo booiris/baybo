@@ -30,6 +30,7 @@ mod dashboard;
 pub(crate) mod event;
 mod keymap;
 mod markdown;
+mod question;
 /// Scenario contract shared by the `chat_smoke` probe and its render test.
 #[cfg(any(test, feature = "test-support"))]
 pub mod smoke_contract;
@@ -76,11 +77,8 @@ use uuid::Uuid;
 
 use std::time::{Duration, Instant};
 
-use crate::app::{
-    AppState, ApprovalChatEntry, ApprovalChatState, BlockKind, CONFIRM_EXIT_WINDOW,
-    TranscriptBlock, ViewMode,
-};
-use crate::client::{PendingApprovals, WsTransport};
+use crate::app::{AppState, BlockKind, CONFIRM_EXIT_WINDOW, TranscriptBlock, ViewMode};
+use crate::client::WsTransport;
 use crate::event::AppEvent;
 use crate::keymap::{Action, KeyContext, translate};
 
@@ -103,7 +101,6 @@ pub struct TuiAdapter {
     on_exit: Option<OnExit>,
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>,
-    approvals: PendingApprovals,
     transport: Arc<WsTransport>,
 }
 
@@ -113,7 +110,6 @@ impl TuiAdapter {
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "tui-user".to_string());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(256);
-        let approvals = transport.approvals();
         let initial_session_id = transport.current_session_id();
         Self {
             initial_session_id,
@@ -129,7 +125,6 @@ impl TuiAdapter {
             on_exit: None,
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
-            approvals,
             transport,
         }
     }
@@ -182,7 +177,6 @@ impl TuiAdapter {
             dashboard_provider: self.dashboard_provider.clone(),
             model_label: self.model_label.clone(),
             on_exit: self.on_exit.clone(),
-            approvals: self.approvals.clone(),
         };
 
         tokio::spawn(async move {
@@ -206,7 +200,6 @@ struct LoopCtx {
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     model_label: Option<String>,
     on_exit: Option<OnExit>,
-    approvals: PendingApprovals,
 }
 
 async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sender<AppEvent>) {
@@ -270,7 +263,7 @@ async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sende
                     target: "agent".into(),
                     message: text,
                 })),
-                TransportEvent::ApprovalRequested => Some(AppEvent::ApprovalRequested),
+                TransportEvent::AsksChanged => Some(AppEvent::AsksChanged),
             };
             if let Some(ev) = forwarded
                 && event_tx.send(ev).await.is_err()
@@ -338,7 +331,11 @@ fn new_chat_terminal(viewport_h: u16, anchor: Position) -> io::Result<Term> {
 /// one spacer row while idle and adds the indicator row only while busy.
 /// Streaming/tool text commits straight into scrollback, so it doesn't add
 /// here.
-fn desired_viewport_height(state: &AppState) -> u16 {
+fn desired_viewport_height(state: &AppState) -> io::Result<u16> {
+    if let Some(form) = &state.question {
+        let (width, height) = crossterm::terminal::size()?;
+        return Ok(form.height(width).min(height).max(1));
+    }
     let mut h = chat::input_box_height(state).saturating_add(chat::working_zone_height(state));
     h = h.saturating_add(chat::model_footer_height(state));
     h = h.saturating_add(state.queued_display_lines().count() as u16);
@@ -346,7 +343,7 @@ fn desired_viewport_height(state: &AppState) -> u16 {
         h = h.saturating_add(chat::approval_pending_height(entry));
     }
     h = h.saturating_add(chat::completion_popup_height(state));
-    h.max(1)
+    Ok(h.max(1))
 }
 
 /// Build a fresh `Terminal` configured for dashboard mode (fullscreen).
@@ -402,7 +399,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
         in_alt_screen: Arc::clone(&in_alt_screen),
     };
 
-    let mut state = AppState::new().with_approval(ctx.approvals.clone());
+    let mut state = AppState::with_asks(ctx.input.asks());
     state.session_id = ctx.initial_session_id.clone();
     state.set_model_label(ctx.model_label.clone());
     if let Some(handler) = ctx.slash_handler.as_ref() {
@@ -415,7 +412,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     // home) rather than below whatever was in the shell. Done before the
     // inline terminal is created so its viewport anchors at the top.
     home_and_clear_screen()?;
-    let mut current_viewport_h = desired_viewport_height(&state);
+    let mut current_viewport_h = desired_viewport_height(&state)?;
     let mut terminal = new_chat_terminal(current_viewport_h, Position::ORIGIN)
         .map_err(|e| anyhow::anyhow!("new_chat_terminal: {e}"))?;
     let mut term_events = EventStream::new();
@@ -664,21 +661,8 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             &mut resize_pending,
                         )?;
                     }
-                    AppEvent::ApprovalRequested => {
-                        if !state.approval_pending()
-                            && let Some(approvals) = state.approval.as_ref()
-                            && let Some(req) = approvals.head()
-                        {
-                            state.set_pending_approval(ApprovalChatEntry {
-                                tool_call_id: req.tool_call_id,
-                                tool: req.tool,
-                                accesses: req.accesses,
-                                params_preview: req.params_preview,
-                                state: ApprovalChatState::Pending { selected: 0 },
-                            });
-                        }
-                        // Showing the approval grows the viewport, so this draw
-                        // rebuilds the inline terminal.
+                    AppEvent::AsksChanged => {
+                        state.refresh_asks();
                         redraw_after_event(
                             &mut terminal,
                             &mut state,
@@ -747,7 +731,7 @@ fn resize_chat_viewport_if_needed(
     terminal: &mut Term,
     current: &mut u16,
 ) -> io::Result<()> {
-    let desired = desired_viewport_height(state);
+    let desired = desired_viewport_height(state)?;
     if desired == *current {
         return Ok(());
     }
@@ -771,7 +755,7 @@ fn resize_chat_viewport_before_scrollback(
     state: &mut AppState,
     current_viewport_h: &mut u16,
 ) -> io::Result<()> {
-    if desired_viewport_height(state) == *current_viewport_h {
+    if desired_viewport_height(state)? == *current_viewport_h {
         return Ok(());
     }
     resize_chat_viewport_if_needed(state, terminal, current_viewport_h)?;
@@ -810,7 +794,7 @@ fn rebuild_chat_terminal_after_resize(
     // top. Calling `Terminal::clear` here would move the cursor off home before
     // the new viewport anchors. See [`home_and_clear_screen`].
     home_and_clear_screen()?;
-    let desired = desired_viewport_height(state);
+    let desired = desired_viewport_height(state)?;
     *terminal = new_chat_terminal(desired, Position::ORIGIN)?;
     *current = desired;
     let session_id = state.session_id.clone();
@@ -829,7 +813,7 @@ fn reset_chat_scrollback(
     session_id: &SessionId,
 ) -> io::Result<()> {
     home_and_clear_screen()?;
-    let desired = desired_viewport_height(state);
+    let desired = desired_viewport_height(state)?;
     *terminal = new_chat_terminal(desired, Position::ORIGIN)?;
     *current = desired;
     state.clear_transcript();
@@ -1384,6 +1368,26 @@ async fn handle_key(
     current_viewport_h: &mut u16,
     key: KeyEvent,
 ) -> anyhow::Result<KeyOutcome> {
+    if matches!(state.mode, ViewMode::Chat)
+        && let Some(form) = &mut state.question
+    {
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            match key.code {
+                crossterm::event::KeyCode::Char('c') => return Ok(KeyOutcome::Exit),
+                crossterm::event::KeyCode::Char('x') => {
+                    interrupt_turn(state, ctx, terminal).await?
+                }
+                _ => {}
+            }
+        } else if let Some(reply) = form.key(key) {
+            state.asks.answer_question(&form.id, reply);
+            state.refresh_asks();
+        }
+        return Ok(KeyOutcome::Continue);
+    }
     let completion_open = !state.completion_candidates().is_empty();
     let key_ctx = KeyContext {
         input_empty: state.input.is_empty(),
@@ -1667,6 +1671,7 @@ async fn handle_slash(
             match ctx.input.switch_session(new_id.clone()).await {
                 Ok(()) => {
                     state.session_id = new_id.clone();
+                    state.refresh_asks();
                     reset_chat_scrollback(state, terminal, current_viewport_h, &new_id)?;
                     let msg = format!("Started a fresh session: {new_id}");
                     commit_below_answer(state, terminal, chat::render_system_lines(&msg))?;
@@ -1742,7 +1747,7 @@ fn exit_dashboard_mode(
         MoveTo(anchor.x, anchor.y)
     )?;
     in_alt_screen.store(false, std::sync::atomic::Ordering::Relaxed);
-    *current_viewport_h = desired_viewport_height(state);
+    *current_viewport_h = desired_viewport_height(state)?;
     *terminal = new_chat_terminal(*current_viewport_h, anchor)?;
     Ok(())
 }

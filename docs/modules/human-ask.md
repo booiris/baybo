@@ -1,14 +1,13 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **foundation and `AskUser` + web stages implemented; the iOS stage is
+> Status: **foundation, web and terminal question support implemented; the iOS stage is
 > pending** — `baybo-human-ask` (queue,
 > core, gates, manager, `AskUserTool`, `AskStepInput`), the ledger, the
 > `tools::ask` ports (`QuestionGate`, `QuestionHandle`, `Tool::sole_call`), the
 > agent live/restart/sole-call paths, the gateway doors, question/approval
 > frames, REST reconstruction and boot order, the web `QuestionCard` / composer
 > answer / render-time badge UI, the project bridge and the integration suites
-> exist; see [Implementation notes](#implementation-notes-foundation-stage). The
-> iOS stage is not started. This document is
+> exist; see [Implementation notes](#implementation-notes-foundation-stage). This document is
 > the spec the three stages described in [Rollout plan](#rollout-plan) are
 > built against. Line numbers cited
 > for existing code are as of commit `504fe0af` and will drift; the named
@@ -56,7 +55,7 @@ Layering, following the store/storage split the rest of the schema uses:
 | `baybo-human-ask` | `AskQueue` (the queue/oneshot/pending-edge mechanism, moved out of `tools::approval`), `AskQueues` (one queue per `ChannelType`, `get_or_create`), `AskCore` (store + observers, shared by gates and manager), `AskChannels` (builds a channel's queue + gate over the one core — the gateway's handle for channel installs), `ChannelAskGate` (implements both gates: persist → enqueue → wake → await, no timeout except a during-execute approval's deadline, origin-aware cancel), `PolicyDenyGate`, `HumanAskManager` (the verbs every other crate calls), the `ResumeSink` / `LivePendingAsks` / `AskObserver` ports, the `AskUser` tool, `AskStepInput`, `MemoryHumanAskStore` test fixture. Never names `Channel`. |
 | `baybo-channels` | `AskSurface` on `Channel`, `SessionEvent::{QuestionAsked, AskResolved}`. (The Resume door is not a channel message: it has its own receiver on the router.) |
 | `baybo-storage`, `baybo` | `Store.human_ask` (the DI bundle field) and the single `stores.human_ask.clone()` read in `build_managers` that constructs `AskCore`. |
-| `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` impl. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingApprovals` and does not depend on this crate.) |
+| `baybo-gateway`, `baybo-agent`, `baybo-project` | Consumers that receive `Arc<HumanAskManager>` (the verbs) and, for the gateway's channel installs, `AskChannels` — never the store. Only the composition root (`baybo`) and `project`'s observer wiring hold `Arc<AskCore>`. `gateway`: wire arms, SubscribeState, queue watchers that dispatch frames, push, REST, the lazy channel install. `agent`: executor/loop/actor/router, the `ResumeSink` impl. `project`: the timeline observer and card-close verb. (`baybo-tui` keeps its own `PendingAsks` and does not depend on this crate.) |
 
 Dependency edges, all acyclic: `human-ask → model, store, tools`;
 `channels → tools, human-ask`; `project → human-ask`;
@@ -826,8 +825,7 @@ error type-erasure at `tool_executor.rs:1174-1192` is irrelevant to it.
 
 **Visibility** uses the two existing session-fixed axes, so the tool list stays
 byte-stable per session (the prompt-cache property `registry.rs:265-281`
-protects): `ToolManifest.channels = vec![ChannelType::owner()]` (precedent:
-`put_blob`, deck tools) and a new `ToolTriggerScope::UserConversation`
+protects): the manifest and gateway use `question_channels()` (owner and TUI) with `ToolTriggerScope::UserConversation`
 (`TriggerSource::User` only). That hides it from cron sessions (including a
 user's reply inside a cron conversation — acceptable), issue sessions, and,
 via the channel door, every subagent (channel `subagent`) and sidecar.
@@ -948,7 +946,7 @@ SessionPatch   { …, awaiting_human: Option<bool> }           // renamed from a
   `app/web/src/pages/projects/*.test.ts(x)`.
 - The sidecar SDK runner's switch has no `default` (`runner.ts:662-764`);
   question frames reaching a multiplexed sidecar are silently dropped. They
-  cannot reach one — `AskUser` is owner-only — but the SDK docs say so.
+  only reach the owner and TUI channels.
 
 ### Web UI
 
@@ -1074,21 +1072,12 @@ lowest-priority `ActorStop` still runs normally.
   the turn consumed it; the transcript records *what* was decided.
 - Logs record `ask_id`, `kind`, `phase`, never option text or params.
 
+### Terminal UI
+
+The TUI shares one ordered queue for approvals and questions, including asks reconstructed from a session snapshot. The form submits structured answers through `AnswerQuestion`. See [TUI keyboard interaction](tui.md#askuser-questions).
+
 ### Deferred
 
-- **TUI**: `map_frame` gets `Frame::QuestionAsked` in the silent-drop group
-  with `// TODO(human-ask): render AskUser questions inline like ApprovalChatEntry`
-  (the `tui` channel never receives it — `AskUser` is owner-only), but
-  `Frame::AskResolved { ask_id, .. }` is handled: `approvals.close(&ask_id)`,
-  because the TUI shows every approval
-  card (`transport.rs:343-354, :390-402`) and an approval abandoned by
-  another client would otherwise stay on screen with nothing to clear it
-  now that the self-deny is gone. `ask: None` in the two `ToolCompleted`
-  literals. No `TransportEvent` / `AppEvent` variants. The six approval-queue
-  call sites (`app.rs:516-522`, `lib.rs:672-679`, `transport.rs:98-108, :343, :393`,
-  `prompt_cmd.rs:212-213, :621`) move onto the TUI's own `PendingApprovals`
-  (see [Data model](#data-model)), and `crates/tui/src/lib.rs:38`'s
-  `pub use baybo_tools::ApprovalQueue` goes.
 - **iOS**: compiles (`pump.rs:373` and the three `SessionPatch` test literals
   at `transport/tests.rs:261,284,309` follow the `awaiting_human` rename;
   `SessionListSink::on_approval_pending` keeps its name — it is a Swift
@@ -1198,9 +1187,8 @@ dispatch_approval_*` get kind-aware siblings.
 `AskQueue` is the gateway's alone. The TUI and `baybo prompt` used to borrow
 `ApprovalQueue` as a display mirror (mirror entries with no waiter, a
 `ResolveFn` callback that turned a local resolve into a `ResolveApproval`
-frame); they keep their own list instead, `baybo_tui::client::PendingApprovals`
-(`show` / `close` / `head` / `answer_head`), whose answers a task on the
-transport sends as `ResolveApproval` frames. `baybo-tui` no longer depends on
+frame); they keep their own list instead, `baybo_tui::client::PendingAsks`
+for both kinds of card. The transport sends `ResolveApproval` or `AnswerQuestion` for the displayed ID. `baybo-tui` no longer depends on
 `baybo-human-ask`.
 
 ### Implementation notes (foundation stage)
@@ -1460,7 +1448,7 @@ leaves draft.
   `ManagerGraph` / `GatewayDeps` / `AdminState` / `WsChannelState`; OpenAPI +
   `schema.d.ts` regen + the 13 `Issue` fixtures.
 - `baybo-tui`, `app/ios`: the six approval-queue call sites move onto the
-  TUI's own `PendingApprovals`, `AskResolved` closes the card, rename
+  TUI's own `PendingAsks`, `AskResolved` closes the card, rename
   follow-ups and rustdoc links; no new behaviour.
 - Docs: this file; `agent.md` (`:124-144`, `:241-254`, `:290`, `:307`),
   `turn.md` (kind table, descriptors, recovery, queue policy; fix the
@@ -1656,7 +1644,7 @@ withdrawn: they are already auto-denied by the gate map's fallback for the
   (`AgentLoop::settle_unapplied_asks`, reached from every door before its
   append and from `compact_now`); "is this step parked" has one home on the
   web (`pendingAsks × toolCallId`, at render time).
-- `AskUser` is owner-channel, `TriggerSource::User` sessions, attended turns,
+- `AskUser` is available on the owner and TUI channels in `TriggerSource::User` sessions, attended turns,
   sole call in its response.
 - Approval wire frames and `ApprovalDecision` are not widened; questions and
   the kind-agnostic `AskResolved` are siblings.

@@ -37,6 +37,10 @@ pub(crate) const INPUT_MAX_ROWS: u16 = 10;
 /// input + optional model footer). Streaming text is committed to scrollback
 /// line-by-line (Codex style) rather than buffered into a viewport preview.
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    if let Some(question) = &mut state.question {
+        question.render(frame, area);
+        return;
+    }
     // Build the live region top→bottom: the working zone (blank spacer +, while
     // busy, the in-flight tool list or the Cooking indicator), then any queued
     // lines, a pending approval block, the slash-completion popup, the input

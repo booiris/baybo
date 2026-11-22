@@ -334,7 +334,7 @@ on approvals (`(ChannelType, SessionId)`) for session-scoped clients;
 `ApprovalGateMap::get` tries session-level first, then type-level, then
 falls back to the fail-closed `AutoDenyGate` (`crates/tools/src/
 approval.rs`), while `QuestionGateMap` is populated only for
-`ChannelType::owner()` (`AskUser` is owner-only). Because the gates live on the
+the owner and TUI channels listed by `question_channels()`. Because the gates live on the
 long-lived channel rather than on a connection, a client reconnecting does not
 lose pending asks — a resubscribe re-delivers the full card sets in the
 `SubscribeState` bundle's `pending_approvals` and `pending_questions` halves
@@ -1048,7 +1048,7 @@ The full frame set (see `crates/wire/src/lib.rs`):
   `HumanAskManager::resolve`, and only for an ask on the connection's own
   channel queue. A multiplexed sidecar is re-sent every pending approval on its
   channel's queue right after it registers, since it has no `SubscribeState`
-  catch-up (`AskUser` is owner-only so question frames never target multiplexed
+  catch-up (question frames target the owner and TUI channels and never reach multiplexed
   sidecars). See [`human-ask.md`](human-ask.md).
 - **TUI history:** `HistorySnapshot { session_id, entries }`,
   `HistoryAppend { session_id, entry }`.

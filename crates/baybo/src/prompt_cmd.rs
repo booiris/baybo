@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use baybo_agent::service::ShutdownSignal;
+use baybo_channels::wire::QuestionReply;
 use baybo_channels::{
     AgentEvent, Connection, ConnectionSink, IncomingMessage, Message, NoticeLevel, SendOutcome,
     SessionEvent,
@@ -37,7 +38,7 @@ use baybo_model::{ChannelType, ContentBlock, MessageMetadata, SessionId, User};
 use baybo_tools::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, AskCancel, AskSite, AutoDenyGate,
 };
-use baybo_tui::client::PendingApprovals;
+use baybo_tui::client::{PendingAsks, PendingCard};
 use baybo_tui::{TransportEvent, TransportEventStream};
 use chrono::Utc;
 use futures::StreamExt;
@@ -182,10 +183,10 @@ async fn run_via_gateway(
         .submit(build_incoming(&session_id, &opts.prompt))
         .await?;
 
-    let approvals = transport.approvals();
+    let asks = transport.asks();
     let answer = await_turn(
         opts.timeout,
-        consume_ws_turn(&approvals, &mut events, decision, opts.json),
+        consume_ws_turn(&asks, &mut events, decision, opts.json),
     )
     .await?;
 
@@ -196,7 +197,7 @@ async fn run_via_gateway(
 }
 
 async fn consume_ws_turn(
-    approvals: &PendingApprovals,
+    asks: &PendingAsks,
     events: &mut TransportEventStream,
     decision: ApprovalDecision,
     json: bool,
@@ -209,11 +210,20 @@ async fn consume_ws_turn(
                 writer.finalize(&blocks_text(&blocks));
                 return Ok(writer.into_answer());
             }
-            TransportEvent::ApprovalRequested => {
-                // No human to decide; resolve over the wire so the turn
-                // never parks on the gateway's approval gate.
-                if let Some(card) = approvals.answer_head(decision) {
-                    note_approval(decision, &card.tool);
+            TransportEvent::AsksChanged => {
+                while let Some(card) = asks.head() {
+                    match card {
+                        PendingCard::Approval(card) => {
+                            if !asks.answer_approval(&card.ask_id, decision) {
+                                break;
+                            }
+                            note_approval(decision, &card.tool);
+                        }
+                        PendingCard::Question { ask_id, .. } => {
+                            asks.answer_question(&ask_id, QuestionReply::Cancelled);
+                            break;
+                        }
+                    }
                 }
             }
             TransportEvent::Notice { level, text } => eprint_notice(level, &text),
@@ -267,6 +277,13 @@ async fn run_in_process(
         session_id.clone(),
         gate,
     );
+
+    // This process serves just the headless turn; nobody can answer a question.
+    graph
+        .channels_registry
+        .gates()
+        .questions
+        .remove(&ChannelType::tui());
 
     // Attach an in-process sink + subscribe so the router's per-session
     // fan-out delivers this turn's output to our mpsc.
@@ -582,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_final_message_is_canonical_answer() {
-        let (q, _answers) = PendingApprovals::new();
+        let (q, _answers) = PendingAsks::new();
         let mut s = ws_stream(vec![
             TransportEvent::StreamDelta("hel".into()),
             TransportEvent::StreamDelta("lo".into()),
@@ -596,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_response_without_deltas_is_returned() {
-        let (q, _answers) = PendingApprovals::new();
+        let (q, _answers) = PendingAsks::new();
         let mut s = ws_stream(vec![TransportEvent::Response(text_blocks("only final"))]);
         let out = consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
             .await
@@ -606,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_deltas_without_final_response_fall_back() {
-        let (q, _answers) = PendingApprovals::new();
+        let (q, _answers) = PendingAsks::new();
         let mut s = ws_stream(vec![TransportEvent::StreamDelta("partial".into())]);
         let out = consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
             .await
@@ -616,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_empty_turn_errors() {
-        let (q, _answers) = PendingApprovals::new();
+        let (q, _answers) = PendingAsks::new();
         let mut s = ws_stream(vec![]);
         assert!(
             consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
@@ -627,8 +644,8 @@ mod tests {
 
     #[tokio::test]
     async fn ws_approval_is_auto_resolved_from_queue() {
-        let (q, _answers) = PendingApprovals::new();
-        q.show(ApprovalRequest {
+        let (q, _answers) = PendingAsks::new();
+        q.show(PendingCard::Approval(ApprovalRequest {
             tool_call_id: String::new(),
             ask_id: "c1".parse().unwrap(),
             session_id: SessionId::from("s1"),
@@ -637,16 +654,55 @@ mod tests {
             accesses: Vec::new(),
             params_preview: String::new(),
             description: None,
-        });
+        }));
         let mut s = ws_stream(vec![
-            TransportEvent::ApprovalRequested,
+            TransportEvent::AsksChanged,
             TransportEvent::Response(text_blocks("done")),
         ]);
         let out = consume_ws_turn(&q, &mut s, ApprovalDecision::Deny, true)
             .await
             .unwrap();
         assert_eq!(out, "done");
-        assert!(q.is_empty(), "the card should be answered and taken off");
+        assert!(
+            q.head().is_none(),
+            "the card should be answered and taken off"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_question_is_cancelled_once_even_with_allow_all() {
+        use baybo_model::human_ask::Question;
+        let (asks, mut answers) = PendingAsks::new();
+        let id = "question".parse::<baybo_model::human_ask::AskId>().unwrap();
+        asks.show(PendingCard::Question {
+            ask_id: id.clone(),
+            submitting: false,
+            questions: vec![Question {
+                header: "Mode".into(),
+                question: "Which mode?".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        });
+        let mut stream = ws_stream(vec![
+            TransportEvent::AsksChanged,
+            TransportEvent::AsksChanged,
+            TransportEvent::Response(text_blocks("done")),
+        ]);
+        assert_eq!(
+            consume_ws_turn(&asks, &mut stream, ApprovalDecision::Approve, true)
+                .await
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(
+            answers.try_recv().unwrap(),
+            baybo_channels::wire::Frame::AnswerQuestion {
+                ask_id: id,
+                reply: QuestionReply::Cancelled
+            }
+        );
+        assert!(answers.try_recv().is_err());
     }
 
     // ---- in-process path --------------------------------------------------

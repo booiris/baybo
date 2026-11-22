@@ -434,6 +434,24 @@ fn tool_approval_modal_renders_and_resolves() {
 }
 
 #[test]
+#[ignore = "tmux render test; run with --ignored"]
+fn keyboard_question_answer_reaches_gateway_and_restores_chat() {
+    run_chat("keyboard_question_answer", |s| {
+        say(s, SAY_QUESTION);
+        wait_render(s, "question", |screen| screen.contains(QUESTION_TEXT))?;
+        s.send_key(Key::Char('2')).expect("choose Release");
+        wait_render(s, "selected Release", |screen| {
+            screen.contains("[x] Release")
+        })?;
+        s.send_key(Key::Enter).expect("submit");
+        wait_render(s, "continued turn", |screen| {
+            screen.contains(QUESTION_REPLY) && !screen.contains(QUESTION_TEXT)
+        })?;
+        Ok(())
+    });
+}
+
+#[test]
 #[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn task_list_is_not_rendered_in_the_tui() {
     run_chat("task_list_is_not_rendered_in_the_tui", |s| {
