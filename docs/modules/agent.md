@@ -150,7 +150,8 @@ through `AgentLoop::run` → `run_inner` → `run_iteration`; each call gets a
 child of the turn token plus the turn's release token. `run_agent_loop`
 reports a user stop only for a `Turn` cancel, so messages queued behind a
 turn the idle reaper released still run; an actor whose own token is
-cancelled (shutdown) takes no further message but `ActorStop`. The loop captures `CancelOrigin` when it observes cancellation and returns
+cancelled (shutdown) wakes from its mailbox wait and performs the same final
+save as `ActorStop`. The loop captures `CancelOrigin` when it observes cancellation and returns
 that same origin to the actor after the turn settles. On `Ancestor` (shutdown, or the idle reaper's release) it appends
 and emits nothing for a call that never finished or whose ask came back
 abandoned — the transcript is left as a crash would leave it, the ask row
@@ -253,7 +254,7 @@ half-open trace rows and cancels non-terminal turns left by a prior process deat
 as `SystemCrash`. It also closes half-open detached trace rows under terminal
 turns (for example a title-generation step that outlived its turn) without
 changing that terminal turn. During the current process,
-`actor::runner::spawn_actor` watches actor task panics and calls
+`actor::runner::ActorTasks` watches actor task panics and calls
 `recover_panicked_actor_session` for that session's active chat turns, then emits
 a user-facing crash notice. The TurnState inactive edge still comes from the turn
 lifecycle event via the projector, not from the runner directly.

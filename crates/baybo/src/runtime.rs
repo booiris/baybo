@@ -24,6 +24,7 @@ use std::sync::Arc;
 use baybo_agent::actor::AgentActor;
 use baybo_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use baybo_agent::router::Router;
+use baybo_agent::runner::ActorTasks;
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
 use baybo_agent::supervisor::AgentSupervisor;
 use baybo_agent::tool_executor::{BoardStores, ToolExecutor};
@@ -213,10 +214,7 @@ pub struct ManagerGraph {
     /// not a panic.
     pub subagent_spawner_slot: baybo_subagent::tool::SubagentSpawnerSlot,
 
-    /// Process-wide parent token for `AgentActor`s. Bridged to the
-    /// shared `ShutdownSignal` in [`build_managers`]; cancelling it
-    /// cascades down through every actor's per-turn cancel tree.
-    pub actor_parent_token: CancellationToken,
+    actor_tasks: ActorTasks,
 
     /// The ask ledger + observers the channel gates share. Rides the graph
     /// to `GatewayDeps` for the lazy channel install.
@@ -250,13 +248,18 @@ const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_
 
 impl ManagerGraph {
     pub async fn shutdown(&mut self, deadline: tokio::time::Instant) {
-        self.actor_parent_token.cancel();
-        let sandbox_runner = self.sandbox_runner.clone();
-        tokio::join!(self.mcp_runtime.shutdown(deadline), async move {
-            if let Some(runner) = sandbox_runner {
-                runner.shutdown(deadline).await;
+        let (actors, (), ()) = tokio::join!(
+            tokio::time::timeout_at(deadline, self.actor_tasks.shutdown()),
+            self.mcp_runtime.shutdown(deadline),
+            async {
+                if let Some(runner) = &self.sandbox_runner {
+                    runner.shutdown(deadline).await;
+                }
             }
-        });
+        );
+        if actors.is_err() {
+            tracing::warn!("shutdown deadline reached before all session actors exited");
+        }
         self.process_manager
             .shutdown_all(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await;
@@ -893,19 +896,10 @@ pub async fn build_managers(
         Arc::new(baybo_human_ask::PolicyDenyGate::new(Arc::clone(&ask_core))),
     ));
 
-    // --- per-actor parent token. The spawner factory derives each
-    // actor's `actor_token` as a child of this; tripping it on
-    // shutdown cascades cancel through every in-flight tool /
-    // subagent across every session.
-    let actor_parent_token = CancellationToken::new();
-    {
-        let signal = shutdown.clone();
-        let cancel_on_shutdown = actor_parent_token.clone();
-        tokio::spawn(async move {
-            signal.wait().await;
-            cancel_on_shutdown.cancel();
-        });
-    }
+    let actor_tasks = ActorTasks::new(
+        shutdown.cancellation_token().child_token(),
+        stores.trace.clone(),
+    );
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
     // dynamically registers/unregisters MCP-discovered tools.
     // Browser MCP server: shipped as a zstd-embedded JS bundle, run
@@ -955,7 +949,7 @@ pub async fn build_managers(
         cron_trigger_rx: Some(cron_trigger_rx),
         issue_run_rx: Some(issue_run_rx),
         subagent_spawner_slot,
-        actor_parent_token,
+        actor_tasks,
         ask_core,
         ask_queues,
         human_asks,
@@ -1028,6 +1022,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     // Single `Arc`-shared actor factory: used by the router for top-level
     // user/cron actors and by the subagent spawner for child actors.
     let spawn_actor_for: baybo_agent::router::ActorSpawner = {
+        let actor_tasks = graph.actor_tasks.clone();
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);
         let skill_registry = Arc::clone(&graph.skill_registry);
@@ -1140,14 +1135,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                     trace_event_stream.clone(),
                 ));
 
-                let runner_ctx = baybo_agent::runner::ActorRunnerContext {
-                    session_id: session.id.clone(),
-                    user_id: session.user.id.clone(),
-                    channel: session.channel.clone(),
-                    response_tx: response_tx.clone(),
-                    turn_lifecycle: Arc::clone(&turn_lifecycle),
-                    trace_store: trace_store.clone(),
-                };
                 let actor = AgentActor::from_parts(
                     baybo_agent::state::DurableActorState::new(session),
                     baybo_agent::state::VolatileResources {
@@ -1164,7 +1151,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                 );
                 let (sender, mailbox) =
                     baybo_agent::mailbox::channel(baybo_agent::mailbox::DEFAULT_CAPACITY);
-                baybo_agent::runner::spawn_actor(actor, mailbox, runner_ctx);
+                actor_tasks.spawn(actor, mailbox);
                 sender
             },
         )
@@ -1186,7 +1173,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     baybo_agent::supervisor::spawn_idle_reaper(
         supervisor.clone(),
         Arc::clone(&graph.session_manager),
-        graph.actor_parent_token.clone(),
+        graph.actor_tasks.parent_token(),
     );
 
     // Turn-state projector: the single producer of the web chat's live
@@ -1198,7 +1185,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         Arc::clone(&graph.turn_lifecycle),
         Arc::clone(&graph.session_manager),
         supervisor.response_tx().clone(),
-        graph.actor_parent_token.clone(),
+        graph.actor_tasks.parent_token(),
     );
 
     let workspace_paths_for_router = Arc::new(baybo_workspace::WorkspacePaths::new(
@@ -1233,7 +1220,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                 dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
                 cost_manager: Arc::clone(&cost_manager),
                 turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
-                actor_parent_token: graph.actor_parent_token.clone(),
+                actor_parent_token: graph.actor_tasks.parent_token(),
                 external_agents: Arc::clone(&external_agents),
                 llm_pool: Arc::clone(&llm_pool),
                 workspace_paths: Arc::clone(&workspace_paths_for_router),
@@ -1260,7 +1247,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         issue_run_rx: graph.issue_run_rx.take(),
         ask_resume_rx: graph.ask_resume_rx.take(),
         board: Some(Arc::clone(&graph.project_manager)),
-        actor_parent_token: graph.actor_parent_token.clone(),
+        actor_parent_token: graph.actor_tasks.parent_token(),
         rate_limit: Arc::clone(&graph.rate_limit),
         inbound_dedup: Arc::clone(&graph.inbound_dedup),
     });

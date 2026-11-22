@@ -5163,6 +5163,22 @@ mod blocking_llm {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn shutdown_joins_an_idle_actor_with_an_unregistered_open_mailbox() {
+    let harness = AgentTestHarness::builder().build();
+    let mailbox = harness.mailbox.clone();
+    harness.supervisor.remove(&harness.session.id);
+    tokio::task::yield_now().await;
+
+    tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
+        .await
+        .expect("shutdown wakes the idle actor");
+    assert!(matches!(
+        mailbox.try_send(AgentMessage::ActorStop),
+        Err(baybo_agent::mailbox::TrySendError::Closed(_))
+    ));
+}
+
 /// `/stop` must abort an LLM call that is already in flight — not just be
 /// observed at the next iteration boundary. The provider call here parks
 /// forever, so the agent loop can only ever leave it if cancelling the turn

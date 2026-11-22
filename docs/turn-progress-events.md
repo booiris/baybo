@@ -155,7 +155,7 @@ in a window where the live signal and the snapshot disagree: from the instant
 the `Pending` row exists the snapshot reads active, and the `Started` broadcast
 refines `started_at` moments later.
 
-A panicked actor is watched by `actor::runner::spawn_actor`: it delegates to
+`actor::runner::ActorTasks` observes panics and delegates to
 `recover_panicked_actor_session`, which closes the orphan trace rows and cancels
 the orphaned turns. Those terminal turn events are what the projector turns
 into the close edge — no special-case `TurnState` broadcast in the runner.

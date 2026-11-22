@@ -411,26 +411,11 @@ learning a new state.
 
 ### Shutdown is not `/stop`
 
-Today a graceful shutdown (`runtime.rs:846` `actor_parent_token.cancel()`) is
-indistinguishable from `/stop` inside the loop: both trip the turn token
-(`run_agent_loop` mints `turn_token = actor_token.child_token()`,
-`actor/mod.rs:609`, and passes only that down), the pre-execute `select!`
-(`tool_executor.rs:849-853`) yields `abandoned()`, the executor returns a real
-`Denied` result, and the cancelled-batch path (`agent_loop.rs:1601-1641`)
-appends a fill for every call that did not finish. Either way the `tool_use`
-is no longer dangling, so there is nothing to resume — that is why today's
-prompts do not survive `baybo gateway restart`.
-
-Two facts shape the fix. There is **no existing discriminator**: `with_turn`
-sees one token and `cancel_row` always writes `ParentCancelled`
-(`scope.rs:192-200, :252-259`); the row reads `UserStopped` after `/stop`
-only because `handle_stop`'s earlier `TurnLifecycle::cancel(UserStopped)`
-trips the token and writes first (`user_input.rs:445-448`,
-`lifecycle.rs:203-211`). And the **batch loop is not the first to see the
-cancel**: the gate's own `select!` inside the executor completes the tool
-future with `Denied` before the loop's biased select observes anything.
-
-So the origin decision moves into the gate race, and the plumbing is new:
+The turn row records who cancelled it. `handle_stop` requests cancellation
+with `UserStopped`. During graceful shutdown, cancellation propagates from
+the actor's parent token and `cancel_row` records `ParentCancelled`.
+The gate and the batch loop both observe cancellation, so they also need
+its origin while choosing what to do with each unfinished call.
 
 - `AgentActor::turn_tokens` builds `TurnTokens { turn: release.child_token(), release }`,
   where `release` is a per-turn child of the actor's token (see "Idle
@@ -472,7 +457,7 @@ So the origin decision moves into the gate race, and the plumbing is new:
 | | call parked on a resumable ask | parked on a non-resumable ask | other unfinished calls |
 | --- | --- | --- | --- |
 | `Turn` — any `TurnLifecycle::cancel` on the turn id: `/stop` (`UserStopped`), board stop (`OperatorCancel` / `BudgetExhausted`, `stopper.rs:52-65`), admin / CLI `OperatorCancel` | gate returns `Denied`; loop claims `Abandoned`, then appends it | same | cancelled fill, as today |
-| `Ancestor` — the turn's release token tripped: process shutdown (through `actor_token`, `runtime.rs:846`), or the idle reaper's `release_parked_turn` | nothing appended, nothing emitted; entry dead, row pending | nothing appended; entry removed; row reconciled by `reload_pending` | nothing appended; hydration fills "interrupted" |
+| `Ancestor` — the turn's release token tripped through the actor's shutdown token or the idle reaper's `release_parked_turn` | nothing appended, nothing emitted; entry dead, row pending | nothing appended; entry removed; row reconciled by `reload_pending` | nothing appended; hydration fills "interrupted" |
 
 For attended sessions there are two ancestor cancels: process shutdown, and
 the idle reaper releasing a parked turn (see "Idle reaper"). The reaper only
@@ -484,15 +469,13 @@ the same way: only a `Turn` cancel is a user stop that discards the messages
 queued behind the turn; after a release they run as the next turn, whose
 prelude withdraws the released asks.
 
-The `Ancestor` branch is **best-effort**: shutdown cancels the parent token
-from a detached task and nothing joins actor tasks before the process exits
-(`gateway_cmd.rs:857-880`, `runner.rs:49`), so whether the loop even reaches
-its cancel arm is timing-dependent. The design does not depend on it. The
-guaranteed invariant is that *nothing on the shutdown path ever appends a
-result or resolves the row for a parked resumable call*; the turn row settles
-`Cancelled { ParentCancelled }` if the loop gets there and boot recovery
-cancels it `SystemCrash` otherwise — both terminal, both fine, the Resume
-turn links by id regardless.
+On graceful shutdown, `ManagerGraph::shutdown` closes actor admission,
+cancels the actors' parent token and waits for their tasks to exit. A turn
+parked on a resumable call settles as `Cancelled { ParentCancelled }`.
+The ask stays pending and its tool call stays unanswered. If the process
+crashes or exceeds its shutdown budget before the turn settles, boot recovery
+marks the unfinished turn `SystemCrash`. In either case the answer starts a
+Resume turn linked to the original turn.
 
 `ManagerGraph::shutdown` no longer runs `close_open_prompts`; there is nothing
 to close. Asks are meant to still be open after the process comes back.
@@ -1090,9 +1073,8 @@ The TUI shares one ordered queue for approvals and questions, including asks rec
   the `onAwaitingHuman` rename with Swift, dropping the REST
   `approval_pending` twin, and refreshing `app/ios/docs/approvals.md` +
   `chat-list.md`) is the iOS stage.
-- `preview` on options; questions on sidecar channels; a REST door for
-  answering questions (WS only in v1); a deterministic shutdown that joins
-  actor tasks (would make the `Ancestor` branch exact instead of best-effort).
+- Remaining question surfaces include option previews, questions on sidecar
+  channels and a REST endpoint for answering questions (WS only in v1).
 
 ## Data model
 
@@ -1610,12 +1592,9 @@ implemented as written unless overridden.
    approvals unanswerable from the phone while the self-deny that used to
    unblock them is gone. The `SessionPatch` wire key is still renamed
    outright. Recommended: twin on REST only.
-3. **Shutdown leaves asks pending; `/stop` abandons them.** This needs the
-   turn's release token threaded into the executor (`TurnTokens`) and the gate to make
-   the origin decision — a small but new seam, and best-effort on the
-   shutdown side. The alternative — treat shutdown like `/stop` — means
-   "survives a restart" only covers crashes, not `baybo gateway restart`,
-   which is the common restart.
+3. **Shutdown leaves asks pending and `/stop` abandons them.** The executor
+   passes `TurnTokens` to the gate so it can distinguish the two. An owner
+   can answer a parked question after `baybo gateway restart`.
 4. **Messages queue behind restored questions too.** The card owns its answers and only Submit or Cancel ask sends a question reply.
 
 (Earlier draft decision "user-rooted subagents become unattended" is

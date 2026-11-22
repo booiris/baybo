@@ -16,6 +16,7 @@ use std::time::Duration;
 use baybo_agent::{
     AgentLoop, SecurityGateway,
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
+    runner::ActorTasks,
     tool_executor::ToolExecutor,
 };
 use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
@@ -120,7 +121,7 @@ pub struct AgentTestHarness {
     pub strict_rejections: Arc<AtomicUsize>,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
-    actor_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    actor_tasks: ActorTasks,
     router_task: Option<JoinHandle<()>>,
 }
 
@@ -206,17 +207,13 @@ impl AgentTestHarness {
     }
 
     /// Stop routing and join every actor, including actors spawned after eviction.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
+        self.outputs.close();
         if let Some(router) = self.router_task {
             router.abort();
             let _ = router.await;
         }
-        self.actor_parent_token.cancel();
-        self.supervisor.shutdown_all().await;
-        let tasks = std::mem::take(&mut *self.actor_tasks.lock());
-        for task in tasks {
-            task.await.expect("harness actor exited cleanly");
-        }
+        self.actor_tasks.shutdown().await;
     }
 }
 
@@ -730,7 +727,7 @@ impl AgentTestHarnessBuilder {
             Arc::clone(&human_asks) as Arc<dyn baybo_human_ask::LivePendingAsks>,
         );
 
-        let actor_tasks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let actor_tasks = ActorTasks::new(actor_parent_token.clone(), trace_store.clone());
         let actor_spawner: baybo_agent::router::ActorSpawner = {
             let trace_store = trace_store.clone();
             let actor_tasks = actor_tasks.clone();
@@ -813,7 +810,7 @@ impl AgentTestHarnessBuilder {
                             workspace: Arc::clone(&workspace),
                         },
                     );
-                    actor_tasks.lock().push(tokio::spawn(actor.run(mailbox_rx)));
+                    actor_tasks.spawn(actor, mailbox_rx);
                     mailbox_tx
                 },
             )
