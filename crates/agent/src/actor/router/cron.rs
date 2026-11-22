@@ -664,38 +664,11 @@ impl Router {
     #[must_use]
     async fn run_conversation_fire(&self, session: Session, trigger: AgentMessage) -> bool {
         let session_id = session.id.clone();
-        let routed = self.route_to_conversation(session, trigger).await;
+        let routed = self.route_one_to_actor(&session, trigger).await;
         if !routed {
             warn!(session_id = %session_id, "failed to deliver cron trigger to its conversation");
         }
         routed
-    }
-
-    /// Hand `message` to the registered actor of a recurring fire's
-    /// conversation, hydrating one if the idle reaper (or a restart) left the
-    /// session without. Returns whether it reached a mailbox.
-    async fn route_to_conversation(&self, session: Session, message: AgentMessage) -> bool {
-        let session_id = session.id.clone();
-        // A fresh cron session has no `last_llm` of its own, so without this
-        // a bound agent's scheduled work runs on the pool default rather than
-        // the model its profile pins.
-        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
-        let response_tx = self.supervisor.response_tx().clone();
-        let parent_token = self.actor_parent_token.clone();
-        let actor_spawner = self.actor_spawner.as_ref();
-        self.supervisor
-            .route_or_spawn(&session_id, message, || {
-                let actor_token = parent_token.child_token();
-                actor_spawner(
-                    session,
-                    pins.entry,
-                    pins.model,
-                    pins.effort,
-                    response_tx,
-                    actor_token,
-                )
-            })
-            .await
     }
 
     /// Tell every recurring fire still owed a background report that it is
@@ -726,7 +699,7 @@ impl Router {
         for session in awaiting {
             let session_id = session.id.clone();
             if !self
-                .route_to_conversation(session, AgentMessage::CronBackgroundWorkLost)
+                .route_one_to_actor(&session, AgentMessage::CronBackgroundWorkLost)
                 .await
             {
                 warn!(
@@ -758,14 +731,8 @@ impl Router {
         let session_id = session.id.clone();
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
-        let (mailbox, actor_token) = self.spawn_oneshot_actor(
-            session,
-            pins.entry,
-            pins.model,
-            pins.effort,
-            response_tx,
-            &self.actor_parent_token,
-        );
+        let (mailbox, actor_token) =
+            self.spawn_oneshot_actor(session, pins, response_tx, &self.supervisor.parent_token());
 
         match mailbox.send(trigger).await {
             Ok(()) => {
@@ -845,7 +812,6 @@ impl Router {
             cron_store: Arc::clone(&self.cron_store),
             actor_spawner: Arc::clone(&self.actor_spawner),
             agent_profiles: Arc::clone(&self.agent_profiles),
-            actor_parent_token: self.actor_parent_token.clone(),
         }
     }
 
@@ -1113,7 +1079,6 @@ pub(super) struct CronResultDelivery {
     /// The origin conversation may be bound to an agent, so hydrating it has
     /// the same pin resolution as any other cold spawn.
     agent_profiles: Arc<dyn baybo_store::agent_profile::AgentProfileStore>,
-    actor_parent_token: CancellationToken,
 }
 
 impl CronResultDelivery {
@@ -1144,26 +1109,13 @@ impl CronResultDelivery {
         };
 
         let origin_id = origin.id.clone();
-        let response_tx = self.supervisor.response_tx().clone();
-        let parent_token = self.actor_parent_token.clone();
-        let actor_spawner = self.actor_spawner.as_ref();
-        let pins = super::resolve_spawn_pins(&origin, &self.agent_profiles).await;
         let delivered = self
             .supervisor
-            .route_or_spawn(
-                &origin_id,
+            .route_session(
+                &origin,
                 AgentMessage::CronResultReady(Box::new(result)),
-                || {
-                    let actor_token = parent_token.child_token();
-                    actor_spawner(
-                        origin,
-                        pins.entry,
-                        pins.model,
-                        pins.effort,
-                        response_tx,
-                        actor_token,
-                    )
-                },
+                &self.actor_spawner,
+                super::resolve_spawn_pins(&origin, &self.agent_profiles),
             )
             .await;
         if !delivered {
@@ -1316,6 +1268,7 @@ mod tests {
             let supervisor = AgentSupervisor::new(
                 response_tx,
                 std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+                tokio_util::sync::CancellationToken::new(),
             );
             let sessions = Arc::new(SessionManager::new(
                 Arc::new(MemorySessionStore::new()),
@@ -1328,8 +1281,8 @@ mod tests {
             let spawned_for_closure = Arc::clone(&spawned);
             let drop_mailboxes = Arc::new(AtomicBool::new(false));
             let drop_for_closure = Arc::clone(&drop_mailboxes);
-            let actor_spawner: ActorSpawner = Arc::new(
-                move |session: Session, _llm, _model, _effort, _tx, _token| {
+            let actor_spawner: ActorSpawner =
+                Arc::new(move |session: Session, _pins, _registry, _tx, _token| {
                     let (sender, receiver) = mailbox::channel(16);
                     if drop_for_closure.load(Ordering::Relaxed) {
                         drop(receiver);
@@ -1337,8 +1290,7 @@ mod tests {
                         spawned_for_closure.lock().push((session.id, receiver));
                     }
                     sender
-                },
-            );
+                });
 
             let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
             let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
@@ -1397,7 +1349,6 @@ mod tests {
                 issue_run_rx: None,
                 ask_resume_rx: None,
                 board: None,
-                actor_parent_token: CancellationToken::new(),
                 rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
             });
 
@@ -2207,8 +2158,7 @@ mod tests {
     /// A recurring fire's session is a conversation the user can reply in, so
     /// its actor MUST be registered with the supervisor. If it were not, a
     /// reply would find no entry and fork a *second* actor over the same
-    /// transcript — and the fire actor's registry guard would then evict the
-    /// user's actor on its way out.
+    /// transcript.
     #[tokio::test]
     async fn a_recurring_fires_actor_is_registered_so_a_reply_reaches_it() {
         let mut h = RouterHarness::new();

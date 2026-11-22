@@ -20,11 +20,11 @@
 //!      `shutdown()` to stop the actor cleanly.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
+use baybo_agent::BackgroundJobManager;
 use baybo_agent::actor::AgentMessage;
-use baybo_agent::{AgentSupervisor, BackgroundJobManager};
 use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, ToolStatus};
 use baybo_cost::SpendingLimits;
 use baybo_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
@@ -1746,27 +1746,11 @@ async fn several_ungrouped_results_drain_into_one_batch_framed_with_its_count() 
 async fn shutdown_kills_background_command_without_persisting_notification() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
-    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(8);
-    let supervisor = AgentSupervisor::new(
-        response_tx,
-        std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
-    );
-    supervisor
-        .register_if_absent(session_id.clone(), harness.mailbox.clone())
-        .expect("harness actor is registered once");
-
-    let supervisor_slot = Arc::new(OnceLock::new());
-    assert!(
-        supervisor_slot.set(supervisor.clone()).is_ok(),
-        "supervisor slot is initialized once"
-    );
-    let shutdown = CancellationToken::new();
+    let supervisor = harness.supervisor.clone();
+    let shutdown = supervisor.parent_token();
     let killed = CancellationToken::new();
-    let manager = BackgroundJobManager::new(
-        supervisor_slot,
-        Arc::clone(&harness.session_manager),
-        shutdown.clone(),
-    );
+    let manager =
+        BackgroundJobManager::new(supervisor.clone(), Arc::clone(&harness.session_manager));
 
     // A job that only ends when cancelled, like a long-running server.
     let cancel = CancellationToken::new();
@@ -5161,22 +5145,6 @@ mod blocking_llm {
             None
         }
     }
-}
-
-#[tokio::test(start_paused = true)]
-async fn shutdown_joins_an_idle_actor_with_an_unregistered_open_mailbox() {
-    let harness = AgentTestHarness::builder().build();
-    let mailbox = harness.mailbox.clone();
-    harness.supervisor.remove(&harness.session.id);
-    tokio::task::yield_now().await;
-
-    tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
-        .await
-        .expect("shutdown wakes the idle actor");
-    assert!(matches!(
-        mailbox.try_send(AgentMessage::ActorStop),
-        Err(baybo_agent::mailbox::TrySendError::Closed(_))
-    ));
 }
 
 /// `/stop` must abort an LLM call that is already in flight — not just be

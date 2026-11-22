@@ -70,19 +70,13 @@ impl Router {
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
             board: Arc::clone(&board),
-            shutdown: self.actor_parent_token.clone(),
+            shutdown: self.supervisor.parent_token(),
         };
 
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
-        let (mailbox, actor_token) = self.spawn_oneshot_actor(
-            session,
-            pins.entry,
-            pins.model,
-            pins.effort,
-            response_tx,
-            &self.actor_parent_token,
-        );
+        let (mailbox, actor_token) =
+            self.spawn_oneshot_actor(session, pins, response_tx, &self.supervisor.parent_token());
 
         let trigger = AgentMessage::IssueRun {
             run_id: run_id.clone(),
@@ -585,7 +579,7 @@ mod tests {
             Arc::new(baybo_session::test_support::MemorySessionFolderStore::new()),
         ));
         let actor_spawner: ActorSpawner =
-            Arc::new(move |_session, _llm, _model, _effort, _tx, _token| {
+            Arc::new(move |_session, _pins, _registry, _tx, _token| {
                 crate::actor::mailbox::channel(1).0
             });
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
@@ -596,6 +590,7 @@ mod tests {
             supervisor: AgentSupervisor::new(
                 response_tx,
                 std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+                tokio_util::sync::CancellationToken::new(),
             ),
             channels: Arc::new(baybo_channels::ChannelRegistry::new()),
             security_gateway: Arc::new(SecurityGateway::new(
@@ -620,7 +615,6 @@ mod tests {
             issue_run_rx: None,
             ask_resume_rx: None,
             board: Some(Arc::clone(&board.projects)),
-            actor_parent_token: CancellationToken::new(),
             rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
             workspace: Arc::new(WorkspacePaths::new("/tmp/baybo-issue-router-test")),
             inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),

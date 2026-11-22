@@ -91,10 +91,8 @@ pub struct VolatileResources {
     /// `actor_token`, so parent shutdown cascades automatically via the
     /// `tokio_util` token tree.
     pub actor_token: CancellationToken,
-    /// Supervisor handle used by [`crate::actor::supervisor::ActorRegistryGuard`]
-    /// in [`crate::actor::AgentActor::run`] to self-deregister when the
-    /// task exits. `None` for one-shot actors that are not tracked by
-    /// the supervisor (cron fires, maintenance spawns, tests).
+    /// Routed actors register their active turn for idle release and remove their
+    /// mailbox on exit. One-shot actors have no routing entry.
     pub supervisor: Option<AgentSupervisor>,
     /// Session-row writer used by handlers whose state mutations must
     /// survive actor eviction. Today only the background-subagent

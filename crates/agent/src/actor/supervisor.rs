@@ -9,17 +9,13 @@ use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
-use crate::actor::AgentMessage;
-use crate::actor::mailbox::{MailboxSender, TrySendError};
+use crate::actor::mailbox::{self, MailboxSender, TrySendError};
+use crate::actor::{AgentActor, AgentMessage};
 use crate::runtime::running_calls::RunningCalls;
 use baybo_session::SessionManager;
-
-/// Handle to communicate with a running AgentActor.
-pub struct ActorHandle {
-    pub sender: MailboxSender<AgentMessage>,
-}
 
 /// Per-parent record of one in-flight background job — whatever tool started
 /// it — enough for `/stop` to enumerate it (cancel it, report what it was
@@ -48,10 +44,7 @@ pub struct InFlightJob {
 /// Cheap to clone: the actor registry is a [`DashMap`] behind an `Arc`,
 /// so router, runtime, and individual actors can share the same view
 /// with sharded-lock concurrency (no global mutex held across reads).
-/// Each actor holds a clone and uses it to self-deregister on shutdown
-/// via [`ActorRegistryGuard`], preventing the `actors` map from leaking
-/// entries when actors die for any reason (Shutdown / panic / mailbox
-/// close).
+/// The task tracker also covers one-shot actors that have no routing entry.
 ///
 /// `in_flight_background_jobs` tracks background jobs (subagents, detached
 /// commands — whatever tool started them) still running per parent session
@@ -63,7 +56,9 @@ pub struct InFlightJob {
 /// suppress signal (an escort whose entry is gone delivers nothing). Process-local (background dispatches don't survive restart).
 #[derive(Clone)]
 pub struct AgentSupervisor {
-    actors: Arc<DashMap<SessionId, ActorHandle>>,
+    parent: CancellationToken,
+    tasks: TaskTracker,
+    actors: Arc<DashMap<SessionId, MailboxSender<AgentMessage>>>,
     response_tx: mpsc::Sender<AgentOutput>,
     in_flight_background_jobs:
         Arc<DashMap<SessionId, HashMap<baybo_model::BackgroundHandle, InFlightJob>>>,
@@ -101,14 +96,39 @@ impl AgentSupervisor {
     pub fn new(
         response_tx: mpsc::Sender<AgentOutput>,
         live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
+        parent: CancellationToken,
     ) -> Self {
         Self {
+            parent,
+            tasks: TaskTracker::new(),
             actors: Arc::new(DashMap::new()),
             response_tx,
             in_flight_background_jobs: Arc::new(DashMap::new()),
             live_asks,
             turn_releases: Arc::new(DashMap::new()),
         }
+    }
+
+    pub fn parent_token(&self) -> CancellationToken {
+        self.parent.clone()
+    }
+
+    pub fn spawn_actor(
+        &self,
+        actor: AgentActor,
+        capacity: usize,
+        trace_store: Arc<dyn baybo_trace::TraceStore>,
+    ) -> MailboxSender<AgentMessage> {
+        let (sender, mailbox) = mailbox::channel(capacity);
+        // Count the task before checking admission so shutdown also waits for
+        // a spawn that has passed the check but has not started running yet.
+        let task =
+            self.tasks
+                .track_future(crate::actor::runner::run_actor(actor, mailbox, trace_store));
+        if !self.parent.is_cancelled() {
+            tokio::spawn(task);
+        }
+        sender
     }
 
     /// End `session_id`'s running turn the way a shutdown would, if all it
@@ -300,57 +320,58 @@ impl AgentSupervisor {
     pub async fn route(&self, session_id: &SessionId, message: AgentMessage) -> bool {
         // Clone the sender out of the shard lock so we don't hold it
         // across the `.await` below.
-        let Some(sender) = self.actors.get(session_id).map(|e| e.sender.clone()) else {
+        let Some(sender) = self.actors.get(session_id).map(|e| e.value().clone()) else {
             return false;
         };
+        Self::send(&sender, session_id, message).await
+    }
+
+    async fn send(
+        sender: &MailboxSender<AgentMessage>,
+        session_id: &SessionId,
+        message: AgentMessage,
+    ) -> bool {
         if let Err(e) = sender.send(message).await {
-            tracing::warn!(
-                %session_id,
-                error = %e,
-                "failed to send message to actor"
-            );
+            warn!(%session_id, error = %e, "failed to send message to actor");
             return false;
         }
         true
     }
 
-    /// Route `message` to the actor for `session_id`, spawning one via
-    /// `spawn` if no actor is registered yet. The spawn + insert step is
-    /// atomic against the actor map's shard lock, so two concurrent
-    /// callers cannot both observe a vacancy and each spawn an actor.
-    ///
-    /// `spawn` must return a freshly built mailbox sender (typically
-    /// produced by an [`crate::actor::router::ActorSpawner`]); the supervisor
-    /// inserts it into the registry, then sends `message`. `spawn` runs
-    /// only when the entry is vacant, so callers must build the session /
-    /// derive the cancellation token before invoking — there's no
-    /// "lazy" mode that skips the work when an actor already exists.
-    ///
-    /// Returns `false` if the eventual `send().await` fails (mailbox
-    /// closed); otherwise `true`.
-    /// Deliver to an actor that already exists, or report that none does.
-    ///
-    /// The spawn half of [`Self::route_or_spawn`] takes a *synchronous*
-    /// closure — deliberately, so no `.await` sits inside the `DashMap` entry
-    /// lock — which forces every caller to resolve its spawn arguments before
-    /// it knows whether a spawn is needed. Callers whose arguments cost
-    /// something to resolve (a store read) try this first and pay only on the
-    /// miss. Never spawns, so a concurrent reap between this call and the
-    /// fallback is just a miss, not a spawn with half-resolved arguments.
-    pub async fn route_existing(
+    pub(super) async fn route_session(
         &self,
-        session_id: &SessionId,
+        session: &baybo_model::Session,
         message: AgentMessage,
-    ) -> Option<bool> {
-        let sender = self.actors.get(session_id)?.sender.clone();
-        if let Err(e) = sender.send(message).await {
-            tracing::warn!(%session_id, error = %e, "failed to send message to actor");
-            return Some(false);
+        spawn: &crate::actor::router::ActorSpawner,
+        pins: impl Future<Output = baybo_model::LlmPin>,
+    ) -> bool {
+        if self.parent.is_cancelled() {
+            return false;
         }
-        Some(true)
+        let sender = self.actors.get(&session.id).map(|e| e.value().clone());
+        let message = if let Some(sender) = sender {
+            match sender.send(message).await {
+                Ok(()) => return true,
+                Err(closed) => closed.0,
+            }
+        } else {
+            message
+        };
+        let pins = pins.await;
+        self.route_or_spawn(&session.id, message, || {
+            spawn(
+                session.clone(),
+                pins,
+                Some(self.clone()),
+                self.response_tx.clone(),
+                self.parent.child_token(),
+            )
+        })
+        .await
     }
 
-    pub async fn route_or_spawn<F>(
+    // The shard lock serializes concurrent cold starts for the same session.
+    async fn route_or_spawn<F>(
         &self,
         session_id: &SessionId,
         message: AgentMessage,
@@ -360,36 +381,26 @@ impl AgentSupervisor {
         F: FnOnce() -> MailboxSender<AgentMessage>,
     {
         use dashmap::Entry;
+        if self.parent.is_cancelled() {
+            return false;
+        }
         let sender = match self.actors.entry(session_id.clone()) {
-            Entry::Occupied(slot) => slot.get().sender.clone(),
-            Entry::Vacant(slot) => {
+            Entry::Occupied(slot) if !slot.get().is_closed() => slot.get().clone(),
+            slot => {
                 debug!(%session_id, "registering actor");
                 let sender = spawn();
-                slot.insert(ActorHandle {
-                    sender: sender.clone(),
-                });
+                if sender.is_closed() {
+                    return false;
+                }
+                slot.insert(sender.clone());
                 sender
             }
         };
-        if let Err(e) = sender.send(message).await {
-            tracing::warn!(
-                %session_id,
-                error = %e,
-                "failed to send message to actor"
-            );
-            return false;
-        }
-        true
+        Self::send(&sender, session_id, message).await
     }
 
-    /// Atomically insert a new actor handle if no entry exists for
-    /// `session_id`. Returns `Ok(())` on insert, or `Err(rejected)`
-    /// with the sender the caller tried to register.
-    ///
-    /// Production code should reach for [`Self::route_or_spawn`] which
-    /// folds the build-and-register step into one atomic check; this
-    /// raw API is kept for tests and any future caller that genuinely
-    /// owns a pre-built mailbox.
+    /// Register a fixture mailbox without routing its first message.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn register_if_absent(
         &self,
         session_id: SessionId,
@@ -399,21 +410,21 @@ impl AgentSupervisor {
         match self.actors.entry(session_id.clone()) {
             Entry::Vacant(slot) => {
                 debug!(%session_id, "registering actor");
-                slot.insert(ActorHandle { sender });
+                slot.insert(sender);
                 Ok(())
             }
             Entry::Occupied(_) => Err(sender),
         }
     }
 
-    /// Remove an actor handle. Called by [`ActorRegistryGuard`] when an
-    /// actor's `run` loop exits for any reason — Shutdown, mailbox
-    /// close, or panic — so the supervisor's map never holds entries
-    /// pointing at dead tokio tasks.
-    ///
-    /// No-op when the entry has already been removed (e.g. an explicit
-    /// `shutdown_all` raced ahead of the actor's own guard drop).
-    pub fn remove(&self, session_id: &SessionId) {
+    pub(super) fn remove_closed_mailbox(&self, session_id: &SessionId) {
+        // An older actor can finish after its session has a replacement.
+        self.actors
+            .remove_if(session_id, |_, sender| sender.is_closed());
+    }
+
+    #[cfg(test)]
+    fn remove(&self, session_id: &SessionId) {
         if self.actors.remove(session_id).is_some() {
             debug!(%session_id, "deregistering actor");
         }
@@ -447,7 +458,7 @@ impl AgentSupervisor {
     ///
     /// Per reaped session: send `AgentMessage::ActorStop` to the actor's
     /// mailbox. The actor's `run` loop matches `ActorStop`, trips its
-    /// `actor_token`, and exits; the `ActorRegistryGuard` then removes the
+    /// `actor_token`, and exits; the runner then removes the
     /// entry from `self.actors` on drop.
     ///
     /// `ActorStop` is only served between turns, so a turn parked on an ask
@@ -499,7 +510,7 @@ impl AgentSupervisor {
                 );
                 continue;
             }
-            let Some(sender) = self.actors.get(&session_id).map(|e| e.sender.clone()) else {
+            let Some(sender) = self.actors.get(&session_id).map(|e| e.value().clone()) else {
                 continue;
             };
             match sender.try_send(AgentMessage::ActorStop) {
@@ -521,7 +532,7 @@ impl AgentSupervisor {
                 Err(TrySendError::Closed(_)) => {
                     debug!(
                         %session_id,
-                        "idle reaper: mailbox already closed; entry will be removed by registry guard"
+                        "idle reaper: mailbox already closed; entry will be removed by the actor runner"
                     );
                 }
             }
@@ -532,25 +543,11 @@ impl AgentSupervisor {
         reaped
     }
 
-    /// Shut down all actors gracefully.
+    /// Cancel actors and wait for their final writes, including panic recovery.
     pub async fn shutdown_all(&self) {
-        // Snapshot out of the shards before awaiting so each shard
-        // lock is released before any `.send().await`.
-        let handles: Vec<(SessionId, MailboxSender<AgentMessage>)> = self
-            .actors
-            .iter()
-            .map(|e| (e.key().clone(), e.sender.clone()))
-            .collect();
-        info!(count = handles.len(), "shutting down all actors");
-        for (session_id, sender) in handles {
-            if let Err(e) = sender.send(AgentMessage::ActorStop).await {
-                tracing::warn!(
-                    %session_id,
-                    error = %e,
-                    "failed to send shutdown to actor"
-                );
-            }
-        }
+        self.parent.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 }
 
@@ -692,30 +689,6 @@ async fn project_turn_state(
     let _ = response_tx.send(out).await;
 }
 
-/// RAII guard that removes an actor entry from [`AgentSupervisor`] when
-/// the actor's task exits. Held by the actor's `run` loop so cleanup
-/// runs unconditionally — including on panic — and the supervisor's
-/// `actors` map cannot accumulate stale handles.
-pub struct ActorRegistryGuard {
-    supervisor: AgentSupervisor,
-    session_id: SessionId,
-}
-
-impl ActorRegistryGuard {
-    pub fn new(supervisor: AgentSupervisor, session_id: SessionId) -> Self {
-        Self {
-            supervisor,
-            session_id,
-        }
-    }
-}
-
-impl Drop for ActorRegistryGuard {
-    fn drop(&mut self) {
-        self.supervisor.remove(&self.session_id);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +702,7 @@ mod tests {
         AgentSupervisor::new(
             tx,
             std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+            tokio_util::sync::CancellationToken::new(),
         )
     }
 
@@ -745,18 +719,27 @@ mod tests {
         assert_eq!(supervisor.len(), 0);
     }
 
-    #[test]
-    fn registry_guard_removes_on_drop() {
+    #[tokio::test]
+    async fn late_cleanup_preserves_a_replacement_mailbox() {
         let supervisor = make_supervisor();
         let session_id = SessionId::from("s-2");
-        let (tx, _rx) = mailbox::channel(8);
+        let (tx, old_rx) = mailbox::channel(8);
         supervisor
             .register_if_absent(session_id.clone(), tx)
             .expect("first insert always succeeds");
-        assert_eq!(supervisor.len(), 1);
-        {
-            let _guard = ActorRegistryGuard::new(supervisor.clone(), session_id.clone());
-        }
+        drop(old_rx);
+        let (replacement, mut rx) = mailbox::channel(8);
+        assert!(
+            supervisor
+                .route_or_spawn(&session_id, AgentMessage::ActorStop, || replacement)
+                .await
+        );
+        supervisor.remove_closed_mailbox(&session_id);
+        assert!(supervisor.route(&session_id, AgentMessage::ActorStop).await);
+        assert!(matches!(rx.try_recv(), Ok(AgentMessage::ActorStop)));
+        assert!(matches!(rx.try_recv(), Ok(AgentMessage::ActorStop)));
+        drop(rx);
+        supervisor.remove_closed_mailbox(&session_id);
         assert_eq!(supervisor.len(), 0);
     }
 
@@ -857,11 +840,7 @@ mod tests {
             .await;
 
         assert!(!routed, "closed mailbox must surface as routed=false");
-        // The actor handle is still inserted — the registry guard will
-        // clear it when the (hypothetical) actor task notices its
-        // mailbox closed; the supervisor itself does not roll back on
-        // send failure.
-        assert_eq!(supervisor.len(), 1);
+        assert!(supervisor.is_empty());
     }
 
     #[test]
@@ -984,6 +963,7 @@ mod tests {
                 ),
                 (during.clone(), ActorStopCost::AbandonsAsks),
             ])),
+            CancellationToken::new(),
         );
         let (resumable_tx, mut resumable_rx) = mailbox::channel(8);
         let (during_tx, mut during_rx) = mailbox::channel(8);
@@ -1062,6 +1042,7 @@ mod tests {
                 ]
                 .into(),
             ))),
+            CancellationToken::new(),
         );
         let (mailbox_tx, mut mailbox_rx) = mailbox::channel(8);
         supervisor
@@ -1096,6 +1077,7 @@ mod tests {
                 id.clone(),
                 ActorStopCost::ReleasesTurn { waiting_calls: 1 },
             )])),
+            CancellationToken::new(),
         );
         let running = RunningCalls::default();
         let release = CancellationToken::new();

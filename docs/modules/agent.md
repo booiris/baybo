@@ -254,7 +254,8 @@ half-open trace rows and cancels non-terminal turns left by a prior process deat
 as `SystemCrash`. It also closes half-open detached trace rows under terminal
 turns (for example a title-generation step that outlived its turn) without
 changing that terminal turn. During the current process,
-`actor::runner::ActorTasks` watches actor task panics and calls
+`AgentSupervisor` tracks routed and one-shot actor tasks through exit. The
+actor runner observes task panics and calls
 `recover_panicked_actor_session` for that session's active chat turns, then emits
 a user-facing crash notice. The TurnState inactive edge still comes from the turn
 lifecycle event via the projector, not from the runner directly.

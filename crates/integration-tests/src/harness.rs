@@ -16,7 +16,6 @@ use std::time::Duration;
 use baybo_agent::{
     AgentLoop, SecurityGateway,
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
-    runner::ActorTasks,
     tool_executor::ToolExecutor,
 };
 use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
@@ -120,8 +119,9 @@ pub struct AgentTestHarness {
     /// [`AgentTestHarnessBuilder::with_strict_tool_pairing`] is on.
     pub strict_rejections: Arc<AtomicUsize>,
     pub mailbox: MailboxSender<AgentMessage>,
+    #[cfg(test)]
+    actor_spawner: baybo_agent::ActorSpawner,
     outputs: mpsc::Receiver<AgentOutput>,
-    actor_tasks: ActorTasks,
     router_task: Option<JoinHandle<()>>,
 }
 
@@ -209,11 +209,10 @@ impl AgentTestHarness {
     /// Stop routing and join every actor, including actors spawned after eviction.
     pub async fn shutdown(mut self) {
         self.outputs.close();
+        self.supervisor.shutdown_all().await;
         if let Some(router) = self.router_task {
-            router.abort();
-            let _ = router.await;
+            router.await.expect("router exited cleanly");
         }
-        self.actor_tasks.shutdown().await;
     }
 }
 
@@ -725,12 +724,11 @@ impl AgentTestHarnessBuilder {
         let supervisor = baybo_agent::AgentSupervisor::new(
             output_tx.clone(),
             Arc::clone(&human_asks) as Arc<dyn baybo_human_ask::LivePendingAsks>,
+            actor_parent_token.clone(),
         );
 
-        let actor_tasks = ActorTasks::new(actor_parent_token.clone(), trace_store.clone());
         let actor_spawner: baybo_agent::router::ActorSpawner = {
             let trace_store = trace_store.clone();
-            let actor_tasks = actor_tasks.clone();
             let skill_registry = skill_registry.clone();
             let session_manager = session_manager.clone();
             let workspace = workspace.clone();
@@ -741,85 +739,71 @@ impl AgentTestHarnessBuilder {
             let turn_lifecycle = turn_lifecycle.clone();
             let supervisor = supervisor.clone();
             let cron_store = cron_store.clone();
-            Arc::new(
-                move |session,
-                      initial_llm,
-                      initial_model,
-                      initial_effort,
-                      response_tx,
-                      actor_token| {
-                    let (mailbox_tx, mailbox_rx) =
-                        baybo_agent::mailbox::channel(self.mailbox_capacity);
-                    let context_manager = ContextManager::from_config(ContextManagerConfig {
-                        agent: None,
-                        tokenizer: tokenizer.clone(),
+            Arc::new(move |session, pins, registry, response_tx, actor_token| {
+                let context_manager = ContextManager::from_config(ContextManagerConfig {
+                    agent: None,
+                    tokenizer: tokenizer.clone(),
+                    workspace: Arc::clone(&workspace),
+                    keep_recent,
+                    compression_threshold,
+                    // The harness drives compaction through the window share and a
+                    // deliberately small stub window; an absolute cap on top would
+                    // be a second trigger every such test has to reason about.
+                    max_active_tokens: 0,
+                    skill_registry: Arc::clone(&skill_registry),
+                    channel: session.channel.clone(),
+                    shape: baybo_context::prompts::soul::PromptShape::for_trigger(&session.trigger),
+                    session_id: session.id.clone(),
+                    sessions: Arc::clone(&session_manager),
+                    subagent_profile: Some((subagent_registry.clone(), "harness".to_string())),
+                    builtin_memory: false,
+                    deferred_tool_servers: Vec::new(),
+                });
+                let agent_loop = AgentLoop::from_config(baybo_agent::agent_loop::AgentLoopConfig {
+                    llm_pool: llm_pool.clone(),
+                    initial_llm: pins.entry,
+                    initial_model: pins.model,
+                    initial_effort: pins.effort,
+                    tool_registry: tool_registry.clone(),
+                    tool_executor: tool_executor.clone(),
+                    context_manager,
+                    max_iterations: 20,
+                    security_gateway: gateway.clone(),
+                    // Mirror production for the progress observer's durable shadow and
+                    // title-generation paths.
+                    sessions: Some(Arc::clone(&session_manager)),
+                    memory: self.memory.clone(),
+                    task_store: task_store.clone(),
+                    title_sink: self.title_sink.clone(),
+                    asks: human_asks.clone(),
+                });
+                let span_recorder = Arc::new(SpanRecorder::new(
+                    session.id.clone(),
+                    session.user.id.clone(),
+                    trace_store.clone() as Arc<dyn TraceStore>,
+                    trace_event_stream.clone(),
+                ));
+                let actor = AgentActor::from_parts(
+                    baybo_agent::state::DurableActorState::new(session),
+                    baybo_agent::state::VolatileResources {
+                        agent_loop,
+                        response_tx,
+                        turn_lifecycle: turn_lifecycle.clone(),
+                        span_recorder,
+                        actor_token,
+                        supervisor: registry,
+                        session_manager: Arc::clone(&session_manager),
+                        cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
                         workspace: Arc::clone(&workspace),
-                        keep_recent,
-                        compression_threshold,
-                        // The harness drives compaction through the window share and a
-                        // deliberately small stub window; an absolute cap on top would
-                        // be a second trigger every such test has to reason about.
-                        max_active_tokens: 0,
-                        skill_registry: Arc::clone(&skill_registry),
-                        channel: session.channel.clone(),
-                        shape: baybo_context::prompts::soul::PromptShape::for_trigger(
-                            &session.trigger,
-                        ),
-                        session_id: session.id.clone(),
-                        sessions: Arc::clone(&session_manager),
-                        subagent_profile: Some((subagent_registry.clone(), "harness".to_string())),
-                        builtin_memory: false,
-                        deferred_tool_servers: Vec::new(),
-                    });
-                    let agent_loop =
-                        AgentLoop::from_config(baybo_agent::agent_loop::AgentLoopConfig {
-                            llm_pool: llm_pool.clone(),
-                            initial_llm,
-                            initial_model,
-                            initial_effort,
-                            tool_registry: tool_registry.clone(),
-                            tool_executor: tool_executor.clone(),
-                            context_manager,
-                            max_iterations: 20,
-                            security_gateway: gateway.clone(),
-                            // Mirror production for the progress observer's durable shadow and
-                            // title-generation paths.
-                            sessions: Some(Arc::clone(&session_manager)),
-                            memory: self.memory.clone(),
-                            task_store: task_store.clone(),
-                            title_sink: self.title_sink.clone(),
-                            asks: human_asks.clone(),
-                        });
-                    let span_recorder = Arc::new(SpanRecorder::new(
-                        session.id.clone(),
-                        session.user.id.clone(),
-                        trace_store.clone() as Arc<dyn TraceStore>,
-                        trace_event_stream.clone(),
-                    ));
-                    let actor = AgentActor::from_parts(
-                        baybo_agent::state::DurableActorState::new(session),
-                        baybo_agent::state::VolatileResources {
-                            agent_loop,
-                            response_tx,
-                            turn_lifecycle: turn_lifecycle.clone(),
-                            span_recorder,
-                            actor_token,
-                            supervisor: Some(supervisor.clone()),
-                            session_manager: Arc::clone(&session_manager),
-                            cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
-                            workspace: Arc::clone(&workspace),
-                        },
-                    );
-                    actor_tasks.spawn(actor, mailbox_rx);
-                    mailbox_tx
-                },
-            )
+                    },
+                );
+                supervisor.spawn_actor(actor, self.mailbox_capacity, trace_store.clone())
+            })
         };
         let mailbox_tx = actor_spawner(
             session.clone(),
-            None,
-            None,
-            None,
+            baybo_model::LlmPin::unpinned(),
+            Some(supervisor.clone()),
             output_tx,
             actor_parent_token.child_token(),
         );
@@ -842,7 +826,7 @@ impl AgentTestHarnessBuilder {
                 channels: Arc::new(baybo_channels::ChannelRegistry::new()),
                 security_gateway: gateway.clone(),
                 cost_manager: cost_manager.clone(),
-                actor_spawner,
+                actor_spawner: actor_spawner.clone(),
                 turn_lifecycle: turn_lifecycle.clone(),
                 cron_store: cron_store.clone(),
                 agent_profiles,
@@ -850,7 +834,6 @@ impl AgentTestHarnessBuilder {
                 issue_run_rx: None,
                 ask_resume_rx: Some(resume_rx),
                 board: None,
-                actor_parent_token: actor_parent_token.clone(),
                 rate_limit: baybo_agent::router::LiveRateLimit::new(1, Duration::from_secs(1)),
                 workspace,
                 inbound_dedup: Arc::new(baybo_channels::InboundDedup::new()),
@@ -884,9 +867,10 @@ impl AgentTestHarnessBuilder {
             actor_parent_token,
             supervisor,
             strict_rejections,
+            #[cfg(test)]
+            actor_spawner,
             mailbox: mailbox_tx,
             outputs: output_rx,
-            actor_tasks,
             router_task,
         }
     }
@@ -1030,5 +1014,73 @@ impl LlmCompletion for StrictToolPairing {
 
     fn audio_delivery(&self) -> baybo_llm::AudioDelivery {
         self.inner.audio_delivery()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use baybo_agent::mailbox::TrySendError;
+
+    fn spawn_oneshot(
+        harness: &AgentTestHarness,
+    ) -> (MailboxSender<AgentMessage>, mpsc::Receiver<AgentOutput>) {
+        let (tx, rx) = mpsc::channel(1);
+        let mailbox = (harness.actor_spawner)(
+            harness.session.clone(),
+            baybo_model::LlmPin::unpinned(),
+            None,
+            tx,
+            harness.supervisor.parent_token().child_token(),
+        );
+        (mailbox, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_exit_preserves_the_chat_mailbox_for_the_same_session() {
+        let harness = AgentTestHarness::builder().build();
+        let (once, mut outputs) = spawn_oneshot(&harness);
+        once.send(AgentMessage::ActorStop).await.unwrap();
+        // The panic observer holds the last output sender through exit cleanup.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), outputs.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            harness
+                .supervisor
+                .route(&harness.session.id, AgentMessage::ActorStop)
+                .await
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_joins_open_mailboxes_and_rejects_a_racing_spawn() {
+        let harness = AgentTestHarness::builder().build();
+        let (once, _outputs) = spawn_oneshot(&harness);
+        let shutdown = harness.supervisor.parent_token();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(harness.supervisor.shutdown_all(), async {
+                shutdown.cancelled().await;
+                let (late, _) = spawn_oneshot(&harness);
+                assert!(matches!(
+                    late.try_send(AgentMessage::ActorStop),
+                    Err(TrySendError::Closed(_))
+                ));
+            });
+        })
+        .await
+        .expect("idle actors exit while their mailbox senders are still alive");
+        for mailbox in [&once, &harness.mailbox] {
+            assert!(matches!(
+                mailbox.try_send(AgentMessage::ActorStop),
+                Err(TrySendError::Closed(_))
+            ));
+        }
+        assert!(harness.supervisor.is_empty());
+        harness.shutdown().await;
     }
 }

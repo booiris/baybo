@@ -13,38 +13,29 @@
 //! user-stopped result must not surface). Process shutdown cancels the job
 //! too, and is never reported as a failure.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_session::SessionManager;
 use baybo_tools::background::{BackgroundJobSink, DetachedJob};
 use baybo_tools::{BackgroundJobControl, BackgroundJobInfo};
 use futures::FutureExt;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::supervisor::{AgentSupervisor, InFlightJob};
 
-/// Implements [`BackgroundJobSink`] and [`BackgroundJobControl`]. Constructed
-/// before the supervisor exists in the boot sequence, so it holds the
-/// supervisor behind a `OnceLock` set right after the supervisor is built.
+/// Implements [`BackgroundJobSink`] and [`BackgroundJobControl`].
 pub struct BackgroundJobManager {
-    supervisor: Arc<OnceLock<AgentSupervisor>>,
+    supervisor: AgentSupervisor,
     session_manager: Arc<SessionManager>,
-    shutdown: CancellationToken,
 }
 
 impl BackgroundJobManager {
-    pub fn new(
-        supervisor: Arc<OnceLock<AgentSupervisor>>,
-        session_manager: Arc<SessionManager>,
-        shutdown: CancellationToken,
-    ) -> Self {
+    pub fn new(supervisor: AgentSupervisor, session_manager: Arc<SessionManager>) -> Self {
         Self {
             supervisor,
             session_manager,
-            shutdown,
         }
     }
 }
@@ -52,13 +43,7 @@ impl BackgroundJobManager {
 #[async_trait]
 impl BackgroundJobSink for BackgroundJobManager {
     async fn adopt(&self, job: DetachedJob) {
-        let Some(sup) = self.supervisor.get().cloned() else {
-            warn!(
-                handle = %job.handle,
-                "background job dispatched before supervisor wired; result will be lost"
-            );
-            return;
-        };
+        let sup = self.supervisor.clone();
         sup.note_background_job_started(
             &job.parent,
             InFlightJob {
@@ -73,7 +58,6 @@ impl BackgroundJobSink for BackgroundJobManager {
         // them: `adopt` runs inside a tool call the agent loop may drop at any
         // await, and a registered job with no escort would never clear.
         let session_manager = Arc::clone(&self.session_manager);
-        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             // A job going to the background is activity on the parent: it
             // keeps the session's recency honest while nothing else is said.
@@ -84,7 +68,7 @@ impl BackgroundJobSink for BackgroundJobManager {
                     "background job: failed to touch parent session"
                 );
             }
-            escort(sup, shutdown, job).await;
+            escort(sup, job).await;
         });
     }
 }
@@ -92,10 +76,8 @@ impl BackgroundJobSink for BackgroundJobManager {
 #[async_trait]
 impl BackgroundJobControl for BackgroundJobManager {
     async fn list(&self, session_id: &baybo_model::SessionId) -> Vec<BackgroundJobInfo> {
-        let Some(sup) = self.supervisor.get() else {
-            return Vec::new();
-        };
-        sup.list_in_flight_background(session_id)
+        self.supervisor
+            .list_in_flight_background(session_id)
             .into_iter()
             .map(|info| BackgroundJobInfo {
                 handle: info.handle,
@@ -106,10 +88,8 @@ impl BackgroundJobControl for BackgroundJobManager {
     }
 
     async fn stop(&self, session_id: &baybo_model::SessionId, handle: &str) -> bool {
-        let Some(sup) = self.supervisor.get() else {
-            return false;
-        };
-        sup.cancel_in_flight_background(session_id, handle)
+        self.supervisor
+            .cancel_in_flight_background(session_id, handle)
             .is_some()
     }
 }
@@ -119,7 +99,8 @@ impl BackgroundJobControl for BackgroundJobManager {
 /// shutting down. The entry is cleared only AFTER delivery, so the reaper
 /// cannot tear the parent down between the job ending and its result
 /// reaching the mailbox.
-async fn escort(supervisor: AgentSupervisor, shutdown: CancellationToken, job: DetachedJob) {
+async fn escort(supervisor: AgentSupervisor, job: DetachedJob) {
+    let shutdown = supervisor.parent_token();
     let DetachedJob {
         handle,
         parent,
@@ -197,6 +178,7 @@ async fn escort(supervisor: AgentSupervisor, shutdown: CancellationToken, job: D
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     use baybo_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
     use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
@@ -218,20 +200,19 @@ mod tests {
         let supervisor = AgentSupervisor::new(
             tx,
             std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+            tokio_util::sync::CancellationToken::new(),
         );
         let parent = SessionId::from("parent");
         let (sender, mailbox) = mailbox::channel(8);
         supervisor
             .register_if_absent(parent.clone(), sender)
             .expect("parent registers once");
-        let slot = Arc::new(OnceLock::new());
-        assert!(slot.set(supervisor.clone()).is_ok());
         let sessions = Arc::new(SessionManager::new(
             Arc::new(MemorySessionStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         ));
         Fixture {
-            manager: BackgroundJobManager::new(slot, sessions, CancellationToken::new()),
+            manager: BackgroundJobManager::new(supervisor.clone(), sessions),
             supervisor,
             parent,
             mailbox,

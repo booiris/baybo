@@ -24,7 +24,6 @@ use std::sync::Arc;
 use baybo_agent::actor::AgentActor;
 use baybo_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use baybo_agent::router::Router;
-use baybo_agent::runner::ActorTasks;
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
 use baybo_agent::supervisor::AgentSupervisor;
 use baybo_agent::tool_executor::{BoardStores, ToolExecutor};
@@ -137,10 +136,8 @@ pub struct ManagerGraph {
     pub deferred_mcp_servers: Arc<Vec<(String, Option<String>, baybo_tools::ToolTriggerScope)>>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
-    /// Deferred supervisor handle for the background-turn manager (built
-    /// with the `tool_executor`, before the supervisor exists). `wire_router`
-    /// sets it once the supervisor is built so command escorts can route.
-    pub bg_supervisor_slot: Arc<std::sync::OnceLock<AgentSupervisor>>,
+    pub supervisor: AgentSupervisor,
+    response_rx: Option<mpsc::Receiver<AgentOutput>>,
     /// Subagent profile registry — `wire_router` hands it to a spawned
     /// subagent's `ContextManager`, which resolves the child's system prompt
     /// from it by profile name.
@@ -196,12 +193,7 @@ pub struct ManagerGraph {
     /// tool registry at construction time.
     pub memory: Option<Arc<dyn Memory>>,
 
-    /// Consumed by [`wire_router`]. Stored in the graph so the caller
-    /// cannot forget to plumb it through — a silently-missing receiver
-    /// would make cron-triggered turns disappear into the void. Wrapped
-    /// in `Option` so [`wire_router`] can `.take()` it, and calling
-    /// `wire_router` twice panics loudly instead of silently handing
-    /// out a dummy receiver.
+    /// Consumed by [`wire_router`] along with the actor response receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
     /// Recorded issue runs waiting to execute. A one-shot like
     /// `cron_trigger_rx` — [`wire_router`] consumes it.
@@ -209,12 +201,10 @@ pub struct ManagerGraph {
 
     /// Late-set slot for the actor-backed subagent spawner. The
     /// `spawn_subagent` tool holds a clone (taken at build time, before the
-    /// supervisor exists); [`wire_router`] fills it once the spawner is
+    /// actor spawner exists); [`wire_router`] fills it once the spawner is
     /// built. An empty slot at tool-call time surfaces as a failed spawn,
     /// not a panic.
     pub subagent_spawner_slot: baybo_subagent::tool::SubagentSpawnerSlot,
-
-    actor_tasks: ActorTasks,
 
     /// The ask ledger + observers the channel gates share. Rides the graph
     /// to `GatewayDeps` for the lazy channel install.
@@ -249,7 +239,7 @@ const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_
 impl ManagerGraph {
     pub async fn shutdown(&mut self, deadline: tokio::time::Instant) {
         let (actors, (), ()) = tokio::join!(
-            tokio::time::timeout_at(deadline, self.actor_tasks.shutdown()),
+            tokio::time::timeout_at(deadline, self.supervisor.shutdown_all()),
             self.mcp_runtime.shutdown(deadline),
             async {
                 if let Some(runner) = &self.sandbox_runner {
@@ -568,7 +558,7 @@ pub async fn build_managers(
     // Late-set slot for the actor-backed subagent spawner. The
     // `spawn_subagent` tool (built below while the registry is assembled)
     // gets a clone now and reads it on first use; the runtime fills it in
-    // `wire_router`, once the supervisor + actor spawner exist.
+    // `wire_router`, once the actor spawner exists.
     let subagent_spawner_slot: baybo_subagent::tool::SubagentSpawnerSlot =
         Arc::new(std::sync::OnceLock::new());
     // Cron* mutators register deferred, `report_nothing` eager — the
@@ -860,15 +850,15 @@ pub async fn build_managers(
         });
     }
 
-    // The one background-job sink every background-capable tool hands its
-    // work to. It routes completion notifications via the supervisor, which
-    // is built further down, so it holds it behind a `OnceLock` set right
-    // after.
-    let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
+    let (response_tx, response_rx) = mpsc::channel(config.channels.message_buffer_size);
+    let supervisor = AgentSupervisor::new(
+        response_tx,
+        human_asks.clone(),
+        shutdown.cancellation_token().child_token(),
+    );
     let bg_manager = Arc::new(baybo_agent::BackgroundJobManager::new(
-        Arc::clone(&bg_supervisor_slot),
+        supervisor.clone(),
         Arc::clone(&session_manager),
-        shutdown.cancellation_token(),
     ));
     let background_jobs: Option<Arc<dyn baybo_tools::background::BackgroundJobSink>> =
         Some(bg_manager.clone());
@@ -896,10 +886,6 @@ pub async fn build_managers(
         Arc::new(baybo_human_ask::PolicyDenyGate::new(Arc::clone(&ask_core))),
     ));
 
-    let actor_tasks = ActorTasks::new(
-        shutdown.cancellation_token().child_token(),
-        stores.trace.clone(),
-    );
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
     // dynamically registers/unregisters MCP-discovered tools.
     // Browser MCP server: shipped as a zstd-embedded JS bundle, run
@@ -928,7 +914,8 @@ pub async fn build_managers(
         turn_lifecycle,
         cron_scheduler,
         security_gateway,
-        bg_supervisor_slot,
+        supervisor,
+        response_rx: Some(response_rx),
         skill_registry,
         deferred_mcp_servers,
         tool_registry,
@@ -949,7 +936,6 @@ pub async fn build_managers(
         cron_trigger_rx: Some(cron_trigger_rx),
         issue_run_rx: Some(issue_run_rx),
         subagent_spawner_slot,
-        actor_tasks,
         ask_core,
         ask_queues,
         human_asks,
@@ -972,12 +958,6 @@ pub struct RouterRunHandle {
     pub incoming_tx: mpsc::Sender<RouterInbound>,
     pub incoming_rx: mpsc::Receiver<RouterInbound>,
     pub response_rx: mpsc::Receiver<AgentOutput>,
-    /// Clone of the actor registry, handed to the gateway so the chat
-    /// `PUT /v1/chat/sessions/{id}/model` endpoint can route an
-    /// `AgentMessage::SetModel` to a live actor (re-pin in place) the
-    /// same way `/stop` reaches one. Cheap to clone — backed by an
-    /// `Arc<DashMap>`.
-    pub supervisor: AgentSupervisor,
 }
 
 const WIRE_ROUTER_TWICE: &str = "wire_router called twice; its one-shot receivers are consumed";
@@ -998,12 +978,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     let builtin_memory = graph.config.memory.builtin.enabled;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
-    let (response_tx, response_rx) = mpsc::channel(buffer);
-
-    let supervisor = AgentSupervisor::new(response_tx, graph.human_asks.clone());
-    // Hand the now-built supervisor to the background-turn manager so its
-    // escorts can route completion notifications back to parent sessions.
-    let _ = graph.bg_supervisor_slot.set(supervisor.clone());
+    let response_rx = graph
+        .response_rx
+        .take()
+        .ok_or_else(|| anyhow::anyhow!(WIRE_ROUTER_TWICE))?;
+    let supervisor = graph.supervisor.clone();
 
     // Process-wide trace event bus. Stays for trace observers
     // (WebUI live stream etc.); `CostManager` no longer subscribes
@@ -1022,7 +1001,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     // Single `Arc`-shared actor factory: used by the router for top-level
     // user/cron actors and by the subagent spawner for child actors.
     let spawn_actor_for: baybo_agent::router::ActorSpawner = {
-        let actor_tasks = graph.actor_tasks.clone();
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);
         let skill_registry = Arc::clone(&graph.skill_registry);
@@ -1062,20 +1040,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         ));
         Arc::new(
             move |session: baybo_model::Session,
-                  initial_llm: Option<LlmEntryName>,
-                  initial_model: Option<String>,
-                  initial_effort: Option<String>,
+                  pins: baybo_model::LlmPin,
+                  registry: Option<AgentSupervisor>,
                   response_tx: mpsc::Sender<AgentOutput>,
                   actor_token: CancellationToken| {
-                // `initial_llm` is `Some` either when the router's
-                // subagent handler resolved a model for a child (from the
-                // spawn request's `model_tier`) or when a user-channel
-                // session carries a per-session pin in
-                // `session.state.last_llm` (the chat model switch) that
-                // `handle_incoming` forwarded here; `None` ⇒ pool default.
-                // `initial_model` is the chat pick WITHIN that entry
-                // (`session.state.last_model`); `None` ⇒ entry default.
-
                 // Loaded lazily, here, because the set of agents is DB
                 // state: boot can only scan the built-in's folder, not
                 // enumerate the rest, and nothing else populates the map that
@@ -1085,9 +1053,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
 
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
-                    initial_llm,
-                    initial_model,
-                    initial_effort,
+                    initial_llm: pins.entry,
+                    initial_model: pins.model,
+                    initial_effort: pins.effort,
                     tool_registry: Arc::clone(&tool_registry),
                     tool_executor: Arc::clone(&tool_executor),
                     context_manager: ContextManager::from_config(ContextManagerConfig {
@@ -1143,16 +1111,17 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                         turn_lifecycle: Arc::clone(&turn_lifecycle),
                         span_recorder,
                         actor_token,
-                        supervisor: Some(supervisor_for_spawn.clone()),
+                        supervisor: registry,
                         session_manager: Arc::clone(&sessions),
                         cron_store: Arc::clone(&cron_store_for_spawn),
                         workspace: Arc::clone(&workspace_paths_arc),
                     },
                 );
-                let (sender, mailbox) =
-                    baybo_agent::mailbox::channel(baybo_agent::mailbox::DEFAULT_CAPACITY);
-                actor_tasks.spawn(actor, mailbox);
-                sender
+                supervisor_for_spawn.spawn_actor(
+                    actor,
+                    baybo_agent::mailbox::DEFAULT_CAPACITY,
+                    Arc::clone(&trace_store),
+                )
             },
         )
     };
@@ -1173,7 +1142,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     baybo_agent::supervisor::spawn_idle_reaper(
         supervisor.clone(),
         Arc::clone(&graph.session_manager),
-        graph.actor_tasks.parent_token(),
+        supervisor.parent_token(),
     );
 
     // Turn-state projector: the single producer of the web chat's live
@@ -1185,7 +1154,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         Arc::clone(&graph.turn_lifecycle),
         Arc::clone(&graph.session_manager),
         supervisor.response_tx().clone(),
-        graph.actor_tasks.parent_token(),
+        supervisor.parent_token(),
     );
 
     let workspace_paths_for_router = Arc::new(baybo_workspace::WorkspacePaths::new(
@@ -1220,7 +1189,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                 dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
                 cost_manager: Arc::clone(&cost_manager),
                 turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
-                actor_parent_token: graph.actor_tasks.parent_token(),
+                actor_parent_token: supervisor.parent_token(),
                 external_agents: Arc::clone(&external_agents),
                 llm_pool: Arc::clone(&llm_pool),
                 workspace_paths: Arc::clone(&workspace_paths_for_router),
@@ -1229,9 +1198,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         ),
     ));
 
-    // Hand a clone to the gateway before the router takes ownership, so
-    // the chat model-switch endpoint can re-pin live actors.
-    let supervisor_for_gateway = supervisor.clone();
     let router = Router::from_config(baybo_agent::router::RouterConfig {
         agent_profiles: graph.stores.agent_profile.clone(),
         workspace: Arc::clone(&workspace_paths_for_router),
@@ -1247,7 +1213,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         issue_run_rx: graph.issue_run_rx.take(),
         ask_resume_rx: graph.ask_resume_rx.take(),
         board: Some(Arc::clone(&graph.project_manager)),
-        actor_parent_token: graph.actor_tasks.parent_token(),
         rate_limit: Arc::clone(&graph.rate_limit),
         inbound_dedup: Arc::clone(&graph.inbound_dedup),
     });
@@ -1257,7 +1222,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         incoming_tx,
         incoming_rx,
         response_rx,
-        supervisor: supervisor_for_gateway,
     })
 }
 

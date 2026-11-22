@@ -6,6 +6,9 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 baybo-cron = { workspace = true }
 baybo-model = { workspace = true }
