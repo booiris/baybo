@@ -63,7 +63,7 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### Main execution path (AgentLoop)
 
-1. System-prompt assembly lives in [`baybo_context::prompts::soul`](context.md) (`assemble` reads the bound agent's resolved persona files — flat for global/legacy agents, below `personas/project/` for newly created project agents, and `personas/baybo/` for the built-in and for an unbound session — plus the shared `personas/USER.md` and the `<memory>` index, and frames them with TOP/TAIL hints). `ContextManager` owns the whole system-prompt lifecycle: `ensure_seeded()` resolves the prompt (`resolve_system_prompt` — a subagent profile looked up by name in the registry, else the bound agent's own persona files, else a fallback), seeds the leading `System` row, and appends the skill reminder. Every `AgentLoop::append_*` entry point calls `ensure_seeded()` before appending its row.
+1. System-prompt assembly lives in [`baybo_context::prompts::soul`](context.md) (`assemble` reads the bound agent's resolved persona files — flat for global/legacy agents, below `personas/project/` for newly created project agents, and `personas/baybo/` for the built-in and for an unbound session — plus the shared `personas/USER.md` and the `<memory>` index, and frames them with TOP/TAIL hints). `ContextManager` owns the whole system-prompt lifecycle: `ensure_seeded()` resolves the prompt (`resolve_system_prompt` — a subagent profile looked up by name in the registry, else the bound agent's own persona files, else a fallback), seeds the leading `System` row, and appends the skill reminder. The input appends on `SettledTranscript` and the fresh-session `AgentLoop::append_spawned_prompt` seed the context before writing their rows.
    A seeded row is durable, so it long outlives the deploy that wrote it. Two seams correct that, both owned by `ContextManager` and both described in [context.md](context.md#the-system-prompts-lifecycle): `reconcile_system_prompt()` runs **before every main LLM call** (step 4 below) and appends the parts that have changed on disk, and the reseed-after-compaction rewrites the row itself. So a mid-session persona edit reaches the model on the next call as a delta, and stops being a delta at the next compaction.
 2. Append the current user message durably through Context, then mirror it into
    the live window. A transcript write failure aborts the turn before the first
@@ -168,7 +168,7 @@ Parallel tool calls within a turn each go through the gate independently; the ga
 
 Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Turn and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
 
-`AgentMessage::CronTrigger { job_id, prompt, delivery }` carries the cron job id, the prompt, and where the reply goes. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `TurnInput::Cron`, which appends the fire via `AgentLoop::append_cron_fire` (framed by `baybo_context::prompts::cron`, so it reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke. A hard-failed fire persists an error control event in its own session, so the conversation doesn't just look blank.
+`AgentMessage::CronTrigger { job_id, prompt, delivery }` carries the cron job id, the prompt, and where the reply goes. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `TurnInput::Cron`, which appends the fire via `SettledTranscript::append_cron_fire` (framed by `baybo_context::prompts::cron`, so it reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke. A hard-failed fire persists an error control event in its own session, so the conversation doesn't just look blank.
 
 `delivery` (`CronDelivery`) splits the two cron shapes:
 
@@ -281,10 +281,10 @@ those ids, so the real result can land adjacent later.
 
 ### Unapplied asks: the turn prelude and the Resume door
 
-Every door that appends to a transcript first calls
-`AgentActor::settle_unapplied_asks()` (`actor/asks.rs`) — and has to: the
-loop's door appends and `compact_now` take the `AsksSettled` value only that
-prelude (`AgentLoop::settle_before_append`) returns. The doors: `handle_user_input`,
+Each actor entry point for an existing transcript obtains a `SettledTranscript`
+through `VolatileResources::settle_unapplied_asks` (`actor/asks.rs`).
+The handle borrows the loop exclusively and exposes the input appends and
+manual compaction. The entry points are `handle_user_input`,
 `handle_merged_user_turn`, `dispatch_issue_run` (before `append_issue_brief`),
 `dispatch_cron_prompt` (before `append_cron_fire`), the background-notification
 delivery (before `append_background_notification_prompt_once`, on both the
@@ -338,7 +338,7 @@ Before a message enters an actor, Router completes: session identification/creat
 
 ### Actor-side slash commands
 
-`AgentActor::handle_user_input` inspects the leading text block of every inbound `IncomingMessage` for control slash commands before routing into `run_agent_loop`. Today the only one is `/compact`, which calls `AgentLoop::compact_now` — the method mints a turn (matching the session's trigger kind), drives `ContextManager::force_compress` via the same `CompressionRunner` the iteration-top path uses, and returns a `CompactionNotice` (severity + text). The actor wraps it as `AgentEvent::Notice` rather than `Message` so the response renders out-of-band and stays out of the assistant transcript (the user typed a control command, not a question). The severity travels with the text because one outcome is not a confirmation: a summariser failure comes back `Warn` — nothing was compacted, and nothing was dropped to fake it — and is persisted as a `notice_warn` control event so a reload still shows it as a warning. Trailing arguments are ignored; matching is case-insensitive on the command token. Sidecar channels learn the command via the gateway slash manifest (`crates/gateway/src/channel/slash.rs::manifest`), but the gateway dispatcher passes it through unchanged — only `/new` needs server-side state.
+`AgentActor::handle_user_input` inspects the leading text block of every inbound `IncomingMessage` for control slash commands before routing into `run_agent_loop`. Today the only one is `/compact`, which calls `SettledTranscript::compact_now` — the method mints a turn (matching the session's trigger kind), drives `ContextManager::force_compress` via the same `CompressionRunner` the iteration-top path uses, and returns a `CompactionNotice` (severity + text). The actor wraps it as `AgentEvent::Notice` rather than `Message` so the response renders out-of-band and stays out of the assistant transcript (the user typed a control command, not a question). The severity travels with the text because one outcome is not a confirmation: a summariser failure comes back `Warn` — nothing was compacted, and nothing was dropped to fake it — and is persisted as a `notice_warn` control event so a reload still shows it as a warning. Trailing arguments are ignored; matching is case-insensitive on the command token. Sidecar channels learn the command via the gateway slash manifest (`crates/gateway/src/channel/slash.rs::manifest`), but the gateway dispatcher passes it through unchanged — only `/new` needs server-side state.
 
 ### Per-session model selection
 

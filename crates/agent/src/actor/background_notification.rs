@@ -11,6 +11,7 @@
 //! data shape. Keeping the orchestration here makes the buffer-to-ledger
 //! durability boundary explicit and keeps the main actor loop about routing.
 
+use anyhow::Context as _;
 use baybo_channels::{AgentEvent, AgentOutput, NoticeLevel};
 use baybo_model::{
     BackgroundNotificationDelivery, ContentBlock, ControlEventKind, PendingBackgroundResult,
@@ -20,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use super::{AgentActor, AgentMessage, is_blank_reply, is_turn_cancelled, mailbox};
-use crate::runtime::agent_loop::AsksSettled;
+use crate::runtime::agent_loop::settled_transcript::SettledTranscript;
 
 /// Maximum terminal results waiting to be committed to a notification prompt.
 /// Dropped results remain recoverable from their child transcript or command
@@ -61,11 +62,7 @@ fn background_prompt_source_event_id(handle_ids: &[baybo_model::BackgroundHandle
     format!("{}:prompt", background_batch_source_event_id(handle_ids))
 }
 
-fn background_reanchor_source_event_id(delivery: &BackgroundNotificationDelivery) -> String {
-    background_reanchor_source_event_id_for(&delivery.handle_ids, delivery.prompt_ordinal)
-}
-
-fn background_reanchor_source_event_id_for(
+fn background_reanchor_source_event_id(
     handle_ids: &[baybo_model::BackgroundHandle],
     prompt_ordinal: i64,
 ) -> String {
@@ -114,6 +111,56 @@ impl BackgroundNotificationRetrySchedule {
         } else {
             RETRY_INITIAL_BACKOFF
         };
+    }
+}
+
+/// Compaction can remove a batch's prompt from the active window. Recover it
+/// under the same key on both crash replay and delivery retry.
+async fn active_prompt_ordinal(
+    transcript: &mut SettledTranscript<'_>,
+    manager: &baybo_session::SessionManager,
+    session_id: &baybo_model::SessionId,
+    delivery: &BackgroundNotificationDelivery,
+) -> anyhow::Result<i64> {
+    let mut ordinal = delivery.prompt_ordinal;
+    while manager
+        .active_index_of_ordinal(session_id, ordinal)
+        .await
+        .context("checking background prompt ordinal")?
+        .is_none()
+    {
+        let key = background_reanchor_source_event_id(&delivery.handle_ids, ordinal);
+        let outcome = transcript
+            .append_background_notification_prompt_once(delivery.content.clone(), &key)
+            .await
+            .context("re-anchoring background notification prompt")?;
+        let next = outcome.ordinal();
+        if outcome.was_inserted() {
+            return Ok(next);
+        }
+        // A crash can leave the ledger behind its replacement, which another
+        // compaction may already have superseded. Follow that durable ordinal.
+        anyhow::ensure!(
+            next > ordinal,
+            "background prompt re-anchor {next} does not follow {ordinal}"
+        );
+        ordinal = next;
+    }
+    Ok(ordinal)
+}
+
+impl super::VolatileResources {
+    async fn background_transcript(
+        &mut self,
+        session: &mut baybo_model::Session,
+    ) -> Option<SettledTranscript<'_>> {
+        match self.settle_unapplied_asks(session).await {
+            Ok(transcript) => Some(transcript),
+            Err(error) => {
+                warn!(session_id = %session.id, %error, "could not settle unapplied asks before a background notification; retrying later");
+                None
+            }
+        }
     }
 }
 
@@ -406,34 +453,23 @@ impl AgentActor {
     /// any fresh results remain buffered as the following batch.
     async fn run_background_notification_delivery(&mut self) {
         let notifications = &self.durable.session.state.background_notifications;
-        if notifications.active_delivery.is_none() && notifications.buffered_results.is_empty() {
+        if notifications.active_delivery.is_some() {
+            self.retry_background_notification_delivery().await;
             return;
         }
-        // Both stages below append the notification prompt; an unapplied
-        // ask's result has to land before it.
-        let settled = match self.settle_unapplied_asks().await {
-            Ok(settled) => settled,
-            Err(error) => {
-                warn!(
-                    session_id = %self.durable.session.id,
-                    error = %error,
-                    "could not settle unapplied asks before a background notification; retrying later"
-                );
-                return;
-            }
-        };
-        if self
-            .durable
-            .session
-            .state
-            .background_notifications
-            .active_delivery
-            .is_some()
-        {
-            self.retry_background_notification_delivery(&settled).await;
+        if notifications.buffered_results.is_empty() {
             return;
         }
 
+        let manager = self.volatile.session_manager.clone();
+        let workspace = self.volatile.workspace.clone();
+        let Some(mut transcript) = self
+            .volatile
+            .background_transcript(&mut self.durable.session)
+            .await
+        else {
+            return;
+        };
         let pending = std::mem::take(
             &mut self
                 .durable
@@ -442,27 +478,20 @@ impl AgentActor {
                 .background_notifications
                 .buffered_results,
         );
-        if pending.is_empty() {
-            return;
-        }
-
         let (handle_ids, result_labels): (Vec<baybo_model::BackgroundHandle>, Vec<String>) =
             pending
                 .iter()
                 .map(|result| (result.handle_id.clone(), result.label.clone()))
                 .unzip();
         let content = baybo_context::prompts::background_notification::build_notification_content(
-            &pending,
-            &self.volatile.workspace,
+            &pending, &workspace,
         );
         let source_event_id = background_prompt_source_event_id(&handle_ids);
 
         // The prompt row and its batch idempotency key land atomically. Raw
         // results own analysed-report delivery until this prompt is durable.
-        let append_outcome = match self
-            .volatile
-            .agent_loop
-            .append_background_notification_prompt_once(&settled, content.clone(), &source_event_id)
+        let append_outcome = match transcript
+            .append_background_notification_prompt_once(content.clone(), &source_event_id)
             .await
         {
             Ok(outcome) => outcome,
@@ -480,21 +509,25 @@ impl AgentActor {
                 return;
             }
         };
-        let mut prompt_ordinal = append_outcome.ordinal();
+        let mut delivery = BackgroundNotificationDelivery {
+            handle_ids,
+            result_labels,
+            content: content.clone(),
+            prompt_ordinal: append_outcome.ordinal(),
+            failed_attempts: 0,
+        };
         if !append_outcome.was_inserted() {
-            let prompt_active = match self
-                .volatile
-                .session_manager
-                .active_index_of_ordinal(&self.durable.session.id, prompt_ordinal)
-                .await
+            delivery.prompt_ordinal = match active_prompt_ordinal(
+                &mut transcript,
+                &manager,
+                &self.durable.session.id,
+                &delivery,
+            )
+            .await
             {
-                Ok(index) => index.is_some(),
+                Ok(ordinal) => ordinal,
                 Err(error) => {
-                    warn!(
-                        session_id = %self.durable.session.id,
-                        error = %error,
-                        "could not verify recovered background notification prompt"
-                    );
+                    warn!(session_id = %self.durable.session.id, error = %format!("{error:#}"), "could not recover background notification prompt");
                     self.durable
                         .session
                         .state
@@ -503,36 +536,6 @@ impl AgentActor {
                     return;
                 }
             };
-            if !prompt_active {
-                let reanchor_source_event_id =
-                    background_reanchor_source_event_id_for(&handle_ids, prompt_ordinal);
-                let reanchored = match self
-                    .volatile
-                    .agent_loop
-                    .append_background_notification_prompt_once(
-                        &settled,
-                        content.clone(),
-                        &reanchor_source_event_id,
-                    )
-                    .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        warn!(
-                            session_id = %self.durable.session.id,
-                            error = %error,
-                            "background notification prompt re-anchor failed"
-                        );
-                        self.durable
-                            .session
-                            .state
-                            .background_notifications
-                            .buffered_results = pending;
-                        return;
-                    }
-                };
-                prompt_ordinal = reanchored.ordinal();
-            }
         }
 
         // The acknowledgement rides the control-event plane: shown in the chat
@@ -551,7 +554,7 @@ impl AgentActor {
         // batch between a failed attempt and its retry produced a second
         // acknowledgement for the same work.
         if append_outcome.was_inserted() {
-            self.announce_background_completion(&pending, prompt_ordinal)
+            self.announce_background_completion(&pending, delivery.prompt_ordinal)
                 .await;
         }
 
@@ -559,13 +562,7 @@ impl AgentActor {
             .session
             .state
             .background_notifications
-            .active_delivery = Some(BackgroundNotificationDelivery {
-            handle_ids,
-            result_labels,
-            content: content.clone(),
-            prompt_ordinal,
-            failed_attempts: 0,
-        });
+            .active_delivery = Some(delivery);
 
         // Commit "buffer emptied + ledger opened" before inference. If this
         // save fails, the in-memory ledger stays active and the next timer
@@ -621,9 +618,18 @@ impl AgentActor {
     /// restores a user-role request tail after partial failed attempts. If
     /// compaction superseded the original prompt, the frozen ledger content is
     /// re-appended and the ordinal is updated first.
-    async fn retry_background_notification_delivery(&mut self, settled: &AsksSettled) {
+    async fn retry_background_notification_delivery(&mut self) {
+        let manager = self.volatile.session_manager.clone();
+        let Some(mut transcript) = self
+            .volatile
+            .background_transcript(&mut self.durable.session)
+            .await
+        else {
+            return;
+        };
         if !self
-            .persist_session_state_with_activity("background_notification_retrying")
+            .durable
+            .persist_with_activity(&manager, "background_notification_retrying")
             .await
         {
             return;
@@ -639,58 +645,23 @@ impl AgentActor {
             return;
         };
 
-        let prompt_active = match self
-            .volatile
-            .session_manager
-            .active_index_of_ordinal(&self.durable.session.id, delivery.prompt_ordinal)
-            .await
+        let ordinal = match active_prompt_ordinal(
+            &mut transcript,
+            &manager,
+            &self.durable.session.id,
+            &delivery,
+        )
+        .await
         {
-            Ok(index) => index.is_some(),
+            Ok(ordinal) => ordinal,
             Err(error) => {
-                warn!(
-                    session_id = %self.durable.session.id,
-                    error = %error,
-                    "could not verify the background notification prompt row"
-                );
-                self.record_background_notification_failure("prompt row verification failed")
+                warn!(session_id = %self.durable.session.id, error = %format!("{error:#}"), "could not recover background notification prompt");
+                self.record_background_notification_failure("prompt recovery failed")
                     .await;
                 return;
             }
         };
-
-        if !prompt_active {
-            // Compaction re-inserted the kept slice at fresh ordinals, so the
-            // recorded prompt ordinal dangles. Re-append the frozen content as
-            // a fresh persisted row so the request carries the prompt. (When it
-            // IS active, nothing to do here — `drive` arms the request-time cue
-            // that restores a user-role tail if the prior attempt left one.)
-            let reanchor_content = delivery.content.clone();
-            let source_event_id = background_reanchor_source_event_id(&delivery);
-            let new_ordinal = self
-                .volatile
-                .agent_loop
-                .append_background_notification_prompt_once(
-                    settled,
-                    reanchor_content,
-                    &source_event_id,
-                )
-                .await
-                .map(|outcome| outcome.ordinal());
-            let new_ordinal = match new_ordinal {
-                Ok(ordinal) => ordinal,
-                Err(error) => {
-                    warn!(
-                        session_id = %self.durable.session.id,
-                        error = %error,
-                        "active background notification prompt re-anchor failed"
-                    );
-                    self.record_background_notification_failure(
-                        "re-anchored prompt row failed to persist",
-                    )
-                    .await;
-                    return;
-                }
-            };
+        if ordinal != delivery.prompt_ordinal {
             if let Some(active) = self
                 .durable
                 .session
@@ -699,7 +670,7 @@ impl AgentActor {
                 .active_delivery
                 .as_mut()
             {
-                active.prompt_ordinal = new_ordinal;
+                active.prompt_ordinal = ordinal;
             }
             self.persist_session_state_with_activity("background_notification_reanchored")
                 .await;
@@ -1028,28 +999,11 @@ mod tests {
             background_prompt_source_event_id(&different)
         );
 
-        let delivery = BackgroundNotificationDelivery {
-            handle_ids: first,
-            result_labels: Vec::new(),
-            content: Vec::new(),
-            prompt_ordinal: 7,
-            failed_attempts: 1,
-        };
-        let reanchor = background_reanchor_source_event_id(&delivery);
-        assert_ne!(
-            reanchor,
-            background_prompt_source_event_id(&delivery.handle_ids)
-        );
+        let reanchor = background_reanchor_source_event_id(&first, 7);
+        assert_ne!(reanchor, background_prompt_source_event_id(&first));
 
-        let legacy = BackgroundNotificationDelivery {
-            handle_ids: Vec::new(),
-            result_labels: Vec::new(),
-            content: Vec::new(),
-            prompt_ordinal: 11,
-            failed_attempts: 1,
-        };
         assert_eq!(
-            background_reanchor_source_event_id(&legacy),
+            background_reanchor_source_event_id(&[], 11),
             "background-notification:legacy-prompt:11:reanchor"
         );
     }

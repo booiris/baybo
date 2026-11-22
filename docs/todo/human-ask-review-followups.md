@@ -3,7 +3,7 @@
 > **Status:** All four follow-ups from the structural review of PR #426 are complete.
 
 See [the human-ask design](../modules/human-ask.md) for the turn prelude.
-The separate proposal for its proof token is in [ask-prelude-handle.md](ask-prelude-handle.md).
+The [transcript handle](ask-prelude-handle.md) implements the follow-up to the original proof token.
 
 ## Completed follow-ups
 
