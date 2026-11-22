@@ -12,6 +12,13 @@ pub enum StorageError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("corrupt {table} row {key}: {reason}")]
+    Corrupt {
+        table: &'static str,
+        key: String,
+        reason: String,
+    },
+
     /// A uniqueness/idempotency constraint rejected a write — e.g. two
     /// schedulers racing on the same cron execution slot. Callers that
     /// expect benign races (the cron tick) match on this to skip.

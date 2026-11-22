@@ -90,11 +90,12 @@ impl EncodedText {
 
 /// Read a value projected by one of the `*_read` views. Inline rows are TEXT;
 /// payload-backed rows are the compressed BLOB selected by the view.
-pub(super) fn read_text(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+pub(super) fn read_text(row: &rusqlite::Row<'_>, column: &str) -> rusqlite::Result<String> {
+    let index = row.as_ref().column_index(column)?;
     match row.get_ref(index)? {
         ValueRef::Text(bytes) => std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
-                bytes.len(),
+                index,
                 rusqlite::types::Type::Text,
                 Box::new(e),
             )
@@ -102,26 +103,26 @@ pub(super) fn read_text(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Resu
         ValueRef::Blob(bytes) => {
             let decoded = zstd::stream::decode_all(Cursor::new(bytes)).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    bytes.len(),
+                    index,
                     rusqlite::types::Type::Blob,
                     Box::new(e),
                 )
             })?;
             String::from_utf8(decoded).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    bytes.len(),
+                    index,
                     rusqlite::types::Type::Blob,
                     Box::new(e),
                 )
             })
         }
         ValueRef::Null => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
+            index,
             rusqlite::types::Type::Null,
             Box::new(FromSqlError::InvalidType),
         )),
         other => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
+            index,
             other.data_type(),
             Box::new(FromSqlError::InvalidType),
         )),

@@ -44,7 +44,8 @@ impl From<baybo_store::StorageError> for SessionError {
             baybo_store::StorageError::NotFound(s) => SessionError::NotFound(s),
             baybo_store::StorageError::Storage(s) => SessionError::Storage(s),
             baybo_store::StorageError::Conflict(s) => SessionError::Storage(s),
-            other @ baybo_store::StorageError::TooLarge { .. } => {
+            other @ (baybo_store::StorageError::Corrupt { .. }
+            | baybo_store::StorageError::TooLarge { .. }) => {
                 SessionError::Storage(other.to_string())
             }
             baybo_store::StorageError::Internal(e) => SessionError::Internal(e),

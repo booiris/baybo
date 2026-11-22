@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_model::{
     AgentFramework, AgentProfileId, ChatMessage, ControlEvent, ControlEventKind, FolderId,
     LineageKind, LlmEntryName, Session, SessionId,
@@ -29,38 +29,6 @@ impl SqliteSessionStore {
 /// when a new variant lands.
 pub(super) const LINEAGE_KIND_SUBAGENT: &str = "subagent";
 
-/// Raw `session_messages` columns as they come off a row, decoded into a
-/// [`ChatMessage`] only once the connection has been released: `(role,
-/// content_json, source, platform_msg_id)`. The serde/enum decode can fail with
-/// a non-`Internal` [`StorageError`], which the pool's `anyhow` closure cannot
-/// build, so every read path collects these tuples first and rehydrates after.
-type RawMessageRow = (String, String, String, String);
-
-/// [`RawMessageRow`] plus the row's `ordinal` and `created_at` (Unix µs), for
-/// the paging reads that surface both.
-type RawMessageRowWithMeta = (i64, String, String, String, i64, String);
-
-/// Raw `sessions` columns projected by the list/get reads:
-/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model,
-/// last_effort, agent_id, agent_framework)`.
-type RawSessionListRow = (
-    String,
-    i64,
-    Option<String>,
-    i64,
-    String,
-    Option<String>,
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
-/// Column list shared by every `sessions` read that decodes a
-/// [`RawSessionListRow`] — the projection order *is* the tuple order, so the
-/// two must never drift.
 pub(super) const SESSION_LIST_COLUMNS: &str = "data, hidden, last_llm, pinned, id, folder_id, \
      archived, title, last_model, last_effort, agent_id, agent_framework";
 
@@ -140,17 +108,82 @@ pub(super) fn rehydrate_message(
     .with_platform_msg_id(platform_msg_id))
 }
 
-/// Decode one [`RawMessageRow`] into a [`ChatMessage`].
-fn decode_message_row(row: RawMessageRow) -> Result<ChatMessage> {
-    let (role, content_json, source_str, platform_msg_id) = row;
-    let content = serde_json::from_str(&content_json)
-        .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-    rehydrate_message(&role, content, &source_str, platform_msg_id)
+pub(super) fn decode_message_row(row: &rusqlite::Row<'_>) -> anyhow::Result<ChatMessage> {
+    let content = super::payload::read_text(row, "content")?;
+    let blocks = serde_json::from_str(&content)?;
+    Ok(rehydrate_message(
+        &row.get::<_, String>("role")?,
+        blocks,
+        &row.get::<_, String>("source")?,
+        row.get("platform_msg_id")?,
+    )?)
 }
 
-/// Rebuild a [`Session`] from a [`RawSessionListRow`], patching the flat
-/// columns over the JSON blob. Flat columns are authoritative; targeted setters
-/// leave the JSON blob untouched to avoid load/save races.
+fn message_time(row: &rusqlite::Row<'_>) -> anyhow::Result<DateTime<Utc>> {
+    super::time::from_us(row.get("created_at")?)
+        .ok_or_else(|| anyhow::anyhow!("session_messages.created_at out of range"))
+}
+
+const fn message_rows<T>(decode: fn(&rusqlite::Row<'_>) -> anyhow::Result<T>) -> RowDecoder<T> {
+    RowDecoder {
+        table: "session_messages",
+        key: "session_id",
+        decode,
+    }
+}
+
+type TimedMessage = (i64, DateTime<Utc>, ChatMessage);
+const TIMED_MESSAGE: RowDecoder<TimedMessage> = message_rows(|row| {
+    Ok((
+        row.get("ordinal")?,
+        message_time(row)?,
+        decode_message_row(row)?,
+    ))
+});
+
+const ACTIVE_MESSAGE: RowDecoder<ActiveMessageRow> = message_rows(|row| {
+    Ok(ActiveMessageRow {
+        ordinal: row.get("ordinal")?,
+        message: decode_message_row(row)?,
+    })
+});
+
+const LAST_USER_MESSAGE: RowDecoder<(SessionId, DateTime<Utc>, ChatMessage)> =
+    message_rows(|row| {
+        Ok((
+            SessionId::from(row.get::<_, String>("session_id")?),
+            message_time(row)?,
+            decode_message_row(row)?,
+        ))
+    });
+
+const SESSION_TAIL: RowDecoder<(SessionId, i64, DateTime<Utc>, ChatMessage)> =
+    message_rows(|row| {
+        Ok((
+            SessionId::from(row.get::<_, String>("session_id")?),
+            row.get("ordinal")?,
+            message_time(row)?,
+            decode_message_row(row)?,
+        ))
+    });
+
+const UNREAD_MESSAGE: RowDecoder<(SessionId, ChatMessage)> = message_rows(|row| {
+    Ok((
+        SessionId::from(row.get::<_, String>("session_id")?),
+        decode_message_row(row)?,
+    ))
+});
+
+const STORED_MESSAGE: RowDecoder<StoredMessage> = message_rows(|row| {
+    Ok(StoredMessage {
+        ordinal: row.get("ordinal")?,
+        superseded_by: row.get("superseded_by")?,
+        compaction_inserted: row.get("compaction_inserted")?,
+        created_at: message_time(row)?,
+        message: decode_message_row(row)?,
+    })
+});
+
 /// What a read does with a binding column it cannot parse.
 ///
 /// The two answers are both right, for different readers. A corrupt binding
@@ -166,63 +199,45 @@ enum OnCorruptBinding {
     Degrade,
 }
 
+const SESSION: RowDecoder<Session> = RowDecoder {
+    table: "sessions",
+    key: "id",
+    decode: |row| decode_session_row(row, OnCorruptBinding::Fail),
+};
+
+const LISTED_SESSION: RowDecoder<Session> = RowDecoder {
+    decode: |row| decode_session_row(row, OnCorruptBinding::Degrade),
+    ..SESSION
+};
+
 fn decode_session_row(
-    row: &RawSessionListRow,
+    row: &rusqlite::Row<'_>,
     on_corrupt: OnCorruptBinding,
-) -> serde_json::Result<Session> {
-    let (
-        data,
-        hidden_col,
-        last_llm_col,
-        pinned_col,
-        _id,
-        folder_id_col,
-        archived_col,
-        title_col,
-        last_model_col,
-        last_effort_col,
-        agent_id_col,
-        agent_framework_col,
-    ) = row;
-    let mut session: Session = serde_json::from_str(data)?;
-    session.hidden = *hidden_col != 0;
-    session.state.last_llm = last_llm_col.clone().map(LlmEntryName::from);
-    session.state.last_model = last_model_col.clone();
-    session.state.last_effort = last_effort_col.clone();
-    session.pinned = *pinned_col != 0;
-    session.folder_id = folder_id_col.clone().map(FolderId::from);
-    session.archived = *archived_col != 0;
-    session.title = title_col.clone();
-    session.state.agent_id = decode_agent_id(agent_id_col, &session.id, on_corrupt)?;
+) -> anyhow::Result<Session> {
+    let mut session: Session = serde_json::from_str(&row.get::<_, String>("data")?)?;
+    session.hidden = row.get("hidden")?;
+    session.state.last_llm = row
+        .get::<_, Option<String>>("last_llm")?
+        .map(LlmEntryName::from);
+    session.state.last_model = row.get("last_model")?;
+    session.state.last_effort = row.get("last_effort")?;
+    session.pinned = row.get("pinned")?;
+    session.folder_id = row
+        .get::<_, Option<String>>("folder_id")?
+        .map(FolderId::from);
+    session.archived = row.get("archived")?;
+    session.title = row.get("title")?;
+    session.state.agent_id = decode_agent_id(&row.get("agent_id")?, &session.id, on_corrupt)?;
     session.state.agent_framework =
-        decode_agent_framework(agent_framework_col, &session.id, on_corrupt)?;
+        decode_agent_framework(&row.get("agent_framework")?, &session.id, on_corrupt)?;
     Ok(session)
 }
 
 /// The parse failure both decoders raise under [`OnCorruptBinding::Fail`].
-/// A `serde_json::Error` because that is what this function already returns,
-/// and the caller maps every one of them to `StorageError::Storage`.
 fn corrupt_binding(column: &str, raw: &str) -> serde_json::Error {
     serde::de::Error::custom(format!(
         "sessions.{column} holds {raw:?}, which is not a valid binding; refusing to run this \
          session as the built-in, which would write into the wrong memory partition"
-    ))
-}
-
-fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionListRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
     ))
 }
 
@@ -272,27 +287,6 @@ fn decode_agent_framework(
     }
 }
 
-/// Decode a batch of session-list rows into `Session`s, skipping (with a
-/// warning) any whose blob fails to deserialize — a single undeserializable
-/// row (e.g. written by an older build whose `lineage.kind` this build doesn't
-/// know) degrades to "silently absent", never fails the whole listing.
-fn decode_session_list_rows(rows: Vec<RawSessionListRow>) -> Vec<Session> {
-    let mut sessions = Vec::with_capacity(rows.len());
-    for row in &rows {
-        // Listing is display: a row whose binding is damaged still belongs in
-        // the user's chat list. Refusing it here would hide a conversation
-        // over a column the list never reads.
-        match decode_session_row(row, OnCorruptBinding::Degrade) {
-            Ok(session) => sessions.push(session),
-            Err(e) => tracing::warn!(
-                session_id = %row.4,
-                "skipping session row that failed to deserialize: {e}"
-            ),
-        }
-    }
-    sessions
-}
-
 /// The `sessions.trigger_kind` column's spelling of a trigger kind.
 fn trigger_kind_column(kind: baybo_model::TriggerKind) -> &'static str {
     match kind {
@@ -311,23 +305,11 @@ impl SessionStore for SqliteSessionStore {
         // patches the flat columns over the JSON blob), so the two can never
         // disagree about which columns are authoritative.
         let sql = format!("SELECT {SESSION_LIST_COLUMNS} FROM sessions WHERE id = ?1");
-        let row = self
-            .pool
+        self.pool
             .interact("sessions.get", move |conn| {
-                Ok(conn
-                    .query_row(&sql, rusqlite::params![sid], read_session_list_row)
-                    .optional()?)
+                SESSION.optional(conn.prepare(&sql)?.query([sid])?)
             })
-            .await?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        // The hydration read: a binding it cannot trust must stop the read,
-        // not quietly become the built-in.
-        decode_session_row(&row, OnCorruptBinding::Fail)
-            .map(Some)
-            .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))
+            .await
     }
 
     async fn save(&self, session: &Session) -> Result<()> {
@@ -650,20 +632,14 @@ impl SessionStore for SqliteSessionStore {
         // so a row whose `data` blob fails to deserialize (e.g. one
         // written by an older build whose lineage kind this build doesn't
         // know) can be named in the skip warning.
-        let rows = self
-            .pool
+        self.pool
             .interact("sessions.list_all", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {SESSION_LIST_COLUMNS} FROM sessions ORDER BY last_active DESC"
                 ))?;
-                let rows = stmt
-                    .query_map([], read_session_list_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                LISTED_SESSION.list(stmt.query([])?)
             })
-            .await?;
-
-        Ok(decode_session_list_rows(rows))
+            .await
     }
 
     async fn list_by_channel(&self, channel: &baybo_model::ChannelType) -> Result<Vec<Session>> {
@@ -671,22 +647,16 @@ impl SessionStore for SqliteSessionStore {
         // `idx_sessions_channel_active` range scan — non-matching rows never
         // ship their `data` blob out of sqlite or pay the serde decode.
         let channel = channel.as_str().to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("sessions.list_by_channel", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
                      WHERE channel = ?1 \
                      ORDER BY last_active DESC"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![channel], read_session_list_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                LISTED_SESSION.list(stmt.query(rusqlite::params![channel])?)
             })
-            .await?;
-
-        Ok(decode_session_list_rows(rows))
+            .await
     }
 
     async fn list_awaiting_cron_reports(&self) -> Result<Vec<Session>> {
@@ -702,16 +672,13 @@ impl SessionStore for SqliteSessionStore {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
                      WHERE trigger_kind = ?1 \
-                       AND json_array_length(data, '$.state.cron_report_awaited') > 0"
+                       AND CASE WHEN json_valid(data) THEN json_array_length(data, '$.state.cron_report_awaited') > 0 ELSE 1 END"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![cron], read_session_list_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                LISTED_SESSION.list(stmt.query(rusqlite::params![cron])?)
             })
             .await?;
 
-        Ok(decode_session_list_rows(rows)
+        Ok(rows
             .into_iter()
             .filter(|s| s.state.background_notifications.awaits_cron_reports())
             .collect())
@@ -730,7 +697,10 @@ impl SessionStore for SqliteSessionStore {
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![parent], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((
+                            row.get::<_, String>("id")?,
+                            row.get::<_, String>("lineage_kind")?,
+                        ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -764,8 +734,7 @@ impl SessionStore for SqliteSessionStore {
         let before_us = before.as_ref().map(|(at, _)| super::time::to_us(*at));
         let before_id = before.as_ref().map(|(_, id)| id.as_str().to_string());
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = self
-            .pool
+        self.pool
             .interact("sessions.list_lineage_children_page", move |conn| {
                 // `idx_sessions_parent` is a partial index on exactly this
                 // predicate, so the scan is the parent's children and nothing
@@ -773,18 +742,19 @@ impl SessionStore for SqliteSessionStore {
                 // turn's fan-out mints siblings inside the same microsecond,
                 // and a timestamp-only cursor would either skip or repeat them.
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions                      WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL                        AND (?2 IS NULL                             OR created_at < ?2                             OR (created_at = ?2 AND id < ?3))                      ORDER BY created_at DESC, id DESC                      LIMIT ?4"
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
+                      WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL \
+                        AND (?2 IS NULL \
+                             OR created_at < ?2 \
+                             OR (created_at = ?2 AND id < ?3)) \
+                      ORDER BY created_at DESC, id DESC \
+                      LIMIT ?4"
                 ))?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![parent, before_us, before_id, limit_i64],
-                        read_session_list_row,
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                LISTED_SESSION.complete(
+                    stmt.query(rusqlite::params![parent, before_us, before_id, limit_i64])?,
+                )
             })
-            .await?;
-        Ok(decode_session_list_rows(rows))
+            .await
     }
 
     async fn append_session_message(
@@ -1140,38 +1110,17 @@ impl SessionStore for SqliteSessionStore {
         session_id: &SessionId,
     ) -> Result<Vec<ActiveMessageRow>> {
         let sid = session_id.as_str().to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("sessions.load_active_session_message_rows", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT ordinal, role, content, source, platform_msg_id \
+                    "SELECT session_id, ordinal, role, content, source, platform_msg_id \
                      FROM session_messages_read \
                      WHERE session_id = ?1 AND superseded_by IS NULL \
                      ORDER BY ordinal",
                 )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![sid], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            super::payload::read_text(row, 2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                ACTIVE_MESSAGE.complete(stmt.query(rusqlite::params![sid])?)
             })
-            .await?;
-
-        rows.into_iter()
-            .map(|(ordinal, role, content, source, platform_msg_id)| {
-                Ok(ActiveMessageRow {
-                    ordinal,
-                    message: decode_message_row((role, content, source, platform_msg_id))?,
-                })
-            })
-            .collect()
+            .await
     }
 
     async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
@@ -1245,11 +1194,11 @@ impl SessionStore for SqliteSessionStore {
                         |row| {
                             let count = |i| row.get::<_, i64>(i).map(|n| n.max(0) as usize);
                             Ok(TokenAnchor {
-                                model_id: row.get(0)?,
-                                actual_tokens: count(1)?,
-                                message_count: count(2)?,
-                                request_overhead: count(3)?,
-                                through_ordinal: row.get(4)?,
+                                model_id: row.get("token_anchor_model")?,
+                                actual_tokens: count("token_anchor_tokens")?,
+                                message_count: count("token_anchor_message_count")?,
+                                request_overhead: count("token_anchor_request_overhead")?,
+                                through_ordinal: row.get("token_anchor_through_ordinal")?,
                             })
                         },
                     )
@@ -1274,11 +1223,11 @@ impl SessionStore for SqliteSessionStore {
                     .query_row(
                         "SELECT \
                            (SELECT COUNT(*) FROM session_messages \
-                            WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal < ?2), \
+                            WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal < ?2) AS count, \
                            EXISTS (SELECT 1 FROM session_messages \
-                                   WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal = ?2)",
+                                   WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal = ?2) AS present",
                         rusqlite::params![sid, ordinal],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        |row| Ok((row.get::<_, i64>("count")?, row.get::<_, i64>("present")?)),
                     )
                     .optional()?
                     .ok_or_else(|| anyhow::anyhow!("active_index returned no rows"))?;
@@ -1331,53 +1280,20 @@ impl SessionStore for SqliteSessionStore {
         // walk; the handful of hidden machinery rows per compaction are
         // skipped as they're read, so the LIMIT still bites the tail.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows: Vec<RawMessageRowWithMeta> = self
-            .pool
+        let mut rows = self.pool
             .interact("sessions.load_active_session_messages_tail", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages_read \
+                    "SELECT session_id, ordinal, role, content, source, created_at, platform_msg_id FROM session_messages_read \
                      WHERE session_id = ?1 AND compaction_inserted = 0 \
                        AND (?2 IS NULL OR ordinal < ?2) \
                      ORDER BY ordinal DESC \
                      LIMIT ?3",
                 )?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![sid, before_ordinal, limit_i64],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                super::payload::read_text(row, 2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, i64>(4)?,
-                                row.get::<_, String>(5)?,
-                            ))
-                        },
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                TIMED_MESSAGE.complete(stmt.query(rusqlite::params![sid, before_ordinal, limit_i64])?)
             })
             .await?;
-
-        let mut out: Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)> = Vec::new();
-        for (ordinal, role, content_json, source_str, created_us, platform_msg_id) in rows {
-            let created_at = super::time::from_us(created_us).ok_or_else(|| {
-                StorageError::Storage(format!(
-                    "session_messages.created_at out of range: {created_us}"
-                ))
-            })?;
-            out.push((
-                ordinal,
-                created_at,
-                decode_message_row((role, content_json, source_str, platform_msg_id))?,
-            ));
-        }
-        // Caller expects ascending ordinal order — the SQL pulled the
-        // newest rows first so the LIMIT bites the tail rather than the
-        // head, but the consumer renders top-to-bottom.
-        out.reverse();
-        Ok(out)
+        rows.reverse();
+        Ok(rows)
     }
 
     async fn load_active_session_messages_since(
@@ -1398,49 +1314,18 @@ impl SessionStore for SqliteSessionStore {
         // The `(session_id, ordinal)` key bites the front of the range so
         // older rows cost nothing.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows: Vec<RawMessageRowWithMeta> = self
-            .pool
+        self.pool
             .interact("sessions.load_active_session_messages_since", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages_read \
+                    "SELECT session_id, ordinal, role, content, source, created_at, platform_msg_id FROM session_messages_read \
                      WHERE session_id = ?1 AND compaction_inserted = 0 \
                        AND ordinal > ?2 \
                      ORDER BY ordinal ASC \
                      LIMIT ?3",
                 )?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![sid, after_ordinal, limit_i64],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                super::payload::read_text(row, 2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, i64>(4)?,
-                                row.get::<_, String>(5)?,
-                            ))
-                        },
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                TIMED_MESSAGE.complete(stmt.query(rusqlite::params![sid, after_ordinal, limit_i64])?)
             })
-            .await?;
-
-        let mut out: Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)> = Vec::new();
-        for (ordinal, role, content_json, source_str, created_us, platform_msg_id) in rows {
-            let created_at = super::time::from_us(created_us).ok_or_else(|| {
-                StorageError::Storage(format!(
-                    "session_messages.created_at out of range: {created_us}"
-                ))
-            })?;
-            out.push((
-                ordinal,
-                created_at,
-                decode_message_row((role, content_json, source_str, platform_msg_id))?,
-            ));
-        }
-        Ok(out)
+            .await
     }
 
     async fn compaction_boundaries(
@@ -1467,7 +1352,10 @@ impl SessionStore for SqliteSessionStore {
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![sid], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        Ok((
+                            row.get::<_, i64>("ordinal")?,
+                            row.get::<_, i64>("created_at")?,
+                        ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
@@ -1636,13 +1524,13 @@ impl SessionStore for SqliteSessionStore {
                 let rows = stmt
                     .query_map(rusqlite::params![since_us, until_us], |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>("session_id")?,
+                            row.get::<_, Option<String>>("agent_id")?,
+                            row.get::<_, Option<String>>("title")?,
+                            row.get::<_, i64>("last_at")?,
+                            row.get::<_, i64>("human_msgs")?,
+                            row.get::<_, i64>("read_from")?,
+                            row.get::<_, i64>("latest")?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1722,8 +1610,7 @@ impl SessionStore for SqliteSessionStore {
         // through the same tags, so a drift shows up in this file's tests.
         const HUMAN_SOURCES_SQL: &str = "'user', 'user_interjection'";
         let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
-        let raw = self
-            .pool
+        self.pool
             .interact("sessions.last_user_messages", move |conn| {
                 let placeholders = super::in_placeholders(keys.len());
                 let mut stmt = conn.prepare(&format!(
@@ -1735,35 +1622,9 @@ impl SessionStore for SqliteSessionStore {
                            AND source IN ({HUMAN_SOURCES_SQL}) \
                      ) WHERE rn = 1"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                            super::payload::read_text(row, 3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                LAST_USER_MESSAGE.list(stmt.query(rusqlite::params_from_iter(keys.iter()))?)
             })
-            .await?;
-        raw.into_iter()
-            .map(|(sid, created_us, role, content, source, pmi)| {
-                let created_at = super::time::from_us(created_us).ok_or_else(|| {
-                    StorageError::Storage(format!(
-                        "session_messages.created_at out of range: {created_us}"
-                    ))
-                })?;
-                Ok((
-                    SessionId::from(sid),
-                    created_at,
-                    decode_message_row((role, content, source, pmi))?,
-                ))
-            })
-            .collect()
+            .await
     }
 
     async fn active_tails(
@@ -1786,8 +1647,7 @@ impl SessionStore for SqliteSessionStore {
         // `limit - 1`. The `limit == 0` early return above is what keeps that
         // subtraction in range.
         let floor_offset = (limit - 1) as i64;
-        let raw = self
-            .pool
+        self.pool
             .interact("sessions.active_tails", move |conn| {
                 let sql =
                     ACTIVE_TAILS_SQL.replace("{{ids}}", &super::values_placeholders(keys.len()));
@@ -1797,37 +1657,9 @@ impl SessionStore for SqliteSessionStore {
                     .map(|k| rusqlite::types::Value::from(k.clone()))
                     .chain(std::iter::once(rusqlite::types::Value::from(floor_offset)))
                     .collect();
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(params), |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, String>(3)?,
-                            super::payload::read_text(row, 4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                SESSION_TAIL.complete(stmt.query(rusqlite::params_from_iter(params))?)
             })
-            .await?;
-        raw.into_iter()
-            .map(|(sid, ordinal, created_us, role, content, source, pmi)| {
-                let created_at = super::time::from_us(created_us).ok_or_else(|| {
-                    StorageError::Storage(format!(
-                        "session_messages.created_at out of range: {created_us}"
-                    ))
-                })?;
-                Ok((
-                    SessionId::from(sid),
-                    ordinal,
-                    created_at,
-                    decode_message_row((role, content, source, pmi))?,
-                ))
-            })
-            .collect()
+            .await
     }
 
     async fn unread_scan(
@@ -1840,8 +1672,7 @@ impl SessionStore for SqliteSessionStore {
         }
         let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
         let limit = limit as i64;
-        let raw = self
-            .pool
+        self.pool
             .interact("sessions.unread_scan", move |conn| {
                 let placeholders = super::in_placeholders(keys.len());
                 let mut stmt = conn.prepare(&format!(
@@ -1858,28 +1689,9 @@ impl SessionStore for SqliteSessionStore {
                     .map(|k| rusqlite::types::Value::from(k.clone()))
                     .chain(std::iter::once(rusqlite::types::Value::from(limit)))
                     .collect();
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(params), |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            super::payload::read_text(row, 2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                UNREAD_MESSAGE.complete(stmt.query(rusqlite::params_from_iter(params))?)
             })
-            .await?;
-        raw.into_iter()
-            .map(|(sid, role, content, source, pmi)| {
-                Ok((
-                    SessionId::from(sid),
-                    decode_message_row((role, content, source, pmi))?,
-                ))
-            })
-            .collect()
+            .await
     }
 
     async fn session_titles(
@@ -1899,8 +1711,8 @@ impl SessionStore for SqliteSessionStore {
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
                         Ok((
-                            SessionId::from(row.get::<_, String>(0)?),
-                            row.get::<_, Option<String>>(1)?,
+                            SessionId::from(row.get::<_, String>("id")?),
+                            row.get::<_, Option<String>>("title")?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1927,8 +1739,8 @@ impl SessionStore for SqliteSessionStore {
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
                         Ok((
-                            SessionId::from(row.get::<_, String>(0)?),
-                            row.get::<_, String>(1)?,
+                            SessionId::from(row.get::<_, String>("id")?),
+                            row.get::<_, String>("channel")?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1981,8 +1793,7 @@ impl SqliteSessionStore {
         // same statement — the `(session_id, seq)` PK confines both to
         // one session partition.
         let (lower, upper) = anchor_range.unwrap_or((i64::MIN, i64::MAX));
-        let rows = self
-            .pool
+        self.pool
             .interact("sessions.list_control_events", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT seq, after_ordinal, kind, text, created_at, platform_msg_id \
@@ -1990,42 +1801,27 @@ impl SqliteSessionStore {
                      WHERE session_id = ?1 AND after_ordinal >= ?2 AND after_ordinal <= ?3 \
                      ORDER BY seq",
                 )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![sid, lower, upper], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, String>(5)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                let event = RowDecoder {
+                    table: "session_control_events",
+                    key: "seq",
+                    decode: |row| {
+                        Ok(ControlEvent {
+                            seq: row.get("seq")?,
+                            after_ordinal: row.get("after_ordinal")?,
+                            kind: row
+                                .get::<_, String>("kind")?
+                                .parse::<ControlEventKind>()
+                                .map_err(anyhow::Error::msg)?,
+                            text: row.get("text")?,
+                            created_at: super::time::from_us(row.get("created_at")?)
+                                .ok_or_else(|| anyhow::anyhow!("created_at out of range"))?,
+                            platform_msg_id: row.get("platform_msg_id")?,
+                        })
+                    },
+                };
+                event.complete(stmt.query(rusqlite::params![sid, lower, upper])?)
             })
-            .await?;
-
-        let mut out = Vec::new();
-        for (seq, after_ordinal, kind_str, text, created_us, platform_msg_id) in rows {
-            let kind = kind_str
-                .parse::<ControlEventKind>()
-                .map_err(StorageError::Storage)?;
-            let created_at = super::time::from_us(created_us).ok_or_else(|| {
-                StorageError::Storage(format!(
-                    "session_control_events.created_at out of range: {created_us}"
-                ))
-            })?;
-            out.push(ControlEvent {
-                seq,
-                after_ordinal,
-                kind,
-                text,
-                created_at,
-                platform_msg_id,
-            });
-        }
-        Ok(out)
+            .await
     }
 
     async fn load_messages_with_supersede_impl(
@@ -2034,58 +1830,16 @@ impl SqliteSessionStore {
         after_ordinal: Option<i64>,
     ) -> Result<Vec<StoredMessage>> {
         let sid = session_id.as_str().to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("sessions.load_session_messages_with_supersede", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT ordinal, superseded_by, role, content, created_at, source, platform_msg_id, compaction_inserted \
+                    "SELECT session_id, ordinal, superseded_by, role, content, created_at, source, platform_msg_id, compaction_inserted \
                      FROM session_messages_read \
                      WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal",
                 )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![sid, after_ordinal.unwrap_or(i64::MIN)], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                            row.get::<_, String>(2)?,
-                            super::payload::read_text(row, 3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, i64>(7)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                STORED_MESSAGE.complete(stmt.query(rusqlite::params![sid, after_ordinal.unwrap_or(i64::MIN)])?)
             })
-            .await?;
-
-        let mut out = Vec::new();
-        for (
-            ordinal,
-            superseded_by,
-            role,
-            content_json,
-            created_us,
-            source_str,
-            platform_msg_id,
-            compaction_inserted,
-        ) in rows
-        {
-            let created_at = super::time::from_us(created_us).ok_or_else(|| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "session_messages.created_at out of range: {created_us}"
-                ))
-            })?;
-            out.push(StoredMessage {
-                ordinal,
-                superseded_by,
-                created_at,
-                compaction_inserted: compaction_inserted != 0,
-                message: decode_message_row((role, content_json, source_str, platform_msg_id))?,
-            });
-        }
-        Ok(out)
+            .await
     }
 }
 
@@ -2422,6 +2176,47 @@ mod tests {
             .unwrap();
         assert_eq!(o0, 0, "seq is per-session, not global");
         assert_eq!(store.list_control_events(&s.id).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn corrupt_message_fails_the_whole_transcript_and_cursor_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(pool.clone());
+        let session = make_root_session("history");
+        store.save(&session).await.unwrap();
+        for value in ["first", "middle", "last"] {
+            store
+                .append_session_message(
+                    &session.id,
+                    &ChatMessage::user(vec![baybo_model::ContentBlock::Text(value.into())]),
+                )
+                .await
+                .unwrap();
+        }
+        pool.interact_write("test.break_message", |conn| {
+            conn.execute(
+                "UPDATE session_messages SET content = '{' WHERE ordinal = 1",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let history = store
+            .load_active_session_message_rows(&session.id)
+            .await
+            .unwrap_err();
+        let page = store
+            .load_active_session_messages_since(&session.id, -1, 5)
+            .await
+            .unwrap_err();
+        for err in [history, page] {
+            assert!(
+                matches!(err, StorageError::Corrupt { table: "session_messages", key, .. } if key == "history")
+            );
+        }
+        assert_eq!(store.count_active_messages(&session.id).await.unwrap(), 3);
     }
 
     #[tokio::test]

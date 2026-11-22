@@ -1,8 +1,7 @@
 use async_trait::async_trait;
-use rusqlite::OptionalExtension;
 use rusqlite::types::Value;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_model::{SessionId, TurnId};
 use baybo_store::turn::Result;
 use baybo_store::{SessionTurnBounds, SessionTurnStats, StorageError, TurnRow, TurnStore};
@@ -28,56 +27,35 @@ const SELECT_COLS: &str = "id, session_id, parent_turn_id, kind, status_kind, \
 /// apart; `status_sql_matches_the_enum` pins this against the enum.
 const NON_TERMINAL_STATUS_SQL: &str = "'pending', 'in_progress', 'stuck'";
 
-/// The `turns` columns exactly as sqlite hands them over, before any fallible
-/// decoding (turn-id parse, µs → `DateTime`). The row closure of `query_map`
-/// can only surface `rusqlite` errors, so decoding happens after the collect.
-type RawTurnRow = (
-    String,
-    String,
-    Option<String>,
-    String,
-    String,
-    i64,
-    Option<i64>,
-    Option<i64>,
-    String,
-);
-
-fn raw_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurnRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        super::payload::read_text(row, 8)?,
-    ))
-}
-
 fn parse_turn_id(s: String) -> anyhow::Result<TurnId> {
     s.parse::<TurnId>()
         .map_err(|e| anyhow::anyhow!("parse turn id: {e}"))
 }
 
-fn turn_row_from(raw: RawTurnRow) -> anyhow::Result<TurnRow> {
-    let (id, session_id, parent_turn_id, kind, status_kind, created_at, started_at, ended_at, data) =
-        raw;
-    Ok(TurnRow {
-        id: parse_turn_id(id)?,
-        session_id: SessionId::from(session_id),
-        parent_turn_id: parent_turn_id.map(parse_turn_id).transpose()?,
-        kind,
-        status_kind,
-        created_at: super::time::from_us(created_at)
-            .ok_or_else(|| anyhow::anyhow!("created_at: out of range"))?,
-        started_at: started_at.and_then(super::time::from_us),
-        ended_at: ended_at.and_then(super::time::from_us),
-        data,
-    })
-}
+const TURN: RowDecoder<TurnRow> = RowDecoder {
+    table: "turns",
+    key: "id",
+    decode: |row| {
+        let id: String = row.get("id")?;
+        let session_id: String = row.get("session_id")?;
+        let parent_turn_id: Option<String> = row.get("parent_turn_id")?;
+        let created_at: i64 = row.get("created_at")?;
+        let started_at: Option<i64> = row.get("started_at")?;
+        let ended_at: Option<i64> = row.get("ended_at")?;
+        Ok(TurnRow {
+            id: parse_turn_id(id)?,
+            session_id: SessionId::from(session_id),
+            parent_turn_id: parent_turn_id.map(parse_turn_id).transpose()?,
+            kind: row.get("kind")?,
+            status_kind: row.get("status_kind")?,
+            created_at: super::time::from_us(created_at)
+                .ok_or_else(|| anyhow::anyhow!("created_at: out of range"))?,
+            started_at: started_at.and_then(super::time::from_us),
+            ended_at: ended_at.and_then(super::time::from_us),
+            data: super::payload::read_text(row, "data")?,
+        })
+    },
+};
 
 #[async_trait]
 impl TurnStore for SqliteTurnStore {
@@ -124,14 +102,12 @@ impl TurnStore for SqliteTurnStore {
         let id = turn_id.to_string();
         self.pool
             .interact("turns.get", move |conn| {
-                let raw = conn
-                    .query_row(
-                        &format!("SELECT {SELECT_COLS} FROM turns_read WHERE id = ?1"),
-                        rusqlite::params![id],
-                        raw_turn_row,
-                    )
-                    .optional()?;
-                raw.map(turn_row_from).transpose()
+                TURN.optional(
+                    conn.prepare(&format!(
+                        "SELECT {SELECT_COLS} FROM turns_read WHERE id = ?1"
+                    ))?
+                    .query(rusqlite::params![id])?,
+                )
             })
             .await
     }
@@ -176,6 +152,7 @@ impl TurnStore for SqliteTurnStore {
     async fn list_by_session(&self, session_id: &SessionId) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_by_session",
+            RowDecoder::list,
             format!(
                 "SELECT {SELECT_COLS} FROM turns_read WHERE session_id = ?1 ORDER BY created_at"
             ),
@@ -187,6 +164,7 @@ impl TurnStore for SqliteTurnStore {
     async fn list_active_by_session(&self, session_id: &SessionId) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_active_by_session",
+            RowDecoder::complete,
             format!(
                 "SELECT {SELECT_COLS} FROM turns_read \
                  WHERE session_id = ?1 AND status_kind IN ({NON_TERMINAL_STATUS_SQL}) \
@@ -216,6 +194,7 @@ impl TurnStore for SqliteTurnStore {
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_by_status_kind",
+            RowDecoder::list,
             format!(
                 "SELECT {SELECT_COLS} FROM turns_read WHERE status_kind = ?1 ORDER BY created_at"
             ),
@@ -227,6 +206,7 @@ impl TurnStore for SqliteTurnStore {
     async fn list_recoverable(&self) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_recoverable",
+            RowDecoder::complete,
             format!(
                 "SELECT {SELECT_COLS} FROM turns_read \
                  WHERE status_kind IN ({NON_TERMINAL_STATUS_SQL}) ORDER BY created_at"
@@ -239,6 +219,7 @@ impl TurnStore for SqliteTurnStore {
     async fn list_children(&self, parent_turn_id: &TurnId) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_children",
+            RowDecoder::list,
             format!(
                 "SELECT {SELECT_COLS} FROM turns_read WHERE parent_turn_id = ?1 ORDER BY created_at"
             ),
@@ -250,6 +231,7 @@ impl TurnStore for SqliteTurnStore {
     async fn list_all(&self) -> Result<Vec<TurnRow>> {
         self.collect(
             "turns.list_all",
+            RowDecoder::list,
             format!("SELECT {SELECT_COLS} FROM turns_read"),
             vec![],
         )
@@ -288,13 +270,7 @@ impl TurnStore for SqliteTurnStore {
                     "SELECT {SELECT_COLS} FROM turns_read {filter} \
                      ORDER BY created_at DESC, id DESC LIMIT {limit_ref} OFFSET {offset_ref}"
                 ))?;
-                let raws = stmt
-                    .query_map(rusqlite::params_from_iter(page_params), raw_turn_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let rows = raws
-                    .into_iter()
-                    .map(turn_row_from)
-                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let rows = TURN.complete(stmt.query(rusqlite::params_from_iter(page_params))?)?;
                 Ok((rows, total as usize))
             })
             .await
@@ -320,23 +296,23 @@ impl TurnStore for SqliteTurnStore {
                 // end of its previous turn as its own.
                 let mut stmt = conn.prepare(&format!(
                     "SELECT session_id, \
-                            MIN(COALESCE(started_at, created_at)), \
-                            MAX(ended_at), \
-                            SUM(ended_at IS NULL), \
+                            MIN(COALESCE(started_at, created_at)) AS first_at, \
+                            MAX(ended_at) AS last_at, \
+                            SUM(ended_at IS NULL) AS live_count, \
                             (SELECT t2.status_kind FROM turns t2 \
                               WHERE t2.session_id = turns.session_id \
-                              ORDER BY t2.created_at DESC, t2.id DESC LIMIT 1) \
+                              ORDER BY t2.created_at DESC, t2.id DESC LIMIT 1) AS latest_status \
                      FROM turns WHERE session_id IN ({placeholders}) \
                      GROUP BY session_id"
                 ))?;
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, Option<i64>>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, String>(4)?,
+                            row.get::<_, String>("session_id")?,
+                            row.get::<_, i64>("first_at")?,
+                            row.get::<_, Option<i64>>("last_at")?,
+                            row.get::<_, i64>("live_count")?,
+                            row.get::<_, String>("latest_status")?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -391,18 +367,18 @@ impl TurnStore for SqliteTurnStore {
                 // (session_id, created_at) — an index seek per session,
                 // no data-blob reads.
                 let mut stmt = conn.prepare(
-                    "SELECT session_id, COUNT(*), \
+                    "SELECT session_id, COUNT(*) AS turn_count, \
                             (SELECT j2.status_kind FROM turns j2 \
                               WHERE j2.session_id = turns.session_id \
-                              ORDER BY j2.created_at DESC, j2.id DESC LIMIT 1) \
+                              ORDER BY j2.created_at DESC, j2.id DESC LIMIT 1) AS latest_status \
                      FROM turns GROUP BY session_id",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
+                            row.get::<_, String>("session_id")?,
+                            row.get::<_, i64>("turn_count")?,
+                            row.get::<_, String>("latest_status")?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -425,16 +401,14 @@ impl SqliteTurnStore {
     async fn collect(
         &self,
         op: &'static str,
+        read: fn(&RowDecoder<TurnRow>, rusqlite::Rows<'_>) -> anyhow::Result<Vec<TurnRow>>,
         sql: String,
         params: Vec<Value>,
     ) -> Result<Vec<TurnRow>> {
         self.pool
             .interact(op, move |conn| {
                 let mut stmt = conn.prepare(&sql)?;
-                let raws = stmt
-                    .query_map(rusqlite::params_from_iter(params), raw_turn_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                raws.into_iter().map(turn_row_from).collect()
+                read(&TURN, stmt.query(rusqlite::params_from_iter(params))?)
             })
             .await
     }

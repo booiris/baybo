@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::StorageError;
 use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result, hash_auth_token};
 
@@ -44,19 +44,11 @@ const REPAIR_UPSERT_TAIL: &str = " ON CONFLICT(device_id) DO UPDATE SET \
      push_url = excluded.push_url, \
      remote_api_key = excluded.remote_api_key";
 
-/// Map an INSERT error to a [`StorageError::Conflict`] when it tripped a
-/// uniqueness constraint (duplicate `device_id` or `auth_token`), else a generic
-/// internal error. `StorageError::Conflict` cannot be built inside the pool's
-/// `anyhow` closure, so the failing statement's message is carried out and
-/// classified here.
-fn insert_conflict_err(op: &str, device_id: &str, msg: &str) -> StorageError {
-    if msg.contains("constraint") || msg.contains("UNIQUE") {
-        StorageError::Conflict(format!(
-            "device {device_id} or its auth_token already exists"
-        ))
-    } else {
-        StorageError::Internal(anyhow::anyhow!("{op}: insert device: {msg}"))
-    }
+fn device_insert_error(error: rusqlite::Error, device_id: &str) -> anyhow::Error {
+    super::unique_conflict(
+        error,
+        format_args!("device {device_id} or its auth_token already exists"),
+    )
 }
 
 /// The eleven positional params for [`INSERT_DEVICE`], in column order.
@@ -78,98 +70,53 @@ fn insert_params(row: &DeviceRow) -> Vec<rusqlite::types::Value> {
     ]
 }
 
-/// The raw column tuple for [`COLS`], decoded inside a `rusqlite` row closure.
-/// `status` stays a `String` here: parsing it can fail with a non-rusqlite
-/// error, so it happens after the rows are collected.
-struct RawDevice {
-    device_id: String,
-    device_pubkey: Vec<u8>,
-    auth_token_sha256: String,
-    status: String,
-    rendezvous_id: Option<String>,
-    created_at: i64,
-    approved_at: Option<i64>,
-    last_seen_at: Option<i64>,
-    relay_url: String,
-    push_url: String,
-    remote_api_key: String,
-}
-
-fn raw_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawDevice> {
-    Ok(RawDevice {
-        device_id: row.get(0)?,
-        device_pubkey: row.get(1)?,
-        auth_token_sha256: row.get(2)?,
-        status: row.get(3)?,
-        rendezvous_id: row.get(4)?,
-        created_at: row.get(5)?,
-        approved_at: row.get(6)?,
-        last_seen_at: row.get(7)?,
-        relay_url: row.get(8)?,
-        push_url: row.get(9)?,
-        remote_api_key: row.get(10)?,
-    })
-}
-
-fn into_device_row(raw: RawDevice) -> anyhow::Result<DeviceRow> {
-    let status = DeviceStatus::parse(&raw.status)
-        .ok_or_else(|| anyhow::anyhow!("unknown device status: {}", raw.status))?;
-    Ok(DeviceRow {
-        device_id: raw.device_id,
-        device_pubkey: raw.device_pubkey,
-        auth_token_sha256: raw.auth_token_sha256,
-        status,
-        rendezvous_id: raw.rendezvous_id,
-        created_at: raw.created_at,
-        approved_at: raw.approved_at,
-        last_seen_at: raw.last_seen_at,
-        relay_url: raw.relay_url,
-        push_url: raw.push_url,
-        remote_api_key: raw.remote_api_key,
-    })
-}
+const DEVICE: RowDecoder<DeviceRow> = RowDecoder {
+    table: "devices",
+    key: "device_id",
+    decode: |row| {
+        let status = row.get::<_, String>("status")?;
+        Ok(DeviceRow {
+            device_id: row.get("device_id")?,
+            device_pubkey: row.get("device_pubkey")?,
+            auth_token_sha256: row.get("auth_token")?,
+            status: DeviceStatus::parse(&status)
+                .ok_or_else(|| anyhow::anyhow!("unknown device status"))?,
+            rendezvous_id: row.get("rendezvous_id")?,
+            created_at: row.get("created_at")?,
+            approved_at: row.get("approved_at")?,
+            last_seen_at: row.get("last_seen_at")?,
+            relay_url: row.get("relay_url")?,
+            push_url: row.get("push_url")?,
+            remote_api_key: row.get("remote_api_key")?,
+        })
+    },
+};
 
 #[async_trait]
 impl DeviceStore for SqliteDeviceStore {
     async fn create(&self, row: &DeviceRow) -> Result<()> {
         let device_id = row.device_id.clone();
         let params = insert_params(row);
-        let failed = self
-            .pool
+        self.pool
             .interact_write("devices.create", move |conn| {
-                match conn.execute(INSERT_DEVICE, rusqlite::params_from_iter(params.iter())) {
-                    Ok(_) => Ok(None),
-                    Err(e) => Ok(Some(e.to_string())),
-                }
+                conn.execute(INSERT_DEVICE, rusqlite::params_from_iter(params.iter()))
+                    .map_err(|e| device_insert_error(e, &device_id))?;
+                Ok(())
             })
-            .await?;
-        match failed {
-            Some(msg) => Err(insert_conflict_err("devices.create", &device_id, &msg)),
-            None => Ok(()),
-        }
+            .await
     }
 
     async fn create_provisioning(&self, row: &DeviceRow) -> Result<()> {
         let device_id = row.device_id.clone();
         let params = insert_params(row);
-        let failed = self
-            .pool
+        self.pool
             .interact_write("devices.create_provisioning", move |conn| {
                 let sql = format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}");
-                match conn.execute(&sql, rusqlite::params_from_iter(params.iter())) {
-                    Ok(_) => Ok(None),
-                    Err(e) => Ok(Some(e.to_string())),
-                }
+                conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+                    .map_err(|e| device_insert_error(e, &device_id))?;
+                Ok(())
             })
-            .await?;
-        match failed {
-            Some(msg) => Err(insert_conflict_err(
-                "devices.create_provisioning",
-                &device_id,
-                &msg,
-            )),
-            None => Ok(()),
-        }
+            .await
     }
 
     async fn approve_replacing(&self, device_id: &str, approved_at: i64) -> Result<Vec<String>> {
@@ -184,7 +131,7 @@ impl DeviceStore for SqliteDeviceStore {
                     .query_row(
                         "SELECT device_id FROM devices WHERE device_id = ?1",
                         rusqlite::params![id],
-                        |row| row.get::<_, String>(0),
+                        |row| row.get::<_, String>("device_id"),
                     )
                     .optional()?
                     .is_some();
@@ -198,7 +145,7 @@ impl DeviceStore for SqliteDeviceStore {
                     let mut stmt = tx.prepare(
                         "SELECT device_id FROM devices WHERE status = 'approved' AND device_id != ?1",
                     )?;
-                    stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0))?
+                    stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>("device_id"))?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
 
@@ -224,9 +171,7 @@ impl DeviceStore for SqliteDeviceStore {
     async fn create_replacing_approved(&self, row: &DeviceRow) -> Result<Vec<String>> {
         let device_id = row.device_id.clone();
         let params = insert_params(row);
-        let inserted_id = device_id.clone();
-        let outcome = self
-            .pool
+        self.pool
             .interact_write("devices.create_replacing_approved", move |conn| {
                 // BEGIN IMMEDIATE takes the write lock up front so the revoke + upsert
                 // commit as a unit — no window where there are zero or two approved
@@ -239,7 +184,7 @@ impl DeviceStore for SqliteDeviceStore {
                 let approved = {
                     let mut stmt =
                         tx.prepare("SELECT device_id FROM devices WHERE status = 'approved'")?;
-                    stmt.query_map([], |row| row.get::<_, String>(0))?
+                    stmt.query_map([], |row| row.get::<_, String>("device_id"))?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 let mut replaced = Vec::new();
@@ -247,7 +192,7 @@ impl DeviceStore for SqliteDeviceStore {
                     // A same-device re-pair (stable device_id) refreshes its own row in
                     // place below; it didn't supersede a *different* binding, so don't
                     // report it as replaced.
-                    if id != inserted_id {
+                    if id != device_id {
                         replaced.push(id);
                     }
                 }
@@ -258,32 +203,23 @@ impl DeviceStore for SqliteDeviceStore {
                 )?;
 
                 let sql = format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}");
-                if let Err(e) = tx.execute(&sql, rusqlite::params_from_iter(params.iter())) {
-                    // Drop the tx without committing: the revoke rolls back with it.
-                    return Ok(Err(e.to_string()));
-                }
+                tx.execute(&sql, rusqlite::params_from_iter(params.iter()))
+                    .map_err(|e| device_insert_error(e, &device_id))?;
 
                 tx.commit()?;
-                Ok(Ok(replaced))
+                Ok(replaced)
             })
-            .await?;
-        outcome.map_err(|msg| {
-            insert_conflict_err("devices.create_replacing_approved", &device_id, &msg)
-        })
+            .await
     }
 
     async fn get(&self, device_id: &str) -> Result<Option<DeviceRow>> {
         let id = device_id.to_string();
         self.pool
             .interact("devices.get", move |conn| {
-                let raw = conn
-                    .query_row(
-                        &format!("SELECT {COLS} FROM devices WHERE device_id = ?1"),
-                        rusqlite::params![id],
-                        raw_from_row,
-                    )
-                    .optional()?;
-                raw.map(into_device_row).transpose()
+                DEVICE.optional(
+                    conn.prepare(&format!("SELECT {COLS} FROM devices WHERE device_id = ?1"))?
+                        .query(rusqlite::params![id])?,
+                )
             })
             .await
     }
@@ -299,16 +235,12 @@ impl DeviceStore for SqliteDeviceStore {
         let token = hash_auth_token(presented_token);
         self.pool
             .interact("devices.lookup_approved_by_auth_token", move |conn| {
-                let raw = conn
-                    .query_row(
-                        &format!(
-                            "SELECT {COLS} FROM devices WHERE auth_token = ?1 AND status = 'approved'"
-                        ),
-                        rusqlite::params![token],
-                        raw_from_row,
-                    )
-                    .optional()?;
-                raw.map(into_device_row).transpose()
+                DEVICE.optional(
+                    conn.prepare(&format!(
+                        "SELECT {COLS} FROM devices WHERE auth_token = ?1 AND status = 'approved'"
+                    ))?
+                    .query(rusqlite::params![token])?,
+                )
             })
             .await
     }
@@ -317,46 +249,34 @@ impl DeviceStore for SqliteDeviceStore {
         let pubkey = device_pubkey.to_vec();
         self.pool
             .interact("devices.lookup_approved_by_pubkey", move |conn| {
-                let raw = conn
-                    .query_row(
-                        // `ORDER BY ... LIMIT 1` keeps the result deterministic even in
+                // `ORDER BY ... LIMIT 1` keeps the result deterministic even in
                         // the (cryptographically impossible) event two approved rows
                         // shared a static key, so device resolution never flaps.
-                        &format!(
+                        DEVICE.optional(conn.prepare(&format!(
                             "SELECT {COLS} FROM devices WHERE device_pubkey = ?1 AND status = 'approved' \
                              ORDER BY created_at ASC LIMIT 1"
-                        ),
-                        rusqlite::params![pubkey],
-                        raw_from_row,
-                    )
-                    .optional()?;
-                raw.map(into_device_row).transpose()
+                        ))?.query(rusqlite::params![pubkey])?)
             })
             .await
     }
 
     async fn list(&self, status: Option<DeviceStatus>) -> Result<Vec<DeviceRow>> {
         self.pool
-            .interact("devices.list", move |conn| {
-                let raws = match status {
-                    Some(s) => {
-                        let mut stmt = conn.prepare(&format!(
-                            "SELECT {COLS} FROM devices WHERE status = ?1 ORDER BY created_at DESC"
-                        ))?;
+            .interact("devices.list", move |conn| match status {
+                Some(s) => {
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT {COLS} FROM devices WHERE status = ?1 ORDER BY created_at DESC"
+                    ))?;
 
-                        stmt.query_map(rusqlite::params![s.as_str().to_string()], raw_from_row)?
-                            .collect::<rusqlite::Result<Vec<_>>>()?
-                    }
-                    None => {
-                        let mut stmt = conn.prepare(&format!(
-                            "SELECT {COLS} FROM devices ORDER BY created_at DESC"
-                        ))?;
+                    DEVICE.list(stmt.query(rusqlite::params![s.as_str().to_string()])?)
+                }
+                None => {
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT {COLS} FROM devices ORDER BY created_at DESC"
+                    ))?;
 
-                        stmt.query_map([], raw_from_row)?
-                            .collect::<rusqlite::Result<Vec<_>>>()?
-                    }
-                };
-                raws.into_iter().map(into_device_row).collect()
+                    DEVICE.list(stmt.query([])?)
+                }
             })
             .await
     }
@@ -433,6 +353,35 @@ mod tests {
         assert_eq!(got.relay_url, "wss://relay.test");
         assert_eq!(got.push_url, "https://push.test");
         assert_eq!(got.remote_api_key, "inst-test");
+    }
+
+    #[tokio::test]
+    async fn a_damaged_approved_device_fails_authentication_and_get() {
+        let (_dir, store) = store().await;
+        store
+            .create(&device_row("broken", "token", "CODE"))
+            .await
+            .unwrap();
+        store
+            .pool
+            .interact_write("test.break_device", |conn| {
+                conn.execute(
+                    "UPDATE devices SET device_pubkey = 'not a blob' WHERE device_id = 'broken'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for result in [
+            store.get("broken").await,
+            store.lookup_approved_by_auth_token("token").await,
+        ] {
+            assert!(
+                matches!(result, Err(StorageError::Corrupt {table: "devices", key, ..}) if key == "broken")
+            );
+        }
+        assert!(store.list(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]

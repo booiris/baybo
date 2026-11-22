@@ -6,9 +6,8 @@
 //! the rich-type <-> row conversion; this layer owns the physical encoding.
 
 use async_trait::async_trait;
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_model::{SpanId, StepId, ToolSetHash, TurnId};
 use baybo_store::trace::Result;
 use baybo_store::{SpanEventRow, SpanRow, StepRow, StorageError, ToolSetRow, TraceStore};
@@ -22,6 +21,51 @@ impl SqliteTraceStore {
         Self { pool }
     }
 }
+
+const STEP: RowDecoder<StepRow> = RowDecoder {
+    table: "steps",
+    key: "id",
+    decode: |row| {
+        Ok(StepRow {
+            id: row.get::<_, String>("id")?.parse()?,
+            data: super::payload::read_text(row, "data")?,
+        })
+    },
+};
+
+const SPAN: RowDecoder<SpanRow> = RowDecoder {
+    table: "spans",
+    key: "id",
+    decode: |row| {
+        Ok(SpanRow {
+            id: row.get::<_, String>("id")?.parse()?,
+            data: super::payload::read_text(row, "data")?,
+        })
+    },
+};
+
+const TOOL_SET: RowDecoder<ToolSetRow> = RowDecoder {
+    table: "llm_tool_sets",
+    key: "hash",
+    decode: |row| {
+        Ok(ToolSetRow {
+            hash: row.get::<_, String>("hash")?.parse()?,
+            data: super::payload::read_text(row, "data")?,
+        })
+    },
+};
+
+const SPAN_EVENT: RowDecoder<SpanEventRow> = RowDecoder {
+    table: "span_events",
+    key: "span_id",
+    decode: |row| {
+        Ok(SpanEventRow {
+            span_id: row.get::<_, String>("span_id")?.parse()?,
+            data: super::payload::read_text(row, "data")?,
+            seq: row.get("seq")?,
+        })
+    },
+};
 
 #[async_trait]
 impl TraceStore for SqliteTraceStore {
@@ -50,18 +94,13 @@ impl TraceStore for SqliteTraceStore {
     }
 
     async fn load_step(&self, step_id: &StepId) -> Result<Option<StepRow>> {
-        let id = *step_id;
-        let key = id.to_string();
+        let key = step_id.to_string();
         self.pool
             .interact("trace.load_step", move |conn| {
-                let data = conn
-                    .query_row(
-                        "SELECT data FROM steps_read WHERE id = ?1",
-                        rusqlite::params![key],
-                        |row| super::payload::read_text(row, 0),
-                    )
-                    .optional()?;
-                Ok(data.map(|data| StepRow { id, data }))
+                STEP.optional(
+                    conn.prepare("SELECT id, data FROM steps_read WHERE id = ?1")?
+                        .query(rusqlite::params![key])?,
+                )
             })
             .await
     }
@@ -73,19 +112,7 @@ impl TraceStore for SqliteTraceStore {
                 let mut stmt = conn.prepare(
                     "SELECT id, data FROM steps_read WHERE turn_id = ?1 ORDER BY started_at",
                 )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![turn_id], |row| {
-                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut out = Vec::with_capacity(rows.len());
-                for (id, data) in rows {
-                    out.push(StepRow {
-                        id: id.parse()?,
-                        data,
-                    });
-                }
-                Ok(out)
+                STEP.complete(stmt.query(rusqlite::params![turn_id])?)
             })
             .await
     }
@@ -106,19 +133,7 @@ impl TraceStore for SqliteTraceStore {
                              WHERE sp.ended_at IS NULL \
                      ) ORDER BY started_at",
                 )?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut out = Vec::with_capacity(rows.len());
-                for (id, data) in rows {
-                    out.push(StepRow {
-                        id: id.parse()?,
-                        data,
-                    });
-                }
-                Ok(out)
+                STEP.complete(stmt.query([])?)
             })
             .await
     }
@@ -148,18 +163,13 @@ impl TraceStore for SqliteTraceStore {
     }
 
     async fn load_span(&self, span_id: &SpanId) -> Result<Option<SpanRow>> {
-        let id = *span_id;
-        let key = id.to_string();
+        let key = span_id.to_string();
         self.pool
             .interact("trace.load_span", move |conn| {
-                let data = conn
-                    .query_row(
-                        "SELECT data FROM spans_read WHERE id = ?1",
-                        rusqlite::params![key],
-                        |row| super::payload::read_text(row, 0),
-                    )
-                    .optional()?;
-                Ok(data.map(|data| SpanRow { id, data }))
+                SPAN.optional(
+                    conn.prepare("SELECT id, data FROM spans_read WHERE id = ?1")?
+                        .query(rusqlite::params![key])?,
+                )
             })
             .await
     }
@@ -171,19 +181,7 @@ impl TraceStore for SqliteTraceStore {
                 let mut stmt = conn.prepare(
                     "SELECT id, data FROM spans_read WHERE step_id = ?1 ORDER BY started_at",
                 )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![step_id], |row| {
-                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut out = Vec::with_capacity(rows.len());
-                for (id, data) in rows {
-                    out.push(SpanRow {
-                        id: id.parse()?,
-                        data,
-                    });
-                }
-                Ok(out)
+                SPAN.complete(stmt.query(rusqlite::params![step_id])?)
             })
             .await
     }
@@ -197,19 +195,7 @@ impl TraceStore for SqliteTraceStore {
                      JOIN steps st ON sp.step_id = st.id \
                      WHERE st.turn_id = ?1 ORDER BY sp.started_at",
                 )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![turn_id], |row| {
-                        Ok((row.get::<_, String>(0)?, super::payload::read_text(row, 1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut out = Vec::with_capacity(rows.len());
-                for (id, data) in rows {
-                    out.push(SpanRow {
-                        id: id.parse()?,
-                        data,
-                    });
-                }
-                Ok(out)
+                SPAN.complete(stmt.query(rusqlite::params![turn_id])?)
             })
             .await
     }
@@ -219,11 +205,11 @@ impl TraceStore for SqliteTraceStore {
         self.pool
             .interact("trace.trace_counts_by_turn", move |conn| {
                 let (steps, spans): (i64, i64) = conn.query_row(
-                    "SELECT (SELECT COUNT(*) FROM steps WHERE turn_id = ?1), \
+                    "SELECT (SELECT COUNT(*) FROM steps WHERE turn_id = ?1) AS step_count, \
                             (SELECT COUNT(*) FROM spans WHERE step_id IN \
-                                 (SELECT id FROM steps WHERE turn_id = ?1))",
+                                 (SELECT id FROM steps WHERE turn_id = ?1)) AS span_count",
                     rusqlite::params![turn_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get("step_count")?, row.get("span_count")?)),
                 )?;
                 Ok((steps as usize, spans as usize))
             })
@@ -256,18 +242,13 @@ impl TraceStore for SqliteTraceStore {
     }
 
     async fn load_tool_set(&self, hash: &ToolSetHash) -> Result<Option<ToolSetRow>> {
-        let hash = hash.clone();
         let key = hash.to_string();
         self.pool
             .interact("trace.load_tool_set", move |conn| {
-                let data = conn
-                    .query_row(
-                        "SELECT data FROM llm_tool_sets_read WHERE hash = ?1",
-                        rusqlite::params![key],
-                        |row| super::payload::read_text(row, 0),
-                    )
-                    .optional()?;
-                Ok(data.map(|data| ToolSetRow { hash, data }))
+                TOOL_SET.optional(
+                    conn.prepare("SELECT hash, data FROM llm_tool_sets_read WHERE hash = ?1")?
+                        .query(rusqlite::params![key])?,
+                )
             })
             .await
     }
@@ -296,23 +277,13 @@ impl TraceStore for SqliteTraceStore {
     }
 
     async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEventRow>> {
-        let span_id = *span_id;
         let key = span_id.to_string();
         self.pool
             .interact("trace.list_span_events", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT seq, data FROM span_events_read WHERE span_id = ?1 ORDER BY seq",
+                    "SELECT span_id, seq, data FROM span_events_read WHERE span_id = ?1 ORDER BY seq",
                 )?;
-                let out = stmt
-                    .query_map(rusqlite::params![key], |row| {
-                        Ok(SpanEventRow {
-                            span_id,
-                            seq: row.get::<_, i64>(0)? as u32,
-                            data: super::payload::read_text(row, 1)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(out)
+                SPAN_EVENT.complete(stmt.query(rusqlite::params![key])?)
             })
             .await
     }
@@ -336,24 +307,7 @@ impl TraceStore for SqliteTraceStore {
                         "SELECT span_id, seq, data FROM span_events_read \
                          WHERE span_id IN ({placeholders}) ORDER BY span_id, seq"
                     ))?;
-                    let raw = stmt
-                        .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                super::payload::read_text(row, 2)?,
-                            ))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    let mut rows = Vec::with_capacity(raw.len());
-                    for (span_id, seq, data) in raw {
-                        rows.push(SpanEventRow {
-                            span_id: span_id.parse()?,
-                            seq: seq as u32,
-                            data,
-                        });
-                    }
-                    Ok(rows)
+                    SPAN_EVENT.complete(stmt.query(rusqlite::params_from_iter(keys.iter()))?)
                 })
                 .await?;
             out.extend(rows);

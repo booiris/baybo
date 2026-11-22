@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId};
 use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::StorageError;
 use baybo_store::project::{
     ACTOR_AGENT_PREFIX, AttentionCounts, BoardActivity, CardSignals, DrainMarks,
@@ -28,19 +28,15 @@ impl SqliteProjectStore {
         issue_id: String,
         since_us: Option<i64>,
     ) -> Result<Vec<IssueEventRow>> {
-        let raws = self
-            .pool
+        self.pool
             .interact("issue_events.list", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {EVENT_COLUMNS} FROM issue_events WHERE issue_id = ?1 \
                      AND (?2 IS NULL OR created_at > ?2) ORDER BY created_at, id"
                 ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![issue_id, since_us], read_raw_event)?
-                    .collect::<rusqlite::Result<Vec<RawEvent>>>()?)
+                EVENT.complete(stmt.query(rusqlite::params![issue_id, since_us])?)
             })
-            .await?;
-        raws.into_iter().map(event_from_raw).collect()
+            .await
     }
 
     async fn append_event_with_client_msg_id(
@@ -100,18 +96,14 @@ impl SqliteProjectStore {
                         "issue event insert conflicted without a client message id to resolve"
                     )
                 })?;
-                let existing = tx
-                    .query_row(
-                        // Use the badge's exact unread predicate and timeline order
-                        // so the divider cannot disagree with the count.
-                        &format!(
+                let existing = IDEMPOTENT_EVENT
+                    .optional(
+                        tx.prepare(&format!(
                             "SELECT {EVENT_COLUMNS} FROM issue_events \
                              WHERE issue_id = ?1 AND client_msg_id = ?2"
-                        ),
-                        rusqlite::params![issue_id, key],
-                        read_raw_event,
-                    )
-                    .optional()?
+                        ))?
+                        .query(rusqlite::params![issue_id, key])?,
+                    )?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "idempotent issue event insert returned no row and no existing key"
@@ -122,9 +114,7 @@ impl SqliteProjectStore {
             })
             .await?;
         match existing {
-            Some(raw) => Ok(IssueEventAppendOutcome::Existing(
-                idempotent_event_from_raw(raw)?,
-            )),
+            Some(event) => Ok(IssueEventAppendOutcome::Existing(event)),
             None => Ok(IssueEventAppendOutcome::Inserted(row)),
         }
     }
@@ -133,69 +123,51 @@ impl SqliteProjectStore {
 const EVENT_COLUMNS: &str = "id, issue_id, project_id, number, actor, body, created_at, client_msg_id, \
      comment_consequences_applied";
 
-type RawEvent = (
-    String,
-    String,
-    String,
-    i64,
-    String,
-    String,
-    i64,
-    Option<String>,
-    bool,
-);
-
-fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-    ))
-}
-
-fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
-    let (id, issue_id, project_id, number, actor, body, created_at, client_msg_id, _) = raw;
-    Ok(IssueEventRow {
-        id: baybo_model::IssueEventId::from(id),
-        issue_id: IssueId::from(issue_id),
-        project_id: ProjectId::parse(project_id)
-            .map_err(|e| StorageError::Storage(e.to_string()))?,
-        number,
-        actor: IssueActor::parse(&actor)
-            .ok_or_else(|| StorageError::Storage(format!("issue_events.actor unknown: {actor}")))?,
-        body: serde_json::from_str(&body)
-            .map_err(|e| StorageError::Storage(format!("issue_events.body unreadable: {e}")))?,
-        client_msg_id: client_msg_id
-            .map(|id| {
-                IssueEventClientMsgId::parse(&id).map_err(|e| {
-                    StorageError::Storage(format!("issue_events.client_msg_id invalid: {e}"))
+const EVENT: RowDecoder<IssueEventRow> = RowDecoder {
+    table: "issue_events",
+    key: "id",
+    decode: |row| {
+        let id: String = row.get("id")?;
+        let issue_id: String = row.get("issue_id")?;
+        let project_id: String = row.get("project_id")?;
+        let actor: String = row.get("actor")?;
+        let body: String = row.get("body")?;
+        let created_at: i64 = row.get("created_at")?;
+        let client_msg_id: Option<String> = row.get("client_msg_id")?;
+        Ok(IssueEventRow {
+            id: baybo_model::IssueEventId::from(id),
+            issue_id: IssueId::from(issue_id),
+            project_id: ProjectId::parse(project_id)?,
+            number: row.get("number")?,
+            actor: IssueActor::parse(&actor)
+                .ok_or_else(|| anyhow::anyhow!("issue_events.actor unknown: {actor}"))?,
+            body: serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("issue_events.body unreadable: {e}"))?,
+            client_msg_id: client_msg_id
+                .map(|id| {
+                    IssueEventClientMsgId::parse(&id)
+                        .map_err(|e| anyhow::anyhow!("issue_events.client_msg_id invalid: {e}"))
                 })
-            })
-            .transpose()?,
-        created_at: ts("issue_events.created_at", created_at)?,
-    })
-}
+                .transpose()?,
+            created_at: ts("issue_events.created_at", created_at)?,
+        })
+    },
+};
 
-fn idempotent_event_from_raw(raw: RawEvent) -> Result<IdempotentIssueEvent> {
-    let consequences_applied = raw.8;
-    Ok(IdempotentIssueEvent {
-        event: event_from_raw(raw)?,
-        consequences_applied,
-    })
-}
+const IDEMPOTENT_EVENT: RowDecoder<IdempotentIssueEvent> = RowDecoder {
+    table: "issue_events",
+    key: "id",
+    decode: |row| {
+        Ok(IdempotentIssueEvent {
+            event: (EVENT.decode)(row)?,
+            consequences_applied: row.get("comment_consequences_applied")?,
+        })
+    },
+};
 
-/// The projection order **is** [`RawProject`]'s tuple order, and nothing
-/// links the two at compile time. A new column goes on the end, always —
-/// see [`ISSUE_COLUMNS`] for what inserting one mid-list does.
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
      daily_budget_tokens, max_parallel_issue_runs, archived_at, created_at, updated_at, \
-     agents_may_merge, COALESCE(rules_changed_at, created_at)";
+     agents_may_merge, COALESCE(rules_changed_at, created_at) AS rules_changed_at";
 
 /// Which of a project's editable fields are **rules the board schedules
 /// by**: the ones whose change makes every question the lead has already
@@ -245,10 +217,6 @@ const AN_ISSUE_FIELD_CHANGED: &str = "COALESCE(?3, title) IS NOT title \
      OR COALESCE(?15, stage) IS NOT stage \
      OR COALESCE(?17, pinned) IS NOT pinned";
 
-/// The projection order **is** [`RawIssue`]'s tuple order, and nothing links
-/// the two at compile time. A new column goes on the end, always: inserting
-/// one mid-list silently re-decodes every field after it, and only the ones
-/// that happen to be parsed would fail loudly.
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
      cancelled_at, created_at, updated_at, attachments, pinned, filed_from_issue_id";
@@ -421,176 +389,54 @@ const BOARD_SESSIONS: &str = "(c.session_id IN (SELECT session_id FROM issue_run
                                   WHERE project_id = ?1 AND session_id IS NOT NULL)))";
 
 /// Shared money/token aggregates; cached-token columns are input subsets.
-const SPEND_SUMS: &str = "COALESCE(SUM(c.input_tokens), 0), COALESCE(SUM(c.output_tokens), 0), \
-     COALESCE(SUM(c.cost_usd), 0)";
+const SPEND_SUMS: &str = "COALESCE(SUM(c.input_tokens), 0) AS input_tokens, COALESCE(SUM(c.output_tokens), 0) AS output_tokens, \
+     COALESCE(SUM(c.cost_usd), 0) AS cost_usd";
 
-fn spend_from_row(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Spend> {
+fn spend_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Spend> {
     Ok(Spend {
-        input_tokens: row.get(first)?,
-        output_tokens: row.get(first + 1)?,
-        cost: baybo_model::MicroUsd::from_micros(row.get(first + 2)?),
+        input_tokens: row.get("input_tokens")?,
+        output_tokens: row.get("output_tokens")?,
+        cost: baybo_model::MicroUsd::from_micros(row.get("cost_usd")?),
     })
 }
 
-/// Positional run columns; append fields to preserve [`read_raw_run`] indexes.
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at, resumes";
 
-type RawRun = (
-    String,
-    String,
-    String,
-    i64,
-    String,
-    Option<String>,
-    String,
-    String,
-    i64,
-    Option<String>,
-    i64,
-    Option<i64>,
-    Option<i64>,
-    i64,
-);
-
-fn read_raw_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRun> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-        row.get(12)?,
-        row.get(13)?,
-    ))
-}
-
-fn run_from_raw(raw: RawRun) -> Result<IssueRunRow> {
-    let (
-        id,
-        issue_id,
-        project_id,
-        number,
-        agent_id,
-        session_id,
-        trigger,
-        status,
-        attempt,
-        error,
-        created_at,
-        started_at,
-        settled_at,
-        resumes,
-    ) = raw;
-    Ok(IssueRunRow {
-        id: IssueRunId::from(id),
-        issue_id: IssueId::from(issue_id),
-        project_id: ProjectId::parse(project_id)
-            .map_err(|e| StorageError::Storage(e.to_string()))?,
-        number,
-        agent_id: AgentProfileId::parse(agent_id)
-            .map_err(|e| StorageError::Storage(e.to_string()))?,
-        session_id: session_id.map(SessionId::from),
-        trigger: RunTrigger::parse(&trigger).ok_or_else(|| {
-            StorageError::Storage(format!("issue_runs.trigger unknown: {trigger}"))
-        })?,
-        status: RunStatus::parse(&status)
-            .ok_or_else(|| StorageError::Storage(format!("issue_runs.status unknown: {status}")))?,
-        attempt,
-        resumes,
-        error,
-        created_at: ts("issue_runs.created_at", created_at)?,
-        started_at: ts_opt("issue_runs.started_at", started_at)?,
-        settled_at: ts_opt("issue_runs.settled_at", settled_at)?,
-    })
-}
-
-type RawProject = (
-    String,
-    String,
-    String,
-    String,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    i64,
-    i64,
-    Option<i64>,
-    i64,
-);
-
-type RawIssue = (
-    String,
-    String,
-    i64,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    i64,
-    Option<String>,
-    Option<i64>,
-    i64,
-    i64,
-    String,
-    i64,
-    Option<String>,
-);
-
-fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-    ))
-}
-
-fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-        row.get(12)?,
-        row.get(13)?,
-        row.get(14)?,
-        row.get(15)?,
-        row.get(16)?,
-        row.get(17)?,
-        row.get(18)?,
-        row.get(19)?,
-    ))
-}
+const RUN: RowDecoder<IssueRunRow> = RowDecoder {
+    table: "issue_runs",
+    key: "id",
+    decode: |row| {
+        let id: String = row.get("id")?;
+        let issue_id: String = row.get("issue_id")?;
+        let project_id: String = row.get("project_id")?;
+        let agent_id: String = row.get("agent_id")?;
+        let session_id: Option<String> = row.get("session_id")?;
+        let trigger: String = row.get("trigger")?;
+        let status: String = row.get("status")?;
+        let created_at: i64 = row.get("created_at")?;
+        let started_at: Option<i64> = row.get("started_at")?;
+        let settled_at: Option<i64> = row.get("settled_at")?;
+        Ok(IssueRunRow {
+            id: IssueRunId::from(id),
+            issue_id: IssueId::from(issue_id),
+            project_id: ProjectId::parse(project_id)?,
+            number: row.get("number")?,
+            agent_id: AgentProfileId::parse(agent_id)?,
+            session_id: session_id.map(SessionId::from),
+            trigger: RunTrigger::parse(&trigger)
+                .ok_or_else(|| anyhow::anyhow!("issue_runs.trigger unknown: {trigger}"))?,
+            status: RunStatus::parse(&status)
+                .ok_or_else(|| anyhow::anyhow!("issue_runs.status unknown: {status}"))?,
+            attempt: row.get("attempt")?,
+            resumes: row.get("resumes")?,
+            error: row.get("error")?,
+            created_at: ts("issue_runs.created_at", created_at)?,
+            started_at: ts_opt("issue_runs.started_at", started_at)?,
+            settled_at: ts_opt("issue_runs.settled_at", settled_at)?,
+        })
+    },
+};
 
 fn encode_attachments(attachments: &[IssueAttachment]) -> Result<String> {
     serde_json::to_string(attachments)
@@ -609,117 +455,105 @@ fn ts_opt(column: &str, us: Option<i64>) -> Result<Option<chrono::DateTime<chron
     }
 }
 
-fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
-    let (
-        id,
-        name,
-        description,
-        workdir,
-        daily_budget_micros,
-        daily_budget_tokens,
-        max_parallel_issue_runs,
-        archived_at,
-        created_at,
-        updated_at,
-        agents_may_merge,
-        rules_changed_at,
-    ) = raw;
-    Ok(ProjectRow {
-        // A stored id runs the grammar again on the way out: the row is the
-        // source of a directory name, and a hand-edited DB is still a way in.
-        id: ProjectId::parse(id).map_err(|e| StorageError::Storage(e.to_string()))?,
-        name,
-        description,
-        workdir,
-        daily_budget: daily_budget_micros.map(baybo_model::MicroUsd::from_micros),
-        daily_budget_tokens,
-        // NULL is a row written before the column existed, not a board that
-        // chose "no ceiling": the driver has to have a number, and the one
-        // it gets is the same one a board opened today starts with.
-        max_parallel_issue_runs: max_parallel_issue_runs
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
-        // NULL is the same "written before the column existed" as above, and
-        // the same answer a board opened today starts with.
-        agents_may_merge: agents_may_merge
-            .map(|n| n != 0)
-            .unwrap_or(baybo_store::project::DEFAULT_AGENTS_MAY_MERGE),
-        // The projection coalesces this to the board's own `created_at`, so
-        // a row written before the column existed reads as "no rule has
-        // changed since this board opened" rather than as a rule change at
-        // the epoch.
-        rules_changed_at: ts("projects.rules_changed_at", rules_changed_at)?,
-        archived_at: ts_opt("projects.archived_at", archived_at)?,
-        created_at: ts("projects.created_at", created_at)?,
-        updated_at: ts("projects.updated_at", updated_at)?,
-    })
-}
+const PROJECT: RowDecoder<ProjectRow> = RowDecoder {
+    table: "projects",
+    key: "id",
+    decode: |row| {
+        let id: String = row.get("id")?;
+        let name: String = row.get("name")?;
+        let daily_budget_micros: Option<i64> = row.get("daily_budget_micros")?;
+        let max_parallel_issue_runs: Option<i64> = row.get("max_parallel_issue_runs")?;
+        let archived_at: Option<i64> = row.get("archived_at")?;
+        let created_at: i64 = row.get("created_at")?;
+        let updated_at: i64 = row.get("updated_at")?;
+        let agents_may_merge: Option<i64> = row.get("agents_may_merge")?;
+        let rules_changed_at: i64 = row.get("rules_changed_at")?;
+        Ok(ProjectRow {
+            // A stored id runs the grammar again on the way out: the row is the
+            // source of a directory name, and a hand-edited DB is still a way in.
+            id: ProjectId::parse(id)?,
+            name,
+            description: row.get("description")?,
+            workdir: row.get("workdir")?,
+            daily_budget: daily_budget_micros.map(baybo_model::MicroUsd::from_micros),
+            daily_budget_tokens: row.get("daily_budget_tokens")?,
+            // NULL is a row written before the column existed, not a board that
+            // chose "no ceiling": the driver has to have a number, and the one
+            // it gets is the same one a board opened today starts with.
+            max_parallel_issue_runs: max_parallel_issue_runs
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(baybo_store::project::DEFAULT_MAX_PARALLEL_ISSUE_RUNS),
+            // NULL is the same "written before the column existed" as above, and
+            // the same answer a board opened today starts with.
+            agents_may_merge: agents_may_merge
+                .map(|n| n != 0)
+                .unwrap_or(baybo_store::project::DEFAULT_AGENTS_MAY_MERGE),
+            // The projection coalesces this to the board's own `created_at`, so
+            // a row written before the column existed reads as "no rule has
+            // changed since this board opened" rather than as a rule change at
+            // the epoch.
+            rules_changed_at: ts("projects.rules_changed_at", rules_changed_at)?,
+            archived_at: ts_opt("projects.archived_at", archived_at)?,
+            created_at: ts("projects.created_at", created_at)?,
+            updated_at: ts("projects.updated_at", updated_at)?,
+        })
+    },
+};
 
-fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
-    let (
-        id,
-        project_id,
-        number,
-        title,
-        description,
-        status,
-        priority,
-        assignee,
-        position,
-        blocked_reason,
-        branch,
-        parent_issue_id,
-        stage,
-        source_key,
-        cancelled_at,
-        created_at,
-        updated_at,
-        attachments,
-        pinned,
-        filed_from,
-    ) = raw;
-    Ok(IssueRow {
-        id: IssueId::from(id),
-        project_id: ProjectId::parse(project_id)
-            .map_err(|e| StorageError::Storage(e.to_string()))?,
-        number,
-        title,
-        description,
-        // Fail-closed like every other field here, and safe to be: every
-        // field `IssueAttachment` grows after this ships must carry
-        // `#[serde(default)]`, exactly as the comment body's does — the
-        // discipline is what keeps an old row readable, not leniency here.
-        attachments: serde_json::from_str(&attachments)
-            .map_err(|e| StorageError::Storage(format!("issues.attachments is not a list: {e}")))?,
-        status: IssueStatus::parse(&status)
-            .ok_or_else(|| StorageError::Storage(format!("issues.status unknown: {status}")))?,
-        priority: IssuePriority::parse(&priority)
-            .ok_or_else(|| StorageError::Storage(format!("issues.priority unknown: {priority}")))?,
-        // The stored assignee re-runs its own grammar on the way out, the
-        // same reason the project id does: an agent id names a directory.
-        assignee: assignee
-            .map(AgentProfileId::parse)
-            .transpose()
-            .map_err(|e| StorageError::Storage(e.to_string()))?,
-        position,
-        pinned: pinned != 0,
-        blocked_reason,
-        branch,
-        parent_issue_id: parent_issue_id.map(IssueId::from),
-        stage,
-        source_key,
-        filed_from: filed_from.map(IssueId::from),
-        cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
-        created_at: ts("issues.created_at", created_at)?,
-        updated_at: ts("issues.updated_at", updated_at)?,
-    })
-}
+const ISSUE: RowDecoder<IssueRow> = RowDecoder {
+    table: "issues",
+    key: "id",
+    decode: |row| {
+        let id: String = row.get("id")?;
+        let project_id: String = row.get("project_id")?;
+        let status: String = row.get("status")?;
+        let priority: String = row.get("priority")?;
+        let assignee: Option<String> = row.get("assignee")?;
+        let parent_issue_id: Option<String> = row.get("parent_issue_id")?;
+        let cancelled_at: Option<i64> = row.get("cancelled_at")?;
+        let created_at: i64 = row.get("created_at")?;
+        let updated_at: i64 = row.get("updated_at")?;
+        let attachments: String = row.get("attachments")?;
+        let pinned: i64 = row.get("pinned")?;
+        let filed_from: Option<String> = row.get("filed_from_issue_id")?;
+        Ok(IssueRow {
+            id: IssueId::from(id),
+            project_id: ProjectId::parse(project_id)?,
+            number: row.get("number")?,
+            title: row.get("title")?,
+            description: row.get("description")?,
+            // Fail-closed like every other field here, and safe to be: every
+            // field `IssueAttachment` grows after this ships must carry
+            // `#[serde(default)]`, exactly as the comment body's does — the
+            // discipline is what keeps an old row readable, not leniency here.
+            attachments: serde_json::from_str(&attachments)
+                .map_err(|e| anyhow::anyhow!("issues.attachments is not a list: {e}"))?,
+            status: IssueStatus::parse(&status)
+                .ok_or_else(|| anyhow::anyhow!("issues.status unknown: {status}"))?,
+            priority: IssuePriority::parse(&priority)
+                .ok_or_else(|| anyhow::anyhow!("issues.priority unknown: {priority}"))?,
+            // The stored assignee re-runs its own grammar on the way out, the
+            // same reason the project id does: an agent id names a directory.
+            assignee: assignee.map(AgentProfileId::parse).transpose()?,
+            position: row.get("position")?,
+            pinned: pinned != 0,
+            blocked_reason: row.get("blocked_reason")?,
+            branch: row.get("branch")?,
+            parent_issue_id: parent_issue_id.map(IssueId::from),
+            stage: row.get("stage")?,
+            source_key: row.get("source_key")?,
+            filed_from: filed_from.map(IssueId::from),
+            cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
+            created_at: ts("issues.created_at", created_at)?,
+            updated_at: ts("issues.updated_at", updated_at)?,
+        })
+    },
+};
 
 #[async_trait]
 impl ProjectStore for SqliteProjectStore {
     async fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectRow>> {
-        let raws = self
-            .pool
+        self.pool
             .interact("projects.list", move |conn| {
                 let sql = format!(
                     "SELECT {PROJECT_COLUMNS} FROM projects {} ORDER BY updated_at DESC, id",
@@ -730,30 +564,23 @@ impl ProjectStore for SqliteProjectStore {
                     }
                 );
                 let mut stmt = conn.prepare(&sql)?;
-                let raws = stmt
-                    .query_map([], read_raw_project)?
-                    .collect::<rusqlite::Result<Vec<RawProject>>>()?;
-                Ok(raws)
+                PROJECT.list(stmt.query([])?)
             })
-            .await?;
-        raws.into_iter().map(project_from_raw).collect()
+            .await
     }
 
     async fn get_project(&self, id: &ProjectId) -> Result<Option<ProjectRow>> {
         let id = id.as_str().to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact("projects.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"),
-                        rusqlite::params![id],
-                        read_raw_project,
-                    )
-                    .optional()?)
+                PROJECT.optional(
+                    conn.prepare(&format!(
+                        "SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"
+                    ))?
+                    .query(rusqlite::params![id])?,
+                )
             })
-            .await?;
-        raw.map(project_from_raw).transpose()
+            .await
     }
 
     async fn create_project(&self, row: &ProjectRow) -> Result<()> {
@@ -859,7 +686,7 @@ impl ProjectStore for SqliteProjectStore {
                          WHERE c.timestamp >= ?2 AND {BOARD_SESSIONS}"
                     ),
                     rusqlite::params![project, since],
-                    |row| spend_from_row(row, 0),
+                    spend_from_row,
                 )?)
             })
             .await
@@ -924,7 +751,7 @@ impl ProjectStore for SqliteProjectStore {
 
                 {
                     let mut stmt = conn.prepare(&format!(
-                        "SELECT e.issue_id, COUNT(*) FROM issue_events e \
+                        "SELECT e.issue_id, COUNT(*) AS count FROM issue_events e \
                          JOIN issues i ON i.id = e.issue_id \
                          WHERE i.project_id = :project AND {UNREAD_EVENT_PREDICATE} \
                          GROUP BY e.issue_id"
@@ -934,7 +761,12 @@ impl ProjectStore for SqliteProjectStore {
                             ":project": project,
                             ":review": review_status,
                         },
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>("issue_id")?,
+                                row.get::<_, i64>("count")?,
+                            ))
+                        },
                     )?;
                     for row in rows {
                         let (issue, count) = row?;
@@ -1007,40 +839,30 @@ impl ProjectStore for SqliteProjectStore {
 
     async fn list_issues(&self, project: &ProjectId) -> Result<Vec<IssueRow>> {
         let project = project.as_str().to_string();
-        let raws = self
-            .pool
+        self.pool
             .interact("issues.list", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {ISSUE_COLUMNS} FROM issues WHERE project_id = ?1 \
                      ORDER BY status, position, number"
                 ))?;
-                let raws = stmt
-                    .query_map(rusqlite::params![project], read_raw_issue)?
-                    .collect::<rusqlite::Result<Vec<RawIssue>>>()?;
-                Ok(raws)
+                ISSUE.complete(stmt.query(rusqlite::params![project])?)
             })
-            .await?;
-        raws.into_iter().map(issue_from_raw).collect()
+            .await
     }
 
     async fn get_issue(&self, project: &ProjectId, number: i64) -> Result<Option<IssueRow>> {
         let project = project.as_str().to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact("issues.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!(
-                            "SELECT {ISSUE_COLUMNS} FROM issues \
+                ISSUE.optional(
+                    conn.prepare(&format!(
+                        "SELECT {ISSUE_COLUMNS} FROM issues \
                              WHERE project_id = ?1 AND number = ?2"
-                        ),
-                        rusqlite::params![project, number],
-                        read_raw_issue,
-                    )
-                    .optional()?)
+                    ))?
+                    .query(rusqlite::params![project, number])?,
+                )
             })
-            .await?;
-        raw.map(issue_from_raw).transpose()
+            .await
     }
 
     async fn create_issue(&self, new: &NewIssue) -> Result<IssueRow> {
@@ -1060,8 +882,7 @@ impl ProjectStore for SqliteProjectStore {
         let filed_from = new.filed_from.as_ref().map(|id| id.as_str().to_string());
         let attachments = encode_attachments(&new.attachments)?;
         let created_at = super::time::to_us(new.created_at);
-        let raw = self
-            .pool
+        self.pool
             .interact_write("issues.create", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1101,18 +922,16 @@ impl ProjectStore for SqliteProjectStore {
                         filed_from
                     ],
                 )?;
-                let raw = tx.query_row(
-                    &format!(
+                let record = ISSUE.required(
+                    tx.prepare(&format!(
                         "SELECT {ISSUE_COLUMNS} FROM issues WHERE project_id = ?1 AND number = ?2"
-                    ),
-                    rusqlite::params![project, number],
-                    read_raw_issue,
+                    ))?
+                    .query(rusqlite::params![project, number])?,
                 )?;
                 tx.commit()?;
-                Ok(raw)
+                Ok(record)
             })
-            .await?;
-        issue_from_raw(raw)
+            .await
     }
 
     async fn update_issue(
@@ -1227,7 +1046,7 @@ impl ProjectStore for SqliteProjectStore {
                     // shows the first on the card; only the second is worth a
                     // mark in the rail.
                     let mut stmt = conn.prepare(&format!(
-                        "SELECT i.project_id, COUNT(*) FROM issues i \
+                        "SELECT i.project_id, COUNT(*) AS count FROM issues i \
                          JOIN projects p ON p.id = i.project_id \
                          WHERE p.archived_at IS NULL AND {FAILED_CARD_PREDICATE} \
                            AND {UNSEEN_FAILURE_PREDICATE} \
@@ -1238,7 +1057,12 @@ impl ProjectStore for SqliteProjectStore {
                             ":done": done_status,
                             ":failed": failed_status,
                         },
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>("project_id")?,
+                                row.get::<_, i64>("count")?,
+                            ))
+                        },
                     )?;
                     for row in rows {
                         let (project, count) = row?;
@@ -1251,7 +1075,7 @@ impl ProjectStore for SqliteProjectStore {
                     // `issue_events.project_id`, because the cursor this
                     // compares against lives on the card.
                     let mut stmt = conn.prepare(&format!(
-                        "SELECT i.project_id, COUNT(*) FROM issue_events e \
+                        "SELECT i.project_id, COUNT(*) AS count FROM issue_events e \
                          JOIN issues i ON i.id = e.issue_id \
                          JOIN projects p ON p.id = i.project_id \
                          WHERE p.archived_at IS NULL AND {UNREAD_EVENT_PREDICATE} \
@@ -1259,7 +1083,12 @@ impl ProjectStore for SqliteProjectStore {
                     ))?;
                     let rows = stmt.query_map(
                         rusqlite::named_params! { ":review": review_status },
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>("project_id")?,
+                                row.get::<_, i64>("count")?,
+                            ))
+                        },
                     )?;
                     for row in rows {
                         let (project, count) = row?;
@@ -1305,7 +1134,10 @@ impl ProjectStore for SqliteProjectStore {
                 let params = rusqlite::params_from_iter(sessions.iter());
                 Ok(stmt
                     .query_map(params, |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((
+                            row.get::<_, String>("session_id")?,
+                            row.get::<_, String>("project_id")?,
+                        ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?)
             })
@@ -1329,8 +1161,7 @@ impl ProjectStore for SqliteProjectStore {
         let project = project.as_str().to_string();
         let before = before.map(super::time::to_us);
         let limit = limit as i64;
-        let raws = self
-            .pool
+        self.pool
             .interact("issue_events.feed", move |conn| {
                 // `id DESC` breaks the tie: two entries written in the same
                 // microsecond would otherwise page unstably, showing one row
@@ -1340,12 +1171,9 @@ impl ProjectStore for SqliteProjectStore {
                      AND (?2 IS NULL OR created_at < ?2) \
                      ORDER BY created_at DESC, id DESC LIMIT ?3"
                 ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![project, before, limit], read_raw_event)?
-                    .collect::<rusqlite::Result<Vec<RawEvent>>>()?)
+                EVENT.complete(stmt.query(rusqlite::params![project, before, limit])?)
             })
-            .await?;
-        raws.into_iter().map(event_from_raw).collect()
+            .await
     }
 
     async fn live_issue_by_source_key(
@@ -1356,40 +1184,31 @@ impl ProjectStore for SqliteProjectStore {
         let project = project.as_str().to_string();
         let source_key = source_key.to_string();
         let done = IssueStatus::Done.as_str();
-        let raw = self
-            .pool
+        self.pool
             .interact("issues.by_source_key", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!(
-                            "SELECT {ISSUE_COLUMNS} FROM issues \
+                ISSUE.optional(
+                    conn.prepare(&format!(
+                        "SELECT {ISSUE_COLUMNS} FROM issues \
                              WHERE project_id = ?1 AND source_key = ?2 \
                                AND cancelled_at IS NULL AND status <> ?3"
-                        ),
-                        rusqlite::params![project, source_key, done],
-                        read_raw_issue,
-                    )
-                    .optional()?)
+                    ))?
+                    .query(rusqlite::params![project, source_key, done])?,
+                )
             })
-            .await?;
-        raw.map(issue_from_raw).transpose()
+            .await
     }
 
     async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>> {
         let parent = parent.as_str().to_string();
-        let raws = self
-            .pool
+        self.pool
             .interact("issues.children", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {ISSUE_COLUMNS} FROM issues WHERE parent_issue_id = ?1 \
                      ORDER BY stage, position, number"
                 ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![parent], read_raw_issue)?
-                    .collect::<rusqlite::Result<Vec<RawIssue>>>()?)
+                ISSUE.complete(stmt.query(rusqlite::params![parent])?)
             })
-            .await?;
-        raws.into_iter().map(issue_from_raw).collect()
+            .await
     }
 
     async fn move_issue(
@@ -1472,8 +1291,7 @@ impl ProjectStore for SqliteProjectStore {
         let agent = new.agent_id.as_str().to_string();
         let trigger = new.trigger.as_str();
         let now = super::time::now_us();
-        let outcome = self
-            .pool
+        self.pool
             .interact_write("issue_runs.enqueue", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1482,47 +1300,27 @@ impl ProjectStore for SqliteProjectStore {
                     rusqlite::params![issue_id],
                     |row| row.get(0),
                 )?;
-                // The live index rejects a second unfinished run. Returned as
-                // data rather than an error because a non-Internal
-                // StorageError cannot be built inside this closure.
-                //
-                // **Only** a constraint refusal comes out that way. Every
-                // other failure here — a busy database, a full disk, a
-                // datatype mismatch — is propagated as the error it is,
-                // because the caller turns this side of the fork into
-                // "issue already has a run in flight" and, since
-                // `enqueue_as` began recording a `RunRefused` entry on it,
-                // into a permanent line on the card saying a dedupe
-                // refusal happened. A transient sqlite failure must not be
-                // written into a card's history as one.
-                if let Err(e) = tx.execute(
+                // Only a constraint refusal belongs in the card's run-refusal history.
+                tx.execute(
                     "INSERT INTO issue_runs (id, issue_id, project_id, number, agent_id, \
                      session_id, trigger, status, attempt, error, created_at, started_at, \
                      settled_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'queued', ?7, NULL, ?8, NULL, NULL)",
                     rusqlite::params![id, issue_id, project, number, agent, trigger, attempt, now],
-                ) {
-                    drop(tx);
-                    if !super::already_there(&e) {
-                        return Err(e.into());
-                    }
-                    return Ok(Err(e.to_string()));
-                }
-                let raw = tx.query_row(
-                    &format!("SELECT {RUN_COLUMNS} FROM issue_runs WHERE id = ?1"),
-                    rusqlite::params![id],
-                    read_raw_run,
+                )
+                .map_err(|error| {
+                    super::unique_conflict(error, "issue already has a run in flight")
+                })?;
+                let record = RUN.required(
+                    tx.prepare(&format!(
+                        "SELECT {RUN_COLUMNS} FROM issue_runs WHERE id = ?1"
+                    ))?
+                    .query(rusqlite::params![id])?,
                 )?;
                 tx.commit()?;
-                Ok(Ok(raw))
+                Ok(record)
             })
-            .await?;
-        match outcome {
-            Ok(raw) => run_from_raw(raw),
-            Err(reason) => Err(StorageError::Conflict(format!(
-                "issue already has a run in flight: {reason}"
-            ))),
-        }
+            .await
     }
 
     async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow> {
@@ -1550,22 +1348,17 @@ impl ProjectStore for SqliteProjectStore {
     ) -> Result<Option<IdempotentIssueEvent>> {
         let issue = issue.as_str().to_owned();
         let client_msg_id = client_msg_id.as_str().to_owned();
-        let raw = self
-            .pool
+        self.pool
             .interact("issue_events.by_client_msg_id", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!(
-                            "SELECT {EVENT_COLUMNS} FROM issue_events \
+                IDEMPOTENT_EVENT.optional(
+                    conn.prepare(&format!(
+                        "SELECT {EVENT_COLUMNS} FROM issue_events \
                              WHERE issue_id = ?1 AND client_msg_id = ?2"
-                        ),
-                        rusqlite::params![issue, client_msg_id],
-                        read_raw_event,
-                    )
-                    .optional()?)
+                    ))?
+                    .query(rusqlite::params![issue, client_msg_id])?,
+                )
             })
-            .await?;
-        raw.map(idempotent_event_from_raw).transpose()
+            .await
     }
 
     async fn mark_comment_consequences_applied(
@@ -1651,31 +1444,24 @@ impl ProjectStore for SqliteProjectStore {
 
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>> {
         let issue = issue.as_str().to_string();
-        let raws = self
-            .pool
+        self.pool
             .interact("issue_runs.list", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {RUN_COLUMNS} FROM issue_runs WHERE issue_id = ?1 \
                      ORDER BY attempt DESC"
                 ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![issue], read_raw_run)?
-                    .collect::<rusqlite::Result<Vec<RawRun>>>()?)
+                RUN.complete(stmt.query(rusqlite::params![issue])?)
             })
-            .await?;
-        raws.into_iter().map(run_from_raw).collect()
+            .await
     }
 
     async fn run_spend(&self, issue: &IssueId) -> Result<Vec<RunSpend>> {
         let issue = issue.as_str().to_string();
-        let rows = self
-            .pool
+        self.pool
             .interact("issue_runs.spend", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT r.id, \
-                            COALESCE(SUM(c.input_tokens), 0), \
-                            COALESCE(SUM(c.output_tokens), 0), \
-                            COALESCE(SUM(c.cost_usd), 0) \
+                            {SPEND_SUMS} \
                      FROM issue_runs r \
                      LEFT JOIN cost_records c ON {RUN_COST_WINDOW} \
                      WHERE r.issue_id = ?1 \
@@ -1683,27 +1469,14 @@ impl ProjectStore for SqliteProjectStore {
                 ))?;
                 Ok(stmt
                     .query_map(rusqlite::params![issue], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
+                        Ok(RunSpend {
+                            run_id: IssueRunId::from(row.get::<_, String>("id")?),
+                            spend: spend_from_row(row)?,
+                        })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?)
             })
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, input_tokens, output_tokens, cost)| RunSpend {
-                run_id: IssueRunId::from(id),
-                spend: Spend {
-                    input_tokens,
-                    output_tokens,
-                    cost: baybo_model::MicroUsd::from_micros(cost),
-                },
-            })
-            .collect())
+            .await
     }
 
     async fn settled_run_facts(&self, runs: &[IssueRunId]) -> Result<Vec<SettledRunFacts>> {
@@ -1711,18 +1484,15 @@ impl ProjectStore for SqliteProjectStore {
             return Ok(Vec::new());
         }
         let ids: Vec<String> = runs.iter().map(|id| id.as_str().to_string()).collect();
-        let rows = self
-            .pool
+        self.pool
             .interact("issue_runs.settled_facts", move |conn| {
                 let holes = std::iter::repeat_n("?", ids.len())
                     .collect::<Vec<_>>()
                     .join(",");
                 let mut stmt = conn.prepare(&format!(
                     "SELECT r.id, \
-                            (r.settled_at - r.started_at) / 1000, \
-                            COALESCE(SUM(c.input_tokens), 0), \
-                            COALESCE(SUM(c.output_tokens), 0), \
-                            COALESCE(SUM(c.cost_usd), 0) \
+                            (r.settled_at - r.started_at) / 1000 AS duration_ms, \
+                            {SPEND_SUMS} \
                      FROM issue_runs r \
                      LEFT JOIN cost_records c ON {RUN_COST_WINDOW} \
                      WHERE r.id IN ({holes}) \
@@ -1730,31 +1500,15 @@ impl ProjectStore for SqliteProjectStore {
                 ))?;
                 Ok(stmt
                     .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
+                        Ok(SettledRunFacts {
+                            run_id: IssueRunId::from(row.get::<_, String>("id")?),
+                            duration_ms: row.get("duration_ms")?,
+                            spend: spend_from_row(row)?,
+                        })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?)
             })
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, duration_ms, input_tokens, output_tokens, cost)| SettledRunFacts {
-                    run_id: IssueRunId::from(id),
-                    duration_ms,
-                    spend: Spend {
-                        input_tokens,
-                        output_tokens,
-                        cost: baybo_model::MicroUsd::from_micros(cost),
-                    },
-                },
-            )
-            .collect())
+            .await
     }
 
     async fn board_activity(
@@ -1771,12 +1525,15 @@ impl ProjectStore for SqliteProjectStore {
 
                 {
                     let mut stmt = conn.prepare(
-                        "SELECT project_id, COUNT(*) FROM issue_runs \
+                        "SELECT project_id, COUNT(*) AS count FROM issue_runs \
                          WHERE status = ?1 AND settled_at IS NULL \
                          GROUP BY project_id",
                     )?;
                     for row in stmt.query_map(rusqlite::params![running], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        Ok((
+                            row.get::<_, String>("project_id")?,
+                            row.get::<_, i64>("count")?,
+                        ))
                     })? {
                         let (project, count) = row?;
                         activity.entry(project).or_default().0 += count.max(0) as usize;
@@ -1814,7 +1571,7 @@ impl ProjectStore for SqliteProjectStore {
                          GROUP BY r.project_id"
                     ))?;
                     for row in stmt.query_map(rusqlite::params![since], |row| {
-                        Ok((row.get::<_, String>(0)?, spend_from_row(row, 1)?))
+                        Ok((row.get::<_, String>("project_id")?, spend_from_row(row)?))
                     })? {
                         let (project, spend) = row?;
                         let entry = activity.entry(project).or_default();
@@ -1839,19 +1596,15 @@ impl ProjectStore for SqliteProjectStore {
 
     async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>> {
         let project = project.as_str().to_string();
-        let raws = self
-            .pool
+        self.pool
             .interact("issue_runs.active", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {RUN_COLUMNS} FROM issue_runs \
                      WHERE project_id = ?1 AND settled_at IS NULL ORDER BY number"
                 ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![project], read_raw_run)?
-                    .collect::<rusqlite::Result<Vec<RawRun>>>()?)
+                RUN.complete(stmt.query(rusqlite::params![project])?)
             })
-            .await?;
-        raws.into_iter().map(run_from_raw).collect()
+            .await
     }
 
     async fn drain_marks(&self, project: &ProjectId) -> Result<DrainMarks> {
@@ -1884,16 +1637,21 @@ impl ProjectStore for SqliteProjectStore {
                             UNION ALL \
                             SELECT MAX(settled_at) FROM issue_runs \
                               WHERE project_id = ?1 AND status = ?3 \
-                                AND settled_at IS NOT NULL)), \
+                                AND settled_at IS NOT NULL)) AS looked_at, \
                          (SELECT MAX(settled_at) FROM issue_runs \
                             WHERE project_id = ?1 AND settled_at IS NOT NULL \
                               AND status <> ?3 \
                               AND trigger NOT IN (",
                         coordination_triggers!(),
-                        "))"
+                        ")) AS worked_at"
                     ),
                     rusqlite::params![project, failed, cancelled],
-                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>("looked_at")?,
+                            row.get::<_, Option<i64>>("worked_at")?,
+                        ))
+                    },
                 )?)
             })
             .await?;
@@ -1905,19 +1663,16 @@ impl ProjectStore for SqliteProjectStore {
 
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
         let id = id.as_str().to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact("issue_runs.get", move |conn| {
-                Ok(conn
-                    .query_row(
-                        &format!("SELECT {RUN_COLUMNS} FROM issue_runs WHERE id = ?1"),
-                        rusqlite::params![id],
-                        read_raw_run,
-                    )
-                    .optional()?)
+                RUN.optional(
+                    conn.prepare(&format!(
+                        "SELECT {RUN_COLUMNS} FROM issue_runs WHERE id = ?1"
+                    ))?
+                    .query(rusqlite::params![id])?,
+                )
             })
-            .await?;
-        raw.map(run_from_raw).transpose()
+            .await
     }
 
     async fn claim_run(&self, id: &IssueRunId, session: &SessionId) -> Result<bool> {
@@ -1971,81 +1726,77 @@ impl ProjectStore for SqliteProjectStore {
 
     async fn hold_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
         let id = id.as_str().to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact_write("issue_runs.hold", move |conn| {
                 // Write and read back in one statement, as `requeue_unsettled`
                 // does: the caller is handed the row this wrote rather than
                 // its own pre-write copy plus a guess at what changed.
-                let mut stmt = conn.prepare(&format!(
-                    "UPDATE issue_runs SET status = 'held' \
+                let tx = conn.transaction()?;
+                let record = {
+                    let mut stmt = tx.prepare(&format!(
+                        "UPDATE issue_runs SET status = 'held' \
                      WHERE id = ?1 AND status = 'queued' AND settled_at IS NULL \
                      RETURNING {RUN_COLUMNS}"
-                ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![id], read_raw_run)?
-                    .next()
-                    .transpose()?)
+                    ))?;
+                    RUN.optional(stmt.query(rusqlite::params![id])?)?
+                };
+                tx.commit()?;
+                Ok(record)
             })
-            .await?;
-        raw.map(run_from_raw).transpose()
+            .await
     }
 
     async fn held_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>> {
         let project = project.as_str().to_string();
-        let raws = self
-            .pool
+        self.pool
             .interact("issue_runs.held", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {RUN_COLUMNS} FROM issue_runs \
                      WHERE project_id = ?1 AND status = 'held' AND settled_at IS NULL \
                      ORDER BY created_at"
                 ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![project], read_raw_run)?
-                    .collect::<rusqlite::Result<Vec<RawRun>>>()?)
+                RUN.complete(stmt.query(rusqlite::params![project])?)
             })
-            .await?;
-        raws.into_iter().map(run_from_raw).collect()
+            .await
     }
 
     async fn release_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
         let id = id.as_str().to_string();
-        let raw = self
-            .pool
+        self.pool
             .interact_write("issue_runs.release", move |conn| {
-                let mut stmt = conn.prepare(&format!(
-                    "UPDATE issue_runs SET status = 'queued' \
+                let tx = conn.transaction()?;
+                let record = {
+                    let mut stmt = tx.prepare(&format!(
+                        "UPDATE issue_runs SET status = 'queued' \
                      WHERE id = ?1 AND status = 'held' \
                      RETURNING {RUN_COLUMNS}"
-                ))?;
-                Ok(stmt
-                    .query_map(rusqlite::params![id], read_raw_run)?
-                    .next()
-                    .transpose()?)
+                    ))?;
+                    RUN.optional(stmt.query(rusqlite::params![id])?)?
+                };
+                tx.commit()?;
+                Ok(record)
             })
-            .await?;
-        raw.map(run_from_raw).transpose()
+            .await
     }
 
     async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>> {
-        let raw = self
-            .pool
+        self.pool
             .interact_write("issue_runs.requeue", move |conn| {
                 // Preserve first claim so pre-restart spend stays in the run window.
                 // Update and return atomically so narrated resume counts match.
-                let mut stmt = conn.prepare(&format!(
-                    "UPDATE issue_runs SET status = 'queued', resumes = resumes + 1 \
+                let tx = conn.transaction()?;
+                let record = {
+                    let mut stmt = tx.prepare(&format!(
+                        "UPDATE issue_runs SET status = 'queued', resumes = resumes + 1 \
                      WHERE settled_at IS NULL AND status = 'running' \
                      RETURNING {RUN_COLUMNS}"
-                ))?;
-                let rows = stmt
-                    .query_map([], read_raw_run)?
-                    .collect::<rusqlite::Result<Vec<RawRun>>>()?;
-                Ok(rows)
+                    ))?;
+                    RUN.complete(stmt.query([])?)?
+                };
+                tx.commit()?;
+                Ok(record)
             })
-            .await?;
-        raw.into_iter().map(run_from_raw).collect()
+            .await
     }
 }
 
@@ -3235,6 +2986,45 @@ mod tests {
             Some(first_claim),
             "a resumed run keeps its original claim instant"
         );
+    }
+
+    #[tokio::test]
+    async fn requeue_preserves_running_rows_when_a_returned_record_is_corrupt() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "work", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store
+            .claim_run(&run.id, &SessionId::from("session"))
+            .await
+            .unwrap();
+        store
+            .pool
+            .interact_write("test.damage_run", |conn| {
+                conn.execute("UPDATE issue_runs SET trigger = 'unknown'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(store.requeue_unsettled().await, Err(StorageError::Corrupt { table: "issue_runs", key, .. }) if key == run.id.as_str())
+        );
+        let (status, resumes): (String, i64) = store
+            .pool
+            .interact("test.run_state", |conn| {
+                Ok(
+                    conn.query_row("SELECT status, resumes FROM issue_runs", [], |r| {
+                        Ok((r.get("status")?, r.get("resumes")?))
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), resumes), ("running", 0));
     }
 
     #[tokio::test]

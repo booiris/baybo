@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
 use baybo_store::secret::{Result, SecretStore, StoreIdentity};
@@ -34,13 +33,14 @@ impl SecretStore for SqliteSecretStore {
         let name = name.to_string();
         self.pool
             .interact("secrets.retrieve", move |conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT encrypted_value FROM secrets WHERE name = ?1",
-                        rusqlite::params![name],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()?)
+                let mut stmt =
+                    conn.prepare("SELECT name, encrypted_value FROM secrets WHERE name = ?1")?;
+                let secret = super::row::RowDecoder {
+                    table: "secrets",
+                    key: "name",
+                    decode: |row| Ok(row.get("encrypted_value")?),
+                };
+                secret.optional(stmt.query([name])?)
             })
             .await
     }
@@ -50,7 +50,7 @@ impl SecretStore for SqliteSecretStore {
             .interact("secrets.list", move |conn| {
                 let mut stmt = conn.prepare("SELECT name FROM secrets")?;
                 let names = stmt
-                    .query_map([], |row| row.get::<_, String>(0))?
+                    .query_map([], |row| row.get::<_, String>("name"))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(names)
             })

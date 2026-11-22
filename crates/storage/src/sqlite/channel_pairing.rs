@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use baybo_model::ChannelType;
-use rusqlite::OptionalExtension;
 
-use super::SqlitePool;
+use super::{SqlitePool, row::RowDecoder};
 use baybo_store::channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 
 pub struct SqliteChannelPairingStore {
@@ -15,48 +14,26 @@ impl SqliteChannelPairingStore {
     }
 }
 
-/// Raw column tuple: the status string can't be parsed inside the rusqlite row
-/// closure (a parse failure isn't a `rusqlite::Error`), so decoding happens
-/// after the rows are collected.
-type RawPairing = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    i64,
-    Option<i64>,
-    Option<i64>,
-);
-
-fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawPairing> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-    ))
-}
-
-fn decode_row(raw: RawPairing) -> anyhow::Result<ChannelPairingRow> {
-    let (ct, bot_id, user_id, code, status_s, created_at, expires_at, approved_at) = raw;
-    let status = PairingStatus::parse(&status_s)
-        .ok_or_else(|| anyhow::anyhow!("unknown pairing status: {status_s}"))?;
-    Ok(ChannelPairingRow {
-        channel_type: ChannelType::from(ct.as_str()),
-        bot_id,
-        user_id,
-        code,
-        status,
-        created_at,
-        expires_at,
-        approved_at,
-    })
-}
+const PAIRING: RowDecoder<ChannelPairingRow> = RowDecoder {
+    table: "channel_pairings",
+    key: "user_id",
+    decode: |row| {
+        let ct: String = row.get("channel_type")?;
+        let status_s: String = row.get("status")?;
+        let status = PairingStatus::parse(&status_s)
+            .ok_or_else(|| anyhow::anyhow!("unknown pairing status: {status_s}"))?;
+        Ok(ChannelPairingRow {
+            channel_type: ChannelType::from(ct.as_str()),
+            bot_id: row.get("bot_id")?,
+            user_id: row.get("user_id")?,
+            code: row.get("code")?,
+            status,
+            created_at: row.get("created_at")?,
+            expires_at: row.get("expires_at")?,
+            approved_at: row.get("approved_at")?,
+        })
+    },
+};
 
 #[async_trait]
 impl ChannelPairingStore for SqliteChannelPairingStore {
@@ -71,17 +48,15 @@ impl ChannelPairingStore for SqliteChannelPairingStore {
         let user_id = user_id.to_string();
         self.pool
             .interact("channel_pairings.get", move |conn| {
-                let raw = conn
-                    .query_row(
+                PAIRING.optional(
+                    conn.prepare(
                         "SELECT channel_type, bot_id, user_id, code, status,
                                 created_at, expires_at, approved_at
                          FROM channel_pairings
                          WHERE channel_type = ?1 AND bot_id = ?2 AND user_id = ?3",
-                        rusqlite::params![ct, bot_id, user_id],
-                        read_row,
-                    )
-                    .optional()?;
-                raw.map(decode_row).transpose()
+                    )?
+                    .query(rusqlite::params![ct, bot_id, user_id])?,
+                )
             })
             .await
             .map_err(|e| e.to_string())
@@ -91,17 +66,15 @@ impl ChannelPairingStore for SqliteChannelPairingStore {
         let code = code.to_string();
         self.pool
             .interact("channel_pairings.get_by_code", move |conn| {
-                let raw = conn
-                    .query_row(
+                PAIRING.optional(
+                    conn.prepare(
                         "SELECT channel_type, bot_id, user_id, code, status,
                                 created_at, expires_at, approved_at
                          FROM channel_pairings
                          WHERE code = ?1",
-                        rusqlite::params![code],
-                        read_row,
-                    )
-                    .optional()?;
-                raw.map(decode_row).transpose()
+                    )?
+                    .query(rusqlite::params![code])?,
+                )
             })
             .await
             .map_err(|e| e.to_string())
@@ -209,33 +182,28 @@ impl ChannelPairingStore for SqliteChannelPairingStore {
 
     async fn list(&self, status: Option<PairingStatus>) -> Result<Vec<ChannelPairingRow>, String> {
         self.pool
-            .interact("channel_pairings.list", move |conn| {
-                let raws: Vec<RawPairing> = match status {
-                    Some(s) => {
-                        let mut stmt = conn.prepare(
-                            "SELECT channel_type, bot_id, user_id, code, status,
+            .interact("channel_pairings.list", move |conn| match status {
+                Some(s) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT channel_type, bot_id, user_id, code, status,
                                     created_at, expires_at, approved_at
                              FROM channel_pairings
                              WHERE status = ?1
                              ORDER BY created_at DESC",
-                        )?;
+                    )?;
 
-                        stmt.query_map(rusqlite::params![s.as_str().to_string()], read_row)?
-                            .collect::<rusqlite::Result<Vec<_>>>()?
-                    }
-                    None => {
-                        let mut stmt = conn.prepare(
-                            "SELECT channel_type, bot_id, user_id, code, status,
+                    PAIRING.list(stmt.query(rusqlite::params![s.as_str().to_string()])?)
+                }
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT channel_type, bot_id, user_id, code, status,
                                     created_at, expires_at, approved_at
                              FROM channel_pairings
                              ORDER BY created_at DESC",
-                        )?;
+                    )?;
 
-                        stmt.query_map([], read_row)?
-                            .collect::<rusqlite::Result<Vec<_>>>()?
-                    }
-                };
-                raws.into_iter().map(decode_row).collect()
+                    PAIRING.list(stmt.query([])?)
+                }
             })
             .await
             .map_err(|e| e.to_string())

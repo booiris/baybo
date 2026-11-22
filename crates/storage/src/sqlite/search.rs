@@ -333,11 +333,11 @@ pub(crate) fn rebuild_if_stale(conn: &mut rusqlite::Connection) -> anyhow::Resul
         let mut rows = stmt.query([])?;
         let mut insert = tx.prepare(INSERT_FTS_ROW)?;
         while let Some(row) = rows.next()? {
-            let session_id: String = row.get(0)?;
-            let ordinal: i64 = row.get(1)?;
-            let role: String = row.get(2)?;
-            let content = super::payload::read_text(row, 3)?;
-            let source: String = row.get(4)?;
+            let session_id: String = row.get("session_id")?;
+            let ordinal: i64 = row.get("ordinal")?;
+            let role: String = row.get("role")?;
+            let content = super::payload::read_text(row, "content")?;
+            let source: String = row.get("source")?;
             // A row this build cannot decode is skipped, not fatal: refusing to
             // open the store over one unreadable historical row would be a far
             // worse failure than that row being unsearchable. `rehydrate_message`
@@ -364,8 +364,8 @@ pub(crate) fn rebuild_if_stale(conn: &mut rusqlite::Connection) -> anyhow::Resul
         let mut rows = stmt.query([])?;
         let mut insert = tx.prepare(INSERT_TITLE_FTS_ROW)?;
         while let Some(row) = rows.next()? {
-            let session_id: String = row.get(0)?;
-            let title: String = row.get(1)?;
+            let session_id: String = row.get("id")?;
+            let title: String = row.get("title")?;
             let Some(segmented) = indexable_title(&title) else {
                 continue;
             };
@@ -398,7 +398,39 @@ impl SqliteMessageSearchStore {
     }
 }
 
+const MESSAGE_HIT: super::row::RowDecoder<baybo_store::SearchHit> = super::row::RowDecoder {
+    table: "session_messages",
+    key: "session_id",
+    decode: |row| {
+        Ok(baybo_store::SearchHit {
+            session_id: baybo_model::SessionId::from(row.get::<_, String>("session_id")?),
+            ordinal: row.get("ordinal")?,
+            channel: baybo_model::ChannelType(row.get("channel")?),
+            created_at: super::time::from_us(row.get("created_at")?)
+                .ok_or_else(|| anyhow::anyhow!("session_messages.created_at out of range"))?,
+            superseded_by: row.get("superseded_by")?,
+            message: super::session::decode_message_row(row)?,
+            score: row.get("score")?,
+        })
+    },
+};
+const TITLE_HIT: super::row::RowDecoder<baybo_store::TitleHit> = super::row::RowDecoder {
+    table: "sessions",
+    key: "session_id",
+    decode: |row| {
+        Ok(baybo_store::TitleHit {
+            session_id: baybo_model::SessionId::from(row.get::<_, String>("session_id")?),
+            channel: baybo_model::ChannelType(row.get("channel")?),
+            title: row.get("title")?,
+            last_active: super::time::from_us(row.get("last_active")?)
+                .ok_or_else(|| anyhow::anyhow!("sessions.last_active out of range"))?,
+            score: row.get("score")?,
+        })
+    },
+};
+
 #[async_trait::async_trait]
+
 impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
     async fn search_messages(
         &self,
@@ -490,54 +522,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                     include_cron_workspaces,
                     limit
                 ];
-                let rows = stmt.query_map(params, |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        super::payload::read_text(row, 4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, Option<i64>>(8)?,
-                        row.get::<_, f64>(9)?,
-                    ))
-                })?;
-                let mut hits = Vec::new();
-                for row in rows {
-                    let (
-                        sid,
-                        ordinal,
-                        chan,
-                        role,
-                        content,
-                        source,
-                        platform_msg_id,
-                        created_at,
-                        sup,
-                        score,
-                    ) = row?;
-                    let blocks = serde_json::from_str(&content)
-                        .map_err(|e| anyhow::anyhow!("deserialize message content: {e}"))?;
-                    let message =
-                        super::session::rehydrate_message(&role, blocks, &source, platform_msg_id)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    hits.push(baybo_store::SearchHit {
-                        session_id: baybo_model::SessionId::from(sid),
-                        ordinal,
-                        channel: baybo_model::ChannelType(chan),
-                        created_at: super::time::from_us(created_at).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "session_messages.created_at out of range: {created_at}"
-                            )
-                        })?,
-                        superseded_by: sup,
-                        message,
-                        score,
-                    });
-                }
-                Ok(hits)
+                MESSAGE_HIT.complete(stmt.query(params)?)
             })
             .await
     }
@@ -562,7 +547,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // without its session has nothing to return. `s.channel` is the
                 // flat column `save` writes, so no `json_extract` and no snapshot.
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT x.session_id, COALESCE(s.channel, ''), s.title, s.last_active, \
+                    "SELECT x.session_id, COALESCE(s.channel, '') AS channel, s.title, s.last_active, \
                             bm25(session_title_fts) AS score \
                      FROM session_title_fts x \
                      JOIN sessions s ON s.id = x.session_id \
@@ -583,29 +568,8 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                     include_cron_workspaces,
                     limit
                 ];
-                let rows = stmt.query_map(params, |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, f64>(4)?,
-                    ))
-                })?;
-                let mut hits = Vec::new();
-                for row in rows {
-                    let (sid, chan, title, last_active, score) = row?;
-                    hits.push(baybo_store::TitleHit {
-                        session_id: baybo_model::SessionId::from(sid),
-                        channel: baybo_model::ChannelType(chan),
-                        title,
-                        last_active: super::time::from_us(last_active).ok_or_else(|| {
-                            anyhow::anyhow!("sessions.last_active out of range: {last_active}")
-                        })?,
-                        score,
-                    });
-                }
-                Ok(hits)
+                TITLE_HIT.complete(stmt.query(params)?)
+
             })
             .await
     }
