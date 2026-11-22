@@ -392,7 +392,7 @@ A dropped waiter is **not** a resolution. `QueueCleanup::drop` (today:
 `drop_call` → `Abandoned` edge) becomes `queue.orphan(ask_id)`: a resumable
 entry loses its responder and becomes dead, no edge is published, the row
 stays pending. This is what makes a parked ask survive an actor panic
-(`recover_panicked_actor_session` cancels the turn; the ask is still on the
+(`TurnRecovery::on_actor_panic` cancels the turn; the ask is still on the
 queue, dead, and the Resume door spawns a fresh actor when it is answered)
 and a process shutdown (next section). A non-resumable entry is removed by
 `orphan` with an `Abandoned` edge and an `AskClosed(Abandoned)` event (it is useless without its tool future),
@@ -486,7 +486,7 @@ Boot order in `runtime.rs::build_managers`, new steps in **bold**, in the
 order the code can actually have:
 
 1. `Store::open` (`:342`).
-2. `recover_orphaned_traces_and_turns` (`:504`) — unchanged. A turn that died
+2. `TurnRecovery::on_startup` (`:504`) — unchanged. A turn that died
    parked on an ask is cancelled `SystemCrash` like any other; the ask row is
    the bridge, not the turn.
 3. **`AskCore::new(stores.human_ask.clone())`**, **`AskQueues::new()`** and
@@ -1190,7 +1190,7 @@ Where the code differs from the sketch above, and why:
   `TriggerSource`), applied to the session the router loads anyway. The ask
   crate sequences no routing policy and the sink holds no session store.
 - **Boot wiring.** `build_managers` follows the [Restart survival](#restart-survival)
-  order: store → `recover_orphaned_traces_and_turns` (which needs the
+  order: store → `TurnRecovery::on_startup` (which needs the
   `SessionManager` and `TurnLifecycle`, built just before it) → `AskCore`,
   `AskQueues` and the resume channel (`RouterResumeSink::channel()`) → `install_channels` → `AskPushRelay`
   installed on `owner` → `HumanAskManager` (with

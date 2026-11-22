@@ -226,6 +226,10 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         agent_output_tx,
         std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
         tokio_util::sync::CancellationToken::new(),
+        baybo_agent::recovery::TurnRecovery::new(
+            Arc::clone(&stores.trace),
+            Arc::clone(&turn_lifecycle),
+        ),
     );
 
     let deck_manager = baybo_deck::DeckManager::from_config(baybo_deck::DeckManagerConfig {

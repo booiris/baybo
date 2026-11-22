@@ -4,7 +4,7 @@
 
 The boot recovery sweep cancels interrupted `InProgress` Turns as `Cancelled { SystemCrash }` on restart (`crates/agent/src/recovery.rs`). For cron-triggered Turns, the `CronScheduler` has already advanced `next_trigger_at`, so it won't re-trigger the interrupted execution. The cancelled Turn sits there with no automatic retry mechanism.
 
-Boot recovery now exists — see `docs/modules/turn.md` "Recovery" and `crates/agent/src/recovery.rs` (`recover_orphaned_traces_and_turns`, wired at boot in `crates/baybo/src/runtime.rs`).
+Boot recovery now exists — see `docs/modules/turn.md` "Recovery" and `crates/agent/src/recovery.rs` (`TurnRecovery::on_startup`, wired at boot in `crates/baybo/src/runtime.rs`).
 
 ## Proposed Direction
 

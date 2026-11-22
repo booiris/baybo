@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::actor::mailbox::{self, MailboxSender, TrySendError};
 use crate::actor::{AgentActor, AgentMessage};
+use crate::recovery::TurnRecovery;
 use crate::runtime::running_calls::RunningCalls;
 use baybo_session::SessionManager;
 
@@ -57,6 +58,7 @@ pub struct InFlightJob {
 #[derive(Clone)]
 pub struct AgentSupervisor {
     root: CancellationToken,
+    recovery: TurnRecovery,
     tasks: TaskTracker,
     actors: Arc<DashMap<SessionId, MailboxSender<AgentMessage>>>,
     response_tx: mpsc::Sender<AgentOutput>,
@@ -97,9 +99,11 @@ impl AgentSupervisor {
         response_tx: mpsc::Sender<AgentOutput>,
         live_asks: Arc<dyn baybo_human_ask::LivePendingAsks>,
         root: CancellationToken,
+        recovery: TurnRecovery,
     ) -> Self {
         Self {
             root,
+            recovery,
             tasks: TaskTracker::new(),
             actors: Arc::new(DashMap::new()),
             response_tx,
@@ -114,18 +118,15 @@ impl AgentSupervisor {
         self.root.clone()
     }
 
-    pub fn spawn_actor(
-        &self,
-        actor: AgentActor,
-        capacity: usize,
-        trace_store: Arc<dyn baybo_trace::TraceStore>,
-    ) -> MailboxSender<AgentMessage> {
+    pub fn spawn_actor(&self, actor: AgentActor, capacity: usize) -> MailboxSender<AgentMessage> {
         let (sender, mailbox) = mailbox::channel(capacity);
         // Count the task before checking admission so shutdown also waits for
         // a spawn that has passed the check but has not started running yet.
-        let task =
-            self.tasks
-                .track_future(crate::actor::runner::run_actor(actor, mailbox, trace_store));
+        let task = self.tasks.track_future(crate::actor::runner::run_actor(
+            actor,
+            mailbox,
+            self.recovery.clone(),
+        ));
         if !self.root.is_cancelled() {
             tokio::spawn(task);
         }
@@ -704,6 +705,7 @@ mod tests {
             tx,
             std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
             tokio_util::sync::CancellationToken::new(),
+            TurnRecovery::in_memory(),
         )
     }
 
@@ -965,6 +967,7 @@ mod tests {
                 (during.clone(), ActorStopCost::AbandonsAsks),
             ])),
             CancellationToken::new(),
+            TurnRecovery::in_memory(),
         );
         let (resumable_tx, mut resumable_rx) = mailbox::channel(8);
         let (during_tx, mut during_rx) = mailbox::channel(8);
@@ -1044,6 +1047,7 @@ mod tests {
                 .into(),
             ))),
             CancellationToken::new(),
+            TurnRecovery::in_memory(),
         );
         let (mailbox_tx, mut mailbox_rx) = mailbox::channel(8);
         supervisor
@@ -1079,6 +1083,7 @@ mod tests {
                 ActorStopCost::ReleasesTurn { waiting_calls: 1 },
             )])),
             CancellationToken::new(),
+            TurnRecovery::in_memory(),
         );
         let running = RunningCalls::default();
         let release = CancellationToken::new();

@@ -201,6 +201,7 @@ mod tests {
             tx,
             std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
             tokio_util::sync::CancellationToken::new(),
+            crate::recovery::TurnRecovery::in_memory(),
         );
         let parent = SessionId::from("parent");
         let (sender, mailbox) = mailbox::channel(8);

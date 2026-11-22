@@ -67,17 +67,12 @@ async fn boot(
     before_reload: impl FnOnce(&AgentTestHarness),
 ) -> Node {
     let store = Store::open(db).await.expect("open the database");
-    let trace_store = Arc::clone(&store.trace);
     let mut b = builder(session, store, runs);
     if resume_door {
         b = b.with_resume_door();
     }
     let harness = b.build();
-    baybo_agent::recovery::recover_orphaned_traces_and_turns(
-        trace_store,
-        Arc::clone(&harness.turn_lifecycle),
-    )
-    .await;
+    harness.recovery.on_startup().await;
     let registry = Arc::new(ChannelRegistry::new());
     boot::install_channels(
         &registry,

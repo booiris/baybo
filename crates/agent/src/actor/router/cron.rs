@@ -1265,10 +1265,15 @@ mod tests {
 
         fn build(seed_origin: bool) -> Self {
             let (response_tx, response_rx) = mpsc::channel(64);
+            let turn_lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
             let supervisor = AgentSupervisor::new(
                 response_tx,
                 std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
                 tokio_util::sync::CancellationToken::new(),
+                crate::recovery::TurnRecovery::new(
+                    Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+                    Arc::clone(&turn_lifecycle),
+                ),
             );
             let sessions = Arc::new(SessionManager::new(
                 Arc::new(MemorySessionStore::new()),
@@ -1323,7 +1328,6 @@ mod tests {
                 .expect("seed the origin conversation");
             }
 
-            let turn_lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
             let cron_store = Arc::new(InMemoryCronStore::new());
             let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
             let router = Router::from_config(RouterConfig {

@@ -156,7 +156,7 @@ the `Pending` row exists the snapshot reads active, and the `Started` broadcast
 refines `started_at` moments later.
 
 The actor runner observes panics and delegates to
-`recover_panicked_actor_session`, which closes the orphan trace rows and cancels
+`TurnRecovery::on_actor_panic`, which closes the orphan trace rows and cancels
 the orphaned turns. Those terminal turn events are what the projector turns
 into the close edge — no special-case `TurnState` broadcast in the runner.
 

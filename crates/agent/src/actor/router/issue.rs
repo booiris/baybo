@@ -585,12 +585,19 @@ mod tests {
         let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("key");
         let (_trigger_tx, cron_trigger_rx) = tokio::sync::mpsc::channel(1);
+        let turn_lifecycle = Arc::new(baybo_turn::TurnLifecycle::new(Arc::new(
+            baybo_turn::test_support::MemoryTurnStore::new(),
+        )));
         let router = Router::from_config(RouterConfig {
             session_manager: Arc::clone(&sessions),
             supervisor: AgentSupervisor::new(
                 response_tx,
                 std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
                 tokio_util::sync::CancellationToken::new(),
+                crate::recovery::TurnRecovery::new(
+                    Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+                    Arc::clone(&turn_lifecycle),
+                ),
             ),
             channels: Arc::new(baybo_channels::ChannelRegistry::new()),
             security_gateway: Arc::new(SecurityGateway::new(
@@ -606,9 +613,7 @@ mod tests {
                 baybo_cost::SpendingLimits::default(),
             ),
             actor_spawner,
-            turn_lifecycle: Arc::new(baybo_turn::TurnLifecycle::new(Arc::new(
-                baybo_turn::test_support::MemoryTurnStore::new(),
-            ))),
+            turn_lifecycle,
             cron_store: Arc::new(baybo_cron::test_support::InMemoryCronStore::new()),
             agent_profiles: Arc::clone(&board.db.agent_profile),
             cron_trigger_rx,

@@ -684,10 +684,15 @@ mod tests {
 
     fn fixture(rate_limit_max: usize, detector: LeakDetector) -> RouterFixture {
         let (response_tx, response_rx) = mpsc::channel(64);
+        let turn_lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
         let supervisor = AgentSupervisor::new(
             response_tx,
             std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
             tokio_util::sync::CancellationToken::new(),
+            crate::recovery::TurnRecovery::new(
+                Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+                Arc::clone(&turn_lifecycle),
+            ),
         );
         let session_store = Arc::new(MemorySessionStore::new());
         let sessions = Arc::new(SessionManager::new(
@@ -718,7 +723,7 @@ mod tests {
                 SpendingLimits::default(),
             ),
             actor_spawner,
-            turn_lifecycle: Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new()))),
+            turn_lifecycle,
             cron_store: Arc::new(InMemoryCronStore::new()) as Arc<dyn CronStore>,
             agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
             cron_trigger_rx,

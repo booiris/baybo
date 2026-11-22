@@ -375,7 +375,7 @@ async fn tool_call_round_trip_invokes_recording_tool() {
 
 #[tokio::test(start_paused = true)]
 async fn large_tool_result_is_stored_once_and_trace_points_to_transcript() {
-    use baybo_store::{SessionStore, TraceStore, TurnStore};
+    use baybo_store::{SessionStore, TurnStore};
     use baybo_trace::{SpanKind, ToolCallOutput};
 
     let payload = format!("persist-this-tool-result:{}", "x".repeat(8 * 1024));
@@ -5392,7 +5392,7 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
     // detail renders the span's recorded `result`, so a blank result would
     // hide what the model produced before the abort even though the
     // transcript kept it.
-    use baybo_trace::{Span, SpanKind, Step, TraceStore};
+    use baybo_trace::{Span, SpanKind, Step};
     let steps: Vec<Step> = trace_store
         .list_steps_by_turn(&turn_id)
         .await
@@ -5715,7 +5715,7 @@ async fn a_turn_that_churns_one_file_is_told_it_made_no_progress() {
 #[tokio::test(start_paused = true)]
 async fn an_llm_span_records_its_tool_set_by_reference() {
     use baybo_store::TurnStore;
-    use baybo_trace::{SpanKind, TraceStore};
+    use baybo_trace::SpanKind;
 
     let tool = Arc::new(RecordingTool::new("echo_tool"));
     let manifest = tool.manifest();

@@ -1,26 +1,22 @@
 //! Actor task lifetime and panic recovery.
 
-use std::sync::Arc;
-
 use baybo_channels::{AgentEvent, AgentOutput, NoticeLevel};
-use baybo_trace::TraceStore;
 use chrono::Utc;
 use tracing::warn;
 
 use crate::actor::mailbox::MailboxReceiver;
 use crate::actor::{AgentActor, AgentMessage};
-use crate::recovery::recover_panicked_actor_session;
+use crate::recovery::TurnRecovery;
 
 pub(super) async fn run_actor(
     actor: AgentActor,
     mailbox: MailboxReceiver<AgentMessage>,
-    trace_store: Arc<dyn TraceStore>,
+    recovery: TurnRecovery,
 ) {
     let session_id = actor.durable.session.id.clone();
     let user_id = actor.durable.session.user.id.clone();
     let channel = actor.durable.session.channel.clone();
     let response_tx = actor.volatile.response_tx.clone();
-    let turn_lifecycle = Arc::clone(&actor.volatile.turn_lifecycle);
     let supervisor = actor.volatile.supervisor.clone();
     let result = tokio::spawn(actor.run(mailbox)).await;
     if let Some(supervisor) = supervisor {
@@ -35,8 +31,7 @@ pub(super) async fn run_actor(
         error = %join_err,
         "agent actor panicked; recovering in-flight turns"
     );
-    let summary =
-        recover_panicked_actor_session(trace_store, turn_lifecycle, &session_id, Utc::now()).await;
+    let summary = recovery.on_actor_panic(&session_id, Utc::now()).await;
     if summary.turns_cancelled > 0 {
         let notice = AgentOutput {
             session_id,

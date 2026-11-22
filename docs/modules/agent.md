@@ -249,16 +249,18 @@ The sink is channel-agnostic: the gateway's `SessionTitleBroadcaster` (in `crate
 
 ### Startup recovery
 
-On boot, `baybo_agent::recovery::recover_orphaned_traces_and_turns` closes
+On boot, `baybo_agent::recovery::TurnRecovery::on_startup` closes
 half-open trace rows and cancels non-terminal turns left by a prior process death
 as `SystemCrash`. It also closes half-open detached trace rows under terminal
 turns (for example a title-generation step that outlived its turn) without
-changing that terminal turn. During the current process,
-`AgentSupervisor` tracks routed and one-shot actor tasks through exit. The
-actor runner observes task panics and calls
-`recover_panicked_actor_session` for that session's active chat turns, then emits
-a user-facing crash notice. The TurnState inactive edge still comes from the turn
-lifecycle event via the projector, not from the runner directly.
+changing that terminal turn.
+
+`AgentSupervisor` holds the recovery instance used at boot and tracks routed
+and one-shot actor tasks through exit. When an actor panics, its runner calls
+`TurnRecovery::on_actor_panic` for all non-terminal turns in that session.
+If recovery cancels any turns,
+the runner sends a crash notice. The projector publishes the TurnState inactive
+edge from the turn lifecycle event.
 
 The transcript side of a crash heals lazily at hydration, not at boot: a death
 mid-tool-batch persists an assistant row whose `ToolUse` ids have no

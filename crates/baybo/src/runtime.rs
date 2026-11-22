@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use baybo_agent::actor::AgentActor;
 use baybo_agent::agent_loop::{AgentLoop, AgentLoopConfig};
+use baybo_agent::recovery::TurnRecovery;
 use baybo_agent::router::Router;
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
 use baybo_agent::supervisor::AgentSupervisor;
@@ -501,11 +502,8 @@ pub async fn build_managers(
     // close) and the surrounding non-terminal turns. `ended_at` is
     // backfilled from observed activity, not boot wall-clock.
     // Best-effort — errors warn but never block boot.
-    baybo_agent::recovery::recover_orphaned_traces_and_turns(
-        stores.trace.clone(),
-        Arc::clone(&turn_lifecycle),
-    )
-    .await;
+    let recovery = TurnRecovery::new(stores.trace.clone(), Arc::clone(&turn_lifecycle));
+    recovery.on_startup().await;
 
     // The one read of the ask ledger: every channel's gate and the ask
     // manager share this core, and every channel fetches its queue from
@@ -855,6 +853,7 @@ pub async fn build_managers(
         response_tx,
         human_asks.clone(),
         shutdown.cancellation_token().child_token(),
+        recovery,
     );
     let bg_manager = Arc::new(baybo_agent::BackgroundJobManager::new(
         supervisor.clone(),
@@ -1117,11 +1116,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                         workspace: Arc::clone(&workspace_paths_arc),
                     },
                 );
-                supervisor_for_spawn.spawn_actor(
-                    actor,
-                    baybo_agent::mailbox::DEFAULT_CAPACITY,
-                    Arc::clone(&trace_store),
-                )
+                supervisor_for_spawn.spawn_actor(actor, baybo_agent::mailbox::DEFAULT_CAPACITY)
             },
         )
     };

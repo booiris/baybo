@@ -16,6 +16,7 @@ use std::time::Duration;
 use baybo_agent::{
     AgentLoop, SecurityGateway,
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
+    recovery::TurnRecovery,
     tool_executor::ToolExecutor,
 };
 use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
@@ -72,7 +73,8 @@ pub struct AgentTestHarness {
     /// token the agent loop threads into the live LLM call.
     pub turn_lifecycle: Arc<TurnLifecycle>,
     pub cost_store: Arc<MemoryCostStore>,
-    pub trace_store: Arc<MemoryTraceStore>,
+    pub trace_store: Arc<dyn TraceStore>,
+    pub recovery: TurnRecovery,
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub cost_manager: Arc<CostManager>,
@@ -317,7 +319,7 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Back sessions, transcripts, turns and the ask ledger with `store`.
+    /// Back sessions, transcripts, turns, traces and the ask ledger with `store`.
     /// The session row must already be saved in it (asks reference it); the
     /// in-memory `memory_session_store` / `turn_store` / `ask_store` fields
     /// are then unwired — read `session_store` / `ask_ledger` /
@@ -505,7 +507,6 @@ impl AgentTestHarnessBuilder {
         // Observability stores.
         let turn_store = Arc::new(MemoryTurnStore::new());
         let cost_store = Arc::new(MemoryCostStore::new());
-        let trace_store = Arc::new(MemoryTraceStore::new());
 
         let trace_event_stream = TraceEventStream::new();
         // Cost ledger. Default builder leaves pricing empty (cost_usd
@@ -576,37 +577,40 @@ impl AgentTestHarnessBuilder {
         let gates = ChannelGates::new();
         let ask_store = MemoryHumanAskStore::new();
         let memory_session_store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
-        let (session_store, folder_store, turn_store_dyn, ask_ledger) = match &self.store {
-            Some(store) => {
-                assert!(
-                    self.seed_transcript.is_empty() && self.seed_asks.is_empty(),
-                    "seed a durable harness through its store, not the builder"
-                );
-                (
-                    store.session.clone(),
-                    store.session_folder.clone(),
-                    store.turn.clone(),
-                    store.human_ask.clone(),
-                )
-            }
-            None => {
-                for row in self.seed_asks {
-                    ask_store.insert(row);
+        let (session_store, folder_store, turn_store_dyn, trace_store, ask_ledger) =
+            match &self.store {
+                Some(store) => {
+                    assert!(
+                        self.seed_transcript.is_empty() && self.seed_asks.is_empty(),
+                        "seed a durable harness through its store, not the builder"
+                    );
+                    (
+                        store.session.clone(),
+                        store.session_folder.clone(),
+                        store.turn.clone(),
+                        store.trace.clone(),
+                        store.human_ask.clone(),
+                    )
                 }
-                // Mirror production's "session row exists before the actor
-                // spawns" shape so the transcript-read intercept's
-                // cross-session lookup finds the row instead of NotFound.
-                memory_session_store.seed_session(&session);
-                memory_session_store.seed_messages(&session.id, &self.seed_transcript);
-                (
-                    Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>,
-                    Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
-                        as Arc<dyn baybo_session::SessionFolderStore>,
-                    share_turn_store(&turn_store),
-                    Arc::clone(&ask_store) as Arc<dyn HumanAskStore>,
-                )
-            }
-        };
+                None => {
+                    for row in self.seed_asks {
+                        ask_store.insert(row);
+                    }
+                    // Mirror production's "session row exists before the actor
+                    // spawns" shape so the transcript-read intercept's
+                    // cross-session lookup finds the row instead of NotFound.
+                    memory_session_store.seed_session(&session);
+                    memory_session_store.seed_messages(&session.id, &self.seed_transcript);
+                    (
+                        Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>,
+                        Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
+                            as Arc<dyn baybo_session::SessionFolderStore>,
+                        share_turn_store(&turn_store),
+                        Arc::new(MemoryTraceStore::new()) as Arc<dyn TraceStore>,
+                        Arc::clone(&ask_store) as Arc<dyn HumanAskStore>,
+                    )
+                }
+            };
         let turn_lifecycle = Arc::new(TurnLifecycle::new(turn_store_dyn));
         let session_manager = Arc::new(baybo_agent::SessionManager::new(
             Arc::clone(&session_store),
@@ -721,10 +725,12 @@ impl AgentTestHarnessBuilder {
 
         let cron_store = Arc::new(baybo_cron::test_support::InMemoryCronStore::new());
 
+        let recovery = TurnRecovery::new(Arc::clone(&trace_store), Arc::clone(&turn_lifecycle));
         let supervisor = baybo_agent::AgentSupervisor::new(
             output_tx.clone(),
             Arc::clone(&human_asks) as Arc<dyn baybo_human_ask::LivePendingAsks>,
             actor_root_token.clone(),
+            recovery.clone(),
         );
 
         let actor_spawner: baybo_agent::router::ActorSpawner = {
@@ -780,7 +786,7 @@ impl AgentTestHarnessBuilder {
                 let span_recorder = Arc::new(SpanRecorder::new(
                     session.id.clone(),
                     session.user.id.clone(),
-                    trace_store.clone() as Arc<dyn TraceStore>,
+                    Arc::clone(&trace_store),
                     trace_event_stream.clone(),
                 ));
                 let actor = AgentActor::from_parts(
@@ -797,7 +803,7 @@ impl AgentTestHarnessBuilder {
                         workspace: Arc::clone(&workspace),
                     },
                 );
-                supervisor.spawn_actor(actor, self.mailbox_capacity, trace_store.clone())
+                supervisor.spawn_actor(actor, self.mailbox_capacity)
             })
         };
         let mailbox_tx = actor_spawner(
@@ -851,6 +857,7 @@ impl AgentTestHarnessBuilder {
             turn_lifecycle,
             cost_store,
             trace_store,
+            recovery,
             tool_registry,
             skill_registry,
             cost_manager,
@@ -1021,6 +1028,93 @@ impl LlmCompletion for StrictToolPairing {
 mod tests {
     use super::*;
     use baybo_agent::mailbox::TrySendError;
+
+    #[tokio::test]
+    async fn actor_panic_closes_the_recorded_turn_step_and_span_in_sqlite() {
+        use baybo_llm::{ChatRequest, LlmResponse, LlmStream, ModelInfo};
+        use baybo_trace::{LifecycleOutcome, LifecycleState, Span, SpanKind, Step};
+        use baybo_turn::{CancelReason, TurnStatus};
+
+        struct PanickingLlm(StubLlm);
+
+        #[async_trait::async_trait]
+        impl LlmCompletion for PanickingLlm {
+            async fn chat(&self, request: &ChatRequest) -> baybo_llm::Result<LlmResponse> {
+                self.0.chat(request).await
+            }
+
+            async fn chat_stream(&self, _: &ChatRequest) -> baybo_llm::Result<LlmStream> {
+                panic!("simulated actor panic during an LLM call")
+            }
+
+            fn model_info(&self) -> &ModelInfo {
+                self.0.model_info()
+            }
+
+            fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
+                self.0.effective_effort(requested)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("baybo.db");
+        let store = baybo_storage::Store::open(&db).await.unwrap();
+        let session = SessionBuilder::new().build();
+        store.session.save(&session).await.unwrap();
+        let mut harness = AgentTestHarness::builder()
+            .session(session.clone())
+            .with_store(store)
+            .with_llm(Arc::new(PanickingLlm(StubLlm::new())))
+            .build();
+        harness.send_text("hello").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(output) = harness.outputs.recv().await {
+                if matches!(
+                    output.event,
+                    AgentEvent::Notice {
+                        level: baybo_channels::NoticeLevel::Error,
+                        ..
+                    }
+                ) {
+                    return;
+                }
+            }
+            panic!("actor exited before sending the crash notice")
+        })
+        .await
+        .expect("actor panic recovery must complete");
+        harness.shutdown().await;
+
+        let store = baybo_storage::Store::open(&db).await.unwrap();
+        let lifecycle = TurnLifecycle::new(store.turn);
+        let turns = lifecycle.list_by_session(&session.id, None).await.unwrap();
+        let [turn] = turns.as_slice() else {
+            panic!("expected one turn: {turns:?}")
+        };
+        assert!(matches!(
+            turn.status,
+            TurnStatus::Cancelled {
+                reason: CancelReason::SystemCrash,
+                ..
+            }
+        ));
+        let crashed = LifecycleState::Done(LifecycleOutcome::Cancelled {
+            reason: CancelReason::SystemCrash,
+        });
+        let steps = store.trace.list_steps_by_turn(&turn.id).await.unwrap();
+        let step = steps
+            .into_iter()
+            .map(|row| Step::from_row(row).unwrap())
+            .find(|step| step.outcome == crashed)
+            .expect("crashed step");
+        let spans = store.trace.list_spans_by_step(&step.id).await.unwrap();
+        let span = spans
+            .into_iter()
+            .map(|row| Span::from_row(row).unwrap())
+            .find(|span| matches!(span.kind, SpanKind::LlmCall { .. }))
+            .expect("LLM span");
+        assert_eq!(span.outcome, crashed);
+    }
 
     fn spawn_oneshot(
         harness: &AgentTestHarness,
