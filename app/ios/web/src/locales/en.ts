@@ -2,29 +2,11 @@
 // web bundle's own strings live here (transcript + deck shell) — all other
 // chrome is native SwiftUI. The deck entry imports this file as plain data;
 // the i18next runtime stays out of that React-free chunk.
+import ask from "./ask.en.json";
+
 export const en = {
   translation: {
-    ask: {
-      title: "Question",
-      progress: "{{done}} / {{total}} answered",
-      offline: "Waiting for connection",
-      write: "Write your own answer",
-      cancel: "Cancel question",
-      confirmCancel: "Confirm cancellation",
-      keep: "Keep answering",
-      sending: "Submitting…",
-      submit: "Submit answers",
-      next: "Next question",
-      other: "Written answer",
-      selected: "Selected",
-      unselected: "Not selected",
-      noAnswer: "No answer recorded",
-      answered_one: "Answered {{count}} question",
-      answered_other: "Answered {{count}} questions",
-      cancelled: "Question cancelled",
-      declined: "Question declined",
-      skipped: "Skipped",
-    },
+    ask,
     chat: {
       loadOlder: "Load earlier messages",
       preCompaction: "Compacted",
