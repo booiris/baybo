@@ -4,6 +4,27 @@
 // the i18next runtime stays out of that React-free chunk.
 export const en = {
   translation: {
+    ask: {
+      title: "Question",
+      progress: "{{done}} / {{total}} answered",
+      offline: "Waiting for connection",
+      write: "Write your own answer",
+      cancel: "Cancel question",
+      confirmCancel: "Confirm cancellation",
+      keep: "Keep answering",
+      sending: "Submitting…",
+      submit: "Submit answers",
+      next: "Next question",
+      other: "Written answer",
+      selected: "Selected",
+      unselected: "Not selected",
+      noAnswer: "No answer recorded",
+      answered_one: "Answered {{count}} question",
+      answered_other: "Answered {{count}} questions",
+      cancelled: "Question cancelled",
+      declined: "Question declined",
+      skipped: "Skipped",
+    },
     chat: {
       loadOlder: "Load earlier messages",
       preCompaction: "Compacted",

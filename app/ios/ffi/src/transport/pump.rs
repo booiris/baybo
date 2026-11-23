@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::api::FrameSink;
-use crate::core::{Frame, ProjectChangeScope, resolve_approval_frame, subscribe_frame};
+use crate::core::{Frame, ProjectChangeScope, subscribe_frame};
 
 use super::socket::ReadEvent;
 use super::supervisor::{Msg, OutboundCmd};
@@ -192,10 +192,10 @@ async fn run_pump(
                         let frame = user_frame(&session_id, &text, &msg_id, attachments);
                         (frame, format!("send session={session_id} msg_id={msg_id}"))
                     }
-                    Some(OutboundCmd::ResolveApproval { ask_id, decision }) => {
+                    Some(OutboundCmd::ReplyToAsk { ask_id, answer }) => {
                         (
-                            resolve_approval_frame(&ask_id, decision),
-                            format!("resolve_approval ask_id={ask_id}"),
+                            answer.into_frame(ask_id),
+                            "reply_to_ask".to_owned(),
                         )
                     }
                     None => {

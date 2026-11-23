@@ -1,3 +1,5 @@
+import { InlineQuestion } from "./InlineQuestion";
+import type { QuestionPresentation } from "./types";
 import {
   Fragment,
   memo,
@@ -23,7 +25,7 @@ import {
   postSyncRequest,
   resendOutline,
   retrySend,
-  revealAfterRetarget,
+  revealTranscript,
   subscribeTranscript,
   postReadingPositionSettled,
   type OutlinePost,
@@ -85,6 +87,7 @@ export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
       status: s.status ?? "running",
       summary: s.summary || undefined,
       approval: s.approval || undefined,
+      ask: s.ask,
       at: parseStepAt(s.at),
     };
   }
@@ -108,6 +111,7 @@ export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number
       status: s.tool_status ?? "",
       summary: s.tool_summary || undefined,
       approval: s.approval || undefined,
+      ask: s.ask,
       at: parseStepAt(s.at),
     };
   }
@@ -287,6 +291,12 @@ const JUMP_SETTLE_MS = 400;
 /// so every scroll-position op targets `document.scrollingElement`.
 function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
+}
+
+// During a keyboard transition WebKit can paint an out-of-range scrollTop
+// for one frame before clamping it. Always target the reachable bottom.
+function maxScrollTop(el: HTMLElement): number {
+  return Math.max(0, el.scrollHeight - el.clientHeight);
 }
 
 /// The blocks a long row is held by when it straddles the top edge — one agent
@@ -1900,15 +1910,20 @@ const MessageRow = memo(function MessageRow({
 /// hardest-won behaviors: frame handling, reset recovery, history paging, and
 /// the scroll/follow model.
 export function Transcript({
+  sessionId,
   restored,
   initialConnEpoch,
+  initialBottomInset = 0,
   expandUnansweredTail = false,
 }: {
+  sessionId?: string;
   restored: PersistedState | null;
   initialConnEpoch: number;
+  initialBottomInset?: number | null;
   expandUnansweredTail?: boolean;
 }) {
   const { t } = useTranslation();
+  const [layoutReady, setLayoutReady] = useState(initialBottomInset !== null);
   // The mirror, split so the first commit paints only the newest screenfuls
   // (`splitForFirstPaint`), with the backward-paging state that describes what
   // is actually RENDERED while the older half is withheld: the floor is the
@@ -1941,6 +1956,7 @@ export function Transcript({
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+  const [questions, setQuestions] = useState<QuestionPresentation | null>(null);
   const [streaming, setStreaming] = useState("");
   const [turnActive, setTurnActive] = useState(false);
   // Latest turn-active value readable synchronously from the sync-apply
@@ -2236,16 +2252,14 @@ export function Transcript({
     persistLatest.current();
   }, [messages, hasMoreOlder, imageDims, compactionPoints, restored?.oldestOrdinal, restored?.hasMoreOlder]);
 
-  // Open the thread at its newest edge — a restored thread would otherwise
-  // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.
-  // Lifting the retarget veil here (post-commit, pre-paint) means the frame
-  // that reveals the page is the frame this conversation's content — pinned
-  // to its newest edge — paints.
+  // Native may measure the composer after the tree mounts. Keep the first
+  // layout hidden until that measurement can participate in the newest pin.
   useLayoutEffect(() => {
+    if (!layoutReady) return;
     const el = scrollEl();
-    if (el) el.scrollTop = el.scrollHeight;
-    revealAfterRetarget();
-  }, []);
+    if (el && followRef.current) el.scrollTop = maxScrollTop(el);
+    revealTranscript();
+  }, [layoutReady]);
 
   // While pinned to the newest edge, keep it in view as content lands (rows,
   // stream deltas, the turn indicator) — pre-paint, so a bubble never paints
@@ -2262,7 +2276,7 @@ export function Transcript({
       !replaceAnchor.current &&
       !userTouchingRef.current
     ) {
-      el.scrollTop = el.scrollHeight;
+      el.scrollTop = maxScrollTop(el);
     }
   }, [messages, streaming, turnActive]);
 
@@ -2308,7 +2322,7 @@ export function Transcript({
         delete row.dataset.cv;
       }
       if (!userTouchingRef.current) {
-        if (followRef.current) el.scrollTop = el.scrollHeight;
+        if (followRef.current) el.scrollTop = maxScrollTop(el);
         else if (before !== null) restoreRowAnchor(before);
       }
       stampFreshRows();
@@ -2350,7 +2364,7 @@ export function Transcript({
           return;
         }
         if (userTouchingRef.current) return;
-        if (followRef.current) el.scrollTop = el.scrollHeight;
+        if (followRef.current) el.scrollTop = maxScrollTop(el);
         else if (widthChanged && before !== null) restoreRowAnchor(before);
       },
     );
@@ -2383,7 +2397,7 @@ export function Transcript({
       // synthetic click — taps on work blocks / buttons then need several tries).
       const draggedUp = el.scrollTop < touchStartScrollTop.current - 2;
       const grew = el.scrollHeight - touchStartScrollHeight.current > 1;
-      if (followRef.current && !draggedUp && grew) el.scrollTop = el.scrollHeight;
+      if (followRef.current && !draggedUp && grew) el.scrollTop = maxScrollTop(el);
     };
     window.addEventListener("touchstart", down, { passive: true });
     window.addEventListener("touchend", up, { passive: true });
@@ -2421,7 +2435,7 @@ export function Transcript({
     // page can't take this branch: paging requires scrolling up past the
     // follow threshold first.)
     if (followRef.current && !userTouchingRef.current) {
-      el.scrollTop = el.scrollHeight;
+      el.scrollTop = maxScrollTop(el);
     } else {
       el.scrollTop = anchor.prevScrollTop + (el.scrollHeight - anchor.prevScrollHeight);
     }
@@ -2441,7 +2455,7 @@ export function Transcript({
     // The rebuild dropped the row — there is nothing left to hold a position
     // against, which is the baseline repair path's whole premise. Newest edge.
     followRef.current = true;
-    el.scrollTop = el.scrollHeight;
+    el.scrollTop = maxScrollTop(el);
   }, [messages]);
 
   // ---- work-frame commit coalescing ----------------------------------------
@@ -2522,6 +2536,23 @@ export function Transcript({
       setShowJump(el.scrollHeight - el.scrollTop - el.clientHeight > FOLLOW_BOTTOM_THRESHOLD_PX);
     });
   }, []);
+
+  const promptId = questions?.prompt?.ask_id;
+  const activeQuestion = questions?.prompt?.active;
+  const previousPromptId = useRef<string | undefined>(undefined);
+  useLayoutEffect(() => {
+    const switchingTabs = promptId !== undefined && previousPromptId.current === promptId;
+    previousPromptId.current = promptId;
+    const log = logRef.current;
+    const prompt = log?.querySelector<HTMLElement>(".inline-question");
+    if (!log || !prompt || (!switchingTabs && !followRef.current)) return;
+    const style = getComputedStyle(log);
+    const available = window.innerHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    if (switchingTabs || prompt.offsetHeight > available) {
+      handleWorkToggle(true);
+      prompt.scrollIntoView({ block: "start" });
+    }
+  }, [promptId, activeQuestion, handleWorkToggle]);
 
   // The server acknowledged our own send (its echo arrived by platform_msg_id) —
   // clear the send-state chrome (spinner / retry dot) on that optimistic bubble
@@ -3331,6 +3362,7 @@ export function Transcript({
                 // a backstop for an `ask_resolved` this page missed.
                 awaitingApproval: undefined,
                 approval: frame.approval || s.approval,
+                ask: frame.ask ?? s.ask,
               };
               return { ...w, steps };
             }
@@ -3343,9 +3375,13 @@ export function Transcript({
             label: frame.summary || frame.call_id,
             status: frame.status,
             approval: frame.approval || undefined,
+            ask: frame.ask,
           });
           return { ...w, steps };
         });
+        break;
+      case "chat_questions":
+        if (frame.session_id === sessionId) setQuestions(frame);
         break;
       case "approval_requested":
         // A tool call is blocked on the user. The prompt itself is NATIVE (the
@@ -3552,18 +3588,19 @@ export function Transcript({
   // padding-bottom (.inset-animated) then tracks the keyboard's slide. While
   // the padding animates, scrollHeight moves every frame — re-pin through the
   // transition so the newest edge rides the keyboard instead of snapping.
-  // Fully imperative: a setState here would re-render the thread per event.
+  // Only the first resolved inset needs a React commit to reveal the page;
+  // subsequent keyboard/composer updates stay imperative.
   const insetAnimated = useRef(false);
   const pinDeadline = useRef(0);
-  const handleBottomInset = (px: number) => {
-    document.documentElement.style.setProperty("--thread-bottom-inset", `${px}px`);
+  const handleBottomInset = () => {
+    if (!layoutReady) setLayoutReady(true);
     const box = logRef.current; // carries the .inset-animated padding transition
     const el = scrollEl(); // the actual (document) scroller
     if (!box || !el) return;
     if (!insetAnimated.current) {
       // First (launch) inset: apply without sliding, then arm the transition.
       insetAnimated.current = true;
-      if (followRef.current) el.scrollTop = el.scrollHeight;
+      if (followRef.current) el.scrollTop = maxScrollTop(el);
       requestAnimationFrame(() => box.classList.add("inset-animated"));
       return;
     }
@@ -3571,7 +3608,7 @@ export function Transcript({
     pinDeadline.current = performance.now() + 350;
     if (already) return; // a pin loop is running; it picked up the new deadline
     const step = () => {
-      if (followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
+      if (followRef.current && !userTouchingRef.current) el.scrollTop = maxScrollTop(el);
       if (performance.now() < pinDeadline.current) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
@@ -3699,7 +3736,7 @@ export function Transcript({
         // on cold open and left the thread parked short of the bottom, with
         // every later growth compounding the gap. Re-pin instead: content can
         // never scroll the reader away — only fingers and explicit jumps do.
-        el.scrollTop = el.scrollHeight;
+        el.scrollTop = maxScrollTop(el);
       }
       // Only a reader who has left the newest edge is asking for history —
       // under a pin the band would page a short thread at every open. And
@@ -3772,7 +3809,7 @@ export function Transcript({
           unconfirmedSends.current.delete(msgId);
           if (ordinal !== null) handlersRef.current.markSent(msgId, ordinal);
         },
-        bottomInset: (px) => handlersRef.current.handleBottomInset(px),
+        bottomInset: () => handlersRef.current.handleBottomInset(),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),
         jumpToMessage: (rowId) => handlersRef.current.jumpToMessage(rowId),
         jumpToOrdinal: (ordinal) => handlersRef.current.jumpToOrdinal(ordinal),
@@ -3796,7 +3833,7 @@ export function Transcript({
     if (!el) return;
     armPinGlide();
     setShowJump(false);
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    el.scrollTo({ top: maxScrollTop(el), behavior: "smooth" });
   }
 
   // A row of the native message-index sheet was tapped: park that user message
@@ -4109,7 +4146,7 @@ export function Transcript({
 
   return (
     <ImageDimsContext.Provider value={imageDimsStore}>
-      <div className="chat-log" ref={logRef}>
+      <div className="chat-log" ref={logRef} data-question-pending={!!questions?.prompt}>
         {(loadingOlder || hasMoreOlder) && (
           <div className="older-slot">
             {loadingOlder ? (
@@ -4129,6 +4166,7 @@ export function Transcript({
               <WorkBlockView
                 key={m.id}
                 row={m}
+                pendingQuestionCallId={questions?.tool_call_id}
                 defaultExpanded={defaultExpandedWorkIds?.has(m.id)}
                 onToggle={handleWorkToggle}
               />
@@ -4155,7 +4193,10 @@ export function Transcript({
             <StreamingMarkdownBody text={streaming} />
           </div>
         )}
-        {(awaitingReply || turnActive) && !streaming && !workLive && (
+        {questions?.prompt && (
+          <InlineQuestion key={questions.prompt.ask_id} prompt={questions.prompt} sessionId={questions.session_id} />
+        )}
+        {!questions?.prompt && (awaitingReply || turnActive) && !streaming && !workLive && (
           // Claimed by the SEND, filled when the turn starts. `turnActive` is
           // server-driven — a round trip behind the send — so mounting on it put
           // a 43px row into the log a beat AFTER the bubble had settled, and the
@@ -4169,7 +4210,7 @@ export function Transcript({
             {t("chat.working")}
           </div>
         )}
-        {renderRows.length === 0 && !streaming && !turnActive && syncing && (
+        {renderRows.length === 0 && !questions?.prompt && !streaming && !turnActive && syncing && (
           // Nothing cached and nothing live, with the first page still in
           // flight — the only open the mirror can't serve. Blank paper here
           // reads as a broken chat; say we're fetching instead. The 400ms CSS
@@ -4180,7 +4221,7 @@ export function Transcript({
             {t("chat.loadingThread")}
           </div>
         )}
-        {renderRows.length === 0 && !streaming && !turnActive && !syncing && syncFailed && (
+        {renderRows.length === 0 && !questions?.prompt && !streaming && !turnActive && !syncing && syncFailed && (
           // The first page failed (offline, or a leg that died under it) and a
           // backoff retry is armed. Tapping retries now.
           <button

@@ -1,17 +1,10 @@
 # human-ask — Durable human-in-the-loop prompts (`AskUser` + tool approvals)
 
-> Status: **foundation, web and terminal question support implemented; the iOS stage is
-> pending** — `baybo-human-ask` (queue,
-> core, gates, manager, `AskUserTool`, `AskStepInput`), the ledger, the
-> `tools::ask` ports (`QuestionGate`, `QuestionHandle`, `Tool::sole_call`), the
-> agent live/restart/sole-call paths, the gateway doors, question/approval
-> frames, REST reconstruction and boot order, the web `QuestionCard` / composer
-> answer / render-time badge UI, the project bridge and the integration suites
-> exist; see [Implementation notes](#implementation-notes-foundation-stage). This document is
-> the spec the three stages described in [Rollout plan](#rollout-plan) are
-> built against. Line numbers cited
-> for existing code are as of commit `504fe0af` and will drift; the named
-> items will not.
+> The gateway, ledger and agent support durable questions in web, terminal and iOS chat.
+> The iOS app presents an inline answer list and restores pending questions on
+> subscribe. See [iOS question and approval prompts](../../app/ios/docs/approvals.md).
+> The REST compatibility fields remain for installed clients. Historical line
+> references in the rollout plan refer to commit `504fe0af`.
 
 ## Overview
 
@@ -914,19 +907,10 @@ SessionPatch   { …, awaiting_human: Option<bool> }           // renamed from a
   `ts(optional)` on every `Option`, enums outside `wire` typed as string;
   regenerated bindings under `sidecars/sdk/channel-ts/src/generated/` are
   committed with the Rust change (`scripts/check-ts-bindings.sh`).
-- REST: `ChatSessionSummary` and `IssueDto` gain `awaiting_human`;
-  `approval_pending` is **kept as a deprecated twin on both DTOs until the iOS stage**
-  (same value), because iOS reads it with `#[serde(default)]` and not only
-  for the chat-list mark — `IssueStore.swift:670-674` uses the issue bit to
-  *authorize* the card's approve/deny controls and `ProjectsStore.swift:555-560`
-  to fill the Waiting-on-you strip. With the self-deny gone, an approval the
-  phone cannot show would otherwise park until someone opens the web. The
-  `SessionPatch` wire key is renamed outright (option C of the interview:
-  the patch-driven list mark on an installed phone goes dark until the iOS stage; the
-  REST twin keeps the cold-start mark and the board working). `docs/openapi.json`
-  and `app/web/src/api/schema.d.ts` are regenerated in the foundation stage; `IssueDto`'s new
-  required field touches the 13 `Issue` test fixtures under
-  `app/web/src/pages/projects/*.test.ts(x)`.
+- REST: `ChatSessionSummary` and `IssueDto` carry `awaiting_human` plus the
+  deprecated `approval_pending` twin for installed clients. Both fields
+  reflect the same pending set. The iOS chat list and board read the REST
+  compatibility field on fetch. The live list patch uses `awaiting_human`.
 - The sidecar SDK runner's switch has no `default` (`runner.ts:662-764`);
   question frames reaching a multiplexed sidecar are silently dropped. They
   only reach the owner and TUI channels.
@@ -1059,20 +1043,15 @@ lowest-priority `ActorStop` still runs normally.
 
 The TUI shares one ordered queue for approvals and questions, including asks reconstructed from a session snapshot. The form submits structured answers through `AnswerQuestion`. See [TUI keyboard interaction](tui.md#askuser-questions).
 
+### iOS chat
+
+The iOS app keeps the compatibility REST fields and the Swift list callback
+name. Its live list mark reads `awaiting_human`. The native pending-prompt queue
+feeds the transcript’s inline question list and the approval prompt above the
+composer. Both direct and relay bindings carry answers over the chat leg.
+
 ### Deferred
 
-- **iOS**: compiles (`pump.rs:373` and the three `SessionPatch` test literals
-  at `transport/tests.rs:261,284,309` follow the `awaiting_human` rename;
-  `SessionListSink::on_approval_pending` keeps its name — it is a Swift
-  protocol requirement). Unknown frames are already inert at every iOS
-  layer, so an approval card abandoned server-side stays on screen until the
-  next `subscribe_state`. Full support (question card, composer routing,
-  `OutboundCmd::AnswerQuestion` beside `ResolveApproval`, a content builder
-  beside `resolve_approval_frame`, an FFI export beside `chat_resolve_approval`,
-  a second native fold beside `ApprovalQueue.apply`, `AskResolved` handling,
-  the `onAwaitingHuman` rename with Swift, dropping the REST
-  `approval_pending` twin, and refreshing `app/ios/docs/approvals.md` +
-  `chat-list.md`) is the iOS stage.
 - Remaining question surfaces include option previews, questions on sidecar
   channels and a REST endpoint for answering questions (WS only in v1).
 
@@ -1465,7 +1444,7 @@ leaves draft.
   `gateway.md:983-986, :1017` (SubscribeState listing), `sidecars.md` note
   on dropped question frames.
 
-**iOS stage** (separate; the seams kept open are listed under Deferred).
+**iOS chat** implements the question list within the conversation, structured replies, subscribe restoration, completed summaries and queued composer sends.
 
 ## Test plan
 

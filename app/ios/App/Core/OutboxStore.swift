@@ -26,6 +26,9 @@ enum OutboxEntryState: String, Codable {
     case sent
     case failed
     case unknown
+    case waitingForAnswer
+
+    var canReconcile: Bool { self != .failed && self != .waitingForAnswer }
 }
 
 /// Blob-ref metadata for an outbox entry's attachments — a Codable mirror of
@@ -149,11 +152,11 @@ final class OutboxStore {
 
     /// Record a fresh send: state `sending`, the transmission already counted
     /// (only sends that actually hit the wire are enrolled).
-    func beginSend(platformMsgId: String, text: String, attachments: [OutboxAttachment]) {
+    func beginSend(platformMsgId: String, text: String, attachments: [OutboxAttachment], waitingForAnswer: Bool = false) {
         let at = now().timeIntervalSince1970
         items[platformMsgId] = OutboxEntry(
             platformMsgId: platformMsgId, text: text, attachments: attachments,
-            state: .sending, transmissions: 1, createdAt: at, lastSentAt: at)
+            state: waitingForAnswer ? .waitingForAnswer : .sending, transmissions: waitingForAnswer ? 0 : 1, createdAt: at, lastSentAt: at)
         persist()
     }
 
@@ -190,7 +193,7 @@ final class OutboxStore {
     /// page alone. Park it `unknown` pending the point lookup.
     func markUnknown(platformMsgId: String) {
         mutate(platformMsgId) { entry in
-            if entry.state != .failed { entry.state = .unknown }
+            if entry.state.canReconcile { entry.state = .unknown }
         }
     }
 

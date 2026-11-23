@@ -89,6 +89,25 @@ pub struct BayboClient {
 }
 
 impl BayboClient {
+    async fn reply_to_ask(
+        &self,
+        ask_id: String,
+        answer: transport::AskReply,
+    ) -> Result<(), String> {
+        use transport::SessionLeg;
+        let registry = match active_leg()? {
+            ActiveLeg::Relay => self.relay.registry(),
+            ActiveLeg::Direct => self.direct.registry(),
+        };
+        let id = ask_id
+            .parse()
+            .map_err(|e: baybo_model::human_ask::InvalidAskId| e.to_string())?;
+        registry
+            .reply_to_ask(id, answer)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Resolve the active leg's REST client ONCE — the dispatch seam every
     /// `gateway_api` helper rides (see [`gateway_client::ActiveGatewayClient`]). Call sites
     /// that used to re-state the direct/relay `match` per method bind this
@@ -1124,17 +1143,24 @@ impl BayboClient {
         ask_id: String,
         decision: ApprovalDecision,
     ) -> Result<(), BayboError> {
-        let this = self;
         runtime::run(async move {
-            let decision = decision.into();
-            match active_leg()? {
-                ActiveLeg::Relay => {
-                    transport::resolve_approval(&this.relay, ask_id, decision).await
-                }
-                ActiveLeg::Direct => {
-                    transport::resolve_approval(&this.direct, ask_id, decision).await
-                }
-            }
+            self.reply_to_ask(ask_id, transport::AskReply::Approval(decision.into()))
+                .await
+        })
+        .await
+    }
+
+    /// Decode the transcript's structured question reply and send it on the active leg.
+    pub async fn chat_answer_question(
+        self: Arc<Self>,
+        ask_id: String,
+        reply_json: String,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let reply = serde_json::from_str(&reply_json)
+                .map_err(|_| "invalid question reply".to_owned())?;
+            self.reply_to_ask(ask_id, transport::AskReply::Question(reply))
+                .await
         })
         .await
     }

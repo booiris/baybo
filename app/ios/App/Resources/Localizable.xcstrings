@@ -1922,6 +1922,30 @@
         }
       }
     },
+    "ask.other": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Write your own answer" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "自己填写" } }
+      }
+    },
+    "chat.questionPlaceholder": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Message, send later…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "发消息，稍后送达" } }
+      }
+    },
+    "chat.questionFailed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Could not send answer: %@" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "回答发送失败：%@" } }
+      }
+    },
+    "chat.queuedQuestionMessages": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Queued messages: %d" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "待发送 %d 条" } }
+      }
+    },
     "chat.previewAttachment": {
       "extractionState": "stale",
       "localizations": {
@@ -3509,13 +3533,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Waiting for your approval"
+            "value": "Waiting for your response"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "等待你的批准"
+            "value": "等待你的回应"
           }
         }
       }

@@ -7,8 +7,11 @@ import SwiftUI
 /// more than once) and is what `chatResolveApproval` answers with. `toolCallId`
 /// identifies the TOOL CALL the prompt blocks — the id the work block's step
 /// carries — so the transcript can badge the exact step that is waiting, and so
-/// a `tool_completed` for that call retires a card the gate already timed out.
-struct PendingApproval: Identifiable, Equatable {
+/// a `tool_completed` for that call retires a card whose close the client missed.
+struct PendingApproval: Identifiable, Equatable, PendingChatPrompt {
+    static let raisedKind = "approval_requested"
+    static let snapshotKey = "pending_approvals"
+
     let askId: String
     let toolCallId: String?
     let tool: String
@@ -69,24 +72,21 @@ struct PendingApproval: Identifiable, Equatable {
     }
 }
 
-/// The pending-approval queue, derived from the frame stream. Extracted from
-/// `ChatStore` because it is the app's densest logic per line and has ZERO
-/// dependencies once separated — no FFI, no bridge, no filesystem.
-///
-/// Four inputs, matching the four ways a prompt appears or goes away:
-/// * `approval_requested` — a new prompt. DEDUPED: the gate's waker re-fires on
-///   the newest queue entry, so the same card legitimately arrives twice;
-/// * `ask_resolved` — the prompt closed, answered (this device, or another
-///   client) or not (`/stop`, an expired during-execute approval). It is
-///   broadcast to EVERY session's sink, so it is matched by PROMPT id and never
-///   by session;
-/// * `subscribe_state.pending_approvals` — the authoritative set on
-///   (re)subscribe, which REPLACES the queue (appending would resurrect a card
-///   the user already answered);
-/// * `tool_completed` — the blocked call finished; a backstop for an
-///   `ask_resolved` this store missed.
-struct ApprovalQueue {
-    private(set) var cards: [PendingApproval] = []
+protocol PendingChatPrompt: Equatable {
+    static var raisedKind: String { get }
+    static var snapshotKey: String { get }
+    var askId: String { get }
+    var toolCallId: String? { get }
+    @MainActor static func from(frame: [String: Any]) -> Self?
+}
+
+typealias ApprovalQueue = PendingPromptQueue<PendingApproval>
+
+/// Live requests append once per ask id. Subscribe snapshots replace the
+/// pending set. A session-less close is matched by ask id, and a completed
+/// tool call retires any prompt whose close the client missed.
+struct PendingPromptQueue<Card: PendingChatPrompt> {
+    private(set) var cards: [Card] = []
 
     /// Fold one frame in; `true` when `cards` actually changed. The caller runs
     /// this on EVERY frame (streamed deltas included), so an unchanged fold must
@@ -94,8 +94,8 @@ struct ApprovalQueue {
     @MainActor
     mutating func apply(_ frame: [String: Any]) -> Bool {
         switch frame["kind"] as? String {
-        case "approval_requested":
-            guard let card = PendingApproval.from(frame: frame),
+        case Card.raisedKind:
+            guard let card = Card.from(frame: frame),
                 !cards.contains(where: { $0.askId == card.askId })
             else { return false }
             cards.append(card)
@@ -104,8 +104,8 @@ struct ApprovalQueue {
             guard let askId = frame["ask_id"] as? String else { return false }
             return resolve(askId: askId)
         case "subscribe_state":
-            let authoritative = (frame["pending_approvals"] as? [[String: Any]] ?? [])
-                .compactMap(PendingApproval.from(frame:))
+            let authoritative = (frame[Card.snapshotKey] as? [[String: Any]] ?? [])
+                .compactMap(Card.from(frame:))
             guard authoritative != cards else { return false }
             cards = authoritative
             return true

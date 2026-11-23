@@ -1,3 +1,4 @@
+import { QuestionResult } from "./QuestionResult";
 import type { TFunction } from "i18next";
 import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -50,7 +51,7 @@ export function workedLabel(t: TFunction, elapsedMs?: number, cancelled = false)
 /// which is the overwhelming majority.
 export function approvalLabel(t: TFunction, step: WorkStep): string | null {
   if (step.kind !== "tool") return null;
-  if (step.awaitingApproval) return t("chat.approvalWaiting");
+  if (Boolean(step.awaitingApproval)) return t("chat.approvalWaiting");
   switch (step.approval) {
     case "approve":
       return t("chat.approvalApproved");
@@ -157,8 +158,8 @@ function WorkStepView({ step, live = false }: { step: WorkStep; live?: boolean }
           <span className="step-glyph">●</span>
           <span className="step-text">
             {step.label}
-            {step.summary ? ` — ${step.summary}` : ""}
-            {approval ? <span className="step-approval">{approval}</span> : null}
+            {Boolean(step.summary) ? ` — ${step.summary}` : ""}
+            {approval !== null ? <span className="step-approval">{approval}</span> : null}
           </span>
         </div>
       );
@@ -169,6 +170,7 @@ function WorkStepView({ step, live = false }: { step: WorkStep; live?: boolean }
 /// A run of consecutive steps of one nature. A turn reads as alternating runs:
 /// what the agent SAID (speech) and what it DID (machinery).
 export type WorkSegment =
+  | { kind: "question"; steps: [Extract<WorkStep, { kind: "tool" }>]; result: NonNullable<Extract<WorkStep, { kind: "tool" }>["ask"]> }
   | { kind: "speech"; steps: Extract<WorkStep, { kind: "prose" }>[] }
   | { kind: "machinery"; steps: WorkStep[]; startedAt?: number; endedAt?: number };
 
@@ -200,6 +202,8 @@ export function segmentWorkSteps(
     if (s.kind === "prose") {
       if (tail !== undefined && tail.kind === "speech") tail.steps.push(s);
       else out.push({ kind: "speech", steps: [s] });
+    } else if (s.kind === "tool" && s.ask != null) {
+      out.push({ kind: "question", steps: [s], result: s.ask });
     } else if (tail !== undefined && tail.kind === "machinery") tail.steps.push(s);
     else out.push({ kind: "machinery", steps: [s] });
   }
@@ -209,7 +213,7 @@ export function segmentWorkSteps(
   // durations add up to the whole — and each reads as "how long it worked
   // before saying this", which is what its header claims.
   const proseAt = (seg: WorkSegment | undefined, which: "first" | "last"): number | undefined => {
-    if (seg === undefined || seg.kind !== "speech") return undefined;
+    if (seg === undefined || seg.kind === "machinery") return undefined;
     const step = which === "first" ? seg.steps[0] : seg.steps[seg.steps.length - 1];
     return step.at;
   };
@@ -333,10 +337,12 @@ function WorkRunView({
 
 export const WorkBlockView = memo(function WorkBlockView({
   row,
+  pendingQuestionCallId,
   defaultExpanded,
   onToggle,
 }: {
   row: WorkRow;
+  pendingQuestionCallId?: string;
   /// Initial state only: a later final answer must not snap shut work the
   /// reader was already looking at, and a manual collapse remains respected.
   defaultExpanded?: boolean;
@@ -346,12 +352,14 @@ export const WorkBlockView = memo(function WorkBlockView({
   /// opening downward from it.
   onToggle?: (expanded: boolean) => void;
 }) {
-  const segments = segmentWorkSteps(row.steps, row.startedAt, row.elapsedMs !== undefined && row.startedAt !== undefined ? row.startedAt + row.elapsedMs : undefined);
+  const hasPendingQuestion = pendingQuestionCallId !== undefined && row.steps.some(step => step.kind === "tool" && step.callId === pendingQuestionCallId);
+  const steps = hasPendingQuestion ? row.steps.filter(step => step.kind !== "tool" || step.callId !== pendingQuestionCallId) : row.steps;
+  const segments = segmentWorkSteps(steps, row.startedAt, row.elapsedMs !== undefined && row.startedAt !== undefined ? row.startedAt + row.elapsedMs : undefined);
   const lastMachinery = segments.reduce((at, seg, i) => (seg.kind === "machinery" ? i : at), -1);
   // A live turn with no step yet still needs its "处理中" affordance and has no
   // run to hang it on — synthesize the empty one.
   const runs: WorkSegment[] =
-    segments.length === 0 && row.active
+    segments.length === 0 && row.active && !hasPendingQuestion
       ? [{ kind: "machinery", steps: [], startedAt: row.startedAt }]
       : segments;
   return (
@@ -363,13 +371,15 @@ export const WorkBlockView = memo(function WorkBlockView({
               <MarkdownBody key={j} text={s.text} />
             ))}
           </div>
+        ) : seg.kind === "question" ? (
+          <QuestionResult key={i} ask={seg.result} onToggle={onToggle} />
         ) : (
           <WorkRunView
             key={`m${i}`}
             seg={seg}
             // Only the turn's LAST run is still being produced into; the ones
             // above it are finished and collapse like any other.
-            live={row.active && (i === lastMachinery || segments.length === 0)}
+            live={row.active && !hasPendingQuestion && (i === lastMachinery || segments.length === 0)}
             cancelled={row.cancelled === true && i === lastMachinery}
             // A lone machinery run spans the whole turn, so the block's own
             // duration is exactly its span — the only number that survives the

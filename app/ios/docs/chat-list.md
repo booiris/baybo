@@ -458,14 +458,14 @@ same archived filter `ChatListBuckets.items(from:)` does, so "the badge is empty
 
 ## Chat-list approval mark
 
-A conversation whose tool call is parked on the gateway's approval gate wears an
+A conversation with a pending question or tool approval wears an
 ink `hand.raised` glyph in the row's trailing meta column, leading the unread
 capsule (`ChatRowBody.approvalMark`); a cron GROUP row ORs it over its fires.
 
 The bit is `SessionRow.approvalPending`, fed by two paths that mirror unread's:
 
 - server-computed `approvalPending` on the REST list summary (cold-start truth);
-- a connection-global `SessionUpdated{approval_pending}` patch tee'd to
+- a connection-global `SessionUpdated{awaiting_human}` patch tee'd to
   `SessionListSink` (`on_approval_pending` → `SessionIndex.noteApprovalPending`)
   as the between-pulls accelerator.
 
@@ -477,11 +477,9 @@ that needs it is the one parked on the list, subscribed to nothing.
 
 ### Why the QUEUE publishes the edges
 
-Server-side the edges are published by the approval QUEUE itself
-(`PendingEdge::Raised/Answered/Abandoned`), because the five-minute gate timeout
-and a `/stop` both retire a prompt through `QueueCleanup::drop` and broadcast no
-resolution at all — a mark hung off `ApprovalResolved` would stick forever on
-exactly the turns nobody answered.
+The gateway's human-ask queue publishes pending-state edges for both kinds of
+prompt. The last close clears the mark, including when another client answers
+or the gateway abandons the prompt.
 
 ### Never restored from disk
 

@@ -226,4 +226,127 @@ struct ChatStoreApprovalTests {
         deliver(Self.requestedFrame)
         #expect(await waitUntil { publishes > 0 }, "a real card does republish")
     }
+
+    @Test func questionDraftSurvivesSnapshotAndSubmitsEachTabInOrder() async throws {
+        #expect(await connect())
+        let snapshot = """
+            {"kind":"subscribe_state","session_id":"s-1","pending_questions":[
+              {"ask_id":"trip","tool_call_id":"ask-trip","questions":[
+                {"header":"Travel","question":"How?","multi_select":false,"options":[{"label":"Train","description":""}]},
+                {"header":"Visits","question":"What?","multi_select":true,"options":[
+                  {"label":"Art","description":""},{"label":"Food","description":""}]}]}]}
+            """
+        deliver(snapshot)
+        #expect(await waitUntil { store.hasPendingQuestion })
+        let draft = try #require(store.questionDraft)
+        store.performQuestionAction(.init(askId: "stale", active: 0, action: .select, index: 0))
+        store.performQuestionAction(.init(askId: "trip", active: 0, action: .tab, index: -1))
+        store.performQuestionAction(.init(askId: "trip", active: 0, action: .next, index: nil))
+        #expect(draft.active == 0 && draft.current.selected.isEmpty)
+        store.performQuestionAction(.init(askId: "trip", active: 0, action: .tab, index: 1))
+        store.performQuestionAction(.init(askId: "trip", active: 0, action: .select, index: 1))
+        #expect(draft.current.selected.isEmpty)
+        store.performQuestionAction(.init(askId: "trip", active: 1, action: .select, index: 0))
+        store.performQuestionAction(.init(askId: "trip", active: 1, action: .submit, index: nil))
+        #expect(store.submittingQuestion == nil)
+        #expect(draft.nextTab == nil)
+        #expect(!draft.canContinue(connected: true))
+        #expect(draft.reply == nil)
+        draft.select("Art")
+        draft.selectTab(0)
+        draft.select("Train")
+        #expect(draft.active == 0)
+        #expect(draft.answers[0].selected == ["Train"])
+        draft.write("  Bike  ", at: draft.active)
+        #expect(draft.active == 0)
+        #expect(draft.current.selected.isEmpty)
+        #expect(draft.nextTab == 1)
+        #expect(draft.canContinue(connected: false))
+        #expect(draft.reply == nil)
+        draft.advance()
+        draft.select("Art")
+        draft.select("Food")
+        draft.select("Art")
+        draft.write("Coffee", at: draft.active)
+        deliver(snapshot)
+        // The following approval is a barrier on the same ordered frame stream.
+        deliver(Self.requestedFrame)
+        #expect(await waitUntil { !store.pendingApprovals.isEmpty })
+        #expect(store.questionDraft === draft)
+        #expect(draft.active == 1)
+        #expect(draft.canContinue(connected: true))
+        #expect(!draft.canContinue(connected: false))
+        store.performQuestionAction(.init(askId: "trip", active: 1, action: .submit, index: nil))
+        store.performQuestionAction(.init(askId: "trip", active: 1, action: .submit, index: nil))
+        #expect(await waitUntil { client.questionReplies.count == 1 })
+        let json = try #require(client.questionReplies.first?.1.data(using: .utf8))
+        let payload = try #require(JSONSerialization.jsonObject(with: json) as? [String: Any])
+        let answers = try #require(payload["answers"] as? [[String: Any]])
+        #expect(payload["kind"] as? String == "answered")
+        #expect(answers.compactMap { $0["header"] as? String } == ["Travel", "Visits"])
+        #expect(answers.compactMap { $0["selected"] as? [String] } == [[], ["Food"]])
+        #expect(answers.compactMap { $0["other"] as? String } == ["Bike", "Coffee"])
+    }
+
+    @Test func manualTabSwitchStopsAutomaticAdvanceForTheRestOfTheDraft() {
+        let card = PendingQuestion(
+            askId: "trip", toolCallId: nil,
+            questions: ["Travel", "Visits", "Pace"].map {
+                .init(header: $0, question: $0, options: [.init(label: "Any", description: "")], multiSelect: false)
+            })
+        let draft = QuestionDraft(card)
+        draft.selectTab(0)
+        draft.select("Any")
+        #expect(draft.active == 0 && draft.current.selected == ["Any"])
+        draft.advanceAfterSelection(at: 0)
+        #expect(draft.active == 1)
+        draft.selectTab(0)
+        draft.select("Any")
+        draft.advanceAfterSelection(at: 0)
+        #expect(draft.active == 0)
+        draft.advance()
+        draft.select("Any")
+        #expect(draft.active == 1)
+        let fresh = QuestionDraft(card)
+        fresh.select("Any")
+        fresh.advanceAfterSelection(at: 1)
+        #expect(fresh.active == 0)
+        fresh.advanceAfterSelection(at: 0)
+        fresh.select("Any")
+        fresh.advanceAfterSelection(at: 0)
+        #expect(fresh.active == 2)
+    }
+
+    @Test func restoredQuestionHoldsMessagesUntilTheContinuedTurnEnds() async throws {
+        #expect(await connect())
+        deliver("""
+            {"kind":"subscribe_state","session_id":"s-1","turn":{"active":false},
+             "pending_questions":[{"ask_id":"q1","tool_call_id":"call","queue_index":0,
+             "questions":[{"header":"Pace","question":"Which pace?","multi_select":false,
+             "options":[{"label":"Slow","description":"Relax"},{"label":"Fast","description":"Explore"}]}]}]}
+            """)
+        #expect(await waitUntil { store.hasPendingQuestion })
+        let draft = try #require(store.questionDraft)
+        draft.select("Slow")
+        #expect(draft.active == 0)
+        #expect(draft.reply?.answers?.first?.selected == ["Slow"])
+        #expect(client.questionReplies.isEmpty)
+        store.setAgentRunning(true)
+        #expect(store.composerShowsStop(hasDraft: false))
+        #expect(!store.composerShowsStop(hasDraft: true))
+        store.send(text: "arriving Saturday", attachments: [])
+        #expect(store.queuedQuestionMessages == 1)
+        #expect(client.sentMessages.isEmpty)
+        store.answerQuestion(askId: "other", reply: .cancelled)
+        store.answerQuestion(askId: "q1", reply: .cancelled)
+        #expect(await waitUntil { client.questionReplies.map(\.0) == ["q1"] })
+        deliver(#"{"kind":"ask_resolved","ask_id":"q1","outcome":"cancelled"}"#)
+        #expect(await waitUntil { !store.hasPendingQuestion })
+        #expect(client.sentMessages.isEmpty)
+        store.send(text: "leaving Sunday", attachments: [])
+        #expect(store.queuedQuestionMessages == 2)
+        #expect(!store.composerShowsStop(hasDraft: true))
+        deliver(#"{"kind":"turn_state","active":false}"#)
+        #expect(await waitUntil { client.sentMessages.map(\.text) == ["arriving Saturday", "leaving Sunday"] })
+    }
 }

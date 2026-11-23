@@ -7,8 +7,8 @@ final class TranscriptHost {
     let webView: WKWebView
     private let navigationPolicy = TranscriptNavigationPolicy()
 
-    init(store: any TranscriptTarget) {
-        let bridge = TranscriptBridge(store: store)
+    init(store: any TranscriptTarget, hasComposer: Bool = true) {
+        let bridge = TranscriptBridge(store: store, hasComposer: hasComposer)
         self.bridge = bridge
 
         let config = WKWebViewConfiguration()

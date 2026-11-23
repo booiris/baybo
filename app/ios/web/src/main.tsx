@@ -15,7 +15,7 @@ import "@fontsource-variable/inter";
 import "katex/dist/katex.min.css";
 import i18n from "./i18n";
 import "./styles.css";
-import { hasNativeBridge, onInit, onLanguage, postContentReady, postReady } from "./bridge";
+import { hasNativeBridge, onInit, onLanguage, postReady } from "./bridge";
 import { Transcript } from "./Transcript";
 
 onLanguage((lang) => void i18n.changeLanguage(lang));
@@ -30,13 +30,14 @@ onInit((payload) => {
     <React.StrictMode>
       <Transcript
         key={payload.sessionId}
+        sessionId={payload.sessionId}
         restored={payload.restoredState}
         initialConnEpoch={payload.connEpoch}
+        initialBottomInset={payload.bottomInset}
         expandUnansweredTail={payload.expandUnansweredTail}
       />
     </React.StrictMode>,
   );
-  requestAnimationFrame(() => postContentReady());
 });
 
 postReady();
@@ -50,5 +51,6 @@ if (!hasNativeBridge) {
     restoredState: null,
     connEpoch: 0,
     expandUnansweredTail: false,
+    bottomInset: 0,
   });
 }

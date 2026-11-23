@@ -68,8 +68,9 @@ class BayboUITestCase: XCTestCase {
     /// attachment demo reached SIX video tiles that way, and a by-label query
     /// that is unambiguous on a fresh install started matching six elements.
     @discardableResult
-    func launch(_ arguments: [String]) -> XCUIApplication {
+    func launch(_ arguments: [String], environment: [String: String] = [:]) -> XCUIApplication {
         let app = XCUIApplication()
+        app.launchEnvironment.merge(environment) { _, value in value }
         app.launchArguments =
             arguments + [
                 "-baybo-reset-store",

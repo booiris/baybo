@@ -1,8 +1,10 @@
 // 简体中文 (Simplified Chinese) — mirrors the shape of `en.ts`.
 import type en from "./en";
+import ask from "./ask.zh.json";
 
 export const zh: typeof en = {
   translation: {
+    ask,
     chat: {
       loadOlder: "加载更早的消息",
       preCompaction: "已压缩",

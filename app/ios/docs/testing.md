@@ -521,6 +521,11 @@ without touching `app/ios` at all.
   keyboard only appears with Simulator.app running and hardware keyboard
   disconnected.
 
+- **`-baybo-demo-question`** (DEBUG, with `-baybo-open-chat`) opens a sample
+  question in the chat transcript. Set `BAYBO_DEMO_QUESTIONS` to the JSON
+  questions array to test another prompt. `QuestionTextUITests` uses this to
+  exercise multiline questions, unbroken option labels and written answers.
+
 - **`-baybo-demo-approval`** (DEBUG, with `-baybo-open-chat`) runs a turn that
   blocks on the approval gate — two parallel `Bash` calls, so the card's queue
   counter renders — through the REAL frame path (`pushFrame`), so the native

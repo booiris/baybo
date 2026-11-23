@@ -1,4 +1,4 @@
-# Tool approvals
+# Chat questions and tool approvals
 
 *The native tool-approval card and the pending-prompt queue behind it: `app/ios/App/Core/ChatApprovals.swift`, `ChatStore.approvalObserveFrame`, and `app/ios/App/Screens/ApprovalCardView.swift`.*
 
@@ -6,7 +6,32 @@ A tool call whose declared resources aren't already granted blocks on the
 gateway's approval gate, which fans out `approval_requested` and waits for an
 answer with **no timeout**; the prompt survives a gateway restart.
 
-## Why the card is native
+## Questions in the conversation
+
+When the agent calls `AskUser`, the chat store folds `question_asked` and
+`subscribe_state.pending_questions` into its pending queue. The first prompt
+appears after the latest message in the transcript. The chat store owns each
+tab’s selections and written answer across renderer reloads and reconnects.
+Tapping a single-choice option shows the selection for 220 ms before advancing
+one tab when another follows. Another interaction cancels the pending advance.
+Once the user taps a different tab, single-choice selections stay on the
+current tab for the rest of that question set, including after reconnecting.
+Multi-select and written answers advance one tab with **Next question**.
+The last tab always shows **Submit answers**. It becomes available when every
+question has an answer and the gateway is connected.
+The options wrap at the reading column and scroll with the conversation.
+**Write your own answer** opens a native editor in the composer’s space.
+**Done** returns to the message composer with both drafts preserved.
+Submit and confirmed cancellation use `chatAnswerQuestion`. A matching close
+or tool completion retires the prompt. The transcript receives the pending
+call ID to hide the duplicate tool step. Completed steps expand in place to
+show the original questions, options, selections, and written answers.
+
+Messages typed while answering are parked in the session's persisted outbox.
+The first idle turn state with no pending question releases them in send order.
+A typed `/stop` still goes to the live turn.
+
+## Why the approval card is native
 
 The card is **NATIVE**, mounted inside the composer dock above the pill (so it
 rides the keyboard and inflates the web bottom inset), and the pending set is
@@ -15,8 +40,8 @@ derived **natively in `pushFrame`** — NOT mirrored from the webview:
 - Frames buffered offscreen can overflow and be dropped.
 - The sync loop restores rows but not pending prompts.
 
-So a web-held queue could lose the only way to answer a gate that is about to
-deny.
+Keeping the pending set in the chat store lets the reader answer as soon as
+they reopen the conversation.
 
 ## The detail never truncates — it scrolls, in a box sized to the window
 
@@ -109,12 +134,9 @@ time out and survive a gateway restart (the gateway re-queues them from its
 ask ledger), but a prompt can still close without a decision — a `/stop`, a
 settled run, the user moving on — so an entry can name a prompt nothing is
 waiting for, which is why answering one tolerates a 404 and reads it as
-"already closed". The card's `approval_pending` flag (the gateway's REST twin
-of `awaiting_human`, until the iOS stage of the human-ask rollout moves the app onto
-the new name) comes off the gateway's ask queue rather than the timeline for
-exactly that reason. The chat list's `SessionUpdated` patch key is already
-`awaiting_human`, so the patch-driven list mark on an installed phone is dark
-until the iOS stage; the REST twin keeps the cold-start mark and the board working.
+"already closed". The board reads the gateway's REST compatibility field `approval_pending`.
+In the chat list the gateway broadcasts `awaiting_human` whenever the session's
+queue gains its first prompt or loses its last one.
 
 ## Related
 

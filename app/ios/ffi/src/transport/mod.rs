@@ -77,6 +77,20 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::api::{DeckSink, FrameSink, ProjectSink, SessionListSink};
 use crate::core::{Frame, MobileError, WireApprovalDecision, WireAttachment};
 
+pub(crate) enum AskReply {
+    Approval(WireApprovalDecision),
+    Question(wire::QuestionReply),
+}
+
+impl AskReply {
+    pub(super) fn into_frame(self, ask_id: baybo_model::human_ask::AskId) -> Frame {
+        match self {
+            Self::Approval(decision) => crate::core::resolve_approval_frame(&ask_id, decision),
+            Self::Question(reply) => Frame::AnswerQuestion { ask_id, reply },
+        }
+    }
+}
+
 mod pump;
 mod socket;
 mod supervisor;
@@ -420,19 +434,19 @@ impl SessionRegistry {
         .await
     }
 
-    /// Queue the user's answer to a pending approval prompt. Unlike
+    /// Queue the user's answer to a pending human prompt. Unlike
     /// [`Self::send`] this takes no session: the prompt's `ask_id` is what the
     /// gateway keys on, and the frame carries no session binding. It still
     /// needs the leg to be live — a decision made after the pump died is lost,
     /// and the prompt stays pending on the gateway.
-    pub(crate) async fn resolve_approval(
+    pub(crate) async fn reply_to_ask(
         &self,
         ask_id: baybo_model::human_ask::AskId,
-        decision: WireApprovalDecision,
+        answer: AskReply,
     ) -> Result<(), TransportError> {
-        self.request(|reply| Msg::ResolveApproval {
+        self.request(|reply| Msg::ReplyToAsk {
             ask_id,
-            decision,
+            answer,
             reply,
         })
         .await
@@ -525,21 +539,6 @@ pub(crate) async fn send<L: SessionLeg>(
 ) -> Result<(), String> {
     leg.registry()
         .send(session_id, text, msg_id, attachments)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Echo the user's approval decision back on `leg`'s live pump.
-pub(crate) async fn resolve_approval<L: SessionLeg>(
-    leg: &L,
-    ask_id: String,
-    decision: WireApprovalDecision,
-) -> Result<(), String> {
-    let ask_id = ask_id
-        .parse()
-        .map_err(|e: baybo_model::human_ask::InvalidAskId| e.to_string())?;
-    leg.registry()
-        .resolve_approval(ask_id, decision)
         .await
         .map_err(|e| e.to_string())
 }

@@ -2,10 +2,9 @@ import SwiftUI
 import WebKit
 
 /// The chat screen: transcript webview filling the space, native header veil
-/// pinned over its top, native composer docked below. Because the composer is
-/// native, the keyboard never pans web content — SwiftUI's safe-area handling
-/// moves the dock and the webview resizes; the web bundle's ResizeObserver
-/// holds the newest edge through that resize.
+/// pinned over its top, native composer docked below. The keyboard moves the
+/// dock while the webview keeps its frame. The transcript uses the dock's
+/// measured top edge to keep the newest messages above the keyboard.
 struct ChatScreen: View {
     @ObservedObject private var store: ChatStore
     @ObservedObject private var bridge: TranscriptBridge
@@ -30,10 +29,7 @@ struct ChatScreen: View {
     /// header — the panel's column is measured off it rather than re-derived
     /// from the header's paddings.
     @State private var modelPillFrame: CGRect = .zero
-    /// The approval card's detail ceiling for this window's free height
-    /// (`ApprovalCardView.detailCap`). Short windows — a foldable's outer
-    /// display in landscape, any screen with the keyboard up — get a shorter box.
-    @State private var approvalDetailCap = ApprovalCardView.detailCeiling
+    @State private var availableHeight: CGFloat = 0
     /// The header's message index (`MessageIndexSheet`).
     @State private var messageIndexOpen = false
     /// The header's subagent list (`SubagentSheet`).
@@ -132,11 +128,11 @@ struct ChatScreen: View {
         // can render it. Only the CONTENT is assembled here.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             ComposerDock(collapsed: bridge.htmlPreviewMaximized) {
-                ComposerView(store: store, attach: attach, approvalDetailCap: approvalDetailCap)
+                ComposerView(store: store, attach: attach, availableHeight: availableHeight)
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.frame(in: .global).minY
                     } action: { minY in
-                        bridge.setComposerTop(minY)
+                        bridge.setComposerTop(minY, for: store)
                     }
                     .jumpToLatestDisc(
                         visible: bridge.jumpVisible,
@@ -163,8 +159,7 @@ struct ChatScreen: View {
         .onGeometryChange(for: CGFloat.self) { proxy in
             proxy.size.height
         } action: { height in
-            let cap = ApprovalCardView.detailCap(available: height)
-            if cap != approvalDetailCap { approvalDetailCap = cap }
+            availableHeight = height
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in
@@ -275,6 +270,7 @@ struct ChatScreen: View {
                 store.startDemoFramesIfRequested()
                 store.startDemoAttachmentsIfRequested()
                 store.startDemoImagesIfRequested()
+                store.startDemoQuestionIfRequested()
                 store.startDemoApprovalIfRequested()
                 store.startDemoHtmlIfRequested()
                 store.startDemoSwitchIfRequested()
