@@ -148,7 +148,7 @@ The tab's content is `SearchScreen`, mounted WITHOUT the shared `section`
 wordmark header — the docked field is the only chrome it needs.
 
 **Opening a hit keeps the tab.** `openSearchResult` passes `keepTab: true`, the
-one exception to `activateSession`'s `homeTab = .chats` rule. It works because
+one exception to `openSession`'s `homeTab = .chats` rule. It works because
 the push lands on the OUTER `NavigationStack` — the one that WRAPS the whole
 `TabView` — so the conversation covers the shell and the tab selection is simply
 preserved underneath it. Popping returns to the Search tab with its query and
@@ -535,6 +535,15 @@ The NSE decodes it (optional field; the pinned AEAD fixture predates it and must
 keep decoding) and stashes it in the delivered `userInfo` under
 `PushPayloadKeys.sessionId` (one file compiled into both targets).
 
-The app's `UNUserNotificationCenterDelegate` routes the tap to that session via
-`AppStore.routeToSession` (stash-and-consume across the launch restore);
-foreground pushes present nothing.
+A tap reaches `AppStore.routeFromNotification` from two places. The tap that
+LAUNCHED the app is read at scene connect — `SceneDelegate` in `AppDelegate.swift`,
+off `connectionOptions.notificationResponse` — which is before the store exists,
+so it waits in a static stash that `restoreOnLaunch` consumes in the same turn it
+sets `route = .home`: the first frame is already the conversation. Every tap,
+that one included, also arrives through `UNUserNotificationCenterDelegate.didReceive`;
+that callback is async and lands after the first frames, which is why it cannot
+be the launch path (it drew the chat list and then pushed the conversation over
+it). The second delivery of a launch tap rewrites the same path and changes
+nothing. `routeToSession` writes the path synchronously and without animation —
+a tap comes from outside the app, so there is no screen of ours to slide from.
+Foreground pushes present nothing.
