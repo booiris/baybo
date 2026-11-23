@@ -244,8 +244,8 @@ final class ProjectCardUITests: BayboUITestCase {
     }
 
     func testFocusingTheFieldWidensThePill() {
-        let app = openCard()
-        let field = app.descendants(matching: .any)[IssueDockFields.field].firstMatch
+        let app = launch(Self.cardArguments)
+        let field = app.textFields[IssueDockFields.field]
         XCTAssertTrue(field.waitForExistence(timeout: 10), "no card composer")
         let resting = field.frame.width
 
