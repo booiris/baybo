@@ -8,14 +8,13 @@ use chrono_tz::Tz;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::Result;
 use crate::error::CronError;
 use crate::shutdown::Shutdown;
 use baybo_model::{
     BuiltinCronJob, CronExecution, CronJob, CronJobPatch, CronSchedule, CronStatus, ExecutionStatus,
 };
 use baybo_store::{CronFire, CronStore, ExecutionCompletion};
-
-type Result<T> = std::result::Result<T, CronError>;
 
 // ── Scheduler ──────────────────────────────────────────────────────────
 
@@ -176,6 +175,52 @@ const TICK_INTERVAL: Duration = Duration::from_secs(10);
 /// per attempt; the spare attempts cover a second scheduler instance racing on
 /// the same row.
 const UPDATE_ATTEMPTS: usize = 3;
+
+/// The execution ledger used to deliver one-shot results to their origin conversation.
+#[async_trait::async_trait]
+pub trait CronDeliveryLedger: Send + Sync {
+    /// Record the fire's outcome before attempting delivery.
+    async fn record_execution_completion(
+        &self,
+        execution_id: &str,
+        completion: ExecutionCompletion,
+    ) -> Result<()>;
+
+    /// Resolve a delivery after a successful append or a terminal drop.
+    async fn mark_execution_notified(&self, execution_id: &str, at: DateTime<Utc>) -> Result<()>;
+
+    /// Completed one-shot executions whose delivery is still unresolved.
+    async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>>;
+}
+
+#[async_trait::async_trait]
+impl CronDeliveryLedger for CronScheduler {
+    async fn record_execution_completion(
+        &self,
+        execution_id: &str,
+        completion: ExecutionCompletion,
+    ) -> Result<()> {
+        self.store
+            .record_execution_completion(execution_id, completion)
+            .await
+            .map_err(CronError::from)
+    }
+
+    async fn mark_execution_notified(&self, execution_id: &str, at: DateTime<Utc>) -> Result<()> {
+        self.store
+            .mark_execution_notified(execution_id, at)
+            .await
+            .map_err(CronError::from)
+    }
+
+    async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
+        let rows = self.store.list_executions_awaiting_delivery().await?;
+        Ok(rows
+            .into_iter()
+            .filter(CronExecution::is_one_shot)
+            .collect())
+    }
+}
 
 impl CronScheduler {
     pub fn new(
@@ -450,45 +495,6 @@ impl CronScheduler {
         }
 
         Err(CronError::Contended(job_id.to_string()))
-    }
-
-    /// Stamp a fire's terminal state onto its execution row — see
-    /// [`CronStore::record_execution_completion`]. Called by the agent layer's
-    /// cron waiter before it delivers the result.
-    pub async fn record_execution_completion(
-        &self,
-        execution_id: &str,
-        completion: ExecutionCompletion,
-    ) -> Result<()> {
-        self.store
-            .record_execution_completion(execution_id, completion)
-            .await
-            .map_err(CronError::from)
-    }
-
-    /// Mark a one-shot's result delivered (or terminally dropped) — see
-    /// [`CronStore::mark_execution_notified`].
-    pub async fn mark_execution_notified(
-        &self,
-        execution_id: &str,
-        at: DateTime<Utc>,
-    ) -> Result<()> {
-        self.store
-            .mark_execution_notified(execution_id, at)
-            .await
-            .map_err(CronError::from)
-    }
-
-    /// One-shot executions whose fire completed but whose result never
-    /// reached the origin conversation (crash in the delivery window). The
-    /// agent layer re-drives these at boot; recurring fires are excluded —
-    /// their result lives in their own conversation, with nothing to deliver.
-    pub async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
-        let rows = self.store.list_executions_awaiting_delivery().await?;
-        Ok(rows
-            .into_iter()
-            .filter(CronExecution::is_one_shot)
-            .collect())
     }
 
     /// Move a cron job to the recycle bin. It stops firing and drops out of

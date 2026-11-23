@@ -724,6 +724,7 @@ impl AgentTestHarnessBuilder {
         );
 
         let cron_store = Arc::new(baybo_cron::test_support::InMemoryCronStore::new());
+        let cron_ledger = cron_store.delivery_ledger();
 
         let recovery = TurnRecovery::new(Arc::clone(&trace_store), Arc::clone(&turn_lifecycle));
         let supervisor = baybo_agent::AgentSupervisor::new(
@@ -744,7 +745,7 @@ impl AgentTestHarnessBuilder {
             let human_asks = human_asks.clone();
             let turn_lifecycle = turn_lifecycle.clone();
             let supervisor = supervisor.clone();
-            let cron_store = cron_store.clone();
+            let cron_ledger = Arc::clone(&cron_ledger);
             Arc::new(move |session, pins, registry, response_tx, actor_token| {
                 let context_manager = ContextManager::from_config(ContextManagerConfig {
                     agent: None,
@@ -799,7 +800,7 @@ impl AgentTestHarnessBuilder {
                         actor_token,
                         supervisor: registry,
                         session_manager: Arc::clone(&session_manager),
-                        cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
+                        cron_ledger: Arc::clone(&cron_ledger),
                         workspace: Arc::clone(&workspace),
                     },
                 );
@@ -834,7 +835,7 @@ impl AgentTestHarnessBuilder {
                 cost_manager: cost_manager.clone(),
                 actor_spawner: actor_spawner.clone(),
                 turn_lifecycle: turn_lifecycle.clone(),
-                cron_store: cron_store.clone(),
+                cron_ledger,
                 agent_profiles,
                 cron_trigger_rx: mpsc::channel(1).1,
                 issue_run_rx: None,

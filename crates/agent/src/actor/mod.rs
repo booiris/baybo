@@ -1244,7 +1244,7 @@ impl AgentActor {
     async fn resolve_cron_delivery(&self, execution_id: &str) {
         if let Err(e) = self
             .volatile
-            .cron_store
+            .cron_ledger
             .mark_execution_notified(execution_id, chrono::Utc::now())
             .await
         {

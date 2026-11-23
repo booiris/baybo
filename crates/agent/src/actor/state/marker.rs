@@ -156,8 +156,8 @@ mod tests {
         use crate::actor::supervisor::AgentSupervisor;
         use crate::runtime::agent_loop::AgentLoop;
         use baybo_channels::AgentOutput;
+        use baybo_cron::CronDeliveryLedger;
         use baybo_session::SessionManager;
-        use baybo_store::CronStore;
         use baybo_trace::SpanRecorder;
         use baybo_turn::TurnLifecycle;
 
@@ -168,7 +168,7 @@ mod tests {
         assert_volatile::<CancellationToken>();
         assert_volatile::<Option<AgentSupervisor>>();
         assert_volatile::<Arc<SessionManager>>();
-        assert_volatile::<Arc<dyn CronStore>>();
+        assert_volatile::<Arc<dyn CronDeliveryLedger>>();
     }
 
     #[test]

@@ -1,8 +1,6 @@
-# Crate boundaries — fix the cron ledger bypass, then make the rule mechanical
+# Crate boundaries and the cron delivery ledger
 
-> **Status:** not started. Recorded 2026-08-09 while reviewing the `kanban` branch for
-> module-boundary drift. The rule these two items enforce landed in `CLAUDE.md` in the
-> same session (`## Architecture` → "Crate boundaries — what crosses, and what doesn't").
+The cron ledger change is complete. The cross-crate CI gate is still proposed.
 
 The `kanban` branch fixed one instance of a repeating shape: `baybo-agent` was handed
 `Arc<dyn ProjectStore>` + `Arc<dyn ProjectEvents>`, and grew four functions in
@@ -14,72 +12,16 @@ holds everything it needs, because answering the next question locally costs two
 going back to the domain crate costs a method plus a review. So the handle you pass is the
 only real bound, and a CRUD trait bounds nothing.
 
-The survey that found the board case found the same shape live in cron. Nothing currently
-stops a third. Hence two items: fix the known one, then gate it.
+## 1. Cron delivery ledger (complete)
 
-## 1. The agent crate writes the cron delivery ledger past its own door
+The agent router used to read and write delivery records through `Arc<dyn CronStore>`.
+It also repeated the scheduler's rule for which executions to replay.
+The router and origin actor now share a `baybo_cron::CronDeliveryLedger` backed by
+the runtime's `CronScheduler`. Its three operations record completion, mark
+delivery resolved and list completed one-shots awaiting delivery. The cron tests
+and agent delivery fixtures exercise the same scheduler implementation.
 
-`crates/cron` built the door **and documented it as the door**:
-
-| | |
-|---|---|
-| `crates/cron/src/scheduler.rs:453` | `pub async fn record_execution_completion` |
-| `crates/cron/src/scheduler.rs:466` | `pub async fn mark_execution_notified` |
-| `crates/cron/src/scheduler.rs:481` | `pub async fn list_executions_awaiting_delivery` |
-| `crates/cron/src/scheduler.rs:451` (doc) | *"Called by the agent layer's cron waiter before it delivers the result."* |
-
-All three have **zero callers**. The agent layer was handed `Arc<dyn CronStore>` and writes
-the ledger straight past them:
-
-| | |
-|---|---|
-| `crates/agent/src/actor/router/cron.rs:833`, `:1060` | the field: `cron_store: Arc<dyn CronStore>` |
-| `crates/agent/src/actor/router/cron.rs:847` | `record_execution_completion` — a write |
-| `crates/agent/src/actor/router/cron.rs:1134` | `mark_execution_notified` — a write |
-| `crates/agent/src/actor/mod.rs:1093` | `mark_execution_notified` — a write |
-| `crates/agent/src/actor/router/cron.rs:753` | `list_executions_awaiting_delivery` — a read |
-
-Building the port does not help if the store rides along beside it. That is the lesson to
-carry into item 2.
-
-### Cost — cheaper than it looks, because the expensive part is already paid
-
-No new domain methods are needed (all three wrappers exist), and the binary **already
-builds** an `Arc<CronScheduler>` at `crates/baybo/src/runtime.rs:508` — the gateway has
-been using it all along. The Router is separately handed `graph.stores.cron.clone()` at
-`runtime.rs:1021` and `:1118`. So this is a handle swap, not a redesign.
-
-All 37 `cron_store` sites outside `crates/{cron,store,storage}` were inventoried:
-
-| | count | nature |
-|---|---|---|
-| production | ~18, across 5 files | field type + `.cron_store` → `.cron_scheduler`; method names and arities identical |
-| `Volatile` marker | 2 | add `impl Sealed`/`Volatile for Arc<CronScheduler>` (`actor/state/marker.rs`) — 2 lines |
-| test construction | 3 | `router/cron.rs:1321`, `router/issue.rs:534`, `integration-tests/src/harness.rs:553` |
-| `agent_loop_e2e.rs` | 9 | **unchanged** — the harness keeps its `Arc<InMemoryCronStore>` field for assertions |
-
-Only friction: the error type becomes `CronError` instead of the store's. Every call site
-is `if let Err(e) = … { warn!(error = %e) }`, so `%e` covers both.
-
-### Three ways to do it
-
-- **A — swap the handle** to `Arc<CronScheduler>`. ~40 lines, 6 files, no new code. Kills
-  the bug, but hands the delivery waiter all **19** of `CronScheduler`'s public methods
-  (`create_job`, `delete_job`, `trigger_now`, `update_job`, …) — a smaller version of the
-  same problem.
-- **B — narrow port (recommended).** Declare `CronDelivery` in `baybo-cron` with the three
-  methods; `impl` it for `CronScheduler`. ~65 lines total. **Cheaper in tests than A**:
-  `InMemoryCronStore` impls `CronDelivery` directly, so the three construction sites become
-  a one-line cast instead of building a scheduler with a `trigger_tx` and a `Shutdown`.
-- **C — concede.** Delete the three dead wrappers and the doc comment that lies about them.
-  Ten minutes, but it formally moves cron-ledger writes into the agent layer and throws away
-  whatever intent produced those wrappers.
-
-Take B.
-
-While in there: `crates/cron/src/shutdown.rs:29` `NeverShutdown` is plain `pub` with no
-`test-support` gate — and CLAUDE.md's own "test-only helpers must be gated" rule uses
-"`NeverShutdown`-style stubs" as its example. Confirm it has no production caller, then gate it.
+`NeverShutdown` is already gated by `cfg(test)` or the `test-support` feature.
 
 ## 2. A CI gate for the rule
 
@@ -104,11 +46,9 @@ needs two pieces of hand-written data:
 
 ### Do not turn it on big-bang
 
-A survey of the current tree found ~40 distinct `(crate, trait)` pairs. Roughly half are a
-domain crate using its own store and drop out the moment the ownership map is applied. The
-rest are real and numerous — `baybo-agent` alone holds `TraceStore` (17 uses), `CronStore`
-(8), `TurnStore` (3), `SessionStore`, `SessionFolderStore`; `crates/query` holds four
-different stores; `gateway` and `cli` hold about a dozen each. Several of those may be
+The original survey found ~40 distinct `(crate, trait)` pairs. Roughly half are a
+domain crate using its own store and drop out the moment the ownership map is applied. That survey also found `baybo-agent` holding `TraceStore`, `TurnStore`, `SessionStore`
+and `SessionFolderStore`, four stores in `query`, and about a dozen each in `gateway` and `cli`. Several of those may be
 defensible (`query` is a read-only projection layer; `gateway` is the HTTP surface), but
 that is a ruling nobody has made yet.
 

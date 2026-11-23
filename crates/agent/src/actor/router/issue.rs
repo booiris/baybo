@@ -614,7 +614,8 @@ mod tests {
             ),
             actor_spawner,
             turn_lifecycle,
-            cron_store: Arc::new(baybo_cron::test_support::InMemoryCronStore::new()),
+            cron_ledger: Arc::new(baybo_cron::test_support::InMemoryCronStore::new())
+                .delivery_ledger(),
             agent_profiles: Arc::clone(&board.db.agent_profile),
             cron_trigger_rx,
             issue_run_rx: None,

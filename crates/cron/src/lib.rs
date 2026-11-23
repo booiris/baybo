@@ -11,7 +11,9 @@ pub use baybo_model::{
 };
 pub use baybo_store::{CronFire, CronStore, ExecutionCompletion};
 pub use error::CronError;
-pub use scheduler::{BuiltinJobSpec, CronScheduler, CronTriggerEvent, NewCronJob, host_timezone};
+pub use scheduler::{
+    BuiltinJobSpec, CronDeliveryLedger, CronScheduler, CronTriggerEvent, NewCronJob, host_timezone,
+};
 pub use shutdown::Shutdown;
 
 #[cfg(any(test, feature = "test-support"))]
