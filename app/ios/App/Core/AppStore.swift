@@ -299,12 +299,11 @@ final class AppStore: ObservableObject {
     /// Whether the active binding is direct (drives push re-registration).
     @Published private(set) var directBound = false
 
-    private var restoring = false
     private var relayPreconnectInFlight = false
     private var directPreconnectInFlight = false
-    /// A push-notification tap that arrived before the launch restore resolved
-    /// the route; consumed once home is up.
-    private var pendingPushSession: String?
+    /// The tap that LAUNCHED the process, handed over by the scene before this
+    /// store exists (it is a `@StateObject`, built on the first body pass).
+    private static var launchPushSession: String?
     private var chatStores: [String: ChatStore] = [:]
     /// Session ids in least→most recently used order, bounding the resident
     /// `chatStores` working set (`evictIdleStores`). Kept in sync with the map:
@@ -657,35 +656,43 @@ final class AppStore: ObservableObject {
 
     /// Probe the durable binding and land on home (the chat list). No session
     /// is minted at launch — the compose button is the only session creator.
+    ///
+    /// The route is resolved HERE, synchronously, so the first committed frame is
+    /// already the screen the launch ends on: both probes are synchronous
+    /// keychain reads, and deferring them drew the `.launching` spinner and then
+    /// the chat list ahead of a conversation a notification tap had asked for.
     private func restoreOnLaunch() {
-        guard !restoring else { return }
-        restoring = true
+        let paired = Baybo.client.pairedDevice()
+        let direct = (try? Baybo.client.directStatus()) ?? nil
+        directBound = direct != nil
+        guard paired != nil || direct != nil else {
+            route = .landing
+            return
+        }
+        if directBound {
+            // Detached, exactly as the foreground path runs it
+            // (`didBecomeActive`). Awaiting it here put TWO REST round trips
+            // (`GET /v1/push/params`, `POST /v1/push/register`, 30 s reply
+            // budget each on a 20 s connect budget) in front of the chat
+            // leg's warm-up, the chat list, the push-tap route and the
+            // stranded-send resume — on the one code path where none of
+            // them is on screen yet. Whether a given launch paid for it was
+            // a race with the APNs token callback, which is what made it
+            // feel intermittent. Nothing below needs its result.
+            Task { await registerPushBestEffort() }
+            preconnectDirectBestEffort()
+        } else if paired != nil {
+            preconnectRelayBestEffort()
+        }
+        route = .home
+        // Ahead of the prewarm: a tapped conversation claims the one transcript
+        // host for itself, so its page starts loading now instead of being
+        // retargeted from a throwaway draft.
+        if let sessionId = Self.launchPushSession {
+            Self.launchPushSession = nil
+            routeToSession(sessionId)
+        }
         Task {
-            defer { restoring = false }
-            let paired = Baybo.client.pairedDevice()
-            let direct = (try? Baybo.client.directStatus()) ?? nil
-            directBound = direct != nil
-            guard paired != nil || direct != nil else {
-                route = .landing
-                return
-            }
-            if directBound {
-                // Detached, exactly as the foreground path runs it
-                // (`didBecomeActive`). Awaiting it here put TWO REST round trips
-                // (`GET /v1/push/params`, `POST /v1/push/register`, 30 s reply
-                // budget each on a 20 s connect budget) in front of the chat
-                // leg's warm-up, the chat list, the push-tap route and the
-                // stranded-send resume — on the one code path where none of
-                // them is on screen yet. Whether a given launch paid for it was
-                // a race with the APNs token callback, which is what made it
-                // feel intermittent. Nothing below needs its result.
-                Task { await registerPushBestEffort() }
-                preconnectDirectBestEffort()
-            } else if paired != nil {
-                preconnectRelayBestEffort()
-            }
-            route = .home
-            consumePendingPushRoute()
             prewarmTranscriptHost()
             prewarmDeckHost()
             prewarmIssueHosts()
@@ -1476,24 +1483,32 @@ final class AppStore: ObservableObject {
         issueHostPool.prewarm()
     }
 
-    /// A push-notification tap targeting `sessionId`: route straight into that
-    /// conversation. Before the launch restore resolves the route, stash it —
-    /// `restoreOnLaunch` consumes the stash once home is up.
-    func routeToSession(_ sessionId: String) {
-        guard route == .home else {
-            pendingPushSession = sessionId
-            return
-        }
-        Task {
-            await activateSession(sessionId, ensureListed: true)
+    /// The door for a notification tap, from the UIKit callbacks that sit
+    /// outside the SwiftUI environment. A tap that launched the process reaches
+    /// the scene before this store exists; it waits for `restoreOnLaunch`.
+    static func routeFromNotification(_ sessionId: String) {
+        if let shared {
+            shared.routeToSession(sessionId)
+        } else {
+            launchPushSession = sessionId
         }
     }
 
-    private func consumePendingPushRoute() {
-        if let sessionId = pendingPushSession {
-            pendingPushSession = nil
-            routeToSession(sessionId)
+    /// A push-notification tap targeting `sessionId`: route straight into that
+    /// conversation. An unbound app has no conversation to open.
+    ///
+    /// The path is written in THIS turn and without animation. A tap arrives
+    /// from outside the app, so there is no screen of ours to slide away from:
+    /// a deferred, animated write showed the chat list first and then pushed
+    /// the conversation over it.
+    func routeToSession(_ sessionId: String) {
+        guard route == .home else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            openSession(sessionId, ensureListed: true)
         }
+        Task { await evictIdleStores() }
     }
 
     /// Select the foreground session. The FFI transport keeps one global chat
@@ -1505,6 +1520,15 @@ final class AppStore: ObservableObject {
         _ sessionId: String, ensureListed: Bool, appendToPath: Bool = false,
         keepTab: Bool = false
     ) async {
+        openSession(
+            sessionId, ensureListed: ensureListed, appendToPath: appendToPath, keepTab: keepTab)
+        await evictIdleStores()
+    }
+
+    private func openSession(
+        _ sessionId: String, ensureListed: Bool, appendToPath: Bool = false,
+        keepTab: Bool = false
+    ) {
         if ensureListed {
             SessionIndex.shared.touch(sessionId: sessionId)
         }
@@ -1526,7 +1550,6 @@ final class AppStore: ObservableObject {
         } else {
             chatPath = [.session(sessionId)]
         }
-        await evictIdleStores()
     }
 
     // MARK: - Archive / delete (optimistic, serialized per session)

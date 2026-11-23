@@ -136,7 +136,7 @@ Duo's outer display, a Split View half — keeps the push.
   `stackPath` — the path without it — so nothing pushes. Every rule keyed on the
   path (leaving a conversation, audio stop, eviction, the resume recycle) runs
   unchanged.
-- **While split, every open docks.** `activateSession` resets the path to
+- **While split, every open docks.** `openSession` resets the path to
   `[.session(id)]` and selects Chats wherever the open came from — the archived
   list, a cron group, a search hit (`keepTab` has nothing to keep: there is no
   push to back out of). That keeps at most ONE conversation in the path, which is
@@ -173,7 +173,7 @@ Duo's outer display, a Split View half — keeps the push.
 
 No session is minted at launch or login; the compose button — the Chats header's
 top-right glass circle — is the only session creator, and compose / push-tap
-routing force `homeTab = .chats` (in `activateSession`) so a pushed conversation
+routing force `homeTab = .chats` (in `openSession`) so a pushed conversation
 lands in the Chats stack.
 
 **One exception, `keepTab: true`** — a conversation opened from a SEARCH hit

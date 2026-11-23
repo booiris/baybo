@@ -47,6 +47,19 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         return true
     }
 
+    /// Names `SceneDelegate` so a launching notification tap can be read at
+    /// scene connect. SwiftUI still owns the window.
+    func application(
+        _ application: UIApplication,
+        configurationForConnecting connectingSceneSession: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(
+            name: nil, sessionRole: connectingSceneSession.role)
+        configuration.delegateClass = SceneDelegate.self
+        return configuration
+    }
+
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
@@ -148,6 +161,25 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 }
 
+/// Exists for one read: the notification tap that LAUNCHED the app.
+///
+/// `didReceive` below also delivers that tap, but as an async callback that
+/// lands after the first frames are on screen — by then the chat list has been
+/// drawn and the conversation can only arrive on top of it. The connection
+/// options carry the same response before anything is rendered.
+final class SceneDelegate: NSObject, UIWindowSceneDelegate {
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options connectionOptions: UIScene.ConnectionOptions
+    ) {
+        guard let response = connectionOptions.notificationResponse,
+            let sessionId = AppDelegate.tappedSessionId(response)
+        else { return }
+        AppStore.routeFromNotification(sessionId)
+    }
+}
+
 extension AppDelegate: UNUserNotificationCenterDelegate {
     /// Foreground pushes present nothing (the pre-delegate behavior, kept on
     /// purpose): the chat list refreshes on foreground and the live session
@@ -166,12 +198,17 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
-            let sessionId = response.notification.request.content
-                .userInfo[PushPayloadKeys.sessionId] as? String
-        else { return }
+        guard let sessionId = Self.tappedSessionId(response) else { return }
         await MainActor.run {
-            AppStore.shared?.routeToSession(sessionId)
+            AppStore.routeFromNotification(sessionId)
         }
+    }
+
+    nonisolated static func tappedSessionId(_ response: UNNotificationResponse) -> String? {
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier else {
+            return nil
+        }
+        return response.notification.request.content
+            .userInfo[PushPayloadKeys.sessionId] as? String
     }
 }
