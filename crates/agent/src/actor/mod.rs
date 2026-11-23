@@ -7,7 +7,7 @@ mod asks;
 mod background_notification;
 pub mod mailbox;
 pub mod router;
-pub mod runner;
+mod runner;
 pub mod state;
 pub mod subagent;
 pub mod supervisor;
@@ -43,7 +43,6 @@ const EMPTY_USER_REPLY_NOTICE: &str =
     "The assistant did not produce a response to your message. Please try again or rephrase.";
 
 use crate::actor::state::{DurableActorState, VolatileResources};
-use crate::actor::supervisor::ActorRegistryGuard;
 
 /// True when `err` carries the [`TurnCancelled`] marker anywhere in its
 /// context chain — i.e. the turn ended via `/stop` or shutdown, not a failure.
@@ -387,18 +386,9 @@ impl AgentActor {
     }
 
     /// Run the actor's message processing loop.
-    pub async fn run(mut self, mut mailbox: mailbox::MailboxReceiver<AgentMessage>) {
+    async fn run(mut self, mut mailbox: mailbox::MailboxReceiver<AgentMessage>) {
         let session_id = self.durable.session.id.clone();
         info!(session_id = %session_id, "agent actor started");
-
-        // Self-deregistration on any exit path — Shutdown message,
-        // mailbox close, or panic. Without this guard the supervisor's
-        // `actors` map would keep the dead handle indefinitely.
-        let _registry_guard = self
-            .volatile
-            .supervisor
-            .clone()
-            .map(|s| ActorRegistryGuard::new(s, session_id.clone()));
 
         // Cold-start hydration: pull any persisted transcript out of
         // the store before processing the first message. No-ops for
@@ -416,20 +406,15 @@ impl AgentActor {
         let mut notification_retry =
             background_notification::BackgroundNotificationRetrySchedule::new();
         loop {
-            let next = if self.has_background_notification_work() {
-                tokio::select! {
-                    biased;
-                    m = mailbox.recv() => m,
-                    _ = tokio::time::sleep(notification_retry.delay()) => {
-                        self.handle_background_notification_timer().await;
-                        notification_retry.after_timer_attempt(
-                            self.has_background_notification_work(),
-                        );
-                        continue;
-                    }
+            let next = tokio::select! {
+                biased;
+                _ = self.volatile.actor_token.cancelled() => Some(AgentMessage::ActorStop),
+                msg = mailbox.recv() => msg,
+                _ = tokio::time::sleep(notification_retry.delay()), if self.has_background_notification_work() => {
+                    self.handle_background_notification_timer().await;
+                    notification_retry.after_timer_attempt(self.has_background_notification_work());
+                    continue;
                 }
-            } else {
-                mailbox.recv().await
             };
             let Some(msg) = next else {
                 break;
@@ -530,7 +515,9 @@ impl AgentActor {
             self.seal_background_notification_groups().await;
             // Surface buffered background-turn results as their own turn once
             // nothing higher-priority remains queued.
-            self.maybe_start_background_notification(&mailbox).await;
+            if !self.volatile.actor_token.is_cancelled() {
+                self.maybe_start_background_notification(&mailbox).await;
+            }
         }
         info!(session_id = %session_id, "agent actor stopped");
     }

@@ -8,7 +8,7 @@
 //! stuck in `Pending` / `InProgress` forever unless a recovery path closes
 //! them.
 //!
-//! [`recover_orphaned_traces_and_turns`] sweeps those orphans at next
+//! [`TurnRecovery::on_startup`] sweeps those orphans at next
 //! boot, cascading bottom-up:
 //!
 //! 1. For each non-terminal turn (`Pending` / `InProgress` / `Stuck`):
@@ -32,7 +32,7 @@
 //! The process may have crashed hours before the next boot; stamping
 //! recovery time would distort every duration metric in the trace UI.
 //!
-//! [`recover_panicked_actor_session`] handles the same shape while the
+//! [`TurnRecovery::on_actor_panic`] handles the same shape while the
 //! process is still alive. In that case the actor task's `JoinError`
 //! gives us a real crash instant, so pending spans, steps, and turns are
 //! closed at that crash time instead of pretending the last trace event
@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use baybo_model::{SessionId, TurnId};
 use baybo_trace::{LifecycleOutcome, LifecycleState, Span, Step, TraceError, TraceStore};
-use baybo_turn::{CancelReason, TurnLifecycle};
+use baybo_turn::{CancelReason, Turn, TurnLifecycle};
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
@@ -72,7 +72,7 @@ impl RecoveryClock {
     }
 }
 
-/// Counters returned by [`recover_orphaned_traces_and_turns`].
+/// Counts the turns inspected and rows settled by a recovery pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RecoverySummary {
     pub turns_inspected: usize,
@@ -81,172 +81,119 @@ pub struct RecoverySummary {
     pub spans_closed: usize,
 }
 
-/// Sweep orphan trace rows and non-terminal turns left behind by an
-/// unclean shutdown. Best-effort: per-turn errors are warn-logged; the
-/// sweep continues with the next turn.
-///
-/// Idempotent: a second call is a no-op once the first has reached every
-/// non-terminal turn and every unfinished detached trace row (steps and spans
-/// are already terminal; the recoverable-turn and unfinished-step listings come
-/// back empty).
-pub async fn recover_orphaned_traces_and_turns(
+/// Repairs unfinished turns and trace rows after a process exit or actor panic.
+#[derive(Clone)]
+pub struct TurnRecovery {
     trace_store: Arc<dyn TraceStore>,
     turn_lifecycle: Arc<TurnLifecycle>,
-) -> RecoverySummary {
-    let mut summary = RecoverySummary::default();
-
-    let turns = match turn_lifecycle.list_recoverable().await {
-        Ok(js) => js,
-        Err(e) => {
-            warn!(error = %e, "recovery sweep: failed to list recoverable turns");
-            return summary;
-        }
-    };
-
-    let mut recoverable_turn_ids = HashSet::new();
-    for turn in turns {
-        recoverable_turn_ids.insert(turn.id);
-        summary.turns_inspected += 1;
-        let turn_started = turn.started_at.unwrap_or(turn.created_at);
-        match close_turn_subtree(
-            &trace_store,
-            &turn.id,
-            turn_started,
-            RecoveryClock::ObservedActivity,
-        )
-        .await
-        {
-            Ok((closed_steps, closed_spans, end_floor)) => {
-                summary.steps_closed += closed_steps;
-                summary.spans_closed += closed_spans;
-                if !turn.is_terminal() {
-                    if let Err(e) = turn_lifecycle
-                        .cancel_at(&turn.id, RECOVERY_CANCEL_REASON, Vec::new(), end_floor)
-                        .await
-                    {
-                        warn!(
-                            turn_id = %turn.id,
-                            error = %e,
-                            "recovery sweep: cancel_at failed; turn left non-terminal"
-                        );
-                    } else {
-                        summary.turns_cancelled += 1;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    turn_id = %turn.id,
-                    error = %e,
-                    "recovery sweep: failed to close trace subtree; turn left non-terminal"
-                );
-            }
-        }
-    }
-
-    let detached_summary =
-        recover_detached_trace_rows(&trace_store, &turn_lifecycle, &recoverable_turn_ids).await;
-    summary.turns_inspected += detached_summary.turns_inspected;
-    summary.steps_closed += detached_summary.steps_closed;
-    summary.spans_closed += detached_summary.spans_closed;
-
-    if summary.turns_inspected > 0 {
-        info!(
-            turns_inspected = summary.turns_inspected,
-            turns_cancelled = summary.turns_cancelled,
-            steps_closed = summary.steps_closed,
-            spans_closed = summary.spans_closed,
-            "recovery sweep: closed orphan trace rows from prior process"
-        );
-    } else {
-        debug!("recovery sweep: no orphan turns or detached trace rows found");
-    }
-
-    summary
 }
 
-/// Recover active turns for one actor that panicked while the process stayed
-/// alive. This is the in-process counterpart to
-/// [`recover_orphaned_traces_and_turns`]: it scans the panicked session's
-/// non-terminal turns, closes their half-open trace rows at `crash_at`, then
-/// cancels the turns with `SystemCrash`.
-///
-/// Scans **every** non-terminal turn, not just the chat turns. The actor is
-/// gone, so a `/compact` or cron-delivery turn it owned is just as orphaned as
-/// a user turn — `is_chat_turn` answers "is a reply in flight for the user",
-/// which is a display question, not a cleanup one. Filtering here left those
-/// turns `InProgress` with a half-open trace subtree until the next process
-/// boot, where [`recover_orphaned_traces_and_turns`] finally swept them.
-///
-/// Cancelling a non-chat turn publishes a terminal lifecycle event like any
-/// other, and that is harmless: the TurnState projector recomputes from the
-/// chat-turn set (finding the session idle, which it is), and the push
-/// dispatcher only fires for user-facing kinds.
-///
-/// `TurnLifecycle::cancel_at` publishes the terminal lifecycle event, so
-/// the TurnState projector remains the only producer of the web chat's
-/// inactive edge.
-pub async fn recover_panicked_actor_session(
-    trace_store: Arc<dyn TraceStore>,
-    turn_lifecycle: Arc<TurnLifecycle>,
-    session_id: &SessionId,
-    crash_at: DateTime<Utc>,
-) -> RecoverySummary {
-    let mut summary = RecoverySummary::default();
-
-    let turns = match turn_lifecycle.list_active_by_session(session_id).await {
-        Ok(js) => js,
-        Err(e) => {
-            warn!(%session_id, error = %e, "actor crash recovery: failed to list active turns");
-            return summary;
+impl TurnRecovery {
+    pub fn new(trace_store: Arc<dyn TraceStore>, turn_lifecycle: Arc<TurnLifecycle>) -> Self {
+        Self {
+            trace_store,
+            turn_lifecycle,
         }
-    };
-
-    if turns.is_empty() {
-        debug!(%session_id, "actor crash recovery: no active turns found");
-        return summary;
     }
 
-    for turn in turns {
-        summary.turns_inspected += 1;
-        let turn_started = turn.started_at.unwrap_or(turn.created_at);
-        match close_turn_subtree(
-            &trace_store,
-            &turn.id,
-            turn_started,
-            RecoveryClock::CrashAt(crash_at),
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        Self::new(
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            Arc::new(TurnLifecycle::new(Arc::new(
+                baybo_turn::test_support::MemoryTurnStore::new(),
+            ))),
         )
-        .await
-        {
-            Ok((closed_steps, closed_spans, end_floor)) => {
-                summary.steps_closed += closed_steps;
-                summary.spans_closed += closed_spans;
-                if let Err(e) = turn_lifecycle
-                    .cancel_at(&turn.id, RECOVERY_CANCEL_REASON, Vec::new(), end_floor)
-                    .await
-                {
-                    warn!(
-                        %session_id,
-                        turn_id = %turn.id,
-                        error = %e,
-                        "actor crash recovery: cancel_at failed; turn left non-terminal"
-                    );
-                } else {
-                    summary.turns_cancelled += 1;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    %session_id,
-                    turn_id = %turn.id,
-                    error = %e,
-                    "actor crash recovery: failed to close trace subtree; turn left non-terminal"
-                );
-            }
-        }
     }
 
-    if summary.turns_inspected > 0 {
+    /// Sweep orphan trace rows and non-terminal turns left behind by an
+    /// unclean shutdown. Best-effort: per-turn errors are warn-logged; the
+    /// sweep continues with the next turn.
+    ///
+    /// Idempotent: a second call is a no-op once the first has reached every
+    /// non-terminal turn and every unfinished detached trace row (steps and spans
+    /// are already terminal; the recoverable-turn and unfinished-step listings come
+    /// back empty).
+    pub async fn on_startup(&self) -> RecoverySummary {
+        let turns = match self.turn_lifecycle.list_recoverable().await {
+            Ok(turns) => turns,
+            Err(e) => {
+                warn!(error = %e, "recovery sweep: failed to list recoverable turns");
+                return RecoverySummary::default();
+            }
+        };
+
+        let recoverable_turn_ids = turns.iter().map(|turn| turn.id).collect();
+        let mut summary = self
+            .recover_turns(&turns, RecoveryClock::ObservedActivity)
+            .await;
+        let detached_summary = recover_detached_trace_rows(
+            self.trace_store.as_ref(),
+            self.turn_lifecycle.as_ref(),
+            &recoverable_turn_ids,
+        )
+        .await;
+        summary.turns_inspected += detached_summary.turns_inspected;
+        summary.steps_closed += detached_summary.steps_closed;
+        summary.spans_closed += detached_summary.spans_closed;
+
+        if summary.turns_inspected > 0 {
+            info!(
+                turns_inspected = summary.turns_inspected,
+                turns_cancelled = summary.turns_cancelled,
+                steps_closed = summary.steps_closed,
+                spans_closed = summary.spans_closed,
+                "recovery sweep: closed orphan trace rows from prior process"
+            );
+        } else {
+            debug!("recovery sweep: no orphan turns or detached trace rows found");
+        }
+
+        summary
+    }
+
+    /// Recover active turns for one actor that panicked while the process stayed
+    /// alive. This is the in-process counterpart to
+    /// [`TurnRecovery::on_startup`]: it scans the panicked session's
+    /// non-terminal turns, closes their half-open trace rows at `crash_at`, then
+    /// cancels the turns with `SystemCrash`.
+    ///
+    /// Scans **every** non-terminal turn, not just the chat turns. The actor is
+    /// gone, so a `/compact` or cron-delivery turn it owned is just as orphaned as
+    /// a user turn — `is_chat_turn` answers "is a reply in flight for the user",
+    /// which is a display question, not a cleanup one. Filtering here left those
+    /// turns `InProgress` with a half-open trace subtree until the next process
+    /// boot, where [`TurnRecovery::on_startup`] finally swept them.
+    ///
+    /// Cancelling a non-chat turn publishes a terminal lifecycle event like any
+    /// other, and that is harmless: the TurnState projector recomputes from the
+    /// chat-turn set (finding the session idle, which it is), and the push
+    /// dispatcher only fires for user-facing kinds.
+    ///
+    /// `TurnLifecycle::cancel_at` publishes the terminal lifecycle event, so
+    /// the TurnState projector remains the only producer of the web chat's
+    /// inactive edge.
+    pub(crate) async fn on_actor_panic(
+        &self,
+        session_id: &SessionId,
+        crash_at: DateTime<Utc>,
+    ) -> RecoverySummary {
+        let turns = match self.turn_lifecycle.list_active_by_session(session_id).await {
+            Ok(turns) => turns,
+            Err(e) => {
+                warn!(%session_id, error = %e, "actor crash recovery: failed to list active turns");
+                return RecoverySummary::default();
+            }
+        };
+
+        if turns.is_empty() {
+            debug!(%session_id, "actor crash recovery: no active turns found");
+            return RecoverySummary::default();
+        }
+
+        let summary = self
+            .recover_turns(&turns, RecoveryClock::CrashAt(crash_at))
+            .await;
         info!(
             %session_id,
             turns_inspected = summary.turns_inspected,
@@ -255,14 +202,53 @@ pub async fn recover_panicked_actor_session(
             spans_closed = summary.spans_closed,
             "actor crash recovery: closed orphan trace rows"
         );
+        summary
     }
 
-    summary
+    async fn recover_turns(&self, turns: &[Turn], clock: RecoveryClock) -> RecoverySummary {
+        let mut summary = RecoverySummary {
+            turns_inspected: turns.len(),
+            ..RecoverySummary::default()
+        };
+        for turn in turns {
+            let started_at = turn.started_at.unwrap_or(turn.created_at);
+            let (steps, spans, ended_at) = match close_turn_subtree(
+                self.trace_store.as_ref(),
+                &turn.id,
+                started_at,
+                clock,
+            )
+            .await
+            {
+                Ok(closed) => closed,
+                Err(error) => {
+                    warn!(session_id = %turn.session_id, turn_id = %turn.id, %error, "failed to recover turn trace");
+                    continue;
+                }
+            };
+            summary.steps_closed += steps;
+            summary.spans_closed += spans;
+            if turn.is_terminal() {
+                continue;
+            }
+            match self
+                .turn_lifecycle
+                .cancel_at(&turn.id, RECOVERY_CANCEL_REASON, Vec::new(), ended_at)
+                .await
+            {
+                Ok(()) => summary.turns_cancelled += 1,
+                Err(error) => {
+                    warn!(session_id = %turn.session_id, turn_id = %turn.id, %error, "failed to cancel recovered turn")
+                }
+            }
+        }
+        summary
+    }
 }
 
 async fn recover_detached_trace_rows(
-    trace_store: &Arc<dyn TraceStore>,
-    turn_lifecycle: &Arc<TurnLifecycle>,
+    trace_store: &dyn TraceStore,
+    turn_lifecycle: &TurnLifecycle,
     recoverable_turn_ids: &HashSet<TurnId>,
 ) -> RecoverySummary {
     let mut summary = RecoverySummary::default();
@@ -339,7 +325,7 @@ async fn recover_detached_trace_rows(
 /// `max(child_steps.ended_at, turn_started)` — the timestamp to stamp on
 /// the turn's eventual `Cancelled` transition.
 async fn close_turn_subtree(
-    trace_store: &Arc<dyn TraceStore>,
+    trace_store: &dyn TraceStore,
     turn_id: &TurnId,
     turn_started: DateTime<Utc>,
     clock: RecoveryClock,
@@ -408,7 +394,7 @@ async fn close_turn_subtree(
 /// `(spans_closed, step_end_floor)`. `step_end_floor` is
 /// `max(child_spans.ended_at, step_started)`.
 async fn close_step_spans(
-    trace_store: &Arc<dyn TraceStore>,
+    trace_store: &dyn TraceStore,
     step: &Step,
     step_started: DateTime<Utc>,
     clock: RecoveryClock,
@@ -460,7 +446,7 @@ async fn close_step_spans(
 /// ordered by `seq` at write time but we don't rely on that here —
 /// take the explicit max.
 async fn pick_span_close_time(
-    trace_store: &Arc<dyn TraceStore>,
+    trace_store: &dyn TraceStore,
     span: &Span,
 ) -> Result<DateTime<Utc>, TraceError> {
     let events: Vec<baybo_trace::SpanEvent> = trace_store
@@ -491,7 +477,7 @@ mod tests {
         LlmCallBegin, LlmCallInputs, SpanEvent, SpanEventKind, SpanKind, StepKind, ToolCallBegin,
     };
     use baybo_turn::test_support::MemoryTurnStore;
-    use baybo_turn::{Turn, TurnInput, TurnStatus, TurnStore};
+    use baybo_turn::{TurnInput, TurnStatus, TurnStore};
     use chrono::Duration;
 
     fn pending_step(turn_id: TurnId, started_at: DateTime<Utc>) -> Step {
@@ -615,7 +601,9 @@ mod tests {
         trace.save_span(&llm.to_row().unwrap()).await.unwrap();
         trace.save_span(&tool.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        let summary = TurnRecovery::new(trace.clone(), lifecycle.clone())
+            .on_startup()
+            .await;
 
         assert_eq!(summary.steps_closed, 1);
         assert_eq!(summary.spans_closed, 0);
@@ -643,7 +631,9 @@ mod tests {
         let step = pending_step(turn.id, step_started);
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        let summary = TurnRecovery::new(trace.clone(), lifecycle.clone())
+            .on_startup()
+            .await;
         assert_eq!(summary.steps_closed, 1);
 
         let reloaded = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
@@ -692,7 +682,9 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        let summary = TurnRecovery::new(trace.clone(), lifecycle.clone())
+            .on_startup()
+            .await;
         assert_eq!(summary.spans_closed, 1);
 
         let reloaded =
@@ -720,13 +712,9 @@ mod tests {
         );
         trace.save_span(&span.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_panicked_actor_session(
-            trace.clone(),
-            lifecycle.clone(),
-            &turn.session_id,
-            crash_at,
-        )
-        .await;
+        let summary = TurnRecovery::new(trace.clone(), lifecycle.clone())
+            .on_actor_panic(&turn.session_id, crash_at)
+            .await;
 
         assert_eq!(summary.turns_inspected, 1);
         assert_eq!(summary.turns_cancelled, 1);
@@ -788,7 +776,9 @@ mod tests {
         trace.save_span(&a.to_row().unwrap()).await.unwrap();
         trace.save_span(&b.to_row().unwrap()).await.unwrap();
 
-        let _ = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        let _ = TurnRecovery::new(trace.clone(), lifecycle.clone())
+            .on_startup()
+            .await;
 
         let step_after = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(step_after.ended_at, Some(late_end));
@@ -803,11 +793,12 @@ mod tests {
         let step = pending_step(turn.id, t0 + Duration::seconds(1));
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
-        let first = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        let recovery = TurnRecovery::new(trace, lifecycle);
+        let first = recovery.on_startup().await;
         assert_eq!(first.turns_cancelled, 1);
         assert_eq!(first.steps_closed, 1);
 
-        let second = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        let second = recovery.on_startup().await;
         assert_eq!(second.turns_inspected, 0);
         assert_eq!(second.turns_cancelled, 0);
         assert_eq!(second.steps_closed, 0);
@@ -831,7 +822,9 @@ mod tests {
         let lifecycle = Arc::new(TurnLifecycle::new(store));
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let summary = recover_orphaned_traces_and_turns(trace, lifecycle.clone()).await;
+        let summary = TurnRecovery::new(trace, lifecycle.clone())
+            .on_startup()
+            .await;
         assert_eq!(summary.turns_cancelled, 1);
         assert_eq!(summary.steps_closed, 0);
 
@@ -858,7 +851,9 @@ mod tests {
         let lifecycle = Arc::new(TurnLifecycle::new(store));
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let summary = recover_orphaned_traces_and_turns(trace, lifecycle.clone()).await;
+        let summary = TurnRecovery::new(trace, lifecycle.clone())
+            .on_startup()
+            .await;
         assert_eq!(summary.turns_inspected, 0);
         assert_eq!(summary.turns_cancelled, 0);
 
@@ -905,7 +900,9 @@ mod tests {
         );
         trace.save_span(&span.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        let summary = TurnRecovery::new(trace.clone(), lifecycle.clone())
+            .on_startup()
+            .await;
         assert_eq!(summary.turns_inspected, 1);
         assert_eq!(summary.turns_cancelled, 0);
         assert_eq!(summary.steps_closed, 1);
@@ -943,13 +940,9 @@ mod tests {
         let step = pending_step(turn.id, t0 + Duration::seconds(1));
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_panicked_actor_session(
-            trace.clone(),
-            lifecycle.clone(),
-            &turn.session_id,
-            crash_at,
-        )
-        .await;
+        let summary = TurnRecovery::new(trace.clone(), lifecycle.clone())
+            .on_actor_panic(&turn.session_id, crash_at)
+            .await;
 
         assert_eq!(
             summary.turns_cancelled, 1,

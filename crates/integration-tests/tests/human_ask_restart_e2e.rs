@@ -72,6 +72,7 @@ async fn boot(
         b = b.with_resume_door();
     }
     let harness = b.build();
+    harness.recovery.on_startup().await;
     let registry = Arc::new(ChannelRegistry::new());
     boot::install_channels(
         &registry,
@@ -151,7 +152,7 @@ async fn raise_then_shut_down(db: &Path, session: &Session, runs: &Arc<AtomicUsi
     assert_eq!(rows.len(), 1, "{rows:?}");
     let ask_id = rows[0].ask_id.clone();
 
-    harness.actor_parent_token.cancel();
+    harness.actor_root_token.cancel();
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
         completed_for_call(&outputs),
@@ -412,7 +413,7 @@ async fn a_message_queued_behind_a_parked_turn_does_not_run_at_shutdown() {
 
     harness.send_text("never mind").await.expect("send");
     reply(&harness, "ok");
-    harness.actor_parent_token.cancel();
+    harness.actor_root_token.cancel();
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     assert!(!replied(&outputs, "ok"), "{outputs:#?}");
@@ -622,7 +623,7 @@ async fn an_answer_to_a_repeated_tool_use_id_survives_a_restart() {
             renamed, CALL_ID,
             "the repeat is renamed before it is recorded"
         );
-        harness.actor_parent_token.cancel();
+        harness.actor_root_token.cancel();
         harness.drain_outputs(DRAIN_TIMEOUT).await;
         tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
             .await
@@ -708,6 +709,7 @@ async fn an_answer_claimed_before_a_crash_is_redriven_by_the_next_boot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_question_survives_a_restart_and_its_answer_resumes_the_turn() {
     use baybo_model::human_ask::{AskKind, QuestionAnswer};
+    use baybo_turn::{CancelReason, TurnStatus};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join(DB_FILE);
@@ -726,7 +728,7 @@ async fn a_question_survives_a_restart_and_its_answer_resumes_the_turn() {
     });
 
     // First boot: model invokes AskUser, parks on the question, then process shuts down.
-    let ask_id = {
+    let (ask_id, settled_turn) = {
         let store = Store::open(&db).await.expect("open the database");
         store
             .session
@@ -758,24 +760,37 @@ async fn a_question_survives_a_restart_and_its_answer_resumes_the_turn() {
             .expect("list asks");
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].kind, AskKind::Question);
-        let ask_id = rows[0].ask_id.clone();
-
-        harness.actor_parent_token.cancel();
-        let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
-        assert_eq!(
-            completed_for_call(&outputs),
-            0,
-            "shutdown emits nothing for the parked question"
-        );
+        let turn_id = rows[0].turn_id;
+        let turns = Arc::clone(&harness.turn_lifecycle);
         assert_eq!(harness.strict_rejections.load(Ordering::SeqCst), 0);
         tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
             .await
             .expect("the actor quiesces");
-        ask_id
+        let old_turn = turns.get(&turn_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                old_turn.status,
+                TurnStatus::Cancelled {
+                    reason: CancelReason::ParentCancelled,
+                    ..
+                }
+            ),
+            "shutdown returned with {:?}",
+            old_turn.status
+        );
+        (rows[0].ask_id.clone(), old_turn)
     };
 
     // Second boot over the same sqlite db.
     let mut node = boot(&db, &session, &runs, true, |_| {}).await;
+    let old_turn = node
+        .harness
+        .turn_lifecycle
+        .get(&settled_turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_turn.status, settled_turn.status);
 
     let cards = node.owner.pending_asks(&session.id);
     assert_eq!(
@@ -924,7 +939,7 @@ async fn a_turn_parked_on_two_asks_resumes_on_the_last_answer() {
         })
         .await
         .expect("both calls park on an approval");
-        harness.actor_parent_token.cancel();
+        harness.actor_root_token.cancel();
         harness.drain_outputs(DRAIN_TIMEOUT).await;
         tokio::time::timeout(WAIT_TIMEOUT, harness.shutdown())
             .await

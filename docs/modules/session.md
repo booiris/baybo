@@ -86,7 +86,7 @@ Session rows and their transcripts are core user data and are **never** dropped 
 
 1. The actor reaper (`AgentSupervisor::reap_idle`) periodically calls `SessionManager::idle_sessions(threshold)`.
 2. That computes `cutoff = now - threshold` and returns `SessionStore::list_expired(cutoff)` — a list of candidate session IDs and nothing more. The method's doc-comment states it "must never become a delete."
-3. For each candidate that has a live registered actor (and no in-flight background subagents), the supervisor sends `AgentMessage::ActorStop`, which trips the actor's cancellation token and lets the registry guard drop the in-memory entry.
+3. For each candidate that has a live registered actor (and no in-flight background subagents), the supervisor sends `AgentMessage::ActorStop`, which trips the actor's cancellation token and lets the actor runner remove its closed mailbox.
 4. The session row, transcript, and channel binding all stay live; the next user message re-hydrates a fresh actor from the store. Dropping the actor is therefore lossless.
 
 ## Collaboration

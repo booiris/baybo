@@ -143,6 +143,10 @@ impl<T: Prioritized> MailboxSender<T> {
         }
     }
 
+    pub(super) fn is_closed(&self) -> bool {
+        self.shared.capacity.is_closed()
+    }
+
     /// Non-blocking enqueue: `Full` when at capacity, `Closed` once the
     /// receiver is gone.
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {

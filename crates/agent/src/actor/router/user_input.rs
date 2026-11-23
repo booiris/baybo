@@ -147,46 +147,9 @@ impl Router {
         // Update last active time
         self.session_manager.touch(&typed_session_id).await?;
 
-        // Route to the session's actor, lazily spawning one if the
-        // session has no live actor yet. The spawner pins the loop to
-        // `session.state.last_llm` — the per-session model the chat
-        // `PUT /v1/chat/sessions/{id}/model` endpoint persisted — or
-        // `None` (pool default) when the session was never switched. A
-        // live actor is re-pinned in place via `AgentMessage::SetModel`,
-        // so this read only matters for a cold spawn / post-eviction
-        // hydration. (`SubagentSpawnRequest` is the other path that pins
-        // a non-default model, via `model_tier`.)
-        let response_tx = self.supervisor.response_tx().clone();
-        let parent_token = self.actor_parent_token.clone();
-        let actor_spawner = self.actor_spawner.as_ref();
-        let message = AgentMessage::UserInput(Box::new(incoming));
-        // A live actor already carries its pins, and resolving them reads the
-        // profile row — a query per message on a session that needs none of
-        // it. `route_or_spawn`'s closure is synchronous, so the only way to
-        // skip that read is to find out first whether a spawn is coming.
-        let routed = match self
-            .supervisor
-            .route_existing(&session_id, message.clone())
-            .await
-        {
-            Some(routed) => routed,
-            None => {
-                let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
-                self.supervisor
-                    .route_or_spawn(&session_id, message, || {
-                        let actor_token = parent_token.child_token();
-                        actor_spawner(
-                            session,
-                            pins.entry,
-                            pins.model,
-                            pins.effort,
-                            response_tx,
-                            actor_token,
-                        )
-                    })
-                    .await
-            }
-        };
+        let routed = self
+            .route_one_to_actor(&session, AgentMessage::UserInput(Box::new(incoming)))
+            .await;
         if !routed {
             anyhow::bail!("failed to route user input to actor for session '{session_id}'");
         }
@@ -339,11 +302,7 @@ impl Router {
         {
             for incoming in sanitized {
                 if !self
-                    .route_one_to_actor(
-                        &session_id,
-                        &session,
-                        AgentMessage::UserInput(Box::new(incoming)),
-                    )
+                    .route_one_to_actor(&session, AgentMessage::UserInput(Box::new(incoming)))
                     .await
                 {
                     anyhow::bail!(
@@ -355,11 +314,7 @@ impl Router {
         }
 
         if !self
-            .route_one_to_actor(
-                &session_id,
-                &session,
-                AgentMessage::UserInputBatch(sanitized),
-            )
+            .route_one_to_actor(&session, AgentMessage::UserInputBatch(sanitized))
             .await
         {
             anyhow::bail!("failed to route user batch to actor for session '{session_id}'");
@@ -393,42 +348,10 @@ impl Router {
         if let Err(e) = self.session_manager.touch(&req.session_id).await {
             warn!(session_id = %req.session_id, error = %e, "could not stamp activity for a resumed ask");
         }
-        let routed = self
-            .route_one_to_actor(&req.session_id, &session, message)
-            .await;
+        let routed = self.route_one_to_actor(&session, message).await;
         if !routed {
             warn!(session_id = %req.session_id, ask_id = %req.ask_id, "could not route a resume to the session's actor");
         }
-    }
-
-    /// Route one `AgentMessage` to the session's actor, cold-spawning from
-    /// `session` if needed. The spawn closure clones `session` so this can be
-    /// called repeatedly (the slash-split batch path); the clone is only paid on
-    /// the rare cold-spawn branch.
-    async fn route_one_to_actor(
-        &self,
-        session_id: &SessionId,
-        session: &baybo_model::Session,
-        message: AgentMessage,
-    ) -> bool {
-        let response_tx = self.supervisor.response_tx().clone();
-        let parent_token = self.actor_parent_token.clone();
-        let actor_spawner = self.actor_spawner.as_ref();
-        let session = session.clone();
-        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
-        self.supervisor
-            .route_or_spawn(session_id, message, || {
-                let actor_token = parent_token.child_token();
-                actor_spawner(
-                    session,
-                    pins.entry,
-                    pins.model,
-                    pins.effort,
-                    response_tx,
-                    actor_token,
-                )
-            })
-            .await
     }
 
     /// Execute `/stop`: cancel the session's in-flight turn + every in-flight
@@ -761,9 +684,15 @@ mod tests {
 
     fn fixture(rate_limit_max: usize, detector: LeakDetector) -> RouterFixture {
         let (response_tx, response_rx) = mpsc::channel(64);
+        let turn_lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
         let supervisor = AgentSupervisor::new(
             response_tx,
             std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
+            tokio_util::sync::CancellationToken::new(),
+            crate::recovery::TurnRecovery::new(
+                Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+                Arc::clone(&turn_lifecycle),
+            ),
         );
         let session_store = Arc::new(MemorySessionStore::new());
         let sessions = Arc::new(SessionManager::new(
@@ -774,7 +703,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new()));
         let mailboxes_for_closure = Arc::clone(&mailboxes);
         let actor_spawner: ActorSpawner =
-            Arc::new(move |_session, _llm, _model, _effort, _tx, _token| {
+            Arc::new(move |_session, _pins, _registry, _tx, _token| {
                 let (sender, receiver) = mailbox::channel(16);
                 mailboxes_for_closure.lock().push(receiver);
                 sender
@@ -794,14 +723,13 @@ mod tests {
                 SpendingLimits::default(),
             ),
             actor_spawner,
-            turn_lifecycle: Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new()))),
+            turn_lifecycle,
             cron_store: Arc::new(InMemoryCronStore::new()) as Arc<dyn CronStore>,
             agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
             cron_trigger_rx,
             issue_run_rx: None,
             ask_resume_rx: None,
             board: None,
-            actor_parent_token: CancellationToken::new(),
             rate_limit: LiveRateLimit::new(rate_limit_max, Duration::from_secs(60)),
             workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
                 "/tmp/baybo-user-input-test",

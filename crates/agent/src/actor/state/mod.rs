@@ -84,17 +84,12 @@ pub struct VolatileResources {
     pub response_tx: mpsc::Sender<AgentOutput>,
     pub turn_lifecycle: Arc<TurnLifecycle>,
     pub span_recorder: Arc<SpanRecorder>,
-    /// Lifetime token for this actor. Derived as a child of the
-    /// `parent_token` passed at construction. For top-level user/cron
-    /// sessions the parent is the process-wide actor parent token; for
-    /// subagent children it is the originating parent actor's
-    /// `actor_token`, so parent shutdown cascades automatically via the
-    /// `tokio_util` token tree.
+    /// Lifetime token for this actor. Top-level actors and background-eligible
+    /// subagents derive it from the supervisor's root token. Foreground-only
+    /// subagents derive it from the spawning call's cancellation token.
     pub actor_token: CancellationToken,
-    /// Supervisor handle used by [`crate::actor::supervisor::ActorRegistryGuard`]
-    /// in [`crate::actor::AgentActor::run`] to self-deregister when the
-    /// task exits. `None` for one-shot actors that are not tracked by
-    /// the supervisor (cron fires, maintenance spawns, tests).
+    /// Routed actors register their active turn for idle release and remove their
+    /// mailbox on exit. One-shot actors have no routing entry.
     pub supervisor: Option<AgentSupervisor>,
     /// Session-row writer used by handlers whose state mutations must
     /// survive actor eviction. Today only the background-subagent

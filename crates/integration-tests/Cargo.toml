@@ -24,7 +24,7 @@ path = "tests/all.rs"
 # graph entirely.
 
 [dependencies]
-baybo-agent = { workspace = true }
+baybo-agent = { workspace = true, features = ["test-support"] }
 baybo-channels = { workspace = true }
 baybo-context = { workspace = true }
 baybo-cost = { workspace = true, features = ["test-support"] }

@@ -232,13 +232,13 @@ in-flight tool call) is closed immediately by `runtime::scope::with_span`'s Drop
 guard, and has to be — recovery reaches pending spans only under a step that is
 itself unfinished, and that step closes normally on the same unwind.
 
-At boot, `recover_orphaned_traces_and_turns` walks non-terminal turns from the
+At boot, `TurnRecovery::on_startup` walks non-terminal turns from the
 prior process, closes pending spans/steps at the last observed child activity,
 and cancels the turn as `SystemCrash`. It also asks `TraceStore` for unfinished
 steps so detached work under already-terminal turns (title generation, progress
 observer) is closed without reopening or cancelling the owning turn. While the
-process is still alive, `recover_panicked_actor_session` performs the same repair
-for the panicked session's active chat turns, using the actor task's crash time
+process is still alive, `TurnRecovery::on_actor_panic` performs the same repair
+for all non-terminal turns in the panicked session, using the actor task's crash time
 as the close time.
 
 ## Constraints

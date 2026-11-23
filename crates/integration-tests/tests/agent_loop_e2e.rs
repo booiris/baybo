@@ -20,11 +20,11 @@
 //!      `shutdown()` to stop the actor cleanly.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
+use baybo_agent::BackgroundJobManager;
 use baybo_agent::actor::AgentMessage;
-use baybo_agent::{AgentSupervisor, BackgroundJobManager};
 use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, ToolStatus};
 use baybo_cost::SpendingLimits;
 use baybo_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
@@ -375,7 +375,7 @@ async fn tool_call_round_trip_invokes_recording_tool() {
 
 #[tokio::test(start_paused = true)]
 async fn large_tool_result_is_stored_once_and_trace_points_to_transcript() {
-    use baybo_store::{SessionStore, TraceStore, TurnStore};
+    use baybo_store::{SessionStore, TurnStore};
     use baybo_trace::{SpanKind, ToolCallOutput};
 
     let payload = format!("persist-this-tool-result:{}", "x".repeat(8 * 1024));
@@ -1746,27 +1746,11 @@ async fn several_ungrouped_results_drain_into_one_batch_framed_with_its_count() 
 async fn shutdown_kills_background_command_without_persisting_notification() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
-    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(8);
-    let supervisor = AgentSupervisor::new(
-        response_tx,
-        std::sync::Arc::new(baybo_human_ask::test_support::NoLivePendingAsks),
-    );
-    supervisor
-        .register_if_absent(session_id.clone(), harness.mailbox.clone())
-        .expect("harness actor is registered once");
-
-    let supervisor_slot = Arc::new(OnceLock::new());
-    assert!(
-        supervisor_slot.set(supervisor.clone()).is_ok(),
-        "supervisor slot is initialized once"
-    );
-    let shutdown = CancellationToken::new();
+    let supervisor = harness.supervisor.clone();
+    let shutdown = supervisor.root_token();
     let killed = CancellationToken::new();
-    let manager = BackgroundJobManager::new(
-        supervisor_slot,
-        Arc::clone(&harness.session_manager),
-        shutdown.clone(),
-    );
+    let manager =
+        BackgroundJobManager::new(supervisor.clone(), Arc::clone(&harness.session_manager));
 
     // A job that only ends when cancelled, like a long-running server.
     let cancel = CancellationToken::new();
@@ -5408,7 +5392,7 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
     // detail renders the span's recorded `result`, so a blank result would
     // hide what the model produced before the abort even though the
     // transcript kept it.
-    use baybo_trace::{Span, SpanKind, Step, TraceStore};
+    use baybo_trace::{Span, SpanKind, Step};
     let steps: Vec<Step> = trace_store
         .list_steps_by_turn(&turn_id)
         .await
@@ -5731,7 +5715,7 @@ async fn a_turn_that_churns_one_file_is_told_it_made_no_progress() {
 #[tokio::test(start_paused = true)]
 async fn an_llm_span_records_its_tool_set_by_reference() {
     use baybo_store::TurnStore;
-    use baybo_trace::{SpanKind, TraceStore};
+    use baybo_trace::SpanKind;
 
     let tool = Arc::new(RecordingTool::new("echo_tool"));
     let manifest = tool.manifest();

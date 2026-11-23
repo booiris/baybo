@@ -26,7 +26,7 @@ use std::time::Instant;
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_cron::CronTriggerEvent;
 use baybo_model::human_ask::ResumeRequest;
-use baybo_model::{LlmEntryName, LlmPin, Session};
+use baybo_model::{LlmPin, Session};
 use baybo_project::IssueRunEvent;
 use baybo_store::agent_profile::AgentProfileStore;
 use tokio::sync::mpsc;
@@ -115,6 +115,9 @@ impl RateLimiter {
     }
 }
 
+/// A routed actor receives its supervisor for mailbox and idle-turn registration.
+/// A one-shot receives `None`. Both run under the same shutdown tracker.
+///
 /// Builds and spawns an [`AgentActor`] for `session`, returning its
 /// mailbox. `actor_token` is installed as the actor's
 /// `VolatileResources::actor_token` — callers that need to cancel
@@ -130,9 +133,8 @@ impl RateLimiter {
 pub type ActorSpawner = Arc<
     dyn Fn(
             Session,
-            /* initial_llm */ Option<LlmEntryName>,
-            /* initial_model */ Option<String>,
-            /* initial_effort */ Option<String>,
+            LlmPin,
+            Option<AgentSupervisor>,
             mpsc::Sender<AgentOutput>,
             /* actor_token */ CancellationToken,
         ) -> MailboxSender<AgentMessage>
@@ -147,25 +149,16 @@ pub type ActorSpawner = Arc<
 /// registers the handle with the supervisor (one-shot sessions have no
 /// follow-up traffic, so registering would just accumulate dangling
 /// handles). The persistent counterpart for user sessions lives in
-/// [`AgentSupervisor::route_or_spawn`].
+/// [`AgentSupervisor`].
 pub(crate) fn build_oneshot_actor(
     actor_spawner: &ActorSpawner,
     parent_token: &CancellationToken,
     session: Session,
-    initial_llm: Option<LlmEntryName>,
-    initial_model: Option<String>,
-    initial_effort: Option<String>,
+    pins: LlmPin,
     response_tx: mpsc::Sender<AgentOutput>,
 ) -> (MailboxSender<AgentMessage>, CancellationToken) {
     let actor_token = parent_token.child_token();
-    let mailbox = actor_spawner(
-        session,
-        initial_llm,
-        initial_model,
-        initial_effort,
-        response_tx,
-        actor_token.clone(),
-    );
+    let mailbox = actor_spawner(session, pins, None, response_tx, actor_token.clone());
     (mailbox, actor_token)
 }
 
@@ -277,11 +270,6 @@ pub struct Router {
     /// the card. `None` in assemblies with no board (the TUI's embedded
     /// runtime), which also have no `issue_run_rx`.
     board: Option<Arc<baybo_project::ProjectManager>>,
-    /// Cancellation parent passed to every top-level actor the router
-    /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
-    /// each actor derives its `actor_token` as a child of this so
-    /// process shutdown cascades into every in-flight turn.
-    actor_parent_token: CancellationToken,
     /// Workspace addresses. The dream fire's digest names each
     /// conversation by its virtual transcript path and each agent by its
     /// memory directory, and both are composed from here.
@@ -320,9 +308,6 @@ pub struct RouterConfig {
     pub ask_resume_rx: Option<mpsc::Receiver<ResumeRequest>>,
     /// See [`Router::board`]. `None` in an assembly with no board.
     pub board: Option<Arc<baybo_project::ProjectManager>>,
-    /// Cancellation parent passed to every top-level actor the router
-    /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
-    pub actor_parent_token: CancellationToken,
     /// Per-user sliding-window rate limit, shared live with the config
     /// reloader so `cost.rate_limit` edits take effect without
     /// rebuilding the router. Production wiring sources it from config;
@@ -350,7 +335,6 @@ impl Router {
             issue_run_rx,
             ask_resume_rx,
             board,
-            actor_parent_token,
             rate_limit,
             workspace,
             inbound_dedup,
@@ -370,10 +354,20 @@ impl Router {
             issue_run_rx,
             ask_resume_rx,
             board,
-            actor_parent_token,
             workspace,
             inbound_dedup,
         }
+    }
+
+    async fn route_one_to_actor(&self, session: &Session, message: AgentMessage) -> bool {
+        self.supervisor
+            .route_session(
+                session,
+                message,
+                &self.actor_spawner,
+                resolve_spawn_pins(session, &self.agent_profiles),
+            )
+            .await
     }
 
     /// Start all channels and begin routing messages.
@@ -393,9 +387,11 @@ impl Router {
         let mut cron_rx = self.cron_trigger_rx.take();
         let mut issue_rx = self.issue_run_rx.take();
         let mut resume_rx = self.ask_resume_rx.take();
+        let shutdown = self.supervisor.root_token();
 
         loop {
             tokio::select! {
+                _ = shutdown.cancelled() => return,
                 Some(inbound) = incoming_rx.recv() => {
                     match inbound {
                         RouterInbound::One(incoming) => {
@@ -441,12 +437,11 @@ impl Router {
                 }
                 else => {
                     info!("router channels closed, shutting down");
-                    break;
+                    shutdown.cancel();
+                    return;
                 }
             }
         }
-
-        self.supervisor.shutdown_all().await;
     }
 
     /// Thin instance wrapper over [`build_oneshot_actor`] for the cron
@@ -454,9 +449,7 @@ impl Router {
     fn spawn_oneshot_actor(
         &self,
         session: Session,
-        initial_llm: Option<LlmEntryName>,
-        initial_model: Option<String>,
-        initial_effort: Option<String>,
+        pins: LlmPin,
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
     ) -> (MailboxSender<AgentMessage>, CancellationToken) {
@@ -464,9 +457,7 @@ impl Router {
             &self.actor_spawner,
             parent_token,
             session,
-            initial_llm,
-            initial_model,
-            initial_effort,
+            pins,
             response_tx,
         )
     }
@@ -475,6 +466,7 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_model::LlmEntryName;
 
     #[test]
     fn live_rate_limit_swap_changes_cap() {
