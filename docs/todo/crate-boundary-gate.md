@@ -16,10 +16,10 @@ only real bound, and a CRUD trait bounds nothing.
 
 The agent router used to read and write delivery records through `Arc<dyn CronStore>`.
 It also repeated the scheduler's rule for which executions to replay.
-The router and origin actor now share a `baybo_cron::CronDeliveryLedger` backed by
-the runtime's `CronScheduler`. Its three operations record completion, mark
+The router and origin actor now share a `baybo_cron::CronDeliveryLedger` over
+the same store as the scheduler. Its three operations record completion, mark
 delivery resolved and list completed one-shots awaiting delivery. The cron tests
-and agent delivery fixtures exercise the same scheduler implementation.
+and agent delivery fixtures exercise the same ledger implementation.
 
 `NeverShutdown` is already gated by `cfg(test)` or the `test-support` feature.
 

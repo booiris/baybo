@@ -177,25 +177,18 @@ const TICK_INTERVAL: Duration = Duration::from_secs(10);
 const UPDATE_ATTEMPTS: usize = 3;
 
 /// The execution ledger used to deliver one-shot results to their origin conversation.
-#[async_trait::async_trait]
-pub trait CronDeliveryLedger: Send + Sync {
-    /// Record the fire's outcome before attempting delivery.
-    async fn record_execution_completion(
-        &self,
-        execution_id: &str,
-        completion: ExecutionCompletion,
-    ) -> Result<()>;
-
-    /// Resolve a delivery after a successful append or a terminal drop.
-    async fn mark_execution_notified(&self, execution_id: &str, at: DateTime<Utc>) -> Result<()>;
-
-    /// Completed one-shot executions whose delivery is still unresolved.
-    async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>>;
+#[derive(Clone)]
+pub struct CronDeliveryLedger {
+    store: Arc<dyn CronStore>,
 }
 
-#[async_trait::async_trait]
-impl CronDeliveryLedger for CronScheduler {
-    async fn record_execution_completion(
+impl CronDeliveryLedger {
+    pub fn new(store: Arc<dyn CronStore>) -> Self {
+        Self { store }
+    }
+
+    /// Record the fire's outcome before attempting delivery.
+    pub async fn record_execution_completion(
         &self,
         execution_id: &str,
         completion: ExecutionCompletion,
@@ -206,14 +199,20 @@ impl CronDeliveryLedger for CronScheduler {
             .map_err(CronError::from)
     }
 
-    async fn mark_execution_notified(&self, execution_id: &str, at: DateTime<Utc>) -> Result<()> {
+    /// Resolve a delivery after a successful append or a terminal drop.
+    pub async fn mark_execution_notified(
+        &self,
+        execution_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
         self.store
             .mark_execution_notified(execution_id, at)
             .await
             .map_err(CronError::from)
     }
 
-    async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
+    /// Completed one-shot executions whose delivery is still unresolved.
+    pub async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
         let rows = self.store.list_executions_awaiting_delivery().await?;
         Ok(rows
             .into_iter()
@@ -3195,7 +3194,9 @@ mod tests {
     /// deliver elsewhere).
     #[tokio::test]
     async fn awaiting_delivery_scan_covers_one_shots_until_resolved() {
-        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let store = Arc::new(InMemoryCronStore::new());
+        let (scheduler, _rx) = scheduler_over(store.clone());
+        let ledger = CronDeliveryLedger::new(store);
 
         let one_shot = scheduler
             .create_job(spec(
@@ -3211,7 +3212,7 @@ mod tests {
 
         // Neither has completed yet.
         assert!(
-            scheduler
+            ledger
                 .list_executions_awaiting_delivery()
                 .await
                 .unwrap()
@@ -3219,7 +3220,7 @@ mod tests {
         );
 
         for exec_id in [&one_shot_exec.id, &recurring_exec.id] {
-            scheduler
+            ledger
                 .record_execution_completion(
                     exec_id,
                     ExecutionCompletion {
@@ -3233,7 +3234,7 @@ mod tests {
                 .unwrap();
         }
 
-        let awaiting = scheduler.list_executions_awaiting_delivery().await.unwrap();
+        let awaiting = ledger.list_executions_awaiting_delivery().await.unwrap();
         assert_eq!(
             awaiting.len(),
             1,
@@ -3241,12 +3242,12 @@ mod tests {
         );
         assert_eq!(awaiting[0].id, one_shot_exec.id);
 
-        scheduler
+        ledger
             .mark_execution_notified(&one_shot_exec.id, Utc::now())
             .await
             .unwrap();
         assert!(
-            scheduler
+            ledger
                 .list_executions_awaiting_delivery()
                 .await
                 .unwrap()

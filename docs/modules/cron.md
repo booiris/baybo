@@ -142,7 +142,7 @@ The header is **English**, like every other prompt in the tree — the model rea
 
 ### At-least-once delivery, exactly-once transcript
 
-The router and origin actor access the delivery ledger through `baybo_cron::CronDeliveryLedger`, implemented by the runtime's `CronScheduler`. The waiter records completion, the actor or router marks delivery resolved, and the scheduler selects completed one-shots awaiting delivery for boot replay.
+The router and origin actor access the delivery ledger through `baybo_cron::CronDeliveryLedger`, which shares the scheduler's underlying `CronStore`. The waiter records completion, the actor or router marks delivery resolved, and the ledger selects completed one-shots awaiting delivery for boot replay.
 
 The ledger fields on `CronExecution` (`completed_at` … `notified_at`) make delivery recoverable. `notified_at` records a **resolution**, not merely a success: it is stamped both when the result lands and when it is terminally dropped (no usable origin), so the boot re-drive's scan (`completed_at IS NOT NULL AND notified_at IS NULL`, both projected into indexed columns) converges instead of re-attempting a hopeless delivery on every boot.
 

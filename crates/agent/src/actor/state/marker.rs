@@ -85,6 +85,9 @@ impl Volatile for crate::runtime::agent_loop::AgentLoop {}
 impl sealed::Sealed for crate::actor::supervisor::AgentSupervisor {}
 impl Volatile for crate::actor::supervisor::AgentSupervisor {}
 
+impl sealed::Sealed for baybo_cron::CronDeliveryLedger {}
+impl Volatile for baybo_cron::CronDeliveryLedger {}
+
 // === Derived<T>: values rebuilt from the durable layer ===
 
 /// A wrapper for values whose authoritative state lives in
@@ -168,7 +171,7 @@ mod tests {
         assert_volatile::<CancellationToken>();
         assert_volatile::<Option<AgentSupervisor>>();
         assert_volatile::<Arc<SessionManager>>();
-        assert_volatile::<Arc<dyn CronDeliveryLedger>>();
+        assert_volatile::<CronDeliveryLedger>();
     }
 
     #[test]

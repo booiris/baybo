@@ -252,7 +252,7 @@ pub struct Router {
     /// Delivery ledger for one-shot cron results: the cron waiter stamps a
     /// fire's outcome here, and `run()` scans it at boot to re-drive results
     /// that never reached their conversation.
-    cron_ledger: Arc<dyn CronDeliveryLedger>,
+    cron_ledger: CronDeliveryLedger,
     agent_profiles: Arc<dyn AgentProfileStore>,
     /// Stored as `Option<Receiver>` so `run()` can `take()` it out of
     /// `self` to drive in a `select!` arm; populated unconditionally from
@@ -295,7 +295,7 @@ pub struct RouterConfig {
     pub actor_spawner: ActorSpawner,
     pub turn_lifecycle: Arc<TurnLifecycle>,
     /// Delivery ledger for one-shot cron results — see [`Router::cron_ledger`].
-    pub cron_ledger: Arc<dyn CronDeliveryLedger>,
+    pub cron_ledger: CronDeliveryLedger,
     /// Read at cold spawn to fall back to a bound agent's LLM pin — see
     /// [`resolve_spawn_pins`].
     pub agent_profiles: Arc<dyn AgentProfileStore>,

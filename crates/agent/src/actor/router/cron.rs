@@ -803,7 +803,7 @@ impl Router {
         CronResultDelivery {
             session_manager: Arc::clone(&self.session_manager),
             supervisor: self.supervisor.clone(),
-            ledger: Arc::clone(&self.cron_ledger),
+            ledger: self.cron_ledger.clone(),
             actor_spawner: Arc::clone(&self.actor_spawner),
             agent_profiles: Arc::clone(&self.agent_profiles),
         }
@@ -1068,7 +1068,7 @@ fn pending_result_from_execution(exec: &CronExecution) -> Option<PendingCronResu
 pub(super) struct CronResultDelivery {
     session_manager: Arc<SessionManager>,
     supervisor: AgentSupervisor,
-    ledger: Arc<dyn CronDeliveryLedger>,
+    ledger: CronDeliveryLedger,
     actor_spawner: ActorSpawner,
     /// The origin conversation may be bound to an agent, so hydrating it has
     /// the same pin resolution as any other cold spawn.
@@ -1343,7 +1343,7 @@ mod tests {
                 ),
                 actor_spawner,
                 turn_lifecycle: Arc::clone(&turn_lifecycle),
-                cron_ledger: cron_store.delivery_ledger(),
+                cron_ledger: CronDeliveryLedger::new(cron_store.clone()),
                 cron_trigger_rx,
                 issue_run_rx: None,
                 ask_resume_rx: None,

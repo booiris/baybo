@@ -996,7 +996,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
     // minimal.
     let cost_manager = Arc::clone(&graph.cost_manager);
     let llm_pool = Arc::clone(&graph.llm_pool);
-    let cron_ledger: Arc<dyn baybo_cron::CronDeliveryLedger> = graph.cron_scheduler.clone();
+    let cron_ledger = baybo_cron::CronDeliveryLedger::new(Arc::clone(&graph.stores.cron));
 
     // Single `Arc`-shared actor factory: used by the router for top-level
     // user/cron actors and by the subagent spawner for child actors.
@@ -1016,7 +1016,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
         let sessions = Arc::clone(&graph.session_manager);
         // The actor stamps a one-shot cron result's delivery here once it has
         // appended it to the scheduling conversation.
-        let cron_ledger = Arc::clone(&cron_ledger);
+        let cron_ledger = cron_ledger.clone();
         let subagent_registry = Arc::clone(&graph.subagent_registry);
         let workspace_paths_arc = Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root().to_path_buf(),
@@ -1113,7 +1113,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> anyhow::Result<RouterRunHa
                         actor_token,
                         supervisor: registry,
                         session_manager: Arc::clone(&sessions),
-                        cron_ledger: Arc::clone(&cron_ledger),
+                        cron_ledger: cron_ledger.clone(),
                         workspace: Arc::clone(&workspace_paths_arc),
                     },
                 );

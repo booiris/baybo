@@ -3,8 +3,6 @@
 //! `baybo-cron = { workspace = true, features = ["test-support"] }` in their
 //! `[dev-dependencies]`.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use baybo_model::{CronExecution, CronJob, CronStatus, ExecutionStatus};
 use baybo_store::StorageError;
@@ -32,16 +30,6 @@ pub struct InMemoryCronStore {
 impl InMemoryCronStore {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Use the scheduler's production delivery rules over these fixture rows.
-    pub fn delivery_ledger(self: &Arc<Self>) -> Arc<dyn crate::CronDeliveryLedger> {
-        let (trigger_tx, _) = tokio::sync::mpsc::channel(1);
-        Arc::new(crate::CronScheduler::new(
-            self.clone(),
-            trigger_tx,
-            Arc::new(crate::NeverShutdown),
-        ))
     }
 
     /// Every execution row, for assertions on the delivery ledger.

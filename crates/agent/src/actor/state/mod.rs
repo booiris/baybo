@@ -103,7 +103,7 @@ pub struct VolatileResources {
     /// result is the one that knows the delivery is done, so it is the one
     /// that stamps `notified_at` — closing out the boot re-drive that would
     /// otherwise replay it (`AgentMessage::CronResultReady`).
-    pub cron_ledger: Arc<dyn CronDeliveryLedger>,
+    pub cron_ledger: CronDeliveryLedger,
     /// Workspace addresses. The background-notification prompt needs them to
     /// name a finished child's virtual transcript path, so a truncated result
     /// tells the parent where the rest actually is.
@@ -126,7 +126,7 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     assert_volatile::<CancellationToken>();
     assert_volatile::<Option<AgentSupervisor>>();
     assert_volatile::<Arc<SessionManager>>();
-    assert_volatile::<Arc<dyn CronDeliveryLedger>>();
+    assert_volatile::<CronDeliveryLedger>();
     assert_volatile::<Arc<baybo_workspace::WorkspacePaths>>();
 };
 
