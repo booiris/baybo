@@ -71,9 +71,10 @@ The keyed swap commits ASYNCHRONOUSLY inside a webview that stays visible
 web-side mechanisms keep the transition clean. A cross-session `init`
 synchronously veils `#root` (`concealForRetarget` in `bridge.ts`) so the
 outgoing conversation vanishes on the next frame instead of lingering under
-the incoming commit; the incoming tree lifts the veil from its mount layout
-effect — the reveal and its first paint are one frame — with a timeout
-failsafe so a throwing mount can't leave the page blank. And the mount is
+the incoming commit; the incoming tree lifts the veil from its layout effect
+once the bottom inset is known — the reveal and its first visible paint are
+one frame. A timeout can lift the retarget veil after a failed mount, but cannot
+bypass an unknown inset. And the mount is
 BOUNDED: only the mirror's newest `FIRST_PAINT_ROWS` mount at open, and the
 older half is a paging RESERVOIR (`popDeferredHeadPage`), fed to `loadOlder`
 one page at a time before the network is ever asked. It must never be
@@ -403,7 +404,7 @@ send, a turn that never starts (`AWAITING_MAX_MS`), and turn end retire the two 
 `app/web` has always done it this way (`sendToSession` writes `awaitingReply: true` in the
 same `setViews` that appends the pending row); iOS was the divergent one.
 
-Beware the other four writers of `scrollTop = scrollHeight` when touching this — the
+Other paths also pin the transcript to `maxScrollTop(el)`. The
 ResizeObserver on `.chat-log` re-pins any height change the layout effect misses, so a fix
 that only guards one of them does nothing. `transcriptScroll.test.tsx` pins the no-move.
 
@@ -427,6 +428,36 @@ area) and feeds the covered strip over `setBottomInset`; SwiftUI geometry jumps 
 target at animation START, so the web side animates `--thread-bottom-inset` on a
 keyboard-like 250ms curve (`.chat-log.inset-animated`) and re-pins the newest edge per
 frame while following.
+
+The bottom scroll target is the document height minus the layout viewport
+height. During keyboard transitions WebKit can expose an out-of-range target
+for a frame before clamping it. Targeting the full document height moved the
+questions a whole viewport offscreen when the written-answer editor took focus.
+
+The inset ALSO rides the `init` payload (`bottomInset`, null until native has
+measured it), and `applyBottomInset` in `bridge.ts` is the only writer of the
+variable. Both exist for the first paint: the `bottomInset` event is buffered
+until the tree subscribes in a passive effect, and a separate `setBottomInset`
+evaluation can land after the page's first commit — either way the mount pin
+measured a zero inset, painted the newest rows under the composer and then
+jumped up by its height.
+
+If `init.bottomInset` is null, `awaiting-inset` keeps the page hidden until the
+first inset event. The transcript then pins and reveals in a layout effect,
+and only that effect posts `shown`; scheduling a notification immediately after
+`root.render` does not prove the layout is ready. The retarget timeout cannot
+lift this geometry gate. Read-only hosts declare `hasComposer: false` and send
+zero, and the browser preview does the same. A staged replacement inherits the
+old bridge's composer geometry before attachment, so it can settle behind the
+old page without waiting for its own composer to mount.
+
+Composer measurements belong to their `TranscriptTarget` instance, not the
+shared webview. Retargeting cannot seed a new conversation with the outgoing
+composer's height (including its keyboard or draft). A measurement that arrives
+before `onAppear` is retained for that target; a late outgoing callback cannot
+change the incoming inset. Detaching a target discards its measurement.
+Inset bridge calls also carry the session id, so a queued call from the old
+session cannot resolve the incoming page's first-layout gate.
 
 One signal covers keyboard, composer growth, and the notice line.
 

@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
+use super::AskReply;
 use crate::api::FrameSink;
-use crate::core::{WireApprovalDecision, WireAttachment};
+use crate::core::WireAttachment;
 
 use super::pump::{LegActivity, PumpCtx, pump};
 use super::{
@@ -27,7 +28,7 @@ use super::{
 /// reconnect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A chat rotation waits for this long with no `Send`, no `ResolveApproval`
+/// A chat rotation waits for this long with no `Send`, no `ReplyToAsk`
 /// and no inbound frame but keepalives: a lull, not just a turn boundary.
 pub(super) const CHAT_ROTATION_QUIET: Duration = Duration::from_secs(5);
 
@@ -49,12 +50,12 @@ pub(super) enum OutboundCmd {
         msg_id: String,
         attachments: Vec<WireAttachment>,
     },
-    /// The user's answer to a pending tool-approval prompt. Fire-and-forget:
+    /// The user's answer to a pending human prompt. Fire-and-forget:
     /// the gateway answers by resolving the gate and broadcasting
     /// `AskResolved`, which arrives on the inbound frame path.
-    ResolveApproval {
+    ReplyToAsk {
         ask_id: baybo_model::human_ask::AskId,
-        decision: WireApprovalDecision,
+        answer: AskReply,
     },
 }
 
@@ -79,9 +80,9 @@ pub(super) enum Msg {
         attachments: Vec<WireAttachment>,
         reply: Reply,
     },
-    ResolveApproval {
+    ReplyToAsk {
         ask_id: baybo_model::human_ask::AskId,
-        decision: WireApprovalDecision,
+        answer: AskReply,
         reply: Reply,
     },
     Preconnect {
@@ -211,7 +212,7 @@ enum Leg {
 struct Rotation {
     gate: RotationGate,
     task: tokio::task::JoinHandle<()>,
-    /// `Send` / `ResolveApproval` (and, past the commit point, `Open`)
+    /// `Send` / `ReplyToAsk` (and, past the commit point, `Open`)
     /// held until the rotation resolves, then replayed onto whichever leg is
     /// current.
     held: Vec<Msg>,
@@ -270,7 +271,7 @@ struct Supervisor {
     rotation_quiet: Duration,
     /// The dialer has a rotation target to watch.
     rotates: bool,
-    /// When the last `Send` or `ResolveApproval` went out.
+    /// When the last `Send` or `ReplyToAsk` went out.
     last_command: Instant,
     rotation_check: Option<AbortHandle>,
     /// Self-sender for dial children, pumps, and ack timers.
@@ -307,11 +308,11 @@ impl Supervisor {
                 attachments,
                 reply,
             } => self.send_user_message(session_id, text, msg_id, attachments, reply),
-            Msg::ResolveApproval {
+            Msg::ReplyToAsk {
                 ask_id,
-                decision,
+                answer,
                 reply,
-            } => self.resolve_approval(ask_id, decision, reply),
+            } => self.reply_to_ask(ask_id, answer, reply),
             Msg::Preconnect { reply } => self.preconnect(reply),
             Msg::Disconnect { reply } => self.disconnect(reply).await,
             Msg::Unsubscribe { session_id, reply } => {
@@ -531,10 +532,10 @@ impl Supervisor {
         }
     }
 
-    fn resolve_approval(
+    fn reply_to_ask(
         &mut self,
         ask_id: baybo_model::human_ask::AskId,
-        decision: WireApprovalDecision,
+        answer: AskReply,
         reply: Reply,
     ) {
         let Leg::Live {
@@ -548,7 +549,7 @@ impl Supervisor {
         };
         let leg_id = *leg_id;
         let sent = outbound_tx
-            .send(OutboundCmd::ResolveApproval { ask_id, decision })
+            .send(OutboundCmd::ReplyToAsk { ask_id, answer })
             .is_ok();
         self.last_command = Instant::now();
         if sent {
@@ -959,7 +960,7 @@ impl Supervisor {
         }
     }
 
-    /// While a rotation is in flight, `Send` and `ResolveApproval` wait for
+    /// While a rotation is in flight, `Send` and `ReplyToAsk` wait for
     /// its outcome. An `Open` abandons a rotation still before its commit
     /// point — a session about to subscribe is not idle — and past it waits
     /// too. Returns the message when it runs now.
@@ -974,7 +975,7 @@ impl Supervisor {
             return Some(msg);
         }
         let held = match msg {
-            Msg::Send { .. } | Msg::ResolveApproval { .. } => msg,
+            Msg::Send { .. } | Msg::ReplyToAsk { .. } => msg,
             Msg::Open { .. } if self.abandon_rotation("open") => return Some(msg),
             Msg::Open { .. } => msg,
             other => return Some(other),
@@ -1249,9 +1250,7 @@ fn clone_for_waiter(e: &TransportError) -> TransportError {
 /// Fail a message held for a rotation that will never resolve (a teardown).
 fn fail_held(msg: Msg) {
     let reply = match msg {
-        Msg::Open { reply, .. } | Msg::Send { reply, .. } | Msg::ResolveApproval { reply, .. } => {
-            reply
-        }
+        Msg::Open { reply, .. } | Msg::Send { reply, .. } | Msg::ReplyToAsk { reply, .. } => reply,
         _ => return,
     };
     let _ = reply.send(Err(TransportError::SessionClosed));

@@ -20,6 +20,7 @@ function initPayload(sessionId: string): InitPayload {
     restoredState: null,
     connEpoch: 1,
     expandUnansweredTail: false,
+    bottomInset: null,
   };
 }
 
@@ -337,6 +338,36 @@ describe("postSubagents — the header's Subagents entry", () => {
 });
 
 describe("the pre-subscribe buffer", () => {
+  it("applies the bottom inset to the document before any transcript subscribes", async () => {
+    await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+
+    window.baybo.setBottomInset(120, SESSION_A);
+
+    expect(document.documentElement.style.getPropertyValue("--thread-bottom-inset")).toBe("120px");
+  });
+
+  it("applies the inset carried by init, and leaves the last one alone when init has none", async () => {
+    await loadBridge();
+
+    window.baybo.init({ ...initPayload(SESSION_A), bottomInset: 96 });
+    expect(document.documentElement.style.getPropertyValue("--thread-bottom-inset")).toBe("96px");
+
+    window.baybo.init(initPayload(SESSION_A));
+    expect(document.documentElement.style.getPropertyValue("--thread-bottom-inset")).toBe("96px");
+  });
+
+  it("drops a queued outgoing inset after a different session has initialized", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init({ ...initPayload(SESSION_A), bottomInset: 300 });
+    window.baybo.init({ ...initPayload(SESSION_B), bottomInset: 120 });
+    window.baybo.setBottomInset(350, SESSION_A);
+    const { log, events } = recorder();
+    bridge.subscribeTranscript(events);
+    expect(log).toEqual([]);
+    expect(document.documentElement.style.getPropertyValue("--thread-bottom-inset")).toBe("120px");
+  });
+
   it("replays everything native pushed before the transcript subscribed, in ARRIVAL ORDER", async () => {
     const bridge = await loadBridge();
     window.baybo.init(initPayload(SESSION_A));
@@ -349,7 +380,7 @@ describe("the pre-subscribe buffer", () => {
     // carried none) — both shapes must survive the buffer.
     window.baybo.sendConfirmed("pm-1", 41);
     window.baybo.sendConfirmed("pm-1", null);
-    window.baybo.setBottomInset(120);
+    window.baybo.setBottomInset(120, SESSION_A);
     window.baybo.jumpToLatest();
     window.baybo.requestSync();
     window.baybo.pushFrame("frame-2");

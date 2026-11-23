@@ -1,4 +1,25 @@
 import type { components } from "../../../web/src/api/schema";
+import type { Question } from "../../../../sidecars/sdk/channel-ts/src/generated/Question";
+import type { QuestionAnswer } from "../../../../sidecars/sdk/channel-ts/src/generated/QuestionAnswer";
+
+export type InlineQuestionPrompt = {
+  ask_id: string;
+  active: number;
+  tabs: { title: string; answered: boolean }[];
+  question: Question;
+  answer: QuestionAnswer;
+  connected: boolean;
+  submitting: boolean;
+  can_continue: boolean;
+  auto_advance: boolean;
+};
+
+export type QuestionPresentation = {
+  kind: "chat_questions";
+  session_id: string;
+  prompt?: InlineQuestionPrompt;
+  tool_call_id?: string;
+};
 
 /** A media reference carried on a chat message — mirrors the Rust
  * `wire::WireAttachment` (snake_case fields). The bytes never ride the message;
@@ -58,6 +79,7 @@ export type WireWorkStepFrame = {
   label?: string;
   status?: string;
   summary?: string;
+  ask?: RestWorkStep["ask"];
   /// The decision the call's approval prompt returned, once it completed within
   /// the buffered turn — the durable twin of the live `tool_completed.approval`.
   approval?: string;
@@ -146,6 +168,7 @@ export type WireApprovalCard = {
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
 /// variants the transcript renders and tolerate the rest.
 export type WireFrame =
+  | QuestionPresentation
   | ({ kind: "message" } & WireMessage)
   | { kind: "answer_delta"; text: string }
   // The model's thinking trace, streamed like answer_delta but folded into the
@@ -154,6 +177,7 @@ export type WireFrame =
   | { kind: "tool_started"; call_id: string; tool: string; label?: string | null }
   | {
       kind: "tool_completed";
+      ask?: RestWorkStep["ask"];
       call_id: string;
       status: string;
       summary: string;
@@ -342,6 +366,7 @@ export type WorkStep =
       /// step renders "waiting for approval" and clears when the matching
       /// `ask_resolved` (or the call's completion) lands.
       awaitingApproval?: string;
+      ask?: RestWorkStep["ask"];
       /// `"approve"` / `"approve_always"` / `"deny"` once the user judged it.
       /// Survives reload (persisted on the tool result).
       approval?: string;

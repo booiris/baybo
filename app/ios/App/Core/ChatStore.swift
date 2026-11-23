@@ -108,7 +108,11 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// once at mount, never observed.
     var initialDraft: String?
     @Published private(set) var connState: ConnState {
-        didSet { watchLegDown() }
+        didSet {
+            watchLegDown()
+            if connState != .connected, submittingQuestion != nil { submittingQuestion = nil }
+            if connState != oldValue, hasPendingQuestion { publishQuestionPresentation() }
+        }
     }
     /// Sustained-disconnect signal behind the header's offline icon. Raw
     /// `connState` can't drive it: a real outage OSCILLATES `connecting ↔
@@ -211,9 +215,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// the frame stream (`pushFrame`), not mirrored from the webview: the
     /// offscreen buffer can overflow and drop frames, and the sync loop restores
     /// rows but not pending prompts, so a web-held queue could lose a card for
-    /// good. The card is the only way to answer, and an unanswered gate denies
-    /// after 5 minutes. The rendering mirror of `approvals`, republished only on
-    /// a real edit.
+    /// the rest of the connection. Publish only when the pending set changes.
     @Published private(set) var pendingApprovals: [PendingApproval] = []
     /// The session's model pin (`last_llm`): the LLM entry name its turns
     /// resolve against, or `nil` to follow the gateway's `default-llm`. Drives
@@ -265,6 +267,16 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// The pending-approval state machine; `pendingApprovals` is its published
     /// mirror.
     private var approvals = ApprovalQueue()
+    private var questions = PendingPromptQueue<PendingQuestion>()
+    @Published private(set) var submittingQuestion: String? {
+        didSet { publishQuestionPresentation() }
+    }
+    @Published private(set) var writingQuestionAnswer = false
+    private var waitingForQuestionTurnEnd = false
+    private var queuesComposerMessages: Bool { waitingForQuestionTurnEnd || queuedQuestionMessages > 0 }
+    @Published private(set) var questionDraft: QuestionDraft?
+    var hasPendingQuestion: Bool { questionDraft != nil }
+    @Published private(set) var queuedQuestionMessages = 0
     /// Monotonic guard for model-pin traffic: a slow `refreshModelPin` fetch or
     /// an out-of-order PUT failure must never clobber a newer selection.
     private var modelPinEpoch = 0
@@ -377,6 +389,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         self.client = client
         self.index = index
         self.outbox = outbox
+        queuedQuestionMessages = outbox.entries().filter { $0.state == .waitingForAnswer }.count
         self.pasteboard = pasteboard
         self.supportDirectory = supportDirectory
         let listed = index.contains(sessionId: sessionId)
@@ -618,6 +631,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// Only sending it discards it (`ComposerStaging.discardDraft`).
     func leaveChat() {
         chatOpen = false
+        writingQuestionAnswer = false
         composerDraft?.leaveConversation()
         retractNotice()
     }
@@ -712,7 +726,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// `userSent` for a row it already holds, so a mirror that carries the
     /// bubble takes this as a no-op and only a thread missing it gains one.
     func replayUnconfirmedSends(to transcript: any TranscriptSurface) {
-        for entry in unconfirmedSends() {
+        for entry in unconfirmedSends() where entry.state != .waitingForAnswer {
             transcript.userSent(
                 msgId: entry.platformMsgId, text: entry.text,
                 attachments: entry.attachments.map(Self.toAttachmentRef))
@@ -735,7 +749,10 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         // again — a resident store left on a previous visit may raise notices.
         chatOpen = true
         self.bridge = bridge
-        defer { media.attach(bridge) }
+        defer {
+            media.attach(bridge)
+            if bridge.ready { publishQuestionPresentation() }
+        }
         // Before the frame flush / sync branch: both are idempotent against a
         // retired send (the replay skips ids the outbox no longer owes). Only
         // onto a READY page — earlier, the calls would park in the bridge's
@@ -801,14 +818,14 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         // webview a re-sync; the observers own native state the sync can't
         // rebuild. An approval in particular: `sync_page` carries rows, not
         // pending prompts, and a re-attach doesn't re-Subscribe, so a card
-        // dropped here would never come back — the gate would just deny itself
-        // five minutes later with the user never asked.
+        // dropped here would only return on the next subscription.
         if let data = frameJson.data(using: .utf8),
             let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         {
             outboxObserveFrame(frame)
             noteChatListPreview(frame)
             approvalObserveFrame(frame)
+            questionObserveFrame(frame)
         }
         // Already overflowed while offscreen: the webview re-syncs on the next
         // attach, so don't buffer past the hole the dropped frames left.
@@ -875,11 +892,24 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// live leg.
     func send(text: String, attachments: [AttachmentRef]) {
         let msgId = UUID().uuidString
+        if text.trimmingCharacters(in: .whitespacesAndNewlines) == Self.stopCommand, waitingForQuestionTurnEnd {
+            stopAgent()
+            return
+        }
+        if queuesComposerMessages {
+            outbox.beginSend(platformMsgId: msgId, text: text, attachments: attachments.map(Self.toOutboxAttachment), waitingForAnswer: true)
+            queuedQuestionMessages += 1
+            return
+        }
+        sendNow(msgId: msgId, text: text, attachments: attachments)
+    }
+
+    private func sendNow(msgId: String, text: String, attachments: [AttachmentRef]) {
         bridge?.userSent(msgId: msgId, text: text, attachments: attachments)
         outbox.beginSend(
             platformMsgId: msgId, text: text, attachments: attachments.map(Self.toOutboxAttachment))
         startOutboxTimerIfNeeded()
-        dispatchSend(msgId: msgId, text: text, attachments: attachments)
+        Task { await dispatchSend(msgId: msgId, text: text, attachments: attachments) }
     }
 
     /// Retry a send the webview flagged failed (its red dot tap). Reuses the
@@ -891,7 +921,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         outbox.resetForManualRetry(
             platformMsgId: msgId, text: text, attachments: attachments.map(Self.toOutboxAttachment))
         startOutboxTimerIfNeeded()
-        dispatchSend(msgId: msgId, text: text, attachments: attachments)
+        Task { await dispatchSend(msgId: msgId, text: text, attachments: attachments) }
     }
 
     /// Enqueue on the live leg (dialing first if needed). A transport failure
@@ -905,23 +935,21 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// prematurely on the single failed dial the outbox is about to retry (the old
     /// catch flagged `sendFailed` on every offline send, then the outbox auto-sent
     /// it anyway).
-    private func dispatchSend(msgId: String, text: String, attachments: [AttachmentRef]) {
-        Task {
-            do {
-                try await ensureRemoteSession()
-                index.recordUserSend(
-                    sessionId: sessionId, text: text, attachments: attachments)
-                try await sendWhenReady(text: text, msgId: msgId, attachments: attachments)
-            } catch {
-                // Queued, not failed: the outbox owns redelivery (see above). A
-                // draft is the one state the outbox can't drain on its own — arm
-                // the in-session recovery so it delivers when the network returns
-                // rather than sitting as a spinner until the next foreground.
-                NSLog("baybo: send deferred to outbox: %@", bayboErrorText(error))
-                scheduleSendRecovery()
-            }
-            surfaceDraftPinFailure()
+    private func dispatchSend(msgId: String, text: String, attachments: [AttachmentRef]) async {
+        do {
+            try await ensureRemoteSession()
+            index.recordUserSend(
+                sessionId: sessionId, text: text, attachments: attachments)
+            try await sendWhenReady(text: text, msgId: msgId, attachments: attachments)
+        } catch {
+            // Queued, not failed: the outbox owns redelivery (see above). A
+            // draft is the one state the outbox can't drain on its own — arm
+            // the in-session recovery so it delivers when the network returns
+            // rather than sitting as a spinner until the next foreground.
+            NSLog("baybo: send deferred to outbox: %@", bayboErrorText(error))
+            scheduleSendRecovery()
         }
+        surfaceDraftPinFailure()
     }
 
     /// Raise the model notice a failed draft-time pin deferred — AFTER the
@@ -1042,7 +1070,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// real. Sequential lookup keeps the state transition deterministic and the
     /// outboxes involved here are normally one entry deep.
     private func reconcileStrandedOutboxBeforeListing() async {
-        for entry in outbox.entries() where entry.state != .failed {
+        for entry in outbox.entries() where entry.state.canReconcile {
             outbox.markUnknown(platformMsgId: entry.platformMsgId)
             await lookUpUnknownEntry(platformMsgId: entry.platformMsgId)
         }
@@ -1322,6 +1350,10 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         }
     }
 
+    func composerShowsStop(hasDraft: Bool) -> Bool {
+        agentRunning && !(queuesComposerMessages && hasDraft)
+    }
+
     /// The transcript reported whether a turn is in flight (from its turn state
     /// plus the optimistic post-send window). Deduped so an unchanged report
     /// doesn't publish a redundant `objectWillChange`.
@@ -1403,7 +1435,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// approval card. Native, not web: it runs BEFORE the frame reaches (or
     /// misses) the webview, so a prompt raised while the user is parked on the
     /// chat list still lands, and an offscreen buffer overflow can't drop the
-    /// only way to answer a gate that denies itself after 5 minutes. The four
+    /// prompt while the gateway waits for a response. The four
     /// inputs and their id semantics live in `ApprovalQueue`.
     private func approvalObserveFrame(_ frame: [String: Any]) {
         guard approvals.apply(frame) else { return }
@@ -1413,8 +1445,8 @@ final class ChatStore: ObservableObject, TranscriptTarget {
     /// The user answered. Dismiss optimistically (the server's `ask_resolved`
     /// fan-out confirms it, and re-adding the card on the frame's return would
     /// flash a prompt they just answered), then echo the decision on the live
-    /// leg. A leg that can't carry it surfaces a notice: the decision is lost and
-    /// the gate will deny on its own timeout, so the user has to know.
+    /// leg. A failed send surfaces a notice. The next subscription restores
+    /// any prompt still pending on the gateway.
     func resolveApproval(_ approval: PendingApproval, decision: ApprovalDecision) {
         dropApproval(askId: approval.askId)
         Haptics.tap()
@@ -1427,6 +1459,102 @@ final class ChatStore: ObservableObject, TranscriptTarget {
                     askId: approval.askId, decision: decision)
             } catch {
                 notice = Lang.shared.t("chat.approvalFailed", bayboErrorText(error))
+            }
+        }
+    }
+
+    func publishQuestionPresentation() {
+        guard let bridge, bridge.ready else { return }
+        struct Frame: Encodable {
+            let kind = "chat_questions"
+            let sessionId: String
+            let toolCallId: String?
+            let prompt: QuestionPresentation?
+        }
+        let frame = Frame(sessionId: sessionId, toolCallId: questionDraft?.card.toolCallId,
+                          prompt: questionDraft?.presentation(connected: connState == .connected, submitting: submittingQuestion != nil))
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        if let data = try? encoder.encode(frame) {
+            bridge.pushFrame(String(decoding: data, as: UTF8.self))
+        }
+    }
+
+    func performQuestionAction(_ action: QuestionAction) {
+        guard let draft = questionDraft, draft.card.askId == action.askId,
+              draft.active == action.active, submittingQuestion == nil else { return }
+        switch action.action {
+        case .tab:
+            guard let index = action.index, draft.answers.indices.contains(index) else { return }
+            draft.selectTab(index)
+        case .select:
+            guard let index = action.index, draft.question.options.indices.contains(index) else { return }
+            draft.select(draft.question.options[index].label)
+        case .other:
+            writingQuestionAnswer = true
+            return
+        case .next:
+            guard draft.nextTab != nil, draft.isAnswered(draft.active) else { return }
+            draft.advance()
+        case .autoNext:
+            guard !writingQuestionAnswer, let index = action.index else { return }
+            draft.advanceAfterSelection(at: index)
+        case .submit:
+            guard draft.nextTab == nil, let reply = draft.reply else { return }
+            answerQuestion(askId: action.askId, reply: reply)
+        case .cancel:
+            answerQuestion(askId: action.askId, reply: .cancelled)
+        }
+        writingQuestionAnswer = false
+        publishQuestionPresentation()
+    }
+
+    func finishWritingQuestionAnswer() { writingQuestionAnswer = false }
+
+    private func questionObserveFrame(_ frame: [String: Any]) {
+        let kind = frame["kind"] as? String
+        let changed = questions.apply(frame)
+        if changed || kind == "subscribe_state" {
+            if let submittingQuestion, kind == "subscribe_state" || !questions.cards.contains(where: { $0.askId == submittingQuestion }) {
+                self.submittingQuestion = nil
+            }
+            if questionDraft?.card != questions.cards.first {
+                writingQuestionAnswer = false
+                questionDraft = questions.cards.first.map(QuestionDraft.init)
+            }
+            if hasPendingQuestion { waitingForQuestionTurnEnd = true }
+            publishQuestionPresentation()
+        }
+        let turn = kind == "subscribe_state" ? frame["turn"] as? [String: Any] : frame
+        guard (kind == "turn_state" || kind == "subscribe_state"),
+            turn?["active"] as? Bool == false, !hasPendingQuestion else { return }
+        waitingForQuestionTurnEnd = false
+        guard queuedQuestionMessages > 0 else { return }
+        let queued = unconfirmedSends().filter { $0.state == .waitingForAnswer }
+        for entry in queued {
+            bridge?.userSent(msgId: entry.platformMsgId, text: entry.text, attachments: entry.attachments.map(Self.toAttachmentRef))
+            outbox.recordTransmission(platformMsgId: entry.platformMsgId)
+        }
+        queuedQuestionMessages = 0
+        startOutboxTimerIfNeeded()
+        Task {
+            for entry in queued {
+                await dispatchSend(msgId: entry.platformMsgId, text: entry.text, attachments: entry.attachments.map(Self.toAttachmentRef))
+            }
+        }
+    }
+
+    func answerQuestion(askId: String, reply: QuestionReply) {
+        guard questionDraft?.card.askId == askId, submittingQuestion == nil, connState == .connected else { return }
+        submittingQuestion = askId
+        Task {
+            do {
+                let data = try JSONEncoder().encode(reply)
+                try await client.chatAnswerQuestion(askId: askId, replyJson: String(decoding: data, as: UTF8.self))
+            } catch {
+                guard submittingQuestion == askId else { return }
+                submittingQuestion = nil
+                notice = Lang.shared.t("chat.questionFailed", bayboErrorText(error))
             }
         }
     }
@@ -1468,7 +1596,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
             }
         }
         if (frame["rebased"] as? Bool) == true {
-            for entry in outbox.entries() where entry.state != .failed {
+            for entry in outbox.entries() where entry.state.canReconcile {
                 resolveUnknownEntry(platformMsgId: entry.platformMsgId)
             }
         }
@@ -1563,7 +1691,7 @@ final class ChatStore: ObservableObject, TranscriptTarget {
         // cap); a lookup error defers to the next reconnect (never a blind
         // resend). This is the iOS analogue of the web loop's "sync first".
         for entry in outbox.entries() {
-            guard entry.state != .failed else { continue }
+            guard entry.state.canReconcile else { continue }
             // The send that DROVE this dial is microseconds old: the gateway has
             // not persisted it yet, so the lookup races its own write, answers
             // `found: false`, and `resumeSending` re-arms it for a blind resend

@@ -73,6 +73,10 @@ enum Theme {
         Font.custom("Space Mono", size: size).weight(weight)
     }
 
+    static let promptTitle = mono(13, weight: .bold)
+    static let promptBody = mono(12)
+    static let promptDetail = mono(11)
+
     /// The system face (SF Pro), for surfaces that deliberately step out of the
     /// Space Mono chrome — currently the chat list, which reads as a native,
     /// content-dense list rather than monospaced chrome.

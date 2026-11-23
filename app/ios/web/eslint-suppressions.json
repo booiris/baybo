@@ -12,11 +12,6 @@
       "count": 41
     }
   },
-  "src/WorkBlock.tsx": {
-    "@typescript-eslint/strict-boolean-expressions": {
-      "count": 3
-    }
-  },
   "src/bridge.ts": {
     "@typescript-eslint/no-unnecessary-condition": {
       "count": 1

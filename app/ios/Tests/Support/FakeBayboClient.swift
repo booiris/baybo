@@ -380,6 +380,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         return try outcome.get()
     }
 
+    private var replies: [(String, String)] = []
+    var questionReplies: [(String, String)] { lock.withLock { replies } }
+
+    func chatAnswerQuestion(askId: String, replyJson: String) async throws {
+        lock.withLock { replies.append((askId, replyJson)) }
+    }
+
     func chatResolveApproval(askId: String, decision: ApprovalDecision) async throws {
         let error: Error? = lock.withLock {
             approvals.append(ApprovalCall(askId: askId, decision: decision))

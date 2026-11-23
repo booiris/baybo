@@ -33,7 +33,7 @@ const WIRE_KINDS = [
 
 /// Kinds native SYNTHESIZES for the webview (never on the wire): the sync /
 /// history API replies and their failure edges.
-const NATIVE_KINDS = ["sync_page", "history_page", "sync_failed", "history_failed"] as const;
+const NATIVE_KINDS = ["sync_page", "history_page", "sync_failed", "history_failed", "chat_questions"] as const;
 
 const HANDLED_KINDS = [...WIRE_KINDS, ...NATIVE_KINDS] satisfies readonly WireFrame["kind"][];
 

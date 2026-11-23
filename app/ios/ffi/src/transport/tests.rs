@@ -1262,6 +1262,34 @@ async fn a_send_on_the_leg_that_proved_the_subscription_is_admitted() {
     }
 }
 
+#[tokio::test]
+async fn a_question_reply_reaches_the_gateway_with_its_ask_id() {
+    let mut server = Server::start().await;
+    let (registry, _) = server.registry();
+    registry
+        .connect("s1", Arc::new(RecordingSink::default()))
+        .await
+        .unwrap();
+    assert!(matches!(server.next_frame().await, Frame::Subscribe { .. }));
+
+    let ask_id = baybo_model::human_ask::AskId::new();
+    let reply = wire::QuestionReply::Answered {
+        answers: vec![baybo_model::human_ask::QuestionAnswer {
+            header: "Pace".into(),
+            selected: vec!["Slow".into()],
+            other: None,
+        }],
+    };
+    registry
+        .reply_to_ask(ask_id.clone(), AskReply::Question(reply.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.next_frame().await,
+        Frame::AnswerQuestion { ask_id, reply }
+    );
+}
+
 /// The cold-start black hole of 2026-08-16: the old leg dies, a foreground
 /// `preconnect` installs a fresh leg that subscribes NOTHING, and a send for
 /// the still-sink-holding session used to return `Ok` while the gateway

@@ -1,0 +1,21 @@
+{
+  "title": "提问",
+  "progress": "已答 {{done}} / {{total}}",
+  "offline": "等待连接",
+  "write": "自己填写",
+  "cancel": "取消提问",
+  "confirmCancel": "确认取消",
+  "keep": "继续回答",
+  "sending": "正在提交…",
+  "submit": "提交回答",
+  "next": "下一题",
+  "other": "自己填写",
+  "selected": "已选",
+  "unselected": "未选",
+  "noAnswer": "没有记录回答",
+  "answered_one": "已回答 {{count}} 个问题",
+  "answered_other": "已回答 {{count}} 个问题",
+  "cancelled": "已取消提问",
+  "declined": "已跳过提问",
+  "skipped": "已跳过"
+}

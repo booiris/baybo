@@ -208,7 +208,7 @@ final class SubagentHost: ObservableObject {
     private var delegation: AnyCancellable?
 
     init(store: SubagentReadStore) {
-        host = TranscriptHost(store: store)
+        host = TranscriptHost(store: store, hasComposer: false)
         webView = host.webView
         bridge = host.bridge
         visibility = bridge.$contentVisible.sink { [weak self] visible in

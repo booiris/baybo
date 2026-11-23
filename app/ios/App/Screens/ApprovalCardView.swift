@@ -53,19 +53,19 @@ struct ApprovalCardView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text(verbatim: String(format: lang.t("chat.approvalTitle"), approval.tool))
-                    .font(Theme.mono(13, weight: .bold))
+                    .font(Theme.promptTitle)
                     .foregroundStyle(Theme.ink)
                 Spacer(minLength: 0)
                 if queued > 0 {
                     Text(verbatim: String(format: lang.t("chat.approvalQueued"), queued))
-                        .font(Theme.mono(11))
+                        .font(Theme.promptDetail)
                         .foregroundStyle(Theme.inkSoft)
                 }
             }
 
             if let description = approval.description, !description.isEmpty {
                 Text(verbatim: description)
-                    .font(Theme.mono(12))
+                    .font(Theme.promptBody)
                     .foregroundStyle(Theme.inkSoft)
             }
 
@@ -143,7 +143,7 @@ struct ApprovalCardView: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(approval.accesses, id: \.self) { access in
                 Text(verbatim: access)
-                    .font(Theme.mono(12))
+                    .font(Theme.promptBody)
                     .foregroundStyle(Theme.ink)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -153,7 +153,7 @@ struct ApprovalCardView: View {
             // user would be judging the coarse version.
             if !approval.paramsPreview.isEmpty {
                 Text(verbatim: approval.paramsPreview)
-                    .font(Theme.mono(11))
+                    .font(Theme.promptDetail)
                     .foregroundStyle(Theme.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
             }

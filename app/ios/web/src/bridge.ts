@@ -19,6 +19,8 @@ export type InitPayload = {
   /// Read-only subagent / issue-run pages expose a work-only tail instead of
   /// presenting it as a completed `Worked` summary.
   expandUnansweredTail: boolean;
+  /** Native chrome covering the page's bottom, in px; null while native has not measured it. */
+  bottomInset: number | null;
 };
 
 /// Where a reader parked up in the history is: the row at the top of the
@@ -103,7 +105,7 @@ type BayboGlobal = {
   audioState(payload: AudioStatePayload): void;
   videoPoster(payload: VideoPosterResultPayload): void;
   setLanguage(lang: string): void;
-  setBottomInset(px: number): void;
+  setBottomInset(px: number, sessionId: string): void;
   jumpToLatest(): void;
   /// A row of the native message-index sheet was tapped — park that user
   /// message under the header veil. `rowId` is an `OutlineEntry.id`.
@@ -189,11 +191,14 @@ export function postToNative(message: Record<string, unknown>): void {
 /// SYNCHRONOUS DOM write from inside the init evaluation, so the outgoing
 /// conversation vanishes on the very next frame instead of lingering under
 /// the incoming one's async keyed commit. The incoming tree reveals from its
-/// mount layout effect — post-commit, pre-paint, so the reveal and the new
-/// content's first paint are the same frame. The timeout is a failsafe only
+/// layout effect once its inset is known, so the reveal and the new
+/// content's first visible paint are the same frame. The timeout is a failsafe only
 /// (a mount that throws must not leave the page permanently blank); the
-/// class lives on <html> so a React remount can't clobber it.
+/// class lives on <html> so a React remount can't clobber it. The independent
+/// inset gate survives that timeout until native supplies the geometry.
 const RETARGET_VEIL_CLASS = "retargeting";
+const AWAITING_INSET_CLASS = "awaiting-inset";
+const BOTTOM_INSET_VAR = "--thread-bottom-inset";
 const RETARGET_VEIL_FAILSAFE_MS = 400;
 let veilFailsafe: ReturnType<typeof setTimeout> | undefined;
 
@@ -203,10 +208,16 @@ function concealForRetarget(): void {
   veilFailsafe = setTimeout(revealAfterRetarget, RETARGET_VEIL_FAILSAFE_MS);
 }
 
-export function revealAfterRetarget(): void {
+function revealAfterRetarget(): void {
   clearTimeout(veilFailsafe);
   veilFailsafe = undefined;
   document.documentElement.classList.remove(RETARGET_VEIL_CLASS);
+}
+
+export function revealTranscript(): void {
+  document.documentElement.classList.remove(AWAITING_INSET_CLASS);
+  revealAfterRetarget();
+  postSafe({ type: "shown" });
 }
 
 export function bindNativeTarget(targetId: string): () => void {
@@ -245,12 +256,6 @@ window.addEventListener("unhandledrejection", (e) => {
 
 export function postReady(): void {
   post({ type: "ready" });
-}
-
-/// The transcript has rendered its first frame — lets native fade the webview
-/// in rather than popping the content in when the chat screen slides on.
-export function postContentReady(): void {
-  postSafe({ type: "shown" });
 }
 
 /// A `restoreReadingPosition` has finished — the row is parked and re-seated,
@@ -746,6 +751,15 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   else e.jumpToLatest();
 }
 
+// The one writer of the inset variable. It is written at the bridge, not by
+// the transcript's `bottomInset` handler: that event is buffered until a tree
+// subscribes in a passive effect, which is AFTER the mount pin measured the
+// thread, so the first paint pinned against a zero inset and then jumped up
+// by the composer's height.
+function applyBottomInset(px: number): void {
+  document.documentElement.style.setProperty(BOTTOM_INSET_VAR, `${px}px`);
+}
+
 function dispatch(item: Buffered): void {
   if (!events) {
     buffer.push(item);
@@ -758,6 +772,12 @@ window.baybo = {
   init(payload) {
     // Native flushes the old mirror before retargeting; do not post stale state here.
     buffer.length = 0;
+    if (initPayload === null || initPayload.sessionId !== payload.sessionId) {
+      document.documentElement.classList.toggle(AWAITING_INSET_CLASS, payload.bottomInset === null);
+    }
+    // Before the render below is even scheduled, so the mount pin measures the
+    // thread against the real inset.
+    if (payload.bottomInset !== null) applyBottomInset(payload.bottomInset);
     // A cross-session retarget re-keys the React tree, but that commit is
     // ASYNCHRONOUS — until the new tree's subscribe effect runs, `events` is
     // still the outgoing session's tree, and native's retarget burst (buffered
@@ -777,7 +797,7 @@ window.baybo = {
       // the stale leftover on a long→short switch. This write is synchronous
       // inside the init evaluation, so the very next frame is blank paper;
       // the new tree's mount reveals in the same frame its content paints
-      // (`revealAfterRetarget` from Transcript's mount layout effect).
+      // (`revealTranscript` from Transcript's layout effect).
       concealForRetarget();
     }
     blobPending.clear();
@@ -841,7 +861,9 @@ window.baybo = {
   setLanguage(lang) {
     onLanguageCb?.(lang);
   },
-  setBottomInset(px) {
+  setBottomInset(px, sessionId) {
+    if (initPayload?.sessionId !== sessionId) return;
+    applyBottomInset(px);
     dispatch({ kind: "bottomInset", px });
   },
   jumpToLatest() {

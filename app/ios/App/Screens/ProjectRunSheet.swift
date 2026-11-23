@@ -123,7 +123,7 @@ final class ProjectRunHost: ObservableObject {
     private var visibility: AnyCancellable?
 
     init(store: ProjectRunReadStore) {
-        host = TranscriptHost(store: store)
+        host = TranscriptHost(store: store, hasComposer: false)
         webView = host.webView
         bridge = host.bridge
         visibility = bridge.$contentVisible.sink { [weak self] visible in

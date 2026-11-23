@@ -36,7 +36,9 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     /// then restore it.
     private var discardPersist = false
     private var lastBottomInset = Int.min
-    private var composerTop: CGFloat?
+    // Geometry can precede the incoming onAppear or outlive the outgoing one.
+    private var composerTops: [ObjectIdentifier: CGFloat] = [:]
+    private let hasComposer: Bool
     /// Mirror of the web transcript's `showJump` state — drives the native
     /// glass jump-to-latest button above the composer.
     @Published private(set) var jumpVisible = false
@@ -64,7 +66,7 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     /// spawn must not retract the header entry); `resetOutline` clears it when
     /// the webview changes conversation.
     @Published private(set) var subagentsPresent = false
-    /// `false` until the transcript has painted its first frame (`shown`), so
+    /// `false` until the transcript has settled its first layout (`shown`), so
     /// the webview can fade in rather than pop its content in as the chat
     /// screen slides on. Re-armed on every fresh page load (`ready`).
     @Published private(set) var contentVisible = false
@@ -87,8 +89,9 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     /// toggle would re-render every native string and none of the web ones.
     private var languageWatch: AnyCancellable?
 
-    init(store: any TranscriptTarget) {
+    init(store: any TranscriptTarget, hasComposer: Bool = true) {
         self.store = store
+        self.hasComposer = hasComposer
         shownSessionId = store.sessionId
         super.init()
         store.attachBridge(self)
@@ -280,6 +283,7 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     }
 
     func detachCurrent(_ leaving: any TranscriptTarget) {
+        composerTops.removeValue(forKey: ObjectIdentifier(leaving))
         // SwiftUI can run the next screen's `onAppear` before this `onDisappear`.
         guard store === leaving else { return }
         collapseHtmlPreview()
@@ -396,9 +400,16 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     /// per keyboard/composer settle, at the animation START (SwiftUI geometry
     /// jumps to the target); the web side animates its padding to match the
     /// keyboard's slide (the webview's own frame never moves).
-    func setComposerTop(_ minYInWindow: CGFloat) {
-        composerTop = minYInWindow
+    func setComposerTop(_ minYInWindow: CGFloat, for target: any TranscriptTarget) {
+        composerTops[ObjectIdentifier(target)] = minYInWindow
         pushBottomInset()
+    }
+
+    func inheritComposerGeometry(from other: TranscriptBridge) {
+        guard let store, store === other.store,
+            let composerTop = other.composerTops[ObjectIdentifier(store)]
+        else { return }
+        setComposerTop(composerTop, for: store)
     }
 
     /// Convert the composer edge to the covered-strip height against the
@@ -409,11 +420,18 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     /// back at 0 while the composer geometry never re-fires.
     /// `InsetTrackingWebView` also retries on window attachment and layout.
     func pushBottomInset() {
-        guard let composerTop, let window = webView?.window else { return }
-        let px = max(0, Int((window.bounds.height - composerTop).rounded()))
+        guard let store, let px = bottomInset else { return }
         guard px != lastBottomInset else { return }
         lastBottomInset = px
-        call("setBottomInset", String(px))
+        call("setBottomInset", "\(px),\(jsonLiteral(store.sessionId))")
+    }
+
+    private var bottomInset: Int? {
+        guard hasComposer else { return 0 }
+        guard let store, let composerTop = composerTops[ObjectIdentifier(store)],
+            let window = webView?.window
+        else { return nil }
+        return max(0, Int((window.bounds.height - composerTop).rounded()))
     }
 
     /// A native jump-button tap runs the web side's glide (scroll state and
@@ -539,11 +557,15 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
         // the same source the native chrome renders from, so the two can't
         // diverge.
         let language = Lang.shared.code
+        // The inset rides `init` because a separate `setBottomInset` call is a
+        // separate evaluation, and the page may commit and pin its first paint
+        // between the two.
         let payload = """
             {"language":\(jsonLiteral(language)),\
             "sessionId":\(jsonLiteral(store.sessionId)),\
             "restoredState":\(restored ?? "null"),\
             "connEpoch":\(store.connEpoch),\
+            "bottomInset":\(bottomInset.map(String.init) ?? "null"),\
             "expandUnansweredTail":\(store.expandsUnansweredTail)}
             """
         call("init", payload)
@@ -639,6 +661,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             ready = true
             deliverInit()
             flushPending()
+            (store as? ChatStore)?.publishQuestionPresentation()
             // Fresh pages reset CSS vars, so replay inset past the dedup.
             lastBottomInset = Int.min
             pushBottomInset()
@@ -656,11 +679,16 @@ extension TranscriptBridge: WKScriptMessageHandler {
             store?.replayUnconfirmedSends(to: self)
             discardPersist = false
             htmlPreviewMaximized = false
+        case "questionAction":
+            guard let chat = store as? ChatStore, body["targetId"] as? String == chat.sessionId,
+                  let data = try? JSONSerialization.data(withJSONObject: body),
+                  let action = try? JSONDecoder().decode(QuestionAction.self, from: data) else { return }
+            chat.performQuestionAction(action)
         case "readingPositionSettled":
             WebLifecycleLog.note(.transcript, "reading position settled")
             readingPositionSettled = true
         case "shown":
-            // The transcript painted its first frame — fade the webview in.
+            // The transcript settled its first layout — fade the webview in.
             // Deliberately NOT a crash-reload budget re-arm: a page can paint
             // and still re-explode moments later (the white-flash loop), so
             // surviving is proven by time between deaths, not by a paint.

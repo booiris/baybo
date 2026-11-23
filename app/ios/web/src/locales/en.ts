@@ -2,8 +2,11 @@
 // web bundle's own strings live here (transcript + deck shell) — all other
 // chrome is native SwiftUI. The deck entry imports this file as plain data;
 // the i18next runtime stays out of that React-free chunk.
+import ask from "./ask.en.json";
+
 export const en = {
   translation: {
+    ask,
     chat: {
       loadOlder: "Load earlier messages",
       preCompaction: "Compacted",

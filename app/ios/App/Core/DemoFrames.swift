@@ -15,6 +15,7 @@
         private static let demoImagesArg = "-baybo-demo-images"
         private static let demoIndexArg = "-baybo-demo-index"
         static let demoApprovalArg = "-baybo-demo-approval"
+        private static let demoQuestionArg = "-baybo-demo-question"
         static let demoSwitchArg = "-baybo-demo-switch"
         static let demoHtmlArg = "-baybo-demo-html"
 
@@ -22,7 +23,7 @@
         /// by no gateway — into a session that is only ever a local draft.
         private static let cannedTurnArgs = [
             demoFramesArg, demoAttachmentsArg, demoImagesArg, demoIndexArg, demoApprovalArg,
-            demoSwitchArg, demoHtmlArg,
+            demoSwitchArg, demoHtmlArg, demoQuestionArg,
         ]
 
         /// True while such a fixture is driving. `ChatStore.requestSync` reads it:
@@ -698,6 +699,46 @@
                 pushDemo(["kind": "turn_state", "active": false])
             }
         }
+
+        func startDemoQuestionIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains(Self.demoQuestionArg) else { return }
+            let questions: [[String: Any]]
+            if let json = ProcessInfo.processInfo.environment["BAYBO_DEMO_QUESTIONS"] {
+                guard let decoded = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]] else {
+                    assertionFailure("Invalid demo question fixture")
+                    return
+                }
+                questions = decoded
+            } else {
+                questions = Self.demoTripQuestions
+            }
+            pushDemoUserSent(msgId: "demo-question-user", text: "Plan a weekend trip")
+            pushDemo([
+                "kind": "question_asked", "ask_id": "demo-question", "tool_call_id": "ask-trip",
+                "questions": questions,
+            ])
+        }
+
+        private static let demoTripQuestions: [[String: Any]] = [
+            [
+                "header": "Travel", "question": "How would you like to travel?",
+                "multi_select": false,
+                "options": [
+                    ["label": "Train", "description": "Watch the countryside go by."],
+                    ["label": "Ferry", "description": "Arrive by water and explore the harbour on foot."],
+                    ["label": "Bicycle", "description": "Follow the river at your own pace."],
+                    ["label": "Walk", "description": "Take the old market road through the villages."],
+                ],
+            ], [
+                "header": "Interests", "question": "What would you like to explore?",
+                "multi_select": true,
+                "options": [
+                    ["label": "Art", "description": "Browse local galleries."],
+                    ["label": "Food", "description": "Try the seasonal market stalls."],
+                    ["label": "Music", "description": "Catch an evening performance."],
+                ],
+            ],
+        ]
 
         /// `-baybo-demo-approval`: a turn that blocks on the approval gate, so the
         /// native card AND the work block's awaiting/result labels are verifiable

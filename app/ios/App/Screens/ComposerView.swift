@@ -39,17 +39,15 @@ struct ComposerView: View {
     /// and over this dock's own rows, so the screen is what presents it (as an
     /// overlay on the dock). This side reports the anchor and answers the pick.
     @ObservedObject private var attach: AttachMenu
-    /// The approval card's detail ceiling (`ApprovalCardView.detailCap`), off
-    /// the height `ChatScreen` measured.
-    private let approvalDetailCap: CGFloat
+    private let availableHeight: CGFloat
     @State private var photoPicks: [PhotosPickerItem] = []
     @FocusState private var focused: Bool
 
-    init(store: ChatStore, attach: AttachMenu, approvalDetailCap: CGFloat) {
+    init(store: ChatStore, attach: AttachMenu, availableHeight: CGFloat) {
         _store = ObservedObject(wrappedValue: store)
         _staging = ObservedObject(wrappedValue: store.staging)
         _attach = ObservedObject(wrappedValue: attach)
-        self.approvalDetailCap = approvalDetailCap
+        self.availableHeight = availableHeight
     }
 
     /// `ComposerDraftUITests` addresses the field by this.
@@ -80,14 +78,11 @@ struct ComposerView: View {
                 .padding(.horizontal, 18)
             }
 
-            // A blocked tool call outranks everything else in the dock: it is
-            // the only thing the user can act on, and an unanswered gate denies
-            // itself after 5 minutes.
             if let approval = store.pendingApprovals.first {
                 ApprovalCardView(
                     approval: approval,
                     queued: store.pendingApprovals.count - 1,
-                    maxDetailHeight: approvalDetailCap
+                    maxDetailHeight: ApprovalCardView.detailCap(available: availableHeight)
                 ) { decision in
                     store.resolveApproval(approval, decision: decision)
                 }
@@ -96,48 +91,13 @@ struct ComposerView: View {
                 .id(approval.askId)
             }
 
-            if !staging.staged.isEmpty {
-                StagedStrip(
-                    items: staging.staged,
-                    onRemove: { staging.remove($0) },
-                    onRetry: { staging.retry($0) })
-            }
-
-            // One ChatGPT-style pill: inline plus on the left, in-field send
-            // on the right — no satellite icon circles.
-            ComposerPill(
-                text: $staging.text,
-                placeholder: lang.t("chat.placeholder"),
-                accessibilityLabel: lang.t("chat.placeholder"),
-                fieldIdentifier: Self.fieldIdentifier,
-                lineLimit: 1...6,
-                focused: $focused
-            ) {
-                AttachButton(attach: attach, pasteReady: staging.pasteReady)
-            } trailing: {
-                // While a turn runs the button is a stop control (cancel via
-                // `/stop`), independent of the field: typing can't turn it back
-                // into a send button mid-turn (interjection is future work).
-                // Idle, it's the send button, enabled only with a draft.
-                Button {
-                    if store.agentRunning {
-                        store.stopAgent()
-                    } else {
-                        send()
-                    }
-                } label: {
-                    ComposerSendCircle(
-                        systemName: store.agentRunning ? "stop.fill" : "arrow.up",
-                        glyphSize: store.agentRunning ? 13 : 15,
-                        filled: store.agentRunning || hasDraft
-                    )
-                    .animation(.easeInOut(duration: 0.2), value: store.agentRunning)
-                }
-                .disabled(!store.agentRunning && !hasDraft)
-                .accessibilityLabel(
-                    Text(verbatim: Lang.shared.t(store.agentRunning ? "chat.stop" : "chat.send")))
-                .padding(.trailing, 6)
-                .padding(.bottom, 6)
+            if store.writingQuestionAnswer, let draft = store.questionDraft {
+                QuestionAnswerEditor(draft: draft, index: draft.active,
+                                     onChange: store.publishQuestionPresentation,
+                                     onDone: store.finishWritingQuestionAnswer)
+                    .id(draft.card.askId)
+            } else {
+                messageControls
             }
         }
         // The rows share the transcript's reading band; the veil below stays
@@ -184,6 +144,55 @@ struct ComposerView: View {
         #endif
     }
 
+    @ViewBuilder private var messageControls: some View {
+        if store.queuedQuestionMessages > 0 {
+            Text(verbatim: String(format: lang.t("chat.queuedQuestionMessages"), store.queuedQuestionMessages))
+                .font(Theme.mono(12))
+                .foregroundStyle(Theme.inkSoft)
+        }
+
+        if !staging.staged.isEmpty {
+            StagedStrip(
+                items: staging.staged,
+                onRemove: { staging.remove($0) },
+                onRetry: { staging.retry($0) })
+        }
+
+        // One ChatGPT-style pill: inline plus on the left, in-field send
+        // on the right — no satellite icon circles.
+        ComposerPill(
+            text: $staging.text,
+            placeholder: lang.t(store.hasPendingQuestion ? "chat.questionPlaceholder" : "chat.placeholder"),
+            accessibilityLabel: lang.t("chat.placeholder"),
+            fieldIdentifier: Self.fieldIdentifier,
+            lineLimit: 1...6,
+            focused: $focused
+        ) {
+            AttachButton(attach: attach, pasteReady: staging.pasteReady)
+        } trailing: {
+            let showsStop = store.composerShowsStop(hasDraft: hasDraft)
+            Button {
+                if showsStop {
+                    store.stopAgent()
+                } else {
+                    send()
+                }
+            } label: {
+                ComposerSendCircle(
+                    systemName: showsStop ? "stop.fill" : "arrow.up",
+                    glyphSize: showsStop ? 13 : 15,
+                    filled: showsStop || hasDraft
+                )
+                .animation(.easeInOut(duration: 0.2), value: showsStop)
+            }
+            .disabled(!showsStop && !hasDraft)
+            .accessibilityLabel(
+                Text(verbatim: Lang.shared.t(showsStop ? "chat.stop" : "chat.send")))
+            .padding(.trailing, 6)
+            .padding(.bottom, 6)
+        }
+    }
+
     /// Quadratic ease-out (`1 − (1−t)²` at t = 0, 0.2 … 1.0): the fade rises
     /// fast then levels off. It spans the dock itself: alpha 0 at the dock's
     /// top edge down to the peak at the PILL'S BOTTOM edge, so peak opacity
@@ -193,8 +202,11 @@ struct ComposerView: View {
     private static let veilPeakAlpha = 0.8
     private static let veilTailAlphas: [Double] = [0.0, 0.36, 0.64, 0.84, 0.96, 1.0]
 
-    /// The dock's gap under the pill — also where the veil turns solid.
-    private var dockBottomPadding: CGFloat { focused ? 12 : 0 }
+    /// The gap below the active editor is also where the veil turns solid.
+    private var dockBottomPadding: CGFloat {
+        if store.writingQuestionAnswer { return 16 }
+        return focused ? 12 : 0
+    }
 
     /// Bottom mirror of the header veil, replacing the old opaque paper dock.
     /// Nothing overhangs the dock, and the whole veil hit-tests: gutter taps
@@ -235,7 +247,7 @@ struct ComposerView: View {
         // The UIKit half FIRST: `discardDraft` empties the model, and a live
         // IME composition that is still in the input session would re-commit
         // into the freshly cleared field on the next input turn.
-        clearField()
+        if focused { clearField() }
         staging.discardDraft()
     }
 

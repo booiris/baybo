@@ -827,6 +827,7 @@ final class AppStore: ObservableObject {
         }
         transcriptSwap?.cancel()
         let fresh = TranscriptHost(store: chatStore(for: sessionId))
+        fresh.bridge.inheritComposerGeometry(from: old.bridge)
         fresh.webView.frame = old.webView.frame
         fresh.webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         stage.insertSubview(fresh.webView, belowSubview: old.webView)
