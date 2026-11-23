@@ -38,8 +38,8 @@ use crate::actor::mailbox::MailboxSender;
 use crate::actor::supervisor::AgentSupervisor;
 use crate::security::SecurityGateway;
 use baybo_cost::CostManager;
+use baybo_cron::CronDeliveryLedger;
 use baybo_session::SessionManager;
-use baybo_store::CronStore;
 use baybo_turn::TurnLifecycle;
 
 /// Live, atomically-updatable rate-limit knobs, shared between the
@@ -252,7 +252,7 @@ pub struct Router {
     /// Delivery ledger for one-shot cron results: the cron waiter stamps a
     /// fire's outcome here, and `run()` scans it at boot to re-drive results
     /// that never reached their conversation.
-    cron_store: Arc<dyn CronStore>,
+    cron_ledger: CronDeliveryLedger,
     agent_profiles: Arc<dyn AgentProfileStore>,
     /// Stored as `Option<Receiver>` so `run()` can `take()` it out of
     /// `self` to drive in a `select!` arm; populated unconditionally from
@@ -294,8 +294,8 @@ pub struct RouterConfig {
     pub cost_manager: Arc<CostManager>,
     pub actor_spawner: ActorSpawner,
     pub turn_lifecycle: Arc<TurnLifecycle>,
-    /// Delivery ledger for one-shot cron results — see [`Router::cron_store`].
-    pub cron_store: Arc<dyn CronStore>,
+    /// Delivery ledger for one-shot cron results — see [`Router::cron_ledger`].
+    pub cron_ledger: CronDeliveryLedger,
     /// Read at cold spawn to fall back to a bound agent's LLM pin — see
     /// [`resolve_spawn_pins`].
     pub agent_profiles: Arc<dyn AgentProfileStore>,
@@ -329,7 +329,7 @@ impl Router {
             cost_manager,
             actor_spawner,
             turn_lifecycle,
-            cron_store,
+            cron_ledger,
             agent_profiles,
             cron_trigger_rx,
             issue_run_rx,
@@ -348,7 +348,7 @@ impl Router {
             rate_limiter: RateLimiter::new(rate_limit),
             actor_spawner,
             turn_lifecycle,
-            cron_store,
+            cron_ledger,
             agent_profiles,
             cron_trigger_rx: Some(cron_trigger_rx),
             issue_run_rx,

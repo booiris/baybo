@@ -193,7 +193,7 @@ Base cases, all real and all in-tree:
 
 - `baybo-agent` held `Arc<dyn ProjectStore>` + `Arc<dyn ProjectEvents>` and grew four functions in `router/issue.rs` that settled runs, appended timeline entries and wrote `issue.branch` — while `docs/modules/project.md` called `ProjectManager` "the whole write surface". Four rules drifted out of `baybo-project` through that gap, each a real defect (`4a86d125`).
 - Settling a run is three writes — ledger row, invalidation, timeline entry. Every caller that did only two left a card saying something the ledger under it contradicted.
-- **Live now, unfixed:** `crates/cron/src/scheduler.rs` exports `record_execution_completion` / `mark_execution_notified` and documents them as the agent layer's door — and they have **zero callers**, because `router/cron.rs` was handed `Arc<dyn CronStore>` and writes the ledger straight past them. Building the port doesn't help if the store rides along beside it.
+- The agent router once wrote the cron execution ledger directly through `CronStore` and duplicated the scheduler's one-shot replay filter. The router and origin actor now receive `CronDeliveryLedger` from `baybo-cron`. Its three operations cover completion, delivery acknowledgement and boot replay.
 - `worktree::prepare_for_issue` returned a bare `PathBuf` instead of the `Checkout` it had just cut, so the workdir-overlap rule got written a second time in `validate_workdir`. The API ships `project-<ULID>` and the web client re-derives `@dev-1` from it — wrongly.
 - `can_host_a_session` had four spellings before it got its one home in `baybo_project::runs`.
 

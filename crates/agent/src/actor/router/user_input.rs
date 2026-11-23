@@ -624,7 +624,6 @@ mod tests {
     use baybo_channels::{ChannelRegistry, InboundDedup, Message};
     use baybo_cost::test_support::MemoryCostStore;
     use baybo_cost::{CostManager, SpendingLimits};
-    use baybo_cron::CronStore;
     use baybo_cron::test_support::InMemoryCronStore;
     use baybo_model::User;
     use baybo_security::test_support::MemorySecretStore;
@@ -724,7 +723,7 @@ mod tests {
             ),
             actor_spawner,
             turn_lifecycle,
-            cron_store: Arc::new(InMemoryCronStore::new()) as Arc<dyn CronStore>,
+            cron_ledger: baybo_cron::CronDeliveryLedger::new(Arc::new(InMemoryCronStore::new())),
             agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
             cron_trigger_rx,
             issue_run_rx: None,

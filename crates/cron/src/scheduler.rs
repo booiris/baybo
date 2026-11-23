@@ -8,14 +8,13 @@ use chrono_tz::Tz;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::Result;
 use crate::error::CronError;
 use crate::shutdown::Shutdown;
 use baybo_model::{
     BuiltinCronJob, CronExecution, CronJob, CronJobPatch, CronSchedule, CronStatus, ExecutionStatus,
 };
 use baybo_store::{CronFire, CronStore, ExecutionCompletion};
-
-type Result<T> = std::result::Result<T, CronError>;
 
 // ── Scheduler ──────────────────────────────────────────────────────────
 
@@ -176,6 +175,51 @@ const TICK_INTERVAL: Duration = Duration::from_secs(10);
 /// per attempt; the spare attempts cover a second scheduler instance racing on
 /// the same row.
 const UPDATE_ATTEMPTS: usize = 3;
+
+/// The execution ledger used to deliver one-shot results to their origin conversation.
+#[derive(Clone)]
+pub struct CronDeliveryLedger {
+    store: Arc<dyn CronStore>,
+}
+
+impl CronDeliveryLedger {
+    pub fn new(store: Arc<dyn CronStore>) -> Self {
+        Self { store }
+    }
+
+    /// Record the fire's outcome before attempting delivery.
+    pub async fn record_execution_completion(
+        &self,
+        execution_id: &str,
+        completion: ExecutionCompletion,
+    ) -> Result<()> {
+        self.store
+            .record_execution_completion(execution_id, completion)
+            .await
+            .map_err(CronError::from)
+    }
+
+    /// Resolve a delivery after a successful append or a terminal drop.
+    pub async fn mark_execution_notified(
+        &self,
+        execution_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.store
+            .mark_execution_notified(execution_id, at)
+            .await
+            .map_err(CronError::from)
+    }
+
+    /// Completed one-shot executions whose delivery is still unresolved.
+    pub async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
+        let rows = self.store.list_executions_awaiting_delivery().await?;
+        Ok(rows
+            .into_iter()
+            .filter(CronExecution::is_one_shot)
+            .collect())
+    }
+}
 
 impl CronScheduler {
     pub fn new(
@@ -450,45 +494,6 @@ impl CronScheduler {
         }
 
         Err(CronError::Contended(job_id.to_string()))
-    }
-
-    /// Stamp a fire's terminal state onto its execution row — see
-    /// [`CronStore::record_execution_completion`]. Called by the agent layer's
-    /// cron waiter before it delivers the result.
-    pub async fn record_execution_completion(
-        &self,
-        execution_id: &str,
-        completion: ExecutionCompletion,
-    ) -> Result<()> {
-        self.store
-            .record_execution_completion(execution_id, completion)
-            .await
-            .map_err(CronError::from)
-    }
-
-    /// Mark a one-shot's result delivered (or terminally dropped) — see
-    /// [`CronStore::mark_execution_notified`].
-    pub async fn mark_execution_notified(
-        &self,
-        execution_id: &str,
-        at: DateTime<Utc>,
-    ) -> Result<()> {
-        self.store
-            .mark_execution_notified(execution_id, at)
-            .await
-            .map_err(CronError::from)
-    }
-
-    /// One-shot executions whose fire completed but whose result never
-    /// reached the origin conversation (crash in the delivery window). The
-    /// agent layer re-drives these at boot; recurring fires are excluded —
-    /// their result lives in their own conversation, with nothing to deliver.
-    pub async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
-        let rows = self.store.list_executions_awaiting_delivery().await?;
-        Ok(rows
-            .into_iter()
-            .filter(CronExecution::is_one_shot)
-            .collect())
     }
 
     /// Move a cron job to the recycle bin. It stops firing and drops out of
@@ -3189,7 +3194,9 @@ mod tests {
     /// deliver elsewhere).
     #[tokio::test]
     async fn awaiting_delivery_scan_covers_one_shots_until_resolved() {
-        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let store = Arc::new(InMemoryCronStore::new());
+        let (scheduler, _rx) = scheduler_over(store.clone());
+        let ledger = CronDeliveryLedger::new(store);
 
         let one_shot = scheduler
             .create_job(spec(
@@ -3205,7 +3212,7 @@ mod tests {
 
         // Neither has completed yet.
         assert!(
-            scheduler
+            ledger
                 .list_executions_awaiting_delivery()
                 .await
                 .unwrap()
@@ -3213,7 +3220,7 @@ mod tests {
         );
 
         for exec_id in [&one_shot_exec.id, &recurring_exec.id] {
-            scheduler
+            ledger
                 .record_execution_completion(
                     exec_id,
                     ExecutionCompletion {
@@ -3227,7 +3234,7 @@ mod tests {
                 .unwrap();
         }
 
-        let awaiting = scheduler.list_executions_awaiting_delivery().await.unwrap();
+        let awaiting = ledger.list_executions_awaiting_delivery().await.unwrap();
         assert_eq!(
             awaiting.len(),
             1,
@@ -3235,12 +3242,12 @@ mod tests {
         );
         assert_eq!(awaiting[0].id, one_shot_exec.id);
 
-        scheduler
+        ledger
             .mark_execution_notified(&one_shot_exec.id, Utc::now())
             .await
             .unwrap();
         assert!(
-            scheduler
+            ledger
                 .list_executions_awaiting_delivery()
                 .await
                 .unwrap()

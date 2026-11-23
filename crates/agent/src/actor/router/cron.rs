@@ -4,13 +4,12 @@ use std::sync::Arc;
 use baybo_context::prompts::cron::{DreamDigestGroup, DreamDigestSession, frame_dream_digest};
 use baybo_context::prompts::soul::{PersonaSources, PromptBudget, PromptShape, assemble_for};
 use baybo_context::tokenizer::HeuristicTokenizer;
-use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
+use baybo_cron::{CronDeliveryLedger, CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
     AgentBinding, AgentFramework, AgentProfileId, BuiltinCronJob, CronExecution, ExecutionOutcome,
     PendingCronResult, Session, SessionId, TriggerSource, User,
 };
 use baybo_session::SessionManager;
-use baybo_store::CronStore;
 use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnPhase, TurnStatusKind};
 use chrono::Utc;
 use chrono_tz::Tz;
@@ -638,7 +637,6 @@ impl Router {
             fire_session_id,
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
-            cron_store: Arc::clone(&self.cron_store),
             delivery: self.cron_result_delivery(),
         }
     }
@@ -768,17 +766,13 @@ impl Router {
     /// that *did* land costs one no-op message rather than a duplicate row.
     /// Run at router start, before any live traffic.
     pub(super) async fn redrive_cron_deliveries(&self) {
-        let awaiting = match self.cron_store.list_executions_awaiting_delivery().await {
+        let pending = match self.cron_ledger.list_executions_awaiting_delivery().await {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(error = %e, "failed to scan for undelivered cron results");
                 return;
             }
         };
-        let pending: Vec<CronExecution> = awaiting
-            .into_iter()
-            .filter(CronExecution::is_one_shot)
-            .collect();
         if pending.is_empty() {
             return;
         }
@@ -809,7 +803,7 @@ impl Router {
         CronResultDelivery {
             session_manager: Arc::clone(&self.session_manager),
             supervisor: self.supervisor.clone(),
-            cron_store: Arc::clone(&self.cron_store),
+            ledger: self.cron_ledger.clone(),
             actor_spawner: Arc::clone(&self.actor_spawner),
             agent_profiles: Arc::clone(&self.agent_profiles),
         }
@@ -847,7 +841,6 @@ struct CronResultWaiter {
     fire_session_id: SessionId,
     lifecycle: Arc<TurnLifecycle>,
     terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
-    cron_store: Arc<dyn CronStore>,
     delivery: CronResultDelivery,
 }
 
@@ -860,7 +853,8 @@ impl CronResultWaiter {
         // window then leaves a durable "completed, not yet delivered" row for
         // the boot re-drive, instead of a result nobody remembers.
         if let Err(e) = self
-            .cron_store
+            .delivery
+            .ledger
             .record_execution_completion(
                 &self.event.execution_id,
                 ExecutionCompletion {
@@ -1074,7 +1068,7 @@ fn pending_result_from_execution(exec: &CronExecution) -> Option<PendingCronResu
 pub(super) struct CronResultDelivery {
     session_manager: Arc<SessionManager>,
     supervisor: AgentSupervisor,
-    cron_store: Arc<dyn CronStore>,
+    ledger: CronDeliveryLedger,
     actor_spawner: ActorSpawner,
     /// The origin conversation may be bound to an agent, so hydrating it has
     /// the same pin resolution as any other cold spawn.
@@ -1133,7 +1127,7 @@ impl CronResultDelivery {
     /// the result has nowhere to go. Keeps the re-drive scan converging.
     async fn resolve_ledger(&self, execution_id: &str) {
         if let Err(e) = self
-            .cron_store
+            .ledger
             .mark_execution_notified(execution_id, Utc::now())
             .await
         {
@@ -1212,6 +1206,7 @@ mod tests {
     use baybo_channels::ChannelRegistry;
     use baybo_cost::test_support::MemoryCostStore;
     use baybo_cost::{CostManager, SpendingLimits};
+    use baybo_cron::CronStore;
     use baybo_cron::test_support::InMemoryCronStore;
     use baybo_model::{ChannelType, CronJob, CronSchedule, CronStatus, User};
     use baybo_security::test_support::MemorySecretStore;
@@ -1348,7 +1343,7 @@ mod tests {
                 ),
                 actor_spawner,
                 turn_lifecycle: Arc::clone(&turn_lifecycle),
-                cron_store: Arc::clone(&cron_store) as Arc<dyn CronStore>,
+                cron_ledger: CronDeliveryLedger::new(cron_store.clone()),
                 cron_trigger_rx,
                 issue_run_rx: None,
                 ask_resume_rx: None,
@@ -2434,6 +2429,50 @@ mod tests {
         // An unparseable zone still yields a titled conversation.
         let fallback = cron_conversation_title("每日新闻", "Mars/Olympus");
         assert!(fallback.starts_with("每日新闻 · "), "{fallback}");
+    }
+
+    #[tokio::test]
+    async fn boot_redrive_resolves_only_one_shots_when_the_origin_is_gone() {
+        let h = RouterHarness::without_origin_session();
+        let now = Utc::now();
+        for (id, schedule) in [
+            ("once", CronSchedule::at(now)),
+            ("recurring", CronSchedule::cron("0 0 * * *")),
+        ] {
+            let mut job = job(id);
+            job.id = id.into();
+            job.schedule = schedule;
+            job.origin_session_id = Some("missing-origin".into());
+            h.cron_store.create(&job).await.unwrap();
+            let mut exec = CronExecution::pending(&job, now, now);
+            exec.id = id.into();
+            exec.fire_session_id = Some("fire".into());
+            exec.completed_at = Some(now);
+            exec.outcome = Some(ExecutionOutcome::Success);
+            assert!(
+                h.cron_store
+                    .record_execution_if_job_unchanged(&exec, &job)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        h.router.redrive_cron_deliveries().await;
+
+        assert!(
+            h.cron_store
+                .execution("once")
+                .unwrap()
+                .notified_at
+                .is_some()
+        );
+        assert!(
+            h.cron_store
+                .execution("recurring")
+                .unwrap()
+                .notified_at
+                .is_none()
+        );
     }
 
     /// The re-drive rebuilds the delivery payload from the persisted ledger, so

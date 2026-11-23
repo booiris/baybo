@@ -34,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actor::supervisor::AgentSupervisor;
 use crate::runtime::agent_loop::AgentLoop;
+use baybo_cron::CronDeliveryLedger;
 use baybo_session::SessionManager;
-use baybo_store::CronStore;
 use baybo_trace::SpanRecorder;
 use baybo_turn::TurnLifecycle;
 
@@ -103,7 +103,7 @@ pub struct VolatileResources {
     /// result is the one that knows the delivery is done, so it is the one
     /// that stamps `notified_at` — closing out the boot re-drive that would
     /// otherwise replay it (`AgentMessage::CronResultReady`).
-    pub cron_store: Arc<dyn CronStore>,
+    pub cron_ledger: CronDeliveryLedger,
     /// Workspace addresses. The background-notification prompt needs them to
     /// name a finished child's virtual transcript path, so a truncated result
     /// tells the parent where the rest actually is.
@@ -126,7 +126,7 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     assert_volatile::<CancellationToken>();
     assert_volatile::<Option<AgentSupervisor>>();
     assert_volatile::<Arc<SessionManager>>();
-    assert_volatile::<Arc<dyn CronStore>>();
+    assert_volatile::<CronDeliveryLedger>();
     assert_volatile::<Arc<baybo_workspace::WorkspacePaths>>();
 };
 
