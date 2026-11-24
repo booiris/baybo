@@ -16,7 +16,17 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     static let messageHandlerName = "baybo"
 
     private weak var store: (any TranscriptTarget)?			
-    weak var webView: WKWebView?
+    weak var webView: WKWebView? {
+        didSet {
+            if hasComposer, let webView {
+                keyboardMotion = TranscriptKeyboardMotion(scroll: webView.scrollView)
+            } else {
+                keyboardMotion = nil
+            }
+        }
+    }
+    private var keyboardMotion: TranscriptKeyboardMotion?
+    private weak var positionedComposerAnchor: UIView?
     private(set) var ready = false
     /// Calls buffered until the page posts `ready`. Readable (like `ready`) so a
     /// test can see what the bridge decided to send without standing up a
@@ -38,6 +48,7 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     private var lastBottomInset = Int.min
     // Geometry can precede the incoming onAppear or outlive the outgoing one.
     private var composerTops: [ObjectIdentifier: CGFloat] = [:]
+    private let composerAnchors = NSMapTable<AnyObject, UIView>.weakToWeakObjects()
     private let hasComposer: Bool
     /// Mirror of the web transcript's `showJump` state — drives the native
     /// glass jump-to-latest button above the composer.
@@ -66,9 +77,7 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     /// spawn must not retract the header entry); `resetOutline` clears it when
     /// the webview changes conversation.
     @Published private(set) var subagentsPresent = false
-    /// `false` until the transcript has settled its first layout (`shown`), so
-    /// the webview can fade in rather than pop its content in as the chat
-    /// screen slides on. Re-armed on every fresh page load (`ready`).
+    /// The chat uncovers the shared webview once its own session posts `shown`.
     @Published private(set) var contentVisible = false
     /// A `restoreReadingPosition` on this page has finished (parked, or the
     /// row could not be found). What a staged replacement waits for before it
@@ -108,20 +117,21 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
         if store === newStore {
             newStore.attachBridge(self)
         } else {
+            keyboardMotion?.reset()
             collapseHtmlPreview()
             // A DIFFERENT store for the same conversation (the LRU evicted this
             // session's store and re-opening minted a fresh one) keeps the very
             // same React tree — `<Transcript>` is keyed on `sessionId`, so `init`
             // re-renders nothing and the outline effect never re-fires. Clearing
             // the index there would blank it with nothing left to re-post it.
-            let sameSession = store?.sessionId == newStore.sessionId
+            let sameSession = shownSessionId == newStore.sessionId
             if let old = store {
                 call("flushPersist", "")
                 old.detachBridge(self)
             }
             store = newStore
-            // Hiding here can pause WebKit rAF and strand the `shown` callback.
-            contentVisible = true
+            positionedComposerAnchor = nil
+            if !sameSession { contentVisible = false }
             deliverInit()
             newStore.attachBridge(self)
             lastBottomInset = Int.min
@@ -273,6 +283,7 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
     /// callers, and it must stay visible at each call site.
     private func reloadDocument() {
         guard let webView, let url = TranscriptSchemeHandler.indexURL else { return }
+        keyboardMotion?.reset()
         ready = false
         // Buffered calls target a document about to be destroyed — and one of
         // them may be an `init` carrying state the new document must rebuild
@@ -286,6 +297,8 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
         composerTops.removeValue(forKey: ObjectIdentifier(leaving))
         // SwiftUI can run the next screen's `onAppear` before this `onDisappear`.
         guard store === leaving else { return }
+        positionedComposerAnchor = nil
+        keyboardMotion?.reset()
         collapseHtmlPreview()
         call("flushPersist", "")
         store?.detachBridge(self)
@@ -398,11 +411,25 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
 
     /// The composer's top edge in `.global` (window) coordinates. Fires once
     /// per keyboard/composer settle, at the animation START (SwiftUI geometry
-    /// jumps to the target); the web side animates its padding to match the
-    /// keyboard's slide (the webview's own frame never moves).
+    /// jumps to the target). The page commits its spacer height and the native
+    /// scroll layer presents the keyboard motion.
     func setComposerTop(_ minYInWindow: CGFloat, for target: any TranscriptTarget) {
+        // SwiftUI also measures the dock before its screen enters the window.
+        // Only two positions of the same mounted dock describe real motion.
+        if target === store, let anchor = composerAnchors.object(forKey: target),
+           let window = webView?.window, anchor.window === window, !anchor.bounds.isEmpty {
+            if positionedComposerAnchor === anchor, contentVisible, !jumpVisible,
+               let old = composerTops[ObjectIdentifier(target)] {
+                keyboardMotion?.move(from: old, to: minYInWindow, with: anchor)
+            }
+            positionedComposerAnchor = anchor
+        }
         composerTops[ObjectIdentifier(target)] = minYInWindow
         pushBottomInset()
+    }
+
+    func setComposerAnchor(_ view: UIView, for target: any TranscriptTarget) {
+        composerAnchors.setObject(view, forKey: target)
     }
 
     func inheritComposerGeometry(from other: TranscriptBridge) {
@@ -667,7 +694,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             pushBottomInset()
             jumpVisible = false
             resetOutline()
-            contentVisible = store?.listed == false
+            contentVisible = !hasComposer && store?.listed == false
             // Queued durability confirms first, then the outbox replay: the
             // confirm retires ids the replay must not re-seed, and neither may
             // sit in `pending` where a rebuild/crash reload would destroy the
@@ -688,7 +715,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             WebLifecycleLog.note(.transcript, "reading position settled")
             readingPositionSettled = true
         case "shown":
-            // The transcript settled its first layout — fade the webview in.
+            guard let sessionId = body["sessionId"] as? String, sessionId == store?.sessionId else { return }
             // Deliberately NOT a crash-reload budget re-arm: a page can paint
             // and still re-explode moments later (the white-flash loop), so
             // surviving is proven by time between deaths, not by a paint.
@@ -815,6 +842,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             }
         case "jumpVisible":
             jumpVisible = (body["visible"] as? Bool) ?? false
+            if jumpVisible { keyboardMotion?.reset() }
         case "outline":
             outlineHasMoreOlder = (body["hasMoreOlder"] as? Bool) ?? false
             outlineLoadingOlder = (body["loadingOlder"] as? Bool) ?? false

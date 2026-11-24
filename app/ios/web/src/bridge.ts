@@ -190,9 +190,8 @@ export function postToNative(message: Record<string, unknown>): void {
 /// Cross-session retarget veil. `concealForRetarget` hides `#root` with a
 /// SYNCHRONOUS DOM write from inside the init evaluation, so the outgoing
 /// conversation vanishes on the very next frame instead of lingering under
-/// the incoming one's async keyed commit. The incoming tree reveals from its
-/// layout effect once its inset is known, so the reveal and the new
-/// content's first visible paint are the same frame. The timeout is a failsafe only
+/// the incoming one's async keyed commit. The incoming tree reveals once its
+/// inset and native scroll position have settled. The timeout is a failsafe only
 /// (a mount that throws must not leave the page permanently blank); the
 /// class lives on <html> so a React remount can't clobber it. The independent
 /// inset gate survives that timeout until native supplies the geometry.
@@ -214,10 +213,36 @@ function revealAfterRetarget(): void {
   document.documentElement.classList.remove(RETARGET_VEIL_CLASS);
 }
 
-export function revealTranscript(): void {
-  document.documentElement.classList.remove(AWAITING_INSET_CLASS);
-  revealAfterRetarget();
-  postSafe({ type: "shown" });
+export function revealTranscript(sessionId: string | undefined, align: () => boolean): (() => void) | undefined {
+  const html = document.documentElement;
+  const current = () => sessionId === undefined || initPayload?.sessionId === sessionId;
+  const reveal = () => {
+    html.classList.remove(AWAITING_INSET_CLASS);
+    revealAfterRetarget();
+    postSafe({ type: "shown", sessionId: sessionId ?? initPayload?.sessionId });
+  };
+  if (!current()) return;
+  align();
+  if (!html.classList.contains(RETARGET_VEIL_CLASS)) {
+    reveal();
+    return;
+  }
+
+  // A reused WKWebView can replay the outgoing native offset *after* the
+  // incoming DOM has pinned. Keep the first paint covered across that commit.
+  let lastFrameAligned = false;
+  const settle = () => {
+    if (!current()) return;
+    const aligned = align();
+    if ((lastFrameAligned && aligned) || !html.classList.contains(RETARGET_VEIL_CLASS)) {
+      reveal();
+      return;
+    }
+    lastFrameAligned = aligned;
+    frame = requestAnimationFrame(settle);
+  };
+  let frame = requestAnimationFrame(settle);
+  return () => cancelAnimationFrame(frame);
 }
 
 export function bindNativeTarget(targetId: string): () => void {
@@ -662,8 +687,7 @@ export type TranscriptEvents = {
   /// retiring the id alone would leave the row with no keep predicate at all.
   sendConfirmed(msgId: string, ordinal: number | null): void;
   /// Native chrome covering the webview's bottom edge (composer + ridden
-  /// keyboard), in CSS px. Streams per layout tick through keyboard
-  /// animations.
+  /// keyboard), in CSS px. SwiftUI reports the target as its layout changes.
   bottomInset(px: number): void;
   /// The native jump-to-latest button was tapped — run the glide.
   jumpToLatest(): void;
@@ -790,14 +814,7 @@ window.baybo = {
     // nothing remounts, and nobody would ever subscribe again.
     if (initPayload !== null && initPayload.sessionId !== payload.sessionId) {
       events = null;
-      // The keyed swap to the new conversation commits ASYNCHRONOUSLY, and
-      // this webview stays visible through the transition (hiding it native-
-      // side pauses WebKit rAF — see TranscriptBridge.retarget) — so the
-      // OUTGOING session's pixels sit on screen until the new tree paints:
-      // the stale leftover on a long→short switch. This write is synchronous
-      // inside the init evaluation, so the very next frame is blank paper;
-      // the new tree's mount reveals in the same frame its content paints
-      // (`revealTranscript` from Transcript's layout effect).
+      // Suppress outgoing DOM paint while React mounts the incoming tree.
       concealForRetarget();
     }
     blobPending.clear();
@@ -863,8 +880,10 @@ window.baybo = {
   },
   setBottomInset(px, sessionId) {
     if (initPayload?.sessionId !== sessionId) return;
-    applyBottomInset(px);
+    // Let a mounted reader protect their offset before a shrinking spacer
+    // changes the document's reachable range.
     dispatch({ kind: "bottomInset", px });
+    applyBottomInset(px);
   },
   jumpToLatest() {
     dispatch({ kind: "jumpToLatest" });

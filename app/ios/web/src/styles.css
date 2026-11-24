@@ -71,11 +71,8 @@
      status-bar part is device-correct via env() (the webview is full-bleed,
      viewport-fit=cover); the 54px covers the native bar height + breathing. */
   --thread-top-inset: calc(env(safe-area-inset-top) + 58px);
-  /* Height of the webview's bottom edge covered by native chrome (composer +
-     the keyboard it rides). The webview is full-bleed and NEVER resizes with
-     the keyboard — native streams this per layout tick over the bridge and
-     the thread pads/pins itself, so content slides in lockstep. Includes the
-     home-indicator area (measured to the screen edge), so no extra env(). */
+  /* Native measures the composer to the window edge, including the keyboard
+     and home indicator. The webview itself stays full-bleed. */
   --thread-bottom-inset: 0px;
 
   /* The widest the reading column grows, gutters included. A phone never
@@ -168,17 +165,12 @@ button {
    document) scrolls, NOT this div — an inner overflow:auto scroller inside
    WKWebView owns an async scroll node that sleeps until the first touch
    (cold-start "tap once to scroll") and lets an uncaptured drag rubber-band the
-   whole webview instead of moving history. `min-height` (not `height`) + NO
-   `overflow` makes this a plain growing block, so the always-live main frame is
-   the one scroller. The top inset clears the native header overlay; the bottom
-   inset clears the native composer (+ keyboard) over the full-bleed webview. */
+   whole webview instead of moving history. The log grows with its rows. */
 .chat-log {
-  --thread-bottom-gap: 4rem;
-  min-height: 100dvh;
   display: flex;
   flex-direction: column;
   gap: var(--chat-row-gap);
-  padding: var(--thread-top-inset) 0 calc(var(--thread-bottom-inset) + var(--thread-bottom-gap));
+  padding-top: var(--thread-top-inset);
   /* The reading band (`--reading-width`), with the thread's gutter inside it. */
   padding-left: calc(var(--reading-band-left) + 1.25rem);
   padding-right: calc(var(--reading-band-right) + 1.25rem);
@@ -190,16 +182,8 @@ button {
      Once content overflows one screen the follow-bottom pin leads as usual. */
   justify-content: flex-start;
 }
-.chat-log[data-question-pending="true"] {
-  --thread-bottom-gap: 24px;
-}
-/* Native reports the bottom obstruction only at keyboard-animation ENDPOINTS
-   (SwiftUI geometry callbacks don't stream interpolated layout), so the web
-   side animates the padding itself on a keyboard-like curve; the transcript
-   re-pins per frame while following (see handleBottomInset). Enabled after the
-   first inset lands so the launch layout doesn't visibly slide. */
-.chat-log.inset-animated {
-  transition: padding-bottom 250ms cubic-bezier(0.33, 1, 0.68, 1);
+.composer-space {
+  height: calc(var(--thread-bottom-inset) + 24px);
 }
 /* Chat MESSAGE bodies read as Inter sans (comfortable long-read); the chrome
    stays monospace. Soft uniform rounded bubbles, hairline outlined. */
@@ -494,8 +478,8 @@ button {
    own scroller. `clip` keeps vertical overflow visible and creates no scroll
    container, so short inline math (the norm) is untouched. */
 /* Cross-session retarget veil (see bridge.ts concealForRetarget): the old
-   conversation is hidden the instant the init for a different session lands,
-   and the incoming tree reveals itself in the frame its content paints. */
+   conversation is hidden the instant the init for a different session lands.
+   The incoming tree reveals once its scroll position settles. */
 html.retargeting #root,
 html.awaiting-inset #root { visibility: hidden; }
 

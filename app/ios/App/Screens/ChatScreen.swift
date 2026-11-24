@@ -63,15 +63,17 @@ struct ChatScreen: View {
             // whose frame tracks the keyboard can't animate with it (the web
             // process relayouts once, asynchronously, at the final size — the
             // transcript would sit still and snap at the end). The frame stays
-            // fixed; the thread instead pads its bottom by the measured
-            // composer/keyboard obstruction fed over the bridge, and animates
-            // that padding web-side so content slides with the keyboard.
+            // fixed. The page measures its newest edge once and the native
+            // scroll layer moves the transcript with the keyboard.
             TranscriptWebView(webView: webView)
                 .ignoresSafeArea(.all, edges: [.top, .bottom])
-                // Fade the transcript in once it has painted (bridge `shown`),
-                // rather than popping the content in as the screen slides on.
-                .opacity(bridge.contentVisible ? 1 : 0)
-                .animation(.easeOut(duration: 0.15), value: bridge.contentVisible)
+                // Keep WebKit rendering behind the cover until this session's
+                // first layout is ready. Hiding the webview can suspend its rAF.
+                .overlay {
+                    if !bridge.contentVisible || bridge.shownSessionId != store.sessionId {
+                        Theme.paper.ignoresSafeArea().transition(.identity)
+                    }
+                }
 
             Group {
                 ChatHeaderView(
@@ -129,6 +131,7 @@ struct ChatScreen: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             ComposerDock(collapsed: bridge.htmlPreviewMaximized) {
                 ComposerView(store: store, attach: attach, availableHeight: availableHeight)
+                    .background(TranscriptComposerAnchor(bridge: bridge, store: store))
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.frame(in: .global).minY
                     } action: { minY in

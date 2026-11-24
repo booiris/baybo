@@ -26,6 +26,86 @@ struct TranscriptInsetTests {
         host.bridge.pending.filter { $0.contains("setBottomInset") }
     }
 
+    @Test func mountingANewComposerDoesNotTranslateTheTranscript() {
+        let outgoing = makeStore()
+        let incoming = makeStore(sessionId: "incoming")
+        let host = makeHost(store: outgoing)
+        defer { host.teardown() }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        host.webView.frame = window.bounds
+        window.addSubview(host.webView)
+        let scroll = host.webView.scrollView
+        scroll.contentSize = CGSize(width: 400, height: 1800)
+        scroll.contentOffset.y = 1000
+
+        host.bridge.setComposerTop(360, for: incoming)
+        host.bridge.retarget(to: incoming)
+        let dock = UIView(frame: CGRect(x: 0, y: 720, width: 400, height: 60))
+        window.addSubview(dock)
+        host.bridge.setComposerAnchor(dock, for: incoming)
+        host.bridge.setComposerTop(dock.frame.minY, for: incoming)
+        #expect(!host.bridge.contentVisible)
+        #expect(scroll.layer.animationKeys()?.isEmpty != false)
+        #expect(insets(host).last == "window.baybo && window.baybo.setBottomInset(80,\"incoming\");")
+    }
+
+    @Test func dismissingTheKeyboardLeavesAShortThreadInPlace() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        let scroll = UIScrollView(frame: window.bounds)
+        scroll.contentSize = window.bounds.size
+        let dock = UIView(frame: CGRect(x: 0, y: 400, width: 400, height: 60))
+        window.addSubview(scroll)
+        window.addSubview(dock)
+        let motion = TranscriptKeyboardMotion(scroll: scroll)
+        defer { motion.reset() }
+        motion.move(from: 400, to: 700, with: dock)
+        #expect(scroll.contentOffset.y == 0)
+        #expect(scroll.layer.animationKeys()?.isEmpty != false)
+    }
+
+    @Test func repeatedKeyboardChangesUseTheDockAnimationAndPreserveTheWebScrollOffset() throws {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        let scroll = UIScrollView(frame: window.bounds)
+        let dock = UIView(frame: CGRect(x: 0, y: 700, width: 400, height: 60))
+        window.addSubview(scroll)
+        window.addSubview(dock)
+        let anchor = UIView(frame: dock.bounds)
+        dock.addSubview(anchor)
+        scroll.contentSize = CGSize(width: scroll.bounds.width, height: scroll.bounds.height + 500)
+        scroll.contentOffset.y = 500
+        let motion = TranscriptKeyboardMotion(scroll: scroll)
+        defer { motion.reset() }
+
+        for newY: CGFloat in [400, 700, 400] {
+            let oldY = dock.frame.minY
+            let delta = oldY - newY
+            dock.frame.origin.y = newY
+            let spring = CASpringAnimation(keyPath: "position")
+            spring.isAdditive = true
+            spring.fromValue = CGPoint(x: 0, y: delta)
+            spring.toValue = CGPoint.zero
+            spring.duration = 0.4
+            spring.beginTime = CACurrentMediaTime()
+            dock.layer.add(spring, forKey: "position")
+            let originalOffset = scroll.contentOffset.y
+            #expect(originalOffset == scroll.contentSize.height - scroll.bounds.height)
+            motion.move(from: oldY, to: newY, with: anchor)
+            #expect(scroll.contentOffset.y == originalOffset)
+            if !UIAccessibility.isReduceMotionEnabled {
+                let copy = try #require(scroll.layer.animationKeys()?.compactMap {
+                    scroll.layer.animation(forKey: $0) as? CASpringAnimation
+                }.first { $0.keyPath == "bounds.origin.y" })
+                #expect(copy.beginTime == spring.beginTime)
+                let displacement = try #require((copy.fromValue as? NSNumber)?.doubleValue)
+                #expect(abs(displacement + Double(delta)) < 0.01)
+            }
+            scroll.contentSize.height += delta
+            scroll.contentOffset.y = scroll.contentSize.height - scroll.bounds.height
+            motion.reset()
+            #expect(scroll.layer.animationKeys()?.contains { scroll.layer.animation(forKey: $0) is CASpringAnimation } != true)
+        }
+    }
+
     @Test func retargetWaitsForTheIncomingComposersOwnMeasurement() {
         let old = makeStore()
         let next = makeStore(sessionId: "next-session")

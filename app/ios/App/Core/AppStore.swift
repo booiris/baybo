@@ -496,6 +496,21 @@ final class AppStore: ObservableObject {
             // row (demo-1, oldest) springs to the top ~2s in. Start with nothing
             // pinned so it lands at the very top, not below demo-3.
             let demoPin = args.contains("-baybo-demo-pin")
+            if args.contains("-baybo-test-list-transcripts") {
+                for (session, count) in [("demo-3", 8), ("demo-5", 65)] {
+                    let rows: [[String: Any]] = (1...count).map { ordinal in
+                        ["id": "\(session)-\(ordinal)", "role": ordinal.isMultiple(of: 2) ? "assistant" : "user",
+                         "ordinal": ordinal, "content": "\(session) row \(ordinal)\n\n" +
+                            String(repeating: "A sample message with enough text to wrap inside the transcript. ", count: 2)]
+                    }
+                    let mirror: [String: Any] = ["messages": rows, "lastOrdinal": count,
+                                                 "oldestOrdinal": 1, "hasMoreOlder": false]
+                    if let data = try? JSONSerialization.data(withJSONObject: mirror),
+                       let json = String(data: data, encoding: .utf8) {
+                        TranscriptStore.write(sessionId: session, stateJson: json)
+                    }
+                }
+            }
             for i in 1...rowCount {
                 SessionIndex.shared.recordUserSend(
                     sessionId: "demo-\(i)",
