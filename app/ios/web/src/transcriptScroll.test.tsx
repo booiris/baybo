@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render } from "@testing-library/react";
+import { Profiler } from "react";
 import { I18nextProvider } from "react-i18next";
 
 import i18n from "./i18n";
@@ -266,7 +267,7 @@ async function pushFrame(frame: Record<string, unknown>): Promise<void> {
 /// would read as drift and get pinned right back.
 async function scrollTo(top: number): Promise<void> {
   await act(async () => {
-    window.dispatchEvent(new Event("touchstart"));
+    window.dispatchEvent(new TouchEvent("touchstart"));
     document.documentElement.scrollTop = top;
     window.dispatchEvent(new Event("touchend"));
   });
@@ -299,6 +300,60 @@ afterEach(() => {
 describe("scroll-up paging holds the viewport", () => {
   it("opens a restored thread on its newest rows", async () => {
     await open(60, 999);
+    expect(scrollTop).toBe(maxScroll());
+  });
+
+  it("keeps deliberate small drags parked while the jump button is still hidden", async () => {
+    await open(60, 999);
+    for (const gap of [2, 24, 95, 17, 16, 4]) {
+      const parked = maxScroll() - gap;
+      await scrollTo(parked);
+      act(() => window.dispatchEvent(new Event("resize")));
+      expect(scrollTop).toBe(parked);
+    }
+    expect(posts().some((p) => p.type === "jumpVisible" && p.visible === true)).toBe(false);
+  });
+
+  it("reports native jump button transitions without committing a transcript render", async () => {
+    const commits = vi.fn();
+    render(
+      <I18nextProvider i18n={i18n}>
+        <Profiler id="transcript" onRender={commits}>
+          <Transcript restored={mirror(60, 999)} initialConnEpoch={0} />
+        </Profiler>
+      </I18nextProvider>,
+    );
+    await settle();
+    commits.mockClear();
+    for (const gap of [130, 180, 90, 0]) await scrollTo(maxScroll() - gap);
+    expect(posts().filter((post) => post.type === "jumpVisible").map((post) => post.visible))
+      .toEqual([false, true, false]);
+    expect(commits).not.toHaveBeenCalled();
+  });
+
+  it("lets momentum stop short of the end and resumes following only on reaching it", async () => {
+    await open(60, 999);
+    const bottom = maxScroll();
+    await scrollTo(bottom - 60);
+    act(() => {
+      window.dispatchEvent(new TouchEvent("touchstart", { touches: [{ clientY: 200 } as Touch] }));
+      window.dispatchEvent(new TouchEvent("touchmove", { touches: [{ clientY: 160 } as Touch] }));
+      document.documentElement.scrollTop = bottom - 20;
+      window.dispatchEvent(new Event("touchend"));
+    });
+    act(() => {
+      document.documentElement.scrollTop = bottom - 9;
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(scrollTop).toBe(bottom - 9);
+    await pushFrame({ kind: "message", role: "assistant", ordinal: 1000, content: "One more reply" });
+    expect(maxScroll()).toBeGreaterThan(bottom);
+    expect(scrollTop).toBe(bottom - 9);
+
+    await scrollTo(maxScroll());
+    const previousEnd = scrollTop;
+    await pushFrame({ kind: "message", role: "assistant", ordinal: 1001, content: "Another reply" });
+    expect(scrollTop).toBeGreaterThan(previousEnd);
     expect(scrollTop).toBe(maxScroll());
   });
 
@@ -349,7 +404,7 @@ describe("scroll-up paging holds the viewport", () => {
   it("holds through a finger that stays down for the whole round trip", async () => {
     await open(60, 999);
     act(() => {
-      window.dispatchEvent(new Event("touchstart"));
+      window.dispatchEvent(new TouchEvent("touchstart"));
     });
     await scrollTo(0);
     await pushFrame({
@@ -1036,7 +1091,7 @@ describe("scroll-up paging without the jolt", () => {
       expect(rowIds()).toHaveLength(40);
 
       act(() => {
-        window.dispatchEvent(new Event("touchstart"));
+        window.dispatchEvent(new TouchEvent("touchstart"));
         document.documentElement.scrollTop = 0;
         // Same position, before React has committed the first page.
         window.dispatchEvent(new Event("scroll"));

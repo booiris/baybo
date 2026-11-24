@@ -40,14 +40,16 @@ struct ComposerView: View {
     /// overlay on the dock). This side reports the anchor and answers the pick.
     @ObservedObject private var attach: AttachMenu
     private let availableHeight: CGFloat
+    private let aboveKeyboard: Bool
     @State private var photoPicks: [PhotosPickerItem] = []
     @FocusState private var focused: Bool
 
-    init(store: ChatStore, attach: AttachMenu, availableHeight: CGFloat) {
+    init(store: ChatStore, attach: AttachMenu, availableHeight: CGFloat, aboveKeyboard: Bool) {
         _store = ObservedObject(wrappedValue: store)
         _staging = ObservedObject(wrappedValue: store.staging)
         _attach = ObservedObject(wrappedValue: attach)
         self.availableHeight = availableHeight
+        self.aboveKeyboard = aboveKeyboard
     }
 
     /// `ComposerDraftUITests` addresses the field by this.
@@ -205,7 +207,7 @@ struct ComposerView: View {
     /// The gap below the active editor is also where the veil turns solid.
     private var dockBottomPadding: CGFloat {
         if store.writingQuestionAnswer { return 16 }
-        return focused ? 12 : 0
+        return aboveKeyboard ? 12 : 0
     }
 
     /// Bottom mirror of the header veil, replacing the old opaque paper dock.

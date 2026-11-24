@@ -31,11 +31,45 @@ export function captureAnchor(
   viewportTop = 0,
   parts?: string,
 ): ScrollAnchor | null {
-  for (const el of root.querySelectorAll(`[${attr}]`)) {
-    const rect = el.getBoundingClientRect();
-    if (rect.bottom <= viewportTop) continue;
+  return anchorInRows(root.querySelectorAll(`[${attr}]`), 0, attr, viewportTop, parts);
+}
+
+/// The transcript is a vertical column. Its direct children, including dividers,
+/// have ordered bottom edges, so earlier rows need no individual measurements.
+export function stackedAnchorReader(attr: string, parts: string) {
+  let first = 0;
+  return (column: Element | null, viewportTop = 0): ScrollAnchor | null => {
+    if (!column) return null;
+    const rows = column.children;
+    const previous = rows.item(first)?.getBoundingClientRect();
+    if (previous && previous.top <= viewportTop && previous.bottom > viewportTop) {
+      return anchorInRows(rows, first, attr, viewportTop, parts, previous);
+    }
+
+    let start = 0;
+    let end = rows.length;
+    while (start < end) {
+      const mid = Math.floor((start + end) / 2);
+      const rect = rows[mid].getBoundingClientRect();
+      // A hidden child has no position to compare. Scan the remaining rows.
+      if (rect.height === 0 && rect.width === 0) break;
+      if (rect.bottom <= viewportTop) start = mid + 1;
+      else end = mid;
+    }
+    first = start;
+    return anchorInRows(rows, first, attr, viewportTop, parts);
+  };
+}
+
+function anchorInRows(
+  rows: ArrayLike<Element>, start: number, attr: string, viewportTop: number, parts?: string, firstRect?: DOMRect,
+): ScrollAnchor | null {
+  for (let i = start; i < rows.length; i++) {
+    const el = rows[i];
     const id = el.getAttribute(attr);
-    if (id === null) return null;
+    if (id === null) continue;
+    const rect = i === start && firstRect ? firstRect : el.getBoundingClientRect();
+    if (rect.bottom <= viewportTop) continue;
     const anchor: ScrollAnchor = { id, offset: rect.top - viewportTop };
     if (parts !== undefined && rect.top < viewportTop) {
       const blocks = el.querySelectorAll(parts);

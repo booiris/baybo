@@ -54,6 +54,11 @@ conversation — held by a single `TranscriptHost`
 web-content process spun up exactly once for the app's bound lifetime; opening a chat
 never re-boots the runtime.
 
+Each screen gives the shared webview a native container. SwiftUI measures the
+container during navigation. The document keeps its previous size until the new
+container lays out, so its rows retain their wrapping and scroll range during
+the handoff.
+
 ### `retarget(to:)`
 
 `ChatScreen.onAppear` calls `TranscriptBridge.retarget(to:)`:
@@ -66,14 +71,16 @@ never re-boots the runtime.
   frames after `init`, and replays the inset/jump/reveal the `ready` handler would have
   (no page reload fires).
 
-The keyed swap commits ASYNCHRONOUSLY inside a webview that stays visible
-(hiding it native-side pauses WebKit rAF — see the retarget comment), so two
-web-side mechanisms keep the transition clean. A cross-session `init`
+The incoming chat covers the shared webview with paper until it receives
+`shown` for its own session. WebKit continues rendering behind the cover.
+A cross-session `init`
 synchronously veils `#root` (`concealForRetarget` in `bridge.ts`) so the
 outgoing conversation vanishes on the next frame instead of lingering under
-the incoming commit; the incoming tree lifts the veil from its layout effect
-once the bottom inset is known — the reveal and its first visible paint are
-one frame. A timeout can lift the retarget veil after a failed mount, but cannot
+the incoming commit. Once its own inset is known, the incoming tree pins the
+newest edge and checks it over two consecutive animation frames before revealing.
+WebKit can briefly replay the outgoing native scroll offset after the incoming
+DOM has already positioned itself. Explicit jumps retain their own position.
+A timeout can lift the retarget veil after a failed mount, but cannot
 bypass an unknown inset. And the mount is
 BOUNDED: only the mirror's newest `FIRST_PAINT_ROWS` mount at open, and the
 older half is a paging RESERVOIR (`popDeferredHeadPage`), fed to `loadOlder`
@@ -424,10 +431,38 @@ keyboard-resized WKWebView relayouts once, async, at the final size, so content 
 still through the slide and snaps at the end.
 
 Instead `ChatScreen` measures the composer's top edge (it rides the keyboard via safe
-area) and feeds the covered strip over `setBottomInset`; SwiftUI geometry jumps to the
-target at animation START, so the web side animates `--thread-bottom-inset` on a
-keyboard-like 250ms curve (`.chat-log.inset-animated`) and re-pins the newest edge per
-frame while following.
+area) and feeds the covered strip over `setBottomInset`. The composer derives its
+clearance above the keyboard from the available screen bounds. This keeps a tap
+that clears focus from moving the dock before the keyboard starts to descend.
+The spacer after `.chat-log` takes its final height immediately, with 36 px of
+clearance above the composer in both regular chat and inline questions. A
+ResizeObserver pins a following reader to the new reachable bottom.
+Earlier builds animated the message list's bottom padding for 250 ms and
+scheduled JavaScript scroll corrections for 350 ms after an inset update.
+The spacer removes both sources of repeated layout and scroll work.
+`TranscriptKeyboardMotion` tracks a native view attached to the composer.
+For a following reader it mirrors the movement of the dock's top edge onto the
+scroll layer. This includes the dock's position and any height change about
+each layer's anchor point, with the original animation timing. A presentation
+offset compensates for WebKit committing the new scroll
+position asynchronously. Short threads move only as their content reaches the
+dock. Interactive drags return control to the scroll view.
+
+During navigation SwiftUI can measure the incoming composer near the middle of
+the screen before docking it at the bottom. Keyboard motion requires two
+positions from the same attached composer and a visible transcript.
+
+A tap in the transcript can dismiss the keyboard. Only a drag arms the
+momentum grace period, so focusing the field again after a tap still follows
+the newest message.
+
+Manual drags and momentum settle at their natural offset. Incoming replies
+and keyboard changes preserve that position while it remains reachable. During
+keyboard dismissal, a reader near the end stays still until the shrinking scroll
+range reaches their position, then follows its edge for the rest of the motion.
+The page and native scroll layer allow one point for rounding at the bottom.
+Scrolling to the end or tapping the jump button resumes following. The button
+appears beyond 96 px.
 
 The bottom scroll target is the document height minus the layout viewport
 height. During keyboard transitions WebKit can expose an out-of-range target
@@ -443,8 +478,8 @@ measured a zero inset, painted the newest rows under the composer and then
 jumped up by its height.
 
 If `init.bottomInset` is null, `awaiting-inset` keeps the page hidden until the
-first inset event. The transcript then pins and reveals in a layout effect,
-and only that effect posts `shown`; scheduling a notification immediately after
+first inset event. The transcript then pins and posts `shown` when it reveals.
+Scheduling a notification immediately after
 `root.render` does not prove the layout is ready. The retarget timeout cannot
 lift this geometry gate. Read-only hosts declare `hasComposer: false` and send
 zero, and the browser preview does the same. A staged replacement inherits the
@@ -513,7 +548,10 @@ on the way in: any geometry read in the frame the viewport changed forces the ne
 layout. So `holdPlaceAcrossWidth` keeps the place warm instead — re-read once per
 frame while the reader scrolls, and after every observed resize (the log changes
 size whenever its content does) — and hands the width change the copy from the
-layout before. A scroll capture that finds the box's width changed under it skips
+layout before. The transcript first checks whether the previous row still crosses
+the viewport edge. When the reader moves past it, a binary search over the
+stacked children locates the new row before measuring its paragraph offset.
+A scroll capture that finds the box's width changed under it skips
 that frame: WebKit clamping `scrollTop` to a shorter thread can fire a scroll event
 in the very frame of the resize, and reading there would overwrite the one good copy.
 Width means the CONTENT width: inside the capped band the viewport can change
