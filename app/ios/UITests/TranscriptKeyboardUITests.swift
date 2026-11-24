@@ -1,6 +1,30 @@
 import XCTest
 
 final class TranscriptKeyboardUITests: BayboUITestCase {
+    func testOpeningKeyboardKeepsTheHeaderAndAShortConversationInPlace() {
+        let app = launch(["-baybo-open-chat", "-baybo-demo-switch"])
+        let web = app.webViews.firstMatch
+        let message = web.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Conversation DEBUG-SESSION")).firstMatch
+        let back = app.buttons["Back to conversations"]
+        let field = app.descendants(matching: .any)["composer.field"].firstMatch
+        XCTAssertTrue(message.waitForExistence(timeout: Self.webviewTimeout))
+        let messageY = message.frame.midY
+        let headerY = back.frame.midY
+        let viewport = web.frame
+        let keyboard = app.keyboards.firstMatch
+        for _ in 0..<2 {
+            field.tap()
+            XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
+            XCTAssertEqual(back.frame.midY, headerY, accuracy: 1)
+            XCTAssertEqual(web.frame, viewport)
+            XCTAssertEqual(message.frame.midY, messageY, accuracy: 1)
+            message.tap()
+            XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
+            XCTAssertEqual(message.frame.midY, messageY, accuracy: 1)
+        }
+    }
+
     func testReopeningConversationsFromTheListShowsTheirNewestRows() {
         let app = launch(["-baybo-open-home", "-baybo-test-list-transcripts"])
         for (number, count) in [(3, 8), (5, 65), (3, 8), (3, 8)] {
