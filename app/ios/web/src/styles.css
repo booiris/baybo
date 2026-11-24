@@ -183,7 +183,7 @@ button {
   justify-content: flex-start;
 }
 .composer-space {
-  height: calc(var(--thread-bottom-inset) + 24px);
+  height: calc(var(--thread-bottom-inset) + 36px);
 }
 /* Chat MESSAGE bodies read as Inter sans (comfortable long-read); the chrome
    stays monospace. Soft uniform rounded bubbles, hairline outlined. */

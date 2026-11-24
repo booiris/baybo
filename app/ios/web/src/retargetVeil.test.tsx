@@ -158,7 +158,7 @@ describe("first layout", () => {
     settle();
     const log = container.querySelector(".chat-log");
     const space = container.querySelector(".composer-space")!;
-    expect(space.parentElement?.previousElementSibling).toBe(log);
+    expect(space.previousElementSibling).toBe(log);
     const resize = observers.get(space)!;
     const notify = () => resize([], {} as ResizeObserver);
     for (const inset of [380, 396, 96, 380, 96]) {

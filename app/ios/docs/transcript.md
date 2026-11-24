@@ -431,13 +431,17 @@ keyboard-resized WKWebView relayouts once, async, at the final size, so content 
 still through the slide and snaps at the end.
 
 Instead `ChatScreen` measures the composer's top edge (it rides the keyboard via safe
-area) and feeds the covered strip over `setBottomInset`. The spacer after
-`.chat-log` takes its final height immediately, with 24 px of clearance above
-the composer in both regular chat and inline questions. A ResizeObserver pins a following
-reader to the new reachable bottom. `TranscriptKeyboardMotion` tracks a native
-view attached to the composer. For a scrollable thread it copies the dock's
-vertical position animation onto the scroll layer, including its original start
-time. A presentation offset compensates for WebKit committing the new scroll
+area) and feeds the covered strip over `setBottomInset`. The composer derives its
+clearance above the keyboard from the available screen bounds. This keeps a tap
+that clears focus from moving the dock before the keyboard starts to descend.
+The spacer after `.chat-log` takes its final height immediately, with 36 px of
+clearance above the composer in both regular chat and inline questions. A
+ResizeObserver pins a following reader to the new reachable bottom.
+`TranscriptKeyboardMotion` tracks a native view attached to the composer.
+For a following reader it mirrors the movement of the dock's top edge onto the
+scroll layer. This includes the dock's position and any height change about
+each layer's anchor point, with the original animation timing. A presentation
+offset compensates for WebKit committing the new scroll
 position asynchronously. Short threads move only as their content reaches the
 dock. Interactive drags return control to the scroll view.
 
@@ -449,13 +453,13 @@ A tap in the transcript can dismiss the keyboard. Only a drag arms the
 momentum grace period, so focusing the field again after a tap still follows
 the newest message.
 
-A reader who scrolls even slightly away from the end keeps the same message
-at the same screen position through keyboard changes. The page and the native
-scroll layer allow one point for rounding at the bottom. Manual drags and
-momentum settle at their natural offset. Incoming replies leave that reading
-position in place. The jump button appears beyond 96 px. On dismissal, the page temporarily
-retains enough space below a parked reader to keep the offset reachable.
-Scrolling back to the end or tapping the jump button resumes following.
+Manual drags and momentum settle at their natural offset. Incoming replies
+and keyboard changes preserve that position while it remains reachable. During
+keyboard dismissal, a reader near the end stays still until the shrinking scroll
+range reaches their position, then follows its edge for the rest of the motion.
+The page and native scroll layer allow one point for rounding at the bottom.
+Scrolling to the end or tapping the jump button resumes following. The button
+appears beyond 96 px.
 
 The bottom scroll target is the document height minus the layout viewport
 height. During keyboard transitions WebKit can expose an out-of-range target

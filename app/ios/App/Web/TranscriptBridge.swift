@@ -418,7 +418,7 @@ final class TranscriptBridge: NSObject, ObservableObject, WebMediaSink, BottomIn
         // Only two positions of the same mounted dock describe real motion.
         if target === store, let anchor = composerAnchors.object(forKey: target),
            let window = webView?.window, anchor.window === window, !anchor.bounds.isEmpty {
-            if positionedComposerAnchor === anchor, contentVisible, !jumpVisible,
+            if positionedComposerAnchor === anchor, contentVisible,
                let old = composerTops[ObjectIdentifier(target)] {
                 keyboardMotion?.move(from: old, to: minYInWindow, with: anchor)
             }
@@ -842,7 +842,6 @@ extension TranscriptBridge: WKScriptMessageHandler {
             }
         case "jumpVisible":
             jumpVisible = (body["visible"] as? Bool) ?? false
-            if jumpVisible { keyboardMotion?.reset() }
         case "outline":
             outlineHasMoreOlder = (body["hasMoreOlder"] as? Bool) ?? false
             outlineLoadingOlder = (body["loadingOlder"] as? Bool) ?? false

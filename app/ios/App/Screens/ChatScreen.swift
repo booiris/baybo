@@ -29,7 +29,6 @@ struct ChatScreen: View {
     /// header — the panel's column is measured off it rather than re-derived
     /// from the header's paddings.
     @State private var modelPillFrame: CGRect = .zero
-    @State private var availableHeight: CGFloat = 0
     /// The header's message index (`MessageIndexSheet`).
     @State private var messageIndexOpen = false
     /// The header's subagent list (`SubagentSheet`).
@@ -57,7 +56,7 @@ struct ChatScreen: View {
         self.docked = docked
     }
 
-    var body: some View {
+    private var transcript: some View {
         ZStack(alignment: .top) {
             // Full-bleed on BOTH vertical edges, keyboard included: a webview
             // whose frame tracks the keyboard can't animate with it (the web
@@ -124,45 +123,46 @@ struct ChatScreen: View {
             )
             .frame(width: 0, height: 0)
         )
+    }
+
+    private func composer(in available: GeometryProxy) -> some View {
         // Everything the dock's own chain has to get right — the panel floating
         // above its top edge, the collapse that must neither clip nor resize —
         // lives in `ComposerDock`, which is store-free so `ComposerDockTests`
         // can render it. Only the CONTENT is assembled here.
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            ComposerDock(collapsed: bridge.htmlPreviewMaximized) {
-                ComposerView(store: store, attach: attach, availableHeight: availableHeight)
-                    .background(TranscriptComposerAnchor(bridge: bridge, store: store))
-                    .onGeometryChange(for: CGFloat.self) { proxy in
-                        proxy.frame(in: .global).minY
-                    } action: { minY in
-                        bridge.setComposerTop(minY, for: store)
-                    }
-                    .jumpToLatestDisc(
-                        visible: bridge.jumpVisible,
-                        label: Lang.shared.t("chat.jumpToLatest"), identifier: "chat-jump"
-                    ) {
-                        bridge.jumpToLatest()
-                    }
-            } panel: {
-                if attach.isOpen {
-                    AttachMenuPanel(
-                        anchor: attach.anchor, sources: attach.sources,
-                        isPresented: $attach.isOpen
-                    ) { source in
-                        attach.pick = source
-                    }
+        ComposerDock(collapsed: bridge.htmlPreviewMaximized) {
+            ComposerView(store: store, attach: attach, availableHeight: available.size.height,
+                         aboveKeyboard: isAboveKeyboard(available))
+                .background(TranscriptComposerAnchor(bridge: bridge, store: store))
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.frame(in: .global).minY
+                } action: { minY in
+                    bridge.setComposerTop(minY, for: store)
+                }
+                .jumpToLatestDisc(
+                    visible: bridge.jumpVisible,
+                    label: Lang.shared.t("chat.jumpToLatest"), identifier: "chat-jump"
+                ) {
+                    bridge.jumpToLatest()
+                }
+        } panel: {
+            if attach.isOpen {
+                AttachMenuPanel(
+                    anchor: attach.anchor, sources: attach.sources,
+                    isPresented: $attach.isOpen
+                ) { source in
+                    attach.pick = source
                 }
             }
-            .animation(Self.chromeFade, value: bridge.htmlPreviewMaximized)
-
         }
-        // Measured OUTSIDE the dock's inset: the whole screen's free height,
-        // keyboard already taken out, and independent of how tall the dock's
-        // own rows are — so the cap cannot feed back into what it is cut from.
-        .onGeometryChange(for: CGFloat.self) { proxy in
-            proxy.size.height
-        } action: { height in
-            availableHeight = height
+        .animation(Self.chromeFade, value: bridge.htmlPreviewMaximized)
+    }
+
+    var body: some View {
+        GeometryReader { available in
+            transcript.safeAreaInset(edge: .bottom, spacing: 0) {
+                composer(in: available)
+            }
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in
@@ -294,6 +294,11 @@ struct ChatScreen: View {
             SessionIndex.shared.leaveSession(store.sessionId)
             ComposerPasteTarget.shared.detach(store.staging)
         }
+    }
+
+    private func isAboveKeyboard(_ available: GeometryProxy) -> Bool {
+        guard let window = webView.window else { return false }
+        return available.frame(in: .global).maxY < window.safeAreaLayoutGuide.layoutFrame.maxY - 1
     }
 
     #if DEBUG

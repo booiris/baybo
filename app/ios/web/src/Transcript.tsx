@@ -294,17 +294,6 @@ function maxScrollTop(el: HTMLElement): number {
   return Math.max(0, el.scrollHeight - el.clientHeight);
 }
 
-// The floor under the spacer keeps WebKit from clamping a parked scrollTop
-// when the keyboard withdraws. Reclaim it once the natural page covers the
-// viewport, or immediately when the reader explicitly returns to the end.
-function releaseComposerFloor(space: HTMLElement | null, el: HTMLElement, following: boolean): void {
-  const floor = space?.parentElement;
-  if (!space || !floor || floor.style.minHeight === "") return;
-  if (following || space.getBoundingClientRect().bottom >= el.clientHeight + BOTTOM_TOLERANCE_PX) {
-    floor.style.minHeight = "";
-  }
-}
-
 /// The blocks a long row is held by when it straddles the top edge — one agent
 /// reply can be several screens of paragraphs, and a fold rewraps all of them.
 const ROW_PART_SELECTOR =
@@ -2288,7 +2277,6 @@ export function Transcript({
       !replaceAnchor.current &&
       !userTouchingRef.current
     ) {
-      releaseComposerFloor(composerSpaceRef.current, el, true);
       el.scrollTop = maxScrollTop(el);
     }
   }, [messages, streaming, turnActive]);
@@ -2352,7 +2340,6 @@ export function Transcript({
     const pinAfterResize = () => {
       const el = scrollEl();
       if (!el) return;
-      releaseComposerFloor(space, el, followRef.current);
       const bottom = maxScrollTop(el);
       // A short draft can become non-scrollable without another scroll event
       // to clear a latched jump button.
@@ -3617,19 +3604,11 @@ export function Transcript({
   };
 
   const handleBottomInset = () => {
-    const space = composerSpaceRef.current;
-    const floor = space?.parentElement;
     const el = scrollEl();
     if (el && followRef.current && !userTouchingRef.current && maxScrollTop(el) - el.scrollTop <= BOTTOM_TOLERANCE_PX) {
       // A completed return gesture has no momentum left to protect. The next
       // off-edge scroll can be the keyboard enlarging the spacer.
       lastDragEndAt.current = Number.NEGATIVE_INFINITY;
-    }
-    if (space && floor && el && !followRef.current) {
-      // Leave a little reachable scroll past the parked offset so a resize
-      // alone cannot be mistaken for the reader scrolling back to the end.
-      const needed = Math.ceil(el.clientHeight - space.getBoundingClientRect().top) + BOTTOM_TOLERANCE_PX + 1;
-      floor.style.minHeight = needed > 0 ? `${needed}px` : "";
     }
     if (!layoutReady) setLayoutReady(true);
   };
@@ -3724,7 +3703,6 @@ export function Transcript({
     const onScroll = () => {
       const el = scrollEl();
       if (!el) return;
-      releaseComposerFloor(composerSpaceRef.current, el, followRef.current);
       const distance = maxScrollTop(el) - el.scrollTop;
       const follow = distance <= BOTTOM_TOLERANCE_PX;
       const coasting = performance.now() - lastDragEndAt.current < TOUCH_COAST_GRACE_MS;
@@ -3738,7 +3716,6 @@ export function Transcript({
       } else if (follow) {
         followRef.current = true;
         if (!userTouchingRef.current) lastDragEndAt.current = Number.NEGATIVE_INFINITY;
-        releaseComposerFloor(composerSpaceRef.current, el, true);
         setShowJump(false);
       } else if (userTouchingRef.current && followRef.current && !draggedVertically.current &&
                  el.scrollTop >= Math.min(touchStartScrollTop.current, maxScrollTop(el)) - BOTTOM_TOLERANCE_PX) {
@@ -3861,7 +3838,6 @@ export function Transcript({
   function jumpToLatest() {
     const el = scrollEl();
     if (!el) return;
-    releaseComposerFloor(composerSpaceRef.current, el, true);
     armPinGlide();
     setShowJump(false);
     el.scrollTo({ top: maxScrollTop(el), behavior: "smooth" });
@@ -4266,9 +4242,7 @@ export function Transcript({
           </button>
         )}
       </div>
-      <div aria-hidden="true">
-        <div ref={composerSpaceRef} className="composer-space" />
-      </div>
+      <div ref={composerSpaceRef} className="composer-space" aria-hidden="true" />
     </ImageDimsContext.Provider>
   );
 }

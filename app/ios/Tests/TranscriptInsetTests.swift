@@ -63,6 +63,33 @@ struct TranscriptInsetTests {
         #expect(scroll.layer.animationKeys()?.isEmpty != false)
     }
 
+    @Test func dismissalMovesAParkedReaderOnlyWhenTheShrinkingScrollRangeReachesThem() {
+        guard !UIAccessibility.isReduceMotionEnabled else { return }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        let scroll = UIScrollView(frame: window.bounds)
+        let dock = UIView(frame: CGRect(x: 0, y: 400, width: 400, height: 60))
+        window.addSubview(scroll)
+        window.addSubview(dock)
+        scroll.contentSize = CGSize(width: 400, height: 1400)
+        scroll.contentOffset.y = 440
+        let motion = TranscriptKeyboardMotion(scroll: scroll)
+        defer { motion.reset() }
+        motion.move(from: 400, to: 700, with: dock)
+        scroll.contentSize.height -= 300
+        scroll.contentOffset.y = 300
+
+        for (dockY, visibleOffset): (CGFloat, CGFloat) in [(430, 440), (600, 400), (700, 300)] {
+            dock.frame.origin.y = dockY
+            motion.move(from: 400, to: 700, with: dock)
+            let correction = scroll.layer.animationKeys()?.compactMap { key -> CGFloat? in
+                guard let animation = scroll.layer.animation(forKey: key) as? CABasicAnimation,
+                      animation.keyPath == "bounds.origin.y" else { return nil }
+                return animation.fromValue as? CGFloat
+            }.first ?? 0
+            #expect(scroll.contentOffset.y + correction == visibleOffset)
+        }
+    }
+
     @Test func repeatedKeyboardChangesUseTheDockAnimationAndPreserveTheWebScrollOffset() throws {
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
         let scroll = UIScrollView(frame: window.bounds)
@@ -87,16 +114,30 @@ struct TranscriptInsetTests {
             spring.duration = 0.4
             spring.beginTime = CACurrentMediaTime()
             dock.layer.add(spring, forKey: "position")
+            // The composer gains 12 pt of clearance above the keyboard. UIKit
+            // animates both its size and its center to keep its top on the dock.
+            let oldHeightMinusNew: CGFloat = delta > 0 ? -12 : 12
+            let size = try #require(spring.copy() as? CASpringAnimation)
+            size.keyPath = "bounds.size"
+            size.fromValue = CGSize(width: 0, height: oldHeightMinusNew)
+            size.toValue = CGSize.zero
+            anchor.layer.add(size, forKey: "bounds.size")
+            let center = try #require(spring.copy() as? CASpringAnimation)
+            center.fromValue = CGPoint(x: 0, y: oldHeightMinusNew * anchor.layer.anchorPoint.y)
+            anchor.layer.add(center, forKey: "position")
             let originalOffset = scroll.contentOffset.y
             #expect(originalOffset == scroll.contentSize.height - scroll.bounds.height)
             motion.move(from: oldY, to: newY, with: anchor)
             #expect(scroll.contentOffset.y == originalOffset)
             if !UIAccessibility.isReduceMotionEnabled {
-                let copy = try #require(scroll.layer.animationKeys()?.compactMap {
+                let mirrors = try #require(scroll.layer.animationKeys()?.compactMap {
                     scroll.layer.animation(forKey: $0) as? CASpringAnimation
-                }.first { $0.keyPath == "bounds.origin.y" })
-                #expect(copy.beginTime == spring.beginTime)
-                let displacement = try #require((copy.fromValue as? NSNumber)?.doubleValue)
+                }.filter { $0.keyPath == "bounds.origin.y" })
+                #expect(!mirrors.isEmpty && mirrors.allSatisfy { $0.beginTime == spring.beginTime })
+                let displacement = try mirrors.reduce(0.0) { total, animation in
+                    let from = try #require((animation.fromValue as? NSNumber)?.doubleValue)
+                    return total + from
+                }
                 #expect(abs(displacement + Double(delta)) < 0.01)
             }
             scroll.contentSize.height += delta

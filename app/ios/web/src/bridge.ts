@@ -880,8 +880,7 @@ window.baybo = {
   },
   setBottomInset(px, sessionId) {
     if (initPayload?.sessionId !== sessionId) return;
-    // Let a mounted reader protect their offset before a shrinking spacer
-    // changes the document's reachable range.
+    // Let the transcript read its current position before the scroll range changes.
     dispatch({ kind: "bottomInset", px });
     applyBottomInset(px);
   },

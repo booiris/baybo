@@ -27,7 +27,8 @@ final class TranscriptKeyboardMotion: NSObject {
     private var correction: CGFloat = 0
     private var startTop: CGFloat = 0
     private var targetTop: CGFloat = 0
-    private var startOffset: CGFloat?
+    private var startBottom: CGFloat?
+    private var readingOffset: CGFloat?
     private var deadline: CFTimeInterval = 0
 
     init(scroll: UIScrollView) {
@@ -45,15 +46,19 @@ final class TranscriptKeyboardMotion: NSObject {
               !scroll.isDragging, !scroll.isDecelerating, !UIAccessibility.isReduceMotionEnabled else { return }
         if updates == nil || self.anchor !== anchor {
             reset()
-            // The jump button appears farther into history. Its absence alone
-            // cannot tell us whether a new keyboard movement should follow.
             let bottom = max(0, scroll.contentSize.height - scroll.bounds.height)
-            guard abs(bottom - scroll.contentOffset.y) <= 1 else { return }
+            let offset = scroll.contentOffset.y
+            let atBottom = abs(bottom - offset) <= 1
+            // Dismissing the keyboard can shrink the document past a reader
+            // near its end. Hold their place until the moving edge reaches it.
+            let newBottom = max(0, bottom + old - new)
+            guard atBottom || (offset > newBottom && offset <= bottom) else { return }
             self.anchor = anchor
             startTop = old
+            readingOffset = atBottom ? nil : offset
             // A document shorter than the screen only starts moving when the
             // composer actually reaches it. Its new scroll range tells us where.
-            startOffset = scroll.contentOffset.y > 0 ? scroll.contentOffset.y : nil
+            startBottom = bottom > 0 ? bottom : nil
             let link = UIUpdateLink(view: scroll)
             link.addAction(to: .beforeCATransactionCommit) { [weak self] _, _ in self?.synchronize() }
             link.requiresContinuousUpdates = true
@@ -75,13 +80,14 @@ final class TranscriptKeyboardMotion: NSObject {
         let windowLayer = window.layer.presentation() ?? window.layer
         let visibleTop = layer.convert(layer.bounds.origin, to: windowLayer).y
         let bottom = max(0, scroll.contentSize.height - scroll.bounds.height)
-        let restingOffset = startOffset.map { $0 + startTop - targetTop } ?? bottom
-        if dockAnimationKeys.isEmpty, startOffset != nil, restingOffset > 0,
+        let restingOffset = startBottom.map { $0 + startTop - targetTop } ?? bottom
+        if dockAnimationKeys.isEmpty, readingOffset == nil, startBottom != nil, restingOffset > 0,
            abs(anchor.convert(anchor.bounds.origin, to: window).y - targetTop) < 1 {
             mirrorDockAnimations(from: anchor.layer, onto: scroll.layer, remaining: visibleTop - targetTop)
         }
         let projected = max(0, restingOffset + targetTop - visibleTop)
-        let visibleOffset = startOffset == nil ? min(bottom, projected) : projected
+        let visibleBottom = startBottom == nil ? min(bottom, projected) : projected
+        let visibleOffset = min(readingOffset ?? visibleBottom, visibleBottom)
         if abs(visibleTop - targetTop) < 0.5 && abs(scroll.contentOffset.y - visibleOffset) < 0.5 &&
             abs(scroll.contentOffset.y - bottom) < 1 {
             reset()
@@ -97,28 +103,39 @@ final class TranscriptKeyboardMotion: NSObject {
         var travel: CGFloat = 0
         for layer in sequence(first: anchor, next: { $0.superlayer }) {
             for key in layer.animationKeys() ?? [] {
-                guard let animation = layer.animation(forKey: key) as? CABasicAnimation,
-                      animation.keyPath == "position", animation.isAdditive,
-                      let from = animation.fromValue as? CGPoint, let to = animation.toValue as? CGPoint,
-                      to == .zero, from.y != 0, let copy = animation.copy() as? CABasicAnimation else { continue }
+                guard let animation = layer.animation(forKey: key) as? CABasicAnimation, animation.isAdditive,
+                      let dy = topEdgeTravel(animation, on: layer), dy != 0,
+                      let copy = animation.copy() as? CABasicAnimation else { continue }
                 copy.delegate = nil
                 copy.keyPath = "bounds.origin.y"
-                copy.fromValue = -from.y
+                copy.fromValue = -dy
                 copy.toValue = 0
                 if animation.beginTime != 0 {
                     copy.beginTime = destination.convertTime(animation.beginTime, from: layer)
                 }
                 mirrors.append(copy)
-                travel += from.y
+                travel += dy
             }
         }
-        // The field's focus padding and the keyboard can start in separate
-        // transactions. A small padding animation cannot carry the keyboard.
+        // SwiftUI can commit nested layers separately. Wait until the
+        // animations account for the whole remaining displacement.
         guard abs(travel) + 1 >= abs(remaining), travel * remaining >= 0 else { return }
         for (index, mirror) in mirrors.enumerated() {
             let key = "baybo.composerPosition.\(index)"
             destination.add(mirror, forKey: key)
             dockAnimationKeys.append(key)
+        }
+    }
+
+    private func topEdgeTravel(_ animation: CABasicAnimation, on layer: CALayer) -> CGFloat? {
+        switch (animation.keyPath, animation.fromValue, animation.toValue) {
+        case ("position", let from as CGPoint, let to as CGPoint) where to == .zero:
+            return from.y
+        case ("bounds.size", let from as CGSize, let to as CGSize) where to == .zero:
+            // A layer resizes about its anchor. Its center can move while its top stays put.
+            return -layer.anchorPoint.y * from.height
+        default:
+            return nil
         }
     }
 

@@ -17,7 +17,7 @@ final class TranscriptKeyboardUITests: BayboUITestCase {
         try checkNearBottomPosition(startWithKeyboard: false)
     }
 
-    func testSlightScrollUpBeforeDismissingKeyboardKeepsTheSameRowInPlace() throws {
+    func testDismissingKeyboardAfterASlightScrollLeavesOnlyTheNormalComposerGap() throws {
         try checkNearBottomPosition(startWithKeyboard: true)
     }
 
@@ -29,6 +29,7 @@ final class TranscriptKeyboardUITests: BayboUITestCase {
             NSPredicate(format: "label BEGINSWITH %@", "Done — three paragraphs")).firstMatch
         XCTAssertTrue(newest.waitForExistence(timeout: Self.webviewTimeout))
         let keyboard = app.keyboards.firstMatch
+        let closedGap = field.frame.minY - newest.frame.maxY
         if startWithKeyboard {
             field.tap()
             XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
@@ -47,36 +48,30 @@ final class TranscriptKeyboardUITests: BayboUITestCase {
         XCTAssertLessThan(parked - pinned, 96)
         XCTAssertEqual(keyboard.exists, startWithKeyboard)
 
-        for open in [!startWithKeyboard, startWithKeyboard] {
-            if open {
-                field.tap()
-                XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
-            } else {
-                row.tap()
-                XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
-            }
-            XCTAssertEqual(row.frame.midY, parked, accuracy: 2)
+        if startWithKeyboard {
+            row.tap()
+            XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
+            XCTAssertEqual(field.frame.minY - newest.frame.maxY, closedGap, accuracy: 2)
+            return
         }
+        field.tap()
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
+        XCTAssertEqual(row.frame.midY, parked, accuracy: 2)
+        row.tap()
+        XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
+        XCTAssertEqual(row.frame.midY, parked, accuracy: 2)
         let towardNewest = web.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.44))
         towardNewest.press(forDuration: 0.1, thenDragTo: towardNewest.withOffset(CGVector(dx: 0, dy: -120)),
                            withVelocity: .slow, thenHoldForDuration: 0.3)
         let returned = newest.frame.midY
-        if startWithKeyboard {
-            newest.tap()
-            XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
-        } else {
-            field.tap()
-            XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
-        }
-        let follows = NSPredicate { _, _ in
-            let delta = newest.frame.midY - returned
-            return startWithKeyboard ? delta > 100 : delta < -100
-        }
+        field.tap()
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
+        let follows = NSPredicate { _, _ in newest.frame.midY < returned - 100 }
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: follows, object: nil)],
                                       timeout: 4), .completed)
     }
 
-    func testOpeningKeyboardKeepsAReaderWhoDraggedIntoHistoryParked() throws {
+    func testTogglingKeyboardKeepsAReaderWhoDraggedIntoHistoryParked() throws {
         let app = launch(["-baybo-open-chat", "-baybo-demo-index"])
         let web = app.webViews.firstMatch
         let field = app.descendants(matching: .any)["composer.field"].firstMatch
@@ -101,6 +96,9 @@ final class TranscriptKeyboardUITests: BayboUITestCase {
         field.tap()
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
         XCTAssertTrue(jump.exists)
+        XCTAssertEqual(row.frame.midY, parkedY, accuracy: 8)
+        web.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35)).tap()
+        XCTAssertTrue(keyboard.waitForNonExistence(timeout: 5))
         XCTAssertEqual(row.frame.midY, parkedY, accuracy: 8)
     }
 
