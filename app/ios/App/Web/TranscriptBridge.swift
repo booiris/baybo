@@ -841,6 +841,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
                     msgId: msgId, text: text, attachments: parseAttachments(body["attachments"]))
             }
         case "jumpVisible":
+            guard let sessionId = body["sessionId"] as? String, sessionId == store?.sessionId else { return }
             jumpVisible = (body["visible"] as? Bool) ?? false
         case "outline":
             outlineHasMoreOlder = (body["hasMoreOlder"] as? Bool) ?? false

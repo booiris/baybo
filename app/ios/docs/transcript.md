@@ -437,6 +437,9 @@ that clears focus from moving the dock before the keyboard starts to descend.
 The spacer after `.chat-log` takes its final height immediately, with 36 px of
 clearance above the composer in both regular chat and inline questions. A
 ResizeObserver pins a following reader to the new reachable bottom.
+Earlier builds animated the message list's bottom padding for 250 ms and
+scheduled JavaScript scroll corrections for 350 ms after an inset update.
+The spacer removes both sources of repeated layout and scroll work.
 `TranscriptKeyboardMotion` tracks a native view attached to the composer.
 For a following reader it mirrors the movement of the dock's top edge onto the
 scroll layer. This includes the dock's position and any height change about
@@ -545,7 +548,10 @@ on the way in: any geometry read in the frame the viewport changed forces the ne
 layout. So `holdPlaceAcrossWidth` keeps the place warm instead — re-read once per
 frame while the reader scrolls, and after every observed resize (the log changes
 size whenever its content does) — and hands the width change the copy from the
-layout before. A scroll capture that finds the box's width changed under it skips
+layout before. The transcript first checks whether the previous row still crosses
+the viewport edge. When the reader moves past it, a binary search over the
+stacked children locates the new row before measuring its paragraph offset.
+A scroll capture that finds the box's width changed under it skips
 that frame: WebKit clamping `scrollTop` to a shorter thread can fire a scroll event
 in the very frame of the resize, and reading there would overwrite the one good copy.
 Width means the CONTENT width: inside the capped band the viewport can change

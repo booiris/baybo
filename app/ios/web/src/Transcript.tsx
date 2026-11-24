@@ -43,7 +43,7 @@ import { useLongPress } from "./gestures";
 import { MarkdownBody, StreamingMarkdownBody } from "./Markdown";
 import {
   anchorShift,
-  captureAnchor,
+  stackedAnchorReader,
   holdPlaceAcrossWidth,
   type ScrollAnchor,
 } from "./resizeAnchor";
@@ -298,16 +298,6 @@ function maxScrollTop(el: HTMLElement): number {
 /// reply can be several screens of paragraphs, and a fold rewraps all of them.
 const ROW_PART_SELECTOR =
   "p, li, pre, blockquote, h1, h2, h3, h4, h5, h6, tr, figure, .katex-display";
-
-/// The topmost row still on screen, and how far below the viewport's top edge it
-/// sat — what a REPLACE or a width change has to put back under a reader parked
-/// in history. Every row carries `data-row-id` for exactly this (and for the
-/// message index's jump), and a REPLACE reuses a surviving row's key, so the
-/// handle is still findable in the rebuilt thread. `null` when no row is on
-/// screen to hold onto.
-function captureRowAnchor(): ScrollAnchor | null {
-  return captureAnchor(document, ROW_ID_ATTR, 0, ROW_PART_SELECTOR);
-}
 
 /// Put an anchored row back under the pixel it was captured at. False when the
 /// row is gone, which each caller answers in its own way.
@@ -2099,6 +2089,7 @@ export function Transcript({
   // page lands or the connection turns over (see onScroll).
   const pagingFailedRef = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
+  const captureRowAnchor = useMemo(() => stackedAnchorReader(ROW_ID_ATTR, ROW_PART_SELECTOR), []);
   const composerSpaceRef = useRef<HTMLDivElement>(null);
   // Set just before a scroll-up PREPEND so the layout effect can re-anchor the
   // viewport (prepending above the top would otherwise jump the scroll
@@ -2136,9 +2127,15 @@ export function Transcript({
   // eats taps on work blocks / buttons whenever `followRef` is set but the
   // scroll isn't exactly at the bottom.
   const touchStartScrollHeight = useRef(0);
-  // Drives the jump-to-latest button — a render concern, unlike followRef
-  // (a ref precisely so scrolling doesn't re-render).
-  const [showJump, setShowJump] = useState(false);
+  // Only the native composer draws this button. Crossing its threshold can
+  // notify it directly without rendering the transcript.
+  const jumpVisible = useRef<boolean | null>(null);
+  const reportJump = useCallback((visible: boolean) => {
+    if (jumpVisible.current === visible) return;
+    jumpVisible.current = visible;
+    postJumpVisible(visible, sessionId);
+  }, [sessionId]);
+  useLayoutEffect(() => { reportJump(false); }, [reportJump]);
   // True while the jump-to-latest smooth glide is in flight. The glide fires
   // scroll events that still read as "off the edge"; onScroll holds the
   // follow/button state while this is set so the button doesn't flicker back.
@@ -2161,9 +2158,9 @@ export function Transcript({
       if (!el) return;
       const distance = maxScrollTop(el) - el.scrollTop;
       followRef.current = distance <= BOTTOM_TOLERANCE_PX;
-      setShowJump(distance > JUMP_BUTTON_DISTANCE_PX);
+      reportJump(distance > JUMP_BUTTON_DISTANCE_PX);
     }, GLIDE_SETTLE_CAP_MS);
-  }, []);
+  }, [reportJump]);
   // Which row the jump ring is blooming around, and the replay nonce that lets
   // it bloom again on a repeat jump to the same row (see MessageRow's `flash`).
   const [flash, setFlash] = useState({ id: "", nonce: 0 });
@@ -2277,7 +2274,8 @@ export function Transcript({
       !replaceAnchor.current &&
       !userTouchingRef.current
     ) {
-      el.scrollTop = maxScrollTop(el);
+      const bottom = maxScrollTop(el);
+      if (el.scrollTop !== bottom) el.scrollTop = bottom;
     }
   }, [messages, streaming, turnActive]);
 
@@ -2318,7 +2316,7 @@ export function Transcript({
       const log = logRef.current;
       const el = scrollEl();
       if (!log || !el) return;
-      const before = followRef.current ? null : captureRowAnchor();
+      const before = followRef.current ? null : captureRowAnchor(logRef.current);
       for (const row of log.querySelectorAll<HTMLElement>(STAMPED_ROW_SELECTOR)) {
         delete row.dataset.cv;
       }
@@ -2328,7 +2326,7 @@ export function Transcript({
       }
       stampFreshRows();
     }, CV_REFRESH_DEBOUNCE_MS);
-  }, [stampFreshRows]);
+  }, [stampFreshRows, captureRowAnchor]);
 
   // The spacer receives the final composer height. WebKit lays it out once
   // while the native scroll layer animates the resulting offset change.
@@ -2345,9 +2343,9 @@ export function Transcript({
       // to clear a latched jump button.
       if (bottom <= BOTTOM_TOLERANCE_PX) {
         followRef.current = true;
-        setShowJump(false);
+        reportJump(false);
       } else if (!followRef.current) {
-        setShowJump(bottom - el.scrollTop > JUMP_BUTTON_DISTANCE_PX);
+        reportJump(bottom - el.scrollTop > JUMP_BUTTON_DISTANCE_PX);
       }
       if (followRef.current && !userTouchingRef.current && el.scrollTop !== bottom) {
         el.scrollTop = bottom;
@@ -2360,7 +2358,7 @@ export function Transcript({
     const stopHoldingPlace = holdPlaceAcrossWidth(
       box,
       window,
-      () => (followRef.current ? null : captureRowAnchor()),
+      () => (followRef.current ? null : captureRowAnchor(logRef.current)),
       ({ widthChanged, before }) => {
         if (widthChanged) scheduleCvRefresh();
         pinAfterResize();
@@ -2374,7 +2372,7 @@ export function Transcript({
       window.removeEventListener("resize", pinAfterResize);
       stopHoldingPlace();
     };
-  }, [scheduleCvRefresh]);
+  }, [scheduleCvRefresh, reportJump, captureRowAnchor]);
 
   // Track finger-down (on the document — the whole page is the scroller now) so
   // the pin-to-newest writes yield to a drag. Passive — never blocks the scroll.
@@ -2554,9 +2552,9 @@ export function Transcript({
     requestAnimationFrame(() => {
       const el = scrollEl();
       if (!el) return;
-      setShowJump(maxScrollTop(el) - el.scrollTop > JUMP_BUTTON_DISTANCE_PX);
+      reportJump(maxScrollTop(el) - el.scrollTop > JUMP_BUTTON_DISTANCE_PX);
     });
-  }, []);
+  }, [reportJump]);
 
   const promptId = questions?.prompt?.ask_id;
   const activeQuestion = questions?.prompt?.active;
@@ -3190,7 +3188,7 @@ export function Transcript({
         // reuses every surviving row's key, so the row they were reading is
         // still on screen and the anchor effect puts it back under the same
         // pixel — and only if the rebuild dropped it do they land at the bottom.
-        if (!followRef.current) replaceAnchor.current = captureRowAnchor();
+        if (!followRef.current) replaceAnchor.current = captureRowAnchor(logRef.current);
         setMessages((prev) => {
           const rebuilt = applySyncReplace(prev, folded, unconfirmedSends.current);
           if (keepFloor === null) return rebuilt;
@@ -3239,7 +3237,7 @@ export function Transcript({
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
       markReadIfAdvanced();
     },
-    [advanceCursorFromSync, clearStreaming, markReadIfAdvanced, setSyncInFlight, runSync, flushRowOps],
+    [advanceCursorFromSync, captureRowAnchor, clearStreaming, markReadIfAdvanced, setSyncInFlight, runSync, flushRowOps],
   );
 
   const handleFrame = (frameJson: string) => {
@@ -3703,7 +3701,9 @@ export function Transcript({
     const onScroll = () => {
       const el = scrollEl();
       if (!el) return;
-      const distance = maxScrollTop(el) - el.scrollTop;
+      const bottom = maxScrollTop(el);
+      const top = el.scrollTop;
+      const distance = bottom - top;
       const follow = distance <= BOTTOM_TOLERANCE_PX;
       const coasting = performance.now() - lastDragEndAt.current < TOUCH_COAST_GRACE_MS;
       if (glidingRef.current) {
@@ -3716,9 +3716,9 @@ export function Transcript({
       } else if (follow) {
         followRef.current = true;
         if (!userTouchingRef.current) lastDragEndAt.current = Number.NEGATIVE_INFINITY;
-        setShowJump(false);
+        reportJump(false);
       } else if (userTouchingRef.current && followRef.current && !draggedVertically.current &&
-                 el.scrollTop >= Math.min(touchStartScrollTop.current, maxScrollTop(el)) - BOTTOM_TOLERANCE_PX) {
+                 top >= Math.min(touchStartScrollTop.current, bottom) - BOTTOM_TOLERANCE_PX) {
         // A tap that dismisses the keyboard changes the document's inset
         // under a stationary finger. Keep its follow intent through the tap.
         return;
@@ -3734,7 +3734,7 @@ export function Transcript({
         // touchend must still read as the reader leaving, not as drift. The
         // reader left; respect it.
         followRef.current = false;
-        setShowJump(distance > JUMP_BUTTON_DISTANCE_PX);
+        reportJump(distance > JUMP_BUTTON_DISTANCE_PX);
       } else {
         // Off-edge reading under a FOLLOWING reader with no finger down: the
         // EDGE moved, not the reader — late reflow under a pin (the drained
@@ -3743,7 +3743,7 @@ export function Transcript({
         // on cold open and left the thread parked short of the bottom, with
         // every later growth compounding the gap. Re-pin instead: content can
         // never scroll the reader away — only fingers and explicit jumps do.
-        el.scrollTop = maxScrollTop(el);
+        el.scrollTop = bottom;
       }
       // Only a reader who has left the newest edge is asking for history —
       // under a pin the band would page a short thread at every open. And
@@ -3753,14 +3753,14 @@ export function Transcript({
       if (
         !followRef.current &&
         !pagingFailedRef.current &&
-        el.scrollTop <= Math.max(SCROLL_TOP_THRESHOLD_PX, el.clientHeight)
+        top <= Math.max(SCROLL_TOP_THRESHOLD_PX, el.clientHeight)
       ) {
         loadOlder();
       }
     };
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
-  }, [loadOlder]);
+  }, [loadOlder, reportJump]);
 
   // Bridge events call the LATEST handlers through this ref (assigned each
   // render), so the subscription registers once without re-subscribing per
@@ -3839,7 +3839,7 @@ export function Transcript({
     const el = scrollEl();
     if (!el) return;
     armPinGlide();
-    setShowJump(false);
+    reportJump(false);
     el.scrollTo({ top: maxScrollTop(el), behavior: "smooth" });
   }
 
@@ -4072,13 +4072,6 @@ export function Transcript({
     postSubagents(hasSubagents);
   }, [hasSubagents]);
 
-  // The button itself is native (a liquid-glass circle above the composer) —
-  // mirror the visibility over the bridge; taps come back via the
-  // `jumpToLatest` transcript event above.
-  useEffect(() => {
-    postJumpVisible(showJump);
-  }, [showJump]);
-
   // While the turn's work block is live it already signals activity; the bare
   // "Working" pending line only covers the gap before the first frame lands.
   // Read past a trailing notice run, as every other live-frame tail reader does:
@@ -4151,6 +4144,39 @@ export function Transcript({
     [renderRows, compactionPoints],
   );
 
+  const pendingQuestionCallId = questions?.tool_call_id;
+  const historyRows = useMemo(() => renderRows.map((m) => {
+    const row =
+      m.role === "work" ? (
+        <WorkBlockView
+          key={m.id}
+          row={m}
+          pendingQuestionCallId={pendingQuestionCallId}
+          defaultExpanded={defaultExpandedWorkIds?.has(m.id)}
+          onToggle={handleWorkToggle}
+        />
+      ) : (
+        <MessageRow
+          key={m.id}
+          m={m}
+          connEpoch={connEpoch}
+          flash={m.id === flash.id ? flash.nonce : 0}
+          onRetry={retryMessage}
+        />
+      );
+    const seamAt = dividerBeforeId.get(m.id);
+    if (seamAt === undefined) return row;
+    return (
+      <Fragment key={`${m.id}-seam`}>
+        <CompactionDivider label={t("chat.preCompaction")} at={seamAt} />
+        {row}
+      </Fragment>
+    );
+  }), [
+    renderRows, pendingQuestionCallId, defaultExpandedWorkIds, handleWorkToggle,
+    connEpoch, flash, retryMessage, dividerBeforeId, t,
+  ]);
+
   return (
     <ImageDimsContext.Provider value={imageDimsStore}>
       <div className="chat-log" ref={logRef}>
@@ -4167,34 +4193,7 @@ export function Transcript({
             )}
           </div>
         )}
-        {renderRows.map((m) => {
-          const row =
-            m.role === "work" ? (
-              <WorkBlockView
-                key={m.id}
-                row={m}
-                pendingQuestionCallId={questions?.tool_call_id}
-                defaultExpanded={defaultExpandedWorkIds?.has(m.id)}
-                onToggle={handleWorkToggle}
-              />
-            ) : (
-              <MessageRow
-                key={m.id}
-                m={m}
-                connEpoch={connEpoch}
-                flash={m.id === flash.id ? flash.nonce : 0}
-                onRetry={retryMessage}
-              />
-            );
-          const seamAt = dividerBeforeId.get(m.id);
-          if (seamAt === undefined) return row;
-          return (
-            <Fragment key={`${m.id}-seam`}>
-              <CompactionDivider label={t("chat.preCompaction")} at={seamAt} />
-              {row}
-            </Fragment>
-          );
-        })}
+        {historyRows}
         {streaming && (
           <div className="msg assistant streaming">
             <StreamingMarkdownBody text={streaming} />

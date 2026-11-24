@@ -310,8 +310,9 @@ export function postMarkRead(ordinal: number): void {
 // The jump-to-latest button is native (liquid glass, above the composer) —
 // the transcript mirrors its visibility state over; taps come back through
 // the `jumpToLatest` transcript event.
-export function postJumpVisible(visible: boolean): void {
-  postSafe({ type: "jumpVisible", visible });
+export function postJumpVisible(visible: boolean, sessionId?: string): void {
+  if (sessionId !== undefined && initPayload !== null && initPayload.sessionId !== sessionId) return;
+  postSafe({ type: "jumpVisible", visible, sessionId });
 }
 
 /// The message-index sheet is native, but only the web tree knows which of the

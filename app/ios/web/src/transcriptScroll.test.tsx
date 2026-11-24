@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render } from "@testing-library/react";
+import { Profiler } from "react";
 import { I18nextProvider } from "react-i18next";
 
 import i18n from "./i18n";
@@ -311,6 +312,23 @@ describe("scroll-up paging holds the viewport", () => {
       expect(scrollTop).toBe(parked);
     }
     expect(posts().some((p) => p.type === "jumpVisible" && p.visible === true)).toBe(false);
+  });
+
+  it("reports native jump button transitions without committing a transcript render", async () => {
+    const commits = vi.fn();
+    render(
+      <I18nextProvider i18n={i18n}>
+        <Profiler id="transcript" onRender={commits}>
+          <Transcript restored={mirror(60, 999)} initialConnEpoch={0} />
+        </Profiler>
+      </I18nextProvider>,
+    );
+    await settle();
+    commits.mockClear();
+    for (const gap of [130, 180, 90, 0]) await scrollTo(maxScroll() - gap);
+    expect(posts().filter((post) => post.type === "jumpVisible").map((post) => post.visible))
+      .toEqual([false, true, false]);
+    expect(commits).not.toHaveBeenCalled();
   });
 
   it("lets momentum stop short of the end and resumes following only on reaching it", async () => {

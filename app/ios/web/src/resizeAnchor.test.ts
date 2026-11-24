@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   anchorShift,
   captureAnchor,
+  stackedAnchorReader,
   holdPlaceAcrossWidth,
   type ScrollAnchor,
 } from "./resizeAnchor";
@@ -58,6 +59,43 @@ describe("captureAnchor", () => {
     const root = page(3);
     scrolled = 1000;
     expect(captureAnchor(root, ATTR)).toBeNull();
+  });
+});
+
+describe("stackedAnchorReader", () => {
+  it("finds the reader near the end without measuring the entire history", () => {
+    const root = page(512);
+    scrolled = 500 * rowH + 25;
+    const expected = captureAnchor(root, ATTR);
+    let reads = 0;
+    for (const row of root.children) {
+      const measure = row.getBoundingClientRect.bind(row);
+      row.getBoundingClientRect = () => { reads++; return measure(); };
+    }
+    const capture = stackedAnchorReader(ATTR, "p");
+    expect(capture(root)).toEqual(expected);
+    expect(reads).toBeLessThanOrEqual(12);
+    reads = 0;
+    scrolled += 10;
+    expect(capture(root)).toEqual({ id: "r500", offset: -35 });
+    expect(reads).toBe(1);
+  });
+
+  it("keeps the paragraph anchor across dividers and a hidden child", () => {
+    const root = page(5);
+    const visible = root.children[2];
+    const part = document.createElement("p");
+    part.getBoundingClientRect = () => rect(-5, 30);
+    visible.append(part);
+    const divider = document.createElement("div");
+    divider.getBoundingClientRect = () => rect(-65, 15);
+    root.insertBefore(divider, visible);
+    root.insertBefore(document.createElement("div"), visible);
+    scrolled = 250;
+    const capture = stackedAnchorReader(ATTR, "p");
+    expect(capture(root)).toEqual({
+      id: "r2", offset: -50, part: { index: 0, offset: -5 },
+    });
   });
 });
 
